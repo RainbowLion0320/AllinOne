@@ -325,10 +325,12 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
+      const roomMeta = rooms.getRoomMeta(payload.room)
       sendJson(res, 200, {
         ok: true,
         user: payload,
         roomId: payload.room,
+        label: roomMeta?.label || '',
         bridges: hub.getBridgeList(payload.room),
       })
       return

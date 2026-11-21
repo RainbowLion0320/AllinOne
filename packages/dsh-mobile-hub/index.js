@@ -8,6 +8,7 @@
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import { dirname } from 'node:path'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { registerDshDispatchTools } from './src/dsh-tools.js'
@@ -42,7 +43,8 @@ export function apply(ctx, config = {}) {
 
   const relayUrl = String(config.relayUrl ?? process.env.RELAY_URL ?? '').trim()
   const secret = resolveSecret(config, log)
-  const bridgeId = String(config.bridgeId ?? 'home-pc').trim() || 'home-pc'
+  const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
+  const bridgeId = String(config.bridgeId ?? process.env.BRIDGE_ID ?? '').trim() || defaultBridgeId
   const statusFile = String(config.statusFile ?? '').trim()
   // Pure zero-invasion bridge mode by default: do NOT inject extra tools into DSH's prompt/tools list
   const enableDispatchTools = config.enableDispatchTools === true

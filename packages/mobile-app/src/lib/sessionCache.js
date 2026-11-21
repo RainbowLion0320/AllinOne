@@ -64,42 +64,50 @@ function openDb() {
   return dbPromise
 }
 
-export async function loadCachedSession(sessionId) {
+export function makeScopedCacheKey(sessionId, scope = '') {
+  const sid = String(sessionId || '')
+  const sc = String(scope || '').trim()
+  return sc ? `${sc}::${sid}` : sid
+}
+
+export async function loadCachedSession(sessionId, scope = '') {
   if (!sessionId) return null
+  const cacheKey = makeScopedCacheKey(sessionId, scope)
   const db = await openDb()
   let record = null
   if (!db) {
-    record = memoryFallback.get(sessionId) || null
+    record = memoryFallback.get(cacheKey) || null
   } else {
     record = await new Promise((resolve) => {
       try {
         const tx = db.transaction(STORE_NAME, 'readonly')
-        const req = tx.objectStore(STORE_NAME).get(sessionId)
-        req.onsuccess = () => resolve(req.result || memoryFallback.get(sessionId) || null)
-        req.onerror = () => resolve(memoryFallback.get(sessionId) || null)
+        const req = tx.objectStore(STORE_NAME).get(cacheKey)
+        req.onsuccess = () => resolve(req.result || memoryFallback.get(cacheKey) || null)
+        req.onerror = () => resolve(memoryFallback.get(cacheKey) || null)
       } catch {
-        resolve(memoryFallback.get(sessionId) || null)
+        resolve(memoryFallback.get(cacheKey) || null)
       }
     })
   }
 
   if (!record) return null
   if (record.cachedAt && Date.now() - record.cachedAt > MAX_CACHE_AGE_MS) {
-    void deleteCachedSession(sessionId)
+    void deleteCachedSession(sessionId, scope)
     return null
   }
   return record
 }
 
-export async function deleteCachedSession(sessionId) {
+export async function deleteCachedSession(sessionId, scope = '') {
   if (!sessionId) return
-  memoryFallback.delete(sessionId)
+  const cacheKey = makeScopedCacheKey(sessionId, scope)
+  memoryFallback.delete(cacheKey)
   const db = await openDb()
   if (!db) return
   await new Promise((resolve) => {
     try {
       const tx = db.transaction(STORE_NAME, 'readwrite')
-      tx.objectStore(STORE_NAME).delete(sessionId)
+      tx.objectStore(STORE_NAME).delete(cacheKey)
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
     } catch {
@@ -108,8 +116,10 @@ export async function deleteCachedSession(sessionId) {
   })
 }
 
-export async function saveCachedSession(sessionId, payload) {
+export async function saveCachedSession(sessionId, payload, scope = '') {
   if (!sessionId || !payload) return
+  const cleanScope = String(scope || '').trim()
+  const cacheKey = makeScopedCacheKey(sessionId, cleanScope)
 
   let messages = Array.isArray(payload.messages) ? payload.messages : []
   let hasMore = Boolean(payload.hasMore)
@@ -132,7 +142,7 @@ export async function saveCachedSession(sessionId, payload) {
     } else {
       // For opaque cursors (Codex), if an existing <=120 snapshot is already stored, keep its valid cursor
       // and only refresh the newest tail without growing persisted size beyond 120.
-      const existing = await loadCachedSession(sessionId)
+      const existing = await loadCachedSession(sessionId, cleanScope)
       if (existing && existing.messages?.length >= MAX_MESSAGES_PER_SESSION) {
         return
       }
@@ -142,7 +152,9 @@ export async function saveCachedSession(sessionId, payload) {
   }
 
   const baseRecord = {
-    sessionId,
+    sessionId: cacheKey,
+    rawSessionId: String(sessionId),
+    scope: cleanScope,
     meta: payload.meta || null,
     messages,
     hasMore,
@@ -153,7 +165,7 @@ export async function saveCachedSession(sessionId, payload) {
   const approxBytes = estimateBytes(baseRecord)
   const record = { ...baseRecord, approxBytes }
 
-  memoryFallback.set(sessionId, record)
+  memoryFallback.set(cacheKey, record)
 
   const db = await openDb()
   if (!db) return
@@ -212,16 +224,34 @@ async function pruneCacheBudget(db) {
   })
 }
 
-export async function getSessionCacheStats() {
+function matchesScope(record, scopeOrPrefix, prefix = false) {
+  if (!scopeOrPrefix) return true
+  const recScope = String(record?.scope || '')
+  const recKey = String(record?.sessionId || '')
+  if (prefix) {
+    return (
+      recScope === scopeOrPrefix ||
+      recScope.startsWith(`${scopeOrPrefix}::`) ||
+      recKey.startsWith(`${scopeOrPrefix}::`)
+    )
+  }
+  return recScope === scopeOrPrefix || recKey.startsWith(`${scopeOrPrefix}::`)
+}
+
+export async function getSessionCacheStats(scope = '') {
+  const cleanScope = String(scope || '').trim()
   const db = await openDb()
   if (!db) {
+    let sessionCount = 0
     let messageCount = 0
     let totalBytes = 0
     for (const r of memoryFallback.values()) {
+      if (!matchesScope(r, cleanScope, false)) continue
+      sessionCount += 1
       messageCount += r.messages?.length || 0
       totalBytes += Number(r.approxBytes) || estimateBytes(r)
     }
-    return { sessionCount: memoryFallback.size, messageCount, totalBytes }
+    return { sessionCount, messageCount, totalBytes }
   }
 
   return new Promise((resolve) => {
@@ -230,13 +260,16 @@ export async function getSessionCacheStats() {
       const req = tx.objectStore(STORE_NAME).getAll()
       req.onsuccess = () => {
         const rows = Array.isArray(req.result) ? req.result : []
+        let sessionCount = 0
         let messageCount = 0
         let totalBytes = 0
         for (const r of rows) {
+          if (!matchesScope(r, cleanScope, false)) continue
+          sessionCount += 1
           messageCount += r.messages?.length || 0
           totalBytes += Number(r.approxBytes) || estimateBytes(r)
         }
-        resolve({ sessionCount: rows.length, messageCount, totalBytes })
+        resolve({ sessionCount, messageCount, totalBytes })
       }
       req.onerror = () => resolve({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
     } catch {
@@ -245,22 +278,54 @@ export async function getSessionCacheStats() {
   })
 }
 
-export async function clearSessionCache() {
-  memoryFallback.clear()
-  cleanupLegacyDbOnce()
-  const db = await openDb()
-  if (db) {
-    await new Promise((resolve) => {
-      try {
-        const tx = db.transaction(STORE_NAME, 'readwrite')
-        tx.objectStore(STORE_NAME).clear()
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => resolve()
-      } catch {
-        resolve()
-      }
-    })
+export async function clearSessionCache(scopeOrPrefix = '', { prefix = false } = {}) {
+  const cleanScope = String(scopeOrPrefix || '').trim()
+  if (!cleanScope) {
+    memoryFallback.clear()
+    cleanupLegacyDbOnce()
+    const db = await openDb()
+    if (db) {
+      await new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE_NAME, 'readwrite')
+          tx.objectStore(STORE_NAME).clear()
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => resolve()
+        } catch {
+          resolve()
+        }
+      })
+    }
+    return
   }
+
+  for (const [k, v] of memoryFallback.entries()) {
+    if (matchesScope(v, cleanScope, prefix)) {
+      memoryFallback.delete(k)
+    }
+  }
+
+  const db = await openDb()
+  if (!db) return
+  await new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const req = store.openCursor()
+      req.onsuccess = () => {
+        const cur = req.result
+        if (!cur) return
+        if (matchesScope(cur.value, cleanScope, prefix)) {
+          store.delete(cur.primaryKey)
+        }
+        cur.continue()
+      }
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
 }
 
 export function formatBytesCompact(bytes) {

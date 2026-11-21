@@ -164,11 +164,24 @@ export function createRoomStore({ filePath }) {
     return { ok: false, error: '配对码无效或已失效，请检查电脑端显示的 8 位配对码' }
   }
 
+  function getRoomMeta(roomId) {
+    if (!roomId || roomId === 'owner') return null
+    const record = rooms.get(roomId)
+    if (!record) return null
+    return {
+      roomId: record.roomId,
+      label: record.label || '',
+      createdAt: record.createdAt || 0,
+      lastSeenAt: record.lastSeenAt || 0,
+    }
+  }
+
   return {
     registerRoom,
     verifyBridge,
     refreshPairCode,
     exchangePair,
+    getRoomMeta,
     count: () => rooms.size,
   }
 }

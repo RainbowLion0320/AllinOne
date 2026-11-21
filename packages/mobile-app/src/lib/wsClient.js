@@ -23,7 +23,7 @@ export function clearAuth() {
 }
 
 export const DEFAULT_PROD_SERVER =
-  String(import.meta.env.VITE_RELAY_URL || '').trim().replace(/\/+$/, '') ||
+  String(import.meta.env?.VITE_RELAY_URL || '').trim().replace(/\/+$/, '') ||
   'https://your-relay.example.com'
 
 export function detectDefaultServerUrl() {
@@ -133,15 +133,52 @@ export async function pairWithRelay(serverUrl, { pairCode = '', pairToken = '' }
   }
 }
 
+export async function probeDeviceStatus(device, timeoutMs = 5000) {
+  if (!device?.baseUrl || !device?.token) {
+    return { status: 'unreachable', bridges: [], label: '', roomId: device?.roomId || '' }
+  }
+  const base = normalizeBaseUrl(device.baseUrl)
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const res = await fetch(`${base}/api/auth/me`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${device.token}` },
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    if (res.status === 401) {
+      return { status: 'expired', bridges: [], label: '', roomId: device.roomId || '' }
+    }
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok) {
+      return { status: 'unreachable', bridges: [], label: '', roomId: device.roomId || '' }
+    }
+    const bridges = Array.isArray(data.bridges) ? data.bridges : []
+    const online = bridges.some((b) => b.online)
+    return {
+      status: online ? 'online' : 'offline',
+      bridges,
+      label: String(data.label || ''),
+      roomId: String(data.roomId || device.roomId || ''),
+    }
+  } catch {
+    return { status: 'unreachable', bridges: [], label: '', roomId: device.roomId || '' }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 /**
  * Mobile WebSocket RPC + Stream client with automatic reconnect & catch-up replay.
  */
 export class MobileRelayClient {
-  constructor({ baseUrl, token }) {
+  constructor({ baseUrl, token, bridgeId = '' }) {
     this.baseUrl = normalizeBaseUrl(baseUrl)
     this.token = token
+    this.targetBridgeId = String(bridgeId || '').trim()
     this.ws = null
     this.closed = false
+    this.openedOnce = false
     this.lastSeq = 0
     this.attempt = 0
     this.reconnectTimer = null
@@ -152,6 +189,10 @@ export class MobileRelayClient {
     this.statusListeners = new Set()
     this.connectionState = 'disconnected'
     this.bridges = []
+  }
+
+  setTargetBridgeId(bridgeId) {
+    this.targetBridgeId = String(bridgeId || '').trim()
   }
 
   onEvent(fn) {
@@ -212,6 +253,7 @@ export class MobileRelayClient {
 
     ws.onopen = () => {
       this.attempt = 0
+      this.openedOnce = true
       this.connectionState = 'connected'
       this.emitStatus()
       this.startPing()
@@ -254,14 +296,41 @@ export class MobileRelayClient {
       this.stopPing()
       if (this.ws === ws) this.ws = null
       if (this.closed) return
-      this.connectionState = ev.code === 4401 ? 'unauthorized' : 'disconnected'
+      if (ev.code === 4401) {
+        this.connectionState = 'unauthorized'
+        this.emitStatus()
+        return
+      }
+      this.connectionState = 'disconnected'
       this.emitStatus()
-      const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
-      this.attempt += 1
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null
-        this.openSocket()
-      }, delay)
+
+      const scheduleNext = () => {
+        if (this.closed) return
+        const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
+        this.attempt += 1
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null
+          this.openSocket()
+        }, delay)
+      }
+
+      // If handshake failed before ever opening, verify whether the 30-day JWT expired (HTTP 401)
+      if (!this.openedOnce && this.attempt === 0) {
+        probeDeviceStatus({ baseUrl: this.baseUrl, token: this.token }, 4000)
+          .then((res) => {
+            if (this.closed) return
+            if (res.status === 'expired') {
+              this.connectionState = 'unauthorized'
+              this.emitStatus()
+              return
+            }
+            scheduleNext()
+          })
+          .catch(scheduleNext)
+        return
+      }
+
+      scheduleNext()
     }
 
     ws.onerror = () => {
@@ -285,20 +354,30 @@ export class MobileRelayClient {
     }
   }
 
-  rpc(method, params = {}, timeoutMs = 45_000) {
+  rpc(method, params = {}, timeoutMs = 45_000, options = {}) {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         reject(new Error('尚未连接到中转服务器，正在重连...'))
         return
       }
       const id = `c-${this.reqSeq++}-${Date.now()}`
+      const bridgeId = options.bridgeId !== undefined
+        ? String(options.bridgeId || '').trim()
+        : this.targetBridgeId
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return
         this.pending.delete(id)
         reject(new Error('请求超时，请检查电脑端连接状态'))
       }, timeoutMs)
       this.pending.set(id, { resolve, reject, timer })
-      this.ws.send(JSON.stringify({ type: 'rpc.req', id, method, params, timeoutMs }))
+      this.ws.send(JSON.stringify({
+        type: 'rpc.req',
+        id,
+        method,
+        params,
+        timeoutMs,
+        ...(bridgeId ? { bridgeId } : {}),
+      }))
     })
   }
 

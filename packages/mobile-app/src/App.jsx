@@ -1,14 +1,31 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META, EVENTS, RPC } from '@allinone/shared'
-import { Loader2, Menu, SquarePen, WifiOff } from 'lucide-react'
+import {
+  ArrowLeftRight,
+  ChevronDown,
+  KeyRound,
+  Loader2,
+  Menu,
+  SquarePen,
+  WifiOff,
+} from 'lucide-react'
 import {
   MobileRelayClient,
-  clearAuth,
   detectDefaultServerUrl,
-  loadSavedAuth,
   pairWithRelay,
-  saveAuth,
 } from './lib/wsClient.js'
+import {
+  getActiveDevice,
+  getCacheScopeKey,
+  getDeviceDisplayName,
+  loadDeviceState,
+  removeDevice,
+  renameDevice,
+  saveDeviceState,
+  selectDevice,
+  updateDeviceMeta,
+  upsertDevice,
+} from './lib/deviceStore.js'
 import {
   clearSessionCache,
   loadCachedSession,
@@ -25,17 +42,21 @@ import { DispatchBoard } from './components/DispatchBoard.jsx'
 import { ModelPickerSheet } from './components/ModelPickerSheet.jsx'
 import { ImageLightbox } from './components/ImageLightbox.jsx'
 import { ShareModal } from './components/ShareModal.jsx'
+import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 
 export function App() {
-  const [auth, setAuth] = useState(() => loadSavedAuth())
+  const [deviceState, setDeviceState] = useState(() => loadDeviceState())
+  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '' })
   const [autoPairing, setAutoPairing] = useState(false)
   const [pairError, setPairError] = useState('')
+  const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [connState, setConnState] = useState('disconnected')
   const [bridges, setBridges] = useState([])
 
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
   const [dispatchOpen, setDispatchOpen] = useState(false)
@@ -65,6 +86,40 @@ export function App() {
   const [approvals, setApprovals] = useState([])
   const [dispatches, setDispatches] = useState([])
 
+  const devices = deviceState.devices
+  const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
+
+  const onlineBridges = useMemo(() => bridges.filter((b) => b.online), [bridges])
+
+  const activeBridge = useMemo(() => {
+    if (!activeDevice || onlineBridges.length === 0) return null
+    const preferredId = String(activeDevice.selectedBridgeId || '').trim()
+    if (preferredId) {
+      const matched = onlineBridges.find((b) => b.bridgeId === preferredId)
+      if (matched) return matched
+      // In a shared owner room where a specific bridge was already active in this view,
+      // never silently reroute mid-conversation to a different online computer.
+      if (activeDevice.roomId === 'owner' && (activeSession || sessions.length > 0)) {
+        return null
+      }
+    }
+    return onlineBridges[0] || null
+  }, [activeDevice, onlineBridges, activeSession, sessions.length])
+
+  const bridgeOnline = Boolean(activeBridge)
+  const activeBridgeId = activeBridge?.bridgeId || ''
+  const activeDeviceName = useMemo(
+    () => getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length),
+    [activeDevice, activeBridge, onlineBridges.length],
+  )
+  const cacheScope = useMemo(
+    () => getCacheScopeKey(activeDevice, activeBridgeId),
+    [activeDevice, activeBridgeId],
+  )
+
+  const skipFirstSaveRef = useRef(true)
+  const deviceStateRef = useRef(deviceState)
+  deviceStateRef.current = deviceState
   const clientRef = useRef(null)
   const activeSessionRef = useRef(null)
   activeSessionRef.current = activeSession
@@ -73,16 +128,88 @@ export function App() {
   const historyMetaRef = useRef(historyMeta)
   historyMetaRef.current = historyMeta
   const openRequestSeqRef = useRef(0)
+  const deviceGenRef = useRef(0)
   const loadingOlderLockRef = useRef(false)
   const streamingRef = useRef(streamingBySession)
   streamingRef.current = streamingBySession
+  const activeBridgeIdRef = useRef(activeBridgeId)
+  activeBridgeIdRef.current = activeBridgeId
+  const cacheScopeRef = useRef(cacheScope)
+  cacheScopeRef.current = cacheScope
+  const toastTimerRef = useRef(null)
+
+  const showToast = useCallback((text) => {
+    if (!text) return
+    setToastMsg(text)
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => {
+      toastTimerRef.current = null
+      setToastMsg('')
+    }, 2600)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    }
+  }, [])
+
+  // Persist multi-device state whenever it changes
+  useEffect(() => {
+    if (skipFirstSaveRef.current) {
+      skipFirstSaveRef.current = false
+      return
+    }
+    saveDeviceState(deviceState)
+  }, [deviceState])
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode)
     localStorage.setItem('allinone_dark', darkMode ? '1' : '0')
   }, [darkMode])
 
+  const resetTransientWorkspace = useCallback(() => {
+    deviceGenRef.current += 1
+    openRequestSeqRef.current += 1
+    loadingOlderLockRef.current = false
+    setActiveSession(null)
+    setMessages([])
+    setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
+    setOlderError('')
+    setLoadingSession(false)
+    setLoadingOlder(false)
+    setAppsStatus([])
+    setModelsCatalog({})
+    setSessionModelPrefs({})
+    setDraftDshPref(null)
+    setWorkspaces([])
+    setSessions([])
+    setStreamingBySession({})
+    setApprovals([])
+    setDispatches([])
+    setNewChatOpen(false)
+    setNewChatCwd('')
+    setDispatchOpen(false)
+    setModelPickerOpen(false)
+    setLightboxState(null)
+  }, [])
+
+  const handleDeviceAuthenticated = useCallback((payload) => {
+    setPairError('')
+    const preview = upsertDevice(deviceStateRef.current, payload)
+    resetTransientWorkspace()
+    setBridges([])
+    setDeviceState((prev) => upsertDevice(prev, payload).state)
+    setAddingDevice({ open: false, serverUrl: '' })
+    setDeviceSwitcherOpen(false)
+    if (preview.device) {
+      const name = getDeviceDisplayName(preview.device)
+      showToast(preview.isNew ? `已添加并切换到 ${name}` : `已更新并切换到 ${name}`)
+    }
+  }, [resetTransientWorkspace, showToast])
+
   // Auto-pair immediately when opened via QR code link (?pair=pt_xxx or ?code=XXXX-XXXX)
+  // Appends the newly paired computer to the saved devices list without deleting existing ones!
   useEffect(() => {
     if (typeof window === 'undefined') return
     const params = new URLSearchParams(window.location.search)
@@ -103,23 +230,21 @@ export function App() {
     pairWithRelay(detectDefaultServerUrl(), { pairToken, pairCode })
       .then((res) => {
         if (cancelled) return
-        const nextAuth = {
+        handleDeviceAuthenticated({
           baseUrl: res.baseUrl,
           token: res.token,
           roomId: res.roomId,
           label: res.label,
           bridges: res.bridges,
-        }
-        saveAuth(nextAuth)
-        void clearSessionCache()
-        setActiveSession(null)
-        setMessages([])
-        setSessions([])
-        setAuth(nextAuth)
+          authMode: 'pair',
+        })
       })
       .catch((err) => {
         if (cancelled) return
         setPairError(String(err?.message || err || '扫码自动配对失败，请重试'))
+        if (deviceStateRef.current.devices.length > 0) {
+          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl() })
+        }
       })
       .finally(() => {
         if (!cancelled) setAutoPairing(false)
@@ -128,7 +253,19 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [handleDeviceAuthenticated])
+
+  // Sync live hostname / platform / selectedBridgeId back to saved device metadata
+  useEffect(() => {
+    if (!activeDevice?.id || !activeBridge) return
+    setDeviceState((prev) =>
+      updateDeviceMeta(prev, activeDevice.id, {
+        lastHostname: activeBridge.hostname || '',
+        lastPlatform: activeBridge.platform || '',
+        selectedBridgeId: activeBridge.bridgeId || '',
+      }),
+    )
+  }, [activeDevice?.id, activeBridge?.bridgeId, activeBridge?.hostname, activeBridge?.platform])
 
   const defaultApp = useMemo(() => {
     const order = ['dsh', 'codex', 'claude', 'antigravity']
@@ -164,30 +301,33 @@ export function App() {
 
   const imageContext = useMemo(
     () => ({
-      baseUrl: auth?.baseUrl || '',
-      token: auth?.token || '',
+      baseUrl: activeDevice?.baseUrl || '',
+      token: activeDevice?.token || '',
       cwd: activeSession?.cwd || '',
+      bridgeId: activeBridgeId,
       onOpenImage: setLightboxState,
     }),
-    [auth?.baseUrl, auth?.token, activeSession?.cwd],
+    [activeDevice?.baseUrl, activeDevice?.token, activeSession?.cwd, activeBridgeId],
   )
 
-  const primaryBridge = bridges.find((b) => b.online) || null
-  const bridgeOnline = Boolean(primaryBridge)
-
-  const loadWorkspaceData = useCallback(async () => {
+  const loadWorkspaceData = useCallback(async (bridgeOverride = '') => {
     const client = clientRef.current
     if (!client) return
+    const targetBridge = String(bridgeOverride || activeBridgeIdRef.current || '').trim()
+    if (targetBridge) client.setTargetBridgeId(targetBridge)
+    const gen = deviceGenRef.current
     setRefreshing(true)
     try {
+      const rpcOpts = targetBridge ? { bridgeId: targetBridge } : {}
       const [statusRes, sessRes, wsRes, aprRes, dispRes, modelsRes] = await Promise.all([
-        client.rpc(RPC.APPS_STATUS).catch(() => ({ apps: [] })),
-        client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }).catch(() => ({ sessions: [] })),
-        client.rpc(RPC.WORKSPACES_LIST).catch(() => ({ workspaces: [] })),
-        client.rpc(RPC.APPROVAL_LIST).catch(() => ({ approvals: [] })),
-        client.rpc(RPC.DISPATCH_LIST, { limit: 30 }).catch(() => ({ tasks: [] })),
-        client.rpc(RPC.MODELS_LIST).catch(() => ({ catalog: {} })),
+        client.rpc(RPC.APPS_STATUS, {}, 45_000, rpcOpts).catch(() => ({ apps: [] })),
+        client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }, 45_000, rpcOpts).catch(() => ({ sessions: [] })),
+        client.rpc(RPC.WORKSPACES_LIST, {}, 45_000, rpcOpts).catch(() => ({ workspaces: [] })),
+        client.rpc(RPC.APPROVAL_LIST, {}, 45_000, rpcOpts).catch(() => ({ approvals: [] })),
+        client.rpc(RPC.DISPATCH_LIST, { limit: 30 }, 45_000, rpcOpts).catch(() => ({ tasks: [] })),
+        client.rpc(RPC.MODELS_LIST, {}, 45_000, rpcOpts).catch(() => ({ catalog: {} })),
       ])
+      if (deviceGenRef.current !== gen || clientRef.current !== client) return
       setAppsStatus(statusRes.apps || [])
       setSessions(sessRes.sessions || [])
       setWorkspaces(wsRes.workspaces || [])
@@ -197,9 +337,18 @@ export function App() {
         setModelsCatalog(modelsRes.catalog)
       }
     } finally {
-      setRefreshing(false)
+      if (deviceGenRef.current === gen) {
+        setRefreshing(false)
+      }
     }
   }, [])
+
+  // Trigger workspace load whenever connected target device/bridge is ready or changes
+  useEffect(() => {
+    if (connState !== 'connected' || !activeDevice?.id || !activeBridgeId) return
+    clientRef.current?.setTargetBridgeId(activeBridgeId)
+    void loadWorkspaceData(activeBridgeId)
+  }, [connState, activeDevice?.id, activeBridgeId, loadWorkspaceData])
 
   const openSession = useCallback(async (sessionOrId) => {
     const client = clientRef.current
@@ -207,6 +356,9 @@ export function App() {
     const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId.id
     const isDifferentSession = activeSessionRef.current?.id !== id
     const reqSeq = ++openRequestSeqRef.current
+    const gen = deviceGenRef.current
+    const scope = cacheScopeRef.current
+    const targetBridge = activeBridgeIdRef.current
     loadingOlderLockRef.current = false
     setLoadingOlder(false)
     setOlderError('')
@@ -221,9 +373,9 @@ export function App() {
       setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
     }
 
-    // 1. Show phone-cached history immediately (0ms perceived latency)
-    const cached = await loadCachedSession(id)
-    if (openRequestSeqRef.current !== reqSeq) return
+    // 1. Show phone-cached history immediately (0ms perceived latency), strictly scoped to current PC
+    const cached = await loadCachedSession(id, scope)
+    if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
     if (cached && cached.messages?.length > 0) {
       if (cached.meta && typeof sessionOrId === 'string') {
         setActiveSession(cached.meta)
@@ -243,8 +395,13 @@ export function App() {
 
     // 2. Sync latest page from PC (14 merged real Q&A bubbles ~15KB) and reconcile with phone cache
     try {
-      const res = await client.rpc(RPC.SESSION_READ, { id, limit: 14 })
-      if (openRequestSeqRef.current !== reqSeq) return
+      const res = await client.rpc(
+        RPC.SESSION_READ,
+        { id, limit: 14 },
+        45_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
+      if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
       if (res?.session) {
         const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
         const reconciled = reconcileCachedWithFreshPage(cached, {
@@ -260,16 +417,20 @@ export function App() {
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
         })
-        void saveCachedSession(id, {
-          meta: metaOnly,
-          messages: reconciled.messages,
-          hasMore: reconciled.hasMore,
-          nextCursor: reconciled.nextCursor,
-          totalCount: reconciled.totalCount,
-        })
+        void saveCachedSession(
+          id,
+          {
+            meta: metaOnly,
+            messages: reconciled.messages,
+            hasMore: reconciled.hasMore,
+            nextCursor: reconciled.nextCursor,
+            totalCount: reconciled.totalCount,
+          },
+          scope,
+        )
       }
     } catch (err) {
-      if (openRequestSeqRef.current !== reqSeq) return
+      if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
       if (!cached || !cached.messages?.length) {
         setStreamingBySession((prev) => ({
           ...prev,
@@ -277,7 +438,7 @@ export function App() {
         }))
       }
     } finally {
-      if (openRequestSeqRef.current === reqSeq) {
+      if (openRequestSeqRef.current === reqSeq && deviceGenRef.current === gen) {
         setLoadingSession(false)
       }
     }
@@ -295,10 +456,18 @@ export function App() {
     setOlderError('')
     const targetId = sess.id
     const cursor = hMeta.nextCursor
+    const gen = deviceGenRef.current
+    const scope = cacheScopeRef.current
+    const targetBridge = activeBridgeIdRef.current
 
     try {
-      const res = await client.rpc(RPC.SESSION_READ, { id: targetId, limit: 14, cursor })
-      if (activeSessionRef.current?.id !== targetId) return
+      const res = await client.rpc(
+        RPC.SESSION_READ,
+        { id: targetId, limit: 14, cursor },
+        45_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
+      if (activeSessionRef.current?.id !== targetId || deviceGenRef.current !== gen) return
       if (res?.session) {
         const olderMsgs = Array.isArray(res.session.messages) ? res.session.messages : []
         const merged = mergeSessionMessages(olderMsgs, messagesRef.current)
@@ -315,39 +484,60 @@ export function App() {
         })
 
         const { messages: _drop, ...metaOnly } = res.session
-        void saveCachedSession(targetId, {
-          meta: metaOnly,
-          messages: merged,
-          hasMore: nextHasMore,
-          nextCursor: nextCur,
-          totalCount: nextTotal,
-        })
+        void saveCachedSession(
+          targetId,
+          {
+            meta: metaOnly,
+            messages: merged,
+            hasMore: nextHasMore,
+            nextCursor: nextCur,
+            totalCount: nextTotal,
+          },
+          scope,
+        )
       }
     } catch (err) {
-      setOlderError(String(err?.message || err || '加载更早历史失败'))
+      if (deviceGenRef.current === gen) {
+        setOlderError(String(err?.message || err || '加载更早历史失败'))
+      }
     } finally {
       loadingOlderLockRef.current = false
-      setLoadingOlder(false)
+      if (deviceGenRef.current === gen) {
+        setLoadingOlder(false)
+      }
     }
   }, [])
 
-  // Connect WebSocket whenever authenticated
+  // Connect WebSocket whenever the active saved computer changes
   useEffect(() => {
-    if (!auth?.token || !auth?.baseUrl) return
-    const client = new MobileRelayClient({ baseUrl: auth.baseUrl, token: auth.token })
+    if (autoPairing || !activeDevice?.token || !activeDevice?.baseUrl) {
+      setConnState('disconnected')
+      setBridges([])
+      return
+    }
+
+    setBridges([])
+    const client = new MobileRelayClient({
+      baseUrl: activeDevice.baseUrl,
+      token: activeDevice.token,
+      bridgeId: activeDevice.selectedBridgeId || '',
+    })
     clientRef.current = client
 
     const unsubStatus = client.onStatus(({ state, bridges: bList }) => {
+      if (clientRef.current !== client) return
       setConnState(state)
       setBridges(bList || [])
-      if (state === 'connected' && (bList || []).some((b) => b.online)) {
-        loadWorkspaceData()
-      }
     })
 
-    const unsubEvents = client.onEvent((event, payload) => {
-      if (event === EVENTS.BRIDGE_STATUS) {
-        if (payload?.online) loadWorkspaceData()
+    const unsubEvents = client.onEvent((event, payload, rawMsg) => {
+      if (clientRef.current !== client) return
+      if (event === EVENTS.BRIDGE_STATUS) return
+
+      // Strictly isolate live events to the currently selected computer bridge
+      const evBridgeId = String(rawMsg?.bridgeId || '').trim()
+      const curBridgeId = activeBridgeIdRef.current
+      if (evBridgeId && curBridgeId && evBridgeId !== curBridgeId) {
         return
       }
 
@@ -437,13 +627,17 @@ export function App() {
           }
           const nextList = [...messagesRef.current, committed]
           setMessages(nextList)
-          void saveCachedSession(sid, {
-            meta: activeSessionRef.current,
-            messages: nextList,
-            hasMore: historyMetaRef.current.hasMore,
-            nextCursor: historyMetaRef.current.nextCursor,
-            totalCount: historyMetaRef.current.totalCount,
-          })
+          void saveCachedSession(
+            sid,
+            {
+              meta: activeSessionRef.current,
+              messages: nextList,
+              hasMore: historyMetaRef.current.hasMore,
+              nextCursor: historyMetaRef.current.nextCursor,
+              totalCount: historyMetaRef.current.totalCount,
+            },
+            cacheScopeRef.current,
+          )
         }
         setSessions((prev) =>
           prev.map((s) => (s.id === sid ? { ...s, status: 'idle', updatedAt: Date.now() } : s)),
@@ -457,21 +651,86 @@ export function App() {
       unsubStatus()
       unsubEvents()
       client.disconnect()
-      clientRef.current = null
+      if (clientRef.current === client) {
+        clientRef.current = null
+      }
     }
-  }, [auth?.token, auth?.baseUrl, loadWorkspaceData])
+  }, [autoPairing, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl])
+
+  const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
+    const cleanBridgeId = String(bridgeId || '').trim()
+    const isSameDevice = activeDevice?.id === deviceId
+    const isSameBridge = isSameDevice && (!cleanBridgeId || cleanBridgeId === activeBridgeIdRef.current)
+    if (isSameBridge) return
+
+    resetTransientWorkspace()
+    if (!isSameDevice) {
+      setBridges([])
+    } else if (cleanBridgeId) {
+      clientRef.current?.setTargetBridgeId(cleanBridgeId)
+    }
+
+    const target = devices.find((d) => d.id === deviceId)
+    setDeviceState((prev) => selectDevice(prev, deviceId, cleanBridgeId || undefined))
+
+    if (target) {
+      const targetBridgeObj = isSameDevice
+        ? onlineBridges.find((b) => b.bridgeId === cleanBridgeId) || null
+        : null
+      const name =
+        isSameDevice && targetBridgeObj
+          ? targetBridgeObj.hostname || targetBridgeObj.bridgeId
+          : getDeviceDisplayName(target)
+      showToast(`已切换到 ${name}`)
+    }
+  }, [activeDevice?.id, devices, onlineBridges, resetTransientWorkspace, showToast])
+
+  const handleRenameDevice = useCallback((deviceId, customName) => {
+    setDeviceState((prev) => renameDevice(prev, deviceId, customName))
+  }, [])
+
+  const handleSyncDeviceMeta = useCallback((deviceId, patch) => {
+    setDeviceState((prev) => updateDeviceMeta(prev, deviceId, patch))
+  }, [])
+
+  const handleRemoveDevice = useCallback((deviceId) => {
+    const target = devices.find((d) => d.id === deviceId)
+    const removingActive = activeDevice?.id === deviceId
+    const removingLast = devices.length <= 1
+    void clearSessionCache(deviceId, { prefix: true })
+    if (removingActive) {
+      resetTransientWorkspace()
+      setBridges([])
+    }
+    if (removingLast) {
+      setDeviceSwitcherOpen(false)
+      setDrawerOpen(false)
+    }
+    setDeviceState((prev) => removeDevice(prev, deviceId))
+    if (target) {
+      showToast(`已移除 ${getDeviceDisplayName(target)}`)
+    }
+  }, [activeDevice?.id, devices, resetTransientWorkspace, showToast])
 
   const handleCreateSession = async ({ app, cwd, title, model, provider, reasoningEffort }) => {
     const client = clientRef.current
     if (!client) throw new Error('未连接到服务器')
-    const res = await client.rpc(RPC.SESSION_CREATE, {
-      app,
-      cwd,
-      title,
-      ...(model ? { model } : {}),
-      ...(provider ? { provider } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-    })
+    const gen = deviceGenRef.current
+    const targetBridge = activeBridgeIdRef.current
+    const res = await client.rpc(
+      RPC.SESSION_CREATE,
+      {
+        app,
+        cwd,
+        title,
+        ...(model ? { model } : {}),
+        ...(provider ? { provider } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      },
+      45_000,
+      targetBridge ? { bridgeId: targetBridge } : {},
+    )
+    if (deviceGenRef.current !== gen) return res.session
     const created = res.session
     if (model || provider || reasoningEffort) {
       setSessionModelPrefs((prev) => ({
@@ -517,6 +776,9 @@ export function App() {
   const handleSend = async ({ text, attachments = [] }) => {
     const client = clientRef.current
     if (!client) return
+    const gen = deviceGenRef.current
+    const scope = cacheScopeRef.current
+    const targetBridge = activeBridgeIdRef.current
 
     let target = activeSession
     if (!target) {
@@ -531,6 +793,7 @@ export function App() {
           provider: initPref.provider || undefined,
           reasoningEffort: initPref.reasoningEffort || undefined,
         })
+        if (deviceGenRef.current !== gen) return
       } catch (err) {
         alert(String(err?.message || err))
         return
@@ -570,13 +833,17 @@ export function App() {
     }
     const nextWithUser = [...messagesRef.current, userMsg]
     setMessages(nextWithUser)
-    void saveCachedSession(target.id, {
-      meta: target,
-      messages: nextWithUser,
-      hasMore: historyMetaRef.current.hasMore,
-      nextCursor: historyMetaRef.current.nextCursor,
-      totalCount: historyMetaRef.current.totalCount,
-    })
+    void saveCachedSession(
+      target.id,
+      {
+        meta: target,
+        messages: nextWithUser,
+        hasMore: historyMetaRef.current.hasMore,
+        nextCursor: historyMetaRef.current.nextCursor,
+        totalCount: historyMetaRef.current.totalCount,
+      },
+      scope,
+    )
 
     setStreamingBySession((prev) => ({
       ...prev,
@@ -584,17 +851,23 @@ export function App() {
     }))
 
     try {
-      await client.rpc(RPC.SESSION_SEND, {
-        id: target.id,
-        text: finalText,
-        cwd: target.cwd,
-        attachments,
-        wait: false,
-        ...(activePref.model ? { model: activePref.model } : {}),
-        ...(activePref.provider ? { provider: activePref.provider } : {}),
-        ...(activePref.reasoningEffort ? { reasoningEffort: activePref.reasoningEffort } : {}),
-      })
+      await client.rpc(
+        RPC.SESSION_SEND,
+        {
+          id: target.id,
+          text: finalText,
+          cwd: target.cwd,
+          attachments,
+          wait: false,
+          ...(activePref.model ? { model: activePref.model } : {}),
+          ...(activePref.provider ? { provider: activePref.provider } : {}),
+          ...(activePref.reasoningEffort ? { reasoningEffort: activePref.reasoningEffort } : {}),
+        },
+        45_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
     } catch (err) {
+      if (deviceGenRef.current !== gen) return
       setStreamingBySession((prev) => ({
         ...prev,
         [target.id]: { active: false, text: '', thinking: '', tools: [], error: String(err?.message || err) },
@@ -605,16 +878,28 @@ export function App() {
   const handleInterrupt = async () => {
     const client = clientRef.current
     if (!client || !activeSession) return
+    const targetBridge = activeBridgeIdRef.current
     try {
-      await client.rpc(RPC.SESSION_INTERRUPT, { id: activeSession.id })
+      await client.rpc(
+        RPC.SESSION_INTERRUPT,
+        { id: activeSession.id },
+        45_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
     } catch {}
   }
 
   const handleResolveApproval = async (id, decision) => {
     const client = clientRef.current
     if (!client) return
+    const targetBridge = activeBridgeIdRef.current
     try {
-      await client.rpc(RPC.APPROVAL_RESOLVE, { id, decision })
+      await client.rpc(
+        RPC.APPROVAL_RESOLVE,
+        { id, decision },
+        45_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
       setApprovals((prev) => prev.filter((a) => a.id !== id))
     } catch (err) {
       alert(String(err?.message || err))
@@ -624,13 +909,19 @@ export function App() {
   const handleDirectDispatch = async ({ app, cwd, prompt }) => {
     const client = clientRef.current
     if (!client) throw new Error('未连接到服务器')
-    const res = await client.rpc(RPC.DISPATCH_CREATE, {
-      app,
-      cwd,
-      prompt,
-      wait: false,
-      issuedBy: 'mobile-board',
-    })
+    const targetBridge = activeBridgeIdRef.current
+    const res = await client.rpc(
+      RPC.DISPATCH_CREATE,
+      {
+        app,
+        cwd,
+        prompt,
+        wait: false,
+        issuedBy: 'mobile-board',
+      },
+      45_000,
+      targetBridge ? { bridgeId: targetBridge } : {},
+    )
     if (res?.task) {
       setDispatches((prev) => [res.task, ...prev.filter((t) => t.taskId !== res.task.taskId)])
     }
@@ -646,26 +937,31 @@ export function App() {
           <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
           <span>正在扫码自动配对你的专属电脑...</span>
         </div>
-        <p className="mt-1.5 text-xs text-slate-400">独立加密房间验证中，请稍候</p>
+        <p className="mt-1.5 text-xs text-slate-400">独立加密房间验证中，已有电脑连接完全保留</p>
       </div>
     )
   }
 
-  if (!auth) {
+  if (!activeDevice || addingDevice.open) {
     return (
       <LoginScreen
         initialError={pairError}
-        onSuccess={(data) => {
-          setPairError('')
-          saveAuth(data)
-          setAuth(data)
-        }}
+        isAddingDevice={Boolean(activeDevice && addingDevice.open)}
+        initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
+        onCancel={
+          activeDevice
+            ? () => {
+                setPairError('')
+                setAddingDevice({ open: false, serverUrl: '' })
+              }
+            : null
+        }
+        onSuccess={handleDeviceAuthenticated}
       />
     )
   }
 
   const activeApp = activeSession?.app || defaultApp
-  const activeMeta = APP_META[activeApp] || APP_META.dsh
   const activeCatalog = modelsCatalog[activeApp] || null
   const activeModelPref = resolveModelPrefFor(activeSession)
   const activeModelObj = (activeCatalog?.models || []).find(
@@ -675,8 +971,21 @@ export function App() {
   ) || (activeCatalog?.models || []).find((m) => m.id === activeModelPref.model)
   const currentStream = activeSession ? streamingBySession[activeSession.id] : null
 
+  const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1
+  const headerSubtitle = (() => {
+    if (connState === 'unauthorized') return `${activeDeviceName} · 凭证已过期`
+    if (connState !== 'connected') return `${activeDeviceName} · 连接中...`
+    if (!bridgeOnline) return `${activeDeviceName} · 等待上线`
+    if (hasMultipleTargets) {
+      return activeSession?.workspace
+        ? `${activeDeviceName} · ${activeSession.workspace}`
+        : activeDeviceName
+    }
+    return activeSession?.workspace || activeDeviceName || '电脑已在线'
+  })()
+
   return (
-    <div className="flex h-full w-full flex-col bg-white dark:bg-[#16171A]">
+    <div className="relative flex h-full w-full flex-col bg-white dark:bg-[#16171A]">
       {/* DeepSeek-style minimal top header */}
       <header className="pt-safe shrink-0 border-b border-slate-100 bg-white/85 px-3 pb-2.5 backdrop-blur-md dark:border-slate-800/80 dark:bg-[#16171A]/85">
         <div className="mx-auto flex max-w-2xl items-center justify-between gap-2">
@@ -692,36 +1001,38 @@ export function App() {
             )}
           </button>
 
-          <button
-            type="button"
-            onClick={() => setDrawerOpen(true)}
-            className="flex min-w-0 flex-1 flex-col items-center text-center"
-          >
-            <div className="flex max-w-full items-center gap-1.5">
+          <div className="flex min-w-0 flex-1 flex-col items-center text-center">
+            <button
+              type="button"
+              onClick={() => setDrawerOpen(true)}
+              className="flex max-w-full items-center gap-1.5"
+            >
               <VendorBadge app={activeApp} size="xs" />
               <span className="truncate text-[14.5px] font-semibold text-slate-900 dark:text-white">
                 {activeSession?.title || 'All in One'}
               </span>
-            </div>
-            <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-slate-400">
+            </button>
+            <button
+              type="button"
+              onClick={() => setDeviceSwitcherOpen(true)}
+              aria-label="切换控制的电脑"
+              className="mt-0.5 inline-flex max-w-[230px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
+            >
               <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  connState === 'connected' && bridgeOnline
-                    ? 'bg-emerald-500'
-                    : connState === 'connecting'
-                      ? 'bg-amber-400'
-                      : 'bg-rose-400'
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  connState === 'unauthorized'
+                    ? 'bg-rose-500'
+                    : connState === 'connected' && bridgeOnline
+                      ? 'bg-emerald-500'
+                      : connState === 'connecting'
+                        ? 'bg-amber-400'
+                        : 'bg-rose-400'
                 }`}
               />
-              <span className="truncate max-w-[200px]">
-                {connState !== 'connected'
-                  ? '正在连接服务器...'
-                  : bridgeOnline
-                    ? activeSession?.workspace || primaryBridge?.hostname || '电脑已在线'
-                    : '等待电脑端上线'}
-              </span>
-            </div>
-          </button>
+              <span className="truncate">{headerSubtitle}</span>
+              <ChevronDown className="h-3 w-3 shrink-0 opacity-65" />
+            </button>
+          </div>
 
           <button
             type="button"
@@ -734,11 +1045,58 @@ export function App() {
         </div>
       </header>
 
-      {/* Offline warning bar if relay connected but PC bridge offline */}
+      {/* Expired token banner (never locks user out of other paired computers) */}
+      {connState === 'unauthorized' && (
+        <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
+          <KeyRound className="h-3.5 w-3.5 shrink-0" />
+          <span>{activeDeviceName} 配对凭证已失效</span>
+          <button
+            type="button"
+            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl })}
+            className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
+          >
+            重新配对
+          </button>
+          {devices.length > 1 && (
+            <button
+              type="button"
+              onClick={() => setDeviceSwitcherOpen(true)}
+              className="rounded-lg border border-rose-300 bg-white px-2 py-0.5 text-[11px] font-medium text-rose-600 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-200"
+            >
+              切换其他电脑
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Offline warning bar if relay connected but target PC bridge offline */}
       {connState === 'connected' && !bridgeOnline && (
-        <div className="flex items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
-          <WifiOff className="h-3.5 w-3.5" />
-          <span>服务器已连通，等待电脑端 All in One 桥接上线...</span>
+        <div className="flex flex-wrap items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+          <WifiOff className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            {onlineBridges.length > 0
+              ? `当前选中的电脑（${activeDevice.selectedBridgeId}）已离线`
+              : `服务器已连通，等待 ${activeDeviceName} 桥接上线...`}
+          </span>
+          {(devices.length > 1 || onlineBridges.length > 0) && (
+            <button
+              type="button"
+              onClick={() => setDeviceSwitcherOpen(true)}
+              className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
+            >
+              <ArrowLeftRight className="h-3 w-3" />
+              <span>切换电脑</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Non-intrusive toast pill */}
+      {toastMsg && (
+        <div className="pointer-events-none fixed top-16 left-1/2 z-[60] -translate-x-1/2">
+          <div className="rounded-full bg-slate-900/90 px-4 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-md dark:bg-white/95 dark:text-slate-900">
+            {toastMsg}
+          </div>
         </div>
       )}
 
@@ -791,21 +1149,38 @@ export function App() {
           setNewChatCwd(typeof cwdHint === 'string' ? cwdHint : '')
           setNewChatOpen(true)
         }}
-        onRefresh={loadWorkspaceData}
+        onRefresh={() => loadWorkspaceData(activeBridgeId)}
         refreshing={refreshing}
+        connState={connState}
         bridgeOnline={bridgeOnline}
-        bridgeHost={primaryBridge?.hostname}
-        roomId={auth?.roomId}
+        activeDeviceName={activeDeviceName}
+        devicesCount={devices.length}
+        onlineBridgesCount={onlineBridges.length}
+        roomId={activeDevice?.roomId}
+        cacheScope={cacheScope}
         darkMode={darkMode}
         onToggleDark={() => setDarkMode((v) => !v)}
         onOpenShare={() => setShareOpen(true)}
-        onLogout={() => {
-          clearAuth()
-          void clearSessionCache()
-          setAuth(null)
-          setActiveSession(null)
-          setMessages([])
+        onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
+      />
+
+      {/* Multi-Computer Switcher & Manager Modal */}
+      <DeviceSwitcherModal
+        open={deviceSwitcherOpen}
+        onClose={() => setDeviceSwitcherOpen(false)}
+        devices={devices}
+        activeDeviceId={activeDevice?.id}
+        activeBridgeId={activeBridgeId}
+        activeConnState={connState}
+        activeBridges={bridges}
+        onSelectDevice={handleSelectDevice}
+        onAddDevice={(prefillServerUrl = '') => {
+          setPairError('')
+          setAddingDevice({ open: true, serverUrl: prefillServerUrl || activeDevice?.baseUrl || '' })
         }}
+        onRenameDevice={handleRenameDevice}
+        onRemoveDevice={handleRemoveDevice}
+        onSyncDeviceMeta={handleSyncDeviceMeta}
       />
 
       {/* New Chat Bottom Sheet */}
@@ -859,7 +1234,7 @@ export function App() {
         appsStatus={appsStatus}
         workspaces={effectiveWorkspaces}
         dispatches={dispatches}
-        onRefresh={loadWorkspaceData}
+        onRefresh={() => loadWorkspaceData(activeBridgeId)}
         onDirectDispatch={handleDirectDispatch}
         onJumpToSession={openSession}
       />
@@ -867,7 +1242,7 @@ export function App() {
       <ShareModal
         open={shareOpen}
         onClose={() => setShareOpen(false)}
-        serverUrl={auth?.baseUrl}
+        serverUrl={activeDevice?.baseUrl}
       />
       {/* Full-Screen Zoomable Image Lightbox */}
       <ImageLightbox state={lightboxState} onClose={() => setLightboxState(null)} />

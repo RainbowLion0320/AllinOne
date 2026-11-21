@@ -1,13 +1,15 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import {
+  ArrowLeftRight,
   ChevronDown,
   ChevronRight,
+  ChevronsUpDown,
   Clock,
   Folder,
   FolderOpen,
   HardDrive,
-  LogOut,
+  Monitor,
   Moon,
   Plus,
   RefreshCw,
@@ -15,8 +17,6 @@ import {
   Share2,
   Sun,
   Trash2,
-  Wifi,
-  WifiOff,
   X,
 } from 'lucide-react'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
@@ -149,13 +149,17 @@ export function SidebarDrawer({
   onNewChat,
   onRefresh,
   refreshing,
+  connState,
   bridgeOnline,
-  bridgeHost,
+  activeDeviceName,
+  devicesCount = 1,
+  onlineBridgesCount = 0,
   roomId,
+  cacheScope = '',
   darkMode,
   onToggleDark,
   onOpenShare,
-  onLogout,
+  onOpenDeviceSwitcher,
 }) {
   const [filterApp, setFilterApp] = useState('all')
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
@@ -171,11 +175,11 @@ export function SidebarDrawer({
 
   useEffect(() => {
     if (!open) return
-    getSessionCacheStats().then(setCacheStats).catch(() => {})
-  }, [open, sessions.length])
+    getSessionCacheStats(cacheScope).then(setCacheStats).catch(() => {})
+  }, [open, sessions.length, cacheScope])
 
   const handleClearCache = async () => {
-    await clearSessionCache()
+    await clearSessionCache(cacheScope)
     setCacheStats({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
     setCacheClearedHint(true)
     setTimeout(() => setCacheClearedHint(false), 1800)
@@ -241,31 +245,19 @@ export function SidebarDrawer({
         }`}
       >
         {/* Top header */}
-        <div className="pt-safe flex items-center justify-between px-4 pb-3">
+        <div className="pt-safe flex items-center justify-between px-4 pb-2.5">
           <div className="flex items-center gap-2.5">
             <img src="./icon-192.png" alt="All in One" className="h-8.5 w-8.5 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
             <div>
               <div className="flex items-center gap-1.5 text-[15px] font-bold text-slate-900 dark:text-white">
                 <span>All in One</span>
                 <span className="rounded-md bg-slate-200/80 px-1.5 py-0.2 text-[9.5px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                  v0.1.18
+                  v0.1.19
                 </span>
               </div>
-              <div className="flex items-center gap-1 text-[11px] text-slate-500 dark:text-slate-400">
-                {bridgeOnline ? (
-                  <>
-                    <Wifi className="h-3 w-3 text-emerald-500" />
-                    <span className="truncate max-w-[140px]">
-                      {bridgeHost || 'PC 已在线'}
-                      {roomId && roomId !== 'owner' ? ' · 专属房间' : ''}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <WifiOff className="h-3 w-3 text-amber-500" />
-                    <span>电脑离线</span>
-                  </>
-                )}
+              <div className="text-[10.5px] text-slate-400">
+                {roomId && roomId !== 'owner' ? '独立加密房间' : '管理员房间'}
+                {devicesCount > 1 ? ` · 已保存 ${devicesCount} 台电脑` : ''}
               </div>
             </div>
           </div>
@@ -288,6 +280,57 @@ export function SidebarDrawer({
               <X className="h-4 w-4" />
             </button>
           </div>
+        </div>
+
+        {/* Active Computer Switcher Card */}
+        <div className="px-4 pb-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              onClose()
+              onOpenDeviceSwitcher?.()
+            }}
+            className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-2 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
+          >
+            <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+              <Monitor className="h-4 w-4" />
+              <span
+                className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-[#232631] ${
+                  connState === 'unauthorized'
+                    ? 'bg-rose-500'
+                    : connState === 'connected' && bridgeOnline
+                      ? 'bg-emerald-500'
+                      : connState === 'connecting'
+                        ? 'bg-amber-400'
+                        : 'bg-slate-400'
+                }`}
+              />
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13px] font-semibold text-slate-800 dark:text-white">
+                {activeDeviceName || '我的电脑'}
+              </div>
+              <div className="truncate text-[10.5px] text-slate-400">
+                {connState === 'unauthorized'
+                  ? '凭证已过期 · 点击重新配对'
+                  : connState === 'connected' && bridgeOnline
+                    ? onlineBridgesCount > 1
+                      ? `在线 · 同房 ${onlineBridgesCount} 台可切换`
+                      : devicesCount > 1
+                        ? `在线 · 点击切换电脑`
+                        : '在线 · 点击添加更多电脑'
+                    : connState === 'connecting'
+                      ? '正在连接服务器...'
+                      : '电脑离线 · 点击切换其他电脑'}
+              </div>
+            </div>
+
+            <div className="inline-flex shrink-0 items-center gap-0.5 rounded-lg bg-slate-100 px-2 py-1 text-[10.5px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+              <span>{devicesCount > 1 || onlineBridgesCount > 1 ? '切换' : '设备'}</span>
+              <ChevronsUpDown className="h-3 w-3 opacity-75" />
+            </div>
+          </button>
         </div>
 
         {/* New Chat primary pill button */}
@@ -573,11 +616,14 @@ export function SidebarDrawer({
 
             <button
               type="button"
-              onClick={onLogout}
-              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+              onClick={() => {
+                onClose()
+                onOpenDeviceSwitcher?.()
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
             >
-              <LogOut className="h-3.5 w-3.5" />
-              <span>切换设备</span>
+              <ArrowLeftRight className="h-3.5 w-3.5 text-[#4D6BFE]" />
+              <span>切换电脑</span>
             </button>
           </div>
         </div>

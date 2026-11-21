@@ -22,7 +22,7 @@ const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const APK_FILENAME = 'All-in-One-v0.1.7.apk'
-const BRIDGE_VERSION = '0.1.18'
+const BRIDGE_VERSION = '0.1.19'
 
 function parseArgs(argv) {
   const opts = {

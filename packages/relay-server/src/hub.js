@@ -67,9 +67,10 @@ export class RelayHub {
 
   getPrimaryBridge(roomId = 'owner', requestedId) {
     const rid = roomId || 'owner'
-    if (requestedId) {
-      const b = this.bridges.get(this.bridgeKey(rid, requestedId))
-      if (b && b.ws.readyState === 1) return b
+    const reqId = String(requestedId || '').trim()
+    if (reqId) {
+      const b = this.bridges.get(this.bridgeKey(rid, reqId))
+      return b && b.ws.readyState === 1 ? b : null
     }
     for (const b of this.bridges.values()) {
       if (b.roomId === rid && b.ws.readyState === 1) return b
@@ -243,7 +244,8 @@ export class RelayHub {
 
     if (msg.type === 'rpc.req') {
       const clientReqId = String(msg.id || randomUUID())
-      const bridge = this.getPrimaryBridge(roomId, msg.bridgeId)
+      const requestedBridgeId = String(msg.bridgeId || '').trim()
+      const bridge = this.getPrimaryBridge(roomId, requestedBridgeId)
       if (!bridge) {
         this.sendToClient(clientId, {
           type: 'rpc.res',
@@ -251,7 +253,9 @@ export class RelayHub {
           ok: false,
           error: {
             code: 'BRIDGE_OFFLINE',
-            message: '你的电脑端桥接服务未在线，请确认电脑已开机并启动 All in One 电脑端桥接。',
+            message: requestedBridgeId
+              ? `目标电脑（${requestedBridgeId}）当前未在线，请确认该电脑已开机并启动桥接，或切换其他电脑。`
+              : '你的电脑端桥接服务未在线，请确认电脑已开机并启动 All in One 电脑端桥接。',
           },
         })
         return
@@ -296,10 +300,13 @@ export class RelayHub {
    */
   callBridge(roomId, method, params = {}, { bridgeId, timeoutMs = 30_000 } = {}) {
     const rid = roomId || 'owner'
+    const requestedBridgeId = String(bridgeId || '').trim()
     return new Promise((resolvePromise, rejectPromise) => {
-      const bridge = this.getPrimaryBridge(rid, bridgeId)
+      const bridge = this.getPrimaryBridge(rid, requestedBridgeId)
       if (!bridge) {
-        const err = new Error('电脑端桥接未在线')
+        const err = new Error(
+          requestedBridgeId ? `目标电脑（${requestedBridgeId}）桥接未在线` : '电脑端桥接未在线',
+        )
         err.code = 'BRIDGE_OFFLINE'
         rejectPromise(err)
         return

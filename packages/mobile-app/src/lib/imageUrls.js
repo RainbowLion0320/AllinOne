@@ -35,7 +35,7 @@ export function normalizeImageKey(ref) {
     .toLowerCase()
 }
 
-export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '' } = {}) {
+export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '', bridgeId = '' } = {}) {
   const rawUrl = typeof item === 'string' ? '' : String(item?.url || '').trim()
   const rawPath = typeof item === 'string' ? String(item).trim() : String(item?.path || '').trim()
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
@@ -73,6 +73,7 @@ export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '' } = {
   const params = new URLSearchParams()
   params.set('path', target)
   if (cwd) params.set('cwd', cwd)
+  if (bridgeId) params.set('bridgeId', bridgeId)
   if (token) params.set('token', token)
   return `${cleanBase}/api/bridge-file?${params.toString()}`
 }

@@ -27,7 +27,7 @@ export function parseDshConfiguredModels() {
     models: [],
   }
 
-  if (!existsSync(patchPath)) {
+  const applyFallbackModels = () => {
     result.providers = [{ id: 'deepseek', name: 'DeepSeek' }]
     result.models = [
       {
@@ -48,6 +48,10 @@ export function parseDshConfiguredModels() {
       },
     ]
     return result
+  }
+
+  if (!existsSync(patchPath)) {
+    return applyFallbackModels()
   }
 
   const lines = readFileSync(patchPath, 'utf8').split(/\r?\n/)
@@ -229,6 +233,10 @@ export function parseDshConfiguredModels() {
       if (b.id === result.defaultProvider) return 1
       return 0
     })
+
+  if (result.models.length === 0) {
+    return applyFallbackModels()
+  }
 
   return result
 }

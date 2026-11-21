@@ -5,6 +5,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import os from 'node:os'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
@@ -35,7 +36,8 @@ export function startStandaloneBridge(options = {}) {
   const relayUrl = options.relayUrl || process.env.RELAY_URL || 'ws://127.0.0.1:8787/ws/bridge'
   const secret = options.secret || process.env.DSH_MOBILE_BRIDGE_SECRET || process.env.BRIDGE_SECRET || 'allinone-dev-bridge'
   const roomId = options.roomId || process.env.ROOM_ID || ''
-  const bridgeId = options.bridgeId || process.env.BRIDGE_ID || 'home-pc'
+  const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
+  const bridgeId = options.bridgeId || process.env.BRIDGE_ID || defaultBridgeId
   const mode = options.mode || 'standalone'
   const cwd = options.cwd || process.env.DEFAULT_CWD || resolve(__dirname, '../..')
   const log = options.log || console

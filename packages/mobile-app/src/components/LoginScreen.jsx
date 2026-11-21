@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import {
+  ArrowLeft,
   ArrowRight,
   Check,
   ChevronDown,
@@ -29,11 +30,18 @@ function formatPairCodeDisplay(val) {
   return clean
 }
 
-export function LoginScreen({ onSuccess, initialError = '' }) {
+export function LoginScreen({
+  onSuccess,
+  initialError = '',
+  isAddingDevice = false,
+  initialServerUrl = '',
+  onCancel = null,
+}) {
   const [mode, setMode] = useState('pair') // 'pair' | 'password'
-  const [serverUrl, setServerUrl] = useState(() => detectDefaultServerUrl())
+  const [serverUrl, setServerUrl] = useState(() => initialServerUrl || detectDefaultServerUrl())
   const [showAdvancedServer, setShowAdvancedServer] = useState(false)
   const [showSetupGuide, setShowSetupGuide] = useState(false)
+  const [osTab, setOsTab] = useState('win') // 'win' | 'unix'
   const [copiedCmd, setCopiedCmd] = useState(false)
 
   const [pairInput, setPairInput] = useState('')
@@ -45,12 +53,18 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
     if (initialError) setError(initialError)
   }, [initialError])
 
+  useEffect(() => {
+    if (initialServerUrl) setServerUrl(initialServerUrl)
+  }, [initialServerUrl])
+
   const effectiveServer = normalizeBaseUrl(serverUrl)
   const winSetupCmd = `irm ${effectiveServer}/setup.ps1 | iex`
+  const unixSetupCmd = `curl -fsSL ${effectiveServer}/setup.sh | bash`
+  const activeSetupCmd = osTab === 'win' ? winSetupCmd : unixSetupCmd
 
-  const handleCopyWinCmd = async () => {
+  const handleCopySetupCmd = async () => {
     try {
-      await navigator.clipboard.writeText(winSetupCmd)
+      await navigator.clipboard.writeText(activeSetupCmd)
     } catch {}
     setCopiedCmd(true)
     setTimeout(() => setCopiedCmd(false), 1800)
@@ -79,6 +93,7 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
           roomId: result.roomId,
           label: result.label,
           bridges: result.bridges,
+          authMode: 'pair',
         })
       } catch (err) {
         setError(String(err?.message || err))
@@ -100,6 +115,7 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
         token: result.token,
         roomId: result.roomId || 'owner',
         bridges: result.bridges,
+        authMode: 'password',
       })
     } catch (err) {
       setError(String(err?.message || err))
@@ -111,16 +127,31 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
   return (
     <div className="flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
       <div className="w-full max-w-sm">
+        {isAddingDevice && onCancel && (
+          <div className="pt-safe mb-3 flex items-center">
+            <button
+              type="button"
+              onClick={onCancel}
+              className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              <span>返回当前电脑</span>
+            </button>
+          </div>
+        )}
+
         {/* Brand mark */}
         <div className="mb-6 flex flex-col items-center text-center">
           <div className="mb-3.5 h-18 w-18 overflow-hidden rounded-[22px] bg-[#03080E] shadow-xl shadow-blue-950/35 ring-1 ring-white/10">
             <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-            All in One
+            {isAddingDevice ? '添加新电脑' : 'All in One'}
           </h1>
           <p className="mt-1 text-[12.5px] text-slate-500 dark:text-slate-400">
-            随时随地用手机掌控本机 Codex / Claude / Antigravity / DeepSeek
+            {isAddingDevice
+              ? '每台电脑独立配对与加密房间，原有电脑连接与缓存完全保留'
+              : '随时随地用手机掌控本机 Codex / Claude / Antigravity / DeepSeek'}
           </p>
         </div>
 
@@ -199,12 +230,38 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
                 </button>
                 {showSetupGuide && (
                   <div className="border-t border-slate-200/60 px-3 pt-2 pb-2.5 text-[11px] leading-relaxed text-slate-500 dark:border-slate-700/60 dark:text-slate-400">
-                    <p className="mb-1.5">在电脑 PowerShell 中粘贴运行，3 秒自动弹出二维码与 8 位配对码：</p>
+                    <div className="mb-1.5 flex items-center justify-between gap-2">
+                      <span>在电脑终端运行，3 秒弹出二维码与配对码：</span>
+                      <div className="inline-flex shrink-0 rounded-lg bg-slate-200/80 p-0.5 text-[10px] dark:bg-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => setOsTab('win')}
+                          className={`rounded-md px-1.5 py-0.5 font-medium ${
+                            osTab === 'win'
+                              ? 'bg-white text-slate-900 shadow-2xs dark:bg-slate-700 dark:text-white'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          Win
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOsTab('unix')}
+                          className={`rounded-md px-1.5 py-0.5 font-medium ${
+                            osTab === 'unix'
+                              ? 'bg-white text-slate-900 shadow-2xs dark:bg-slate-700 dark:text-white'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          Mac/Linux
+                        </button>
+                      </div>
+                    </div>
                     <div className="flex items-center gap-1.5 rounded-xl bg-slate-900 px-2.5 py-2 font-mono text-[10.5px] text-slate-100">
-                      <span className="flex-1 select-all break-all">{winSetupCmd}</span>
+                      <span className="flex-1 select-all break-all">{activeSetupCmd}</span>
                       <button
                         type="button"
-                        onClick={handleCopyWinCmd}
+                        onClick={handleCopySetupCmd}
                         className="shrink-0 rounded-lg bg-white/10 p-1.5 text-white hover:bg-white/20"
                         title="复制命令"
                       >
@@ -281,7 +338,13 @@ export function LoginScreen({ onSuccess, initialError = '' }) {
             disabled={loading}
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-60"
           >
-            <span>{loading ? '正在验证连接...' : mode === 'pair' ? '立即配对连接' : '连接我的电脑'}</span>
+            <span>
+              {loading
+                ? '正在验证连接...'
+                : mode === 'pair'
+                  ? isAddingDevice ? '配对并添加此电脑' : '立即配对连接'
+                  : isAddingDevice ? '添加并连接电脑' : '连接我的电脑'}
+            </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>
 

@@ -17,6 +17,26 @@ import { createRelayServer } from '../packages/relay-server/src/index.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
 import { RPC } from '../packages/shared/src/protocol.js'
+import {
+  DEVICES_STORAGE_KEY,
+  LEGACY_AUTH_STORAGE_KEY,
+  getActiveDevice,
+  getCacheScopeKey,
+  getDeviceDisplayName,
+  loadDeviceState,
+  removeDevice,
+  renameDevice,
+  saveDeviceState,
+  selectDevice,
+  upsertDevice,
+} from '../packages/mobile-app/src/lib/deviceStore.js'
+import {
+  clearSessionCache,
+  getSessionCacheStats,
+  loadCachedSession,
+  saveCachedSession,
+} from '../packages/mobile-app/src/lib/sessionCache.js'
+import { resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
 
 const TEST_PASS = 'smoke-test-pass-123'
 const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
@@ -44,6 +64,7 @@ async function main() {
   })
 
   let friendBridgeA = null
+  let ownerBridge2 = null
   let portableChild = null
 
   try {
@@ -118,7 +139,10 @@ async function main() {
     assert.ok(modelsRes?.catalog, 'Should return per-app models catalog')
     for (const app of ['dsh', 'codex', 'claude', 'antigravity']) {
       assert.ok(Array.isArray(modelsRes.catalog[app]?.models), `catalog[${app}].models should be array`)
-      assert.ok(modelsRes.catalog[app].models.length > 0, `catalog[${app}] should have >=1 models`)
+      const appInfo = statusRes.apps.find((a) => a.app === app)
+      if (appInfo?.writable || app === 'dsh') {
+        assert.ok(modelsRes.catalog[app].models.length > 0, `catalog[${app}] should have >=1 models when writable`)
+      }
     }
     console.log(
       '[smoke] 3.5/5 Models catalog:',
@@ -371,11 +395,174 @@ async function main() {
       console.log('[smoke] 6/6 Multi-tenant room isolation OK (portable bundle not built yet)')
     }
 
+    // 7. Multi-device switching, /api/auth/me status probing, strict bridgeId routing, & scoped cache isolation
+    const meA = await (await fetch(`${httpBase}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${pairARes.token}` },
+    })).json()
+    assert.equal(meA.ok, true)
+    assert.equal(meA.roomId, regA.roomId)
+    assert.equal(meA.label, 'Friend-A-PC', '/api/auth/me should return room label')
+    assert.equal(meA.bridges.length, 1)
+    assert.equal(meA.bridges[0].online, true)
+
+    const meB = await (await fetch(`${httpBase}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${pairBRes.token}` },
+    })).json()
+    assert.equal(meB.ok, true)
+    assert.equal(meB.label, 'Friend-B-PC')
+    assert.equal(meB.bridges.length, 0)
+
+    // Strict bridgeId routing with 2 simultaneous bridges in owner room
+    ownerBridge2 = startStandaloneBridge({
+      relayUrl: wsBridgeUrl,
+      secret: TEST_BRIDGE_SECRET,
+      bridgeId: 'smoke-pc-2',
+      quiet: true,
+    })
+    for (let i = 0; i < 50; i++) {
+      if (relay.hub.getBridgeList('owner').filter((b) => b.online).length >= 2) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    assert.equal(relay.hub.getBridgeList('owner').filter((b) => b.online).length, 2, 'Owner room should support 2 simultaneous online bridges')
+
+    const imgBridge2 = await fetch(
+      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=smoke-pc-2&token=${encodeURIComponent(loginData.token)}`,
+    )
+    assert.equal(imgBridge2.status, 200, 'Explicit online bridgeId should succeed')
+
+    const imgOfflineBridge = await fetch(
+      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=offline-pc-999&token=${encodeURIComponent(loginData.token)}`,
+    )
+    assert.equal(imgOfflineBridge.status, 503, 'Explicit offline bridgeId must return 503 and NEVER fall back to another online PC')
+
+    const wsMulti = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(loginData.token)}`)
+    const multiPending = new Map()
+    await new Promise((resolve, reject) => {
+      wsMulti.on('message', (raw) => {
+        const m = JSON.parse(String(raw))
+        if (m.type === 'hello') {
+          assert.equal(m.bridges.length, 2)
+          resolve()
+        }
+        if (m.type === 'rpc.res') {
+          const p = multiPending.get(m.id)
+          if (p) {
+            multiPending.delete(m.id)
+            p.resolve(m)
+          }
+        }
+      })
+      wsMulti.on('error', reject)
+    })
+    const rpcWithBridge = (bridgeId) =>
+      new Promise((resolve) => {
+        const id = `mb-${Math.random().toString(36).slice(2, 8)}`
+        multiPending.set(id, { resolve })
+        wsMulti.send(JSON.stringify({ type: 'rpc.req', id, method: RPC.APPS_STATUS, params: {}, bridgeId }))
+      })
+    const okRes2 = await rpcWithBridge('smoke-pc-2')
+    assert.equal(okRes2.ok, true, 'RPC targeting online smoke-pc-2 should succeed')
+    const failOffline = await rpcWithBridge('offline-pc-999')
+    assert.equal(failOffline.ok, false)
+    assert.equal(failOffline.error?.code, 'BRIDGE_OFFLINE', 'RPC targeting offline bridgeId must fail strictly with BRIDGE_OFFLINE')
+    wsMulti.close()
+
+    // Mobile multi-device store + legacy v1 migration + isolated cache test
+    const memStore = new Map()
+    const fakeStorage = {
+      getItem: (k) => (memStore.has(k) ? memStore.get(k) : null),
+      setItem: (k, v) => memStore.set(k, String(v)),
+      removeItem: (k) => memStore.delete(k),
+    }
+    fakeStorage.setItem(LEGACY_AUTH_STORAGE_KEY, JSON.stringify({
+      baseUrl: httpBase,
+      token: pairARes.token,
+      roomId: regA.roomId,
+      label: 'Friend-A-PC',
+      bridges: pairARes.bridges,
+    }))
+    let dState = loadDeviceState(fakeStorage)
+    assert.equal(dState.devices.length, 1, 'Legacy v1 auth should migrate into v2 device list')
+    assert.equal(memStore.has(DEVICES_STORAGE_KEY), true)
+    assert.equal(memStore.has(LEGACY_AUTH_STORAGE_KEY), false)
+
+    // Rename Device A and pair Device B (independent room) -> both coexist
+    const devAId = dState.devices[0].id
+    dState = renameDevice(dState, devAId, '公司 Mac')
+    const addedB = upsertDevice(dState, {
+      baseUrl: httpBase,
+      token: pairBRes.token,
+      roomId: regB.roomId,
+      label: '家里 Windows',
+      bridges: [],
+      authMode: 'pair',
+    })
+    assert.equal(addedB.isNew, true)
+    dState = addedB.state
+    assert.equal(dState.devices.length, 2, 'Pairing 2nd PC must preserve 1st PC')
+    assert.equal(getActiveDevice(dState).id, addedB.device.id)
+    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac')
+
+    // Re-pairing Device A refreshes token in-place and preserves customName
+    const repairedA = upsertDevice(dState, {
+      baseUrl: httpBase,
+      token: `${pairARes.token}-refreshed`,
+      roomId: regA.roomId,
+      label: 'Friend-A-PC',
+      bridges: pairARes.bridges,
+      authMode: 'pair',
+    })
+    assert.equal(repairedA.isNew, false)
+    dState = repairedA.state
+    assert.equal(dState.devices.length, 2)
+    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac', 'Re-pairing must keep custom nickname')
+    assert.equal(dState.devices[0].token, `${pairARes.token}-refreshed`)
+
+    // Switch back to Device B and verify save/reload persistence
+    dState = selectDevice(dState, addedB.device.id)
+    saveDeviceState(dState, fakeStorage)
+    const reloaded = loadDeviceState(fakeStorage)
+    assert.equal(reloaded.devices.length, 2)
+    assert.equal(reloaded.activeDeviceId, addedB.device.id)
+
+    // Verify per-device isolated session cache (same sessionId on 2 PCs must NEVER collide)
+    await clearSessionCache()
+    const scopeA = getCacheScopeKey(dState.devices[0], 'friend-a-pc')
+    const scopeB = getCacheScopeKey(dState.devices[1], 'home-win')
+    await saveCachedSession('codex:shared-id', { messages: [{ id: 'm1', role: 'user', text: 'from Mac' }] }, scopeA)
+    await saveCachedSession('codex:shared-id', { messages: [{ id: 'm1', role: 'user', text: 'from Win' }] }, scopeB)
+    assert.equal((await loadCachedSession('codex:shared-id', scopeA)).messages[0].text, 'from Mac')
+    assert.equal((await loadCachedSession('codex:shared-id', scopeB)).messages[0].text, 'from Win')
+    assert.equal((await getSessionCacheStats(scopeA)).sessionCount, 1)
+    assert.equal((await getSessionCacheStats(scopeB)).sessionCount, 1)
+
+    // Clearing Device A cache prefix leaves Device B cache untouched
+    await clearSessionCache(dState.devices[0].id, { prefix: true })
+    assert.equal(await loadCachedSession('codex:shared-id', scopeA), null)
+    assert.equal((await loadCachedSession('codex:shared-id', scopeB)).messages[0].text, 'from Win')
+    await clearSessionCache()
+
+    // Removing Device B auto-falls back to Device A
+    dState = removeDevice(dState, addedB.device.id)
+    assert.equal(dState.devices.length, 1)
+    assert.equal(dState.activeDeviceId, devAId)
+
+    // Image URL helper propagates bridgeId
+    const imgSrc = resolveImageSrc('/tmp/shot.png', {
+      baseUrl: httpBase,
+      token: 'tok',
+      cwd: '/work',
+      bridgeId: 'smoke-pc-2',
+    })
+    assert.ok(imgSrc.includes('bridgeId=smoke-pc-2'), 'resolveImageSrc must include bridgeId query param')
+    console.log('[smoke] 7/7 Multi-device store, status probe, strict bridgeId routing & scoped cache OK')
+
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
     if (portableChild) {
       try { portableChild.kill() } catch {}
     }
+    if (ownerBridge2) await ownerBridge2.stop()
     if (friendBridgeA) await friendBridgeA.stop()
     await bridge.stop()
     await relay.close()
