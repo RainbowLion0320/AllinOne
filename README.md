@@ -112,7 +112,7 @@ docker compose --env-file .env up -d --build
 ## 五、安装到手机
 
 - **PWA 免安装（推荐）**：用手机浏览器打开 `https://ai.yourdomain.com`（或直接扫码电脑弹出的配对二维码）→「添加到主屏幕」。
-- **Capacitor 原生 Android / iOS 壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的真实服务器地址后执行：
+- **Capacitor 原生 Android / iOS 壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的真实服务器地址后执行（若需在 Android APK 内直接开启实时摄像头扫码，在 `android/app/src/main/AndroidManifest.xml` 中添加 `<uses-permission android:name="android.permission.CAMERA" />` 即可）：
   ```bash
   cd packages/mobile-app
   npm run build

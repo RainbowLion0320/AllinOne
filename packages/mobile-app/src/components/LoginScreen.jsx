@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
@@ -8,6 +8,7 @@ import {
   Copy,
   KeyRound,
   QrCode,
+  ScanLine,
   Server,
   ShieldCheck,
   Terminal,
@@ -20,6 +21,7 @@ import {
   pairWithRelay,
   parsePairInput,
 } from '../lib/wsClient.js'
+import { QrScannerModal } from './QrScannerModal.jsx'
 
 function formatPairCodeDisplay(val) {
   // Keep pasted URLs or pt_ tokens untouched
@@ -35,6 +37,7 @@ export function LoginScreen({
   initialError = '',
   isAddingDevice = false,
   initialServerUrl = '',
+  autoOpenScanner = false,
   onCancel = null,
 }) {
   const [mode, setMode] = useState('pair') // 'pair' | 'password'
@@ -43,6 +46,7 @@ export function LoginScreen({
   const [showSetupGuide, setShowSetupGuide] = useState(false)
   const [osTab, setOsTab] = useState('win') // 'win' | 'unix'
   const [copiedCmd, setCopiedCmd] = useState(false)
+  const [scannerOpen, setScannerOpen] = useState(Boolean(autoOpenScanner))
 
   const [pairInput, setPairInput] = useState('')
   const [password, setPassword] = useState('')
@@ -70,36 +74,55 @@ export function LoginScreen({
     setTimeout(() => setCopiedCmd(false), 1800)
   }
 
+  const executePair = useCallback(async (rawInput, fromScanner = false) => {
+    const parsed = parsePairInput(rawInput)
+    if (!parsed.pairCode && !parsed.pairToken) {
+      setError(
+        fromScanner
+          ? '识别到的二维码不是 All in One 配对码，请扫描电脑端弹出的配对二维码'
+          : '请输入电脑端显示的 8 位配对码，或点击上方「扫一扫」直接扫码',
+      )
+      return
+    }
+    if (parsed.serverUrl) {
+      setServerUrl(parsed.serverUrl)
+    }
+    setError('')
+    setLoading(true)
+    try {
+      const targetServer = parsed.serverUrl || serverUrl
+      const result = await pairWithRelay(targetServer, {
+        pairCode: parsed.pairCode,
+        pairToken: parsed.pairToken,
+      })
+      onSuccess({
+        baseUrl: result.baseUrl,
+        token: result.token,
+        roomId: result.roomId,
+        label: result.label,
+        bridges: result.bridges,
+        authMode: 'pair',
+      })
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setLoading(false)
+    }
+  }, [onSuccess, serverUrl])
+
+  const handleQrDetected = useCallback((rawText) => {
+    setScannerOpen(false)
+    setMode('pair')
+    setPairInput(formatPairCodeDisplay(rawText))
+    void executePair(rawText, true)
+  }, [executePair])
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
 
     if (mode === 'pair') {
-      const parsed = parsePairInput(pairInput)
-      if (!parsed.pairCode && !parsed.pairToken) {
-        setError('请输入电脑端显示的 8 位配对码，或粘贴扫码链接')
-        return
-      }
-      setLoading(true)
-      try {
-        const targetServer = parsed.serverUrl || serverUrl
-        const result = await pairWithRelay(targetServer, {
-          pairCode: parsed.pairCode,
-          pairToken: parsed.pairToken,
-        })
-        onSuccess({
-          baseUrl: result.baseUrl,
-          token: result.token,
-          roomId: result.roomId,
-          label: result.label,
-          bridges: result.bridges,
-          authMode: 'pair',
-        })
-      } catch (err) {
-        setError(String(err?.message || err))
-      } finally {
-        setLoading(false)
-      }
+      await executePair(pairInput, false)
       return
     }
 
@@ -195,6 +218,38 @@ export function LoginScreen({
 
           {mode === 'pair' ? (
             <>
+              {/* One-tap QR Code Scanner CTA */}
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => {
+                  setError('')
+                  setScannerOpen(true)
+                }}
+                className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-3 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:hover:bg-[#242D47]"
+              >
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white shadow-sm shadow-[#4D6BFE]/30">
+                    <ScanLine className="h-5 w-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[13.5px] font-bold text-[#2842C9] dark:text-white">
+                      扫一扫电脑端二维码
+                    </div>
+                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">
+                      支持实时扫码 / 拍图识别 · 扫完自动直连
+                    </div>
+                  </div>
+                </div>
+                <ArrowRight className="h-4 w-4 shrink-0 text-[#4D6BFE]" />
+              </button>
+
+              <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                <span className="h-px flex-1 bg-slate-200 dark:bg-slate-700/80" />
+                <span>或手动输入 8 位配对码</span>
+                <span className="h-px flex-1 bg-slate-200 dark:bg-slate-700/80" />
+              </div>
+
               <div>
                 <label className="mb-1.5 flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300">
                   <span className="inline-flex items-center gap-1.5">
@@ -365,6 +420,12 @@ export function LoginScreen({
           </div>
         </form>
       </div>
+
+      <QrScannerModal
+        open={scannerOpen}
+        onClose={() => setScannerOpen(false)}
+        onDetected={handleQrDetected}
+      />
     </div>
   )
 }

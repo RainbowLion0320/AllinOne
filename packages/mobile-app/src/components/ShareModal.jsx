@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { Check, Copy, Download, Globe, Share2, ShieldCheck, Smartphone, Terminal, X } from 'lucide-react'
 import { DEFAULT_PROD_SERVER, normalizeBaseUrl } from '../lib/wsClient.js'
 
-const APK_FILENAME = 'All-in-One-v0.1.7.apk'
+const APK_FILENAME = 'All-in-One-v0.1.8.apk'
 
 export function ShareModal({ open, onClose, serverUrl }) {
   const [osTab, setOsTab] = useState('win') // 'win' | 'unix'

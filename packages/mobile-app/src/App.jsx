@@ -47,7 +47,7 @@ import { VendorBadge } from './components/VendorIcon.jsx'
 
 export function App() {
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
-  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '' })
+  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false })
   const [autoPairing, setAutoPairing] = useState(false)
   const [pairError, setPairError] = useState('')
   const [toastMsg, setToastMsg] = useState('')
@@ -200,7 +200,7 @@ export function App() {
     resetTransientWorkspace()
     setBridges([])
     setDeviceState((prev) => upsertDevice(prev, payload).state)
-    setAddingDevice({ open: false, serverUrl: '' })
+    setAddingDevice({ open: false, serverUrl: '', openScanner: false })
     setDeviceSwitcherOpen(false)
     if (preview.device) {
       const name = getDeviceDisplayName(preview.device)
@@ -243,7 +243,7 @@ export function App() {
         if (cancelled) return
         setPairError(String(err?.message || err || '扫码自动配对失败，请重试'))
         if (deviceStateRef.current.devices.length > 0) {
-          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl() })
+          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl(), openScanner: false })
         }
       })
       .finally(() => {
@@ -948,11 +948,12 @@ export function App() {
         initialError={pairError}
         isAddingDevice={Boolean(activeDevice && addingDevice.open)}
         initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
+        autoOpenScanner={Boolean(addingDevice.open && addingDevice.openScanner)}
         onCancel={
           activeDevice
             ? () => {
                 setPairError('')
-                setAddingDevice({ open: false, serverUrl: '' })
+                setAddingDevice({ open: false, serverUrl: '', openScanner: false })
               }
             : null
         }
@@ -1052,7 +1053,7 @@ export function App() {
           <span>{activeDeviceName} 配对凭证已失效</span>
           <button
             type="button"
-            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl })}
+            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false })}
             className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
           >
             重新配对
@@ -1174,9 +1175,13 @@ export function App() {
         activeConnState={connState}
         activeBridges={bridges}
         onSelectDevice={handleSelectDevice}
-        onAddDevice={(prefillServerUrl = '') => {
+        onAddDevice={(prefillServerUrl = '', opts = {}) => {
           setPairError('')
-          setAddingDevice({ open: true, serverUrl: prefillServerUrl || activeDevice?.baseUrl || '' })
+          setAddingDevice({
+            open: true,
+            serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
+            openScanner: Boolean(opts?.openScanner),
+          })
         }}
         onRenameDevice={handleRenameDevice}
         onRemoveDevice={handleRemoveDevice}

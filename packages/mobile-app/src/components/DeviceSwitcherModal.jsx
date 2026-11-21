@@ -8,6 +8,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  ScanLine,
   ShieldCheck,
   Trash2,
   X,
@@ -446,17 +447,31 @@ export function DeviceSwitcherModal({
 
         {/* Footer CTA */}
         <div className="border-t border-slate-100 px-4 pt-3 pb-3.5 dark:border-slate-800">
-          <button
-            type="button"
-            onClick={() => {
-              onClose()
-              onAddDevice?.()
-            }}
-            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
-          >
-            <Plus className="h-4.5 w-4.5 stroke-[2.5]" />
-            <span>添加新电脑（配对码 / 扫码）</span>
-          </button>
+          <div className="grid grid-cols-5 gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onAddDevice?.('', { openScanner: true })
+              }}
+              className="col-span-3 flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+            >
+              <ScanLine className="h-4.5 w-4.5" />
+              <span>扫码添加电脑</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onAddDevice?.('', { openScanner: false })
+              }}
+              className="col-span-2 flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 py-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 active:scale-[0.98] dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
+            >
+              <Plus className="h-4 w-4" />
+              <span>输配对码</span>
+            </button>
+          </div>
 
           <div className="mt-2 flex items-center justify-center gap-1 text-[10.5px] text-slate-400">
             <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
