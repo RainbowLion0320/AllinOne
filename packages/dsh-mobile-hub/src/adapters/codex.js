@@ -1,9 +1,35 @@
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, isExecutableFile, spawnCrossPlatform } from '../helpers/bin-finder.js'
+
+/**
+ * Fallback discovery on macOS/Linux: if Codex Desktop / ChatGPT app is currently running
+ * from a custom or newly reorganized app bundle path, extract the live `codex` binary path.
+ */
+function findRunningCodexBinary() {
+  if (process.platform === 'win32') return null
+  try {
+    const out = execFileSync('ps', ['-axo', 'command='], {
+      timeout: 1200,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    for (const rawLine of out.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || !/codex/i.test(line)) continue
+      // Match an absolute path ending with `/codex` followed by space + args (e.g. `app-server`, `exec-server`)
+      const m = line.match(/^(\/[^\0\n]*?\/codex)(?:\s|$)/)
+      if (m && m[1] && isExecutableFile(m[1])) {
+        return m[1]
+      }
+    }
+  } catch {}
+  return null
+}
 
 function findCodexBinary(configuredBin) {
   const home = homedir()
@@ -15,19 +41,34 @@ function findCodexBinary(configuredBin) {
   ]
   if (process.platform === 'darwin') {
     candidates.push(
+      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
+      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
+      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
+      '/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex',
+      '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
       '/Applications/Codex.app/Contents/Resources/codex',
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
       join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
       '/Applications/Codex.app/Contents/Resources/bin/codex',
       join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'bin', 'codex'),
     )
   } else if (process.platform === 'win32') {
     const appData = process.env.APPDATA || join(home, 'AppData', 'Roaming')
+    const localApp = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
     candidates.push(
       join(appData, 'npm', 'codex.cmd'),
       join(appData, 'npm', 'codex.exe'),
+      join(localApp, 'Programs', 'ChatGPT', 'resources', 'codex-cli', 'codex.exe'),
+      join(localApp, 'Programs', 'Codex', 'resources', 'codex.exe'),
     )
   }
-  return findExecutable(process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex'], candidates) || 'codex'
+  return (
+    findExecutable(process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex'], candidates) ||
+    findRunningCodexBinary() ||
+    'codex'
+  )
 }
 
 function normalizeThreadSummary(t) {

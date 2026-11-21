@@ -104,6 +104,10 @@ export function ensureRichPath() {
       extras.push(
         '/Applications/Antigravity.app/Contents/Resources/app/bin',
         join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin'),
+        '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin',
+        join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'bin'),
+        '/Applications/Codex.app/Contents/Resources/codex-cli/bin',
+        join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'bin'),
         '/Applications/Codex.app/Contents/Resources',
         join(home, 'Applications', 'Codex.app', 'Contents', 'Resources'),
       )
