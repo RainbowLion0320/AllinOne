@@ -464,6 +464,7 @@ export class DesktopBridgeManager extends EventEmitter {
 
   async stop({ nextState = 'idle' } = {}) {
     this.syncSeq += 1
+    this.appendLog(`Stopping embedded bridge (nextState=${nextState})`)
     await this.killChild()
     this.state = nextState
     this.error = ''

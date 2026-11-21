@@ -211,6 +211,7 @@ export function App() {
     }
   }, [desktopApi])
 
+  const hadDesktopAccountRef = useRef(false)
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
   useEffect(() => {
     if (!desktopApi) return
@@ -219,6 +220,7 @@ export function App() {
       activeDevice?.baseUrl &&
       (activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_'))
     ) {
+      hadDesktopAccountRef.current = true
       desktopApi
         .syncAccount?.({
           baseUrl: activeDevice.baseUrl,
@@ -230,7 +232,9 @@ export function App() {
           if (st) setDesktopBridge(st)
         })
         .catch(() => {})
-    } else if (!activeDevice) {
+    } else if (!activeDevice && hadDesktopAccountRef.current) {
+      // Only stop the local bridge on explicit logout (never on initial boot before UI login!)
+      hadDesktopAccountRef.current = false
       desktopApi.stopBridge?.().catch(() => {})
     }
   }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, activeDevice?.roomId, activeDevice?.username, activeDevice?.authMode])
