@@ -17,7 +17,13 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 
-const APK_FILENAME = 'All-in-One-v0.1.8.apk'
+const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
+
+function resolveApkUrl(base) {
+  if (!CONFIGURED_APK_URL) return ''
+  if (/^https?:\/\//i.test(CONFIGURED_APK_URL)) return CONFIGURED_APK_URL
+  return `${base}/${CONFIGURED_APK_URL.replace(/^\/+/, '')}`
+}
 
 export function ShareModal({
   open,
@@ -41,10 +47,10 @@ export function ShareModal({
   const webUrl = generatedInvite
     ? `${base}/?invite=${encodeURIComponent(generatedInvite.code)}`
     : `${base}/`
-  const apkUrl = `${base}/${APK_FILENAME}`
+  const apkUrl = resolveApkUrl(base)
 
   const shareBundleText = [
-    '分享给你一个超好用的工具 All in One（手机远程操控自己电脑上的 Codex / Claude / Antigravity / DeepSeek）',
+    '分享给你一个工具 All in One（跨设备远程操控本机 Codex / Claude Code / Antigravity / DeepSeek）',
     ...(generatedInvite
       ? [
           '',
@@ -54,13 +60,13 @@ export function ShareModal({
       : []),
     '',
     '【第 1 步：手机注册并登录账号】',
-    `• 网页入口：${webUrl}`,
-    `• Android App：下载安装 ${apkUrl}（自动热更新，无需重装）`,
+    `• 网页入口（推荐添加到主屏幕）：${webUrl}`,
+    ...(apkUrl ? [`• Android App：下载安装 ${apkUrl}`] : []),
     '',
-    '【第 2 步：在你的电脑运行 1 行命令并登录同一账号】',
+    '【第 2 步：在你的电脑运行 1 行命令（或安装桌面客户端）并登录同一账号】',
     `• macOS / Linux: ${unixCmd}`,
     `• Windows (PowerShell): ${winCmd}`,
-    '登录成功后，手机端自动发现并连接你的电脑（多台电脑只需各登一次账号即可自由切换）。',
+    '登录成功后，手机端和桌面端即可自动发现并连接你的全部电脑。',
     '',
     '注：每个账号数据与电脑完全独立隔离，互不可见。',
   ].join('\n')
@@ -238,22 +244,24 @@ export function ShareModal({
             手机端入口
           </div>
 
-          <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">
-                <Download className="h-3.5 w-3.5 text-emerald-500" />
-                <span>Android 安装包</span>
+          {apkUrl && (
+            <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">
+                  <Download className="h-3.5 w-3.5 text-emerald-500" />
+                  <span>Android 安装包</span>
+                </div>
+                <div className="truncate text-[10.5px] text-slate-400">{apkUrl}</div>
               </div>
-              <div className="truncate text-[10.5px] text-slate-400">{apkUrl}</div>
+              <button
+                type="button"
+                onClick={() => copyText('apk', apkUrl)}
+                className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                {copiedKey === 'apk' ? '已复制' : '复制'}
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => copyText('apk', apkUrl)}
-              className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-            >
-              {copiedKey === 'apk' ? '已复制' : '复制'}
-            </button>
-          </div>
+          )}
 
           <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
             <div className="min-w-0">

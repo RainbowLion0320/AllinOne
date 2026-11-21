@@ -62,7 +62,7 @@ if (cmd === 'invite' && sub === 'create') {
     const link = publicUrl ? `  ->  ${publicUrl}/?invite=${encodeURIComponent(inv.code)}` : ''
     console.log(`  ${inv.code}${inv.note ? `  (${inv.note})` : ''}${link}`)
   }
-  console.log('\n提示：如果中转服务正在运行，通过手机 App 管理员后台生成无需重启；CLI 修改后请执行 systemctl restart allinone-relay.service 使运行中内存生效。\n')
+  console.log('\n提示：如果中转服务正在运行，通过 App 管理员后台生成无需重启；CLI 修改后请重启中转服务（例如 docker compose restart allinone-relay 或 systemctl restart allinone-relay）使运行中内存生效。\n')
   process.exit(0)
 }
 

@@ -15,7 +15,7 @@ export default defineConfig({
       manifest: {
         name: 'All in One',
         short_name: 'All in One',
-        description: '基于 DeepSeek Harness 的全端 AI 远程总控（DSH / Codex / Claude / Antigravity）',
+        description: 'All in One — 跨设备 AI 编程助手远程总控（Codex / Claude Code / Antigravity / DeepSeek Harness）',
         theme_color: '#03080E',
         background_color: '#03080E',
         display: 'standalone',

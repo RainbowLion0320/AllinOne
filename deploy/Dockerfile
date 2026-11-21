@@ -1,17 +1,34 @@
-# Stage 1: Build Mobile PWA
+# Stage 1: Build Portable PC Bridge + Mobile PWA (skipping Electron desktop workspace)
 FROM node:22-alpine AS builder
 WORKDIR /app
+
+ARG PUBLIC_RELAY_URL=""
+ARG VITE_RELAY_URL=""
+ARG VITE_APK_URL=""
+ENV PUBLIC_RELAY_URL=${PUBLIC_RELAY_URL}
+ENV VITE_RELAY_URL=${VITE_RELAY_URL}
+ENV VITE_APK_URL=${VITE_APK_URL}
 
 COPY package.json ./
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/relay-server/package.json ./packages/relay-server/
+COPY packages/dsh-mobile-hub/package.json ./packages/dsh-mobile-hub/
 COPY packages/mobile-app/package.json ./packages/mobile-app/
 
-RUN npm install --workspaces --include-workspace-root=false --workspace=@allinone/shared --workspace=@allinone/relay-server --workspace=@allinone/mobile-app
+RUN npm install --include-workspace-root=false \
+    --workspace=@allinone/shared \
+    --workspace=@allinone/relay-server \
+    --workspace=dsh-mobile-hub \
+    --workspace=@allinone/mobile-app
 
+COPY scripts ./scripts
 COPY packages/shared ./packages/shared
+COPY packages/dsh-mobile-hub ./packages/dsh-mobile-hub
 COPY packages/mobile-app ./packages/mobile-app
-RUN npm --workspace=@allinone/mobile-app run build
+
+# Build single-file PC bridge into packages/mobile-app/public/downloads/allinone-bridge.mjs,
+# then bundle Mobile PWA (which copies downloads/allinone-bridge.mjs into dist/)
+RUN npm run build:bridge && npm --workspace=@allinone/mobile-app run build
 
 # Stage 2: Slim production Relay Server + Static PWA
 FROM node:22-alpine AS runtime
@@ -20,8 +37,14 @@ ENV NODE_ENV=production
 ENV PORT=8787
 ENV HOST=0.0.0.0
 
-COPY --from=builder /app/package.json ./
-COPY --from=builder /app/node_modules ./node_modules
+COPY package.json ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/relay-server/package.json ./packages/relay-server/
+
+RUN npm install --omit=dev --include-workspace-root=false \
+    --workspace=@allinone/shared \
+    --workspace=@allinone/relay-server
+
 COPY --from=builder /app/packages/shared ./packages/shared
 COPY packages/relay-server ./packages/relay-server
 COPY --from=builder /app/packages/mobile-app/dist ./packages/mobile-app/dist
@@ -30,4 +53,7 @@ RUN mkdir -p /app/packages/relay-server/data/uploads && chown -R node:node /app/
 USER node
 
 EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8787) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
 CMD ["node", "packages/relay-server/src/index.js"]

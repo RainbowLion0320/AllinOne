@@ -19,7 +19,13 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 
-const APK_FILENAME = 'All-in-One-v0.1.8.apk'
+const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
+
+function resolveApkUrl(base) {
+  if (!CONFIGURED_APK_URL) return ''
+  if (/^https?:\/\//i.test(CONFIGURED_APK_URL)) return CONFIGURED_APK_URL
+  return `${base}/${CONFIGURED_APK_URL.replace(/^\/+/, '')}`
+}
 
 function formatTimeShort(ts) {
   if (!ts) return ''
@@ -103,14 +109,14 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
 
   const buildShareText = (inv) => {
     const regUrl = `${cleanBase}/?invite=${encodeURIComponent(inv.code)}`
-    const apkUrl = `${cleanBase}/${APK_FILENAME}`
+    const apkUrl = resolveApkUrl(cleanBase)
     return [
       '给你分享一个 All in One 一次性注册邀请码（仅限 1 人使用）：',
       `邀请码：${inv.code}`,
       `注册直达链接：${regUrl}`,
-      `Android App 下载：${apkUrl}`,
+      ...(apkUrl ? [`Android App 下载：${apkUrl}`] : []),
       '',
-      '注册完账号后，在自己电脑终端运行 1 行命令并登录同一账号即可自动连接所有电脑：',
+      '注册完账号后，在自己电脑安装桌面端或运行 1 行命令并登录同一账号即可自动连接所有电脑：',
       `• macOS / Linux: curl -fsSL ${cleanBase}/setup.sh | bash`,
       `• Windows (PowerShell): irm ${cleanBase}/setup.ps1 | iex`,
     ].join('\n')

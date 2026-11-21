@@ -174,7 +174,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
           const name = String(err2?.name || '')
           setCamState('error')
           if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-            setCamError('未获得实时摄像头权限（若使用旧版 APK 请更新至 v0.1.8，或直接点下方「拍照识别 / 相册选图」）。')
+            setCamError('未获得实时摄像头权限（请检查应用摄像头权限，或直接点下方「拍照识别 / 相册选图」）。')
           } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
             setCamError('未检测到可用摄像头，请使用下方「相册选图」。')
           } else {

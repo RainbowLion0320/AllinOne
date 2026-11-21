@@ -1,8 +1,17 @@
 {
   "name": "allinone-dsh-mobile",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "基于 DeepSeek Harness 的多应用远程控制手机 App（统一调度 DeepSeek Harness / Codex / Claude / Antigravity）",
+  "license": "MIT",
+  "description": "All in One — Self-hosted cross-device control center (Mobile PWA / Electron Desktop / PC Bridge) for DeepSeek Harness, Codex, Claude Code, and Antigravity.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RainbowLion0320/AllinOne.git"
+  },
+  "homepage": "https://github.com/RainbowLion0320/AllinOne#readme",
+  "bugs": {
+    "url": "https://github.com/RainbowLion0320/AllinOne/issues"
+  },
   "workspaces": [
     "packages/*"
   ],

@@ -1,0 +1,43 @@
+# Contributing to All in One
+
+Thanks for your interest in contributing to **All in One**!
+
+## Development Setup
+
+Requirements:
+- **Node.js >= 22.13.0**
+- **npm >= 10**
+
+```bash
+git clone https://github.com/RainbowLion0320/AllinOne.git
+cd AllinOne
+npm install
+npm run build
+npm run test:smoke
+```
+
+## Workspace Overview
+
+- `packages/shared` — RPC methods, event constants, composite IDs, and path/ID validation helpers
+- `packages/relay-server` — HTTP/WS relay gateway, account/invite store, room isolation, and admin CLI
+- `packages/dsh-mobile-hub` — Local bridge orchestrator, agent adapters (`codex`, `claude`, `antigravity`, `dsh`), and portable CLI
+- `packages/mobile-app` — React + Tailwind + Vite PWA frontend (also bundled into the Electron desktop app)
+- `packages/desktop-app` — Electron desktop wrapper with embedded bridge manager, system tray, and DMG/NSIS packaging
+
+## Useful Commands
+
+```bash
+npm run build           # Build portable bridge + frontend dist
+npm run test:smoke      # Run full end-to-end smoke & security test suite
+npm run start:relay     # Start local relay server on http://127.0.0.1:8787
+npm run dev:mobile      # Run Vite dev server (proxies /api and /ws to 8787)
+npm run dev:desktop     # Run Electron desktop app locally
+```
+
+## Pull Request Guidelines
+
+1. Keep changes focused and well-scoped.
+2. **Never commit secrets, personal server URLs/IPs, `.env*` files, local user data (`data/*.json`), or compiled binaries (`.apk`, `.dmg`, `.exe`).**
+3. Run `npm run build && npm run test:smoke` locally and ensure all checks pass before opening a PR.
+4. Use clear, descriptive commit messages (Conventional Commits style preferred, e.g., `feat(desktop): ...`, `fix(antigravity): ...`).
+5. For security-related changes or new protocol endpoints, add corresponding test coverage in `scripts/smoke-test.mjs`.

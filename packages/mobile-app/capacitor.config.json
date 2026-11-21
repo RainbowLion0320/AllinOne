@@ -5,10 +5,10 @@
   "server": {
     "url": "https://your-relay.example.com/",
     "androidScheme": "https",
-    "cleartext": true
+    "cleartext": false
   },
   "android": {
-    "allowMixedContent": true
+    "allowMixedContent": false
   },
   "ios": {
     "contentInset": "automatic"

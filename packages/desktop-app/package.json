@@ -2,6 +2,7 @@
   "name": "@allinone/desktop-app",
   "version": "0.3.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "author": "All in One",
   "description": "All in One Desktop — 跨设备 AI 远程总控与内置本机桥接桌面客户端（macOS / Windows）",

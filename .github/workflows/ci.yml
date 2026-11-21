@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: Build & Smoke Test (Node 22)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build portable bridge & frontend
+        run: npm run build
+
+      - name: Verify portable bridge asset
+        run: test -s packages/mobile-app/dist/downloads/allinone-bridge.mjs
+
+      - name: Run end-to-end smoke & security tests
+        run: npm run test:smoke
+
+  docker-check:
+    name: Verify Relay Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f deploy/Dockerfile -t allinone-relay:ci .
+
+      - name: Verify built bridge exists in image
+        run: docker run --rm --entrypoint sh allinone-relay:ci -c "test -s /app/packages/mobile-app/dist/downloads/allinone-bridge.mjs && test -s /app/packages/mobile-app/dist/index.html"

@@ -3,6 +3,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-}
+        VITE_RELAY_URL: ${VITE_RELAY_URL:-}
+        VITE_APK_URL: ${VITE_APK_URL:-}
     container_name: allinone-relay
     restart: unless-stopped
     environment:

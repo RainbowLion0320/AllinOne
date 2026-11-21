@@ -21,8 +21,8 @@ import { renderQrSvg } from './src/helpers/qr-svg.js'
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const APK_FILENAME = 'All-in-One-v0.1.8.apk'
-const BRIDGE_VERSION = '0.2.0'
+const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
+const BRIDGE_VERSION = '0.3.0'
 
 function parseArgs(argv) {
   const opts = {
@@ -316,7 +316,9 @@ function openFileInBrowser(filePath) {
 
 function buildPairHtml({ serverUrl, roomId, label, pairCode, pairToken, pairExpiresAt, apps = [] }) {
   const pairUrl = `${serverUrl}/?pair=${encodeURIComponent(pairToken)}`
-  const apkUrl = `${serverUrl}/${APK_FILENAME}`
+  const apkUrl = CONFIGURED_APK_URL
+    ? (/^https?:\/\//i.test(CONFIGURED_APK_URL) ? CONFIGURED_APK_URL : `${serverUrl}/${CONFIGURED_APK_URL.replace(/^\/+/, '')}`)
+    : ''
   const qrSvg = renderQrSvg(pairUrl, { pixelSize: 220, quietZone: 4, darkColor: '#0B1220', lightColor: '#FFFFFF' })
 
   const appNames = {
@@ -410,8 +412,8 @@ function buildPairHtml({ serverUrl, roomId, label, pairCode, pairToken, pairExpi
     <div class="pills">${appPills}</div>
 
     <div class="steps">
-      <div><strong>方式 1（最快捷）：</strong>手机浏览器 / 微信扫码，自动免密进入你的专属房间。</div>
-      <div><strong>方式 2（Android APK）：</strong>安装 <a href="${escapeHtml(apkUrl)}" target="_blank">All-in-One Android 版</a>，打开后输入上方 8 位配对码即可（一次配对 30 天免登录）。</div>
+      <div><strong>方式 1（最快捷）：</strong>手机浏览器扫码直接进入（建议「添加到主屏幕」作为 PWA 使用）。</div>
+      ${apkUrl ? `<div><strong>方式 2（Android APK）：</strong>安装 <a href="${escapeHtml(apkUrl)}" target="_blank">All in One Android 版</a>，打开后输入上方 8 位配对码即可。</div>` : ''}
       <div><strong>提示：</strong>请保持电脑端命令行窗口运行（可最小化），关闭后手机将暂停连接。</div>
     </div>
 
