@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import { APPS, EVENTS, makeCompositeId, toEpochMs } from '../protocol.js'
+import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 
@@ -444,6 +444,7 @@ export class DshAdapter {
   }
 
   async readSession(sessionId, { limit = 25, cursor = null } = {}) {
+    sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
     let messages = []
     let title = sessionId
     let cwd = ''
@@ -476,7 +477,8 @@ export class DshAdapter {
     }
 
     // 2) Enrich or fallback from projcache JSON
-    const cacheFile = join(this.dshHome, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+    const cacheDir = join(this.dshHome, 'storages', 'session_projcache', 'sessions')
+    const cacheFile = assertPathWithinDir(join(cacheDir, `${sessionId}.json`), cacheDir, 'DSH session cache')
     const cacheRec = readJsonSafe(cacheFile)
     let provider = ''
     let reasoningEffort = ''
@@ -613,6 +615,7 @@ export class DshAdapter {
   }
 
   async sendMessage(sessionId, { text, cwd, title, attachments = [], model, provider, reasoningEffort } = {}) {
+    sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
     const compositeId = makeCompositeId(APPS.DSH, sessionId)
     const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, cwd, title)
     const realCompositeId = makeCompositeId(APPS.DSH, resolvedId)
@@ -759,6 +762,7 @@ export class DshAdapter {
   }
 
   async interrupt(sessionId) {
+    sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
     const active = this.activeTurns.get(sessionId)
     const agent = active?.agent || this.ctx?.agents?.get?.(sessionId)
     if (active) active.aborted = true

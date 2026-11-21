@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { APPS, EVENTS, makeCompositeId, toEpochMs } from '../protocol.js'
+import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
 
@@ -14,8 +14,14 @@ const MAX_IDLE_WARM_SESSIONS = 3
 
 function getTranscriptStatMtime(agyHome, conversationId) {
   if (!conversationId) return 0
-  const p = join(agyHome, 'brain', conversationId, '.system_generated', 'logs', 'transcript.jsonl')
   try {
+    const safeId = assertSafeSessionId(conversationId, 'Antigravity conversationId')
+    const brainDir = join(agyHome, 'brain')
+    const p = assertPathWithinDir(
+      join(brainDir, safeId, '.system_generated', 'logs', 'transcript.jsonl'),
+      brainDir,
+      'Antigravity transcript',
+    )
     return statSync(p).mtimeMs || 0
   } catch {
     return 0
@@ -204,13 +210,12 @@ async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
 }
 
 function parseDesktopTranscript(conversationId) {
-  const transcriptPath = join(
-    getAgyHome(),
-    'brain',
-    conversationId,
-    '.system_generated',
-    'logs',
-    'transcript.jsonl',
+  const safeId = assertSafeSessionId(conversationId, 'Antigravity conversationId')
+  const brainDir = join(getAgyHome(), 'brain')
+  const transcriptPath = assertPathWithinDir(
+    join(brainDir, safeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    brainDir,
+    'Antigravity transcript',
   )
   if (!existsSync(transcriptPath)) return []
   return transcriptCache.getOrParse(transcriptPath, () => {
@@ -720,6 +725,7 @@ export class AntigravityAdapter {
   }
 
   async readSession(conversationId, { limit = 25, cursor = null } = {}) {
+    conversationId = assertSafeSessionId(conversationId, 'Antigravity conversationId')
     const cliReady = Boolean(await this.checkCliVersion())
     const pageSize = Math.max(10, Math.min(Number(limit) || 25, 200))
 
@@ -1129,6 +1135,7 @@ export class AntigravityAdapter {
   }
 
   async sendMessage(sessionId, { text, cwd, attachments = [], model, reasoningEffort } = {}) {
+    sessionId = assertSafeSessionId(sessionId, 'Antigravity conversationId')
     const compositeId = makeCompositeId(APPS.ANTIGRAVITY, sessionId)
 
     let entry = null
@@ -1275,6 +1282,7 @@ export class AntigravityAdapter {
   }
 
   async interrupt(sessionId) {
+    sessionId = assertSafeSessionId(sessionId, 'Antigravity conversationId')
     const active = this.activeTurns.get(sessionId)
     if (active) {
       active.aborted = true

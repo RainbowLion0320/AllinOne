@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import http from 'node:http'
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
@@ -236,9 +237,24 @@ async function main() {
     console.log('[smoke] 5/6 DSH Cordis plugin & 6 master dispatch tools OK')
 
     // 6. Strict Multi-Tenant Room Isolation & Portable Bridge Bundle Test
-    const pubHealth = await (await fetch(`${httpBase}/api/health`)).json()
+    const pubHealthRes = await fetch(`${httpBase}/api/health`)
+    const pubHealth = await pubHealthRes.json()
     assert.equal(pubHealth.ok, true)
     assert.equal(pubHealth.bridges, undefined, 'Public /api/health must NOT leak bridge list')
+    assert.equal(pubHealth.onlineBridges, undefined, 'Public /api/health must NOT leak onlineBridges count')
+    assert.equal(pubHealth.clients, undefined, 'Public /api/health must NOT leak active client count')
+    assert.equal(pubHealth.rooms, undefined, 'Public /api/health must NOT leak room count')
+    assert.equal(pubHealthRes.headers.get('x-content-type-options'), 'nosniff')
+    assert.equal(pubHealthRes.headers.get('x-frame-options'), 'DENY')
+    assert.equal(pubHealthRes.headers.get('referrer-policy'), 'no-referrer')
+    assert.ok(String(pubHealthRes.headers.get('permissions-policy') || '').includes('camera=(self)'))
+
+    const ownerHealth = await (await fetch(`${httpBase}/api/health`, {
+      headers: { Authorization: `Bearer ${loginData.token}` },
+    })).json()
+    assert.equal(ownerHealth.ok, true)
+    assert.equal(ownerHealth.roomId, 'owner')
+    assert.ok(ownerHealth.onlineBridges >= 1)
 
     // Register Room A and Room B
     const regA = await (await fetch(`${httpBase}/api/rooms/register`, {
@@ -279,7 +295,7 @@ async function main() {
     assert.equal(relay.hub.getBridgeList('owner').length, 1, 'Owner room must still see ONLY 1 bridge')
     assert.equal(relay.hub.getBridgeList('owner')[0].bridgeId, 'smoke-pc')
 
-    // Pair Phone A via lowercase no-hyphen pairCode
+    // Pair Phone A via lowercase no-hyphen pairCode (strictly single-use!)
     const pairARes = await (await fetch(`${httpBase}/api/auth/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -289,6 +305,20 @@ async function main() {
     assert.equal(pairARes.roomId, regA.roomId)
     assert.equal(pairARes.bridges.length, 1)
     assert.equal(pairARes.bridges[0].bridgeId, 'friend-a-pc')
+
+    // Second redemption of the same pairCode OR pairToken must fail immediately (single-use burn)
+    const replayCodeRes = await fetch(`${httpBase}/api/auth/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairCode: regA.pairCode }),
+    })
+    assert.equal(replayCodeRes.status, 401, 'Reusing an already-redeemed pairCode must return 401')
+    const replayTokRes = await fetch(`${httpBase}/api/auth/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairToken: regA.pairToken }),
+    })
+    assert.equal(replayTokRes.status, 401, 'Reusing an already-redeemed pairToken must return 401')
 
     // Pair Phone B via pairToken (no bridge connected in Room B)
     const pairBRes = await (await fetch(`${httpBase}/api/auth/pair`, {
@@ -547,15 +577,293 @@ async function main() {
     assert.equal(dState.devices.length, 1)
     assert.equal(dState.activeDeviceId, devAId)
 
-    // Image URL helper propagates bridgeId
+    // Image URL helper propagates bridgeId and prefers short-lived mediaToken (`mt=`) over master `token=`
     const imgSrc = resolveImageSrc('/tmp/shot.png', {
       baseUrl: httpBase,
-      token: 'tok',
+      mediaToken: 'mtok',
+      token: 'master-tok',
       cwd: '/work',
       bridgeId: 'smoke-pc-2',
     })
     assert.ok(imgSrc.includes('bridgeId=smoke-pc-2'), 'resolveImageSrc must include bridgeId query param')
-    console.log('[smoke] 7/7 Multi-device store, status probe, strict bridgeId routing & scoped cache OK')
+    assert.ok(imgSrc.includes('mt=mtok') && !imgSrc.includes('master-tok'), 'resolveImageSrc must prefer mt= mediaToken over master token')
+    console.log('[smoke] 7/8 Multi-device store, status probe, strict bridgeId routing & scoped cache OK')
+
+    // 8. Comprehensive Security Hardening Suite
+    // 8.1 Production default-secret refusal
+    assert.throws(
+      () =>
+        createRelayServer({
+          port: 0,
+          host: '127.0.0.1',
+          nodeEnv: 'production',
+          clientAccessToken: 'allinone-dev-pass',
+          bridgeSecret: 'allinone-dev-bridge',
+          roomsFile: join(tmpDir, 'prod-rooms.json'),
+          uploadDir: join(tmpDir, 'prod-uploads'),
+        }),
+      /Refusing to start in production/,
+      'Production server must refuse to start with default dev secrets',
+    )
+
+    // 8.2 Strict CORS & WebSocket CSWSH Origin allowlist
+    const evilCorsRes = await fetch(`${httpBase}/api/health`, {
+      headers: { Origin: 'https://evil.example.com' },
+    })
+    assert.equal(evilCorsRes.headers.get('access-control-allow-origin'), null, 'Untrusted origin must not receive ACAO')
+    const evilPreflight = await fetch(`${httpBase}/api/auth/me`, {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://evil.example.com' },
+    })
+    assert.equal(evilPreflight.status, 403, 'Untrusted origin OPTIONS preflight must be rejected with 403')
+    const capCorsRes = await fetch(`${httpBase}/api/health`, {
+      headers: { Origin: 'https://localhost' },
+    })
+    assert.equal(capCorsRes.headers.get('access-control-allow-origin'), 'https://localhost')
+
+    // 8.3 Single-use WS ticket & CSWSH origin block
+    const ticketRes = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${loginData.token}` },
+    })).json()
+    assert.equal(ticketRes.ok, true)
+    assert.ok(ticketRes.ticket.startsWith('tk_'))
+
+    // Evil origin WS upgrade must fail with 403 (and must NOT consume ticket or allow connection)
+    await assert.rejects(
+      () =>
+        new Promise((resolve, reject) => {
+          const evilWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketRes.ticket)}`, {
+            headers: { Origin: 'https://evil.example.com' },
+          })
+          evilWs.on('open', () => { evilWs.close(); resolve() })
+          evilWs.on('error', reject)
+        }),
+      'Evil Origin WS upgrade must be rejected',
+    )
+
+    // Valid ticket connects cleanly once, then fails on 2nd use
+    const wsTicketConn = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketRes.ticket)}`)
+    await new Promise((resolve, reject) => {
+      wsTicketConn.on('message', (raw) => {
+        if (JSON.parse(String(raw)).type === 'hello') resolve()
+      })
+      wsTicketConn.on('error', reject)
+    })
+    wsTicketConn.close()
+    await assert.rejects(
+      () =>
+        new Promise((resolve, reject) => {
+          const replayWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketRes.ticket)}`)
+          replayWs.on('open', () => { replayWs.close(); resolve() })
+          replayWs.on('error', reject)
+        }),
+      'Reusing a single-use WS ticket must be rejected',
+    )
+
+    // 8.4 Scoped read-only media token (works for images/uploads, rejected on session/WS/upload APIs)
+    const mediaTokRes = await (await fetch(`${httpBase}/api/auth/media-token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${loginData.token}` },
+    })).json()
+    assert.equal(mediaTokRes.ok, true)
+    assert.ok(mediaTokRes.mediaToken)
+
+    const mtImgRes = await fetch(
+      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&mt=${encodeURIComponent(mediaTokRes.mediaToken)}`,
+    )
+    assert.equal(mtImgRes.status, 200, 'Media token must authorize GET /api/bridge-file')
+    const mtOnMe = await fetch(`${httpBase}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${mediaTokRes.mediaToken}` },
+    })
+    assert.equal(mtOnMe.status, 401, 'Media token must NOT work as a full session token on /api/auth/me')
+    const mtOnTicket = await fetch(`${httpBase}/api/auth/ws-ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${mediaTokRes.mediaToken}` },
+    })
+    assert.equal(mtOnTicket.status, 401, 'Media token must NOT mint WS tickets')
+    await assert.rejects(
+      () =>
+        new Promise((resolve, reject) => {
+          const mtWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(mediaTokRes.mediaToken)}`)
+          mtWs.on('open', () => { mtWs.close(); resolve() })
+          mtWs.on('error', reject)
+        }),
+      'Media token must NOT open /ws/client',
+    )
+
+    // 8.5 Bridge URL query secret rejection + ephemeral consume on non-image upload + safe headers
+    await assert.rejects(
+      () =>
+        new Promise((resolve, reject) => {
+          const qsBridge = new WebSocket(`ws://127.0.0.1:${port}/ws/bridge?secret=${encodeURIComponent(TEST_BRIDGE_SECRET)}`)
+          qsBridge.on('open', () => { qsBridge.close(); resolve() })
+          qsBridge.on('error', reject)
+        }),
+      'Bridge WS must reject ?secret= in URL query string',
+    )
+    const qsUploadTry = await fetch(`${httpBase}${ownerUpload.upload.url}?secret=${encodeURIComponent(TEST_BRIDGE_SECRET)}`)
+    assert.equal(qsUploadTry.status, 401, 'Upload download must reject ?secret= in URL query string')
+
+    const bridgeConsumeRes = await fetch(`${httpBase}${ownerUpload.upload.url}?consume=1`, {
+      headers: { 'X-Bridge-Secret': TEST_BRIDGE_SECRET },
+    })
+    assert.equal(bridgeConsumeRes.status, 200)
+    assert.ok(String(bridgeConsumeRes.headers.get('content-disposition') || '').startsWith('attachment'))
+    assert.equal(bridgeConsumeRes.headers.get('content-security-policy'), "default-src 'none'; sandbox")
+    const afterConsumeRes = await fetch(`${httpBase}${ownerUpload.upload.url}`, {
+      headers: { Authorization: `Bearer ${loginData.token}` },
+    })
+    assert.equal(afterConsumeRes.status, 404, 'Consumed non-image upload must be deleted immediately from relay disk')
+
+    // 8.6 SSRF & X-Bridge-Secret leak defense in materializeAttachments
+    let attackerHits = 0
+    const attackerServer = http.createServer((req, res) => {
+      attackerHits += 1
+      res.writeHead(200)
+      res.end('nope')
+    })
+    await new Promise((r) => attackerServer.listen(0, '127.0.0.1', r))
+    const attackerPort = attackerServer.address().port
+    try {
+      const matResult = await bridge.orchestrator.materializeAttachments([
+        { url: `http://127.0.0.1:${attackerPort}/steal`, filename: 'evil.txt', mimeType: 'text/plain' },
+        { url: '/api/uploads/../../etc/passwd', filename: 'trav.txt', mimeType: 'text/plain' },
+        { localPath: '/etc/passwd', filename: 'passwd', mimeType: 'text/plain' },
+      ])
+      assert.equal(matResult.length, 0, 'Untrusted URLs and caller-supplied localPath must all be rejected')
+      assert.equal(attackerHits, 0, 'Bridge must NEVER send fetch or X-Bridge-Secret to external/attacker URLs')
+    } finally {
+      await new Promise((r) => attackerServer.close(r))
+    }
+
+    // 8.7 Symlink image bypass defense in readLocalFile
+    const symlinkPath = join(tmpDir, 'disguised-secret.png')
+    symlinkSync(join(process.cwd(), 'package.json'), symlinkPath)
+    const symlinkRes = await fetch(
+      `${httpBase}/api/bridge-file?path=${encodeURIComponent(symlinkPath)}&mt=${encodeURIComponent(mediaTokRes.mediaToken)}`,
+    )
+    assert.equal(symlinkRes.status, 403, 'Symlink pointing to non-image file must be blocked with 403')
+
+    // 8.8 Session ID path traversal & CLI argument injection defense
+    await assert.rejects(() => bridge.orchestrator.readSession({ id: 'dsh:../../etc/passwd' }), /非法的/)
+    await assert.rejects(() => bridge.orchestrator.readSession({ id: 'claude:../../etc/passwd' }), /非法的/)
+    await assert.rejects(() => bridge.orchestrator.readSession({ id: 'antigravity:../../etc/passwd' }), /非法的/)
+    await assert.rejects(
+      () => bridge.orchestrator.sendMessage({ id: 'claude:--malicious-flag', text: 'hi' }),
+      /非法的/,
+    )
+    await assert.rejects(
+      () => bridge.orchestrator.sendMessage({ id: 'claude:safe-id-1', text: 'hi', model: 'opus & calc.exe' }),
+      /非法的/,
+    )
+
+    // 8.9 Token revocation (`POST /api/rooms/revoke`) kicks active WS with 4401 and invalidates JWT + mediaToken
+    const mediaTokA = await (await fetch(`${httpBase}/api/auth/media-token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pairARes.token}` },
+    })).json()
+    assert.equal(mediaTokA.ok, true)
+
+    const ticketA = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pairARes.token}` },
+    })).json()
+    const wsRevoke = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketA.ticket)}`)
+    await new Promise((resolve, reject) => {
+      wsRevoke.on('message', (raw) => {
+        if (JSON.parse(String(raw)).type === 'hello') resolve()
+      })
+      wsRevoke.on('error', reject)
+    })
+    const closeCodePromise = new Promise((resolve) => {
+      wsRevoke.on('close', (code) => resolve(code))
+    })
+
+    const revokeRes = await (await fetch(`${httpBase}/api/rooms/revoke`, {
+      method: 'POST',
+      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
+    })).json()
+    assert.equal(revokeRes.ok, true)
+    assert.equal(revokeRes.disconnectedClients, 1)
+    assert.equal(await closeCodePromise, 4401, 'Revoked WS client must be kicked with code 4401')
+
+    const revokedMe = await fetch(`${httpBase}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${pairARes.token}` },
+    })
+    assert.equal(revokedMe.status, 401, 'Revoked JWT must return 401 on /api/auth/me')
+    const revokedMedia = await fetch(
+      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&mt=${encodeURIComponent(mediaTokA.mediaToken)}`,
+    )
+    assert.equal(revokedMedia.status, 401, 'Revoked room mediaToken must return 401')
+
+    // Re-pairing after revocation issues a fresh working token (tv=1)
+    const postRevokeRefresh = await (await fetch(`${httpBase}/api/rooms/pair-code`, {
+      method: 'POST',
+      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
+    })).json()
+    const postRevokePair = await (await fetch(`${httpBase}/api/auth/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairCode: postRevokeRefresh.pairCode }),
+    })).json()
+    assert.equal(postRevokePair.ok, true)
+    const freshMe = await fetch(`${httpBase}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${postRevokePair.token}` },
+    })
+    assert.equal(freshMe.status, 200, 'Re-paired token after revocation must succeed')
+
+    // 8.10 X-Forwarded-For spoofing resistance (uses rightmost trusted-proxy IP, ignores spoofed leftmost)
+    for (let i = 0; i < 15; i += 1) {
+      const r = await fetch(`${httpBase}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': `1.2.3.${i + 1}, 203.0.113.9`,
+        },
+        body: JSON.stringify({ password: 'bad-password' }),
+      })
+      assert.equal(r.status, 401)
+    }
+    const throttled = await fetch(`${httpBase}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '9.9.9.9, 203.0.113.9',
+      },
+      body: JSON.stringify({ password: 'bad-password' }),
+    })
+    assert.equal(throttled.status, 429, 'Spoofing leftmost X-Forwarded-For must NOT bypass rate limit')
+
+    // 8.11 Optional REGISTER_INVITE_CODE gating
+    const gatedRelay = createRelayServer({
+      port: 0,
+      host: '127.0.0.1',
+      clientAccessToken: TEST_PASS,
+      bridgeSecret: TEST_BRIDGE_SECRET,
+      registerInviteCode: 'invite-top-secret',
+      roomsFile: join(tmpDir, 'gated-rooms.json'),
+      uploadDir: join(tmpDir, 'gated-uploads'),
+    })
+    const gatedAddr = await gatedRelay.start()
+    try {
+      const noInv = await fetch(`http://127.0.0.1:${gatedAddr.port}/api/rooms/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: 'Uninvited' }),
+      })
+      assert.equal(noInv.status, 403, 'Gated server must reject room registration without invite code')
+      const withInv = await fetch(`http://127.0.0.1:${gatedAddr.port}/api/rooms/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Invite-Code': 'invite-top-secret' },
+        body: JSON.stringify({ label: 'Invited-PC' }),
+      })
+      assert.equal(withInv.status, 200, 'Gated server must accept valid invite code')
+    } finally {
+      await gatedRelay.close()
+    }
+
+    console.log('[smoke] 8/8 Security hardening suite OK (11 checks passed)')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

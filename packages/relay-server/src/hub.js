@@ -375,6 +375,32 @@ export class RelayHub {
     } catch {}
   }
 
+  disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    let disconnected = 0
+    const droppedClientIds = new Set()
+    for (const [cid, client] of this.clients.entries()) {
+      if (client.roomId !== rid) continue
+      droppedClientIds.add(cid)
+      this.clients.delete(cid)
+      disconnected += 1
+      try {
+        client.ws.close(code, reason)
+      } catch {}
+    }
+    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
+      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
+        clearTimeout(pending.timer)
+        this.pendingRpc.delete(relayReqId)
+      }
+    }
+    this.roomEvents.delete(rid)
+    if (disconnected > 0) {
+      this.log.info(`[relay] Revoked and disconnected ${disconnected} client(s) in room=${rid}`)
+    }
+    return disconnected
+  }
+
   shutdown() {
     for (const pending of this.pendingRpc.values()) {
       clearTimeout(pending.timer)

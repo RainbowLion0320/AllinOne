@@ -26,5 +26,8 @@ COPY --from=builder /app/packages/shared ./packages/shared
 COPY packages/relay-server ./packages/relay-server
 COPY --from=builder /app/packages/mobile-app/dist ./packages/mobile-app/dist
 
+RUN mkdir -p /app/packages/relay-server/data/uploads && chown -R node:node /app/packages/relay-server/data
+USER node
+
 EXPOSE 8787
 CMD ["node", "packages/relay-server/src/index.js"]

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, openSync, readSync, closeSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { APPS, EVENTS, makeCompositeId, toEpochMs } from '../protocol.js'
+import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
@@ -311,10 +311,12 @@ export class ClaudeAdapter {
   }
 
   findSessionFile(sessionId) {
+    sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     const projectsDir = join(this.claudeHome, 'projects')
     if (!existsSync(projectsDir)) return null
     for (const proj of readdirSync(projectsDir)) {
-      const candidate = join(projectsDir, proj, `${sessionId}.jsonl`)
+      const projDir = join(projectsDir, proj)
+      const candidate = assertPathWithinDir(join(projDir, `${sessionId}.jsonl`), projDir, 'Claude session file')
       if (existsSync(candidate)) return candidate
     }
     return null
@@ -409,6 +411,7 @@ export class ClaudeAdapter {
   }
 
   async readSession(sessionId, { limit = 25, cursor = null } = {}) {
+    sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     const fp = this.findSessionFile(sessionId)
     if (!fp) {
       const pending = this.pendingCreated.get(sessionId)
@@ -476,6 +479,7 @@ export class ClaudeAdapter {
   }
 
   async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, model, reasoningEffort } = {}) {
+    sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     if (this.activeProcs.has(sessionId)) {
       throw new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
     }
@@ -499,8 +503,13 @@ export class ClaudeAdapter {
     if (!prompt) throw new Error('消息内容不能为空')
 
     const pref = this.sessionPrefs.get(sessionId)
-    const effectiveModel = model || pref?.model || ''
-    const effectiveEffort = reasoningEffort || pref?.reasoningEffort || ''
+    const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
+    const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
+    const effectivePermissionMode = assertSafeCliToken(
+      permissionMode || this.permissionMode,
+      'permissionMode',
+      { allowEmpty: false },
+    )
     if (effectiveModel || effectiveEffort) {
       this.sessionPrefs.set(sessionId, { model: effectiveModel || 'default', reasoningEffort: effectiveEffort || '' })
     }
@@ -511,7 +520,7 @@ export class ClaudeAdapter {
       'stream-json',
       '--verbose',
       '--permission-mode',
-      permissionMode || this.permissionMode,
+      effectivePermissionMode,
     ]
     if (effectiveModel && effectiveModel !== 'default') {
       args.push('--model', effectiveModel)
@@ -703,6 +712,7 @@ export class ClaudeAdapter {
   }
 
   async interrupt(sessionId) {
+    sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     const active = this.activeProcs.get(sessionId)
     if (!active) return { interrupted: false, sessionId }
     active.aborted = true

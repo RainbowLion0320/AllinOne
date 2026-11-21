@@ -1,7 +1,7 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
-import { extname, join, normalize, resolve } from 'node:path'
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
+import { extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { RPC } from '@allinone/shared'
@@ -52,6 +52,61 @@ const MIME_TYPES = {
 }
 
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // 15MB
+const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
+const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
+const SAFE_INLINE_IMAGE_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'image/bmp',
+  'image/avif',
+])
+
+const LOCAL_DEV_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i
+const CAPACITOR_ORIGINS = new Set([
+  'capacitor://localhost',
+  'ionic://localhost',
+  'https://localhost',
+  'http://localhost',
+])
+
+function isTrustedProxyAddr(rawAddr) {
+  let addr = String(rawAddr || '').trim().toLowerCase()
+  if (!addr) return false
+  if (addr.startsWith('::ffff:')) addr = addr.slice(7)
+  if (addr === '127.0.0.1' || addr === '::1') return true
+  if (addr.startsWith('10.') || addr.startsWith('192.168.') || addr.startsWith('fc') || addr.startsWith('fd')) {
+    return true
+  }
+  const m = addr.match(/^172\.(\d+)\./)
+  if (m) {
+    const second = Number(m[1])
+    if (second >= 16 && second <= 31) return true
+  }
+  return false
+}
+
+function buildAllowedOriginsSet(publicRelayUrl, rawAllowedOrigins) {
+  const allowed = new Set(CAPACITOR_ORIGINS)
+  if (publicRelayUrl) {
+    try {
+      allowed.add(new URL(publicRelayUrl).origin.toLowerCase())
+    } catch {}
+  }
+  const extra = String(rawAllowedOrigins || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  for (const item of extra) {
+    try {
+      allowed.add(new URL(item).origin.toLowerCase())
+    } catch {
+      allowed.add(item.replace(/\/+$/, '').toLowerCase())
+    }
+  }
+  return allowed
+}
 
 function readJsonBody(req, maxBytes = 256 * 1024) {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -87,16 +142,16 @@ function sendJson(res, status, data) {
   res.end(body)
 }
 
-function setCors(req, res) {
-  const origin = req.headers.origin
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin)
-    res.setHeader('Vary', 'Origin')
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*')
+function setSecurityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  // Allow self camera so built-in QR scanner continues to work cleanly in PWA/WebView
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()')
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
+  if (forwardedProto === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id')
 }
 
 export function createRelayServer(options = {}) {
@@ -105,7 +160,26 @@ export function createRelayServer(options = {}) {
   const clientAccessToken = String(options.clientAccessToken ?? process.env.CLIENT_ACCESS_TOKEN ?? 'allinone-dev-pass')
   const bridgeSecret = String(options.bridgeSecret ?? process.env.BRIDGE_SECRET ?? 'allinone-dev-bridge')
   const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '')
+  const registerInviteCode = String(options.registerInviteCode ?? process.env.REGISTER_INVITE_CODE ?? '').trim()
   const publicRelayUrl = String(options.publicRelayUrl ?? process.env.PUBLIC_RELAY_URL ?? '').trim().replace(/\/+$/, '')
+  const allowedOrigins = buildAllowedOriginsSet(
+    publicRelayUrl,
+    options.allowedOrigins ?? process.env.ALLOWED_ORIGINS ?? '',
+  )
+  const isProd = (options.nodeEnv ?? process.env.NODE_ENV) === 'production'
+  if (
+    isProd &&
+    !options.allowDevSecrets &&
+    (clientAccessToken === 'allinone-dev-pass' ||
+      bridgeSecret === 'allinone-dev-bridge' ||
+      clientAccessToken.trim().length < 8 ||
+      bridgeSecret.trim().length < 8)
+  ) {
+    throw new Error(
+      'Refusing to start in production with default or weak CLIENT_ACCESS_TOKEN / BRIDGE_SECRET. Set strong secrets (>= 8 chars) in .env.',
+    )
+  }
+
   const staticDir = resolve(
     options.staticDir ?? (process.env.STATIC_DIR || resolve(__dirname, '../../mobile-app/dist')),
   )
@@ -116,10 +190,43 @@ export function createRelayServer(options = {}) {
     options.roomsFile ?? (process.env.ROOMS_FILE || resolve(__dirname, '../data/rooms.json')),
   )
   mkdirSync(uploadDir, { recursive: true })
+  try { chmodSync(uploadDir, 0o700) } catch {}
 
-  const auth = createAuthManager({ clientAccessToken, bridgeSecret, jwtSecret })
   const rooms = createRoomStore({ filePath: roomsFile })
+  const auth = createAuthManager({
+    clientAccessToken,
+    bridgeSecret,
+    jwtSecret,
+    registerInviteCode,
+    getTokenVersion: (roomId) => rooms.getTokenVersion(roomId),
+  })
   const hub = new RelayHub()
+
+  function isAllowedOrigin(rawOrigin, req) {
+    const origin = String(rawOrigin || '').trim()
+    if (!origin) return true
+    const lower = origin.replace(/\/+$/, '').toLowerCase()
+    if (allowedOrigins.has(lower)) return true
+    if (LOCAL_DEV_ORIGIN_RE.test(lower)) return true
+    const reqHost = String(req?.headers?.host || '').trim().toLowerCase()
+    if (reqHost && (lower === `https://${reqHost}` || lower === `http://${reqHost}`)) {
+      return true
+    }
+    return false
+  }
+
+  function setCors(req, res) {
+    const origin = req.headers.origin
+    if (origin && isAllowedOrigin(origin, req)) {
+      res.setHeader('Access-Control-Allow-Origin', origin)
+      res.setHeader('Vary', 'Origin')
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code',
+    )
+  }
 
   // Small in-memory LRU cache for bridged PC images (strictly namespaced by roomId)
   const BRIDGE_IMG_CACHE_MAX_ITEMS = 32
@@ -162,35 +269,63 @@ export function createRelayServer(options = {}) {
     bridgeImgCacheBytes += entry.buf.length
   }
 
-  // Periodic cleanup of uploaded temporary files older than 24h
+  function purgeRoomBridgeImgCache(roomId) {
+    const prefix = `${roomId}|`
+    for (const [key, entry] of bridgeImgCache.entries()) {
+      if (key.startsWith(prefix)) {
+        bridgeImgCache.delete(key)
+        bridgeImgCacheBytes -= entry.buf.length
+      }
+    }
+  }
+
+  // Periodic cleanup of uploaded temporary files older than UPLOAD_TTL_MS (2h)
   const cleanupTimer = setInterval(() => {
     try {
-      const cutoff = Date.now() - 24 * 60 * 60 * 1000
+      const cutoff = Date.now() - UPLOAD_TTL_MS
       for (const file of readdirSync(uploadDir)) {
         const fp = join(uploadDir, file)
         const st = statSync(fp)
         if (st.mtimeMs < cutoff) unlinkSync(fp)
       }
     } catch {}
-  }, 60 * 60 * 1000)
+  }, UPLOAD_CLEANUP_INTERVAL_MS)
   cleanupTimer.unref()
 
-  function extractBearer(req, urlObj) {
+  function extractBearer(req) {
     const header = req.headers.authorization || ''
     if (header.startsWith('Bearer ')) return header.slice(7).trim()
-    return urlObj.searchParams.get('token') || ''
+    return ''
+  }
+
+  function extractMediaToken(req, urlObj) {
+    const headerTok = extractBearer(req)
+    if (headerTok) return headerTok
+    return String(urlObj.searchParams.get('mt') || urlObj.searchParams.get('token') || '').trim()
   }
 
   function getClientIp(req) {
-    return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
-      .split(',')[0]
-      .trim()
+    const remote = String(req.socket?.remoteAddress || 'unknown').trim()
+    if (isTrustedProxyAddr(remote)) {
+      const realIp = String(req.headers['x-real-ip'] || '').trim()
+      if (realIp && !realIp.includes(',')) return realIp
+      const xff = String(req.headers['x-forwarded-for'] || '').trim()
+      if (xff) {
+        const parts = xff.split(',').map((s) => s.trim()).filter(Boolean)
+        // Rightmost X-Forwarded-For entry is appended by the trusted reverse proxy (cannot be spoofed by client)
+        if (parts.length > 0) return parts[parts.length - 1]
+      }
+    }
+    return remote
   }
 
-  /** Authenticate a PC Bridge request and return its authoritative `roomId` or null. */
+  /**
+   * Authenticate a PC Bridge request via HTTP headers ONLY (never URL query secrets!)
+   * and return its authoritative `roomId` or null.
+   */
   function authenticateBridge(req, urlObj) {
-    const secret = String(req.headers['x-bridge-secret'] || urlObj.searchParams.get('secret') || urlObj.searchParams.get('bridgeSecret') || '').trim()
-    const requestedRoom = String(req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '').trim()
+    const secret = String(req.headers['x-bridge-secret'] || '').trim()
+    const requestedRoom = String(req.headers['x-room-id'] || urlObj?.searchParams?.get('roomId') || '').trim()
     if (!secret) return null
     if (!requestedRoom || requestedRoom === 'owner') {
       return auth.verifyBridgeSecret(secret) ? 'owner' : null
@@ -199,8 +334,14 @@ export function createRelayServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
+    setSecurityHeaders(req, res)
     setCors(req, res)
     if (req.method === 'OPTIONS') {
+      if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
+        res.writeHead(403)
+        res.end()
+        return
+      }
       res.writeHead(204)
       res.end()
       return
@@ -209,21 +350,30 @@ export function createRelayServer(options = {}) {
     const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
     const pathname = urlObj.pathname
 
-    // Health check (privacy-safe: only exposes own room bridges when authenticated)
+    // Health check (privacy-safe: unauthenticated callers only see `{ ok: true }`)
     if (pathname === '/api/health' && req.method === 'GET') {
-      const user = auth.verifySessionToken(extractBearer(req, urlObj))
+      const user = auth.verifySessionToken(extractBearer(req))
+      if (!user) {
+        sendJson(res, 200, { ok: true })
+        return
+      }
       sendJson(res, 200, {
         ok: true,
-        ...(user ? { roomId: user.room, bridges: hub.getBridgeList(user.room) } : {}),
-        onlineBridges: hub.getOnlineBridgeCount(),
-        clients: hub.clients.size,
-        rooms: rooms.count() + 1,
+        roomId: user.room,
+        bridges: hub.getBridgeList(user.room),
         uptimeSec: Math.round(process.uptime()),
+        ...(user.room === 'owner'
+          ? {
+              onlineBridges: hub.getOnlineBridgeCount(),
+              clients: hub.clients.size,
+              rooms: rooms.count() + 1,
+            }
+          : {}),
       })
       return
     }
 
-    // Multi-tenant: Register a brand-new isolated room for a friend's PC
+    // Multi-tenant: Register a brand-new isolated room for a PC (optionally invite-code gated)
     if (pathname === '/api/rooms/register' && req.method === 'POST') {
       const ip = getClientIp(req)
       if (!auth.checkRegisterLimit(ip)) {
@@ -232,6 +382,12 @@ export function createRelayServer(options = {}) {
       }
       try {
         const body = await readJsonBody(req)
+        const invite = String(req.headers['x-invite-code'] || body.inviteCode || '').trim()
+        if (!auth.verifyRegisterInviteCode(invite)) {
+          auth.recordFailure(ip)
+          sendJson(res, 403, { ok: false, error: '需要有效的邀请码才能注册新设备' })
+          return
+        }
         const created = rooms.registerRoom({ label: body.label || body.hostname || 'My PC' })
         sendJson(res, 200, { ok: true, ...created })
       } catch {
@@ -257,7 +413,32 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Multi-tenant: Mobile pairing via 8-char Pairing Code or QR pairToken -> room-scoped 30-day JWT
+    // Revoke ALL active mobile tokens for a room (callable by either the PC bridge or an authenticated mobile client of that room)
+    if (pathname === '/api/rooms/revoke' && req.method === 'POST') {
+      const bridgeRoom = authenticateBridge(req, urlObj)
+      const clientUser = bridgeRoom ? null : auth.verifySessionToken(extractBearer(req))
+      const targetRoom = bridgeRoom || clientUser?.room || null
+      if (!targetRoom) {
+        sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      const revoked = rooms.revokeRoomTokens(targetRoom)
+      if (!revoked) {
+        sendJson(res, 404, { ok: false, error: '房间不存在' })
+        return
+      }
+      purgeRoomBridgeImgCache(targetRoom)
+      const disconnectedClients = hub.disconnectRoomClients(targetRoom, 4401, 'Session revoked')
+      sendJson(res, 200, {
+        ok: true,
+        roomId: revoked.roomId,
+        tokenVersion: revoked.tokenVersion,
+        disconnectedClients,
+      })
+      return
+    }
+
+    // Multi-tenant: Mobile pairing via single-use 8-char Pairing Code or QR pairToken -> room-scoped 30-day JWT
     if (pathname === '/api/auth/pair' && req.method === 'POST') {
       const ip = getClientIp(req)
       if (!auth.checkRateLimit(ip)) {
@@ -276,7 +457,12 @@ export function createRelayServer(options = {}) {
           return
         }
         auth.clearFailure(ip)
-        const token = auth.signSessionToken(result.roomId, body.deviceName || 'mobile', result.roomId)
+        const token = auth.signSessionToken(
+          result.roomId,
+          body.deviceName || 'mobile',
+          result.roomId,
+          result.tokenVersion,
+        )
         sendJson(res, 200, {
           ok: true,
           token,
@@ -305,7 +491,12 @@ export function createRelayServer(options = {}) {
           return
         }
         auth.clearFailure(ip)
-        const token = auth.signSessionToken('owner', body.deviceName || 'mobile', 'owner')
+        const token = auth.signSessionToken(
+          'owner',
+          body.deviceName || 'mobile',
+          'owner',
+          rooms.getTokenVersion('owner'),
+        )
         sendJson(res, 200, {
           ok: true,
           token,
@@ -318,9 +509,33 @@ export function createRelayServer(options = {}) {
       return
     }
 
+    // Issue a 30-second single-use WebSocket handshake ticket so master 30-day JWT never appears in WS URLs/logs
+    if (pathname === '/api/auth/ws-ticket' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      const { ticket, expiresAt } = auth.issueWsTicket(payload)
+      sendJson(res, 200, { ok: true, ticket, expiresAt })
+      return
+    }
+
+    // Issue a 15-minute read-only scoped media token for <img> / download links (cannot open WS or run RPCs)
+    if (pathname === '/api/auth/media-token' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      const { mediaToken, expiresAt } = auth.signMediaToken(payload)
+      sendJson(res, 200, { ok: true, mediaToken, expiresAt })
+      return
+    }
+
     // Verify existing session token
     if (pathname === '/api/auth/me' && req.method === 'GET') {
-      const payload = auth.verifySessionToken(extractBearer(req, urlObj))
+      const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
@@ -338,7 +553,7 @@ export function createRelayServer(options = {}) {
 
     // Attachment upload (scoped strictly to caller's roomId)
     if (pathname === '/api/uploads' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req, urlObj))
+      const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
@@ -362,8 +577,8 @@ export function createRelayServer(options = {}) {
           size: buf.length,
           createdAt: Date.now(),
         }
-        writeFileSync(join(uploadDir, `${id}.bin`), buf)
-        writeFileSync(join(uploadDir, `${id}.json`), JSON.stringify(meta))
+        writeFileSync(join(uploadDir, `${id}.bin`), buf, { mode: 0o600 })
+        writeFileSync(join(uploadDir, `${id}.json`), JSON.stringify(meta), { mode: 0o600 })
         sendJson(res, 200, {
           ok: true,
           upload: {
@@ -383,7 +598,7 @@ export function createRelayServer(options = {}) {
 
     // Proxy local PC image files strictly through the authenticated user's OWN room bridge
     if (pathname === '/api/bridge-file' && (req.method === 'GET' || req.method === 'HEAD')) {
-      const payload = auth.verifySessionToken(extractBearer(req, urlObj))
+      const payload = auth.verifyMediaToken(extractMediaToken(req, urlObj))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
@@ -441,7 +656,7 @@ export function createRelayServer(options = {}) {
           ? 503
           : /找不到/.test(msg)
             ? 404
-            : /仅允许|不支持/.test(msg)
+            : /仅允许|不支持|拒绝访问/.test(msg)
               ? 403
               : 500
         sendJson(res, status, { ok: false, error: msg })
@@ -452,7 +667,7 @@ export function createRelayServer(options = {}) {
     // Attachment download (strictly isolated to the owning roomId!)
     if (pathname.startsWith('/api/uploads/') && req.method === 'GET') {
       const bridgeRoom = authenticateBridge(req, urlObj)
-      const clientUser = auth.verifySessionToken(extractBearer(req, urlObj))
+      const clientUser = bridgeRoom ? null : auth.verifyMediaToken(extractMediaToken(req, urlObj))
       const callerRoom = bridgeRoom || clientUser?.room || null
       if (!callerRoom) {
         sendJson(res, 401, { ok: false, error: '未授权' })
@@ -461,7 +676,7 @@ export function createRelayServer(options = {}) {
       const id = pathname.slice('/api/uploads/'.length).replace(/[^a-zA-Z0-9-]/g, '')
       const binPath = join(uploadDir, `${id}.bin`)
       const metaPath = join(uploadDir, `${id}.json`)
-      if (!existsSync(binPath) || !existsSync(metaPath)) {
+      if (!id || !existsSync(binPath) || !existsSync(metaPath)) {
         sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
         return
       }
@@ -472,10 +687,20 @@ export function createRelayServer(options = {}) {
         return
       }
       const data = readFileSync(binPath)
+      // Ephemeral consume: when the PC bridge downloads a non-image attachment with ?consume=1, delete temp files immediately
+      if (bridgeRoom && urlObj.searchParams.get('consume') === '1') {
+        try { unlinkSync(binPath) } catch {}
+        try { unlinkSync(metaPath) } catch {}
+      }
+      const safeMime = String(meta.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase()
+      const disposition = SAFE_INLINE_IMAGE_MIMES.has(safeMime) ? 'inline' : 'attachment'
       res.writeHead(200, {
         'Content-Type': meta.mimeType || 'application/octet-stream',
         'Content-Length': data.length,
-        'Content-Disposition': `inline; filename="${encodeURIComponent(meta.filename)}"`,
+        'Content-Disposition': `${disposition}; filename*=UTF-8''${encodeURIComponent(meta.filename || 'upload.bin')}`,
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
       })
       res.end(data)
       return
@@ -486,7 +711,8 @@ export function createRelayServer(options = {}) {
       const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
       const candidate = resolve(staticDir, normalize(rel))
       let target = null
-      if (candidate.startsWith(staticDir) && existsSync(candidate) && statSync(candidate).isFile()) {
+      const withinStaticDir = candidate === staticDir || candidate.startsWith(`${staticDir}${sep}`)
+      if (withinStaticDir && existsSync(candidate) && statSync(candidate).isFile()) {
         target = candidate
       } else if (!pathname.startsWith('/api/') && !pathname.startsWith('/ws/') && !pathname.startsWith('/downloads/')) {
         const indexHtml = join(staticDir, 'index.html')
@@ -569,8 +795,21 @@ export function createRelayServer(options = {}) {
     }
 
     if (pathname === '/ws/client') {
-      const token = extractBearer(req, urlObj)
-      const user = auth.verifySessionToken(token)
+      // Block cross-site WebSocket hijacking (CSWSH) from untrusted third-party web origins
+      if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+        socket.destroy()
+        return
+      }
+      const ticket = String(urlObj.searchParams.get('ticket') || '').trim()
+      let user = null
+      if (ticket) {
+        user = auth.consumeWsTicket(ticket)
+      } else {
+        // Fallback for older cached mobile clients or header-authenticated callers
+        const legacyTok = extractBearer(req) || String(urlObj.searchParams.get('token') || '').trim()
+        user = auth.verifySessionToken(legacyTok)
+      }
       if (!user) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()

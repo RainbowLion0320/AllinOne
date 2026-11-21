@@ -13,6 +13,8 @@ import {
   MobileRelayClient,
   detectDefaultServerUrl,
   pairWithRelay,
+  requestMediaToken,
+  revokeDeviceSessions,
 } from './lib/wsClient.js'
 import {
   getActiveDevice,
@@ -54,6 +56,7 @@ export function App() {
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [connState, setConnState] = useState('disconnected')
   const [bridges, setBridges] = useState([])
+  const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '', unsupported: false })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
@@ -299,16 +302,68 @@ export function App() {
     return [...map.values()]
   }, [workspaces, sessions])
 
-  const imageContext = useMemo(
-    () => ({
+  // Mint and auto-refresh a short-lived 15-min read-only media token so the 30-day master JWT never appears in image URLs
+  useEffect(() => {
+    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || connState === 'unauthorized') {
+      setMediaAuth({ deviceId: '', mediaToken: '', unsupported: false })
+      return
+    }
+    let cancelled = false
+    let expiresAt = 0
+    const deviceId = activeDevice.id
+    const baseUrl = activeDevice.baseUrl
+    const token = activeDevice.token
+
+    const refresh = () => {
+      requestMediaToken(baseUrl, token)
+        .then((res) => {
+          if (cancelled) return
+          expiresAt = res.expiresAt || 0
+          setMediaAuth({
+            deviceId,
+            mediaToken: res.mediaToken || '',
+            unsupported: Boolean(res.unsupported),
+          })
+        })
+        .catch(() => {})
+    }
+
+    const onWake = () => {
+      if (document.visibilityState === 'visible' && (!expiresAt || Date.now() > expiresAt - 5 * 60 * 1000)) {
+        refresh()
+      }
+    }
+
+    refresh()
+    const timer = setInterval(refresh, 10 * 60 * 1000)
+    document.addEventListener('visibilitychange', onWake)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onWake)
+    }
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, connState])
+
+  const imageContext = useMemo(() => {
+    const matched = mediaAuth.deviceId === activeDevice?.id
+    return {
       baseUrl: activeDevice?.baseUrl || '',
-      token: activeDevice?.token || '',
+      mediaToken: matched ? mediaAuth.mediaToken : '',
+      token: matched && mediaAuth.unsupported ? activeDevice?.token || '' : '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       onOpenImage: setLightboxState,
-    }),
-    [activeDevice?.baseUrl, activeDevice?.token, activeSession?.cwd, activeBridgeId],
-  )
+    }
+  }, [
+    activeDevice?.id,
+    activeDevice?.baseUrl,
+    activeDevice?.token,
+    mediaAuth.deviceId,
+    mediaAuth.mediaToken,
+    mediaAuth.unsupported,
+    activeSession?.cwd,
+    activeBridgeId,
+  ])
 
   const loadWorkspaceData = useCallback(async (bridgeOverride = '') => {
     const client = clientRef.current
@@ -693,8 +748,13 @@ export function App() {
     setDeviceState((prev) => updateDeviceMeta(prev, deviceId, patch))
   }, [])
 
-  const handleRemoveDevice = useCallback((deviceId) => {
+  const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
     const target = devices.find((d) => d.id === deviceId)
+    if (revokeAll && target?.baseUrl && target?.token) {
+      try {
+        await revokeDeviceSessions(target.baseUrl, target.token)
+      } catch {}
+    }
     const removingActive = activeDevice?.id === deviceId
     const removingLast = devices.length <= 1
     void clearSessionCache(deviceId, { prefix: true })
@@ -708,7 +768,8 @@ export function App() {
     }
     setDeviceState((prev) => removeDevice(prev, deviceId))
     if (target) {
-      showToast(`已移除 ${getDeviceDisplayName(target)}`)
+      const name = getDeviceDisplayName(target)
+      showToast(revokeAll ? `已吊销 ${name} 全部手机凭证并移除` : `已移除 ${name}`)
     }
   }, [activeDevice?.id, devices, resetTransientWorkspace, showToast])
 

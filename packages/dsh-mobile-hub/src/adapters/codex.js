@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { APPS, EVENTS, makeCompositeId, toEpochMs } from '../protocol.js'
+import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
 
@@ -723,6 +723,7 @@ export class CodexAdapter {
   }
 
   async readSession(threadId, { limit = 25, cursor = null } = {}) {
+    threadId = assertSafeSessionId(threadId, 'Codex threadId')
     const pendingNew = this.pendingNewWriters.get(threadId)
     let t = {}
     try {
@@ -880,6 +881,7 @@ export class CodexAdapter {
   }
 
   async sendMessage(threadId, { text, cwd, attachments = [], approvalPolicy, model, reasoningEffort } = {}) {
+    threadId = assertSafeSessionId(threadId, 'Codex threadId')
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
     if (this.activeTurns.has(threadId)) {
       const err = new Error('该 Codex 对话正在运行中，请等待完成或先中断当前任务。')
@@ -1000,6 +1002,7 @@ export class CodexAdapter {
   }
 
   async interrupt(threadId) {
+    threadId = assertSafeSessionId(threadId, 'Codex threadId')
     const active = this.activeTurns.get(threadId)
     if (!active) return { interrupted: false, sessionId: threadId }
     active.aborted = true

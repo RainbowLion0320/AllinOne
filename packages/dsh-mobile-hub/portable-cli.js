@@ -22,7 +22,7 @@ const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const APK_FILENAME = 'All-in-One-v0.1.8.apk'
-const BRIDGE_VERSION = '0.1.20'
+const BRIDGE_VERSION = '0.1.21'
 
 function parseArgs(argv) {
   const opts = {
@@ -30,6 +30,7 @@ function parseArgs(argv) {
     cwd: process.env.ALLINONE_CWD || os.homedir(),
     label: process.env.ALLINONE_PC_NAME || os.hostname() || 'My-PC',
     stateDir: process.env.ALLINONE_HOME || join(os.homedir(), '.allinone-bridge'),
+    inviteCode: process.env.ALLINONE_INVITE || '',
     reset: false,
     noBrowser: false,
     help: false,
@@ -44,6 +45,8 @@ function parseArgs(argv) {
     else if (a.startsWith('--name=')) opts.label = a.slice('--name='.length)
     else if (a === '--state-dir') opts.stateDir = argv[++i] || opts.stateDir
     else if (a.startsWith('--state-dir=')) opts.stateDir = a.slice('--state-dir='.length)
+    else if (a === '--invite') opts.inviteCode = argv[++i] || opts.inviteCode
+    else if (a.startsWith('--invite=')) opts.inviteCode = a.slice('--invite='.length)
     else if (a === '--reset') opts.reset = true
     else if (a === '--no-browser') opts.noBrowser = true
     else if (a === '--help' || a === '-h') opts.help = true
@@ -80,15 +83,34 @@ function saveConfig(configPath, cfg) {
   try { chmodSync(configPath, 0o600) } catch {}
 }
 
-async function registerNewRoom(serverUrl, label) {
+async function registerNewRoom(serverUrl, label, inviteCode = '') {
+  const headers = { 'Content-Type': 'application/json' }
+  if (inviteCode) headers['X-Invite-Code'] = inviteCode
   const res = await fetch(`${serverUrl}/api/rooms/register`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label }),
+    headers,
+    body: JSON.stringify({ label, ...(inviteCode ? { inviteCode } : {}) }),
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
     throw new Error(data.error || `注册设备房间失败 (HTTP ${res.status})`)
+  }
+  return data
+}
+
+async function revokeRoomSessions(serverUrl, roomId, bridgeSecret) {
+  const res = await fetch(`${serverUrl}/api/rooms/revoke`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Room-Id': roomId,
+      'X-Bridge-Secret': bridgeSecret,
+    },
+    body: '{}',
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `吊销设备会话失败 (HTTP ${res.status})`)
   }
   return data
 }
@@ -252,7 +274,7 @@ function buildPairHtml({ serverUrl, roomId, label, pairCode, pairToken, pairExpi
     }
     const m = Math.floor(left / 60);
     const s = String(left % 60).padStart(2, '0');
-    el.textContent = '配对码剩余有效期 ' + m + ':' + s + '（已配对的手机不受影响）';
+    el.textContent = '一次性配对码剩余有效期 ' + m + ':' + s + '（配对成功即失效，已配对手机不受影响）';
   }
   tick();
   setInterval(tick, 1000);
@@ -275,13 +297,13 @@ function printBanner({ serverUrl, roomId, label, pairCode, pairToken, pairHtmlPa
   console.log(`  独立房间号 : ${roomId} (与其他用户完全隔离)`)
   if (appSummary) console.log(`  本机 AI    : ${appSummary}`)
   console.log('--------------------------------------------------------------')
-  console.log(`  ★ 8 位配对码 :  ${pairCode}   (15 分钟有效)`)
+  console.log(`  ★ 8 位配对码 :  ${pairCode}   (一次性有效，15 分钟过期)`)
   console.log(`  ★ 扫码直连   :  ${pairUrl}`)
   console.log(`  ★ 二维码页面 :  ${pairHtmlPath}`)
   console.log('--------------------------------------------------------------')
   console.log('  保持本窗口运行即可在手机远程操控本机 AI（可最小化）')
   if (process.stdin.isTTY) {
-    console.log('  操作提示：[Enter] 刷新配对码  |  [O] 打开二维码页  |  [Ctrl+C] 退出')
+    console.log('  操作提示：[Enter] 刷新配对码  |  [O] 打开二维码页  |  [R] 踢出所有手机  |  [Ctrl+C] 退出')
   }
   console.log('==============================================================')
   console.log('')
@@ -299,6 +321,7 @@ async function main() {
   --server <url>    中转服务器地址 (默认: ${DEFAULT_SERVER_URL})
   --name <label>    本机显示名称 (默认: 本机主机名)
   --cwd <dir>       默认工作目录 (默认: 用户主目录)
+  --invite <code>   房间注册邀请码 (若服务器开启了 REGISTER_INVITE_CODE)
   --reset           重新申请一个全新隔离房间
   --no-browser      不自动打开本地二维码网页
   -h, --help        显示帮助
@@ -320,7 +343,7 @@ async function main() {
   let pairInfo = null
   if (!cfg) {
     console.log(`[allinone] 正在向 ${opts.server} 申请独立隔离房间...`)
-    const created = await registerNewRoom(opts.server, opts.label)
+    const created = await registerNewRoom(opts.server, opts.label, opts.inviteCode)
     cfg = {
       serverUrl: opts.server,
       roomId: created.roomId,
@@ -336,7 +359,7 @@ async function main() {
     pairInfo = await refreshRoomPairCode(opts.server, cfg.roomId, cfg.bridgeSecret)
     if (!pairInfo) {
       console.log('[allinone] 原房间已失效，正在自动重新注册新房间...')
-      const created = await registerNewRoom(opts.server, opts.label)
+      const created = await registerNewRoom(opts.server, opts.label, opts.inviteCode)
       cfg = {
         serverUrl: opts.server,
         roomId: created.roomId,
@@ -361,7 +384,8 @@ async function main() {
       pairExpiresAt: pairInfo.pairExpiresAt,
       apps: detectedApps,
     })
-    writeFileSync(pairHtmlPath, html, 'utf8')
+    writeFileSync(pairHtmlPath, html, { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(pairHtmlPath, 0o600) } catch {}
     if (openNow && !opts.noBrowser) {
       openFileInBrowser(pairHtmlPath)
     }
@@ -459,6 +483,20 @@ async function main() {
       if (cmd === 'o' || cmd === 'open') {
         openFileInBrowser(pairHtmlPath)
         console.log('[allinone] 已在浏览器中打开二维码配对页面。')
+        return
+      }
+      if (cmd === 'r' || cmd === 'revoke') {
+        try {
+          const res = await revokeRoomSessions(opts.server, cfg.roomId, cfg.bridgeSecret)
+          console.log('')
+          console.log(
+            `[allinone] ✓ 已吊销本机房间所有手机登录凭证（已断开 ${res.disconnectedClients || 0} 个在线连接）！`,
+          )
+          console.log('[allinone]   按回车 (Enter) 可生成新的配对码重新配对手机。')
+          console.log('')
+        } catch (err) {
+          console.error(`[allinone] 吊销手机会话失败: ${String(err?.message || err)}`)
+        }
         return
       }
       if (cmd === 'q' || cmd === 'exit') {

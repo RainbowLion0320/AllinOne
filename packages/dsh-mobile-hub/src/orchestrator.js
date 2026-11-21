@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
@@ -178,32 +178,60 @@ export class MultiAppOrchestrator {
 
   /**
    * Download any relay-hosted attachments to local PC disk before handing them to local agents.
+   * Security:
+   *  - NEVER trusts caller-supplied `att.localPath` (prevents arbitrary local file injection).
+   *  - Strictly validates `att.url` matches `/api/uploads/<uuid>` and ALWAYS fetches from `this.relayHttpBase`
+   *    with `redirect: 'error'` so `X-Bridge-Secret` can NEVER be leaked to third-party hosts (SSRF defense).
    */
   async materializeAttachments(attachments = []) {
     if (!Array.isArray(attachments) || attachments.length === 0) return []
+    const RELAY_UPLOAD_PATH_RE = /^\/api\/uploads\/[a-f0-9-]{8,64}$/i
+    const MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
     mkdirSync(this.inboundDir, { recursive: true })
+    try { chmodSync(this.inboundDir, 0o700) } catch {}
     const out = []
 
-    for (const att of attachments) {
-      if (att.localPath) {
-        out.push(att)
+    for (const att of attachments.slice(0, 12)) {
+      if (!att || typeof att !== 'object') continue
+      const rawUrl = String(att.url || '').trim()
+      if (!rawUrl || !this.relayHttpBase) continue
+      if (!RELAY_UPLOAD_PATH_RE.test(rawUrl)) {
+        this.log.warn?.(`mobile-hub: rejected untrusted attachment URL: ${rawUrl.slice(0, 120)}`)
         continue
       }
-      if (att.url && this.relayHttpBase) {
-        try {
-          const fullUrl = att.url.startsWith('http') ? att.url : `${this.relayHttpBase}${att.url}`
-          const headers = { 'X-Bridge-Secret': this.bridgeSecret }
-          if (this.roomId) headers['X-Room-Id'] = this.roomId
-          const res = await fetch(fullUrl, { headers })
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          const arrBuf = await res.arrayBuffer()
-          const safe = String(att.filename || 'upload.bin').replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_')
-          const localPath = join(this.inboundDir, `${Date.now()}-${safe}`)
-          writeFileSync(localPath, Buffer.from(arrBuf))
-          out.push({ ...att, localPath })
-        } catch (err) {
-          this.log.warn?.(`mobile-hub: failed downloading attachment ${att.filename}: ${String(err)}`)
+      try {
+        const isImage = String(att.mimeType || '').toLowerCase().startsWith('image/')
+        // Ephemeral cleanup: consume non-image uploads on relay immediately after PC downloads them
+        const fullUrl = `${this.relayHttpBase}${rawUrl}${isImage ? '' : '?consume=1'}`
+        const headers = { 'X-Bridge-Secret': this.bridgeSecret }
+        if (this.roomId) headers['X-Room-Id'] = this.roomId
+        const res = await fetch(fullUrl, { headers, redirect: 'error' })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const declaredLen = Number(res.headers.get('content-length') || 0)
+        if (declaredLen > MAX_DOWNLOAD_BYTES) {
+          throw new Error('Attachment exceeds 15MB limit')
         }
+        const arrBuf = await res.arrayBuffer()
+        if (arrBuf.byteLength === 0 || arrBuf.byteLength > MAX_DOWNLOAD_BYTES) {
+          throw new Error('Attachment size invalid or exceeds 15MB limit')
+        }
+        const rawBase = basename(String(att.filename || 'upload.bin'))
+        const safe = rawBase
+          .replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_')
+          .replace(/^\.+/, '')
+          .slice(0, 100) || 'upload.bin'
+        const localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safe}`)
+        writeFileSync(localPath, Buffer.from(arrBuf), { mode: 0o600 })
+        out.push({
+          id: att.id,
+          filename: safe,
+          mimeType: att.mimeType || 'application/octet-stream',
+          size: arrBuf.byteLength,
+          url: rawUrl,
+          localPath,
+        })
+      } catch (err) {
+        this.log.warn?.(`mobile-hub: failed downloading attachment ${att.filename}: ${String(err)}`)
       }
     }
     return out
@@ -415,7 +443,14 @@ export class MultiAppOrchestrator {
     if (!existsSync(resolved)) {
       throw new Error(`找不到本机图片文件：${resolved}`)
     }
-    const st = statSync(resolved)
+    // Resolve symlinks and re-validate the real target's extension so `fake.png -> /etc/passwd` is blocked
+    const realPath = realpathSync(resolved)
+    const realExt = extname(realPath).toLowerCase()
+    const realMimeType = IMAGE_MIMES[realExt]
+    if (!realMimeType) {
+      throw new Error(`出于安全限制，符号链接指向非图片文件，已拒绝访问（${realExt || '未知格式'}）`)
+    }
+    const st = statSync(realPath)
     if (!st.isFile()) {
       throw new Error('目标路径不是文件')
     }
@@ -423,14 +458,14 @@ export class MultiAppOrchestrator {
       throw new Error(`图片文件大小超出限制（${Math.round(st.size / 1024 / 1024)}MB / 最大 20MB）`)
     }
 
-    const buf = readFileSync(resolved)
+    const buf = readFileSync(realPath)
     return {
       ok: true,
-      filename: basename(resolved),
-      mimeType,
+      filename: basename(realPath),
+      mimeType: realMimeType,
       size: buf.length,
       mtimeMs: st.mtimeMs,
-      path: resolved,
+      path: realPath,
       dataBase64: buf.toString('base64'),
     }
   }

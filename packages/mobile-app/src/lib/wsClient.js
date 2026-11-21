@@ -168,6 +168,74 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
   }
 }
 
+export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
+  const base = normalizeBaseUrl(baseUrl)
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const res = await fetch(`${base}/api/auth/ws-ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    if (res.status === 401) {
+      const err = new Error('登录已失效')
+      err.status = 401
+      throw err
+    }
+    if (res.status === 404) {
+      // Older relay server without ws-ticket support -> caller may fall back to legacy token query
+      return null
+    }
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok || !data.ticket) {
+      throw new Error(data.error || `获取连接票据失败 (HTTP ${res.status})`)
+    }
+    return data.ticket
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+export async function requestMediaToken(baseUrl, token, timeoutMs = 8000) {
+  const base = normalizeBaseUrl(baseUrl)
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const res = await fetch(`${base}/api/auth/media-token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    if (res.status === 404) return { unsupported: true, mediaToken: '', expiresAt: 0 }
+    if (res.status === 401) {
+      const err = new Error('登录已失效')
+      err.status = 401
+      throw err
+    }
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok || !data.mediaToken) {
+      throw new Error(data.error || `获取媒体令牌失败 (HTTP ${res.status})`)
+    }
+    return { unsupported: false, mediaToken: data.mediaToken, expiresAt: data.expiresAt || 0 }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+export async function revokeDeviceSessions(baseUrl, token) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/rooms/revoke`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `吊销会话失败 (HTTP ${res.status})`)
+  }
+  return data
+}
+
 /**
  * Mobile WebSocket RPC + Stream client with automatic reconnect & catch-up replay.
  */
@@ -179,6 +247,7 @@ export class MobileRelayClient {
     this.ws = null
     this.closed = false
     this.openedOnce = false
+    this.connectGen = 0
     this.lastSeq = 0
     this.attempt = 0
     this.reconnectTimer = null
@@ -220,6 +289,7 @@ export class MobileRelayClient {
 
   disconnect() {
     this.closed = true
+    this.connectGen += 1
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -238,13 +308,42 @@ export class MobileRelayClient {
     this.emitStatus()
   }
 
-  openSocket() {
+  scheduleNextReconnect() {
+    if (this.closed || this.reconnectTimer) return
+    const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
+    this.attempt += 1
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      void this.openSocket()
+    }, delay)
+  }
+
+  async openSocket() {
     if (this.closed) return
+    const gen = ++this.connectGen
     this.connectionState = 'connecting'
     this.emitStatus()
 
+    // Exchange 30-day master JWT (in Authorization header) for a 30s single-use WS ticket
+    let ticket = null
+    try {
+      ticket = await requestWsTicket(this.baseUrl, this.token)
+    } catch (err) {
+      if (this.closed || gen !== this.connectGen) return
+      if (err?.status === 401) {
+        this.connectionState = 'unauthorized'
+        this.emitStatus()
+        return
+      }
+      this.connectionState = 'disconnected'
+      this.emitStatus()
+      this.scheduleNextReconnect()
+      return
+    }
+    if (this.closed || gen !== this.connectGen) return
+
     const url = toWsUrl(this.baseUrl, '/ws/client', {
-      token: this.token,
+      ...(ticket ? { ticket } : { token: this.token }),
       lastSeq: this.lastSeq > 0 ? this.lastSeq : undefined,
     })
 
@@ -252,6 +351,10 @@ export class MobileRelayClient {
     this.ws = ws
 
     ws.onopen = () => {
+      if (this.closed || gen !== this.connectGen) {
+        try { ws.close(1000) } catch {}
+        return
+      }
       this.attempt = 0
       this.openedOnce = true
       this.connectionState = 'connected'
@@ -295,7 +398,7 @@ export class MobileRelayClient {
     ws.onclose = (ev) => {
       this.stopPing()
       if (this.ws === ws) this.ws = null
-      if (this.closed) return
+      if (this.closed || gen !== this.connectGen) return
       if (ev.code === 4401) {
         this.connectionState = 'unauthorized'
         this.emitStatus()
@@ -304,33 +407,23 @@ export class MobileRelayClient {
       this.connectionState = 'disconnected'
       this.emitStatus()
 
-      const scheduleNext = () => {
-        if (this.closed) return
-        const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
-        this.attempt += 1
-        this.reconnectTimer = setTimeout(() => {
-          this.reconnectTimer = null
-          this.openSocket()
-        }, delay)
-      }
-
       // If handshake failed before ever opening, verify whether the 30-day JWT expired (HTTP 401)
       if (!this.openedOnce && this.attempt === 0) {
         probeDeviceStatus({ baseUrl: this.baseUrl, token: this.token }, 4000)
           .then((res) => {
-            if (this.closed) return
+            if (this.closed || gen !== this.connectGen) return
             if (res.status === 'expired') {
               this.connectionState = 'unauthorized'
               this.emitStatus()
               return
             }
-            scheduleNext()
+            this.scheduleNextReconnect()
           })
-          .catch(scheduleNext)
+          .catch(() => this.scheduleNextReconnect())
         return
       }
 
-      scheduleNext()
+      this.scheduleNextReconnect()
     }
 
     ws.onerror = () => {

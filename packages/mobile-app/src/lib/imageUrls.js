@@ -35,7 +35,7 @@ export function normalizeImageKey(ref) {
     .toLowerCase()
 }
 
-export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '', bridgeId = '' } = {}) {
+export function resolveImageSrc(item, { baseUrl = '', token = '', mediaToken = '', cwd = '', bridgeId = '' } = {}) {
   const rawUrl = typeof item === 'string' ? '' : String(item?.url || '').trim()
   const rawPath = typeof item === 'string' ? String(item).trim() : String(item?.path || '').trim()
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
@@ -46,11 +46,14 @@ export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '', brid
   }
 
   const cleanBase = String(baseUrl || '').replace(/\/+$/, '')
+  const authParamName = mediaToken ? 'mt' : 'token'
+  const authParamVal = mediaToken || token
 
   // Relay-hosted uploaded attachment
   if (target.startsWith('/api/uploads/')) {
+    if (!cleanBase || !authParamVal) return ''
     const sep = target.includes('?') ? '&' : '?'
-    return `${cleanBase}${target}${token ? `${sep}token=${encodeURIComponent(token)}` : ''}`
+    return `${cleanBase}${target}${sep}${authParamName}=${encodeURIComponent(authParamVal)}`
   }
 
   // External or direct HTTP(S) URL
@@ -60,21 +63,22 @@ export function resolveImageSrc(item, { baseUrl = '', token = '', cwd = '', brid
       target.startsWith(cleanBase) &&
       (target.includes('/api/uploads/') || target.includes('/api/bridge-file')) &&
       !target.includes('token=') &&
-      token
+      !target.includes('mt=')
     ) {
+      if (!authParamVal) return ''
       const sep = target.includes('?') ? '&' : '?'
-      return `${target}${sep}token=${encodeURIComponent(token)}`
+      return `${target}${sep}${authParamName}=${encodeURIComponent(authParamVal)}`
     }
     return target
   }
 
   // Local PC file path (Windows absolute, file:// URI, ~/..., or relative to session cwd)
-  if (!cleanBase) return ''
+  if (!cleanBase || !authParamVal) return ''
   const params = new URLSearchParams()
   params.set('path', target)
   if (cwd) params.set('cwd', cwd)
   if (bridgeId) params.set('bridgeId', bridgeId)
-  if (token) params.set('token', token)
+  params.set(authParamName, authParamVal)
   return `${cleanBase}/api/bridge-file?${params.toString()}`
 }
 

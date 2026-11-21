@@ -362,26 +362,40 @@ export function DeviceSwitcherModal({
 
                   {/* Inline remove confirmation */}
                   {isConfirmingDelete && (
-                    <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                      <span>移除此电脑并清空其本地缓存？</span>
-                      <div className="flex shrink-0 items-center gap-1.5">
+                    <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>移除此电脑并清空其本地缓存？</span>
                         <button
                           type="button"
                           onClick={() => setConfirmDeleteId(null)}
-                          className="rounded-lg bg-white px-2 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                          className="shrink-0 rounded-lg bg-white px-2 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-200"
                         >
                           取消
                         </button>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
                         <button
                           type="button"
                           onClick={() => {
                             setConfirmDeleteId(null)
-                            onRemoveDevice?.(device.id)
+                            onRemoveDevice?.(device.id, { revokeAll: false })
                           }}
-                          className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white active:scale-95"
+                          className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 active:scale-95 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
                         >
-                          确认移除
+                          仅移除本机
                         </button>
+                        {status !== 'expired' && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setConfirmDeleteId(null)
+                              onRemoveDevice?.(device.id, { revokeAll: true })
+                            }}
+                            className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white active:scale-95"
+                          >
+                            移除并踢出全部手机
+                          </button>
+                        )}
                       </div>
                     </div>
                   )}

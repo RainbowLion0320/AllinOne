@@ -252,7 +252,7 @@ export function SidebarDrawer({
               <div className="flex items-center gap-1.5 text-[15px] font-bold text-slate-900 dark:text-white">
                 <span>All in One</span>
                 <span className="rounded-md bg-slate-200/80 px-1.5 py-0.2 text-[9.5px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                  v0.1.20
+                  v0.1.21
                 </span>
               </div>
               <div className="text-[10.5px] text-slate-400">
