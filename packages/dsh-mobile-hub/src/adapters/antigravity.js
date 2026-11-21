@@ -546,44 +546,20 @@ export class AntigravityAdapter {
     this.reaperTimer = null
   }
 
-  async listModels() {
-    if (this.modelsCache && Date.now() - this.modelsCacheAt < 5 * 60_000) {
-      return this.modelsCache
-    }
-    const cliVer = await this.checkCliVersion()
-    if (!cliVer) {
-      return { app: APPS.ANTIGRAVITY, defaultModel: '', defaultEffort: '', supportsMidChatSwitch: false, models: [] }
-    }
-
-    const rawText = await new Promise((resolvePromise) => {
-      try {
-        const proc = spawnCrossPlatform(this.agyBin, ['models'], {
-          stdio: ['ignore', 'pipe', 'ignore'],
-          windowsHide: true,
-        })
-        let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
-        proc.on('close', () => resolvePromise(out))
-        proc.on('error', () => resolvePromise(''))
-      } catch {
-        resolvePromise('')
-      }
-    })
-
+  parseModelPairs(pairs = []) {
     const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max']
     const familyMap = new Map()
     const familyOrder = []
 
-    for (const line of rawText.split(/\r?\n/)) {
-      const trimmed = line.trim()
-      if (!trimmed || !trimmed.includes('\t')) continue
-      const [id, rawLabel] = trimmed.split('\t').map((s) => s.trim())
+    for (const { id: rawId, label: rawLabel } of pairs) {
+      const id = String(rawId || '').trim()
       if (!id) continue
+      const label = String(rawLabel || '').trim()
       const m = id.match(/^(.+)-(low|medium|high|xhigh|max)$/i)
       if (m) {
         const baseId = m[1]
         const eff = m[2].toLowerCase()
-        const cleanName = (rawLabel || baseId).replace(/\s*\((Low|Medium|High|XHigh|Max)\)\s*$/i, '').trim()
+        const cleanName = (label || baseId).replace(/\s*\((Low|Medium|High|XHigh|Max)\)\s*$/i, '').trim()
         let entry = familyMap.get(baseId)
         if (!entry) {
           entry = { id: baseId, name: cleanName, efforts: [], effortModelIds: {}, defaultEffort: '' }
@@ -594,13 +570,13 @@ export class AntigravityAdapter {
         entry.effortModelIds[eff] = id
       } else {
         if (!familyMap.has(id)) {
-          familyMap.set(id, { id, name: rawLabel || id, efforts: [], effortModelIds: {}, defaultEffort: '' })
+          familyMap.set(id, { id, name: label || id, efforts: [], effortModelIds: {}, defaultEffort: '' })
           familyOrder.push(id)
         }
       }
     }
 
-    const models = familyOrder.map((key) => {
+    return familyOrder.map((key) => {
       const e = familyMap.get(key)
       e.efforts.sort((a, b) => EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b))
       e.defaultEffort = e.efforts.includes('high')
@@ -610,16 +586,113 @@ export class AntigravityAdapter {
           : e.efforts[0] || ''
       return e
     })
+  }
 
-    this.modelsCache = {
+  async listModelsViaAcpFallback() {
+    const client = new AgyAcpClient({
+      agyBin: this.agyBin,
+      cwd: this.defaultCwd,
+      autoApprove: this.autoApprove,
+      log: this.log,
+    })
+    let sessionId = ''
+    try {
+      await client.start()
+      const res = await client.rpc('session/new', { cwd: this.defaultCwd, mcpServers: [] }, 15_000)
+      sessionId = res?.sessionId || ''
+      const raw = res?.models?.availableModels || res?.availableModels || []
+      return raw
+        .map((m) => ({
+          id: m?.modelId || m?.id || '',
+          label: m?.name || m?.displayName || m?.modelId || '',
+        }))
+        .filter((x) => x.id)
+    } catch (err) {
+      this.log.warn?.(`mobile-hub: agy ACP model fallback failed: ${String(err?.message || err)}`)
+      return []
+    } finally {
+      await client.close(sessionId).catch(() => {})
+    }
+  }
+
+  async listModels() {
+    if (this.modelsCache && this.modelsCache.models?.length > 0 && Date.now() - this.modelsCacheAt < 5 * 60_000) {
+      return this.modelsCache
+    }
+    const cliVer = await this.checkCliVersion()
+    if (!cliVer) {
+      return {
+        app: APPS.ANTIGRAVITY,
+        defaultModel: '',
+        defaultEffort: '',
+        supportsMidChatSwitch: false,
+        models: [],
+        hint: process.platform === 'win32'
+          ? '需先安装 Antigravity CLI (irm https://antigravity.google/cli/install.ps1 | iex)'
+          : '需先安装 Antigravity CLI (curl -fsSL https://antigravity.google/cli/install.sh | bash)',
+      }
+    }
+
+    const rawText = await new Promise((resolvePromise) => {
+      let settled = false
+      const done = (val) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolvePromise(val)
+      }
+      let proc = null
+      const timer = setTimeout(() => {
+        try { proc?.kill() } catch {}
+        done('')
+      }, 15_000)
+      try {
+        proc = spawnCrossPlatform(this.agyBin, ['models'], {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          windowsHide: true,
+        })
+        let out = ''
+        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
+        proc.on('close', () => done(out))
+        proc.on('error', () => done(''))
+      } catch {
+        done('')
+      }
+    })
+
+    const cliPairs = []
+    for (const rawLine of rawText.split(/\r?\n/)) {
+      // Strip any ANSI escape codes or carriage-return spinner fragments
+      const cleaned = rawLine.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').split('\r').pop() || ''
+      const trimmed = cleaned.trim()
+      if (!trimmed || /^fetching\b/i.test(trimmed)) continue
+      const cols = trimmed.includes('\t')
+        ? trimmed.split('\t').map((s) => s.trim()).filter(Boolean)
+        : trimmed.split(/\s{2,}/).map((s) => s.trim()).filter(Boolean)
+      if (cols.length >= 2 && /^[a-z0-9._-]+$/i.test(cols[0])) {
+        cliPairs.push({ id: cols[0], label: cols.slice(1).join(' ') })
+      }
+    }
+
+    let models = this.parseModelPairs(cliPairs)
+    if (models.length === 0) {
+      // Fallback: query models directly from Desktop's shared `--app-data-dir antigravity` ACP auth!
+      const acpPairs = await this.listModelsViaAcpFallback()
+      models = this.parseModelPairs(acpPairs)
+    }
+
+    const catalog = {
       app: APPS.ANTIGRAVITY,
       defaultModel: models[0]?.id || '',
       defaultEffort: models[0]?.defaultEffort || '',
-      supportsMidChatSwitch: true,
+      supportsMidChatSwitch: models.length > 0,
       models,
     }
-    this.modelsCacheAt = Date.now()
-    return this.modelsCache
+    if (models.length > 0) {
+      this.modelsCache = catalog
+      this.modelsCacheAt = Date.now()
+    }
+    return catalog
   }
 
   async resolveAcpModelId(model, reasoningEffort) {
@@ -641,17 +714,29 @@ export class AntigravityAdapter {
     if (this.cliVersionCache) return this.cliVersionCache
     this.agyBin = findAgyBinary(this.configuredBin)
     const ver = await new Promise((resolvePromise) => {
+      let settled = false
+      const done = (val) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolvePromise(val)
+      }
+      let proc = null
+      const timer = setTimeout(() => {
+        try { proc?.kill() } catch {}
+        done('')
+      }, 6_000)
       try {
-        const proc = spawnCrossPlatform(this.agyBin, ['--version'], {
+        proc = spawnCrossPlatform(this.agyBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
         let out = ''
         proc.stdout.on('data', (d) => { out += d.toString('utf8') })
-        proc.on('close', (code) => resolvePromise(code === 0 ? out.trim() : ''))
-        proc.on('error', () => resolvePromise(''))
+        proc.on('close', (code) => done(code === 0 ? out.trim() : ''))
+        proc.on('error', () => done(''))
       } catch {
-        resolvePromise('')
+        done('')
       }
     })
     if (ver) this.cliVersionCache = ver
@@ -764,7 +849,11 @@ export class AntigravityAdapter {
   async createSession({ cwd, title, model, reasoningEffort } = {}) {
     const cliVer = await this.checkCliVersion()
     if (!cliVer) {
-      throw new Error('本机未检测到官方 Antigravity CLI（agy.exe）。')
+      throw new Error(
+        process.platform === 'win32'
+          ? '本机未检测到 Antigravity CLI（请运行 irm https://antigravity.google/cli/install.ps1 | iex 安装）'
+          : '本机未检测到 Antigravity CLI（请运行 curl -fsSL https://antigravity.google/cli/install.sh | bash 安装）',
+      )
     }
     const targetCwd = String(cwd || '').trim() && existsSync(String(cwd).trim())
       ? String(cwd).trim()
@@ -795,7 +884,9 @@ export class AntigravityAdapter {
         this.sessionPrefs.set(sessionId, { model: model || '', reasoningEffort: reasoningEffort || '' })
         const resolvedModel = await this.resolveAcpModelId(model, reasoningEffort)
         if (resolvedModel) {
-          await client.rpc('session/set_model', { sessionId, modelId: resolvedModel }, 10_000).catch(() => {})
+          await client.rpc('session/set_model', { sessionId, modelId: resolvedModel }, 10_000).catch((err) => {
+            this.log.warn?.(`mobile-hub: agy session/set_model(${resolvedModel}) failed: ${String(err?.message || err)}`)
+          })
         }
       }
       this.ensureReaperRunning()
@@ -1143,7 +1234,11 @@ export class AntigravityAdapter {
     try {
       const cliVer = await this.checkCliVersion()
       if (!cliVer) {
-        throw new Error('本机未检测到官方 Antigravity CLI（agy.exe）。')
+        throw new Error(
+        process.platform === 'win32'
+          ? '本机未检测到 Antigravity CLI（请运行 irm https://antigravity.google/cli/install.ps1 | iex 安装）'
+          : '本机未检测到 Antigravity CLI（请运行 curl -fsSL https://antigravity.google/cli/install.sh | bash 安装）',
+      )
       }
       if (this.activeTurns.has(sessionId)) {
         throw new Error('该 Antigravity 对话正在运行中，请等待完成或先点击停止。')
@@ -1226,7 +1321,9 @@ export class AntigravityAdapter {
       if (effectiveModel) {
         const resolvedModel = await this.resolveAcpModelId(effectiveModel, effectiveEffort)
         if (resolvedModel) {
-          await entry.client.rpc('session/set_model', { sessionId, modelId: resolvedModel }, 10_000).catch(() => {})
+          await entry.client.rpc('session/set_model', { sessionId, modelId: resolvedModel }, 10_000).catch((err) => {
+            this.log.warn?.(`mobile-hub: agy session/set_model(${resolvedModel}) failed: ${String(err?.message || err)}`)
+          })
         }
       }
 

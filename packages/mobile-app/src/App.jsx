@@ -76,6 +76,7 @@ export function App() {
 
   const [appsStatus, setAppsStatus] = useState([])
   const [modelsCatalog, setModelsCatalog] = useState({})
+  const [loadingModels, setLoadingModels] = useState(false)
   const [sessionModelPrefs, setSessionModelPrefs] = useState({})
   const [draftDshPref, setDraftDshPref] = useState(null)
   const [workspaces, setWorkspaces] = useState([])
@@ -1427,7 +1428,22 @@ export function App() {
         onSwitchAppClick={() => setNewChatOpen(true)}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
-        onOpenModelPicker={() => setModelPickerOpen(true)}
+        onOpenModelPicker={() => {
+          setModelPickerOpen(true)
+          const curModels = modelsCatalog?.[activeApp]?.models || []
+          if (curModels.length === 0 && clientRef.current && connState === 'connected' && activeBridgeId) {
+            setLoadingModels(true)
+            clientRef.current
+              .rpc(RPC.MODELS_LIST, { app: activeApp }, 25_000, { bridgeId: activeBridgeId })
+              .then((res) => {
+                if (res?.catalog) {
+                  setModelsCatalog((prev) => ({ ...prev, ...res.catalog }))
+                }
+              })
+              .catch(() => {})
+              .finally(() => setLoadingModels(false))
+          }
+        }}
         imageContext={imageContext}
         onUploadFile={(file) => clientRef.current?.uploadFile(file)}
         onSend={handleSend}
@@ -1507,6 +1523,7 @@ export function App() {
         open={modelPickerOpen}
         app={activeApp}
         catalog={activeCatalog}
+        loading={loadingModels}
         value={activeModelPref}
         mode="midchat"
         onClose={() => setModelPickerOpen(false)}
