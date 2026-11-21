@@ -1,0 +1,331 @@
+const STORAGE_KEY = 'allinone_dsh_auth_v1'
+
+export function loadSavedAuth() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed.token === 'string') return parsed
+  } catch {}
+  return null
+}
+
+export function saveAuth(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
+  } catch {}
+}
+
+export function clearAuth() {
+  try {
+    localStorage.removeItem(STORAGE_KEY)
+  } catch {}
+}
+
+export const DEFAULT_PROD_SERVER =
+  String(import.meta.env.VITE_RELAY_URL || '').trim().replace(/\/+$/, '') ||
+  'https://your-relay.example.com'
+
+export function detectDefaultServerUrl() {
+  if (typeof window !== 'undefined' && window.location.protocol.startsWith('http')) {
+    const host = window.location.hostname
+    const port = window.location.port
+    // Inside Capacitor Android/iOS WebView, origin is https://localhost or capacitor://localhost
+    if (host === 'localhost' && (!port || port === '80' || port === '443')) {
+      return DEFAULT_PROD_SERVER
+    }
+    const basePath = window.location.pathname
+      .replace(/\/index\.html$/i, '')
+      .replace(/\/+$/, '')
+    return `${window.location.origin}${basePath}`
+  }
+  return DEFAULT_PROD_SERVER
+}
+
+export function normalizeBaseUrl(input) {
+  const trimmed = String(input || '').trim().replace(/\/+$/, '')
+  if (!trimmed) {
+    return detectDefaultServerUrl()
+  }
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return `https://${trimmed}`
+  }
+  return trimmed
+}
+
+export function toWsUrl(httpBase, path, queryParams = {}) {
+  const base = normalizeBaseUrl(httpBase)
+  const cleanPath = String(path || '').replace(/^\/+/, '')
+  const u = new URL(`${base}/${cleanPath}`)
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
+  for (const [k, v] of Object.entries(queryParams)) {
+    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v))
+  }
+  return u.toString()
+}
+
+export async function loginToRelay(serverUrl, password) {
+  const base = normalizeBaseUrl(serverUrl)
+  const res = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      password,
+      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `连接失败 (HTTP ${res.status})`)
+  }
+  return {
+    baseUrl: base,
+    token: data.token,
+    roomId: data.roomId || 'owner',
+    bridges: data.bridges || [],
+  }
+}
+
+export function parsePairInput(rawInput) {
+  const text = String(rawInput || '').trim()
+  if (!text) return { pairCode: '', pairToken: '', serverUrl: '' }
+
+  // Full pairing link pasted from PC terminal/QR (e.g. https://.../dsh/?pair=pt_xxx)
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const u = new URL(text)
+      const pairToken = u.searchParams.get('pair') || u.searchParams.get('token') || ''
+      const pairCode = u.searchParams.get('code') || ''
+      const basePath = u.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '')
+      const serverUrl = `${u.origin}${basePath}`
+      return { pairCode, pairToken, serverUrl }
+    } catch {}
+  }
+
+  if (text.startsWith('pt_')) {
+    return { pairCode: '', pairToken: text, serverUrl: '' }
+  }
+
+  return { pairCode: text, pairToken: '', serverUrl: '' }
+}
+
+export async function pairWithRelay(serverUrl, { pairCode = '', pairToken = '' } = {}) {
+  const base = normalizeBaseUrl(serverUrl)
+  const res = await fetch(`${base}/api/auth/pair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      pairCode,
+      pairToken,
+      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `配对失败 (HTTP ${res.status})`)
+  }
+  return {
+    baseUrl: base,
+    token: data.token,
+    roomId: data.roomId || '',
+    label: data.label || '',
+    bridges: data.bridges || [],
+  }
+}
+
+/**
+ * Mobile WebSocket RPC + Stream client with automatic reconnect & catch-up replay.
+ */
+export class MobileRelayClient {
+  constructor({ baseUrl, token }) {
+    this.baseUrl = normalizeBaseUrl(baseUrl)
+    this.token = token
+    this.ws = null
+    this.closed = false
+    this.lastSeq = 0
+    this.attempt = 0
+    this.reconnectTimer = null
+    this.pingTimer = null
+    this.reqSeq = 1
+    this.pending = new Map()
+    this.eventListeners = new Set()
+    this.statusListeners = new Set()
+    this.connectionState = 'disconnected'
+    this.bridges = []
+  }
+
+  onEvent(fn) {
+    this.eventListeners.add(fn)
+    return () => this.eventListeners.delete(fn)
+  }
+
+  onStatus(fn) {
+    this.statusListeners.add(fn)
+    fn({ state: this.connectionState, bridges: this.bridges })
+    return () => this.statusListeners.delete(fn)
+  }
+
+  emitStatus() {
+    const snap = { state: this.connectionState, bridges: this.bridges }
+    for (const fn of this.statusListeners) {
+      try { fn(snap) } catch {}
+    }
+  }
+
+  connect() {
+    this.closed = false
+    this.openSocket()
+  }
+
+  disconnect() {
+    this.closed = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.stopPing()
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer)
+      p.reject(new Error('连接已断开'))
+    }
+    this.pending.clear()
+    if (this.ws) {
+      try { this.ws.close(1000) } catch {}
+      this.ws = null
+    }
+    this.connectionState = 'disconnected'
+    this.emitStatus()
+  }
+
+  openSocket() {
+    if (this.closed) return
+    this.connectionState = 'connecting'
+    this.emitStatus()
+
+    const url = toWsUrl(this.baseUrl, '/ws/client', {
+      token: this.token,
+      lastSeq: this.lastSeq > 0 ? this.lastSeq : undefined,
+    })
+
+    const ws = new WebSocket(url)
+    this.ws = ws
+
+    ws.onopen = () => {
+      this.attempt = 0
+      this.connectionState = 'connected'
+      this.emitStatus()
+      this.startPing()
+    }
+
+    ws.onmessage = (ev) => {
+      let msg
+      try { msg = JSON.parse(ev.data) } catch { return }
+
+      if (msg.type === 'hello') {
+        if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
+        this.bridges = msg.bridges || []
+        this.emitStatus()
+        return
+      }
+
+      if (msg.type === 'rpc.res') {
+        const p = this.pending.get(msg.id)
+        if (!p) return
+        clearTimeout(p.timer)
+        this.pending.delete(msg.id)
+        if (msg.ok) p.resolve(msg.result)
+        else p.reject(new Error(msg.error?.message || 'RPC 执行失败'))
+        return
+      }
+
+      if (msg.type === 'event') {
+        if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
+        if (msg.event === 'bridge.status' && Array.isArray(msg.payload?.bridges)) {
+          this.bridges = msg.payload.bridges
+          this.emitStatus()
+        }
+        for (const fn of this.eventListeners) {
+          try { fn(msg.event, msg.payload, msg) } catch {}
+        }
+      }
+    }
+
+    ws.onclose = (ev) => {
+      this.stopPing()
+      if (this.ws === ws) this.ws = null
+      if (this.closed) return
+      this.connectionState = ev.code === 4401 ? 'unauthorized' : 'disconnected'
+      this.emitStatus()
+      const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
+      this.attempt += 1
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null
+        this.openSocket()
+      }, delay)
+    }
+
+    ws.onerror = () => {
+      // handled in onclose
+    }
+  }
+
+  startPing() {
+    this.stopPing()
+    this.pingTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        try { this.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+      }
+    }, 25_000)
+  }
+
+  stopPing() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer)
+      this.pingTimer = null
+    }
+  }
+
+  rpc(method, params = {}, timeoutMs = 45_000) {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('尚未连接到中转服务器，正在重连...'))
+        return
+      }
+      const id = `c-${this.reqSeq++}-${Date.now()}`
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return
+        this.pending.delete(id)
+        reject(new Error('请求超时，请检查电脑端连接状态'))
+      }, timeoutMs)
+      this.pending.set(id, { resolve, reject, timer })
+      this.ws.send(JSON.stringify({ type: 'rpc.req', id, method, params, timeoutMs }))
+    })
+  }
+
+  async uploadFile(file) {
+    const dataBase64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result || ''))
+      reader.onerror = () => reject(new Error('读取文件失败'))
+      reader.readAsDataURL(file)
+    })
+
+    const res = await fetch(`${this.baseUrl}/api/uploads`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        dataBase64,
+      }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || '上传失败')
+    }
+    return data.upload
+  }
+}

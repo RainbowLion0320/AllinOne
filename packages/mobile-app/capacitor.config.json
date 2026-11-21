@@ -1,0 +1,16 @@
+{
+  "appId": "com.allinone.dshmobile",
+  "appName": "All in One",
+  "webDir": "dist",
+  "server": {
+    "url": "https://your-relay.example.com/",
+    "androidScheme": "https",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "ios": {
+    "contentInset": "automatic"
+  }
+}

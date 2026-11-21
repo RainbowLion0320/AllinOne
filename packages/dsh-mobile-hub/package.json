@@ -1,0 +1,27 @@
+{
+  "name": "dsh-mobile-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness Cordis plugin & local multi-agent bridge for AllinOne Mobile App (DSH / Codex / Claude / Antigravity).",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "standalone": "node standalone.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

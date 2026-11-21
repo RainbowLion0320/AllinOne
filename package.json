@@ -1,0 +1,22 @@
+{
+  "name": "allinone-dsh-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "description": "基于 DeepSeek Harness 的多应用远程控制手机 App（统一调度 DeepSeek Harness / Codex / Claude / Antigravity）",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:relay": "npm --workspace=@allinone/relay-server run dev",
+    "start:relay": "npm --workspace=@allinone/relay-server run start",
+    "dev:bridge": "npm --workspace=dsh-mobile-hub run standalone",
+    "dev:mobile": "npm --workspace=@allinone/mobile-app run dev",
+    "build:bridge": "node scripts/build-portable-bridge.mjs",
+    "build:mobile": "npm --workspace=@allinone/mobile-app run build",
+    "build": "npm run build:bridge && npm run build:mobile",
+    "test:smoke": "node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -1,0 +1,346 @@
+/**
+ * Local persistent chat history cache on the user's phone (IndexedDB with memory fallback).
+ * Guardrails against unbounded storage growth:
+ *  - Auto-deletes legacy v1 database on startup
+ *  - Max 40 sessions (LRU eviction)
+ *  - Max 120 persisted messages per session (strictly preserves valid pagination cursors)
+ *  - Max 12 MB total persisted size (byte-aware LRU eviction)
+ *  - 14-day TTL for inactive cached sessions
+ */
+
+const DB_NAME = 'allinone_session_cache_v2'
+const LEGACY_DB_NAME = 'allinone_session_cache_v1'
+const STORE_NAME = 'sessions'
+
+const MAX_CACHED_SESSIONS = 40
+const MAX_MESSAGES_PER_SESSION = 120
+const MAX_TOTAL_CACHE_BYTES = 12 * 1024 * 1024 // 12 MB
+const MAX_CACHE_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
+
+const memoryFallback = new Map()
+let dbPromise = null
+let legacyCleaned = false
+
+function cleanupLegacyDbOnce() {
+  if (legacyCleaned || typeof indexedDB === 'undefined') return
+  legacyCleaned = true
+  try {
+    indexedDB.deleteDatabase(LEGACY_DB_NAME)
+  } catch {}
+}
+
+function estimateBytes(obj) {
+  try {
+    return new Blob([JSON.stringify(obj)]).size
+  } catch {
+    try {
+      return JSON.stringify(obj).length * 2
+    } catch {
+      return 0
+    }
+  }
+}
+
+function openDb() {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null)
+  cleanupLegacyDbOnce()
+  if (dbPromise) return dbPromise
+  dbPromise = new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(DB_NAME, 1)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          const store = db.createObjectStore(STORE_NAME, { keyPath: 'sessionId' })
+          store.createIndex('cachedAt', 'cachedAt', { unique: false })
+        }
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => resolve(null)
+    } catch {
+      resolve(null)
+    }
+  })
+  return dbPromise
+}
+
+export async function loadCachedSession(sessionId) {
+  if (!sessionId) return null
+  const db = await openDb()
+  let record = null
+  if (!db) {
+    record = memoryFallback.get(sessionId) || null
+  } else {
+    record = await new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE_NAME, 'readonly')
+        const req = tx.objectStore(STORE_NAME).get(sessionId)
+        req.onsuccess = () => resolve(req.result || memoryFallback.get(sessionId) || null)
+        req.onerror = () => resolve(memoryFallback.get(sessionId) || null)
+      } catch {
+        resolve(memoryFallback.get(sessionId) || null)
+      }
+    })
+  }
+
+  if (!record) return null
+  if (record.cachedAt && Date.now() - record.cachedAt > MAX_CACHE_AGE_MS) {
+    void deleteCachedSession(sessionId)
+    return null
+  }
+  return record
+}
+
+export async function deleteCachedSession(sessionId) {
+  if (!sessionId) return
+  memoryFallback.delete(sessionId)
+  const db = await openDb()
+  if (!db) return
+  await new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      tx.objectStore(STORE_NAME).delete(sessionId)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
+}
+
+export async function saveCachedSession(sessionId, payload) {
+  if (!sessionId || !payload) return
+
+  let messages = Array.isArray(payload.messages) ? payload.messages : []
+  let hasMore = Boolean(payload.hasMore)
+  let nextCursor = payload.nextCursor ?? null
+  const totalCount = payload.totalCount ?? null
+
+  // Enforce per-session persisted cap without ever corrupting opaque cursors (e.g. Codex)
+  if (messages.length > MAX_MESSAGES_PER_SESSION) {
+    const dropCount = messages.length - MAX_MESSAGES_PER_SESSION
+    const isNumericCursor =
+      nextCursor === null ||
+      nextCursor === undefined ||
+      (typeof nextCursor === 'string' && /^\d+$/.test(nextCursor))
+
+    if (isNumericCursor) {
+      const baseStart = nextCursor ? Number(nextCursor) : 0
+      messages = messages.slice(dropCount)
+      nextCursor = String(baseStart + dropCount)
+      hasMore = true
+    } else {
+      // For opaque cursors (Codex), if an existing <=120 snapshot is already stored, keep its valid cursor
+      // and only refresh the newest tail without growing persisted size beyond 120.
+      const existing = await loadCachedSession(sessionId)
+      if (existing && existing.messages?.length >= MAX_MESSAGES_PER_SESSION) {
+        return
+      }
+      // First time exceeding 120: persist capped latest slice cleanly (user can still scroll live in RAM)
+      messages = messages.slice(-MAX_MESSAGES_PER_SESSION)
+    }
+  }
+
+  const baseRecord = {
+    sessionId,
+    meta: payload.meta || null,
+    messages,
+    hasMore,
+    nextCursor,
+    totalCount,
+    cachedAt: Date.now(),
+  }
+  const approxBytes = estimateBytes(baseRecord)
+  const record = { ...baseRecord, approxBytes }
+
+  memoryFallback.set(sessionId, record)
+
+  const db = await openDb()
+  if (!db) return
+
+  await new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      tx.objectStore(STORE_NAME).put(record)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
+
+  // Background TTL + session count + total byte budget LRU prune
+  pruneCacheBudget(db).catch(() => {})
+}
+
+async function pruneCacheBudget(db) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      const store = tx.objectStore(STORE_NAME)
+      const idx = store.index('cachedAt')
+      const cutoff = Date.now() - MAX_CACHE_AGE_MS
+      let keptCount = 0
+      let keptBytes = 0
+
+      const req = idx.openCursor(null, 'prev') // newest -> oldest
+      req.onsuccess = () => {
+        const cur = req.result
+        if (!cur) {
+          resolve()
+          return
+        }
+        const val = cur.value || {}
+        const size = Number(val.approxBytes) || estimateBytes(val)
+        const expired = val.cachedAt && val.cachedAt < cutoff
+        const overSessions = keptCount >= MAX_CACHED_SESSIONS
+        const overBytes = keptCount > 0 && keptBytes + size > MAX_TOTAL_CACHE_BYTES
+
+        if (expired || overSessions || overBytes) {
+          store.delete(cur.primaryKey)
+          memoryFallback.delete(cur.primaryKey)
+        } else {
+          keptCount += 1
+          keptBytes += size
+        }
+        cur.continue()
+      }
+      req.onerror = () => resolve()
+    } catch {
+      resolve()
+    }
+  })
+}
+
+export async function getSessionCacheStats() {
+  const db = await openDb()
+  if (!db) {
+    let messageCount = 0
+    let totalBytes = 0
+    for (const r of memoryFallback.values()) {
+      messageCount += r.messages?.length || 0
+      totalBytes += Number(r.approxBytes) || estimateBytes(r)
+    }
+    return { sessionCount: memoryFallback.size, messageCount, totalBytes }
+  }
+
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly')
+      const req = tx.objectStore(STORE_NAME).getAll()
+      req.onsuccess = () => {
+        const rows = Array.isArray(req.result) ? req.result : []
+        let messageCount = 0
+        let totalBytes = 0
+        for (const r of rows) {
+          messageCount += r.messages?.length || 0
+          totalBytes += Number(r.approxBytes) || estimateBytes(r)
+        }
+        resolve({ sessionCount: rows.length, messageCount, totalBytes })
+      }
+      req.onerror = () => resolve({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+    } catch {
+      resolve({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+    }
+  })
+}
+
+export async function clearSessionCache() {
+  memoryFallback.clear()
+  cleanupLegacyDbOnce()
+  const db = await openDb()
+  if (db) {
+    await new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE_NAME, 'readwrite')
+        tx.objectStore(STORE_NAME).clear()
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => resolve()
+      } catch {
+        resolve()
+      }
+    })
+  }
+}
+
+export function formatBytesCompact(bytes) {
+  const n = Number(bytes || 0)
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/**
+ * Deduplicate and merge chronological message arrays (`older` before `newer`).
+ */
+export function mergeSessionMessages(older = [], newer = []) {
+  const byId = new Map()
+  const orderedIds = []
+
+  const add = (m) => {
+    if (!m) return
+    const id = m.id || `${m.role}-${m.ts || 0}-${orderedIds.length}`
+    if (!byId.has(id)) {
+      orderedIds.push(id)
+      byId.set(id, { ...m, id })
+    } else {
+      byId.set(id, { ...byId.get(id), ...m, id })
+    }
+  }
+
+  for (const m of older) add(m)
+  for (const m of newer) add(m)
+
+  return orderedIds.map((id) => byId.get(id))
+}
+
+/**
+ * Reconcile a fresh tail page from PC with an existing phone-cached history.
+ */
+export function reconcileCachedWithFreshPage(cached, fresh) {
+  const freshMsgs = Array.isArray(fresh?.messages) ? fresh.messages : []
+  const cachedMsgs = Array.isArray(cached?.messages) ? cached.messages : []
+
+  if (cachedMsgs.length === 0) {
+    return {
+      messages: freshMsgs,
+      hasMore: Boolean(fresh?.hasMore),
+      nextCursor: fresh?.nextCursor ?? null,
+      totalCount: fresh?.totalCount ?? null,
+    }
+  }
+
+  if (freshMsgs.length === 0) {
+    return {
+      messages: cachedMsgs,
+      hasMore: Boolean(cached?.hasMore),
+      nextCursor: cached?.nextCursor ?? null,
+      totalCount: cached?.totalCount ?? null,
+    }
+  }
+
+  const cachedIdSet = new Set(cachedMsgs.map((m) => m.id).filter(Boolean))
+  const overlaps = freshMsgs.some((m) => m.id && cachedIdSet.has(m.id))
+
+  if (overlaps && cachedMsgs.length >= freshMsgs.length) {
+    const firstFreshIdxInCache = cachedMsgs.findIndex((m) => m.id && m.id === freshMsgs[0]?.id)
+    const olderPrefix =
+      firstFreshIdxInCache > 0
+        ? cachedMsgs.slice(0, firstFreshIdxInCache)
+        : cachedMsgs.filter((m) => !freshMsgs.some((fm) => fm.id === m.id))
+    const merged = mergeSessionMessages(olderPrefix, freshMsgs)
+    return {
+      messages: merged,
+      hasMore: Boolean(cached.hasMore),
+      nextCursor: cached.nextCursor ?? null,
+      totalCount: fresh?.totalCount ?? cached.totalCount ?? null,
+    }
+  }
+
+  return {
+    messages: freshMsgs,
+    hasMore: Boolean(fresh?.hasMore),
+    nextCursor: fresh?.nextCursor ?? null,
+    totalCount: fresh?.totalCount ?? null,
+  }
+}

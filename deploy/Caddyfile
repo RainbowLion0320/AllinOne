@@ -1,0 +1,9 @@
+# 把下面的 ai.yourdomain.com 改成你自己的域名（Caddy 会自动申请免费 HTTPS/WSS 证书）
+ai.yourdomain.com {
+    encode gzip zstd
+
+    reverse_proxy allinone-relay:8787 {
+        flush_interval -1
+        header_up X-Real-IP {remote_host}
+    }
+}

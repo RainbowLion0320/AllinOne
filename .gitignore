@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+Thumbs.db
+packages/mobile-app/android/
+packages/mobile-app/ios/
+dist-apk/
+dist-assets/
+*.apk
+packages/relay-server/data/
+packages/dsh-mobile-hub/*.status.json
+packages/dsh-mobile-hub/cordis.patch.yml
+packages/mobile-app/public/downloads/allinone-bridge.mjs
+packages/mobile-app/.env.local

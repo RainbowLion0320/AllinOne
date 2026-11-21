@@ -1,0 +1,587 @@
+import React, { useEffect, useMemo, useState } from 'react'
+import { APP_META } from '@allinone/shared'
+import {
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Folder,
+  FolderOpen,
+  HardDrive,
+  LogOut,
+  Moon,
+  Plus,
+  RefreshCw,
+  Search,
+  Share2,
+  Sun,
+  Trash2,
+  Wifi,
+  WifiOff,
+  X,
+} from 'lucide-react'
+import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
+
+const FILTER_TABS = [
+  { id: 'all', label: '全部', color: '#4D6BFE' },
+  { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
+  { id: 'codex', label: 'Codex', color: '#10A37F' },
+  { id: 'claude', label: 'Claude', color: '#D97757' },
+  { id: 'antigravity', label: 'Antigravity', color: '#7C5CFF' },
+]
+
+function normalizeProjectKey(s) {
+  const rawWs = String(s.workspace || '').trim()
+  if (rawWs && rawWs !== 'Desktop' && rawWs !== 'SDK') return rawWs
+  const cwd = String(s.cwd || '').trim().replace(/[\\/]+$/, '')
+  if (cwd) {
+    const parts = cwd.split(/[\\/]/).filter(Boolean)
+    if (parts.length > 0) return parts[parts.length - 1]
+  }
+  return rawWs || '未分组'
+}
+
+function groupByProject(sessions) {
+  const map = new Map()
+  for (const s of sessions) {
+    const name = normalizeProjectKey(s)
+    const key = name.toLowerCase()
+    let group = map.get(key)
+    if (!group) {
+      group = {
+        key,
+        label: name,
+        cwd: s.cwd || '',
+        latestAt: 0,
+        hasRunning: false,
+        items: [],
+      }
+      map.set(key, group)
+    }
+    if (!group.cwd && s.cwd) group.cwd = s.cwd
+    const ts = s.updatedAt || s.createdAt || 0
+    if (ts > group.latestAt) group.latestAt = ts
+    if (s.status === 'running') group.hasRunning = true
+    group.items.push(s)
+  }
+
+  const groups = [...map.values()]
+  for (const g of groups) {
+    g.items.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))
+  }
+  groups.sort((a, b) => {
+    // Keep '未分组' at the bottom unless it's the only group
+    if (a.label === '未分组' && b.label !== '未分组') return 1
+    if (b.label === '未分组' && a.label !== '未分组') return -1
+    return b.latestAt - a.latestAt
+  })
+  return groups
+}
+
+function groupByTime(sessions) {
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const startOfYesterday = startOfToday - 86_400_000
+  const startOf7Days = startOfToday - 7 * 86_400_000
+
+  const groups = [
+    { key: 'today', label: '今天', items: [] },
+    { key: 'yesterday', label: '昨天', items: [] },
+    { key: 'week', label: '近 7 天', items: [] },
+    { key: 'older', label: '更早', items: [] },
+  ]
+
+  for (const s of sessions) {
+    const t = s.updatedAt || s.createdAt || 0
+    if (t >= startOfToday) groups[0].items.push(s)
+    else if (t >= startOfYesterday) groups[1].items.push(s)
+    else if (t >= startOf7Days) groups[2].items.push(s)
+    else groups[3].items.push(s)
+  }
+
+  return groups.filter((g) => g.items.length > 0)
+}
+
+function SessionRow({ session, isActive, showProjectSubtitle, onSelect }) {
+  const meta = APP_META[session.app] || APP_META.dsh
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`group flex w-full flex-col rounded-xl px-2.5 py-2 text-left transition ${
+        isActive
+          ? 'bg-[#E9EEFF] text-[#2842C9] dark:bg-[#273154] dark:text-white'
+          : 'hover:bg-slate-200/50 dark:hover:bg-slate-800/60'
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <VendorBadge app={session.app} size="xs" />
+        <span className="flex-1 truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
+          {session.title}
+        </span>
+        {session.status === 'running' && (
+          <span
+            title="运行中"
+            className="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
+          />
+        )}
+        {session.readOnlyDesktop && (
+          <span className="shrink-0 rounded bg-slate-200/80 px-1 py-0.5 text-[9px] text-slate-500 dark:bg-slate-700/80 dark:text-slate-300">
+            历史
+          </span>
+        )}
+      </div>
+      {showProjectSubtitle && (
+        <div className="mt-0.5 pl-8 text-[11px] text-slate-400 truncate">
+          {session.workspace || meta.name}
+        </div>
+      )}
+    </button>
+  )
+}
+
+export function SidebarDrawer({
+  open,
+  onClose,
+  sessions,
+  activeSessionId,
+  onSelectSession,
+  onNewChat,
+  onRefresh,
+  refreshing,
+  bridgeOnline,
+  bridgeHost,
+  roomId,
+  darkMode,
+  onToggleDark,
+  onOpenShare,
+  onLogout,
+}) {
+  const [filterApp, setFilterApp] = useState('all')
+  const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
+  const [search, setSearch] = useState('')
+  const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+  const [cacheClearedHint, setCacheClearedHint] = useState(false)
+  // Map of projectKey -> boolean (explicitly expanded or collapsed by user)
+  const [expandedMap, setExpandedMap] = useState({})
+
+  useEffect(() => {
+    try { localStorage.setItem('allinone_group_mode', groupMode) } catch {}
+  }, [groupMode])
+
+  useEffect(() => {
+    if (!open) return
+    getSessionCacheStats().then(setCacheStats).catch(() => {})
+  }, [open, sessions.length])
+
+  const handleClearCache = async () => {
+    await clearSessionCache()
+    setCacheStats({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+    setCacheClearedHint(true)
+    setTimeout(() => setCacheClearedHint(false), 1800)
+  }
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    return sessions.filter((s) => {
+      if (filterApp !== 'all' && s.app !== filterApp) return false
+      if (!q) return true
+      return (
+        (s.title || '').toLowerCase().includes(q) ||
+        (s.workspace || '').toLowerCase().includes(q) ||
+        (s.cwd || '').toLowerCase().includes(q) ||
+        (s.preview || '').toLowerCase().includes(q)
+      )
+    })
+  }, [sessions, filterApp, search])
+
+  const projectGroups = useMemo(() => groupByProject(filtered), [filtered])
+  const timeGroups = useMemo(() => groupByTime(filtered), [filtered])
+
+  const activeProjectKey = useMemo(() => {
+    const active = sessions.find((s) => s.id === activeSessionId)
+    return active ? normalizeProjectKey(active).toLowerCase() : ''
+  }, [sessions, activeSessionId])
+
+  const isProjectExpanded = (group, index) => {
+    if (search.trim().length > 0) return true
+    if (group.key in expandedMap) return expandedMap[group.key]
+    if (group.key === activeProjectKey) return true
+    // By default expand the top 3 most recently active projects, collapse the rest
+    return index < 3
+  }
+
+  const toggleProject = (key, current) => {
+    setExpandedMap((prev) => ({ ...prev, [key]: !current }))
+  }
+
+  const allExpanded = projectGroups.length > 0 && projectGroups.every((g, idx) => isProjectExpanded(g, idx))
+
+  const toggleAllProjects = () => {
+    const target = !allExpanded
+    const next = {}
+    for (const g of projectGroups) next[g.key] = target
+    setExpandedMap(next)
+  }
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        onClick={onClose}
+        className={`fixed inset-0 z-40 bg-black/35 backdrop-blur-[2px] transition-opacity duration-200 ${
+          open ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'
+        }`}
+      />
+
+      {/* Drawer Panel */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-transform duration-250 ease-out dark:bg-[#1B1D23] ${
+          open ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        {/* Top header */}
+        <div className="pt-safe flex items-center justify-between px-4 pb-3">
+          <div className="flex items-center gap-2.5">
+            <img src="./icon-192.png" alt="All in One" className="h-8.5 w-8.5 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
+            <div>
+              <div className="flex items-center gap-1.5 text-[15px] font-bold text-slate-900 dark:text-white">
+                <span>All in One</span>
+                <span className="rounded-md bg-slate-200/80 px-1.5 py-0.2 text-[9.5px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                  v0.1.18
+                </span>
+              </div>
+              <div className="flex items-center gap-1 text-[11px] text-slate-500 dark:text-slate-400">
+                {bridgeOnline ? (
+                  <>
+                    <Wifi className="h-3 w-3 text-emerald-500" />
+                    <span className="truncate max-w-[140px]">
+                      {bridgeHost || 'PC 已在线'}
+                      {roomId && roomId !== 'owner' ? ' · 专属房间' : ''}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <WifiOff className="h-3 w-3 text-amber-500" />
+                    <span>电脑离线</span>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={onRefresh}
+              aria-label="刷新会话列表"
+              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+            >
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="关闭侧边栏"
+              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* New Chat primary pill button */}
+        <div className="px-4 pb-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              onClose()
+              onNewChat()
+            }}
+            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
+          >
+            <Plus className="h-4 w-4 stroke-[2.5]" />
+            <span>开启新对话</span>
+          </button>
+        </div>
+
+        {/* Search input */}
+        <div className="px-4 pb-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="搜索项目、对话标题或目录..."
+              className="w-full rounded-xl border border-slate-200/80 bg-white py-2 pr-3 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#14161B] dark:text-slate-100"
+            />
+          </div>
+        </div>
+
+        {/* Vendor Icon Filter Bar (5-column grid, zero clipping) */}
+        <div className="px-4 pb-2">
+          <div className="grid grid-cols-5 gap-1.5">
+            {FILTER_TABS.map((tab) => {
+              const active = filterApp === tab.id
+              const count =
+                tab.id === 'all'
+                  ? sessions.length
+                  : sessions.filter((s) => s.app === tab.id).length
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  title={`${tab.label} (${count})`}
+                  aria-label={`筛选 ${tab.label}`}
+                  onClick={() => setFilterApp(tab.id)}
+                  className={`relative flex h-10 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                    active
+                      ? 'border-transparent shadow-xs'
+                      : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
+                  }`}
+                  style={
+                    active
+                      ? {
+                          backgroundColor: `${tab.color}1F`,
+                          borderColor: `${tab.color}66`,
+                          color: tab.color,
+                        }
+                      : undefined
+                  }
+                >
+                  <VendorIcon
+                    app={tab.id}
+                    size={tab.id === 'all' ? 17 : 19}
+                    mono={tab.id === 'all'}
+                  />
+                  {count > 0 && (
+                    <span
+                      className={`absolute top-1 right-1.5 text-[9px] leading-none font-semibold ${
+                        active ? 'opacity-90' : 'text-slate-400 dark:text-slate-500'
+                      }`}
+                    >
+                      {count > 99 ? '99' : count}
+                    </span>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+          {filterApp !== 'all' && (
+            <div className="mt-1.5 flex items-center justify-between px-0.5 text-[10.5px] text-slate-400">
+              <span>
+                当前筛选：<strong className="font-semibold text-slate-600 dark:text-slate-200">{FILTER_TABS.find((t) => t.id === filterApp)?.label}</strong>
+              </span>
+              <button
+                type="button"
+                onClick={() => setFilterApp('all')}
+                className="text-[#4D6BFE] hover:underline"
+              >
+                显示全部
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Grouping Mode Switcher: By Project (default) vs By Time */}
+        <div className="flex items-center justify-between px-4 pb-2 text-[11px]">
+          <div className="inline-flex rounded-lg bg-slate-200/70 p-0.5 dark:bg-[#242731]">
+            <button
+              type="button"
+              onClick={() => setGroupMode('project')}
+              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
+                groupMode === 'project'
+                  ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <Folder className="h-3 w-3" />
+              <span>按项目</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setGroupMode('time')}
+              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
+                groupMode === 'time'
+                  ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <Clock className="h-3 w-3" />
+              <span>按时间</span>
+            </button>
+          </div>
+
+          {groupMode === 'project' && projectGroups.length > 0 && (
+            <button
+              type="button"
+              onClick={toggleAllProjects}
+              className="text-slate-400 hover:text-[#4D6BFE]"
+            >
+              {allExpanded ? '全部折叠' : '全部展开'}
+            </button>
+          )}
+        </div>
+
+        {/* Grouped conversation list */}
+        <div className="flex-1 overflow-y-auto px-3 pb-4">
+          {filtered.length === 0 ? (
+            <div className="py-12 text-center text-xs text-slate-400">
+              {bridgeOnline ? '暂无匹配的对话' : '等待电脑端上线...'}
+            </div>
+          ) : groupMode === 'project' ? (
+            <div className="space-y-1.5">
+              {projectGroups.map((group, idx) => {
+                const expanded = isProjectExpanded(group, idx)
+                return (
+                  <div
+                    key={group.key}
+                    className="overflow-hidden rounded-2xl border border-slate-200/60 bg-white/70 dark:border-slate-800/80 dark:bg-[#20232B]/70"
+                  >
+                    <div className="flex items-center gap-1 pr-1.5">
+                      <button
+                        type="button"
+                        onClick={() => toggleProject(group.key, expanded)}
+                        className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left"
+                      >
+                        {expanded ? (
+                          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        ) : (
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        )}
+                        {expanded ? (
+                          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                        ) : (
+                          <Folder className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        )}
+                        <span className="flex-1 truncate text-[12.5px] font-semibold text-slate-700 dark:text-slate-200">
+                          {group.label}
+                        </span>
+                        {group.hasRunning && (
+                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot" />
+                        )}
+                        <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                          {group.items.length}
+                        </span>
+                      </button>
+
+                      {group.cwd && (
+                        <button
+                          type="button"
+                          title={`在 ${group.label} 新建对话`}
+                          onClick={() => {
+                            onClose()
+                            onNewChat(group.cwd)
+                          }}
+                          className="rounded-lg p-1 text-slate-400 hover:bg-slate-200/70 hover:text-[#4D6BFE] dark:hover:bg-slate-700/70"
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+
+                    {expanded && (
+                      <div className="space-y-0.5 border-t border-slate-100 px-1.5 py-1.5 dark:border-slate-800/80">
+                        {group.items.map((s) => (
+                          <SessionRow
+                            key={s.id}
+                            session={s}
+                            isActive={s.id === activeSessionId}
+                            showProjectSubtitle={false}
+                            onSelect={() => {
+                              onSelectSession(s)
+                              onClose()
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            timeGroups.map((group) => (
+              <div key={group.key} className="mb-3">
+                <div className="px-2 py-1.5 text-[11px] font-semibold tracking-wide text-slate-400">
+                  {group.label}
+                </div>
+                <div className="space-y-1">
+                  {group.items.map((s) => (
+                    <SessionRow
+                      key={s.id}
+                      session={s}
+                      isActive={s.id === activeSessionId}
+                      showProjectSubtitle={true}
+                      onSelect={() => {
+                        onSelectSession(s)
+                        onClose()
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Footer controls */}
+        <div className="pb-safe border-t border-slate-200/80 px-4 pt-2.5 dark:border-slate-800">
+          {/* Phone local history cache meter + one-tap cleanup */}
+          <div className="mb-2 flex items-center justify-between rounded-xl bg-slate-100/80 px-2.5 py-1.5 text-[11px] text-slate-500 dark:bg-[#232630] dark:text-slate-400">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+              <span className="truncate">
+                {cacheClearedHint
+                  ? '本地历史缓存已清空'
+                  : `缓存 ${cacheStats.sessionCount} 会话 · ${formatBytesCompact(cacheStats.totalBytes)}`}
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={cacheStats.sessionCount === 0}
+              onClick={handleClearCache}
+              className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-200/80 hover:text-rose-500 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-700/70"
+            >
+              <Trash2 className="h-3 w-3" />
+              <span>清理</span>
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-1">
+            <button
+              type="button"
+              onClick={onToggleDark}
+              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              {darkMode ? <Sun className="h-4 w-4 text-amber-400" /> : <Moon className="h-4 w-4" />}
+              <span>{darkMode ? '浅色' : '深色'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onOpenShare?.()
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+            >
+              <Share2 className="h-3.5 w-3.5" />
+              <span>分享给朋友</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onLogout}
+              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>切换设备</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+    </>
+  )
+}
