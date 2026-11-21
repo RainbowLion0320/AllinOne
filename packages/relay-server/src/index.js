@@ -48,6 +48,9 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
   '.apk': 'application/vnd.android.package-archive',
+  '.dmg': 'application/octet-stream',
+  '.exe': 'application/octet-stream',
+  '.zip': 'application/zip',
   '.ps1': 'text/plain; charset=utf-8',
   '.sh': 'text/plain; charset=utf-8',
 }
@@ -70,6 +73,7 @@ const CAPACITOR_ORIGINS = new Set([
   'ionic://localhost',
   'https://localhost',
   'http://localhost',
+  'app://allinone',
 ])
 
 function isTrustedProxyAddr(rawAddr) {
@@ -620,6 +624,34 @@ export function createRelayServer(options = {}) {
         devices: getMergedAccountDevices(payload.room),
         bridges: hub.getBridgeList(payload.room),
       })
+      return
+    }
+
+    // Register / bind this PC using an already-authenticated account JWT (used by Desktop App for 1-click auto-bind!)
+    if (pathname === '/api/account/devices/register' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const bound = accounts.bindDevice({
+          userId: payload.room,
+          label: body.label || body.hostname || 'My PC',
+          hostname: body.hostname || body.label || 'My-PC',
+          platform: body.platform || 'unknown',
+          bridgeId: body.bridgeId || '',
+        })
+        hub.broadcastRoomDevices(payload.room)
+        sendJson(res, 200, {
+          ok: true,
+          ...bound,
+          devices: getMergedAccountDevices(payload.room),
+        })
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: String(err?.message || '绑定电脑失败') })
+      }
       return
     }
 

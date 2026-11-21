@@ -1075,7 +1075,28 @@ async function main() {
       )
     }
 
-    console.log('[smoke] 9/9 Account system, single-use invite codes & auto multi-PC discovery OK')
+    // Desktop App JWT-authenticated device registration (`POST /api/account/devices/register`) + `app://allinone` CORS
+    const desktopRegRes = await fetch(`${httpBase}/api/account/devices/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceLogin.token}`,
+        Origin: 'app://allinone',
+      },
+      body: JSON.stringify({
+        label: 'Alice-Desktop-App',
+        hostname: 'ALICE-MBP',
+        platform: 'darwin',
+      }),
+    })
+    assert.equal(desktopRegRes.status, 200)
+    assert.equal(desktopRegRes.headers.get('access-control-allow-origin'), 'app://allinone')
+    const desktopBound = await desktopRegRes.json()
+    assert.equal(desktopBound.ok, true)
+    assert.ok(desktopBound.deviceSecret.startsWith('dv_'))
+    assert.equal(desktopBound.roomId, aliceReg.roomId)
+
+    console.log('[smoke] 9/9 Account system, single-use invite codes, desktop auto-bind & multi-PC discovery OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

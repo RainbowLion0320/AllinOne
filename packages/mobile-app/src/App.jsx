@@ -95,6 +95,10 @@ export function App() {
   const [streamingBySession, setStreamingBySession] = useState({})
   const [approvals, setApprovals] = useState([])
   const [dispatches, setDispatches] = useState([])
+  const [desktopBridge, setDesktopBridge] = useState(null)
+
+  const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
+  const isMacDesktop = desktopApi?.platform === 'darwin'
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
@@ -180,6 +184,88 @@ export function App() {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     }
   }, [])
+
+  // Electron Desktop App integration: live local bridge status + menu shortcuts + keyboard shortcuts
+  useEffect(() => {
+    if (!desktopApi) return
+    let unsubStatus = null
+    let unsubMenu = null
+    desktopApi.getBridgeStatus?.().then((st) => {
+      if (st) setDesktopBridge(st)
+    }).catch(() => {})
+    if (typeof desktopApi.onBridgeStatus === 'function') {
+      unsubStatus = desktopApi.onBridgeStatus((st) => setDesktopBridge(st))
+    }
+    if (typeof desktopApi.onMenuAction === 'function') {
+      unsubMenu = desktopApi.onMenuAction((action) => {
+        if (action === 'new-chat') setNewChatOpen(true)
+        else if (action === 'devices') setDeviceSwitcherOpen(true)
+        else if (action === 'share') setShareOpen(true)
+        else if (action === 'invites') setInviteManagerOpen(true)
+        else if (action === 'toggle-dark') setDarkMode((v) => !v)
+      })
+    }
+    return () => {
+      try { unsubStatus?.() } catch {}
+      try { unsubMenu?.() } catch {}
+    }
+  }, [desktopApi])
+
+  // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
+  useEffect(() => {
+    if (!desktopApi) return
+    if (
+      activeDevice?.token &&
+      activeDevice?.baseUrl &&
+      (activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_'))
+    ) {
+      desktopApi
+        .syncAccount?.({
+          baseUrl: activeDevice.baseUrl,
+          token: activeDevice.token,
+          roomId: activeDevice.roomId,
+          username: activeDevice.username || '',
+        })
+        .then((st) => {
+          if (st) setDesktopBridge(st)
+        })
+        .catch(() => {})
+    } else if (!activeDevice) {
+      desktopApi.stopBridge?.().catch(() => {})
+    }
+  }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, activeDevice?.roomId, activeDevice?.username, activeDevice?.authMode])
+
+  // Desktop keyboard shortcuts (Cmd/Ctrl+N new chat, Cmd/Ctrl+K switch computer, Esc close modals)
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (mod && !e.shiftKey && !e.altKey) {
+        const k = e.key.toLowerCase()
+        if (k === 'n' && activeDevice) {
+          e.preventDefault()
+          setNewChatOpen(true)
+          return
+        }
+        if (k === 'k' && activeDevice) {
+          e.preventDefault()
+          setDeviceSwitcherOpen((v) => !v)
+          return
+        }
+      }
+      if (e.key === 'Escape') {
+        if (lightboxState) setLightboxState(null)
+        else if (modelPickerOpen) setModelPickerOpen(false)
+        else if (newChatOpen) setNewChatOpen(false)
+        else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
+        else if (inviteManagerOpen) setInviteManagerOpen(false)
+        else if (shareOpen) setShareOpen(false)
+        else if (dispatchOpen) setDispatchOpen(false)
+        else if (drawerOpen) setDrawerOpen(false)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [activeDevice, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, dispatchOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -1159,15 +1245,47 @@ export function App() {
   })()
 
   return (
-    <div className="relative flex h-full w-full flex-col bg-white dark:bg-[#16171A]">
-      {/* DeepSeek-style minimal top header */}
-      <header className="pt-safe shrink-0 border-b border-slate-100 bg-white/85 px-3 pb-2.5 backdrop-blur-md dark:border-slate-800/80 dark:bg-[#16171A]/85">
-        <div className="mx-auto flex max-w-2xl items-center justify-between gap-2">
+    <div className="relative flex h-full w-full bg-white dark:bg-[#16171A]">
+      {/* Responsive Sidebar (slide-over drawer on mobile, docked left column on desktop lg:) */}
+      <SidebarDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        sessions={sessions}
+        activeSessionId={activeSession?.id}
+        onSelectSession={openSession}
+        onNewChat={(cwdHint = '') => {
+          setNewChatCwd(typeof cwdHint === 'string' ? cwdHint : '')
+          setNewChatOpen(true)
+        }}
+        onRefresh={() => loadWorkspaceData(activeBridgeId)}
+        refreshing={refreshing}
+        connState={connState}
+        bridgeOnline={bridgeOnline}
+        activeDeviceName={activeDeviceName}
+        devicesCount={isAccountMode ? Math.max(accountDevices.length, onlineBridges.length) : devices.length}
+        onlineBridgesCount={onlineBridges.length}
+        roomId={activeDevice?.roomId}
+        username={activeDevice?.username || ''}
+        isAdmin={isAdmin}
+        isMacDesktop={isMacDesktop}
+        cacheScope={cacheScope}
+        darkMode={darkMode}
+        onToggleDark={() => setDarkMode((v) => !v)}
+        onOpenShare={() => setShareOpen(true)}
+        onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
+        onOpenInviteManager={() => setInviteManagerOpen(true)}
+      />
+
+      {/* Right Main Column */}
+      <div className="relative flex min-w-0 flex-1 flex-col bg-white dark:bg-[#16171A]">
+      {/* Minimal top header */}
+      <header className="app-drag pt-safe shrink-0 border-b border-slate-100 bg-white/85 px-3 pb-2.5 backdrop-blur-md dark:border-slate-800/80 dark:bg-[#16171A]/85">
+        <div className="mx-auto flex max-w-2xl items-center justify-between gap-2 lg:max-w-3xl">
           <button
             type="button"
             onClick={() => setDrawerOpen(true)}
             aria-label="打开对话列表"
-            className="relative flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            className="app-no-drag relative flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 lg:hidden dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <Menu className="h-5 w-5" />
             {approvals.length > 0 && (
@@ -1175,11 +1293,11 @@ export function App() {
             )}
           </button>
 
-          <div className="flex min-w-0 flex-1 flex-col items-center text-center">
+          <div className="app-no-drag flex min-w-0 flex-1 flex-col items-center text-center">
             <button
               type="button"
               onClick={() => setDrawerOpen(true)}
-              className="flex max-w-full items-center gap-1.5"
+              className="flex max-w-full items-center gap-1.5 lg:pointer-events-none"
             >
               <VendorBadge app={activeApp} size="xs" />
               <span className="truncate text-[14.5px] font-semibold text-slate-900 dark:text-white">
@@ -1190,7 +1308,7 @@ export function App() {
               type="button"
               onClick={() => setDeviceSwitcherOpen(true)}
               aria-label="切换控制的电脑"
-              className="mt-0.5 inline-flex max-w-[230px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
+              className="mt-0.5 inline-flex max-w-[260px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -1212,7 +1330,7 @@ export function App() {
             type="button"
             onClick={() => setNewChatOpen(true)}
             aria-label="新建对话"
-            className="flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <SquarePen className="h-4.5 w-4.5" />
           </button>
@@ -1311,35 +1429,7 @@ export function App() {
         onSend={handleSend}
         onInterrupt={handleInterrupt}
       />
-
-      {/* Slide-over Sidebar Drawer */}
-      <SidebarDrawer
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        sessions={sessions}
-        activeSessionId={activeSession?.id}
-        onSelectSession={openSession}
-        onNewChat={(cwdHint = '') => {
-          setNewChatCwd(typeof cwdHint === 'string' ? cwdHint : '')
-          setNewChatOpen(true)
-        }}
-        onRefresh={() => loadWorkspaceData(activeBridgeId)}
-        refreshing={refreshing}
-        connState={connState}
-        bridgeOnline={bridgeOnline}
-        activeDeviceName={activeDeviceName}
-        devicesCount={isAccountMode ? Math.max(accountDevices.length, onlineBridges.length) : devices.length}
-        onlineBridgesCount={onlineBridges.length}
-        roomId={activeDevice?.roomId}
-        username={activeDevice?.username || ''}
-        isAdmin={isAdmin}
-        cacheScope={cacheScope}
-        darkMode={darkMode}
-        onToggleDark={() => setDarkMode((v) => !v)}
-        onOpenShare={() => setShareOpen(true)}
-        onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
-        onOpenInviteManager={() => setInviteManagerOpen(true)}
-      />
+      </div>
 
       {/* Multi-Computer Switcher & Account Device Manager Modal */}
       <DeviceSwitcherModal
@@ -1352,6 +1442,21 @@ export function App() {
         activeBridges={bridges}
         accountDevices={accountDevices}
         isAdmin={isAdmin}
+        desktopBridge={desktopBridge}
+        onToggleDesktopBridge={
+          desktopApi
+            ? () => {
+                desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+              }
+            : null
+        }
+        onToggleDesktopAutoLaunch={
+          desktopApi
+            ? () => {
+                desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+              }
+            : null
+        }
         onSelectDevice={handleSelectDevice}
         onAddDevice={(prefillServerUrl = '', opts = {}) => {
           setPairError('')

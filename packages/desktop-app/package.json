@@ -1,0 +1,101 @@
+{
+  "name": "@allinone/desktop-app",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "author": "All in One",
+  "description": "All in One Desktop — 跨设备 AI 远程总控与内置本机桥接桌面客户端（macOS / Windows）",
+  "main": "src/main.js",
+  "scripts": {
+    "prepare:assets": "node scripts/prepare-assets.mjs",
+    "dev": "node scripts/prepare-assets.mjs && electron .",
+    "pack:mac": "node scripts/prepare-assets.mjs && electron-builder --mac",
+    "pack:mac-dir": "node scripts/prepare-assets.mjs && electron-builder --mac --dir",
+    "pack:win": "node scripts/prepare-assets.mjs && electron-builder --win",
+    "pack:all": "node scripts/prepare-assets.mjs && electron-builder --mac --win"
+  },
+  "devDependencies": {
+    "electron": "35.7.5",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.allinone.desktop",
+    "productName": "All in One",
+    "copyright": "Copyright © 2026 All in One",
+    "electronVersion": "35.7.5",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "build/trayTemplate.png",
+      "build/trayTemplate@2x.png",
+      "build/tray-icon.png",
+      "build/icon.png",
+      "runtime-config.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bridge-runtime",
+        "to": "bridge-runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "identity": null,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "darkModeSupport": true,
+      "hardenedRuntime": false
+    },
+    "dmg": {
+      "title": "All in One",
+      "contents": [
+        {
+          "x": 140,
+          "y": 170
+        },
+        {
+          "x": 400,
+          "y": 170,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "All in One",
+      "perMachine": false
+    }
+  }
+}

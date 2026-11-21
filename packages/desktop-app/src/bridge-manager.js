@@ -1,0 +1,491 @@
+/**
+ * Embedded PC Bridge Lifecycle Manager for All in One Desktop App.
+ *
+ * Zero-terminal experience:
+ *  - Reuses existing ~/.allinone-bridge/config.json if already bound to the same account & server
+ *  - Otherwise auto-binds this PC via POST /api/account/devices/register using the logged-in JWT
+ *  - Runs the bundled single-file bridge in an isolated child process using Electron's embedded Node runtime
+ *    (zero Node.js installation required on the user's computer!)
+ *  - Auto-disables legacy com.allinone.bridge LaunchAgent on macOS to prevent duplicate bridge collisions
+ */
+
+import { execFileSync, spawn } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import os from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const MAX_LOG_BYTES = 1024 * 1024 // 1 MB rolling cap
+
+function normalizeBaseUrl(raw) {
+  return String(raw || '').trim().replace(/\/+$/, '')
+}
+
+function readJsonSafe(filePath) {
+  if (!existsSync(filePath)) return null
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function saveConfigSecure(filePath, data) {
+  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8')
+  try { chmodSync(filePath, 0o600) } catch {}
+}
+
+function resolveBridgeScriptPath(isPackaged) {
+  const candidates = []
+  if (isPackaged && process.resourcesPath) {
+    candidates.push(join(process.resourcesPath, 'bridge-runtime', 'allinone-bridge.mjs'))
+  }
+  candidates.push(
+    join(__dirname, '..', 'bridge-runtime', 'allinone-bridge.mjs'),
+    join(__dirname, '..', '..', 'mobile-app', 'public', 'downloads', 'allinone-bridge.mjs'),
+  )
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+  throw new Error('找不到内置桥接程序 (allinone-bridge.mjs)')
+}
+
+function stopLegacyMacLaunchAgent() {
+  if (process.platform !== 'darwin') return
+  const plistPath = join(os.homedir(), 'Library', 'LaunchAgents', 'com.allinone.bridge.plist')
+  if (!existsSync(plistPath)) return
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null
+    if (uid !== null) {
+      execFileSync('launchctl', ['bootout', `gui/${uid}/com.allinone.bridge`], {
+        stdio: 'ignore',
+        timeout: 3000,
+      })
+    }
+  } catch {}
+  try {
+    execFileSync('launchctl', ['unload', '-w', plistPath], {
+      stdio: 'ignore',
+      timeout: 3000,
+    })
+  } catch {}
+}
+
+export class DesktopBridgeManager extends EventEmitter {
+  constructor({ isPackaged = false, getAutoLaunch = () => false } = {}) {
+    super()
+    this.isPackaged = isPackaged
+    this.getAutoLaunch = getAutoLaunch
+    this.stateDir = join(os.homedir(), '.allinone-bridge')
+    this.configPath = join(this.stateDir, 'config.json')
+    this.logPath = join(this.stateDir, 'desktop-bridge.log')
+
+    this.proc = null
+    this.restartTimer = null
+    this.restartAttempts = 0
+    this.disposed = false
+
+    this.enabled = true
+    this.state = 'idle' // 'idle' | 'binding' | 'starting' | 'connected' | 'paused' | 'error'
+    this.error = ''
+    this.activeAccount = null // { baseUrl, token, roomId, username }
+    this.deviceMeta = null // { label, bridgeId, roomId, username, serverUrl }
+    this.appsSummary = ''
+    this.syncSeq = 0
+  }
+
+  ensureStateDir() {
+    mkdirSync(this.stateDir, { recursive: true })
+    try { chmodSync(this.stateDir, 0o700) } catch {}
+  }
+
+  appendLog(line) {
+    try {
+      this.ensureStateDir()
+      if (existsSync(this.logPath)) {
+        const st = statSync(this.logPath)
+        if (st.size > MAX_LOG_BYTES) {
+          const tail = readFileSync(this.logPath, 'utf8').slice(-200_000)
+          writeFileSync(this.logPath, tail, 'utf8')
+        }
+      }
+      appendFileSync(this.logPath, `[${new Date().toISOString()}] ${line}\n`, 'utf8')
+    } catch {}
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      enabled: this.enabled,
+      autoLaunch: Boolean(this.getAutoLaunch?.()),
+      label: this.deviceMeta?.label || os.hostname() || 'My PC',
+      bridgeId: this.deviceMeta?.bridgeId || '',
+      username: this.deviceMeta?.username || this.activeAccount?.username || '',
+      serverUrl: this.deviceMeta?.serverUrl || this.activeAccount?.baseUrl || '',
+      appsSummary: this.appsSummary,
+      error: this.error,
+      logPath: this.logPath,
+    }
+  }
+
+  emitStatus() {
+    this.emit('status', this.getStatus())
+  }
+
+  async verifyExistingConfig(cfg) {
+    if (!cfg?.serverUrl || !cfg?.roomId || !cfg?.bridgeSecret) return { valid: false, networkError: false }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 6000)
+    try {
+      const res = await fetch(`${normalizeBaseUrl(cfg.serverUrl)}/api/account/device-status`, {
+        method: 'GET',
+        headers: {
+          'X-Room-Id': cfg.roomId,
+          'X-Bridge-Secret': cfg.bridgeSecret,
+        },
+        signal: controller.signal,
+      })
+      if (res.status === 401) return { valid: false, networkError: false }
+      if (!res.ok) return { valid: false, networkError: true }
+      const data = await res.json().catch(() => ({}))
+      return { valid: Boolean(data.ok), data, networkError: false }
+    } catch {
+      return { valid: false, networkError: true }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async registerDeviceWithJwt({ baseUrl, token, existingBridgeId = '' }) {
+    const label = os.hostname() || 'My-PC'
+    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/account/devices/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        label,
+        hostname: label,
+        platform: process.platform,
+        ...(existingBridgeId ? { bridgeId: existingBridgeId } : {}),
+      }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok || !data.deviceSecret) {
+      throw new Error(data.error || `自动绑定本机失败 (HTTP ${res.status})`)
+    }
+    return data
+  }
+
+  /**
+   * Called automatically whenever Desktop UI signs into or switches an account.
+   */
+  async syncAccount(account) {
+    if (this.disposed) return this.getStatus()
+    const baseUrl = normalizeBaseUrl(account?.baseUrl)
+    const token = String(account?.token || '').trim()
+    const roomId = String(account?.roomId || '').trim()
+    const username = String(account?.username || '').trim()
+
+    if (!baseUrl || !token || !roomId.startsWith('usr_')) {
+      await this.stop({ nextState: 'idle' })
+      return this.getStatus()
+    }
+
+    const sameRunning =
+      this.proc &&
+      !this.proc.killed &&
+      this.deviceMeta?.roomId === roomId &&
+      normalizeBaseUrl(this.deviceMeta?.serverUrl) === baseUrl &&
+      this.enabled
+
+    this.activeAccount = { baseUrl, token, roomId, username }
+    if (sameRunning) {
+      return this.getStatus()
+    }
+
+    if (!this.enabled) {
+      this.state = 'paused'
+      this.error = ''
+      this.emitStatus()
+      return this.getStatus()
+    }
+
+    const mySeq = ++this.syncSeq
+    this.state = 'binding'
+    this.error = ''
+    this.emitStatus()
+
+    try {
+      this.ensureStateDir()
+      let cfg = readJsonSafe(this.configPath)
+      let readyCfg = null
+
+      if (
+        cfg &&
+        cfg.mode === 'account' &&
+        cfg.roomId === roomId &&
+        normalizeBaseUrl(cfg.serverUrl) === baseUrl &&
+        cfg.bridgeSecret
+      ) {
+        const check = await this.verifyExistingConfig(cfg)
+        if (mySeq !== this.syncSeq) return this.getStatus()
+        if (check.valid || check.networkError) {
+          readyCfg = {
+            ...cfg,
+            label: check.data?.label || cfg.label || os.hostname() || 'My-PC',
+            username: check.data?.username || cfg.username || username,
+          }
+        }
+      }
+
+      if (!readyCfg) {
+        this.appendLog(`Auto-registering this PC into account @${username || roomId} on ${baseUrl}...`)
+        const bound = await this.registerDeviceWithJwt({ baseUrl, token })
+        if (mySeq !== this.syncSeq) return this.getStatus()
+        readyCfg = {
+          mode: 'account',
+          serverUrl: baseUrl,
+          roomId: bound.roomId || roomId,
+          userId: bound.userId || roomId,
+          username: bound.username || username,
+          deviceId: bound.deviceId,
+          bridgeId: bound.bridgeId,
+          bridgeSecret: bound.deviceSecret,
+          label: bound.label || os.hostname() || 'My-PC',
+          createdAt: Date.now(),
+        }
+        saveConfigSecure(this.configPath, readyCfg)
+        this.appendLog(`Bound PC successfully: bridgeId=${readyCfg.bridgeId}`)
+      }
+
+      if (mySeq !== this.syncSeq) return this.getStatus()
+      this.deviceMeta = {
+        label: readyCfg.label || os.hostname() || 'My-PC',
+        bridgeId: readyCfg.bridgeId || readyCfg.label || os.hostname() || 'My-PC',
+        roomId: readyCfg.roomId,
+        username: readyCfg.username || username,
+        serverUrl: readyCfg.serverUrl,
+      }
+
+      await this.spawnBridgeProcess(readyCfg)
+    } catch (err) {
+      if (mySeq !== this.syncSeq) return this.getStatus()
+      this.state = 'error'
+      this.error = String(err?.message || err)
+      this.appendLog(`syncAccount error: ${this.error}`)
+      this.emitStatus()
+    }
+
+    return this.getStatus()
+  }
+
+  /**
+   * Auto-start on Desktop App boot if ~/.allinone-bridge/config.json already has a valid account binding.
+   */
+  async startFromSavedConfigIfPresent() {
+    if (this.disposed || !this.enabled || this.proc) return this.getStatus()
+    const cfg = readJsonSafe(this.configPath)
+    if (!cfg || cfg.mode !== 'account' || !cfg.roomId?.startsWith('usr_') || !cfg.bridgeSecret || !cfg.serverUrl) {
+      return this.getStatus()
+    }
+    this.deviceMeta = {
+      label: cfg.label || os.hostname() || 'My-PC',
+      bridgeId: cfg.bridgeId || cfg.label || os.hostname() || 'My-PC',
+      roomId: cfg.roomId,
+      username: cfg.username || '',
+      serverUrl: normalizeBaseUrl(cfg.serverUrl),
+    }
+    try {
+      await this.spawnBridgeProcess(cfg)
+    } catch (err) {
+      this.state = 'error'
+      this.error = String(err?.message || err)
+      this.emitStatus()
+    }
+    return this.getStatus()
+  }
+
+  async spawnBridgeProcess(cfg) {
+    await this.killChild()
+    if (this.disposed || !this.enabled) return
+
+    // Stop legacy LaunchAgent if present on macOS so it won't fight over the same bridgeId
+    stopLegacyMacLaunchAgent()
+
+    const scriptPath = resolveBridgeScriptPath(this.isPackaged)
+    const serverUrl = normalizeBaseUrl(cfg.serverUrl)
+    const label = cfg.label || os.hostname() || 'My-PC'
+
+    this.state = 'starting'
+    this.error = ''
+    this.emitStatus()
+    this.appendLog(`Starting embedded bridge: script=${scriptPath} server=${serverUrl} bridgeId=${cfg.bridgeId || label}`)
+
+    const child = spawn(
+      process.execPath,
+      [
+        scriptPath,
+        '--server', serverUrl,
+        '--state-dir', this.stateDir,
+        '--name', label,
+        '--no-browser',
+      ],
+      {
+        cwd: os.homedir(),
+        env: {
+          ...process.env,
+          ELECTRON_RUN_AS_NODE: '1',
+          ALLINONE_SERVER: serverUrl,
+          ALLINONE_HOME: this.stateDir,
+          ALLINONE_PC_NAME: label,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      },
+    )
+
+    this.proc = child
+
+    const handleLine = (raw) => {
+      const line = String(raw || '').trim()
+      if (!line) return
+      this.appendLog(line)
+      if (line.includes('已加密连接到中转服务器')) {
+        this.restartAttempts = 0
+        this.state = 'connected'
+        this.error = ''
+        this.emitStatus()
+      } else if (line.includes('本机 AI')) {
+        const idx = line.indexOf(':')
+        if (idx !== -1) {
+          this.appsSummary = line.slice(idx + 1).trim()
+          this.emitStatus()
+        }
+      } else if (line.includes('已被解绑') || line.includes('凭证无效')) {
+        this.error = '本机绑定凭证已失效，请重新登录'
+        this.state = 'error'
+        this.emitStatus()
+      }
+    }
+
+    let outBuf = ''
+    child.stdout?.on('data', (chunk) => {
+      outBuf += chunk.toString('utf8')
+      let nl
+      while ((nl = outBuf.indexOf('\n')) !== -1) {
+        handleLine(outBuf.slice(0, nl))
+        outBuf = outBuf.slice(nl + 1)
+      }
+    })
+
+    let errBuf = ''
+    child.stderr?.on('data', (chunk) => {
+      errBuf += chunk.toString('utf8')
+      let nl
+      while ((nl = errBuf.indexOf('\n')) !== -1) {
+        handleLine(`[stderr] ${errBuf.slice(0, nl)}`)
+        errBuf = errBuf.slice(nl + 1)
+      }
+    })
+
+    child.on('error', (err) => {
+      if (this.proc !== child) return
+      this.proc = null
+      this.state = 'error'
+      this.error = String(err?.message || err)
+      this.appendLog(`Child process error: ${this.error}`)
+      this.emitStatus()
+    })
+
+    child.on('exit', (code, signal) => {
+      if (this.proc !== child) return
+      this.proc = null
+      this.appendLog(`Bridge exited (code=${code}, signal=${signal})`)
+
+      if (this.disposed || !this.enabled) {
+        this.state = this.enabled ? 'idle' : 'paused'
+        this.emitStatus()
+        return
+      }
+
+      this.state = 'starting'
+      this.restartAttempts += 1
+      const delayMs = Math.min(20_000, 2000 * Math.min(this.restartAttempts, 8))
+      this.appendLog(`Scheduling auto-restart in ${delayMs}ms (attempt #${this.restartAttempts})`)
+      this.emitStatus()
+
+      clearTimeout(this.restartTimer)
+      this.restartTimer = setTimeout(() => {
+        if (this.disposed || !this.enabled) return
+        const latestCfg = readJsonSafe(this.configPath) || cfg
+        void this.spawnBridgeProcess(latestCfg)
+      }, delayMs)
+    })
+  }
+
+  async killChild() {
+    clearTimeout(this.restartTimer)
+    this.restartTimer = null
+    const child = this.proc
+    if (!child) return
+    this.proc = null
+    await new Promise((resolveDone) => {
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(killTimer)
+        resolveDone()
+      }
+      child.once('exit', done)
+      const killTimer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch {}
+        setTimeout(done, 150)
+      }, 2500)
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        done()
+      }
+    })
+  }
+
+  async stop({ nextState = 'idle' } = {}) {
+    this.syncSeq += 1
+    await this.killChild()
+    this.state = nextState
+    this.error = ''
+    this.emitStatus()
+    return this.getStatus()
+  }
+
+  async toggleEnabled() {
+    this.enabled = !this.enabled
+    if (!this.enabled) {
+      return this.stop({ nextState: 'paused' })
+    }
+    this.restartAttempts = 0
+    if (this.activeAccount) {
+      return this.syncAccount(this.activeAccount)
+    }
+    return this.startFromSavedConfigIfPresent()
+  }
+
+  async dispose() {
+    this.disposed = true
+    this.syncSeq += 1
+    await this.killChild()
+  }
+}

@@ -157,6 +157,7 @@ export function SidebarDrawer({
   roomId,
   username = '',
   isAdmin = false,
+  isMacDesktop = false,
   cacheScope = '',
   darkMode,
   onToggleDark,
@@ -233,23 +234,27 @@ export function SidebarDrawer({
 
   return (
     <>
-      {/* Backdrop */}
+      {/* Mobile Backdrop (hidden on desktop docked layout) */}
       <div
         onClick={onClose}
-        className={`fixed inset-0 z-40 bg-black/35 backdrop-blur-[2px] transition-opacity duration-200 ${
+        className={`fixed inset-0 z-40 bg-black/35 backdrop-blur-[2px] transition-opacity duration-200 lg:hidden ${
           open ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'
         }`}
       />
 
-      {/* Drawer Panel */}
+      {/* Drawer Panel (slide-over on mobile, permanently docked sidebar on desktop lg:) */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-transform duration-250 ease-out dark:bg-[#1B1D23] ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-transform duration-250 ease-out dark:bg-[#1B1D23] lg:static lg:inset-auto lg:z-auto lg:w-[292px] lg:max-w-none lg:shrink-0 lg:translate-x-0 lg:border-r lg:border-slate-200/80 lg:shadow-none lg:transition-none lg:dark:border-slate-800/80 ${
           open ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        {/* Top header */}
-        <div className="pt-safe flex items-center justify-between px-4 pb-2.5">
-          <div className="flex items-center gap-2.5">
+        {/* Top header (includes macOS traffic-light clearance & drag bar when running in Electron) */}
+        <div
+          className={`app-drag flex items-center justify-between px-4 pb-2.5 ${
+            isMacDesktop ? 'pt-9' : 'pt-safe'
+          }`}
+        >
+          <div className="app-no-drag flex min-w-0 items-center gap-2.5">
             <img src="./icon-192.png" alt="All in One" className="h-8 w-8 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
             <div className="min-w-0">
               <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
@@ -263,7 +268,7 @@ export function SidebarDrawer({
             </div>
           </div>
 
-          <div className="flex items-center gap-1">
+          <div className="app-no-drag flex items-center gap-1">
             <button
               type="button"
               onClick={onRefresh}
@@ -276,7 +281,7 @@ export function SidebarDrawer({
               type="button"
               onClick={onClose}
               aria-label="关闭侧边栏"
-              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <X className="h-4 w-4" />
             </button>

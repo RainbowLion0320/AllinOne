@@ -27,17 +27,22 @@ export const DEFAULT_PROD_SERVER =
   'https://your-relay.example.com'
 
 export function detectDefaultServerUrl() {
-  if (typeof window !== 'undefined' && window.location.protocol.startsWith('http')) {
-    const host = window.location.hostname
-    const port = window.location.port
-    // Inside Capacitor Android/iOS WebView, origin is https://localhost or capacitor://localhost
-    if (host === 'localhost' && (!port || port === '80' || port === '443')) {
-      return DEFAULT_PROD_SERVER
+  if (typeof window !== 'undefined') {
+    const desktopDefault = String(window.allinoneDesktop?.defaultServerUrl || '').trim().replace(/\/+$/, '')
+    if (desktopDefault) return desktopDefault
+
+    if (window.location.protocol.startsWith('http')) {
+      const host = window.location.hostname
+      const port = window.location.port
+      // Inside Capacitor Android/iOS WebView, origin is https://localhost or capacitor://localhost
+      if (host === 'localhost' && (!port || port === '80' || port === '443')) {
+        return DEFAULT_PROD_SERVER
+      }
+      const basePath = window.location.pathname
+        .replace(/\/index\.html$/i, '')
+        .replace(/\/+$/, '')
+      return `${window.location.origin}${basePath}`
     }
-    const basePath = window.location.pathname
-      .replace(/\/index\.html$/i, '')
-      .replace(/\/+$/, '')
-    return `${window.location.origin}${basePath}`
   }
   return DEFAULT_PROD_SERVER
 }

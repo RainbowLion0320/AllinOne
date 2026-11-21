@@ -28,6 +28,14 @@ html, body, #root {
   padding-bottom: max(0.75rem, var(--safe-bottom));
 }
 
+/* Native frameless/hiddenInset titlebar drag region for Electron Desktop App */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
 /* Custom sleek scrollbar */
 ::-webkit-scrollbar {
   width: 5px;

@@ -632,7 +632,7 @@ export function ChatView({
         onTouchCancel={finishTouchPull}
         className="flex-1 overflow-y-auto px-4 pt-3 pb-4"
       >
-        <div ref={contentRef} className="mx-auto w-full max-w-2xl">
+        <div ref={contentRef} className="mx-auto w-full max-w-2xl lg:max-w-3xl">
         {/* Top IntersectionObserver sentinel for seamless automatic infinite scroll */}
         <div ref={topSentinelRef} className="h-px w-full" aria-hidden="true" />
 

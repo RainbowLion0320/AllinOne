@@ -276,9 +276,11 @@ export function LoginScreen({
   }
 
   const isAccountTab = mode === 'login' || mode === 'register'
+  const isDesktopApp = typeof window !== 'undefined' && Boolean(window.allinoneDesktop)
 
   return (
     <div className="flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
+      {isDesktopApp && <div className="app-drag fixed inset-x-0 top-0 z-10 h-9" />}
       <div className="w-full max-w-sm">
         {isAddingDevice && onCancel && (
           <div className="pt-safe mb-3 flex items-center">
@@ -546,7 +548,8 @@ export function LoginScreen({
             </>
           )}
 
-          {/* Collapsible 1-line PC setup tip */}
+          {/* Collapsible 1-line PC setup tip (hidden inside Desktop App since bridge is built in) */}
+          {!isDesktopApp && (
           <div className="rounded-2xl border border-slate-200/70 bg-slate-50/80 dark:border-slate-700/70 dark:bg-[#16181F]">
             <button
               type="button"
@@ -601,6 +604,7 @@ export function LoginScreen({
               </div>
             )}
           </div>
+          )}
 
           {/* Server URL switcher */}
           <div>

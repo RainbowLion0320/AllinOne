@@ -14,6 +14,9 @@
     "build:bridge": "node scripts/build-portable-bridge.mjs",
     "build:mobile": "npm --workspace=@allinone/mobile-app run build",
     "build": "npm run build:bridge && npm run build:mobile",
+    "dev:desktop": "npm --workspace=@allinone/desktop-app run dev",
+    "pack:mac": "npm --workspace=@allinone/desktop-app run pack:mac",
+    "pack:win": "npm --workspace=@allinone/desktop-app run pack:win",
     "admin": "node packages/relay-server/src/admin-cli.js",
     "test:smoke": "node scripts/smoke-test.mjs"
   },

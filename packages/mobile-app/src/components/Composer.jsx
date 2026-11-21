@@ -69,7 +69,7 @@ export function Composer({
 
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
-      <div className="mx-auto w-full max-w-2xl">
+      <div className="mx-auto w-full max-w-2xl lg:max-w-3xl">
         {/* Pending attachment chips (with image thumbnails!) */}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 px-1">

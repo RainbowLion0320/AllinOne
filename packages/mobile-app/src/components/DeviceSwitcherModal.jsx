@@ -83,6 +83,9 @@ export function DeviceSwitcherModal({
   activeBridges = [],
   accountDevices = [],
   isAdmin = false,
+  desktopBridge = null,
+  onToggleDesktopBridge = null,
+  onToggleDesktopAutoLaunch = null,
   onSelectDevice,
   onAddDevice,
   onRenameDevice,
@@ -231,6 +234,71 @@ export function DeviceSwitcherModal({
 
         {/* Scrollable Content */}
         <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3.5">
+          {/* Local Desktop Built-in Bridge Strip (only shown inside Electron Desktop App) */}
+          {desktopBridge && (
+            <div className="flex items-center justify-between gap-2 rounded-2xl border border-slate-200/80 bg-slate-50/80 px-3 py-2.5 dark:border-slate-800 dark:bg-[#151820]">
+              <div className="flex min-w-0 items-center gap-2">
+                <span
+                  className={`h-2 w-2 shrink-0 rounded-full ${
+                    desktopBridge.state === 'connected'
+                      ? 'bg-emerald-500'
+                      : desktopBridge.state === 'starting' || desktopBridge.state === 'binding'
+                        ? 'bg-amber-400 animate-pulse'
+                        : desktopBridge.state === 'error'
+                          ? 'bg-rose-500'
+                          : 'bg-slate-400'
+                  }`}
+                />
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
+                    本机桥接 ·{' '}
+                    {desktopBridge.state === 'connected'
+                      ? '在线'
+                      : desktopBridge.state === 'starting' || desktopBridge.state === 'binding'
+                        ? '启动中'
+                        : desktopBridge.state === 'paused'
+                          ? '已暂停'
+                          : desktopBridge.state === 'error'
+                            ? '异常'
+                            : '未启动'}
+                  </div>
+                  {desktopBridge.error && (
+                    <div className="truncate text-[10.5px] text-rose-500">{desktopBridge.error}</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                {onToggleDesktopAutoLaunch && (
+                  <button
+                    type="button"
+                    onClick={onToggleDesktopAutoLaunch}
+                    className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${
+                      desktopBridge.autoLaunch
+                        ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]'
+                        : 'bg-white text-slate-500 border border-slate-200 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-400'
+                    }`}
+                  >
+                    {desktopBridge.autoLaunch ? '自启开' : '自启关'}
+                  </button>
+                )}
+                {onToggleDesktopBridge && (
+                  <button
+                    type="button"
+                    onClick={onToggleDesktopBridge}
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition active:scale-95 ${
+                      desktopBridge.enabled
+                        ? 'bg-white text-slate-700 border border-slate-200 hover:text-rose-500 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200'
+                        : 'bg-[#4D6BFE] text-white'
+                    }`}
+                  >
+                    {desktopBridge.enabled ? '暂停' : '开启'}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Active Account Header Card */}
           {isAccountMode && activeEntry && (
             <div className="rounded-2xl border border-[#4D6BFE]/25 bg-gradient-to-br from-[#F4F7FF] to-white p-3 dark:border-[#4D6BFE]/35 dark:from-[#1E2438] dark:to-[#181B24]">

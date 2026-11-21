@@ -15,3 +15,10 @@ packages/dsh-mobile-hub/*.status.json
 packages/dsh-mobile-hub/cordis.patch.yml
 packages/mobile-app/public/downloads/allinone-bridge.mjs
 packages/mobile-app/.env.local
+packages/desktop-app/release/
+packages/desktop-app/renderer/
+packages/desktop-app/bridge-runtime/
+packages/desktop-app/build/
+packages/desktop-app/runtime-config.json
+*.dmg
+*.exe
