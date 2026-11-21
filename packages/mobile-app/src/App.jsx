@@ -12,7 +12,11 @@ import {
 import {
   MobileRelayClient,
   detectDefaultServerUrl,
+  listAccountDevices,
   pairWithRelay,
+  probeDeviceStatus,
+  removeAccountDevice,
+  renameAccountDevice,
   requestMediaToken,
   revokeDeviceSessions,
 } from './lib/wsClient.js'
@@ -45,21 +49,24 @@ import { ModelPickerSheet } from './components/ModelPickerSheet.jsx'
 import { ImageLightbox } from './components/ImageLightbox.jsx'
 import { ShareModal } from './components/ShareModal.jsx'
 import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
+import { InviteManagerModal } from './components/InviteManagerModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 
 export function App() {
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
-  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false })
+  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
   const [autoPairing, setAutoPairing] = useState(false)
   const [pairError, setPairError] = useState('')
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [connState, setConnState] = useState('disconnected')
   const [bridges, setBridges] = useState([])
+  const [accountDevices, setAccountDevices] = useState([])
   const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '', unsupported: false })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
+  const [inviteManagerOpen, setInviteManagerOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
   const [dispatchOpen, setDispatchOpen] = useState(false)
@@ -91,30 +98,47 @@ export function App() {
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
+  const isAccountMode = Boolean(
+    activeDevice && (activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_')),
+  )
+  const isAdmin = Boolean(
+    activeDevice && (activeDevice.role === 'admin' || activeDevice.roomId === 'owner'),
+  )
 
   const onlineBridges = useMemo(() => bridges.filter((b) => b.online), [bridges])
 
   const activeBridge = useMemo(() => {
     if (!activeDevice || onlineBridges.length === 0) return null
     const preferredId = String(activeDevice.selectedBridgeId || '').trim()
+    let chosen = null
     if (preferredId) {
       const matched = onlineBridges.find((b) => b.bridgeId === preferredId)
-      if (matched) return matched
-      // In a shared owner room where a specific bridge was already active in this view,
-      // never silently reroute mid-conversation to a different online computer.
-      if (activeDevice.roomId === 'owner' && (activeSession || sessions.length > 0)) {
+      if (matched) {
+        chosen = matched
+      } else if ((activeDevice.roomId === 'owner' || isAccountMode) && (activeSession || sessions.length > 0)) {
+        // Never silently reroute mid-conversation to a different online computer
         return null
       }
     }
-    return onlineBridges[0] || null
-  }, [activeDevice, onlineBridges, activeSession, sessions.length])
+    if (!chosen) chosen = onlineBridges[0] || null
+    if (chosen && isAccountMode) {
+      const boundMeta = accountDevices.find((d) => d.bridgeId === chosen.bridgeId)
+      if (boundMeta?.label) {
+        return { ...chosen, label: boundMeta.label }
+      }
+    }
+    return chosen
+  }, [activeDevice, onlineBridges, activeSession, sessions.length, isAccountMode, accountDevices])
 
   const bridgeOnline = Boolean(activeBridge)
   const activeBridgeId = activeBridge?.bridgeId || ''
-  const activeDeviceName = useMemo(
-    () => getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length),
-    [activeDevice, activeBridge, onlineBridges.length],
-  )
+  const activeDeviceName = useMemo(() => {
+    if (isAccountMode && !activeBridge && activeDevice?.selectedBridgeId) {
+      const bound = accountDevices.find((d) => d.bridgeId === activeDevice.selectedBridgeId)
+      if (bound) return bound.label || bound.hostname || bound.bridgeId
+    }
+    return getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length)
+  }, [activeDevice, activeBridge, onlineBridges.length, isAccountMode, accountDevices])
   const cacheScope = useMemo(
     () => getCacheScopeKey(activeDevice, activeBridgeId),
     [activeDevice, activeBridgeId],
@@ -201,31 +225,53 @@ export function App() {
     setPairError('')
     const preview = upsertDevice(deviceStateRef.current, payload)
     resetTransientWorkspace()
-    setBridges([])
+    setBridges(Array.isArray(payload.bridges) ? payload.bridges : [])
+    setAccountDevices(Array.isArray(payload.devices) ? payload.devices : [])
     setDeviceState((prev) => upsertDevice(prev, payload).state)
-    setAddingDevice({ open: false, serverUrl: '', openScanner: false })
+    setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
     setDeviceSwitcherOpen(false)
     if (preview.device) {
-      const name = getDeviceDisplayName(preview.device)
-      showToast(preview.isNew ? `已添加并切换到 ${name}` : `已更新并切换到 ${name}`)
+      if (payload.authMode === 'account') {
+        const onlineN = (payload.devices || payload.bridges || []).filter((x) => x.online).length
+        showToast(
+          onlineN > 0
+            ? `已登录 @${payload.username} · 发现 ${onlineN} 台在线电脑`
+            : `已登录 @${payload.username}`,
+        )
+      } else {
+        const name = getDeviceDisplayName(preview.device)
+        showToast(preview.isNew ? `已添加并切换到 ${name}` : `已更新并切换到 ${name}`)
+      }
     }
   }, [resetTransientWorkspace, showToast])
 
-  // Auto-pair immediately when opened via QR code link (?pair=pt_xxx or ?code=XXXX-XXXX)
-  // Appends the newly paired computer to the saved devices list without deleting existing ones!
+  // Auto-handle QR code link (?pair=pt_xxx / ?code=XXXX-XXXX) or Invite Registration link (?invite=INV-XXXX-XXXX)
   useEffect(() => {
     if (typeof window === 'undefined') return
     const params = new URLSearchParams(window.location.search)
+    const inviteCode = (params.get('invite') || '').trim()
     const pairToken = (params.get('pair') || '').trim()
     const pairCode = (params.get('code') || '').trim()
-    if (!pairToken && !pairCode) return
+    if (!inviteCode && !pairToken && !pairCode) return
 
-    // Strip pairing secret from address bar immediately
+    // Strip sensitive params from address bar immediately
+    params.delete('invite')
     params.delete('pair')
     params.delete('code')
     const cleanQuery = params.toString()
     const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash || ''}`
     try { window.history.replaceState({}, '', cleanUrl) } catch {}
+
+    if (inviteCode) {
+      setPairError('')
+      setAddingDevice({
+        open: true,
+        serverUrl: detectDefaultServerUrl(),
+        openScanner: false,
+        inviteCode,
+      })
+      return
+    }
 
     let cancelled = false
     setAutoPairing(true)
@@ -246,7 +292,7 @@ export function App() {
         if (cancelled) return
         setPairError(String(err?.message || err || '扫码自动配对失败，请重试'))
         if (deviceStateRef.current.devices.length > 0) {
-          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl(), openScanner: false })
+          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl(), openScanner: false, inviteCode: '' })
         }
       })
       .finally(() => {
@@ -563,15 +609,35 @@ export function App() {
     }
   }, [])
 
-  // Connect WebSocket whenever the active saved computer changes
+  // Connect WebSocket whenever the active saved computer/account changes
   useEffect(() => {
     if (autoPairing || !activeDevice?.token || !activeDevice?.baseUrl) {
       setConnState('disconnected')
       setBridges([])
+      setAccountDevices([])
       return
     }
 
     setBridges([])
+    if (!(activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_'))) {
+      setAccountDevices([])
+    } else {
+      // Also refresh persisted account profile (role/username/devices) cleanly on mount/switch
+      probeDeviceStatus(activeDevice, 5000)
+        .then((res) => {
+          if (Array.isArray(res.devices)) setAccountDevices(res.devices)
+          if (res.username || res.role) {
+            setDeviceState((prev) =>
+              updateDeviceMeta(prev, activeDevice.id, {
+                ...(res.username ? { username: res.username } : {}),
+                ...(res.role ? { role: res.role } : {}),
+              }),
+            )
+          }
+        })
+        .catch(() => {})
+    }
+
     const client = new MobileRelayClient({
       baseUrl: activeDevice.baseUrl,
       token: activeDevice.token,
@@ -579,10 +645,11 @@ export function App() {
     })
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, bridges: bList }) => {
+    const unsubStatus = client.onStatus(({ state, bridges: bList, devices: dList }) => {
       if (clientRef.current !== client) return
       setConnState(state)
       setBridges(bList || [])
+      if (Array.isArray(dList)) setAccountDevices(dList)
     })
 
     const unsubEvents = client.onEvent((event, payload, rawMsg) => {
@@ -715,7 +782,8 @@ export function App() {
   const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
     const cleanBridgeId = String(bridgeId || '').trim()
     const isSameDevice = activeDevice?.id === deviceId
-    const isSameBridge = isSameDevice && (!cleanBridgeId || cleanBridgeId === activeBridgeIdRef.current)
+    const curSelectedBridge = activeDevice?.selectedBridgeId || activeBridgeIdRef.current
+    const isSameBridge = isSameDevice && (!cleanBridgeId || cleanBridgeId === curSelectedBridge)
     if (isSameBridge) return
 
     resetTransientWorkspace()
@@ -729,16 +797,19 @@ export function App() {
     setDeviceState((prev) => selectDevice(prev, deviceId, cleanBridgeId || undefined))
 
     if (target) {
+      const targetAcctPc = isSameDevice
+        ? accountDevices.find((d) => d.bridgeId === cleanBridgeId) || null
+        : null
       const targetBridgeObj = isSameDevice
         ? onlineBridges.find((b) => b.bridgeId === cleanBridgeId) || null
         : null
       const name =
-        isSameDevice && targetBridgeObj
-          ? targetBridgeObj.hostname || targetBridgeObj.bridgeId
+        isSameDevice && (targetAcctPc || targetBridgeObj)
+          ? targetAcctPc?.label || targetBridgeObj?.label || targetBridgeObj?.hostname || cleanBridgeId
           : getDeviceDisplayName(target)
       showToast(`已切换到 ${name}`)
     }
-  }, [activeDevice?.id, devices, onlineBridges, resetTransientWorkspace, showToast])
+  }, [activeDevice?.id, activeDevice?.selectedBridgeId, devices, accountDevices, onlineBridges, resetTransientWorkspace, showToast])
 
   const handleRenameDevice = useCallback((deviceId, customName) => {
     setDeviceState((prev) => renameDevice(prev, deviceId, customName))
@@ -747,6 +818,47 @@ export function App() {
   const handleSyncDeviceMeta = useCallback((deviceId, patch) => {
     setDeviceState((prev) => updateDeviceMeta(prev, deviceId, patch))
   }, [])
+
+  const handleRenameAccountDevice = useCallback(async (pcDeviceId, newLabel) => {
+    if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    try {
+      const nextList = await renameAccountDevice(activeDevice.baseUrl, activeDevice.token, {
+        deviceId: pcDeviceId,
+        label: newLabel,
+      })
+      setAccountDevices(nextList)
+      showToast(`已重命名为 ${newLabel}`)
+    } catch (err) {
+      showToast(String(err?.message || err))
+    }
+  }, [activeDevice?.baseUrl, activeDevice?.token, showToast])
+
+  const handleRemoveAccountDevice = useCallback(async (pcDeviceId, pcBridgeId = '') => {
+    if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    try {
+      const nextList = await removeAccountDevice(activeDevice.baseUrl, activeDevice.token, {
+        deviceId: pcDeviceId,
+      })
+      setAccountDevices(nextList)
+      if (pcBridgeId && activeBridgeIdRef.current === pcBridgeId) {
+        resetTransientWorkspace()
+        setDeviceState((prev) =>
+          updateDeviceMeta(prev, activeDevice.id, { selectedBridgeId: '' }),
+        )
+      }
+      showToast('已解绑并断开该电脑')
+    } catch (err) {
+      showToast(String(err?.message || err))
+    }
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, resetTransientWorkspace, showToast])
+
+  const handleRefreshAccountDevices = useCallback(async () => {
+    if (!activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) return
+    try {
+      const res = await listAccountDevices(activeDevice.baseUrl, activeDevice.token)
+      setAccountDevices(res.devices)
+    } catch {}
+  }, [activeDevice?.baseUrl, activeDevice?.token, isAccountMode])
 
   const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
     const target = devices.find((d) => d.id === deviceId)
@@ -1009,12 +1121,13 @@ export function App() {
         initialError={pairError}
         isAddingDevice={Boolean(activeDevice && addingDevice.open)}
         initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
+        initialInviteCode={addingDevice.inviteCode || ''}
         autoOpenScanner={Boolean(addingDevice.open && addingDevice.openScanner)}
         onCancel={
           activeDevice
             ? () => {
                 setPairError('')
-                setAddingDevice({ open: false, serverUrl: '', openScanner: false })
+                setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
               }
             : null
         }
@@ -1033,7 +1146,7 @@ export function App() {
   ) || (activeCatalog?.models || []).find((m) => m.id === activeModelPref.model)
   const currentStream = activeSession ? streamingBySession[activeSession.id] : null
 
-  const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1
+  const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const headerSubtitle = (() => {
     if (connState === 'unauthorized') return `${activeDeviceName} · 凭证已过期`
     if (connState !== 'connected') return `${activeDeviceName} · 连接中...`
@@ -1114,10 +1227,10 @@ export function App() {
           <span>{activeDeviceName} 配对凭证已失效</span>
           <button
             type="button"
-            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false })}
+            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false, inviteCode: '' })}
             className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
           >
-            重新配对
+            {isAccountMode ? '重新登录' : '重新配对'}
           </button>
           {devices.length > 1 && (
             <button
@@ -1136,18 +1249,20 @@ export function App() {
         <div className="flex flex-wrap items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
           <span>
-            {onlineBridges.length > 0
-              ? `当前选中的电脑（${activeDevice.selectedBridgeId}）已离线`
-              : `服务器已连通，等待 ${activeDeviceName} 桥接上线...`}
+            {isAccountMode && accountDevices.length === 0
+              ? '账号已登录，请在电脑端运行桥接并登录同一账号'
+              : onlineBridges.length > 0
+                ? `当前选中的电脑（${activeDeviceName}）已离线`
+                : `服务器已连通，等待 ${activeDeviceName} 桥接上线...`}
           </span>
-          {(devices.length > 1 || onlineBridges.length > 0) && (
+          {(devices.length > 1 || onlineBridges.length > 0 || isAccountMode) && (
             <button
               type="button"
               onClick={() => setDeviceSwitcherOpen(true)}
               className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
             >
               <ArrowLeftRight className="h-3 w-3" />
-              <span>切换电脑</span>
+              <span>{isAccountMode && accountDevices.length === 0 ? '绑定电脑' : '切换电脑'}</span>
             </button>
           )}
         </div>
@@ -1216,17 +1331,20 @@ export function App() {
         connState={connState}
         bridgeOnline={bridgeOnline}
         activeDeviceName={activeDeviceName}
-        devicesCount={devices.length}
+        devicesCount={isAccountMode ? Math.max(accountDevices.length, onlineBridges.length) : devices.length}
         onlineBridgesCount={onlineBridges.length}
         roomId={activeDevice?.roomId}
+        username={activeDevice?.username || ''}
+        isAdmin={isAdmin}
         cacheScope={cacheScope}
         darkMode={darkMode}
         onToggleDark={() => setDarkMode((v) => !v)}
         onOpenShare={() => setShareOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
+        onOpenInviteManager={() => setInviteManagerOpen(true)}
       />
 
-      {/* Multi-Computer Switcher & Manager Modal */}
+      {/* Multi-Computer Switcher & Account Device Manager Modal */}
       <DeviceSwitcherModal
         open={deviceSwitcherOpen}
         onClose={() => setDeviceSwitcherOpen(false)}
@@ -1235,6 +1353,8 @@ export function App() {
         activeBridgeId={activeBridgeId}
         activeConnState={connState}
         activeBridges={bridges}
+        accountDevices={accountDevices}
+        isAdmin={isAdmin}
         onSelectDevice={handleSelectDevice}
         onAddDevice={(prefillServerUrl = '', opts = {}) => {
           setPairError('')
@@ -1242,11 +1362,24 @@ export function App() {
             open: true,
             serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
             openScanner: Boolean(opts?.openScanner),
+            inviteCode: '',
           })
         }}
         onRenameDevice={handleRenameDevice}
         onRemoveDevice={handleRemoveDevice}
         onSyncDeviceMeta={handleSyncDeviceMeta}
+        onRenameAccountDevice={handleRenameAccountDevice}
+        onRemoveAccountDevice={handleRemoveAccountDevice}
+        onRefreshAccountDevices={handleRefreshAccountDevices}
+        onOpenInviteManager={() => setInviteManagerOpen(true)}
+      />
+
+      {/* Admin Single-Use Invite Code Manager */}
+      <InviteManagerModal
+        open={inviteManagerOpen}
+        onClose={() => setInviteManagerOpen(false)}
+        baseUrl={activeDevice?.baseUrl}
+        token={activeDevice?.token}
       />
 
       {/* New Chat Bottom Sheet */}
@@ -1309,6 +1442,9 @@ export function App() {
         open={shareOpen}
         onClose={() => setShareOpen(false)}
         serverUrl={activeDevice?.baseUrl}
+        token={activeDevice?.token}
+        isAdmin={isAdmin}
+        onOpenInviteManager={() => setInviteManagerOpen(true)}
       />
       {/* Full-Screen Zoomable Image Lightbox */}
       <ImageLightbox state={lightboxState} onClose={() => setLightboxState(null)} />

@@ -69,7 +69,7 @@ else
 fi
 
 echo ""
-echo "Starting All in One PC Bridge (a QR code page will open shortly)..."
+echo "Starting All in One PC Bridge (sign in with your account to bind this PC)..."
 echo ""
 if [ -t 0 ]; then
   exec "${NODE_BIN}" "${BRIDGE_FILE}" --server "${SERVER_URL}"

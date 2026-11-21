@@ -16,6 +16,7 @@ import {
   Search,
   Share2,
   Sun,
+  Ticket,
   Trash2,
   X,
 } from 'lucide-react'
@@ -155,11 +156,14 @@ export function SidebarDrawer({
   devicesCount = 1,
   onlineBridgesCount = 0,
   roomId,
+  username = '',
+  isAdmin = false,
   cacheScope = '',
   darkMode,
   onToggleDark,
   onOpenShare,
   onOpenDeviceSwitcher,
+  onOpenInviteManager,
 }) {
   const [filterApp, setFilterApp] = useState('all')
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
@@ -252,12 +256,16 @@ export function SidebarDrawer({
               <div className="flex items-center gap-1.5 text-[15px] font-bold text-slate-900 dark:text-white">
                 <span>All in One</span>
                 <span className="rounded-md bg-slate-200/80 px-1.5 py-0.2 text-[9.5px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                  v0.1.21
+                  v0.2.0
                 </span>
               </div>
               <div className="text-[10.5px] text-slate-400">
-                {roomId && roomId !== 'owner' ? '独立加密房间' : '管理员房间'}
-                {devicesCount > 1 ? ` · 已保存 ${devicesCount} 台电脑` : ''}
+                {username
+                  ? `@${username}${isAdmin ? ' · 管理员' : ''}`
+                  : roomId && roomId !== 'owner'
+                    ? '旧版配对房间'
+                    : '管理员房间'}
+                {devicesCount > 1 ? ` · ${devicesCount} 台电脑` : ''}
               </div>
             </div>
           </div>
@@ -602,17 +610,45 @@ export function SidebarDrawer({
               <span>{darkMode ? '浅色' : '深色'}</span>
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onOpenShare?.()
-              }}
-              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-            >
-              <Share2 className="h-3.5 w-3.5" />
-              <span>分享给朋友</span>
-            </button>
+            {isAdmin && onOpenInviteManager ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onOpenInviteManager()
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+              >
+                <Ticket className="h-3.5 w-3.5" />
+                <span>邀请码</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onOpenShare?.()
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                <span>分享</span>
+              </button>
+            )}
+
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onOpenShare?.()
+                }}
+                className="inline-flex items-center gap-1 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                <span>分享</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -623,7 +659,7 @@ export function SidebarDrawer({
               className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               <ArrowLeftRight className="h-3.5 w-3.5 text-[#4D6BFE]" />
-              <span>切换电脑</span>
+              <span>电脑</span>
             </button>
           </div>
         </div>

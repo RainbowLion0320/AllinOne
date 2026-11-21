@@ -51,6 +51,7 @@ async function main() {
     clientAccessToken: TEST_PASS,
     bridgeSecret: TEST_BRIDGE_SECRET,
     roomsFile: join(tmpDir, 'rooms.json'),
+    accountsFile: join(tmpDir, 'accounts.json'),
     uploadDir: join(tmpDir, 'uploads'),
   })
   const { port } = await relay.start()
@@ -67,6 +68,8 @@ async function main() {
   let friendBridgeA = null
   let ownerBridge2 = null
   let portableChild = null
+  let acctPortableChild = null
+  let acctBridge2 = null
 
   try {
     // Wait up to 5s for bridge to connect
@@ -396,7 +399,7 @@ async function main() {
     })
     assert.equal(oldCodeTry.status, 401, 'Old pairCode must be invalidated after refresh')
 
-    // Live test of bundled single-file portable bridge (if built)
+    // Live test of bundled single-file portable bridge in legacy pair mode (if built)
     const bundlePath = join(process.cwd(), 'packages/mobile-app/public/downloads/allinone-bridge.mjs')
     if (existsSync(bundlePath)) {
       const portableStateDir = join(tmpDir, 'portable-home')
@@ -405,6 +408,7 @@ async function main() {
         '--server', httpBase,
         '--state-dir', portableStateDir,
         '--name', 'Portable-Test-PC',
+        '--legacy-pair',
         '--no-browser',
       ], { stdio: ['ignore', 'pipe', 'pipe'] })
       let out = ''
@@ -863,10 +867,222 @@ async function main() {
       await gatedRelay.close()
     }
 
-    console.log('[smoke] 8/8 Security hardening suite OK (11 checks passed)')
+    console.log('[smoke] 8/9 Security hardening suite OK (11 checks passed)')
+
+    // 9. Account System, Single-Use Invite Codes & Auto Multi-PC Discovery
+    const bootBefore = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
+    assert.equal(bootBefore.ok, true)
+    assert.equal(bootBefore.hasUsers, false, 'Fresh server should report hasUsers=false before first admin')
+
+    // Reject registration without valid invite
+    const badReg = await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'nobody', password: 'Password123!', inviteCode: 'INV-AAAA-BBBB' }),
+    })
+    assert.equal(badReg.status, 400, 'Registration with invalid invite code must fail')
+
+    // Bootstrap first admin account using server CLIENT_ACCESS_TOKEN
+    const alicePass = 'AliceStrongPass99!'
+    const aliceReg = await (await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: alicePass, inviteCode: TEST_PASS }),
+    })).json()
+    assert.equal(aliceReg.ok, true)
+    assert.equal(aliceReg.user.role, 'admin', 'First bootstrapped user must be admin')
+    assert.ok(aliceReg.roomId.startsWith('usr_'))
+
+    const bootAfter = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
+    assert.equal(bootAfter.hasUsers, true)
+
+    // Bootstrap key must NO LONGER work once 1st user exists
+    const secondBootTry = await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'intruder', password: 'Password123!', inviteCode: TEST_PASS }),
+    })
+    assert.equal(secondBootTry.status, 400, 'CLIENT_ACCESS_TOKEN bootstrap must only work for the very first user')
+
+    // Admin generates 2 single-use invite codes
+    const invCreate = await (await fetch(`${httpBase}/api/admin/invites`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceReg.token}`,
+      },
+      body: JSON.stringify({ count: 2, note: 'smoke-friends' }),
+    })).json()
+    assert.equal(invCreate.ok, true)
+    assert.equal(invCreate.invites.length, 2)
+    const inv1 = invCreate.invites[0]
+    const inv2 = invCreate.invites[1]
+    assert.match(inv1.code, /^INV-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/)
+
+    // Bob registers with invite #1 -> succeeds as non-admin user
+    const bobReg = await (await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'bob', password: 'BobPassword88!', inviteCode: inv1.code.toLowerCase() }),
+    })).json()
+    assert.equal(bobReg.ok, true)
+    assert.equal(bobReg.user.role, 'user')
+
+    // Reusing invite #1 for Charlie must FAIL (strictly 1 user per invite code!)
+    const reuseInv1 = await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv1.code }),
+    })
+    assert.equal(reuseInv1.status, 400, 'Single-use invite code must reject a 2nd user')
+
+    // Non-admin Bob cannot list or create invite codes
+    const bobAdminTry = await fetch(`${httpBase}/api/admin/invites`, {
+      headers: { Authorization: `Bearer ${bobReg.token}` },
+    })
+    assert.equal(bobAdminTry.status, 403, 'Non-admin user must receive 403 on /api/admin/invites')
+
+    // Admin revokes unused invite #2 -> Charlie cannot use it
+    const revokeInv2 = await (await fetch(`${httpBase}/api/admin/invites/revoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceReg.token}`,
+      },
+      body: JSON.stringify({ id: inv2.id }),
+    })).json()
+    assert.equal(revokeInv2.ok, true)
+    assert.equal(revokeInv2.invite.status, 'revoked')
+    const revokedInvTry = await fetch(`${httpBase}/api/account/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv2.code }),
+    })
+    assert.equal(revokedInvTry.status, 400, 'Revoked invite code must be rejected')
+
+    // Verify accounts.json NEVER stores plaintext passwords
+    const persistedAccounts = readFileSync(join(tmpDir, 'accounts.json'), 'utf8')
+    assert.equal(persistedAccounts.includes(alicePass), false, 'accounts.json must NOT store plaintext password')
+
+    // Bind PC-1 via portable single-file CLI in account mode (verifying password is NEVER written to config.json!)
+    if (existsSync(bundlePath)) {
+      const acctStateDir = join(tmpDir, 'portable-account-home')
+      acctPortableChild = spawn(process.execPath, [
+        bundlePath,
+        '--server', httpBase,
+        '--state-dir', acctStateDir,
+        '--name', 'Alice-Mac',
+        '--username', 'alice',
+        '--password', alicePass,
+        '--no-browser',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let acctOut = ''
+      acctPortableChild.stdout.on('data', (d) => { acctOut += String(d) })
+      acctPortableChild.stderr.on('data', (d) => { acctOut += String(d) })
+      for (let i = 0; i < 60; i++) {
+        if (existsSync(join(acctStateDir, 'config.json')) && acctOut.includes('已加密连接到中转服务器')) break
+        await new Promise((r) => setTimeout(r, 150))
+      }
+      assert.ok(acctOut.includes('已加密连接到中转服务器'), `Account portable CLI should connect (${acctOut.slice(0, 300)})`)
+      const pcCfgRaw = readFileSync(join(acctStateDir, 'config.json'), 'utf8')
+      assert.equal(pcCfgRaw.includes(alicePass), false, 'PC config.json must NEVER store account password!')
+      assert.ok(pcCfgRaw.includes('"mode": "account"'))
+    }
+
+    // Bind PC-2 via /api/account/device-login and connect via standalone bridge
+    const boundPc2 = await (await fetch(`${httpBase}/api/account/device-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'alice',
+        password: alicePass,
+        label: 'Alice-Win-Desktop',
+        hostname: 'WIN-HOME',
+        platform: 'win32',
+      }),
+    })).json()
+    assert.equal(boundPc2.ok, true)
+    assert.ok(boundPc2.deviceSecret.startsWith('dv_'))
+    assert.equal(
+      readFileSync(join(tmpDir, 'accounts.json'), 'utf8').includes(boundPc2.deviceSecret),
+      false,
+      'accounts.json must NOT store plaintext deviceSecret',
+    )
+
+    acctBridge2 = startStandaloneBridge({
+      relayUrl: wsBridgeUrl,
+      secret: boundPc2.deviceSecret,
+      roomId: boundPc2.roomId,
+      bridgeId: boundPc2.bridgeId,
+      quiet: true,
+    })
+    const expectedCount = existsSync(bundlePath) ? 2 : 1
+    for (let i = 0; i < 50; i++) {
+      if (relay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length >= expectedCount) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+
+    // Mobile login as Alice automatically discovers ALL bound online PCs!
+    const aliceLogin = await (await fetch(`${httpBase}/api/account/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: alicePass }),
+    })).json()
+    assert.equal(aliceLogin.ok, true)
+    assert.equal(aliceLogin.devices.length, expectedCount)
+    assert.ok(aliceLogin.devices.every((d) => d.online), 'All connected Alice PCs should show online automatically')
+
+    // Bob's account is strictly isolated (0 devices)
+    const bobLogin = await (await fetch(`${httpBase}/api/account/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'bob', password: 'BobPassword88!' }),
+    })).json()
+    assert.equal(bobLogin.ok, true)
+    assert.equal(bobLogin.devices.length, 0, 'Bob must NEVER see Alice devices')
+
+    // Rename & then unbind PC-2 -> immediately invalidates PC-2 deviceSecret while PC-1 stays online
+    const renamedPc2 = await (await fetch(`${httpBase}/api/account/devices/rename`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceLogin.token}`,
+      },
+      body: JSON.stringify({ deviceId: boundPc2.deviceId, label: '家里游戏主机' }),
+    })).json()
+    assert.equal(renamedPc2.ok, true)
+    assert.equal(renamedPc2.device.label, '家里游戏主机')
+
+    const removedPc2 = await (await fetch(`${httpBase}/api/account/devices/remove`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceLogin.token}`,
+      },
+      body: JSON.stringify({ deviceId: boundPc2.deviceId }),
+    })).json()
+    assert.equal(removedPc2.ok, true)
+
+    const pc2StatusAfterRemove = await fetch(`${httpBase}/api/account/device-status`, {
+      headers: { 'X-Room-Id': boundPc2.roomId, 'X-Bridge-Secret': boundPc2.deviceSecret },
+    })
+    assert.equal(pc2StatusAfterRemove.status, 401, 'Unbound PC deviceSecret must immediately return 401')
+    if (existsSync(bundlePath)) {
+      assert.equal(
+        relay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length,
+        1,
+        'PC-1 must stay online after unbinding PC-2',
+      )
+    }
+
+    console.log('[smoke] 9/9 Account system, single-use invite codes & auto multi-PC discovery OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
+    if (acctPortableChild) {
+      try { acctPortableChild.kill() } catch {}
+    }
+    if (acctBridge2) await acctBridge2.stop()
     if (portableChild) {
       try { portableChild.kill() } catch {}
     }

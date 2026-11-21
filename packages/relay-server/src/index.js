@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { RPC } from '@allinone/shared'
 import { createAuthManager } from './auth.js'
+import { createAccountStore } from './accounts.js'
 import { RelayHub } from './hub.js'
 import { createRoomStore } from './rooms.js'
 
@@ -189,18 +190,54 @@ export function createRelayServer(options = {}) {
   const roomsFile = resolve(
     options.roomsFile ?? (process.env.ROOMS_FILE || resolve(__dirname, '../data/rooms.json')),
   )
+  const accountsFile = resolve(
+    options.accountsFile ?? (process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json')),
+  )
   mkdirSync(uploadDir, { recursive: true })
   try { chmodSync(uploadDir, 0o700) } catch {}
 
   const rooms = createRoomStore({ filePath: roomsFile })
+  const accounts = createAccountStore({ filePath: accountsFile })
   const auth = createAuthManager({
     clientAccessToken,
     bridgeSecret,
     jwtSecret,
     registerInviteCode,
-    getTokenVersion: (roomId) => rooms.getTokenVersion(roomId),
+    getTokenVersion: (roomId) =>
+      String(roomId || '').startsWith('usr_')
+        ? accounts.getTokenVersion(roomId)
+        : rooms.getTokenVersion(roomId),
   })
-  const hub = new RelayHub()
+
+  function getMergedAccountDevices(roomId, liveBridges = null) {
+    if (!String(roomId || '').startsWith('usr_')) return undefined
+    const bound = accounts.listUserDevices(roomId)
+    const live = liveBridges || hub.getBridgeList(roomId)
+    const liveByBridgeId = new Map(live.map((b) => [b.bridgeId, b]))
+    const merged = bound.map((dev) => {
+      const b = liveByBridgeId.get(dev.bridgeId)
+      return {
+        deviceId: dev.deviceId,
+        bridgeId: dev.bridgeId,
+        label: dev.label || b?.hostname || dev.hostname || dev.bridgeId,
+        hostname: b?.hostname || dev.hostname || dev.bridgeId,
+        platform: b?.platform || dev.platform || 'unknown',
+        online: Boolean(b?.online),
+        apps: b?.apps || [],
+        mode: b?.mode || 'portable',
+        connectedAt: b?.connectedAt || 0,
+        lastSeenAt: b?.lastSeen || dev.lastSeenAt || dev.createdAt || 0,
+        createdAt: dev.createdAt || 0,
+      }
+    })
+    // Online devices first, then most recently seen
+    merged.sort((a, b) => Number(b.online) - Number(a.online) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
+    return merged
+  }
+
+  const hub = new RelayHub({
+    getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
+  })
 
   function isAllowedOrigin(rawOrigin, req) {
     const origin = String(rawOrigin || '').trim()
@@ -321,16 +358,28 @@ export function createRelayServer(options = {}) {
 
   /**
    * Authenticate a PC Bridge request via HTTP headers ONLY (never URL query secrets!)
-   * and return its authoritative `roomId` or null.
+   * Supports:
+   *  - Account device bridges (`usr_*` + per-PC `deviceSecret` -> authoritative `bridgeId`)
+   *  - Legacy multi-tenant room bridges (`rm_*` + room `bridgeSecret`)
+   *  - Legacy owner bridge (`owner` + `BRIDGE_SECRET`)
    */
-  function authenticateBridge(req, urlObj) {
+  function authenticateBridgeInfo(req, urlObj) {
     const secret = String(req.headers['x-bridge-secret'] || '').trim()
     const requestedRoom = String(req.headers['x-room-id'] || urlObj?.searchParams?.get('roomId') || '').trim()
     if (!secret) return null
     if (!requestedRoom || requestedRoom === 'owner') {
-      return auth.verifyBridgeSecret(secret) ? 'owner' : null
+      return auth.verifyBridgeSecret(secret) ? { roomId: 'owner', bridgeId: '', deviceId: '', label: '' } : null
     }
-    return rooms.verifyBridge(requestedRoom, secret) ? requestedRoom : null
+    if (requestedRoom.startsWith('usr_')) {
+      return accounts.verifyDeviceBridge(requestedRoom, secret)
+    }
+    return rooms.verifyBridge(requestedRoom, secret)
+      ? { roomId: requestedRoom, bridgeId: '', deviceId: '', label: '' }
+      : null
+  }
+
+  function authenticateBridge(req, urlObj) {
+    return authenticateBridgeInfo(req, urlObj)?.roomId || null
   }
 
   const server = http.createServer(async (req, res) => {
@@ -413,7 +462,316 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Revoke ALL active mobile tokens for a room (callable by either the PC bridge or an authenticated mobile client of that room)
+    // Account bootstrap check (tiny boolean so first-time UI knows whether an admin account already exists)
+    if (pathname === '/api/account/bootstrap-status' && req.method === 'GET') {
+      sendJson(res, 200, {
+        ok: true,
+        hasUsers: accounts.userCount() > 0,
+      })
+      return
+    }
+
+    // Account registration (strictly requires an admin-issued single-use invite code;
+    // when 0 users exist yet, server CLIENT_ACCESS_TOKEN works once to bootstrap the first admin account)
+    if (pathname === '/api/account/register' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
+        const isBootstrapAdmin =
+          accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAccessPassword(inviteCode)
+
+        const result = accounts.registerUser({
+          username: body.username,
+          password: body.password,
+          inviteCode,
+          isBootstrapAdmin,
+        })
+        if (!result.ok) {
+          auth.recordFailure(ip)
+          sendJson(res, 400, { ok: false, error: result.error })
+          return
+        }
+        auth.clearFailure(ip)
+        const user = result.user
+        const token = auth.signSessionToken(
+          user.userId,
+          body.deviceName || 'mobile',
+          user.userId,
+          user.tokenVersion,
+          { role: user.role, username: user.username },
+        )
+        sendJson(res, 200, {
+          ok: true,
+          token,
+          roomId: user.userId,
+          user,
+          devices: [],
+          bridges: [],
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Account mobile/web login -> room-scoped JWT bound to `usr_<id>` + auto-returns all bound PCs!
+    if (pathname === '/api/account/login' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const verified = accounts.authenticateUser(body.username, body.password)
+        if (!verified) {
+          auth.recordFailure(ip)
+          sendJson(res, 401, { ok: false, error: '用户名或密码不正确' })
+          return
+        }
+        auth.clearFailure(ip)
+        const { user } = verified
+        const token = auth.signSessionToken(
+          user.userId,
+          body.deviceName || 'mobile',
+          user.userId,
+          user.tokenVersion,
+          { role: user.role, username: user.username },
+        )
+        const bridges = hub.getBridgeList(user.userId)
+        sendJson(res, 200, {
+          ok: true,
+          token,
+          roomId: user.userId,
+          user,
+          devices: getMergedAccountDevices(user.userId, bridges),
+          bridges,
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // PC Bridge account login -> verifies username+password once, issues a per-PC `deviceSecret` (PC never stores password!)
+    if (pathname === '/api/account/device-login' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const verified = accounts.authenticateUser(body.username, body.password)
+        if (!verified) {
+          auth.recordFailure(ip)
+          sendJson(res, 401, { ok: false, error: '用户名或密码不正确' })
+          return
+        }
+        auth.clearFailure(ip)
+        const bound = accounts.bindDevice({
+          userId: verified.user.userId,
+          label: body.label || body.hostname || 'My PC',
+          hostname: body.hostname || body.label || 'My-PC',
+          platform: body.platform || 'unknown',
+          bridgeId: body.bridgeId || '',
+        })
+        hub.broadcastRoomDevices(verified.user.userId)
+        sendJson(res, 200, { ok: true, ...bound })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Bridge-authenticated device status check (lets PC CLI verify binding & list sibling PCs in the same account)
+    if (pathname === '/api/account/device-status' && req.method === 'GET') {
+      const info = authenticateBridgeInfo(req, urlObj)
+      if (!info || !info.roomId.startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '电脑绑定凭证无效或已被解绑' })
+        return
+      }
+      sendJson(res, 200, {
+        ok: true,
+        userId: info.userId,
+        username: info.username,
+        deviceId: info.deviceId,
+        bridgeId: info.bridgeId,
+        label: info.label,
+        devices: getMergedAccountDevices(info.roomId),
+      })
+      return
+    }
+
+    // List all bound PCs for the authenticated account
+    if (pathname === '/api/account/devices' && req.method === 'GET') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
+        return
+      }
+      sendJson(res, 200, {
+        ok: true,
+        devices: getMergedAccountDevices(payload.room),
+        bridges: hub.getBridgeList(payload.room),
+      })
+      return
+    }
+
+    // Rename a bound PC inside the authenticated user's account
+    if (pathname === '/api/account/devices/rename' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const updated = accounts.renameUserDevice(payload.room, body.deviceId, body.label)
+        if (!updated) {
+          sendJson(res, 404, { ok: false, error: '找不到目标电脑或名称为空' })
+          return
+        }
+        hub.broadcastRoomDevices(payload.room)
+        sendJson(res, 200, {
+          ok: true,
+          device: updated,
+          devices: getMergedAccountDevices(payload.room),
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Unbind a PC from the authenticated user's account (immediately kicks its WS bridge and revokes its deviceSecret)
+    if (pathname === '/api/account/devices/remove' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const removed = accounts.removeUserDevice(payload.room, body.deviceId)
+        if (!removed) {
+          sendJson(res, 404, { ok: false, error: '找不到目标电脑' })
+          return
+        }
+        hub.disconnectBridge(payload.room, removed.bridgeId, 4401, 'Device unbound')
+        hub.broadcastRoomDevices(payload.room)
+        sendJson(res, 200, {
+          ok: true,
+          removed,
+          devices: getMergedAccountDevices(payload.room),
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Change account password (revokes all other sessions and returns a fresh JWT for caller)
+    if (pathname === '/api/account/password' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const changed = accounts.changePassword(payload.room, body.currentPassword, body.newPassword)
+        if (!changed.ok) {
+          sendJson(res, 400, { ok: false, error: changed.error })
+          return
+        }
+        purgeRoomBridgeImgCache(payload.room)
+        hub.disconnectRoomClients(payload.room, 4401, 'Password changed')
+        const freshToken = auth.signSessionToken(
+          changed.user.userId,
+          payload.dev || 'mobile',
+          changed.user.userId,
+          changed.user.tokenVersion,
+          { role: changed.user.role, username: changed.user.username },
+        )
+        sendJson(res, 200, { ok: true, token: freshToken, user: changed.user })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Admin: List all single-use invite codes + registered user summary
+    if (pathname === '/api/admin/invites' && req.method === 'GET') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!auth.isAdminPayload(payload)) {
+        sendJson(res, 403, { ok: false, error: '仅管理员可管理邀请码' })
+        return
+      }
+      const invites = accounts.listInvites()
+      const stats = {
+        total: invites.length,
+        active: invites.filter((i) => i.status === 'active').length,
+        used: invites.filter((i) => i.status === 'used').length,
+        revoked: invites.filter((i) => i.status === 'revoked').length,
+      }
+      sendJson(res, 200, { ok: true, invites, stats, users: accounts.listUsers() })
+      return
+    }
+
+    // Admin: Generate N single-use registration invite codes (each usable by strictly 1 user)
+    if (pathname === '/api/admin/invites' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!auth.isAdminPayload(payload)) {
+        sendJson(res, 403, { ok: false, error: '仅管理员可生成邀请码' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const created = accounts.createInvites({
+          count: body.count ?? 1,
+          note: body.note || '',
+          createdBy: payload.uname || payload.sub || 'admin',
+          grantAdmin: Boolean(body.grantAdmin),
+        })
+        sendJson(res, 200, { ok: true, invites: created })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Admin: Revoke an unused invite code
+    if (pathname === '/api/admin/invites/revoke' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!auth.isAdminPayload(payload)) {
+        sendJson(res, 403, { ok: false, error: '仅管理员可作废邀请码' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const resRevoke = accounts.revokeInvite(body.id || body.code)
+        if (!resRevoke) {
+          sendJson(res, 404, { ok: false, error: '找不到该邀请码' })
+          return
+        }
+        if (!resRevoke.ok) {
+          sendJson(res, 400, { ok: false, error: resRevoke.error })
+          return
+        }
+        sendJson(res, 200, { ok: true, invite: resRevoke.invite })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Revoke ALL active mobile tokens for a room or account (callable by either the PC bridge or an authenticated mobile client)
     if (pathname === '/api/rooms/revoke' && req.method === 'POST') {
       const bridgeRoom = authenticateBridge(req, urlObj)
       const clientUser = bridgeRoom ? null : auth.verifySessionToken(extractBearer(req))
@@ -422,9 +780,11 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
-      const revoked = rooms.revokeRoomTokens(targetRoom)
+      const revoked = targetRoom.startsWith('usr_')
+        ? accounts.revokeUserTokens(targetRoom)
+        : rooms.revokeRoomTokens(targetRoom)
       if (!revoked) {
-        sendJson(res, 404, { ok: false, error: '房间不存在' })
+        sendJson(res, 404, { ok: false, error: '房间或账号不存在' })
         return
       }
       purgeRoomBridgeImgCache(targetRoom)
@@ -540,13 +900,19 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
-      const roomMeta = rooms.getRoomMeta(payload.room)
+      const isAccount = String(payload.room || '').startsWith('usr_')
+      const acctUser = isAccount ? accounts.getUserById(payload.room) : null
+      const roomMeta = isAccount ? null : rooms.getRoomMeta(payload.room)
+      const bridges = hub.getBridgeList(payload.room)
       sendJson(res, 200, {
         ok: true,
         user: payload,
         roomId: payload.room,
-        label: roomMeta?.label || '',
-        bridges: hub.getBridgeList(payload.room),
+        username: acctUser?.username || payload.uname || '',
+        role: acctUser?.role || (payload.room === 'owner' ? 'admin' : 'user'),
+        label: acctUser ? `@${acctUser.username}` : roomMeta?.label || '',
+        ...(isAccount ? { devices: getMergedAccountDevices(payload.room, bridges) } : {}),
+        bridges,
       })
       return
     }
@@ -775,17 +1141,20 @@ export function createRelayServer(options = {}) {
     const pathname = urlObj.pathname
 
     if (pathname === '/ws/bridge') {
-      const roomId = authenticateBridge(req, urlObj)
-      if (!roomId) {
+      const bridgeAuth = authenticateBridgeInfo(req, urlObj)
+      if (!bridgeAuth) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()
         return
       }
       const meta = {
-        roomId,
-        bridgeId: urlObj.searchParams.get('bridgeId') || 'home-pc',
-        hostname: urlObj.searchParams.get('hostname') || 'PC',
-        platform: urlObj.searchParams.get('platform') || 'win32',
+        roomId: bridgeAuth.roomId,
+        // For account-bound devices, enforce the authoritative bridgeId bound to that deviceSecret
+        bridgeId: bridgeAuth.bridgeId || urlObj.searchParams.get('bridgeId') || 'home-pc',
+        deviceId: bridgeAuth.deviceId || '',
+        label: bridgeAuth.label || '',
+        hostname: urlObj.searchParams.get('hostname') || bridgeAuth.hostname || 'PC',
+        platform: urlObj.searchParams.get('platform') || bridgeAuth.platform || 'win32',
         mode: urlObj.searchParams.get('mode') || 'dsh-plugin',
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -849,7 +1218,7 @@ export function createRelayServer(options = {}) {
       })
     })
 
-  return { server, wss, hub, rooms, start, close }
+  return { server, wss, hub, rooms, accounts, start, close }
 }
 
 // Run directly when invoked as main script

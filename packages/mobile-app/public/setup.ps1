@@ -81,6 +81,6 @@ if ($DesktopDir -and (Test-Path $DesktopDir)) {
 }
 
 Write-Host ''
-Write-Host 'Starting All in One PC Bridge (a QR code page will open shortly)...' -ForegroundColor Cyan
+Write-Host 'Starting All in One PC Bridge (sign in with your account to bind this PC)...' -ForegroundColor Cyan
 Write-Host ''
 & $NodeExe $BridgeFile --server $ServerUrl

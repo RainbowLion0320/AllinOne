@@ -1,0 +1,467 @@
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { safeEqual } from './auth.js'
+
+const INVITE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ' // No 0/O/1/I ambiguity
+const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
+const SCRYPT_KEYLEN = 64
+const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
+
+function sha256Hex(val) {
+  return createHash('sha256').update(String(val ?? ''), 'utf8').digest('hex')
+}
+
+function hashPassword(password, saltHex) {
+  const salt = saltHex || randomBytes(16).toString('hex')
+  const derived = scryptSync(String(password), salt, SCRYPT_KEYLEN, SCRYPT_OPTS).toString('hex')
+  return { salt, hash: derived }
+}
+
+function verifyPasswordHash(password, salt, expectedHashHex) {
+  if (!password || !salt || !expectedHashHex) return false
+  try {
+    const derivedBuf = scryptSync(String(password), String(salt), SCRYPT_KEYLEN, SCRYPT_OPTS)
+    const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
+    if (derivedBuf.length !== expectedBuf.length) return false
+    return timingSafeEqual(derivedBuf, expectedBuf)
+  } catch {
+    return false
+  }
+}
+
+function generateInviteCode() {
+  const bytes = randomBytes(8)
+  let raw = ''
+  for (let i = 0; i < 8; i += 1) {
+    raw += INVITE_ALPHABET[bytes[i] % INVITE_ALPHABET.length]
+  }
+  return `INV-${raw.slice(0, 4)}-${raw.slice(4)}`
+}
+
+export function normalizeInviteCode(input) {
+  let clean = String(input || '')
+    .trim()
+    .toUpperCase()
+    .replace(/^INV[-_\s]*/i, '')
+    .replace(/[^A-Z0-9]/g, '')
+  if (clean.length !== 8) return ''
+  return `INV-${clean.slice(0, 4)}-${clean.slice(4)}`
+}
+
+function sanitizeBridgeSlug(raw) {
+  const slug = String(raw || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32)
+  return slug || 'my-pc'
+}
+
+export function validateUsername(raw) {
+  const u = String(raw || '').trim()
+  if (!USERNAME_RE.test(u)) {
+    return { ok: false, error: '用户名需为 3~32 位字母、数字、点、下划线或连字符' }
+  }
+  return { ok: true, username: u, usernameLower: u.toLowerCase() }
+}
+
+export function validatePassword(raw) {
+  const p = String(raw ?? '')
+  if (p.length < 8) {
+    return { ok: false, error: '密码长度至少需要 8 位' }
+  }
+  if (p.length > 128) {
+    return { ok: false, error: '密码长度不能超过 128 位' }
+  }
+  return { ok: true, password: p }
+}
+
+/**
+ * Lightweight, zero-dependency account + single-use invite code + per-PC device credential store.
+ * Persists to JSON with `0600` permissions using atomic temp-file rename:
+ *  - Passwords stored strictly as salted `scrypt` hashes (never plaintext)
+ *  - Per-PC `deviceSecret` stored strictly as salted SHA-256 hashes (never plaintext)
+ *  - Invite codes are strictly single-use: burned synchronously inside `registerUser()`
+ */
+export function createAccountStore({ filePath }) {
+  mkdirSync(dirname(filePath), { recursive: true })
+
+  /** @type {Map<string, any>} */
+  const usersById = new Map()
+  /** @type {Map<string, string>} */
+  const userIdByLower = new Map()
+  /** @type {Map<string, any>} */
+  const invitesById = new Map()
+
+  function load() {
+    if (!existsSync(filePath)) return
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+      for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
+        if (!u?.userId || !u?.username) continue
+        const normalized = {
+          ...u,
+          usernameLower: String(u.usernameLower || u.username).toLowerCase(),
+          role: u.role === 'admin' ? 'admin' : 'user',
+          tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
+          devices: Array.isArray(u.devices) ? u.devices : [],
+        }
+        usersById.set(normalized.userId, normalized)
+        userIdByLower.set(normalized.usernameLower, normalized.userId)
+      }
+      for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
+        if (!inv?.id || !inv?.code) continue
+        invitesById.set(inv.id, inv)
+      }
+    } catch {}
+  }
+
+  function save() {
+    const payload = JSON.stringify(
+      {
+        version: 1,
+        users: [...usersById.values()],
+        invites: [...invitesById.values()],
+      },
+      null,
+      2,
+    )
+    const tmpPath = `${filePath}.tmp.${process.pid}`
+    writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(tmpPath, 0o600) } catch {}
+    renameSync(tmpPath, filePath)
+    try { chmodSync(filePath, 0o600) } catch {}
+  }
+
+  load()
+
+  function sanitizeDeviceRecord(d) {
+    return {
+      deviceId: d.deviceId,
+      bridgeId: d.bridgeId,
+      label: d.label || d.hostname || d.bridgeId,
+      hostname: d.hostname || d.bridgeId,
+      platform: d.platform || 'unknown',
+      createdAt: d.createdAt || 0,
+      lastSeenAt: d.lastSeenAt || 0,
+    }
+  }
+
+  function sanitizeUser(u) {
+    if (!u) return null
+    return {
+      userId: u.userId,
+      username: u.username,
+      role: u.role,
+      tokenVersion: u.tokenVersion,
+      createdAt: u.createdAt || 0,
+      lastLoginAt: u.lastLoginAt || 0,
+      deviceCount: Array.isArray(u.devices) ? u.devices.length : 0,
+    }
+  }
+
+  function createInvites({ count = 1, note = '', createdBy = 'admin', grantAdmin = false } = {}) {
+    const n = Math.max(1, Math.min(50, Math.floor(Number(count) || 1)))
+    const cleanNote = String(note || '').trim().slice(0, 80)
+    const existingCodes = new Set([...invitesById.values()].map((i) => i.code))
+    const created = []
+    const now = Date.now()
+
+    for (let i = 0; i < n; i += 1) {
+      let code = generateInviteCode()
+      while (existingCodes.has(code)) {
+        code = generateInviteCode()
+      }
+      existingCodes.add(code)
+      const record = {
+        id: `inv_${randomBytes(6).toString('hex')}`,
+        code,
+        note: cleanNote,
+        grantAdmin: Boolean(grantAdmin),
+        createdBy: String(createdBy || 'admin').slice(0, 64),
+        createdAt: now,
+        status: 'active', // 'active' | 'used' | 'revoked'
+        usedByUserId: '',
+        usedByUsername: '',
+        usedAt: 0,
+        revokedAt: 0,
+      }
+      invitesById.set(record.id, record)
+      created.push({ ...record })
+    }
+    save()
+    return created
+  }
+
+  function listInvites() {
+    return [...invitesById.values()]
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .map((inv) => ({ ...inv }))
+  }
+
+  function revokeInvite(idOrCode) {
+    const raw = String(idOrCode || '').trim()
+    if (!raw) return null
+    const normalizedCode = normalizeInviteCode(raw)
+    let target = invitesById.get(raw) || null
+    if (!target && normalizedCode) {
+      for (const inv of invitesById.values()) {
+        if (safeEqual(inv.code, normalizedCode)) {
+          target = inv
+          break
+        }
+      }
+    }
+    if (!target) return null
+    if (target.status !== 'active') {
+      return { ok: false, error: target.status === 'used' ? '该邀请码已被使用，无法作废' : '该邀请码已经作废', invite: { ...target } }
+    }
+    target.status = 'revoked'
+    target.revokedAt = Date.now()
+    save()
+    return { ok: true, invite: { ...target } }
+  }
+
+  function registerUser({ username, password, inviteCode = '', isBootstrapAdmin = false } = {}) {
+    const uCheck = validateUsername(username)
+    if (!uCheck.ok) return uCheck
+    const pCheck = validatePassword(password)
+    if (!pCheck.ok) return pCheck
+
+    if (userIdByLower.has(uCheck.usernameLower)) {
+      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+    }
+
+    let matchedInvite = null
+    if (!isBootstrapAdmin) {
+      const normalized = normalizeInviteCode(inviteCode)
+      if (!normalized) {
+        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
+      }
+      for (const inv of invitesById.values()) {
+        if (inv.status === 'active' && safeEqual(inv.code, normalized)) {
+          matchedInvite = inv
+          break
+        }
+      }
+      if (!matchedInvite) {
+        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
+      }
+    }
+
+    const now = Date.now()
+    const userId = `usr_${randomBytes(8).toString('hex')}`
+    const { salt, hash } = hashPassword(pCheck.password)
+    const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
+
+    // Strictly burn the single-use invite synchronously before persisting
+    if (matchedInvite) {
+      matchedInvite.status = 'used'
+      matchedInvite.usedByUserId = userId
+      matchedInvite.usedByUsername = uCheck.username
+      matchedInvite.usedAt = now
+    }
+
+    const record = {
+      userId,
+      username: uCheck.username,
+      usernameLower: uCheck.usernameLower,
+      role,
+      passwordSalt: salt,
+      passwordHash: hash,
+      tokenVersion: 0,
+      createdAt: now,
+      lastLoginAt: now,
+      invitedBy: isBootstrapAdmin ? 'bootstrap' : matchedInvite?.createdBy || '',
+      inviteId: matchedInvite?.id || '',
+      devices: [],
+    }
+
+    usersById.set(userId, record)
+    userIdByLower.set(record.usernameLower, userId)
+    save()
+
+    return {
+      ok: true,
+      user: sanitizeUser(record),
+      devices: [],
+    }
+  }
+
+  function authenticateUser(username, password) {
+    const lower = String(username || '').trim().toLowerCase()
+    if (!lower || !password) return null
+    const userId = userIdByLower.get(lower)
+    if (!userId) return null
+    const record = usersById.get(userId)
+    if (!record) return null
+    if (!verifyPasswordHash(password, record.passwordSalt, record.passwordHash)) {
+      return null
+    }
+    record.lastLoginAt = Date.now()
+    save()
+    return {
+      user: sanitizeUser(record),
+      devices: record.devices.map(sanitizeDeviceRecord),
+    }
+  }
+
+  function changePassword(userId, currentPassword, newPassword) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    if (!verifyPasswordHash(currentPassword, record.passwordSalt, record.passwordHash)) {
+      return { ok: false, error: '当前密码不正确' }
+    }
+    const pCheck = validatePassword(newPassword)
+    if (!pCheck.ok) return pCheck
+    const { salt, hash } = hashPassword(pCheck.password)
+    record.passwordSalt = salt
+    record.passwordHash = hash
+    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    save()
+    return { ok: true, user: sanitizeUser(record) }
+  }
+
+  function bindDevice({ userId, label = '', hostname = '', platform = 'unknown', bridgeId = '' } = {}) {
+    const record = usersById.get(userId)
+    if (!record) return null
+    const now = Date.now()
+    const deviceId = `dev_${randomBytes(6).toString('hex')}`
+    const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
+    const cleanHost = String(hostname || label || 'My-PC').trim().slice(0, 64) || 'My-PC'
+    const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
+    const baseSlug = sanitizeBridgeSlug(bridgeId || cleanHost || cleanLabel)
+
+    const existingBridgeIds = new Set((record.devices || []).map((d) => d.bridgeId))
+    let finalBridgeId = baseSlug
+    if (existingBridgeIds.has(finalBridgeId)) {
+      finalBridgeId = `${baseSlug.slice(0, 24)}-${deviceId.slice(4, 10)}`
+    }
+
+    const devRecord = {
+      deviceId,
+      bridgeId: finalBridgeId,
+      label: cleanLabel,
+      hostname: cleanHost,
+      platform: String(platform || 'unknown').trim().slice(0, 32) || 'unknown',
+      secretHash: sha256Hex(`${userId}:${deviceId}:${deviceSecret}`),
+      createdAt: now,
+      lastSeenAt: now,
+    }
+    record.devices.push(devRecord)
+    save()
+
+    return {
+      userId: record.userId,
+      username: record.username,
+      roomId: record.userId,
+      deviceId: devRecord.deviceId,
+      bridgeId: devRecord.bridgeId,
+      label: devRecord.label,
+      hostname: devRecord.hostname,
+      platform: devRecord.platform,
+      deviceSecret,
+    }
+  }
+
+  function verifyDeviceBridge(userId, deviceSecret) {
+    if (!userId || !deviceSecret) return null
+    const record = usersById.get(userId)
+    if (!record || !Array.isArray(record.devices)) return null
+    for (const dev of record.devices) {
+      const candidate = sha256Hex(`${userId}:${dev.deviceId}:${deviceSecret}`)
+      if (safeEqual(candidate, dev.secretHash)) {
+        const now = Date.now()
+        // Throttle disk writes for heartbeat/reconnect bursts (update persisted lastSeenAt at most once/min)
+        const shouldPersist = now - (dev.lastSeenAt || 0) > 60_000
+        dev.lastSeenAt = now
+        if (shouldPersist) save()
+        return {
+          roomId: record.userId,
+          userId: record.userId,
+          username: record.username,
+          deviceId: dev.deviceId,
+          bridgeId: dev.bridgeId,
+          label: dev.label,
+          hostname: dev.hostname,
+          platform: dev.platform,
+        }
+      }
+    }
+    return null
+  }
+
+  function listUserDevices(userId) {
+    const record = usersById.get(userId)
+    if (!record) return []
+    return record.devices.map(sanitizeDeviceRecord)
+  }
+
+  function renameUserDevice(userId, deviceId, newLabel) {
+    const record = usersById.get(userId)
+    if (!record) return null
+    const target = record.devices.find((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+    if (!target) return null
+    const clean = String(newLabel || '').trim().slice(0, 48)
+    if (!clean) return null
+    target.label = clean
+    save()
+    return sanitizeDeviceRecord(target)
+  }
+
+  function removeUserDevice(userId, deviceId) {
+    const record = usersById.get(userId)
+    if (!record) return null
+    const idx = record.devices.findIndex((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+    if (idx === -1) return null
+    const [removed] = record.devices.splice(idx, 1)
+    save()
+    return sanitizeDeviceRecord(removed)
+  }
+
+  function getUserById(userId) {
+    const record = usersById.get(userId)
+    return sanitizeUser(record)
+  }
+
+  function getTokenVersion(userId) {
+    const record = usersById.get(userId)
+    if (!record) return -1
+    return Number(record.tokenVersion || 0)
+  }
+
+  function revokeUserTokens(userId) {
+    const record = usersById.get(userId)
+    if (!record) return null
+    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    save()
+    return { roomId: record.userId, tokenVersion: record.tokenVersion }
+  }
+
+  function listUsers() {
+    return [...usersById.values()]
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .map(sanitizeUser)
+  }
+
+  return {
+    userCount: () => usersById.size,
+    createInvites,
+    listInvites,
+    revokeInvite,
+    registerUser,
+    authenticateUser,
+    changePassword,
+    bindDevice,
+    verifyDeviceBridge,
+    listUserDevices,
+    renameUserDevice,
+    removeUserDevice,
+    getUserById,
+    getTokenVersion,
+    revokeUserTokens,
+    listUsers,
+  }
+}

@@ -146,19 +146,33 @@ export function createAuthManager({
     return tokenTv === currentTv
   }
 
-  function signSessionToken(subject = 'owner', deviceName = 'mobile', roomId = 'owner', tokenVersion = 0) {
+  function signSessionToken(
+    subject = 'owner',
+    deviceName = 'mobile',
+    roomId = 'owner',
+    tokenVersion = 0,
+    { role = '', username = '' } = {},
+  ) {
     const room = String(roomId || 'owner').trim() || 'owner'
     const tv = Number.isFinite(Number(tokenVersion)) ? Math.max(0, Math.floor(Number(tokenVersion))) : 0
     const now = Date.now()
+    const effectiveRole = role || (room === 'owner' ? 'admin' : 'user')
     return signRawPayload({
       sub: subject,
       room,
       dev: String(deviceName || 'mobile').slice(0, 64),
       tv,
+      role: effectiveRole,
+      ...(username ? { uname: String(username).slice(0, 32) } : {}),
       scope: 'session',
       iat: now,
       exp: now + TOKEN_TTL_MS,
     })
+  }
+
+  function isAdminPayload(payload) {
+    if (!payload) return false
+    return payload.role === 'admin' || payload.room === 'owner'
   }
 
   function verifySessionToken(token) {
@@ -248,6 +262,7 @@ export function createAuthManager({
     checkRegisterLimit,
     signSessionToken,
     verifySessionToken,
+    isAdminPayload,
     signMediaToken,
     verifyMediaToken,
     issueWsTicket,

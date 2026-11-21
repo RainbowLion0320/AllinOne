@@ -12,8 +12,9 @@ const DEFAULT_RPC_TIMEOUT_MS = 120_000
  * Guarantees Room A can NEVER see Room B's bridges, events, RPCs, or files.
  */
 export class RelayHub {
-  constructor({ log = console } = {}) {
+  constructor({ log = console, getRoomDevices = null } = {}) {
     this.log = log
+    this.getRoomDevices = typeof getRoomDevices === 'function' ? getRoomDevices : null
     /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number }>} */
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
     /** @type {Map<string, { roomId: string, ws: import('ws').WebSocket, user: any, connectedAt: number }>} */
@@ -22,6 +23,15 @@ export class RelayHub {
     this.pendingRpc = new Map()
     /** @type {Map<string, { seq: number, buffer: any[] }>} */
     this.roomEvents = new Map()
+  }
+
+  resolveRoomDevices(roomId, liveBridges = null) {
+    if (!this.getRoomDevices) return undefined
+    try {
+      return this.getRoomDevices(roomId, liveBridges || this.getBridgeList(roomId))
+    } catch {
+      return undefined
+    }
   }
 
   bridgeKey(roomId, bridgeId) {
@@ -53,6 +63,8 @@ export class RelayHub {
       if (b.roomId !== rid) continue
       out.push({
         bridgeId: b.bridgeId,
+        deviceId: b.meta?.deviceId || '',
+        label: b.meta?.label || b.meta?.hostname || b.bridgeId,
         online: b.ws.readyState === 1,
         hostname: b.meta?.hostname || b.bridgeId,
         platform: b.meta?.platform || 'unknown',
@@ -96,10 +108,13 @@ export class RelayHub {
       `[relay] Bridge connected: room=${roomId} id=${bridgeId} (${meta.hostname || 'unknown'}, mode=${meta.mode || 'unknown'})`,
     )
 
+    const bridges = this.getBridgeList(roomId)
+    const devices = this.resolveRoomDevices(roomId, bridges)
     this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
       bridgeId,
       online: true,
-      bridges: this.getBridgeList(roomId),
+      bridges,
+      ...(devices ? { devices } : {}),
     })
 
     ws.on('message', (raw) => {
@@ -133,10 +148,13 @@ export class RelayHub {
             }
           }
         }
+        const bridges = this.getBridgeList(roomId)
+        const devices = this.resolveRoomDevices(roomId, bridges)
         this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
           bridgeId,
           online: false,
-          bridges: this.getBridgeList(roomId),
+          bridges,
+          ...(devices ? { devices } : {}),
         })
       }
     })
@@ -150,12 +168,15 @@ export class RelayHub {
 
     const evState = this.getRoomEventState(roomId)
 
+    const bridges = this.getBridgeList(roomId)
+    const devices = this.resolveRoomDevices(roomId, bridges)
     this.sendRaw(ws, {
       type: 'hello',
       clientId,
       roomId,
       seq: evState.seq,
-      bridges: this.getBridgeList(roomId),
+      bridges,
+      ...(devices ? { devices } : {}),
       ts: Date.now(),
     })
 
@@ -197,10 +218,13 @@ export class RelayHub {
       const bridge = this.bridges.get(key)
       if (bridge) {
         bridge.meta = { ...bridge.meta, ...(msg.meta || {}) }
+        const bridges = this.getBridgeList(roomId)
+        const devices = this.resolveRoomDevices(roomId, bridges)
         this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
           bridgeId,
           online: true,
-          bridges: this.getBridgeList(roomId),
+          bridges,
+          ...(devices ? { devices } : {}),
         })
       }
       return
@@ -373,6 +397,31 @@ export class RelayHub {
     try {
       ws.send(JSON.stringify(payload))
     } catch {}
+  }
+
+  broadcastRoomDevices(roomId) {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const bridges = this.getBridgeList(rid)
+    const devices = this.resolveRoomDevices(rid, bridges)
+    this.broadcastEvent(rid, '', EVENTS.BRIDGE_STATUS, {
+      bridgeId: '',
+      online: bridges.some((b) => b.online),
+      bridges,
+      ...(devices ? { devices } : {}),
+    })
+  }
+
+  disconnectBridge(roomId, bridgeId, code = 4401, reason = 'Device unbound') {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const bid = String(bridgeId || '').trim()
+    if (!bid) return false
+    const key = this.bridgeKey(rid, bid)
+    const entry = this.bridges.get(key)
+    if (!entry) return false
+    try {
+      entry.ws.close(code, reason)
+    } catch {}
+    return true
   }
 
   disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {

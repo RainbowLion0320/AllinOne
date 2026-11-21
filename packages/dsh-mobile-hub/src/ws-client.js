@@ -147,6 +147,12 @@ export class RelayBridgeLink {
       this.clearHeartbeat()
       if (this.ws === ws) this.ws = null
       if (this.stopped) return
+      if (code === 4401) {
+        const detail = reason || 'Device unbound or credential revoked'
+        this.log.warn?.(`mobile-hub: relay rejected bridge (${detail})`)
+        this.emitState('unauthorized', detail)
+        return
+      }
       const detail = `closed code=${code}${reason ? ` (${reason})` : ''}`
       this.log.warn?.(`mobile-hub: relay ${detail}`)
       this.emitState('disconnected', detail)

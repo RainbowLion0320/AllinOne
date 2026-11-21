@@ -64,6 +64,178 @@ export function toWsUrl(httpBase, path, queryParams = {}) {
   return u.toString()
 }
 
+export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
+  const base = normalizeBaseUrl(serverUrl)
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const res = await fetch(`${base}/api/account/bootstrap-status`, {
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.ok) return { hasUsers: true }
+    return { hasUsers: Boolean(data.hasUsers) }
+  } catch {
+    return { hasUsers: true }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+export async function loginAccount(serverUrl, { username, password }) {
+  const base = normalizeBaseUrl(serverUrl)
+  const res = await fetch(`${base}/api/account/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: String(username || '').trim(),
+      password: String(password ?? ''),
+      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `登录失败 (HTTP ${res.status})`)
+  }
+  return {
+    baseUrl: base,
+    token: data.token,
+    roomId: data.roomId || data.user?.userId || '',
+    username: data.user?.username || String(username || '').trim(),
+    role: data.user?.role || 'user',
+    label: `@${data.user?.username || String(username || '').trim()}`,
+    devices: Array.isArray(data.devices) ? data.devices : [],
+    bridges: Array.isArray(data.bridges) ? data.bridges : [],
+  }
+}
+
+export async function registerAccount(serverUrl, { username, password, inviteCode }) {
+  const base = normalizeBaseUrl(serverUrl)
+  const res = await fetch(`${base}/api/account/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: String(username || '').trim(),
+      password: String(password ?? ''),
+      inviteCode: String(inviteCode || '').trim(),
+      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `注册失败 (HTTP ${res.status})`)
+  }
+  return {
+    baseUrl: base,
+    token: data.token,
+    roomId: data.roomId || data.user?.userId || '',
+    username: data.user?.username || String(username || '').trim(),
+    role: data.user?.role || 'user',
+    label: `@${data.user?.username || String(username || '').trim()}`,
+    devices: Array.isArray(data.devices) ? data.devices : [],
+    bridges: Array.isArray(data.bridges) ? data.bridges : [],
+  }
+}
+
+export async function listAccountDevices(baseUrl, token) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/devices`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `获取电脑列表失败 (HTTP ${res.status})`)
+  }
+  return {
+    devices: Array.isArray(data.devices) ? data.devices : [],
+    bridges: Array.isArray(data.bridges) ? data.bridges : [],
+  }
+}
+
+export async function renameAccountDevice(baseUrl, token, { deviceId, label }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/devices/rename`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ deviceId, label }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `重命名失败 (HTTP ${res.status})`)
+  }
+  return Array.isArray(data.devices) ? data.devices : []
+}
+
+export async function removeAccountDevice(baseUrl, token, { deviceId }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/devices/remove`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ deviceId }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `解绑失败 (HTTP ${res.status})`)
+  }
+  return Array.isArray(data.devices) ? data.devices : []
+}
+
+export async function adminListInvites(baseUrl, token) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/invites`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `获取邀请码失败 (HTTP ${res.status})`)
+  }
+  return {
+    invites: Array.isArray(data.invites) ? data.invites : [],
+    stats: data.stats || { total: 0, active: 0, used: 0, revoked: 0 },
+    users: Array.isArray(data.users) ? data.users : [],
+  }
+}
+
+export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false } = {}) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/invites`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ count, note, grantAdmin }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `生成邀请码失败 (HTTP ${res.status})`)
+  }
+  return Array.isArray(data.invites) ? data.invites : []
+}
+
+export async function adminRevokeInvite(baseUrl, token, { id }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/invites/revoke`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ id }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `作废邀请码失败 (HTTP ${res.status})`)
+  }
+  return data.invite
+}
+
 export async function loginToRelay(serverUrl, password) {
   const base = normalizeBaseUrl(serverUrl)
   const res = await fetch(`${base}/api/auth/login`, {
@@ -158,7 +330,10 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
     return {
       status: online ? 'online' : 'offline',
       bridges,
+      devices: Array.isArray(data.devices) ? data.devices : null,
       label: String(data.label || ''),
+      username: String(data.username || ''),
+      role: String(data.role || ''),
       roomId: String(data.roomId || device.roomId || ''),
     }
   } catch {
@@ -258,6 +433,7 @@ export class MobileRelayClient {
     this.statusListeners = new Set()
     this.connectionState = 'disconnected'
     this.bridges = []
+    this.devices = null
   }
 
   setTargetBridgeId(bridgeId) {
@@ -271,12 +447,12 @@ export class MobileRelayClient {
 
   onStatus(fn) {
     this.statusListeners.add(fn)
-    fn({ state: this.connectionState, bridges: this.bridges })
+    fn({ state: this.connectionState, bridges: this.bridges, devices: this.devices })
     return () => this.statusListeners.delete(fn)
   }
 
   emitStatus() {
-    const snap = { state: this.connectionState, bridges: this.bridges }
+    const snap = { state: this.connectionState, bridges: this.bridges, devices: this.devices }
     for (const fn of this.statusListeners) {
       try { fn(snap) } catch {}
     }
@@ -369,6 +545,7 @@ export class MobileRelayClient {
       if (msg.type === 'hello') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
         this.bridges = msg.bridges || []
+        if (Array.isArray(msg.devices)) this.devices = msg.devices
         this.emitStatus()
         return
       }
@@ -385,8 +562,9 @@ export class MobileRelayClient {
 
       if (msg.type === 'event') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
-        if (msg.event === 'bridge.status' && Array.isArray(msg.payload?.bridges)) {
-          this.bridges = msg.payload.bridges
+        if (msg.event === 'bridge.status') {
+          if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
+          if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
           this.emitStatus()
         }
         for (const fn of this.eventListeners) {

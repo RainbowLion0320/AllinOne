@@ -53,12 +53,21 @@ function sanitizeDevice(raw) {
     ? raw.bridges.find((b) => b?.online) || raw.bridges[0] || null
     : null
   const now = Date.now()
+  const authMode =
+    raw.authMode === 'account' || roomId.startsWith('usr_')
+      ? 'account'
+      : raw.authMode === 'password' || (raw.authMode !== 'pair' && roomId === 'owner')
+        ? 'password'
+        : 'pair'
+  const role = raw.role === 'admin' || roomId === 'owner' ? 'admin' : raw.role === 'user' ? 'user' : ''
   return {
     id,
     baseUrl,
     token,
     roomId,
-    authMode: raw.authMode === 'password' || (raw.authMode !== 'pair' && roomId === 'owner') ? 'password' : 'pair',
+    authMode,
+    username: String(raw.username || '').trim().slice(0, 32),
+    role,
     customName: String(raw.customName || '').trim().slice(0, 40),
     label: String(raw.label || '').trim().slice(0, 64),
     lastHostname: String(raw.lastHostname || firstBridge?.hostname || '').trim().slice(0, 64),
@@ -162,6 +171,8 @@ export function upsertDevice(state, payload) {
       token: incoming.token,
       roomId: incoming.roomId,
       authMode: incoming.authMode,
+      username: incoming.username || existing.username || '',
+      role: incoming.role || existing.role || '',
       label: incoming.label || existing.label,
       lastHostname: incoming.lastHostname || existing.lastHostname,
       lastPlatform: incoming.lastPlatform || existing.lastPlatform,
@@ -236,6 +247,20 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
       changed = true
     }
   }
+  if (patch.username !== undefined) {
+    const val = String(patch.username || '').trim().slice(0, 32)
+    if (val && val !== cur.username) {
+      next.username = val
+      changed = true
+    }
+  }
+  if (patch.role !== undefined) {
+    const val = patch.role === 'admin' ? 'admin' : patch.role === 'user' ? 'user' : ''
+    if (val && val !== cur.role) {
+      next.role = val
+      changed = true
+    }
+  }
   if (patch.lastHostname !== undefined) {
     const val = String(patch.lastHostname || '').trim().slice(0, 64)
     if (val && val !== cur.lastHostname) {
@@ -295,6 +320,13 @@ export function removeDevice(state, deviceId) {
 
 export function getDeviceDisplayName(device, activeBridge = null, onlineBridgeCount = 0) {
   if (!device) return '未选择电脑'
+  if (device.authMode === 'account' || String(device.roomId || '').startsWith('usr_')) {
+    if (activeBridge) {
+      return activeBridge.label || activeBridge.hostname || activeBridge.bridgeId
+    }
+    if (device.lastHostname) return device.lastHostname
+    return device.username ? `@${device.username}` : device.label || '我的账号'
+  }
   const baseName =
     device.customName ||
     activeBridge?.hostname ||
