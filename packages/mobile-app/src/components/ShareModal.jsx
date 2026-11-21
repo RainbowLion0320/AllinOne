@@ -6,7 +6,6 @@ import {
   Globe,
   Loader2,
   Share2,
-  ShieldCheck,
   Smartphone,
   Terminal,
   Ticket,
@@ -109,15 +108,12 @@ export function ShareModal({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="mb-3 flex items-center justify-between">
+        <div className="mb-3.5 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
               <Share2 className="h-4 w-4" />
             </div>
-            <div>
-              <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">分享给朋友</h2>
-              <p className="text-[11px] text-slate-400">发送一次性邀请码，注册登录即可直连电脑</p>
-            </div>
+            <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">分享</h2>
           </div>
           <button
             type="button"
@@ -131,11 +127,11 @@ export function ShareModal({
 
         {/* Admin one-tap single-use invite generator */}
         {isAdmin && token && (
-          <div className="mb-3.5 rounded-2xl border border-[#4D6BFE]/30 bg-[#F2F5FF] p-3 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
+          <div className="mb-3 rounded-2xl border border-[#4D6BFE]/30 bg-[#F2F5FF] p-3 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 text-xs font-bold text-[#2842C9] dark:text-white">
                 <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>一次性注册邀请码</span>
+                <span>邀请码</span>
               </div>
               {onOpenInviteManager && (
                 <button
@@ -146,7 +142,7 @@ export function ShareModal({
                   }}
                   className="text-[11px] font-semibold text-[#4D6BFE] hover:underline"
                 >
-                  管理全部邀请码 →
+                  管理 →
                 </button>
               )}
             </div>
@@ -162,7 +158,7 @@ export function ShareModal({
                     onClick={() => copyText('inv', generatedInvite.code)}
                     className="rounded-lg bg-[#4D6BFE]/12 px-2 py-1 text-[11px] font-semibold text-[#4D6BFE]"
                   >
-                    {copiedKey === 'inv' ? '已复制' : '复制码'}
+                    {copiedKey === 'inv' ? '已复制' : '复制'}
                   </button>
                   <button
                     type="button"
@@ -182,27 +178,19 @@ export function ShareModal({
                 className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#4D6BFE] py-2 text-xs font-semibold text-white active:scale-[0.98] disabled:opacity-60"
               >
                 {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ticket className="h-3.5 w-3.5" />}
-                <span>生成 1 个一次性邀请码（自动附带到下方文案）</span>
+                <span>生成一次性邀请码</span>
               </button>
             )}
             {genError && <div className="mt-1.5 text-[11px] text-rose-500">{genError}</div>}
           </div>
         )}
 
-        {/* Privacy guarantee pill */}
-        <div className="mb-3.5 flex items-start gap-2 rounded-2xl border border-emerald-200/70 bg-emerald-50/70 px-3 py-2 text-[11.5px] leading-relaxed text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/35 dark:text-emerald-300">
-          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
-          <span>
-            <strong>账号空间严格隔离：</strong>每位用户注册后拥有独立空间与单机专属密钥，只能控制自己账号下绑定的电脑，完全互不可见。
-          </span>
-        </div>
-
         {/* Step 1: PC 1-line command */}
-        <div className="mb-3.5 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171E]">
+        <div className="mb-3 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171E]">
           <div className="mb-2 flex items-center justify-between">
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100">
               <Terminal className="h-3.5 w-3.5 text-[#4D6BFE]" />
-              电脑端 1 行安装绑定命令
+              电脑端绑定命令
             </span>
             <div className="inline-flex rounded-lg bg-slate-200/80 p-0.5 text-[10.5px] dark:bg-slate-800">
               <button
@@ -241,23 +229,20 @@ export function ShareModal({
               <span>{copiedKey === 'cmd' ? '已复制' : '复制'}</span>
             </button>
           </div>
-          <p className="mt-1.5 text-[10.5px] text-slate-400">
-            运行后输入账号密码登录一次即可绑定（绝不保存明文密码），手机端自动出现该电脑。
-          </p>
         </div>
 
         {/* Step 2: Mobile links */}
-        <div className="mb-4 space-y-2 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171E]">
+        <div className="mb-3.5 space-y-2 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171E]">
           <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100">
             <Smartphone className="h-3.5 w-3.5 text-[#4D6BFE]" />
-            手机端注册与下载入口
+            手机端入口
           </div>
 
           <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">
                 <Download className="h-3.5 w-3.5 text-emerald-500" />
-                <span>Android 通用安装包 (自动热更新)</span>
+                <span>Android 安装包</span>
               </div>
               <div className="truncate text-[10.5px] text-slate-400">{apkUrl}</div>
             </div>
@@ -266,7 +251,7 @@ export function ShareModal({
               onClick={() => copyText('apk', apkUrl)}
               className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             >
-              {copiedKey === 'apk' ? '已复制' : '复制链接'}
+              {copiedKey === 'apk' ? '已复制' : '复制'}
             </button>
           </div>
 
@@ -274,7 +259,7 @@ export function ShareModal({
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">
                 <Globe className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>{generatedInvite ? '免填邀请码注册直达链接' : '免安装网页 / iOS PWA 入口'}</span>
+                <span>{generatedInvite ? '邀请注册链接' : '网页入口'}</span>
               </div>
               <div className="truncate text-[10.5px] text-slate-400">{webUrl}</div>
             </div>
@@ -283,24 +268,22 @@ export function ShareModal({
               onClick={() => copyText('web', webUrl)}
               className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             >
-              {copiedKey === 'web' ? '已复制' : '复制链接'}
+              {copiedKey === 'web' ? '已复制' : '复制'}
             </button>
           </div>
         </div>
 
-        {/* One-tap copy complete WeChat share guide */}
+        {/* One-tap copy complete share guide */}
         <button
           type="button"
           onClick={() => copyText('all', shareBundleText)}
-          className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+          className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
         >
           {copiedKey === 'all' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
           <span>
             {copiedKey === 'all'
-              ? '已复制完整邀请文案，直接粘贴发给朋友！'
-              : generatedInvite
-                ? '一键复制含邀请码的分享文案'
-                : '一键复制完整分享文案（微信直发）'}
+              ? '已复制'
+              : '复制分享文案'}
           </span>
         </button>
       </div>

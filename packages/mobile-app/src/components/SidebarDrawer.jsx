@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import {
-  ArrowLeftRight,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
@@ -251,22 +250,16 @@ export function SidebarDrawer({
         {/* Top header */}
         <div className="pt-safe flex items-center justify-between px-4 pb-2.5">
           <div className="flex items-center gap-2.5">
-            <img src="./icon-192.png" alt="All in One" className="h-8.5 w-8.5 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
-            <div>
-              <div className="flex items-center gap-1.5 text-[15px] font-bold text-slate-900 dark:text-white">
-                <span>All in One</span>
-                <span className="rounded-md bg-slate-200/80 px-1.5 py-0.2 text-[9.5px] font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                  v0.2.0
-                </span>
+            <img src="./icon-192.png" alt="All in One" className="h-8 w-8 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
+            <div className="min-w-0">
+              <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
+                All in One
               </div>
-              <div className="text-[10.5px] text-slate-400">
-                {username
-                  ? `@${username}${isAdmin ? ' · 管理员' : ''}`
-                  : roomId && roomId !== 'owner'
-                    ? '旧版配对房间'
-                    : '管理员房间'}
-                {devicesCount > 1 ? ` · ${devicesCount} 台电脑` : ''}
-              </div>
+              {username && (
+                <div className="truncate text-[11px] text-slate-400">
+                  @{username}
+                </div>
+              )}
             </div>
           </div>
 
@@ -300,7 +293,7 @@ export function SidebarDrawer({
             }}
             className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-2 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
           >
-            <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+            <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
               <Monitor className="h-4 w-4" />
               <span
                 className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-[#232631] ${
@@ -315,29 +308,23 @@ export function SidebarDrawer({
               />
             </div>
 
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[13px] font-semibold text-slate-800 dark:text-white">
-                {activeDeviceName || '我的电脑'}
-              </div>
-              <div className="truncate text-[10.5px] text-slate-400">
-                {connState === 'unauthorized'
-                  ? '凭证已过期 · 点击重新配对'
-                  : connState === 'connected' && bridgeOnline
-                    ? onlineBridgesCount > 1
-                      ? `在线 · 同房 ${onlineBridgesCount} 台可切换`
-                      : devicesCount > 1
-                        ? `在线 · 点击切换电脑`
-                        : '在线 · 点击添加更多电脑'
-                    : connState === 'connecting'
-                      ? '正在连接服务器...'
-                      : '电脑离线 · 点击切换其他电脑'}
-              </div>
-            </div>
+            <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-slate-800 dark:text-white">
+              {activeDeviceName || '我的电脑'}
+            </span>
 
-            <div className="inline-flex shrink-0 items-center gap-0.5 rounded-lg bg-slate-100 px-2 py-1 text-[10.5px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-              <span>{devicesCount > 1 || onlineBridgesCount > 1 ? '切换' : '设备'}</span>
-              <ChevronsUpDown className="h-3 w-3 opacity-75" />
-            </div>
+            {connState === 'unauthorized' ? (
+              <span className="shrink-0 rounded-md bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-500 dark:bg-rose-950/50 dark:text-rose-300">
+                已过期
+              </span>
+            ) : connState === 'connecting' ? (
+              <span className="shrink-0 text-[10.5px] text-amber-500">连接中</span>
+            ) : !(connState === 'connected' && bridgeOnline) ? (
+              <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                离线
+              </span>
+            ) : null}
+
+            <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
           </button>
         </div>
 
@@ -349,10 +336,10 @@ export function SidebarDrawer({
               onClose()
               onNewChat()
             }}
-            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
+            className="flex w-full items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
           >
             <Plus className="h-4 w-4 stroke-[2.5]" />
-            <span>开启新对话</span>
+            <span>新对话</span>
           </button>
         </div>
 
@@ -364,7 +351,7 @@ export function SidebarDrawer({
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="搜索项目、对话标题或目录..."
+              placeholder="搜索对话..."
               className="w-full rounded-xl border border-slate-200/80 bg-white py-2 pr-3 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#14161B] dark:text-slate-100"
             />
           </div>
@@ -385,7 +372,7 @@ export function SidebarDrawer({
                   type="button"
                   title={`${tab.label} (${count})`}
                   aria-label={`筛选 ${tab.label}`}
-                  onClick={() => setFilterApp(tab.id)}
+                  onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
                   className={`relative flex h-10 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
                     active
                       ? 'border-transparent shadow-xs'
@@ -419,20 +406,6 @@ export function SidebarDrawer({
               )
             })}
           </div>
-          {filterApp !== 'all' && (
-            <div className="mt-1.5 flex items-center justify-between px-0.5 text-[10.5px] text-slate-400">
-              <span>
-                当前筛选：<strong className="font-semibold text-slate-600 dark:text-slate-200">{FILTER_TABS.find((t) => t.id === filterApp)?.label}</strong>
-              </span>
-              <button
-                type="button"
-                onClick={() => setFilterApp('all')}
-                className="text-[#4D6BFE] hover:underline"
-              >
-                显示全部
-              </button>
-            </div>
-          )}
         </div>
 
         {/* Grouping Mode Switcher: By Project (default) vs By Time */}
@@ -470,7 +443,7 @@ export function SidebarDrawer({
               onClick={toggleAllProjects}
               className="text-slate-400 hover:text-[#4D6BFE]"
             >
-              {allExpanded ? '全部折叠' : '全部展开'}
+              {allExpanded ? '折叠' : '展开'}
             </button>
           )}
         </div>
@@ -579,88 +552,67 @@ export function SidebarDrawer({
 
         {/* Footer controls */}
         <div className="pb-safe border-t border-slate-200/80 px-4 pt-2.5 dark:border-slate-800">
-          {/* Phone local history cache meter + one-tap cleanup */}
-          <div className="mb-2 flex items-center justify-between rounded-xl bg-slate-100/80 px-2.5 py-1.5 text-[11px] text-slate-500 dark:bg-[#232630] dark:text-slate-400">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-              <span className="truncate">
-                {cacheClearedHint
-                  ? '本地历史缓存已清空'
-                  : `缓存 ${cacheStats.sessionCount} 会话 · ${formatBytesCompact(cacheStats.totalBytes)}`}
-              </span>
+          {/* Show cache bar only when cached data exists */}
+          {(cacheStats.sessionCount > 0 || cacheClearedHint) && (
+            <div className="mb-2 flex items-center justify-between rounded-xl bg-slate-100/80 px-2.5 py-1.5 text-[11px] text-slate-500 dark:bg-[#232630] dark:text-slate-400">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                <span className="truncate">
+                  {cacheClearedHint
+                    ? '已清空缓存'
+                    : `缓存 ${cacheStats.sessionCount} · ${formatBytesCompact(cacheStats.totalBytes)}`}
+                </span>
+              </div>
+              {cacheStats.sessionCount > 0 && (
+                <button
+                  type="button"
+                  onClick={handleClearCache}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-200/80 hover:text-rose-500 dark:text-slate-300 dark:hover:bg-slate-700/70"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  <span>清理</span>
+                </button>
+              )}
             </div>
-            <button
-              type="button"
-              disabled={cacheStats.sessionCount === 0}
-              onClick={handleClearCache}
-              className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-200/80 hover:text-rose-500 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-700/70"
-            >
-              <Trash2 className="h-3 w-3" />
-              <span>清理</span>
-            </button>
-          </div>
+          )}
 
           <div className="flex items-center justify-between gap-1">
             <button
               type="button"
               onClick={onToggleDark}
-              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
+              className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               {darkMode ? <Sun className="h-4 w-4 text-amber-400" /> : <Moon className="h-4 w-4" />}
               <span>{darkMode ? '浅色' : '深色'}</span>
             </button>
 
-            {isAdmin && onOpenInviteManager ? (
-              <button
-                type="button"
-                onClick={() => {
-                  onClose()
-                  onOpenInviteManager()
-                }}
-                className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-              >
-                <Ticket className="h-3.5 w-3.5" />
-                <span>邀请码</span>
-              </button>
-            ) : (
+            <div className="flex items-center gap-1">
+              {isAdmin && onOpenInviteManager && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose()
+                    onOpenInviteManager()
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                >
+                  <Ticket className="h-3.5 w-3.5" />
+                  <span>邀请码</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => {
                   onClose()
                   onOpenShare?.()
                 }}
-                className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
               >
                 <Share2 className="h-3.5 w-3.5" />
                 <span>分享</span>
               </button>
-            )}
-
-            {isAdmin && (
-              <button
-                type="button"
-                onClick={() => {
-                  onClose()
-                  onOpenShare?.()
-                }}
-                className="inline-flex items-center gap-1 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
-              >
-                <Share2 className="h-3.5 w-3.5" />
-                <span>分享</span>
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onOpenDeviceSwitcher?.()
-              }}
-              className="inline-flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <ArrowLeftRight className="h-3.5 w-3.5 text-[#4D6BFE]" />
-              <span>电脑</span>
-            </button>
+            </div>
           </div>
         </div>
       </aside>

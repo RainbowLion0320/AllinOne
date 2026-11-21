@@ -303,8 +303,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
         </button>
 
         <div className="text-center">
-          <div className="text-sm font-semibold">扫一扫配对电脑</div>
-          <div className="text-[11px] text-white/60">对准电脑端弹出的 All in One 二维码</div>
+          <div className="text-sm font-semibold">扫一扫</div>
         </div>
 
         <div className="flex h-10 w-10 items-center justify-end">

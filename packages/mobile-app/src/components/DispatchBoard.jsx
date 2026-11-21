@@ -61,13 +61,10 @@ export function DispatchBoard({
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center">
       <div className="flex max-h-[88vh] w-full max-w-lg flex-col rounded-t-3xl bg-[#F8F9FC] shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-slate-200/80 px-5 py-4 dark:border-slate-800">
+        <div className="flex items-center justify-between border-b border-slate-200/80 px-5 py-3.5 dark:border-slate-800">
           <div className="flex items-center gap-2">
-            <Cpu className="h-5 w-5 text-[#4D6BFE]" />
-            <div>
-              <h3 className="text-base font-bold text-slate-900 dark:text-white">全端总控调度台</h3>
-              <p className="text-[11px] text-slate-500">管理 4 个应用在线状态 & 并行跨应用派单</p>
-            </div>
+            <Cpu className="h-4.5 w-4.5 text-[#4D6BFE]" />
+            <h3 className="text-[15.5px] font-bold text-slate-900 dark:text-white">调度台</h3>
           </div>
           <div className="flex items-center gap-1">
             <button
@@ -131,7 +128,7 @@ export function DispatchBoard({
             className="rounded-2xl border border-[#4D6BFE]/25 bg-white p-3.5 dark:border-[#4D6BFE]/30 dark:bg-[#232630]"
           >
             <div className="mb-2.5 text-xs font-bold text-slate-800 dark:text-white">
-              快速后台派单（支持多应用并行干活）
+              后台派单
             </div>
             <div className="mb-2.5 flex flex-wrap gap-1.5">
               {APP_LIST.map((appId) => {
@@ -159,7 +156,7 @@ export function DispatchBoard({
               type="text"
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
-              placeholder="工作目录（留空则使用电脑默认目录）"
+              placeholder="工作目录（可选）"
               className="mb-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-[11px] text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-200"
             />
             {workspaces?.length > 0 && (
@@ -180,7 +177,7 @@ export function DispatchBoard({
               rows={2}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder={`输入要派发给 ${APP_META[targetApp]?.shortName} 的任务指令...`}
+              placeholder={`派发给 ${APP_META[targetApp]?.shortName} 的任务...`}
               className="w-full resize-none rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
             />
             <div className="mt-2.5 flex justify-end">
@@ -190,7 +187,7 @@ export function DispatchBoard({
                 className="inline-flex items-center gap-1.5 rounded-xl bg-[#4D6BFE] px-4 py-2 text-xs font-semibold text-white active:scale-95 disabled:opacity-50"
               >
                 {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                <span>派发到后台执行</span>
+                <span>派发</span>
               </button>
             </div>
           </form>
@@ -198,11 +195,11 @@ export function DispatchBoard({
           {/* Dispatched Tasks Feed */}
           <div>
             <div className="mb-2 text-xs font-bold text-slate-600 dark:text-slate-300">
-              最近跨应用派单记录（含 DSH 总控自动派单）
+              派单记录
             </div>
             {dispatches.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-slate-200 py-8 text-center text-xs text-slate-400 dark:border-slate-700">
-                暂无派单记录。你可以在上方直接派单，或在 DSH 对话中一句话指挥其他应用。
+              <div className="rounded-2xl border border-dashed border-slate-200 py-7 text-center text-xs text-slate-400 dark:border-slate-700">
+                暂无记录
               </div>
             ) : (
               <div className="space-y-2">

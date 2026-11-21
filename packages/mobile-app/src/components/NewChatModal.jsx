@@ -104,7 +104,7 @@ export function NewChatModal({
           className="pb-safe max-h-[90vh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1E2028]"
         >
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-base font-bold text-slate-900 dark:text-white">开启新对话</h3>
+            <h3 className="text-base font-bold text-slate-900 dark:text-white">新对话</h3>
             <button
               type="button"
               onClick={onClose}
@@ -119,22 +119,18 @@ export function NewChatModal({
             <div>
               <div className="mb-2 flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-500 dark:text-slate-400">
-                  选择应用
+                  应用
                 </span>
                 <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-300">
                   <span>{selectedAppMeta.shortName}</span>
-                  <span className="text-slate-300 dark:text-slate-600">·</span>
-                  <span
-                    className={
-                      selectedAppStatus?.writable
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : selectedAppStatus?.available
-                          ? 'text-amber-500'
-                          : 'text-slate-400'
-                    }
-                  >
-                    {selectedAppStatus?.writable ? '可读写' : selectedAppStatus?.available ? '仅只读' : '未就绪'}
-                  </span>
+                  {!selectedAppStatus?.writable && (
+                    <>
+                      <span className="text-slate-300 dark:text-slate-600">·</span>
+                      <span className={selectedAppStatus?.available ? 'text-amber-500' : 'text-slate-400'}>
+                        {selectedAppStatus?.available ? '只读' : '未就绪'}
+                      </span>
+                    </>
+                  )}
                 </span>
               </div>
               <div className="grid grid-cols-4 gap-2">
@@ -181,13 +177,10 @@ export function NewChatModal({
 
             {/* Model & Reasoning Effort Selector (per-app native rules) */}
             <div className="rounded-2xl border border-slate-200/80 bg-slate-50/80 p-3 dark:border-slate-700/80 dark:bg-[#16171A]">
-              <div className="mb-2 flex items-center justify-between">
+              <div className="mb-2 flex items-center">
                 <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
                   <SlidersHorizontal className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  模型与推理强度
-                </span>
-                <span className="text-[10.5px] text-slate-400">
-                  {appModels.length > 0 ? `共 ${appModels.length} 个可选` : '使用默认配置'}
+                  模型
                 </span>
               </div>
 
@@ -203,17 +196,14 @@ export function NewChatModal({
                   </div>
                   {activeModelObj?.providerName && (
                     <div className="text-[10.5px] text-slate-400">
-                      通道：{activeModelObj.providerName}
+                      {activeModelObj.providerName}
                     </div>
                   )}
                 </div>
-                <div className="inline-flex shrink-0 items-center gap-0.5 text-xs font-medium text-[#4D6BFE]">
-                  <span>切换</span>
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </div>
+                <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
               </button>
 
-              {activeEfforts.length > 0 ? (
+              {activeEfforts.length > 0 && (
                 <div className="mt-2.5">
                   <div className="mb-1.5 flex items-center gap-1 text-[11px] text-slate-400">
                     <Sparkles className="h-3 w-3 text-[#4D6BFE]" />
@@ -239,12 +229,6 @@ export function NewChatModal({
                     })}
                   </div>
                 </div>
-              ) : (
-                appModels.length > 0 && (
-                  <div className="mt-2 text-[11px] text-slate-400">
-                    当前模型不支持单独调节推理强度
-                  </div>
-                )
               )}
             </div>
 
@@ -252,13 +236,13 @@ export function NewChatModal({
             <div>
               <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
                 <FolderOpen className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                电脑端工作目录
+                工作目录
               </label>
               <input
                 type="text"
                 value={cwd}
                 onChange={(e) => setCwd(e.target.value)}
-                placeholder="留空则使用电脑默认目录"
+                placeholder="默认目录"
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-100"
               />
               {workspaces?.length > 0 && (
@@ -280,13 +264,13 @@ export function NewChatModal({
             {/* Optional title */}
             <div>
               <label className="mb-1.5 block text-xs font-medium text-slate-500 dark:text-slate-400">
-                对话名称（可选）
+                标题（可选）
               </label>
               <input
                 type="text"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="留空则自动命名"
+                placeholder="自动命名"
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-100"
               />
             </div>
@@ -294,10 +278,10 @@ export function NewChatModal({
             <button
               type="submit"
               disabled={creating}
-              className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-60"
+              className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-60"
             >
               {creating && <Loader2 className="h-4 w-4 animate-spin" />}
-              <span>{creating ? '正在创建...' : `在 ${APP_META[app]?.shortName} 中开启对话`}</span>
+              <span>{creating ? '创建中...' : '开始对话'}</span>
             </button>
           </form>
         </div>

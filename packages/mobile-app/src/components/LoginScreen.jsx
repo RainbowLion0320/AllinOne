@@ -11,7 +11,6 @@ import {
   QrCode,
   ScanLine,
   Server,
-  ShieldCheck,
   Sparkles,
   Terminal,
   Ticket,
@@ -289,22 +288,19 @@ export function LoginScreen({
               className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               <ArrowLeft className="h-4 w-4" />
-              <span>返回当前会话</span>
+              <span>返回</span>
             </button>
           </div>
         )}
 
         {/* Brand mark */}
         <div className="mb-5 flex flex-col items-center text-center">
-          <div className="mb-3 h-17 w-17 overflow-hidden rounded-[22px] bg-[#03080E] shadow-xl shadow-blue-950/35 ring-1 ring-white/10">
+          <div className="mb-3 h-16 w-16 overflow-hidden rounded-[20px] bg-[#03080E] shadow-xl shadow-blue-950/35 ring-1 ring-white/10">
             <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
           </div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-            {isAddingDevice ? '登录账号或添加设备' : 'All in One'}
+          <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
+            {isAddingDevice ? '添加账号' : 'All in One'}
           </h1>
-          <p className="mt-1 text-[12.5px] text-slate-500 dark:text-slate-400">
-            电脑与手机登录同一账号，自动发现并无缝切换你名下所有电脑
-          </p>
         </div>
 
         <form
@@ -327,7 +323,7 @@ export function LoginScreen({
                 }`}
               >
                 <User className="h-3.5 w-3.5" />
-                <span>账号登录</span>
+                <span>登录</span>
               </button>
               <button
                 type="button"
@@ -342,7 +338,7 @@ export function LoginScreen({
                 }`}
               >
                 <UserPlus className="h-3.5 w-3.5" />
-                <span>邀请码注册</span>
+                <span>注册</span>
               </button>
             </div>
           )}
@@ -398,18 +394,15 @@ export function LoginScreen({
               )}
 
               <div>
-                <label className="mb-1.5 flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300">
-                  <span className="inline-flex items-center gap-1.5">
-                    <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>一次性邀请码</span>
-                  </span>
-                  <span className="text-[10.5px] text-slate-400">仅限单人单次使用</span>
+                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                  <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                  <span>邀请码</span>
                 </label>
                 <input
                   type="text"
                   value={inviteCode}
                   onChange={(e) => setInviteCode(e.target.value)}
-                  placeholder="例如：INV-AB34-CD56"
+                  placeholder="INV-XXXX-XXXX"
                   autoCapitalize="characters"
                   autoCorrect="off"
                   spellCheck={false}
@@ -420,13 +413,13 @@ export function LoginScreen({
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <User className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>设置用户名</span>
+                  <span>用户名</span>
                 </label>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="3~32 位字母、数字、下划线"
+                  placeholder="3~32 位字母、数字或下划线"
                   autoComplete="username"
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -439,13 +432,13 @@ export function LoginScreen({
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
                     <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>密码（至少 8 位）</span>
+                    <span>密码</span>
                   </label>
                   <input
                     type="password"
                     value={accountPassword}
                     onChange={(e) => setAccountPassword(e.target.value)}
-                    placeholder="至少 8 位密码"
+                    placeholder="至少 8 位"
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
@@ -458,7 +451,7 @@ export function LoginScreen({
                     type="password"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
-                    placeholder="再次输入密码"
+                    placeholder="再次输入"
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
@@ -562,14 +555,13 @@ export function LoginScreen({
             >
               <span className="inline-flex items-center gap-1.5">
                 <Terminal className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>电脑端绑定命令（登录后自动上线）</span>
+                <span>电脑端绑定命令</span>
               </span>
               {showSetupGuide ? <ChevronUp className="h-3.5 w-3.5 text-slate-400" /> : <ChevronDown className="h-3.5 w-3.5 text-slate-400" />}
             </button>
             {showSetupGuide && (
               <div className="border-t border-slate-200/60 px-3 pt-2 pb-2.5 text-[11px] leading-relaxed text-slate-500 dark:border-slate-700/60 dark:text-slate-400">
-                <div className="mb-1.5 flex items-center justify-between gap-2">
-                  <span>在电脑终端运行并登录同一账号即可：</span>
+                <div className="mb-1.5 flex items-center justify-end">
                   <div className="inline-flex shrink-0 rounded-lg bg-slate-200/80 p-0.5 text-[10px] dark:bg-slate-800">
                     <button
                       type="button"
@@ -618,17 +610,26 @@ export function LoginScreen({
               className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
             >
               <Server className="h-3 w-3" />
-              <span>中转服务器：{effectiveServer.replace(/^https?:\/\//, '')}</span>
+              <span>服务器：{effectiveServer.replace(/^https?:\/\//, '')}</span>
               {showAdvancedServer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             </button>
             {showAdvancedServer && (
-              <input
-                type="url"
-                value={serverUrl}
-                onChange={(e) => setServerUrl(e.target.value)}
-                placeholder={DEFAULT_PROD_SERVER}
-                className="mt-1.5 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
-              />
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <input
+                  type="url"
+                  value={serverUrl}
+                  onChange={(e) => setServerUrl(e.target.value)}
+                  placeholder={DEFAULT_PROD_SERVER}
+                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                />
+                <button
+                  type="button"
+                  onClick={() => setServerUrl(normalizeBaseUrl(DEFAULT_PROD_SERVER))}
+                  className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                >
+                  默认
+                </button>
+              </div>
             )}
           </div>
 
@@ -645,14 +646,14 @@ export function LoginScreen({
           >
             <span>
               {loading
-                ? '正在验证...'
+                ? '验证中...'
                 : mode === 'login'
-                  ? '登录并同步全部电脑'
+                  ? '登录'
                   : mode === 'register'
-                    ? '验证邀请码并注册'
+                    ? '注册'
                     : mode === 'pair'
-                      ? '配对连接'
-                      : '管理员登录'}
+                      ? '配对'
+                      : '登录'}
             </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>
@@ -665,7 +666,7 @@ export function LoginScreen({
                 onClick={() => setShowLegacyOptions((v) => !v)}
                 className="flex w-full items-center justify-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
               >
-                <span>其他连接方式（旧版配对码 / 扫码 / 管理员密钥）</span>
+                <span>扫码 / 密钥登录</span>
                 {showLegacyOptions ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
               </button>
               {showLegacyOptions && (
@@ -696,20 +697,6 @@ export function LoginScreen({
               )}
             </div>
           )}
-
-          <div className="flex items-center justify-between pt-0.5 text-[11px] text-slate-400">
-            <span className="inline-flex items-center gap-1">
-              <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
-              每台电脑独立密钥 · 账号严格隔离
-            </span>
-            <button
-              type="button"
-              onClick={() => setServerUrl(normalizeBaseUrl(DEFAULT_PROD_SERVER))}
-              className="text-[#4D6BFE] hover:underline"
-            >
-              恢复默认
-            </button>
-          </div>
         </form>
       </div>
 

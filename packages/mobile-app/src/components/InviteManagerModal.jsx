@@ -154,19 +154,14 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-5 pb-3.5 dark:border-slate-800">
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-4.5 pb-3.5 dark:border-slate-800">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
-              <Ticket className="h-4.5 w-4.5" />
+            <div className="flex h-8.5 w-8.5 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+              <Ticket className="h-4 w-4" />
             </div>
-            <div>
-              <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
-                一次性邀请码管理
-              </h2>
-              <p className="text-[11px] text-slate-400">
-                每个邀请码仅限 1 位用户注册使用，用完即失效
-              </p>
-            </div>
+            <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
+              邀请码
+            </h2>
           </div>
           <div className="flex items-center gap-1">
             <button
@@ -192,11 +187,11 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
         <div className="grid grid-cols-3 gap-2 px-4 pt-3">
           <div className="rounded-2xl bg-emerald-50/80 px-3 py-2 text-center dark:bg-emerald-950/30">
             <div className="text-base font-bold text-emerald-600 dark:text-emerald-300">{stats.active}</div>
-            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">可用邀请码</div>
+            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">可用</div>
           </div>
           <div className="rounded-2xl bg-slate-100/90 px-3 py-2 text-center dark:bg-[#232631]">
             <div className="text-base font-bold text-slate-700 dark:text-slate-200">{stats.used}</div>
-            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">已使用</div>
+            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">已用</div>
           </div>
           <button
             type="button"
@@ -207,9 +202,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
               <Users className="h-3.5 w-3.5" />
               <span>{users.length}</span>
             </div>
-            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">
-              {showUsers ? '收起用户列表' : '已注册用户'}
-            </div>
+            <div className="text-[10.5px] text-slate-500 dark:text-slate-400">用户</div>
           </button>
         </div>
 
@@ -268,7 +261,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
               value={note}
               onChange={(e) => setNote(e.target.value)}
               maxLength={40}
-              placeholder="可选备注（如：给朋友小明）"
+              placeholder="备注（可选）"
               className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
             />
             <button
@@ -316,11 +309,11 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           {loading && invites.length === 0 ? (
             <div className="flex items-center justify-center py-10 text-xs text-slate-400">
               <Loader2 className="mr-2 h-4 w-4 animate-spin text-[#4D6BFE]" />
-              正在加载邀请码...
+              加载中...
             </div>
           ) : filtered.length === 0 ? (
             <div className="py-10 text-center text-xs text-slate-400">
-              暂无{filter === 'active' ? '可用' : ''}邀请码，点击上方按钮即可按需生成
+              暂无邀请码
             </div>
           ) : (
             filtered.map((inv) => {
@@ -391,7 +384,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-200/70 active:scale-95 dark:bg-[#232631] dark:text-slate-200"
                       >
                         {copiedKey === `code:${inv.id}` ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                        <span>{copiedKey === `code:${inv.id}` ? '已复制码' : '复制邀请码'}</span>
+                        <span>{copiedKey === `code:${inv.id}` ? '已复制' : '复制码'}</span>
                       </button>
                       <button
                         type="button"
@@ -399,7 +392,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-200/70 active:scale-95 dark:bg-[#232631] dark:text-slate-200"
                       >
                         {copiedKey === `link:${inv.id}` ? <Check className="h-3 w-3 text-emerald-500" /> : <Link2 className="h-3 w-3" />}
-                        <span>{copiedKey === `link:${inv.id}` ? '已复制链接' : '注册链接'}</span>
+                        <span>{copiedKey === `link:${inv.id}` ? '已复制' : '链接'}</span>
                       </button>
                       <button
                         type="button"
@@ -407,7 +400,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         className="inline-flex items-center gap-1 rounded-lg bg-[#4D6BFE]/12 px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE] hover:bg-[#4D6BFE]/20 active:scale-95 dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]"
                       >
                         {copiedKey === `msg:${inv.id}` ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                        <span>{copiedKey === `msg:${inv.id}` ? '已复制文案' : '发给朋友'}</span>
+                        <span>{copiedKey === `msg:${inv.id}` ? '已复制' : '分享'}</span>
                       </button>
                     </div>
                   )}

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { Check, Cpu, Search, Sparkles, X } from 'lucide-react'
+import { Check, Search, Sparkles, X } from 'lucide-react'
 import { VendorBadge, formatEffortLabel } from './VendorIcon.jsx'
 
 export function ModelPickerSheet({
@@ -101,17 +101,10 @@ export function ModelPickerSheet({
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-4 pb-3 dark:border-slate-800">
           <div className="flex items-center gap-2.5">
-            <VendorBadge app={app} size="md" />
-            <div>
-              <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">
-                {appMeta.shortName} 模型与推理强度
-              </h3>
-              <p className="text-[11px] text-slate-400">
-                {mode === 'midchat'
-                  ? '遵循该应用自身规则，切换后下一条消息立即生效'
-                  : '选择新建对话使用的模型和推理档位'}
-              </p>
-            </div>
+            <VendorBadge app={app} size="sm" />
+            <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">
+              {appMeta.shortName} 模型
+            </h3>
           </div>
           <button
             type="button"
@@ -178,9 +171,7 @@ export function ModelPickerSheet({
         <div className="flex-1 overflow-y-auto px-3 py-2">
           {filteredModels.length === 0 ? (
             <div className="py-10 text-center text-xs text-slate-400">
-              {models.length === 0
-                ? '暂未获取到该应用的模型列表（请确认电脑端桥接已更新）'
-                : '没有匹配的模型'}
+              {models.length === 0 ? '暂无可用模型' : '没有匹配的模型'}
             </div>
           ) : (
             <div className="space-y-1">
@@ -193,8 +184,9 @@ export function ModelPickerSheet({
                   (!catalog?.defaultProvider || !m.provider || m.provider === catalog.defaultProvider)
                 const effortHint =
                   m.efforts?.length > 0
-                    ? `${formatEffortLabel(m.efforts[0])} ~ ${formatEffortLabel(m.efforts[m.efforts.length - 1])}`
-                    : '固定推理'
+                    ? `${formatEffortLabel(m.efforts[0])}~${formatEffortLabel(m.efforts[m.efforts.length - 1])}`
+                    : ''
+                const hasSubMeta = Boolean(m.providerName || (m.name && m.name !== m.id) || effortHint)
                 return (
                   <button
                     key={key}
@@ -217,17 +209,19 @@ export function ModelPickerSheet({
                           </span>
                         )}
                       </div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
-                        {m.providerName && (
-                          <span className="rounded bg-slate-100 px-1.5 py-0.2 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-                            {m.providerName}
-                          </span>
-                        )}
-                        {m.name && m.name !== m.id && (
-                          <span className="truncate font-mono">{m.id}</span>
-                        )}
-                        <span className="shrink-0">· {effortHint}</span>
-                      </div>
+                      {hasSubMeta && (
+                        <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
+                          {m.providerName && (
+                            <span className="rounded bg-slate-100 px-1.5 py-0.2 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                              {m.providerName}
+                            </span>
+                          )}
+                          {m.name && m.name !== m.id && (
+                            <span className="truncate font-mono">{m.id}</span>
+                          )}
+                          {effortHint && <span className="shrink-0">· {effortHint}</span>}
+                        </div>
+                      )}
                     </div>
 
                     <div
@@ -246,44 +240,33 @@ export function ModelPickerSheet({
           )}
         </div>
 
-        {/* Sticky Reasoning Effort selector + Confirm */}
+        {/* Sticky Reasoning Effort selector (only when supported) + Confirm */}
         <div className="pb-safe border-t border-slate-100 bg-slate-50/80 px-4 pt-3 pb-4 dark:border-slate-800 dark:bg-[#171920]">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
-              <Sparkles className="h-3.5 w-3.5 text-[#4D6BFE]" />
-              推理强度 (Reasoning Effort)
-            </span>
-            {activeModelObj && (
-              <span className="max-w-[160px] truncate font-mono text-[10.5px] text-slate-400">
-                {activeModelObj.name || activeModelObj.id}
-              </span>
-            )}
-          </div>
-
-          {activeEfforts.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {activeEfforts.map((eff) => {
-                const active = pickedEffort === eff
-                return (
-                  <button
-                    key={eff}
-                    type="button"
-                    onClick={() => setPickedEffort(eff)}
-                    className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition active:scale-95 ${
-                      active
-                        ? 'bg-[#4D6BFE] text-white shadow-xs shadow-[#4D6BFE]/30'
-                        : 'border border-slate-200 bg-white text-slate-600 hover:border-[#4D6BFE]/40 dark:border-slate-700 dark:bg-[#222530] dark:text-slate-300'
-                    }`}
-                  >
-                    {formatEffortLabel(eff)}
-                  </button>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="flex items-center gap-1.5 rounded-xl bg-slate-100 px-3 py-2 text-[11.5px] text-slate-500 dark:bg-[#222530] dark:text-slate-400">
-              <Cpu className="h-3.5 w-3.5 shrink-0 opacity-70" />
-              <span>该模型不支持单独调节推理强度，将按默认档位运行</span>
+          {activeEfforts.length > 0 && (
+            <div className="mb-3">
+              <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                <Sparkles className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                <span>推理强度</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {activeEfforts.map((eff) => {
+                  const active = pickedEffort === eff
+                  return (
+                    <button
+                      key={eff}
+                      type="button"
+                      onClick={() => setPickedEffort(eff)}
+                      className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition active:scale-95 ${
+                        active
+                          ? 'bg-[#4D6BFE] text-white shadow-xs shadow-[#4D6BFE]/30'
+                          : 'border border-slate-200 bg-white text-slate-600 hover:border-[#4D6BFE]/40 dark:border-slate-700 dark:bg-[#222530] dark:text-slate-300'
+                      }`}
+                    >
+                      {formatEffortLabel(eff)}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
           )}
 
@@ -291,15 +274,9 @@ export function ModelPickerSheet({
             type="button"
             onClick={handleConfirm}
             disabled={!pickedModel && models.length > 0}
-            className="mt-3 flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-50"
+            className="flex w-full items-center justify-center rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-50"
           >
-            <span>确认应用</span>
-            {pickedModel && (
-              <span className="max-w-[180px] truncate text-xs font-normal text-white/85">
-                · {activeModelObj?.name || pickedModel}
-                {activeEfforts.length > 0 && pickedEffort ? ` (${formatEffortLabel(pickedEffort)})` : ''}
-              </span>
-            )}
+            确认
           </button>
         </div>
       </div>

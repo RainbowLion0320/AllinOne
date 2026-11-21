@@ -1108,9 +1108,8 @@ export function App() {
         </div>
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-800 dark:text-white">
           <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-          <span>正在扫码自动配对你的专属电脑...</span>
+          <span>正在配对...</span>
         </div>
-        <p className="mt-1.5 text-xs text-slate-400">独立加密房间验证中，已有电脑连接完全保留</p>
       </div>
     )
   }
@@ -1148,15 +1147,15 @@ export function App() {
 
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const headerSubtitle = (() => {
-    if (connState === 'unauthorized') return `${activeDeviceName} · 凭证已过期`
-    if (connState !== 'connected') return `${activeDeviceName} · 连接中...`
-    if (!bridgeOnline) return `${activeDeviceName} · 等待上线`
+    if (connState === 'unauthorized') return `${activeDeviceName} · 已过期`
+    if (connState !== 'connected') return `${activeDeviceName} · 连接中`
+    if (!bridgeOnline) return `${activeDeviceName} · 离线`
     if (hasMultipleTargets) {
       return activeSession?.workspace
         ? `${activeDeviceName} · ${activeSession.workspace}`
         : activeDeviceName
     }
-    return activeSession?.workspace || activeDeviceName || '电脑已在线'
+    return activeSession?.workspace || activeDeviceName || '已连接'
   })()
 
   return (
@@ -1220,11 +1219,11 @@ export function App() {
         </div>
       </header>
 
-      {/* Expired token banner (never locks user out of other paired computers) */}
+      {/* Expired token banner */}
       {connState === 'unauthorized' && (
         <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
           <KeyRound className="h-3.5 w-3.5 shrink-0" />
-          <span>{activeDeviceName} 配对凭证已失效</span>
+          <span>登录已过期</span>
           <button
             type="button"
             onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false, inviteCode: '' })}
@@ -1238,7 +1237,7 @@ export function App() {
               onClick={() => setDeviceSwitcherOpen(true)}
               className="rounded-lg border border-rose-300 bg-white px-2 py-0.5 text-[11px] font-medium text-rose-600 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-200"
             >
-              切换其他电脑
+              切换
             </button>
           )}
         </div>
@@ -1250,10 +1249,8 @@ export function App() {
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
           <span>
             {isAccountMode && accountDevices.length === 0
-              ? '账号已登录，请在电脑端运行桥接并登录同一账号'
-              : onlineBridges.length > 0
-                ? `当前选中的电脑（${activeDeviceName}）已离线`
-                : `服务器已连通，等待 ${activeDeviceName} 桥接上线...`}
+              ? '尚未绑定电脑'
+              : `${activeDeviceName} 离线`}
           </span>
           {(devices.length > 1 || onlineBridges.length > 0 || isAccountMode) && (
             <button
@@ -1262,7 +1259,7 @@ export function App() {
               className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
             >
               <ArrowLeftRight className="h-3 w-3" />
-              <span>{isAccountMode && accountDevices.length === 0 ? '绑定电脑' : '切换电脑'}</span>
+              <span>{isAccountMode && accountDevices.length === 0 ? '绑定' : '切换'}</span>
             </button>
           )}
         </div>

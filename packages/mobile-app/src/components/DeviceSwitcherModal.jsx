@@ -11,7 +11,6 @@ import {
   Plus,
   RefreshCw,
   ScanLine,
-  ShieldCheck,
   Terminal,
   Ticket,
   Trash2,
@@ -20,7 +19,6 @@ import {
 } from 'lucide-react'
 import {
   formatPlatformLabel,
-  formatServerHost,
   getDeviceDisplayName,
 } from '../lib/deviceStore.js'
 import { probeDeviceStatus } from '../lib/wsClient.js'
@@ -38,7 +36,7 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-300">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-        <span>{onlineCount > 1 ? `${onlineCount} 台在线` : '在线'}</span>
+        <span>{onlineCount > 1 ? `${onlineCount} 在线` : '在线'}</span>
       </span>
     )
   }
@@ -46,7 +44,7 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[10.5px] font-medium text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
         <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
-        <span>凭证已过期</span>
+        <span>已过期</span>
       </span>
     )
   }
@@ -54,14 +52,14 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
         <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-        <span>连接异常</span>
+        <span>异常</span>
       </span>
     )
   }
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
       <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-      <span>电脑离线</span>
+      <span>离线</span>
     </span>
   )
 }
@@ -197,22 +195,17 @@ export function DeviceSwitcherModal({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-5 pb-3.5 dark:border-slate-800">
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-4.5 pb-3.5 dark:border-slate-800">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
-              <Laptop className="h-4.5 w-4.5" />
+            <div className="flex h-8.5 w-8.5 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+              <Laptop className="h-4 w-4" />
             </div>
-            <div>
-              <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
-                我的电脑
-                <span className="ml-1.5 text-xs font-medium text-slate-400">
-                  ({isAccountMode ? accountDevices.length : devices.length})
-                </span>
-              </h2>
-              <p className="text-[11px] text-slate-400">
-                {isAccountMode ? '账号下所有电脑自动同步，一键切换' : '一键切换远程控制的电脑'}
-              </p>
-            </div>
+            <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
+              我的电脑
+              <span className="ml-1.5 text-xs font-medium text-slate-400">
+                ({isAccountMode ? accountDevices.length : devices.length})
+              </span>
+            </h2>
           </div>
 
           <div className="flex items-center gap-1">
@@ -251,16 +244,12 @@ export function DeviceSwitcherModal({
                       <span className="truncate text-sm font-bold text-slate-900 dark:text-white">
                         @{activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}
                       </span>
-                      {isAdmin && (
-                        <span className="shrink-0 rounded-md bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                          管理员
-                        </span>
-                      )}
                     </div>
-                    <div className="truncate text-[10.5px] text-slate-400">
-                      {onlineAcctCount > 0 ? `${onlineAcctCount} / ${accountDevices.length} 台电脑在线` : `已绑定 ${accountDevices.length} 台电脑`}
-                      {formatServerHost(activeEntry.baseUrl) ? ` · ${formatServerHost(activeEntry.baseUrl)}` : ''}
-                    </div>
+                    {accountDevices.length > 1 && (
+                      <div className="truncate text-[10.5px] text-slate-400">
+                        {onlineAcctCount}/{accountDevices.length} 在线
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -351,10 +340,10 @@ export function DeviceSwitcherModal({
                 <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-700/80 dark:bg-[#151820]">
                   <Terminal className="mx-auto mb-2 h-6 w-6 text-[#4D6BFE]" />
                   <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    账号下还没有绑定电脑
+                    尚未绑定电脑
                   </div>
-                  <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-                    在你的电脑终端运行下面 1 行命令，输入账号 <strong>@{activeEntry?.username}</strong> 登录，电脑就会自动出现在这里：
+                  <p className="mt-1 text-[11px] text-slate-400">
+                    在电脑终端运行下方命令并登录 <strong>@{activeEntry?.username}</strong>
                   </p>
                   <div className="mt-2.5 space-y-1.5 text-left">
                     {[
@@ -418,25 +407,19 @@ export function DeviceSwitcherModal({
                               <span className="truncate text-[13.5px] font-semibold text-slate-900 dark:text-white">
                                 {pc.label || pc.hostname || pc.bridgeId}
                               </span>
-                              {isSelected && (
-                                <span className="rounded-md bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                                  当前
-                                </span>
-                              )}
                               <StatusPill status={pc.online ? 'online' : 'offline'} />
                             </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-400">
-                              {pc.hostname && pc.hostname !== pc.label && (
-                                <span className="truncate max-w-[120px]">{pc.hostname}</span>
-                              )}
-                              {platformLabel && <span>{platformLabel}</span>}
-                              {!pc.online && pc.lastSeenAt > 0 && (
-                                <>
-                                  <span>·</span>
-                                  <span>{formatRelativeSeen(pc.lastSeenAt)}</span>
-                                </>
-                              )}
-                            </div>
+                            {(platformLabel || (!pc.online && pc.lastSeenAt > 0)) && (
+                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-400">
+                                {platformLabel && <span>{platformLabel}</span>}
+                                {!pc.online && pc.lastSeenAt > 0 && (
+                                  <>
+                                    {platformLabel && <span>·</span>}
+                                    <span>{formatRelativeSeen(pc.lastSeenAt)}</span>
+                                  </>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </button>
 
@@ -479,7 +462,7 @@ export function DeviceSwitcherModal({
                             onChange={(e) => setEditDraft(e.target.value)}
                             autoFocus
                             maxLength={40}
-                            placeholder="输入电脑备注名（如：家里台式机 / 公司 Mac）"
+                            placeholder="输入备注名"
                             className="min-w-0 flex-1 rounded-xl border border-[#4D6BFE] bg-white px-2.5 py-1.5 text-xs text-slate-900 outline-none dark:bg-[#14161D] dark:text-white"
                           />
                           <button
@@ -501,7 +484,7 @@ export function DeviceSwitcherModal({
 
                       {isConfirmingUnbind && (
                         <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                          <span>解绑后该电脑将立即断开连接？</span>
+                          <span>解绑此电脑？</span>
                           <div className="flex shrink-0 items-center gap-1.5">
                             <button
                               type="button"
@@ -535,7 +518,7 @@ export function DeviceSwitcherModal({
             <div className="space-y-2">
               {isAccountMode && (
                 <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
-                  其他已保存账号 / 旧版配对房间
+                  其他连接
                 </div>
               )}
               {otherEntries.map((device) => {
@@ -564,7 +547,6 @@ export function DeviceSwitcherModal({
 
                 const displayName = getDeviceDisplayName(device, primaryBridge, 1)
                 const platformLabel = formatPlatformLabel(primaryBridge?.platform || device.lastPlatform)
-                const serverHost = formatServerHost(device.baseUrl)
                 const isEditing = editingId === device.id
                 const isConfirmingDelete = confirmDeleteId === device.id
                 const isAcct = device.authMode === 'account' || String(device.roomId || '').startsWith('usr_')
@@ -604,26 +586,20 @@ export function DeviceSwitcherModal({
                             <span className="truncate text-[13.5px] font-semibold text-slate-900 dark:text-white">
                               {isAcct && device.username ? `@${device.username}` : displayName}
                             </span>
-                            {isActive && (
-                              <span className="rounded-md bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                                当前
-                              </span>
-                            )}
                             <StatusPill status={status} onlineCount={onlineBridges.length} />
                           </div>
 
-                          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-slate-400">
-                            {platformLabel && <span>{platformLabel}</span>}
-                            {platformLabel && <span>·</span>}
-                            <span>
-                              {isAcct
-                                ? '账号空间'
-                                : device.roomId === 'owner'
-                                  ? '管理员房间'
-                                  : '旧版配对房间'}
-                            </span>
-                            {serverHost && <span>· {serverHost}</span>}
-                          </div>
+                          {(platformLabel || !isAcct) && (
+                            <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-400">
+                              {platformLabel && <span>{platformLabel}</span>}
+                              {!isAcct && (
+                                <>
+                                  {platformLabel && <span>·</span>}
+                                  <span>{device.roomId === 'owner' ? '密钥' : '旧版配对'}</span>
+                                </>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </button>
 
@@ -746,10 +722,7 @@ export function DeviceSwitcherModal({
 
                     {/* Same-room multi-bridge selector for legacy owner rooms */}
                     {!isAcct && (onlineBridges.length > 1 || (isActive && !activeBridgeId && onlineBridges.length === 1)) && !isConfirmingDelete && (
-                      <div className="mt-2.5 border-t border-slate-200/70 pt-2 dark:border-slate-700/70">
-                        <div className="mb-1.5 text-[10.5px] font-medium text-slate-400">
-                          该房间内在线的电脑（点击切换）：
-                        </div>
+                      <div className="mt-2 border-t border-slate-200/70 pt-2 dark:border-slate-700/70">
                         <div className="flex flex-wrap gap-1.5">
                           {onlineBridges.map((b) => {
                             const isSelectedBridge = isActive && b.bridgeId === activeBridgeId
@@ -791,10 +764,10 @@ export function DeviceSwitcherModal({
                 onClose()
                 onAddDevice?.('', { openScanner: false })
               }}
-              className="col-span-3 flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+              className="col-span-3 flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
             >
-              <Plus className="h-4.5 w-4.5" />
-              <span>{isAccountMode ? '切换 / 添加账号' : '登录新版账号'}</span>
+              <Plus className="h-4 w-4" />
+              <span>{isAccountMode ? '添加账号' : '登录账号'}</span>
             </button>
 
             <button
@@ -803,16 +776,11 @@ export function DeviceSwitcherModal({
                 onClose()
                 onAddDevice?.('', { openScanner: true })
               }}
-              className="col-span-2 flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 py-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 active:scale-[0.98] dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
+              className="col-span-2 flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 active:scale-[0.98] dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
             >
               <ScanLine className="h-4 w-4" />
-              <span>旧版扫码</span>
+              <span>扫码</span>
             </button>
-          </div>
-
-          <div className="mt-2 flex items-center justify-center gap-1 text-[10.5px] text-slate-400">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
-            <span>每台电脑独立设备密钥与隔离缓存，互不可见</span>
           </div>
         </div>
       </div>
