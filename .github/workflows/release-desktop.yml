@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             cmd: npm run pack:mac
             artifact_name: allinone-desktop-macos-arm64
             files: packages/desktop-app/release/*.dmg
