@@ -39,6 +39,7 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from './lib/sessionCache.js'
+import { clearDraftsForScope, makeDraftKey } from './lib/draftStore.js'
 import { LoginScreen } from './components/LoginScreen.jsx'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
@@ -1127,6 +1128,7 @@ export function App() {
     const removingActive = activeDevice?.id === deviceId
     const removingLast = devices.length <= 1
     void clearSessionCache(deviceId, { prefix: true })
+    clearDraftsForScope(deviceId)
     if (removingActive) {
       resetTransientWorkspace()
       setBridges([])
@@ -1586,6 +1588,7 @@ export function App() {
 
       {/* Floating DeepSeek-style Composer */}
       <Composer
+        draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
         activeApp={activeApp}
         streaming={Boolean(currentStream?.active)}
         disabled={!bridgeOnline || connState !== 'connected'}

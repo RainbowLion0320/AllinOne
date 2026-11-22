@@ -1,10 +1,12 @@
-import React, { useRef, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Cpu, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { resolveImageSrc } from '../lib/imageUrls.js'
+import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
 export function Composer({
+  draftKey = '',
   activeApp,
   streaming,
   disabled,
@@ -19,11 +21,16 @@ export function Composer({
   onSend,
   onInterrupt,
 }) {
-  const [text, setText] = useState('')
-  const [attachments, setAttachments] = useState([])
+  const [text, setText] = useState(() => loadDraft(draftKey).text)
+  const [attachments, setAttachments] = useState(() => loadDraft(draftKey).attachments)
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef(null)
   const textareaRef = useRef(null)
+  const draftKeyRef = useRef(draftKey)
+  const textRef = useRef(text)
+  const attachmentsRef = useRef(attachments)
+  textRef.current = text
+  attachmentsRef.current = attachments
 
   const meta = APP_META[activeApp] || APP_META.dsh
 
@@ -33,14 +40,53 @@ export function Composer({
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`
   }
 
+  // Save outgoing conversation's draft and restore incoming conversation's draft whenever draftKey changes
+  useEffect(() => {
+    const prevKey = draftKeyRef.current
+    if (prevKey === draftKey) return
+    saveDraft(prevKey, { text: textRef.current, attachments: attachmentsRef.current })
+    draftKeyRef.current = draftKey
+    const nextDraft = loadDraft(draftKey)
+    setText(nextDraft.text)
+    setAttachments(nextDraft.attachments)
+  }, [draftKey])
+
+  // Keep textarea height synced cleanly after switching to a restored draft (or empty box)
+  useLayoutEffect(() => {
+    autoResize(textareaRef.current)
+  }, [draftKey, text])
+
+  const updateText = (nextText) => {
+    setText(nextText)
+    saveDraft(draftKeyRef.current, { text: nextText, attachments: attachmentsRef.current })
+  }
+
+  const updateAttachments = (updater) => {
+    setAttachments((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater
+      saveDraft(draftKeyRef.current, { text: textRef.current, attachments: next })
+      return next
+    })
+  }
+
   const handleFileChange = async (e) => {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file || !onUploadFile) return
+    const targetKey = draftKeyRef.current
     setUploading(true)
     try {
       const uploaded = await onUploadFile(file)
-      setAttachments((prev) => [...prev, uploaded])
+      if (draftKeyRef.current === targetKey) {
+        updateAttachments((prev) => [...prev, uploaded])
+      } else {
+        // User switched conversations mid-upload: keep attachment scoped to the original conversation's draft
+        const existing = loadDraft(targetKey)
+        saveDraft(targetKey, {
+          text: existing.text,
+          attachments: [...existing.attachments, uploaded],
+        })
+      }
     } catch (err) {
       alert(`上传失败：${err.message || err}`)
     } finally {
@@ -52,7 +98,9 @@ export function Composer({
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
     if (disabled || streaming) return
+    const curKey = draftKeyRef.current
     onSend({ text: trimmed, attachments })
+    clearDraft(curKey)
     setText('')
     setAttachments([])
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
@@ -84,7 +132,7 @@ export function Composer({
                   <img src={thumbSrc} alt={att.filename} className="h-full w-full object-cover" />
                   <button
                     type="button"
-                    onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== att.id))}
+                    onClick={() => updateAttachments((prev) => prev.filter((x) => x.id !== att.id))}
                     className="absolute top-0.5 right-0.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-black/65 text-white hover:bg-rose-500"
                   >
                     <X className="h-3 w-3" />
@@ -98,7 +146,7 @@ export function Composer({
                   <span className="max-w-[140px] truncate">{att.filename}</span>
                   <button
                     type="button"
-                    onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== att.id))}
+                    onClick={() => updateAttachments((prev) => prev.filter((x) => x.id !== att.id))}
                     className="text-slate-400 hover:text-rose-500"
                   >
                     <X className="h-3.5 w-3.5" />
@@ -116,7 +164,7 @@ export function Composer({
             rows={1}
             value={text}
             onChange={(e) => {
-              setText(e.target.value)
+              updateText(e.target.value)
               autoResize(e.target)
             }}
             onKeyDown={handleKeyDown}

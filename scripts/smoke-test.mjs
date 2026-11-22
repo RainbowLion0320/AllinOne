@@ -41,6 +41,7 @@ import {
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
 import { resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
+import { clearDraft, clearDraftsForScope, loadDraft, makeDraftKey, saveDraft } from '../packages/mobile-app/src/lib/draftStore.js'
 
 const TEST_PASS = 'smoke-test-pass-123'
 const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
@@ -1244,7 +1245,26 @@ async function main() {
     } finally {
       await watchAdapter.dispose()
     }
-    console.log('[smoke] 11/11 Antigravity split-brain transcript resilience, cache reconciliation & live external watcher OK')
+    // Per-conversation local draft isolation (text + pending attachments)
+    const dkA = makeDraftKey('dev1::pc1', 'codex:sess-a', 'codex')
+    const dkB = makeDraftKey('dev1::pc1', 'antigravity:sess-b', 'antigravity')
+    const dkNew = makeDraftKey('dev1::pc1', '', 'claude')
+    saveDraft(dkA, { text: 'Draft for Codex A', attachments: [{ id: 'att1', filename: 'a.png' }] })
+    saveDraft(dkB, { text: 'Draft for Agy B', attachments: [] })
+    saveDraft(dkNew, { text: 'New Claude chat draft', attachments: [] })
+    assert.equal(loadDraft(dkA).text, 'Draft for Codex A')
+    assert.equal(loadDraft(dkA).attachments.length, 1)
+    assert.equal(loadDraft(dkB).text, 'Draft for Agy B')
+    assert.equal(loadDraft(dkB).attachments.length, 0)
+    assert.equal(loadDraft(dkNew).text, 'New Claude chat draft')
+    clearDraft(dkA)
+    assert.equal(loadDraft(dkA).text, '')
+    assert.equal(loadDraft(dkB).text, 'Draft for Agy B', 'Clearing session A draft must not touch session B')
+    clearDraftsForScope('dev1')
+    assert.equal(loadDraft(dkB).text, '')
+    assert.equal(loadDraft(dkNew).text, '')
+
+    console.log('[smoke] 11/11 Antigravity split-brain transcript resilience, cache reconciliation, live watcher & per-session drafts OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
