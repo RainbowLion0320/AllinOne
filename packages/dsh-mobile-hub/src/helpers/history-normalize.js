@@ -85,7 +85,13 @@ export function mergeAndCompactMessages(rawMessages = []) {
   for (const msg of rawMessages) {
     if (!msg) continue
     const prev = merged[merged.length - 1]
-    if (msg.role === 'assistant' && prev && prev.role === 'assistant') {
+    const msgBranch = msg.branchEpoch ?? 0
+    if (
+      msg.role === 'assistant' &&
+      prev &&
+      prev.role === 'assistant' &&
+      (prev._branchEpoch ?? 0) === msgBranch
+    ) {
       if (msg.thinking) {
         prev.thinking = prev.thinking ? `${prev.thinking}\n\n${msg.thinking}` : msg.thinking
       }
@@ -107,6 +113,7 @@ export function mergeAndCompactMessages(rawMessages = []) {
         thinking: msg.thinking || '',
         _allTools: Array.isArray(msg.tools) ? [...msg.tools] : [],
         _images: Array.isArray(msg.images) ? [...msg.images] : [],
+        _branchEpoch: msgBranch,
         ts: msg.ts || 0,
       })
     }

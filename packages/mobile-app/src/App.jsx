@@ -168,6 +168,9 @@ export function App() {
   activeBridgeIdRef.current = activeBridgeId
   const cacheScopeRef = useRef(cacheScope)
   cacheScopeRef.current = cacheScope
+  const quietSyncInFlightRef = useRef(false)
+  const quietSyncPendingRef = useRef('')
+  const lastFocusSyncAtRef = useRef(0)
   const toastTimerRef = useRef(null)
 
   const showToast = useCallback((text) => {
@@ -676,6 +679,112 @@ export function App() {
     }
   }, [])
 
+  const syncActiveSessionQuietly = useCallback(async (sessionId = '') => {
+    const client = clientRef.current
+    const targetId = sessionId || activeSessionRef.current?.id || ''
+    if (!client || !targetId) return
+    if (streamingRef.current[targetId]?.active || loadingOlderLockRef.current) return
+    if (quietSyncInFlightRef.current) {
+      quietSyncPendingRef.current = targetId
+      return
+    }
+
+    quietSyncInFlightRef.current = true
+    const gen = deviceGenRef.current
+    const scope = cacheScopeRef.current
+    const targetBridge = activeBridgeIdRef.current
+    try {
+      const res = await client.rpc(
+        RPC.SESSION_READ,
+        { id: targetId, limit: 14 },
+        30_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
+      if (
+        deviceGenRef.current !== gen ||
+        activeSessionRef.current?.id !== targetId ||
+        streamingRef.current[targetId]?.active
+      ) {
+        return
+      }
+      if (res?.session) {
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
+        const currentSnapshot = {
+          messages: messagesRef.current,
+          hasMore: historyMetaRef.current.hasMore,
+          nextCursor: historyMetaRef.current.nextCursor,
+          totalCount: historyMetaRef.current.totalCount,
+        }
+        const reconciled = reconcileCachedWithFreshPage(currentSnapshot, {
+          messages: freshMsgs,
+          hasMore,
+          nextCursor,
+          totalCount,
+        })
+        setActiveSession(res.session)
+        setMessages(reconciled.messages)
+        setHistoryMeta({
+          hasMore: reconciled.hasMore,
+          nextCursor: reconciled.nextCursor,
+          totalCount: reconciled.totalCount,
+        })
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetId
+              ? { ...s, status: res.session.status || s.status, title: res.session.title || s.title }
+              : s,
+          ),
+        )
+        void saveCachedSession(
+          targetId,
+          {
+            meta: metaOnly,
+            messages: reconciled.messages,
+            hasMore: reconciled.hasMore,
+            nextCursor: reconciled.nextCursor,
+            totalCount: reconciled.totalCount,
+          },
+          scope,
+        )
+      }
+    } catch {
+      // Quiet background sync errors should never disrupt active reading
+    } finally {
+      quietSyncInFlightRef.current = false
+      const pendingId = quietSyncPendingRef.current
+      quietSyncPendingRef.current = ''
+      if (
+        pendingId &&
+        deviceGenRef.current === gen &&
+        activeSessionRef.current?.id === pendingId &&
+        !streamingRef.current[pendingId]?.active
+      ) {
+        void syncActiveSessionQuietly(pendingId)
+      }
+    }
+  }, [])
+
+  // Auto-sync the open session whenever user switches back to All in One (Desktop focus or mobile resume)
+  useEffect(() => {
+    const triggerFocusSync = () => {
+      if (document.visibilityState === 'hidden') return
+      if (connState !== 'connected' || !activeBridgeIdRef.current) return
+      const now = Date.now()
+      if (now - lastFocusSyncAtRef.current < 1_500) return
+      lastFocusSyncAtRef.current = now
+      const curId = activeSessionRef.current?.id
+      if (curId && !streamingRef.current[curId]?.active) {
+        void syncActiveSessionQuietly(curId)
+      }
+    }
+    window.addEventListener('focus', triggerFocusSync)
+    document.addEventListener('visibilitychange', triggerFocusSync)
+    return () => {
+      window.removeEventListener('focus', triggerFocusSync)
+      document.removeEventListener('visibilitychange', triggerFocusSync)
+    }
+  }, [connState, syncActiveSessionQuietly])
+
   const loadOlderMessages = useCallback(async () => {
     const client = clientRef.current
     const sess = activeSessionRef.current
@@ -811,7 +920,18 @@ export function App() {
       }
 
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
-        setSessions((prev) => [payload.session, ...prev.filter((s) => s.id !== payload.session.id)])
+        const updated = payload.session
+        setSessions((prev) => {
+          const next = [updated, ...prev.filter((s) => s.id !== updated.id)]
+          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+          return next
+        })
+        if (activeSessionRef.current?.id === updated.id) {
+          setActiveSession((prev) => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev))
+          if ((payload.historyChanged || payload.statusChanged) && !streamingRef.current[updated.id]?.active) {
+            void syncActiveSessionQuietly(updated.id)
+          }
+        }
         return
       }
 
@@ -895,6 +1015,12 @@ export function App() {
         setSessions((prev) =>
           prev.map((s) => (s.id === sid ? { ...s, status: 'idle', updatedAt: Date.now() } : s)),
         )
+        // Reconcile optimistic msg-u/msg-a IDs with authoritative disk transcript & syncState shortly after turn settles
+        setTimeout(() => {
+          if (activeSessionRef.current?.id === sid && !streamingRef.current[sid]?.active) {
+            void syncActiveSessionQuietly(sid)
+          }
+        }, 1200)
       }
     })
 

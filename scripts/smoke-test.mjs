@@ -18,7 +18,8 @@ import { createRelayServer } from '../packages/relay-server/src/index.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
-import { RPC } from '../packages/shared/src/protocol.js'
+import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
+import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
 import {
   DEVICES_STORAGE_KEY,
   LEGACY_AUTH_STORAGE_KEY,
@@ -36,6 +37,7 @@ import {
   clearSessionCache,
   getSessionCacheStats,
   loadCachedSession,
+  reconcileCachedWithFreshPage,
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
 import { resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
@@ -1155,7 +1157,94 @@ async function main() {
       if (prevOptOut === undefined) delete process.env.ALLINONE_NO_AUTOFIX
       else process.env.ALLINONE_NO_AUTOFIX = prevOptOut
     }
-    console.log('[smoke] 10/10 Half-installed CLI auto-completion detector & opt-out guard OK')
+    console.log('[smoke] 10/11 Half-installed CLI auto-completion detector & opt-out guard OK')
+
+    // 11. Antigravity split-brain transcript resilience, unique branch IDs, cache reconciliation & live external watcher
+    const splitJsonl = [
+      JSON.stringify({ step_index: 10, type: 'USER_INPUT', created_at: '2026-11-21T10:00:00Z', content: '<USER_REQUEST>\nTrunk Q\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', created_at: '2026-11-21T10:00:05Z', content: 'Trunk A' }),
+      JSON.stringify({ step_index: 12, type: 'USER_INPUT', created_at: '2026-11-21T11:00:00Z', content: '<USER_REQUEST>\nACP Branch Q\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 13, type: 'PLANNER_RESPONSE', created_at: '2026-11-21T11:00:05Z', content: 'ACP Branch A' }),
+      // Desktop resumed stale RAM at step 11 -> wrote step 12 & 13 again!
+      JSON.stringify({ step_index: 12, type: 'USER_INPUT', created_at: '2026-11-22T10:00:00Z', content: '<USER_REQUEST>\nDesktop Fresh Q\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 13, type: 'PLANNER_RESPONSE', created_at: '2026-11-22T10:00:05Z', content: 'Desktop Fresh A' }),
+    ].join('\n')
+
+    const parsedSplit = parseAgyTranscriptContent(splitJsonl)
+    assert.equal(parsedSplit.messages.length, 6, 'All 6 messages across both branches must be preserved without overwriting')
+    assert.ok(parsedSplit.divergence, 'step_index regression must be flagged as divergence')
+    assert.equal(parsedSplit.divergence.lastFromStep, 13)
+    assert.equal(parsedSplit.divergence.lastToStep, 12)
+    const uniqueIds = new Set(parsedSplit.messages.map((m) => m.id))
+    assert.equal(uniqueIds.size, 6, 'All message IDs must be strictly unique even when step_index regresses')
+    assert.equal(parsedSplit.messages[0].id, 'agy-u-10', 'Branch 0 IDs stay backward compatible')
+    assert.equal(parsedSplit.messages[4].id, 'agy-u-b1-12', 'Regressed branch must receive distinct branch-scoped ID')
+    assert.equal(parsedSplit.messages[5].text, 'Desktop Fresh A', 'Latest Desktop message must stay at the bottom')
+
+    // Cache reconciliation must drop trailing synthetic msg-u/msg-a bubbles without duplicating persisted history
+    const cachedWithOptimistic = {
+      messages: [
+        parsedSplit.messages[0],
+        parsedSplit.messages[1],
+        parsedSplit.messages[2],
+        parsedSplit.messages[3],
+        { id: 'msg-u-999999', role: 'user', text: 'Desktop Fresh Q', ts: parsedSplit.messages[4].ts },
+        { id: 'msg-a-999999', role: 'assistant', text: 'Desktop Fresh A', ts: parsedSplit.messages[5].ts },
+      ],
+      hasMore: true,
+      nextCursor: '10',
+      totalCount: 16,
+    }
+    const reconciled = reconcileCachedWithFreshPage(cachedWithOptimistic, {
+      messages: parsedSplit.messages.slice(2),
+      hasMore: true,
+      nextCursor: '12',
+      totalCount: 18,
+    })
+    assert.equal(reconciled.messages.length, 6, 'Reconciliation must replace synthetic bubbles cleanly with zero duplicates')
+    assert.equal(reconciled.messages[reconciled.messages.length - 1].id, 'agy-a-b1-13')
+
+    // Live external watcher: modifying a watched transcript.jsonl emits EVENTS.SESSION_UPDATED with historyChanged=true
+    const fakeAgyHome = join(tmpDir, 'fake-agy-home')
+    const fakeConvId = '11111111-2222-3333-4444-555555555555'
+    const fakeLogDir = join(fakeAgyHome, 'brain', fakeConvId, '.system_generated', 'logs')
+    mkdirSync(fakeLogDir, { recursive: true })
+    const fakeTranscriptPath = join(fakeLogDir, 'transcript.jsonl')
+    writeFileSync(
+      fakeTranscriptPath,
+      `${JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-22T10:00:00Z', content: 'hi' })}\n`,
+    )
+    const watchEvents = []
+    const watchAdapter = new AntigravityAdapter({
+      config: { agyHome: fakeAgyHome, watchPollIntervalMs: 220 },
+      log: { warn() {}, log() {} },
+      emitEvent: (ev, payload) => watchEvents.push({ ev, payload }),
+    })
+    try {
+      const initSess = await watchAdapter.readSession(fakeConvId, { limit: 15 })
+      assert.equal(initSess.messages.length, 1)
+      await new Promise((r) => setTimeout(r, 80))
+      writeFileSync(
+        fakeTranscriptPath,
+        [
+          JSON.stringify({ step_index: 1, type: 'USER_INPUT', created_at: '2026-11-22T10:00:00Z', content: 'hi' }),
+          JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-22T10:00:02Z', content: 'hello from desktop!' }),
+        ].join('\n') + '\n',
+      )
+      for (let i = 0; i < 25; i++) {
+        if (watchEvents.some((e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.historyChanged)) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const hit = watchEvents.find((e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.historyChanged)
+      assert.ok(hit, 'External transcript.jsonl write must trigger EVENTS.SESSION_UPDATED(historyChanged=true)')
+      assert.equal(hit.payload.session.nativeId, fakeConvId)
+      const afterSess = await watchAdapter.readSession(fakeConvId, { limit: 15 })
+      assert.equal(afterSess.messages.length, 2)
+      assert.equal(afterSess.messages[1].text, 'hello from desktop!')
+    } finally {
+      await watchAdapter.dispose()
+    }
+    console.log('[smoke] 11/11 Antigravity split-brain transcript resilience, cache reconciliation & live external watcher OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

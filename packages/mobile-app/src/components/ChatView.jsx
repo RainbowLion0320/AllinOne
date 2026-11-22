@@ -15,6 +15,7 @@ import {
   Sparkles,
   Terminal,
   Wrench,
+  X,
   XCircle,
 } from 'lucide-react'
 import { MarkdownView } from '../lib/markdown.jsx'
@@ -618,6 +619,9 @@ export function ChatView({
     }
   }
 
+  const [dismissedSyncWarnKey, setDismissedSyncWarnKey] = useState('')
+  const syncWarnKey = session?.syncWarning ? `${session?.id || ''}::${session.syncWarning}` : ''
+  const showSyncWarning = Boolean(session?.syncWarning && dismissedSyncWarnKey !== syncWarnKey)
   const hasContent = displayMessages.length > 0 || streamingState?.active
 
   return (
@@ -683,6 +687,22 @@ export function ChatView({
           <div className="mb-4 flex items-start gap-2 rounded-2xl border border-[#4D6BFE]/25 bg-[#F2F5FF] px-3.5 py-2.5 text-xs leading-relaxed text-slate-700 dark:border-[#4D6BFE]/35 dark:bg-[#1E2438] dark:text-slate-200">
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-[#4D6BFE]" />
             <span>{session.notice}</span>
+          </div>
+        )}
+
+        {/* Antigravity cross-client sync notice (only when split-brain or Desktop memory sync hint applies) */}
+        {showSyncWarning && (
+          <div className="mb-4 flex items-start gap-2 rounded-2xl border border-amber-300/60 bg-amber-50/90 px-3.5 py-2.5 text-xs leading-relaxed text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/35 dark:text-amber-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span className="flex-1">{session.syncWarning}</span>
+            <button
+              type="button"
+              aria-label="关闭同步提示"
+              onClick={() => setDismissedSyncWarnKey(syncWarnKey)}
+              className="rounded-lg p-0.5 text-amber-700/70 hover:bg-amber-200/50 hover:text-amber-900 dark:text-amber-300/70 dark:hover:bg-amber-800/40"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         )}
 
@@ -788,6 +808,14 @@ export function ChatView({
                     </div>
                   )}
                 </div>
+              </div>
+            )}
+
+            {/* External Desktop live-sync pulse (e.g. Antigravity Desktop currently generating) */}
+            {!streamingState?.active && session?.syncState?.externalRunning && (
+              <div className="flex items-center gap-2 py-1 text-xs text-slate-400 dark:text-slate-500">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
+                <span>桌面端正在运行此对话，进度自动实时同步中...</span>
               </div>
             )}
 

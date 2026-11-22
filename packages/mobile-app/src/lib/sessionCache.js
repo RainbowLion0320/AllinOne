@@ -361,12 +361,14 @@ export function mergeSessionMessages(older = [], newer = []) {
 
 /**
  * Reconcile a fresh tail page from PC with an existing phone-cached history.
+ * Strictly drops trailing synthetic optimistic messages (`msg-u-*` / `msg-a-*`) once
+ * authoritative persisted messages overlap, preventing ghost duplicates or stale tails.
  */
 export function reconcileCachedWithFreshPage(cached, fresh) {
   const freshMsgs = Array.isArray(fresh?.messages) ? fresh.messages : []
   const cachedMsgs = Array.isArray(cached?.messages) ? cached.messages : []
 
-  if (cachedMsgs.length === 0) {
+  if (cachedMsgs.length === 0 || !fresh?.hasMore) {
     return {
       messages: freshMsgs,
       hasMore: Boolean(fresh?.hasMore),
@@ -384,15 +386,22 @@ export function reconcileCachedWithFreshPage(cached, fresh) {
     }
   }
 
-  const cachedIdSet = new Set(cachedMsgs.map((m) => m.id).filter(Boolean))
-  const overlaps = freshMsgs.some((m) => m.id && cachedIdSet.has(m.id))
+  const freshIdSet = new Set(freshMsgs.map((m) => m?.id).filter(Boolean))
+  const firstFreshIdxInCache = cachedMsgs.findIndex((m) => m?.id && m.id === freshMsgs[0]?.id)
+  const firstOverlapIdx =
+    firstFreshIdxInCache >= 0
+      ? firstFreshIdxInCache
+      : cachedMsgs.findIndex((m) => m?.id && freshIdSet.has(m.id))
 
-  if (overlaps && cachedMsgs.length >= freshMsgs.length) {
-    const firstFreshIdxInCache = cachedMsgs.findIndex((m) => m.id && m.id === freshMsgs[0]?.id)
-    const olderPrefix =
-      firstFreshIdxInCache > 0
-        ? cachedMsgs.slice(0, firstFreshIdxInCache)
-        : cachedMsgs.filter((m) => !freshMsgs.some((fm) => fm.id === m.id))
+  if (firstOverlapIdx > 0 && cachedMsgs.length >= freshMsgs.length) {
+    const firstFreshTs = Number(freshMsgs[0]?.ts || 0)
+    const olderPrefix = cachedMsgs.slice(0, firstOverlapIdx).filter((m) => {
+      if (!m) return false
+      if (/^msg-[ua]-/.test(String(m.id || '')) && firstFreshTs > 0 && Number(m.ts || 0) >= firstFreshTs - 5_000) {
+        return false
+      }
+      return true
+    })
     const merged = mergeSessionMessages(olderPrefix, freshMsgs)
     return {
       messages: merged,
