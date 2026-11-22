@@ -10,6 +10,8 @@ export function Composer({
   activeApp,
   streaming,
   disabled,
+  needsWorkspace = false,
+  targetWorkspaceName = '',
   onSwitchAppClick,
   modelPref,
   modelDisplayName,
@@ -95,7 +97,7 @@ export function Composer({
   const handleSubmit = () => {
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
-    if (disabled || streaming) return
+    if (disabled || streaming || needsWorkspace) return
     const curKey = draftKeyRef.current
     onSend({ text: trimmed, attachments })
     clearDraft(curKey)
@@ -111,7 +113,12 @@ export function Composer({
     }
   }
 
-  const canSend = (text.trim().length > 0 || attachments.length > 0) && !disabled && !uploading
+  const canSend = (text.trim().length > 0 || attachments.length > 0) && !disabled && !uploading && !needsWorkspace
+  const placeholderText = needsWorkspace
+    ? '请先在上方选择目标项目目录...'
+    : targetWorkspaceName
+      ? `在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`
+      : `给 ${meta.shortName} 发送消息...`
 
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
@@ -166,7 +173,7 @@ export function Composer({
               autoResize(e.target)
             }}
             onKeyDown={handleKeyDown}
-            placeholder={`给 ${meta.shortName} 发送消息...`}
+            placeholder={placeholderText}
             className="max-h-[140px] w-full resize-none bg-transparent px-1 text-[15px] leading-relaxed text-slate-900 placeholder-slate-400 outline-none dark:text-white dark:placeholder-slate-500"
           />
 

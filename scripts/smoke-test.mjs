@@ -41,7 +41,17 @@ import {
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
 import { resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
-import { clearDraft, clearDraftsForScope, loadDraft, makeDraftKey, saveDraft } from '../packages/mobile-app/src/lib/draftStore.js'
+import {
+  clearDraft,
+  clearDraftsForScope,
+  loadDraft,
+  loadLastSessionId,
+  loadLastWorkspace,
+  makeDraftKey,
+  saveDraft,
+  saveLastSessionId,
+  saveLastWorkspace,
+} from '../packages/mobile-app/src/lib/draftStore.js'
 
 const TEST_PASS = 'smoke-test-pass-123'
 const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
@@ -1260,9 +1270,15 @@ async function main() {
     clearDraft(dkA)
     assert.equal(loadDraft(dkA).text, '')
     assert.equal(loadDraft(dkB).text, 'Draft for Agy B', 'Clearing session A draft must not touch session B')
+    saveLastSessionId('dev1::pc1', 'codex:sess-a')
+    saveLastWorkspace('dev1::pc1', '/Users/demo/AllinOne')
+    assert.equal(loadLastSessionId('dev1::pc1'), 'codex:sess-a')
+    assert.equal(loadLastWorkspace('dev1::pc1'), '/Users/demo/AllinOne')
     clearDraftsForScope('dev1')
     assert.equal(loadDraft(dkB).text, '')
     assert.equal(loadDraft(dkNew).text, '')
+    assert.equal(loadLastSessionId('dev1::pc1'), '')
+    assert.equal(loadLastWorkspace('dev1::pc1'), '')
 
     console.log('[smoke] 11/11 Antigravity split-brain transcript resilience, cache reconciliation, live watcher & per-session drafts OK')
 

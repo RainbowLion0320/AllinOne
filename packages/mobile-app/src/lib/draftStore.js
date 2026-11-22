@@ -4,10 +4,14 @@
  */
 
 export const DRAFTS_STORAGE_KEY = 'allinone_composer_drafts_v1'
+export const LAST_SESSION_STORAGE_KEY = 'allinone_last_session_v1'
+export const LAST_WORKSPACE_STORAGE_KEY = 'allinone_last_workspace_v1'
 const MAX_DRAFTS = 60
 const MAX_TEXT_CHARS = 32_000
 
 const memoryDrafts = new Map()
+const memoryLastSessions = new Map()
+const memoryLastWorkspaces = new Map()
 let hydrated = false
 
 function readRawStorage() {
@@ -116,7 +120,11 @@ export function clearDraftsForScope(scopePrefix) {
   const prefix = String(scopePrefix || '').trim()
   if (!prefix) {
     memoryDrafts.clear()
+    memoryLastSessions.clear()
+    memoryLastWorkspaces.clear()
     persistDrafts()
+    persistScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
+    persistScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
     return
   }
   let changed = false
@@ -127,4 +135,82 @@ export function clearDraftsForScope(scopePrefix) {
     }
   }
   if (changed) persistDrafts()
+
+  clearScopeMapPrefix(LAST_SESSION_STORAGE_KEY, memoryLastSessions, prefix)
+  clearScopeMapPrefix(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces, prefix)
+}
+
+function hydrateScopeMap(storageKey, map) {
+  if (map.size > 0) return
+  try {
+    if (typeof localStorage === 'undefined') return
+    const raw = localStorage.getItem(storageKey)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    for (const [k, v] of Object.entries(parsed)) {
+      if (k && typeof v === 'string' && v.trim()) map.set(k, v.trim())
+    }
+  } catch {}
+}
+
+function persistScopeMap(storageKey, map) {
+  try {
+    if (typeof localStorage === 'undefined') return
+    if (map.size === 0) {
+      localStorage.removeItem(storageKey)
+      return
+    }
+    localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(map.entries())))
+  } catch {}
+}
+
+function clearScopeMapPrefix(storageKey, map, prefix) {
+  hydrateScopeMap(storageKey, map)
+  let changed = false
+  for (const k of [...map.keys()]) {
+    if (k === prefix || k.startsWith(`${prefix}::`)) {
+      map.delete(k)
+      changed = true
+    }
+  }
+  if (changed) persistScopeMap(storageKey, map)
+}
+
+export function loadLastSessionId(scope) {
+  const sc = String(scope || '').trim()
+  if (!sc) return ''
+  hydrateScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
+  return memoryLastSessions.get(sc) || ''
+}
+
+export function saveLastSessionId(scope, sessionId) {
+  const sc = String(scope || '').trim()
+  const sid = String(sessionId || '').trim()
+  if (!sc) return
+  hydrateScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
+  if (!sid) {
+    if (memoryLastSessions.delete(sc)) persistScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
+    return
+  }
+  if (memoryLastSessions.get(sc) === sid) return
+  memoryLastSessions.set(sc, sid)
+  persistScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
+}
+
+export function loadLastWorkspace(scope) {
+  const sc = String(scope || '').trim()
+  if (!sc) return ''
+  hydrateScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
+  return memoryLastWorkspaces.get(sc) || ''
+}
+
+export function saveLastWorkspace(scope, cwd) {
+  const sc = String(scope || '').trim()
+  const path = String(cwd || '').trim()
+  if (!sc || !path) return
+  hydrateScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
+  if (memoryLastWorkspaces.get(sc) === path) return
+  memoryLastWorkspaces.set(sc, path)
+  persistScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
 }

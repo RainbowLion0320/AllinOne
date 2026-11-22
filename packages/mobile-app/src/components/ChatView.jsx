@@ -8,6 +8,8 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  Folder,
+  FolderPlus,
   History,
   Info,
   Loader2,
@@ -307,6 +309,10 @@ export function ChatView({
   appsStatus,
   activeApp = 'dsh',
   onSelectApp,
+  workspaces = [],
+  selectedWorkspace = '',
+  onSelectWorkspace,
+  onOpenNewChatModal,
   approvals,
   imageContext,
   onResolveApproval,
@@ -696,7 +702,7 @@ export function ChatView({
 
         {/* Empty Greeting Screen */}
         {!loadingSession && !hasContent && (
-          <div className="flex flex-col items-center pt-24 pb-8 text-center">
+          <div className="flex flex-col items-center pt-20 pb-8 text-center">
             <div className="mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10">
               <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
             </div>
@@ -704,36 +710,91 @@ export function ChatView({
               {session ? session.title : 'All in One'}
             </h2>
 
-            {/* Native AI Tool Switcher Pills */}
-            <div className="mt-5 flex flex-wrap justify-center gap-2">
-              {['dsh', 'codex', 'claude', 'antigravity'].map((appId) => {
-                const info = appsStatus.find((a) => a.app === appId)
-                const am = APP_META[appId]
-                const online = info?.available
-                const rw = info?.writable
-                const selected = activeApp === appId
-                return (
-                  <button
-                    key={appId}
-                    type="button"
-                    onClick={() => onSelectApp?.(appId)}
-                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
-                      selected
-                        ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
-                        : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
-                    }`}
-                  >
-                    <VendorIcon app={appId} size={13} />
-                    <span>{am.shortName}</span>
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
-                      }`}
-                    />
-                  </button>
-                )
-              })}
-            </div>
+            {session ? (
+              session.workspace && (
+                <div
+                  title={session.cwd || session.workspace}
+                  className="mt-3 inline-flex max-w-xs items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-300"
+                >
+                  <Folder className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                  <span className="truncate">{session.workspace}</span>
+                </div>
+              )
+            ) : (
+              <>
+                {/* Native AI Tool Switcher Pills */}
+                <div className="mt-5 flex flex-wrap justify-center gap-2">
+                  {['dsh', 'codex', 'claude', 'antigravity'].map((appId) => {
+                    const info = appsStatus.find((a) => a.app === appId)
+                    const am = APP_META[appId]
+                    const online = info?.available
+                    const rw = info?.writable
+                    const selected = activeApp === appId
+                    return (
+                      <button
+                        key={appId}
+                        type="button"
+                        onClick={() => onSelectApp?.(appId)}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
+                          selected
+                            ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
+                            : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
+                        }`}
+                      >
+                        <VendorIcon app={appId} size={13} />
+                        <span>{am.shortName}</span>
+                        <span
+                          className={`h-1.5 w-1.5 rounded-full ${
+                            online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
+                          }`}
+                        />
+                      </button>
+                    )
+                  })}
+                </div>
+
+                {/* Explicit Project Directory Selector (prevents blind sends to unknown directories) */}
+                <div className="mt-6 w-full max-w-md">
+                  <div className="mb-2 text-[11px] font-medium text-slate-400 dark:text-slate-500">
+                    {selectedWorkspace ? '目标项目' : '请选择目标项目后开始对话'}
+                  </div>
+                  <div className="flex flex-wrap justify-center gap-1.5">
+                    {workspaces.slice(0, 6).map((w) => {
+                      const isSel = selectedWorkspace && w.path.toLowerCase() === selectedWorkspace.toLowerCase()
+                      return (
+                        <button
+                          key={w.path}
+                          type="button"
+                          title={w.path}
+                          onClick={() => onSelectWorkspace?.(w.path)}
+                          className={`inline-flex max-w-[180px] items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition active:scale-95 ${
+                            isSel
+                              ? 'border-[#4D6BFE]/70 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
+                              : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
+                          }`}
+                        >
+                          <Folder className={`h-3.5 w-3.5 shrink-0 ${isSel ? 'text-[#4D6BFE]' : 'text-slate-400'}`} />
+                          <span className="truncate">{w.name || w.path}</span>
+                        </button>
+                      )
+                    })}
+                    <button
+                      type="button"
+                      onClick={() => onOpenNewChatModal?.()}
+                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:border-[#4D6BFE]/60 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700 dark:text-slate-400"
+                    >
+                      <FolderPlus className="h-3.5 w-3.5" />
+                      <span>选择目录</span>
+                    </button>
+                  </div>
+                  {selectedWorkspace && (
+                    <div className="mt-2 truncate px-4 font-mono text-[10.5px] text-slate-400 dark:text-slate-500">
+                      {selectedWorkspace}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         )}
 

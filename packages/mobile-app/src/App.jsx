@@ -39,7 +39,14 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from './lib/sessionCache.js'
-import { clearDraftsForScope, makeDraftKey } from './lib/draftStore.js'
+import {
+  clearDraftsForScope,
+  loadLastSessionId,
+  loadLastWorkspace,
+  makeDraftKey,
+  saveLastSessionId,
+  saveLastWorkspace,
+} from './lib/draftStore.js'
 import { LoginScreen } from './components/LoginScreen.jsx'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
@@ -70,6 +77,7 @@ export function App() {
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
   const [selectedDraftApp, setSelectedDraftApp] = useState('')
+  const [selectedDraftCwd, setSelectedDraftCwd] = useState('')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [lightboxState, setLightboxState] = useState(null)
@@ -169,6 +177,7 @@ export function App() {
   const quietSyncInFlightRef = useRef(false)
   const quietSyncPendingRef = useRef('')
   const lastFocusSyncAtRef = useRef(0)
+  const autoOpenedScopeRef = useRef('')
   const toastTimerRef = useRef(null)
 
   const showToast = useCallback((text) => {
@@ -301,6 +310,8 @@ export function App() {
     setSessionModelPrefs({})
     setDraftDshPref(null)
     setSelectedDraftApp('')
+    setSelectedDraftCwd('')
+    autoOpenedScopeRef.current = ''
     setWorkspaces([])
     setSessions([])
     setStreamingBySession({})
@@ -595,7 +606,9 @@ export function App() {
 
     if (typeof sessionOrId === 'object') {
       setActiveSession(sessionOrId)
+      if (sessionOrId.cwd) saveLastWorkspace(scope, sessionOrId.cwd)
     }
+    saveLastSessionId(scope, id)
     if (isDifferentSession) {
       // Clear previous session's messages immediately so ChatView never measures stale scrollHeight
       setMessages([])
@@ -672,6 +685,35 @@ export function App() {
       }
     }
   }, [])
+
+  // Auto-resume the last active conversation (or most recent conversation) once per connected PC,
+  // so opening the app lands straight inside a real project conversation instead of an unscoped blank screen.
+  useEffect(() => {
+    if (connState !== 'connected' || !activeBridgeId || !cacheScope) return
+    if (sessions.length === 0) return
+    if (autoOpenedScopeRef.current === cacheScope) return
+    if (activeSessionRef.current) {
+      autoOpenedScopeRef.current = cacheScope
+      return
+    }
+    autoOpenedScopeRef.current = cacheScope
+    const savedId = loadLastSessionId(cacheScope)
+    const targetSess = (savedId && sessions.find((s) => s.id === savedId)) || sessions[0]
+    if (targetSess) {
+      void openSession(targetSess)
+    }
+  }, [connState, activeBridgeId, cacheScope, sessions, openSession])
+
+  // Restore last explicitly used project directory on the empty screen (only if still present on this PC)
+  useEffect(() => {
+    if (selectedDraftCwd || !cacheScope || effectiveWorkspaces.length === 0) return
+    const saved = loadLastWorkspace(cacheScope)
+    if (!saved) return
+    const matched = effectiveWorkspaces.find((w) => w.path.toLowerCase() === saved.toLowerCase())
+    if (matched) {
+      setSelectedDraftCwd(matched.path)
+    }
+  }, [cacheScope, effectiveWorkspaces, selectedDraftCwd])
 
   const syncActiveSessionQuietly = useCallback(async (sessionId = '') => {
     const client = clientRef.current
@@ -1163,6 +1205,11 @@ export function App() {
     }
     setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)])
     setActiveSession(created)
+    saveLastSessionId(cacheScopeRef.current, created.id)
+    if (created.cwd) {
+      saveLastWorkspace(cacheScopeRef.current, created.cwd)
+      setSelectedDraftCwd(created.cwd)
+    }
     setMessages([])
     setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: 0 })
     return created
@@ -1203,12 +1250,18 @@ export function App() {
 
     let target = activeSession
     if (!target) {
-      // Auto-create a session on the selected/default native app when typing from the greeting screen
+      // Strictly require an explicitly chosen project directory before creating a new conversation
+      const explicitCwd = String(selectedDraftCwd || '').trim()
+      if (!explicitCwd) {
+        showToast('请先选择目标项目目录')
+        setNewChatOpen(true)
+        return
+      }
       try {
         const initPref = resolveModelPrefFor({ app: effectiveDefaultApp })
         target = await handleCreateSession({
           app: effectiveDefaultApp,
-          cwd: effectiveWorkspaces?.[0]?.path || '',
+          cwd: explicitCwd,
           title: text.slice(0, 28) || '新对话',
           model: initPref.model || undefined,
           provider: initPref.provider || undefined,
@@ -1368,17 +1421,27 @@ export function App() {
   ) || (activeCatalog?.models || []).find((m) => m.id === activeModelPref.model)
   const currentStream = activeSession ? streamingBySession[activeSession.id] : null
 
+  const selectedDraftWorkspaceObj = useMemo(() => {
+    if (!selectedDraftCwd) return null
+    const lower = selectedDraftCwd.toLowerCase()
+    const hit = effectiveWorkspaces.find((w) => w.path.toLowerCase() === lower)
+    if (hit) return hit
+    const parts = selectedDraftCwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean)
+    return { name: parts[parts.length - 1] || selectedDraftCwd, path: selectedDraftCwd }
+  }, [selectedDraftCwd, effectiveWorkspaces])
+
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
+  const currentWorkspaceLabel = activeSession?.workspace || selectedDraftWorkspaceObj?.name || ''
   const headerSubtitle = (() => {
     if (connState === 'unauthorized') return `${activeDeviceName} · 已过期`
     if (connState !== 'connected') return `${activeDeviceName} · 连接中`
     if (!bridgeOnline) return `${activeDeviceName} · 离线`
     if (hasMultipleTargets) {
-      return activeSession?.workspace
-        ? `${activeDeviceName} · ${activeSession.workspace}`
+      return currentWorkspaceLabel
+        ? `${activeDeviceName} · ${currentWorkspaceLabel}`
         : activeDeviceName
     }
-    return activeSession?.workspace || activeDeviceName || '已连接'
+    return currentWorkspaceLabel || activeDeviceName || '已连接'
   })()
 
   return (
@@ -1465,7 +1528,10 @@ export function App() {
 
           <button
             type="button"
-            onClick={() => setNewChatOpen(true)}
+            onClick={() => {
+              setNewChatCwd(activeSession?.cwd || selectedDraftCwd || '')
+              setNewChatOpen(true)
+            }}
             aria-label="新建对话"
             className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
@@ -1548,6 +1614,16 @@ export function App() {
           setSelectedDraftApp(appId)
           setDraftDshPref(null)
         }}
+        workspaces={effectiveWorkspaces}
+        selectedWorkspace={selectedDraftCwd}
+        onSelectWorkspace={(cwdPath) => {
+          setSelectedDraftCwd(cwdPath)
+          if (cwdPath) saveLastWorkspace(cacheScopeRef.current, cwdPath)
+        }}
+        onOpenNewChatModal={() => {
+          setNewChatCwd(selectedDraftCwd || '')
+          setNewChatOpen(true)
+        }}
         approvals={approvals}
         imageContext={imageContext}
         onResolveApproval={handleResolveApproval}
@@ -1559,7 +1635,12 @@ export function App() {
         activeApp={activeApp}
         streaming={Boolean(currentStream?.active)}
         disabled={!bridgeOnline || connState !== 'connected'}
-        onSwitchAppClick={() => setNewChatOpen(true)}
+        needsWorkspace={!activeSession && !selectedDraftCwd}
+        targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
+        onSwitchAppClick={() => {
+          setNewChatCwd(activeSession?.cwd || selectedDraftCwd || '')
+          setNewChatOpen(true)
+        }}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
         onOpenModelPicker={() => {
