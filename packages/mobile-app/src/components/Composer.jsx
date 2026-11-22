@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { ArrowUp, ChevronDown, Cpu, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
+import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { resolveImageSrc } from '../lib/imageUrls.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
@@ -10,8 +10,6 @@ export function Composer({
   activeApp,
   streaming,
   disabled,
-  dispatchMode,
-  onToggleDispatchMode,
   onSwitchAppClick,
   modelPref,
   modelDisplayName,

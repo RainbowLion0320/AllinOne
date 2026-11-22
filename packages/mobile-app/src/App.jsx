@@ -45,7 +45,6 @@ import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
 import { Composer } from './components/Composer.jsx'
 import { NewChatModal } from './components/NewChatModal.jsx'
-import { DispatchBoard } from './components/DispatchBoard.jsx'
 import { ModelPickerSheet } from './components/ModelPickerSheet.jsx'
 import { ImageLightbox } from './components/ImageLightbox.jsx'
 import { ShareModal } from './components/ShareModal.jsx'
@@ -70,7 +69,7 @@ export function App() {
   const [inviteManagerOpen, setInviteManagerOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
-  const [dispatchOpen, setDispatchOpen] = useState(false)
+  const [selectedDraftApp, setSelectedDraftApp] = useState('')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [lightboxState, setLightboxState] = useState(null)
@@ -92,11 +91,9 @@ export function App() {
   const [olderError, setOlderError] = useState('')
   const [loadingSession, setLoadingSession] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
-  const [dispatchMode, setDispatchMode] = useState(true)
 
   const [streamingBySession, setStreamingBySession] = useState({})
   const [approvals, setApprovals] = useState([])
-  const [dispatches, setDispatches] = useState([])
   const [desktopBridge, setDesktopBridge] = useState(null)
 
   const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
@@ -268,13 +265,12 @@ export function App() {
         else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
         else if (inviteManagerOpen) setInviteManagerOpen(false)
         else if (shareOpen) setShareOpen(false)
-        else if (dispatchOpen) setDispatchOpen(false)
         else if (drawerOpen) setDrawerOpen(false)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, dispatchOpen, drawerOpen])
+  }, [activeDevice, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -304,14 +300,13 @@ export function App() {
     setModelsCatalog({})
     setSessionModelPrefs({})
     setDraftDshPref(null)
+    setSelectedDraftApp('')
     setWorkspaces([])
     setSessions([])
     setStreamingBySession({})
     setApprovals([])
-    setDispatches([])
     setNewChatOpen(false)
     setNewChatCwd('')
-    setDispatchOpen(false)
     setModelPickerOpen(false)
     setLightboxState(null)
   }, [])
@@ -515,12 +510,11 @@ export function App() {
     setRefreshing(true)
     try {
       const rpcOpts = targetBridge ? { bridgeId: targetBridge } : {}
-      const [statusRes, sessRes, wsRes, aprRes, dispRes, modelsRes] = await Promise.all([
+      const [statusRes, sessRes, wsRes, aprRes, modelsRes] = await Promise.all([
         client.rpc(RPC.APPS_STATUS, {}, 45_000, rpcOpts).catch(() => ({ apps: [] })),
         client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }, 45_000, rpcOpts).catch(() => ({ sessions: [] })),
         client.rpc(RPC.WORKSPACES_LIST, {}, 45_000, rpcOpts).catch(() => ({ workspaces: [] })),
         client.rpc(RPC.APPROVAL_LIST, {}, 45_000, rpcOpts).catch(() => ({ approvals: [] })),
-        client.rpc(RPC.DISPATCH_LIST, { limit: 30 }, 45_000, rpcOpts).catch(() => ({ tasks: [] })),
         client.rpc(RPC.MODELS_LIST, {}, 45_000, rpcOpts).catch(() => ({ catalog: {} })),
       ])
       if (deviceGenRef.current !== gen || clientRef.current !== client) return
@@ -528,7 +522,6 @@ export function App() {
       setSessions(sessRes.sessions || [])
       setWorkspaces(wsRes.workspaces || [])
       setApprovals(aprRes.approvals || [])
-      setDispatches(dispRes.tasks || [])
       if (modelsRes?.catalog && Object.keys(modelsRes.catalog).length > 0) {
         setModelsCatalog(modelsRes.catalog)
       }
@@ -914,12 +907,6 @@ export function App() {
         return
       }
 
-      if (event === EVENTS.DISPATCH_UPDATED && payload?.task) {
-        const task = payload.task
-        setDispatches((prev) => [task, ...prev.filter((x) => x.taskId !== task.taskId)])
-        return
-      }
-
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
         const updated = payload.session
         setSessions((prev) => {
@@ -1181,8 +1168,10 @@ export function App() {
     return created
   }
 
+  const effectiveDefaultApp = selectedDraftApp || defaultApp
+
   const resolveModelPrefFor = (sessionObj) => {
-    const appId = sessionObj?.app || defaultApp
+    const appId = sessionObj?.app || effectiveDefaultApp
     const cat = modelsCatalog[appId]
     const explicit = sessionObj?.id ? sessionModelPrefs[sessionObj.id] : draftDshPref
     if (explicit?.model) return explicit
@@ -1214,11 +1203,11 @@ export function App() {
 
     let target = activeSession
     if (!target) {
-      // Auto-create a session on the first available writable app when typing from the greeting screen
+      // Auto-create a session on the selected/default native app when typing from the greeting screen
       try {
-        const initPref = resolveModelPrefFor({ app: defaultApp })
+        const initPref = resolveModelPrefFor({ app: effectiveDefaultApp })
         target = await handleCreateSession({
-          app: defaultApp,
+          app: effectiveDefaultApp,
           cwd: effectiveWorkspaces?.[0]?.path || '',
           title: text.slice(0, 28) || '新对话',
           model: initPref.model || undefined,
@@ -1233,11 +1222,7 @@ export function App() {
     }
 
     const activePref = resolveModelPrefFor(target)
-
-    const finalText =
-      target.app === 'dsh' && dispatchMode && !text.includes('allinone_')
-        ? text
-        : text
+    const finalText = text
 
     // Optimistically replace generic placeholder title on first user message
     const genericTitle = /^(新 |手机端总控对话|[0-9a-f]{8}-[0-9a-f]{4}-)/i.test(target.title || '')
@@ -1338,27 +1323,6 @@ export function App() {
     }
   }
 
-  const handleDirectDispatch = async ({ app, cwd, prompt }) => {
-    const client = clientRef.current
-    if (!client) throw new Error('未连接到服务器')
-    const targetBridge = activeBridgeIdRef.current
-    const res = await client.rpc(
-      RPC.DISPATCH_CREATE,
-      {
-        app,
-        cwd,
-        prompt,
-        wait: false,
-        issuedBy: 'mobile-board',
-      },
-      45_000,
-      targetBridge ? { bridgeId: targetBridge } : {},
-    )
-    if (res?.task) {
-      setDispatches((prev) => [res.task, ...prev.filter((t) => t.taskId !== res.task.taskId)])
-    }
-  }
-
   if (autoPairing) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-b from-[#F5F8FF] to-white px-6 text-center dark:from-[#16171A] dark:to-[#111216]">
@@ -1394,7 +1358,7 @@ export function App() {
     )
   }
 
-  const activeApp = activeSession?.app || defaultApp
+  const activeApp = activeSession?.app || effectiveDefaultApp
   const activeCatalog = modelsCatalog[activeApp] || null
   const activeModelPref = resolveModelPrefFor(activeSession)
   const activeModelObj = (activeCatalog?.models || []).find(
@@ -1579,11 +1543,14 @@ export function App() {
         totalHistoryCount={historyMeta.totalCount}
         onLoadOlder={loadOlderMessages}
         appsStatus={appsStatus}
+        activeApp={activeApp}
+        onSelectApp={(appId) => {
+          setSelectedDraftApp(appId)
+          setDraftDshPref(null)
+        }}
         approvals={approvals}
         imageContext={imageContext}
         onResolveApproval={handleResolveApproval}
-        onQuickPrompt={(promptText) => handleSend({ text: promptText })}
-        onOpenDispatchBoard={() => setDispatchOpen(true)}
       />
 
       {/* Floating DeepSeek-style Composer */}
@@ -1592,8 +1559,6 @@ export function App() {
         activeApp={activeApp}
         streaming={Boolean(currentStream?.active)}
         disabled={!bridgeOnline || connState !== 'connected'}
-        dispatchMode={dispatchMode}
-        onToggleDispatchMode={() => setDispatchMode((v) => !v)}
         onSwitchAppClick={() => setNewChatOpen(true)}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
@@ -1718,17 +1683,6 @@ export function App() {
         }}
       />
 
-      {/* Master Dispatch Board */}
-      <DispatchBoard
-        open={dispatchOpen}
-        onClose={() => setDispatchOpen(false)}
-        appsStatus={appsStatus}
-        workspaces={effectiveWorkspaces}
-        dispatches={dispatches}
-        onRefresh={() => loadWorkspaceData(activeBridgeId)}
-        onDirectDispatch={handleDirectDispatch}
-        onJumpToSession={openSession}
-      />
       {/* Share with Friends Modal */}
       <ShareModal
         open={shareOpen}

@@ -12,7 +12,6 @@ import {
   Info,
   Loader2,
   ShieldAlert,
-  Sparkles,
   Terminal,
   Wrench,
   X,
@@ -248,25 +247,6 @@ function mergeAssistantRuns(messages) {
   return merged
 }
 
-const QUICK_DISPATCH_PROMPTS = [
-  {
-    title: '查看 Git 状态',
-    prompt: '帮我检查一下当前工作区的 git status 和最近 5 条提交记录，简要汇报当前进度。',
-  },
-  {
-    title: '运行测试排查',
-    prompt: '请运行当前项目的测试脚本，如果有报错请直接定位根因并给出修复方案。',
-  },
-  {
-    title: '梳理项目目录',
-    prompt: '帮我快速梳理一下当前项目的目录结构和主要入口文件，用简洁列表说明。',
-  },
-  {
-    title: '截取电脑屏幕',
-    prompt: '截一张当前电脑屏幕图片给我看看运行效果。',
-  },
-]
-
 /**
  * Memoized message row so prepending older pages or live streaming deltas never re-render
  * already-mounted Markdown trees or image cards.
@@ -325,11 +305,11 @@ export function ChatView({
   totalHistoryCount = null,
   onLoadOlder,
   appsStatus,
+  activeApp = 'dsh',
+  onSelectApp,
   approvals,
   imageContext,
   onResolveApproval,
-  onQuickPrompt,
-  onOpenDispatchBoard,
 }) {
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
@@ -716,7 +696,7 @@ export function ChatView({
 
         {/* Empty Greeting Screen */}
         {!loadingSession && !hasContent && (
-          <div className="flex flex-col items-center pt-14 pb-6 text-center">
+          <div className="flex flex-col items-center pt-24 pb-8 text-center">
             <div className="mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10">
               <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
             </div>
@@ -724,19 +704,24 @@ export function ChatView({
               {session ? session.title : 'All in One'}
             </h2>
 
-            {/* Live 4-App Health Strip */}
-            <div className="mt-4 flex flex-wrap justify-center gap-1.5">
+            {/* Native AI Tool Switcher Pills */}
+            <div className="mt-5 flex flex-wrap justify-center gap-2">
               {['dsh', 'codex', 'claude', 'antigravity'].map((appId) => {
                 const info = appsStatus.find((a) => a.app === appId)
                 const am = APP_META[appId]
                 const online = info?.available
                 const rw = info?.writable
+                const selected = activeApp === appId
                 return (
                   <button
                     key={appId}
                     type="button"
-                    onClick={onOpenDispatchBoard}
-                    className="inline-flex items-center gap-1.5 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 shadow-2xs transition hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200"
+                    onClick={() => onSelectApp?.(appId)}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
+                      selected
+                        ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
+                        : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
+                    }`}
                   >
                     <VendorIcon app={appId} size={13} />
                     <span>{am.shortName}</span>
@@ -748,23 +733,6 @@ export function ChatView({
                   </button>
                 )
               })}
-            </div>
-
-            {/* Compact Quick Dispatch Chips */}
-            <div className="mt-8 grid w-full grid-cols-2 gap-2 text-left">
-              {QUICK_DISPATCH_PROMPTS.map((item) => (
-                <button
-                  key={item.title}
-                  type="button"
-                  onClick={() => onQuickPrompt(item.prompt)}
-                  className="flex items-center gap-2 rounded-2xl border border-slate-200/80 bg-[#F8F9FC] px-3.5 py-3 transition hover:border-[#4D6BFE]/50 hover:bg-[#F1F5FF] active:scale-[0.98] dark:border-slate-800 dark:bg-[#1E2028] dark:hover:border-[#4D6BFE]/50"
-                >
-                  <Sparkles className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                  <span className="truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
-                    {item.title}
-                  </span>
-                </button>
-              ))}
             </div>
           </div>
         )}
