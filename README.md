@@ -33,7 +33,7 @@
 > - macOS / Linux：`curl -fsSL https://你的服务器/setup.sh | bash`
 > - Windows (PowerShell)：`irm https://你的服务器/setup.ps1 | iex`
 >
-> macOS 首次打开未签名应用如遇系统提示，在「系统设置 → 隐私与安全性」点「仍要打开」即可。
+> macOS 首次打开未公证应用如遇系统提示，在「系统设置 → 隐私与安全性」点「仍要打开」；若仍提示已损坏，在终端运行一次 `xattr -cr "/Applications/All in One.app"` 即可。
 
 #### 手机端
 

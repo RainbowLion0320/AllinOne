@@ -25,6 +25,7 @@
     "copyright": "Copyright © 2026 All in One",
     "electronVersion": "35.7.5",
     "npmRebuild": false,
+    "afterPack": "scripts/after-pack.cjs",
     "directories": {
       "output": "release",
       "buildResources": "build"

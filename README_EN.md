@@ -29,6 +29,8 @@ All in One runs a lightweight relay on your own server and connects directly to 
 2. Open **All in One**, enter your server URL, and register with your invite code or sign in.
 3. Once signed in, the app binds this computer to your account, stays connected in the system tray, and detects your installed AI coding tools (automatically installing missing official CLI companions when a desktop app or session store is already present).
 
+> On macOS, if Gatekeeper blocks the first launch of this un-notarized build, allow it under **System Settings → Privacy & Security → Open Anyway**, or run `xattr -cr "/Applications/All in One.app"` once in Terminal.
+>
 > On Linux or headless machines, connect with a single command:
 > - macOS / Linux: `curl -fsSL https://your-server/setup.sh | bash`
 > - Windows (PowerShell): `irm https://your-server/setup.ps1 | iex`
