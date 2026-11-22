@@ -101,6 +101,7 @@ export class DesktopBridgeManager extends EventEmitter {
     this.activeAccount = null // { baseUrl, token, roomId, username }
     this.deviceMeta = null // { label, bridgeId, roomId, username, serverUrl }
     this.appsSummary = ''
+    this.autofixText = ''
     this.syncSeq = 0
   }
 
@@ -133,6 +134,7 @@ export class DesktopBridgeManager extends EventEmitter {
       username: this.deviceMeta?.username || this.activeAccount?.username || '',
       serverUrl: this.deviceMeta?.serverUrl || this.activeAccount?.baseUrl || '',
       appsSummary: this.appsSummary,
+      autofixText: this.autofixText,
       error: this.error,
       logPath: this.logPath,
     }
@@ -373,6 +375,15 @@ export class DesktopBridgeManager extends EventEmitter {
           this.appsSummary = line.slice(idx + 1).trim()
           this.emitStatus()
         }
+      } else if (line.includes('[autofix:progress]')) {
+        const idx = line.indexOf('[autofix:progress]')
+        this.autofixText = line.slice(idx + '[autofix:progress]'.length).trim()
+        this.emitStatus()
+      } else if (line.includes('[autofix:idle]')) {
+        if (this.autofixText) {
+          this.autofixText = ''
+          this.emitStatus()
+        }
       } else if (line.includes('已被解绑') || line.includes('凭证无效')) {
         this.error = '本机绑定凭证已失效，请重新登录'
         this.state = 'error'
@@ -412,6 +423,7 @@ export class DesktopBridgeManager extends EventEmitter {
     child.on('exit', (code, signal) => {
       if (this.proc !== child) return
       this.proc = null
+      this.autofixText = ''
       this.appendLog(`Bridge exited (code=${code}, signal=${signal})`)
 
       if (this.disposed || !this.enabled) {

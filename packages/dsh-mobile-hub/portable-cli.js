@@ -17,6 +17,7 @@ import readline from 'node:readline'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
 import { renderQrSvg } from './src/helpers/qr-svg.js'
+import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
 
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
@@ -708,6 +709,42 @@ async function main() {
       }
     }).catch(() => {})
   }
+
+  // Silently detect & auto-complete any half-installed AI CLIs in the background
+  // (e.g. Antigravity.app installed without `agy`, or ~/.claude/projects without `claude`)
+  // and hot-refresh adapter readiness + models with zero user prompts.
+  void bridge.appsReadyPromise
+    .catch(() => [])
+    .then(() =>
+      autoCompleteHalfInstalledClis({
+        stateDir: opts.stateDir,
+        log: {
+          info: (msg) => console.log(`[allinone] ${msg}`),
+          warn: (msg) => console.warn(`[allinone] ${msg}`),
+        },
+        onProgress: (ev) => {
+          if (ev.phase === 'installing') {
+            console.log(`[allinone] [autofix:progress] 正在自动补全 ${ev.displayName}...`)
+          } else if (ev.phase === 'idle') {
+            console.log('[allinone] [autofix:idle]')
+          }
+        },
+        onInstalled: async () => {
+          orchestrator.refreshEnvironment()
+          const freshApps = await orchestrator.getAppsStatus()
+          detectedApps = freshApps
+          link.setAppsMeta(freshApps)
+          const appSummary = freshApps
+            .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
+            .join(' | ')
+          console.log(`  本机 AI    : ${appSummary}`)
+          if (!isAccountMode) {
+            try { writePairPage(false) } catch {}
+          }
+        },
+      }),
+    )
+    .catch(() => {})
 
   // Interactive terminal controls
   let rl = null

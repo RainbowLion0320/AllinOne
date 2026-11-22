@@ -10,13 +10,14 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
 import { createRelayServer } from '../packages/relay-server/src/index.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
+import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { RPC } from '../packages/shared/src/protocol.js'
 import {
   DEVICES_STORAGE_KEY,
@@ -410,7 +411,10 @@ async function main() {
         '--name', 'Portable-Test-PC',
         '--legacy-pair',
         '--no-browser',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] })
+      ], {
+        env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
       let out = ''
       portableChild.stdout.on('data', (d) => { out += String(d) })
       portableChild.stderr.on('data', (d) => { out += String(d) })
@@ -975,7 +979,10 @@ async function main() {
         '--username', 'alice',
         '--password', alicePass,
         '--no-browser',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] })
+      ], {
+        env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
       let acctOut = ''
       acctPortableChild.stdout.on('data', (d) => { acctOut += String(d) })
       acctPortableChild.stderr.on('data', (d) => { acctOut += String(d) })
@@ -1096,7 +1103,59 @@ async function main() {
     assert.ok(desktopBound.deviceSecret.startsWith('dv_'))
     assert.equal(desktopBound.roomId, aliceReg.roomId)
 
-    console.log('[smoke] 9/9 Account system, single-use invite codes, desktop auto-bind & multi-PC discovery OK')
+    console.log('[smoke] 9/10 Account system, single-use invite codes, desktop auto-bind & multi-PC discovery OK')
+
+    // 10. Half-installed CLI detection & opt-out guard (never installs unused tools; detects partial installs accurately)
+    const emptyFakeHome = join(tmpDir, 'fake-home-empty')
+    mkdirSync(emptyFakeHome, { recursive: true })
+    const emptyMissing = detectHalfInstalledClis({
+      homeDir: emptyFakeHome,
+      platform: 'darwin',
+      env: {},
+      checkBin: () => null,
+      checkSystemApps: false,
+    })
+    assert.equal(emptyMissing.length, 0, 'Clean machine with no AI apps/data must NOT trigger any CLI auto-install')
+
+    const partialFakeHome = join(tmpDir, 'fake-home-partial')
+    mkdirSync(join(partialFakeHome, '.gemini', 'antigravity'), { recursive: true })
+    mkdirSync(join(partialFakeHome, '.claude', 'projects'), { recursive: true })
+    mkdirSync(join(partialFakeHome, '.codex', 'sessions'), { recursive: true })
+    const partialMissing = detectHalfInstalledClis({
+      homeDir: partialFakeHome,
+      platform: 'darwin',
+      env: {},
+      checkBin: (names) => (names.includes('npm') ? '/usr/local/bin/npm' : null),
+      checkSystemApps: false,
+    })
+    assert.deepEqual(
+      partialMissing.map((m) => m.app).sort(),
+      ['antigravity', 'claude', 'codex'],
+      'Half-installed environments (data exists, CLI missing) must be detected automatically',
+    )
+
+    // When CLIs ARE present, nothing is flagged as half-installed
+    const completeResult = detectHalfInstalledClis({
+      homeDir: partialFakeHome,
+      platform: 'darwin',
+      env: {},
+      checkBin: () => '/usr/local/bin/mock-bin',
+      checkSystemApps: false,
+    })
+    assert.equal(completeResult.length, 0, 'Complete environments must not trigger auto-install')
+
+    // ALLINONE_NO_AUTOFIX=1 opt-out guard
+    const prevOptOut = process.env.ALLINONE_NO_AUTOFIX
+    process.env.ALLINONE_NO_AUTOFIX = '1'
+    try {
+      const optOutRes = await autoCompleteHalfInstalledClis({ stateDir: join(tmpDir, 'autofix-optout') })
+      assert.equal(optOutRes.skipped, true)
+      assert.equal(optOutRes.reason, 'disabled')
+    } finally {
+      if (prevOptOut === undefined) delete process.env.ALLINONE_NO_AUTOFIX
+      else process.env.ALLINONE_NO_AUTOFIX = prevOptOut
+    }
+    console.log('[smoke] 10/10 Half-installed CLI auto-completion detector & opt-out guard OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

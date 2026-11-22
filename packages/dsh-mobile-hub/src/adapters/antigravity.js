@@ -546,6 +546,14 @@ export class AntigravityAdapter {
     this.reaperTimer = null
   }
 
+  refreshBinary() {
+    this.agyBin = findAgyBinary(this.configuredBin)
+    this.cliVersionCache = null
+    this.modelsCache = null
+    this.modelsCacheAt = 0
+    return this.agyBin
+  }
+
   parseModelPairs(pairs = []) {
     const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max']
     const familyMap = new Map()

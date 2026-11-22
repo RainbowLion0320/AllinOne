@@ -278,6 +278,11 @@ export class ClaudeAdapter {
     this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
   }
 
+  refreshBinary() {
+    this.claudeBin = findClaudeCommand(this.configuredBin)
+    return this.claudeBin
+  }
+
   async listModels() {
     const efforts = ['low', 'medium', 'high', 'xhigh', 'max']
     const baseModels = [

@@ -32,6 +32,7 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 - **Origin allowlist & CORS**: Enforces same-origin / configured `PUBLIC_RELAY_URL` / `ALLOWED_ORIGINS` (plus explicit Capacitor and Electron `app://allinone` origins).
 - **SSRF & Path Traversal checks**: Attachment fetch validates target origin against the relay server itself and blocks private/metadata destinations; local file reads enforce canonical path containment (`assertPathWithinDir`) and safe session IDs.
 - **Rate limiting**: Applies per-IP rate limiting on authentication and registration endpoints, handling reverse-proxy `X-Forwarded-For` headers safely.
+- **Scoped CLI auto-completion**: The PC bridge only invokes official vendor CLI installers (`antigravity.google`, `claude.ai`, `@openai/codex`) when a local half-installed footprint is already present, applies a 6-hour failure cooldown, and can be disabled entirely via `ALLINONE_NO_AUTOFIX=1`.
 
 ## 4. Production Hardening Checklist
 

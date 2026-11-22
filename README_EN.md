@@ -162,13 +162,13 @@ npm run pack:win   # Windows x64 NSIS .exe (run on Windows)
 
 ---
 
-### Agent Prerequisites
+### Agent Prerequisites (Automatic Half-Installed Completion)
 
-- **Codex**: `codex` CLI on `PATH`, or macOS `/Applications/ChatGPT.app` (bundled CLI auto-discovered).
-- **Claude Code**: Installed and authenticated `claude` CLI.
-- **Antigravity**: Install the official `agy` CLI alongside Antigravity Desktop:
-  - macOS / Linux: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
-  - Windows (PowerShell): `irm https://antigravity.google/cli/install.ps1 | iex`
+All in One connects directly to the AI coding agents already on your computer. On startup, the bridge automatically inspects your local setup: **if it detects a half-installed tool (for example, `Antigravity.app` is installed without the `agy` CLI, or `~/.claude/projects` / `~/.codex/sessions` exists without the CLI binary), it silently runs the official installer in the background and hot-refreshes readiness automatically** — while never installing tools you don't use. Set `ALLINONE_NO_AUTOFIX=1` to disable automatic background CLI completion.
+
+- **Codex**: `codex` CLI on `PATH`, or macOS `/Applications/ChatGPT.app` (bundled CLI auto-discovered; half-installed state auto-completed).
+- **Claude Code**: Authenticated `claude` CLI (auto-completed if local sessions/config exist without the binary).
+- **Antigravity**: Automatically installs official `agy` CLI when Antigravity Desktop/data is detected and reuses Desktop auth seamlessly (manual install: `curl -fsSL https://antigravity.google/cli/install.sh | bash` / Windows `irm https://antigravity.google/cli/install.ps1 | iex`).
 - **DeepSeek Harness**: Standalone bridge provides read-only history; mount `packages/dsh-mobile-hub` as a DSH Cordis plugin (see `cordis.patch.example.yml`) for full read/write.
 
 ---

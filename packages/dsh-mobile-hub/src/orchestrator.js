@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync,
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
+import { ensureRichPath } from './helpers/bin-finder.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
@@ -68,6 +69,15 @@ export class MultiAppOrchestrator {
     const adapter = this.adapters[app]
     if (!adapter) throw new Error(`不支持的应用类型：${app}（可选：${APP_LIST.join(', ')}）`)
     return adapter
+  }
+
+  refreshEnvironment() {
+    ensureRichPath(true)
+    for (const app of APP_LIST) {
+      try {
+        this.adapters[app]?.refreshBinary?.()
+      } catch {}
+    }
   }
 
   async getAppsStatus() {

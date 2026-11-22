@@ -259,6 +259,7 @@ function refreshTrayMenu() {
 
   const menu = Menu.buildFromTemplate([
     { label: stateLabel, enabled: false },
+    ...(st.autofixText ? [{ label: `↻ ${st.autofixText}`, enabled: false }] : []),
     ...(st.username ? [{ label: `账号：@${st.username}`, enabled: false }] : []),
     { type: 'separator' },
     { label: '打开 All in One', click: () => showMainWindow() },

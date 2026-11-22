@@ -542,6 +542,46 @@ export function App() {
     void loadWorkspaceData(activeBridgeId)
   }, [connState, activeDevice?.id, activeBridgeId, loadWorkspaceData])
 
+  // Auto-sync app readiness & model catalog whenever the active bridge broadcasts updated meta.apps
+  // (e.g. after background auto-completion finishes installing a missing CLI like `agy` / `claude` / `codex`).
+  const activeBridgeMetaApps = useMemo(() => {
+    const matched = bridges.find((b) => b.bridgeId === activeBridgeId && b.online !== false)
+    return Array.isArray(matched?.meta?.apps) ? matched.meta.apps : null
+  }, [bridges, activeBridgeId])
+
+  const activeBridgeAppsSig = useMemo(() => {
+    if (!activeBridgeMetaApps || activeBridgeMetaApps.length === 0) return ''
+    return activeBridgeMetaApps
+      .map((a) => `${a.app}:${a.available ? 1 : 0}:${a.writable ? 1 : 0}`)
+      .join('|')
+  }, [activeBridgeMetaApps])
+
+  const lastMetaAppsSigRef = useRef('')
+  useEffect(() => {
+    if (!activeBridgeAppsSig || connState !== 'connected' || !activeBridgeId) return
+    const key = `${activeBridgeId}::${activeBridgeAppsSig}`
+    if (lastMetaAppsSigRef.current === key) return
+    const prevKey = lastMetaAppsSigRef.current
+    lastMetaAppsSigRef.current = key
+    if (activeBridgeMetaApps) {
+      setAppsStatus(activeBridgeMetaApps)
+    }
+    // If readiness changed mid-session on the same bridge, quietly refresh model catalog too
+    if (prevKey && prevKey.startsWith(`${activeBridgeId}::`)) {
+      const client = clientRef.current
+      if (client) {
+        client
+          .rpc(RPC.MODELS_LIST, {}, 45_000, { bridgeId: activeBridgeId })
+          .then((res) => {
+            if (res?.catalog && Object.keys(res.catalog).length > 0) {
+              setModelsCatalog(res.catalog)
+            }
+          })
+          .catch(() => {})
+      }
+    }
+  }, [activeBridgeAppsSig, activeBridgeMetaApps, activeBridgeId, connState])
+
   const openSession = useCallback(async (sessionOrId) => {
     const client = clientRef.current
     if (!client) return

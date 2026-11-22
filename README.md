@@ -213,15 +213,13 @@ npm run pack:win
 
 ---
 
-### 4. 各 AI 工具前置条件
+### 4. 各 AI 工具前置条件（支持半成品静默自动补齐）
 
-All in One 本身不内置大模型或 API Key，而是直接驱动你电脑上已登录的本地工具：
+All in One 本身不内置大模型或 API Key，而是直接驱动你电脑上已登录的本地工具。桥接器启动时会自动体检：**若检测到某个 AI 工具处于“半成品”状态（例如已安装 `Antigravity.app` 或已有 `~/.claude/projects`、`~/.codex/sessions` 会话数据，但缺少对应 CLI），会在后台静默自动安装官方 CLI 并热刷新就绪状态，无需手动干预；对未使用的工具则不会安装任何多余组件**（如需关闭自动补齐，可设置环境变量 `ALLINONE_NO_AUTOFIX=1`）。
 
-- **Codex**：已安装 `codex` CLI 或 macOS `/Applications/ChatGPT.app`（桥接器会自动探测 PATH、ChatGPT.app 内置二进制与运行中进程）。
-- **Claude Code**：已安装并完成登录的 `claude` CLI。
-- **Antigravity**：macOS 的 `Antigravity.app` 不内置命令行工具，如需在远程读写会话与切换模型，请额外安装官方 `agy` CLI：
-  - macOS / Linux：`curl -fsSL https://antigravity.google/cli/install.sh | bash`
-  - Windows (PowerShell)：`irm https://antigravity.google/cli/install.ps1 | iex`
+- **Codex**：已安装 `codex` CLI 或 macOS `/Applications/ChatGPT.app`（自动探测内置 `codex`；半成品状态自动补装）。
+- **Claude Code**：已安装并完成登录的 `claude` CLI（已有会话但缺 CLI 时自动补装）。
+- **Antigravity**：macOS 的 `Antigravity.app` 不内置命令行工具，桥接器检测到半成品状态会自动安装官方 `agy` CLI 并直接复用桌面端登录态（也支持手动安装：`curl -fsSL https://antigravity.google/cli/install.sh | bash` / Windows `irm https://antigravity.google/cli/install.ps1 | iex`）。
 - **DeepSeek Harness**：独立桥接自动支持历史会话只读；如需远程续聊请通过方式 C 挂载插件。
 
 ---

@@ -471,6 +471,16 @@ export class CodexAdapter {
     this.modelsCacheAt = 0
   }
 
+  refreshBinary() {
+    this.codexBin = findCodexBinary(this.configuredBin)
+    if (this.reader) {
+      this.reader.codexBin = this.codexBin
+    }
+    this.modelsCache = null
+    this.modelsCacheAt = 0
+    return this.codexBin
+  }
+
   /** Read-only RPC via persistent reader daemon (never acquires write locks). */
   async rpc(method, params = {}, timeoutMs = 45_000) {
     return this.reader.rpc(method, params, timeoutMs)

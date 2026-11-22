@@ -54,10 +54,11 @@ function readUnixLoginShellPath() {
 }
 
 /**
- * Enrich `process.env.PATH` once with login-shell PATH + common macOS/Linux/Windows tool locations.
+ * Enrich `process.env.PATH` with login-shell PATH + common macOS/Linux/Windows tool locations.
+ * Pass `forceRefresh = true` after installing a new CLI so freshly created bin dirs are picked up immediately.
  */
-export function ensureRichPath() {
-  if (pathEnriched) return process.env.PATH || ''
+export function ensureRichPath(forceRefresh = false) {
+  if (pathEnriched && !forceRefresh) return process.env.PATH || ''
   pathEnriched = true
 
   const home = homedir()
