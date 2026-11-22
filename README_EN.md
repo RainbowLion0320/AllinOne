@@ -24,16 +24,22 @@ All in One runs a lightweight relay on your own server and connects directly to 
 #### Desktop
 
 1. Download and install from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest):
-   - **macOS (Apple Silicon)**: `All in One-*-arm64.dmg`
-   - **Windows (x64)**: `All in One Setup *.exe`
+   - **macOS (Apple Silicon)**: `All.in.One-*-arm64.dmg`
+   - **Windows (x64)**: `All.in.One.Setup.*.exe`
 2. Open **All in One**, enter your server URL, and register with your invite code or sign in.
 3. Once signed in, the app binds this computer to your account, stays connected in the system tray, and detects your installed AI coding tools (automatically installing missing official CLI companions when a desktop app or session store is already present).
 
-> On macOS, if Gatekeeper blocks the first launch of this un-notarized build, allow it under **System Settings → Privacy & Security → Open Anyway**, or run `xattr -cr "/Applications/All in One.app"` once in Terminal.
->
-> On Linux or headless machines, connect with a single command:
-> - macOS / Linux: `curl -fsSL https://your-server/setup.sh | bash`
-> - Windows (PowerShell): `irm https://your-server/setup.ps1 | iex`
+> [!NOTE]
+> **First-launch OS security prompts (community builds are not commercially notarized):**
+> - **macOS**: If Gatekeeper warns that the app cannot be verified or is "damaged", click **Cancel** and allow it in **System Settings → Privacy & Security → Open Anyway**, or run once in Terminal:
+>   ```bash
+>   xattr -cr "/Applications/All in One.app"
+>   ```
+> - **Windows**: If SmartScreen appears, click **More info → Run anyway**.
+
+On Linux or headless machines, connect with a single command:
+- macOS / Linux: `curl -fsSL https://your-server/setup.sh | bash`
+- Windows (PowerShell): `irm https://your-server/setup.ps1 | iex`
 
 #### Mobile
 

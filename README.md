@@ -24,16 +24,22 @@
 #### 电脑端
 
 1. 前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载并安装：
-   - **macOS (Apple Silicon)**：`All in One-*-arm64.dmg`
-   - **Windows (x64)**：`All in One Setup *.exe`
+   - **macOS (Apple Silicon)**：`All.in.One-*-arm64.dmg`
+   - **Windows (x64)**：`All.in.One.Setup.*.exe`
 2. 打开 **All in One**，填入服务器地址，用邀请码注册或直接登录。
 3. 登录后会自动把这台电脑绑定到你的账号、在系统托盘保持后台连接，并识别本机已有的 AI 编程工具（若已装桌面端但缺对应 CLI，后台会自动补齐）。
 
-> Linux 或纯终端环境可直接运行一行命令接入：
-> - macOS / Linux：`curl -fsSL https://你的服务器/setup.sh | bash`
-> - Windows (PowerShell)：`irm https://你的服务器/setup.ps1 | iex`
->
-> macOS 首次打开未公证应用如遇系统提示，在「系统设置 → 隐私与安全性」点「仍要打开」；若仍提示已损坏，在终端运行一次 `xattr -cr "/Applications/All in One.app"` 即可。
+> [!NOTE]
+> **首次打开系统拦截提醒（开源安装包未购商业公证证书）：**
+> - **macOS**：安装后首次打开若提示「无法验证」或「已损坏，无法打开」，请先点「取消」，在「系统设置 → 隐私与安全性」点「仍要打开」；若仍提示已损坏，在终端运行一次：
+>   ```bash
+>   xattr -cr "/Applications/All in One.app"
+>   ```
+> - **Windows**：若弹出 SmartScreen「Windows 已保护你的电脑」，点击「更多信息 → 仍要运行」即可。
+
+Linux 或纯终端环境可直接运行一行命令接入：
+- macOS / Linux：`curl -fsSL https://你的服务器/setup.sh | bash`
+- Windows (PowerShell)：`irm https://你的服务器/setup.ps1 | iex`
 
 #### 手机端
 
