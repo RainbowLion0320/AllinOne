@@ -52,7 +52,10 @@ export function LoginScreen({
     autoOpenScanner ? 'pair' : initialInviteCode ? 'register' : 'login',
   )
   const [serverUrl, setServerUrl] = useState(() => initialServerUrl || detectDefaultServerUrl())
-  const [showAdvancedServer, setShowAdvancedServer] = useState(false)
+  const [showAdvancedServer, setShowAdvancedServer] = useState(() => {
+    const init = String(initialServerUrl || detectDefaultServerUrl() || '')
+    return !init || /your-relay\.example\.com/i.test(init)
+  })
   const [showLegacyOptions, setShowLegacyOptions] = useState(() => Boolean(autoOpenScanner))
   const [showSetupGuide, setShowSetupGuide] = useState(false)
   const [osTab, setOsTab] = useState('unix') // 'win' | 'unix'

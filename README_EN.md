@@ -5,40 +5,93 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=Download&color=4D6BFE" alt="Download Latest Release" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22.13-339933.svg" alt="Node.js >= 22.13" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Mobile%20PWA-slate.svg" alt="Cross-Platform" />
   <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
 </p>
 
-**All in One** is a **self-hosted, zero-invasion, zero-extra-token** remote control suite (Electron Desktop App + Mobile PWA / Capacitor shell + Self-hosted Relay Server + Local PC Bridge) for managing local AI coding agents across all of your devices.
+**All in One** is a **1-click install, self-hosted, zero-invasion, zero-extra-token** control center for operating local AI coding agents across all of your computers and phones.
 
-Sign in with the same account on your phone and any number of computers to **resume native local sessions in-place** across **Codex, Claude Code, Antigravity, and DeepSeek Harness**, reusing your machine's local workspace, native session stores, and vendor prompt caches.
+Sign in with the same account on your phone and any number of computers to **resume native local sessions in-place** across **Codex, Claude Code, Antigravity, and DeepSeek Harness**, reusing your machine's local workspaces and vendor prompt caches.
 
 ---
 
-## Key Features
+## 1. Quick Install (Zero-Config Setup)
 
-- **Zero-Invasion Native Bridge (0 Extra Tokens)**: No wrapper prompts or proxy context injection — communicates directly through each agent's official local protocol/CLI so desktop and mobile sessions stay natively synced.
-- **4 Major Coding Agents Unified**:
+### For Users (You Already Have a Server URL & Invite Code)
 
-  | Agent | Native Integration | Capabilities | Prerequisites |
+**No Node.js, no Git, and no terminal setup required:**
+
+1. **Install the Desktop App (All-in-One Installer, Recommended)**
+   - Download the installer from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest):
+     - **macOS (Apple Silicon)**: `All in One-*-arm64.dmg` (drag to Applications)
+     - **Windows (x64)**: `All in One Setup *.exe` (standard installer wizard)
+   - Launch **All in One**, enter your Relay Server URL, and sign in (or register with a single-use invite code).
+   - Once signed in, the app automatically:
+     - Binds this computer to your account and runs the embedded PC bridge in the menu bar / system tray (stays reachable even when the window is closed);
+     - Auto-discovers locally installed **Codex, Claude Code, Antigravity, and DeepSeek Harness**;
+     - **Auto-completes half-installed CLI tools in the background**: if an AI desktop app or local session history exists without its CLI binary (e.g., `Antigravity.app` installed without `agy`), the bridge silently installs the official CLI and hot-refreshes readiness — while never touching tools you don't use.
+   - *Headless / Linux alternative (1-line command)*:
+     - macOS / Linux: `curl -fsSL https://your-server/setup.sh | bash`
+     - Windows (PowerShell): `irm https://your-server/setup.ps1 | iex`
+
+2. **Use on Mobile (No App Store Needed — iOS & Android)**
+   - Open your server URL (or invite link) in your mobile browser → **Add to Home Screen** (PWA).
+   - Sign in with the same account and all of your online computers appear automatically.
+
+---
+
+### For Server Owners (3-Minute Self-Hosted Docker Deploy)
+
+All in One is **100% self-hosted**. Deploy the relay gateway on your own Linux server with automatic HTTPS via Caddy:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/RainbowLion0320/AllinOne.git
+cd AllinOne
+
+# 2. Replace `ai.yourdomain.com` in deploy/Caddyfile with your real domain
+
+# 3. Create deploy/.env with strong random secrets (never commit to Git)
+cat > deploy/.env <<'EOF'
+CLIENT_ACCESS_TOKEN=replace-with-strong-admin-token
+BRIDGE_SECRET=replace-with-strong-bridge-secret
+JWT_SECRET=replace-with-32-plus-char-random-secret
+PUBLIC_RELAY_URL=https://ai.yourdomain.com
+VITE_RELAY_URL=https://ai.yourdomain.com
+EOF
+
+# 4. Build & launch (bundles PWA, portable bridge, and auto-HTTPS)
+cd deploy
+docker compose --env-file .env up -d --build
+
+# 5. Bootstrap your first single-use admin invite code (one-time)
+docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
+docker compose restart allinone-relay
+```
+
+Then return to **[For Users](#for-users-you-already-have-a-server-url--invite-code)** to install the Desktop App or open `https://ai.yourdomain.com` and register your admin account. After that, you can create and revoke single-use invite codes directly inside the app UI without SSHing into the server.
+
+---
+
+## 2. Key Features & Supported Agents
+
+- **Zero-Invasion Native Bridge (0 Extra Tokens)**: Talks directly to each agent's official local protocol/CLI without wrapper prompts or proxy context overhead.
+- **Any-Device to Any-PC Control**: Operate any of your computers from your phone OR from another Mac/Windows desktop running All in One.
+- **Single-Use Invite Codes & Isolated Multi-Tenancy**: Salted `scrypt` password hashes, hashed per-PC credentials, and isolated rooms per account.
+- **4 Unified AI Coding Agents**:
+
+  | Agent | Native Protocol | Capabilities | Cross-Client Sync Notes |
   | :--- | :--- | :--- | :--- |
-  | **Codex** | Official `codex app-server --stdio` (read/write split, auto-releases write lock per turn) | Full R/W sessions, model & reasoning effort switching, interrupt | `codex` CLI or macOS `ChatGPT.app` (auto-discovers bundled `codex`) |
-  | **Claude Code** | Official `claude -p --resume --output-format stream-json` | Full R/W `~/.claude/projects/` sessions, model switching, interrupt | Authenticated `claude` CLI |
-  | **Antigravity** | Official `agy acp --app-data-dir antigravity` warm session pool | Shares desktop auth/history, full model family & reasoning switching, background task updates | Antigravity + official [`agy` CLI](#agent-prerequisites) |
-  | **DeepSeek Harness** | Native Cordis plugin (`dsh-mobile-hub`) / standalone read-only reader | Full R/W when mounted as DSH plugin; read-only history in standalone bridge | DeepSeek Harness (optional plugin mount for writes) |
-
-- **Account + Single-Use Invite Codes & Auto Multi-PC Discovery**:
-  - Admins issue strictly single-use invite codes (`INV-XXXX-XXXX`) via CLI or in-app UI;
-  - Every PC signed into your account registers its own isolated room/credentials and appears automatically on your phone and desktop apps.
-- **All-in-One Electron Desktop Client**:
-  - Bundles Node 22, the portable PC bridge, system tray / menu bar residency, and a dual-pane UI into a single `.dmg` / `.exe` installer — no manual Node.js setup or terminal commands required on target machines.
-- **Mobile-First Experience**: Installable PWA, project/time grouping, incremental history paging + IndexedDB cache, secure local screenshot preview with pinch-zoom, and built-in QR scanner.
+  | **Codex** | `codex app-server --stdio` (read/write split, auto-releases lock) | Full R/W, model & effort switching, interrupt | Auto-discovers PATH & macOS `ChatGPT.app` bundled CLI |
+  | **Claude Code** | `claude -p --resume --output-format stream-json` | Full R/W `~/.claude/projects/`, model switch, interrupt | Seamless switching; auto-completes half-installed CLI |
+  | **Antigravity** | `agy acp --app-data-dir antigravity` warm pool + live disk watcher | Shared auth/history, 11 model families + effort tiers, background tasks | Real-time Desktop → All in One sync; if you send turns via All in One to an already-open Desktop thread, restart `Antigravity.app` before resuming that thread in the native app |
+  | **DeepSeek Harness** | Native Cordis plugin (`dsh-mobile-hub`) / standalone read-only | Full R/W when mounted as DSH plugin; read-only history standalone | Shared in-process state when mounted as plugin |
 
 ---
 
-## Architecture
+## 3. Architecture
 
 ```mermaid
 flowchart LR
@@ -64,86 +117,28 @@ flowchart LR
 
 ---
 
-## Monorepo Layout
+## 4. Developer & Custom Build Guide
 
-```text
-AllinOne/
-├── packages/
-│   ├── shared/          # Shared RPC / Event protocol and path/ID guards
-│   ├── relay-server/    # Self-hosted HTTPS/WSS gateway, account/invite store & static host
-│   ├── dsh-mobile-hub/  # Local multi-agent bridge, portable single-file CLI & DSH plugin
-│   ├── mobile-app/      # Responsive React + Tailwind + PWA + Capacitor UI
-│   └── desktop-app/     # Electron desktop app (embedded bridge, tray, macOS/Windows packaging)
-├── deploy/              # Dockerfile, docker-compose.yml, Caddyfile, nginx.conf
-├── scripts/             # Portable bridge bundler & end-to-end smoke test suite
-└── .github/workflows/   # CI build/test & desktop installer release workflows
-```
+> Requires **Node.js >= 22.13.0** for building from source.
 
----
-
-## Quick Start
-
-### 1. Local Development (3 Minutes)
-
-> Requirement: **Node.js >= 22.13.0**
+<details>
+<summary>Local development (3 minutes)</summary>
 
 ```bash
-# 1. Clone and install dependencies
 git clone https://github.com/RainbowLion0320/AllinOne.git
 cd AllinOne
 npm install
-
-# 2. Build the portable PC bridge + web frontend
 npm run build
-
-# 3. Generate your first single-use admin invite code
-npm run admin -- invite create --count 1 --admin --note "owner"
-
-# 4. Start the relay server (default: http://127.0.0.1:8787)
+npm run admin -- invite create --count 1 --admin --note "dev"
 npm run start:relay
+# In a second terminal:
+npm run dev:desktop
 ```
 
-Open `http://127.0.0.1:8787`, register your admin account using the invite code, then either:
-- Launch the Electron desktop app (UI + embedded bridge): `npm run dev:desktop`, or
-- Run the portable bridge CLI: `node packages/mobile-app/public/downloads/allinone-bridge.mjs --server http://127.0.0.1:8787`
+</details>
 
----
-
-### 2. Self-Host on Linux (Recommended: Docker + Caddy)
-
-```bash
-git clone https://github.com/RainbowLion0320/AllinOne.git
-cd AllinOne
-
-# 1. Replace `ai.yourdomain.com` in deploy/Caddyfile with your real domain
-
-# 2. Create deploy/.env with strong random secrets (never commit to Git)
-cat > deploy/.env <<'EOF'
-CLIENT_ACCESS_TOKEN=replace-with-strong-admin-token
-BRIDGE_SECRET=replace-with-strong-bridge-secret
-JWT_SECRET=replace-with-32-plus-char-random-secret
-PUBLIC_RELAY_URL=https://ai.yourdomain.com
-VITE_RELAY_URL=https://ai.yourdomain.com
-EOF
-
-# 3. Build and start (automatically bundles the portable bridge, PWA, and HTTPS certs)
-cd deploy
-docker compose --env-file .env up -d --build
-
-# 4. Bootstrap your first single-use admin invite code
-docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
-docker compose restart allinone-relay
-```
-
-After registering your admin account, you can generate and revoke additional invite codes directly inside the app UI without touching the server or restarting.
-
----
-
-### 3. Connect Your Computers
-
-#### Option A: All in One Desktop App (Recommended)
-
-Configure your server URL in `.env.local` (gitignored), then build a self-contained installer:
+<details>
+<summary>Build custom desktop installers with your server URL pre-filled</summary>
 
 ```bash
 cat > .env.local <<'EOF'
@@ -152,39 +147,33 @@ VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
 npm run pack:mac   # macOS arm64 .dmg -> packages/desktop-app/release/
-npm run pack:win   # Windows x64 NSIS .exe (run on Windows)
+npm run pack:win   # Windows x64 .exe (run on Windows)
 ```
 
-#### Option B: 1-Line Portable CLI Bridge
+You can also trigger **Actions → Build Desktop Installers → Run workflow** on your fork with an optional `relay_url` input to build both macOS and Windows installers in CI.
 
-- **macOS / Linux**: `curl -fsSL https://ai.yourdomain.com/setup.sh | bash`
-- **Windows (PowerShell)**: `irm https://ai.yourdomain.com/setup.ps1 | iex`
+</details>
+
+<details>
+<summary>Monorepo layout, Capacitor builds, DSH plugin & smoke tests</summary>
+
+- `packages/shared` — Shared RPC / Event protocol and path/ID guards
+- `packages/relay-server` — Self-hosted HTTPS/WSS gateway, accounts, invites & static host
+- `packages/dsh-mobile-hub` — Local bridge orchestrator, 4 agent adapters, CLI auto-completion & portable CLI
+- `packages/mobile-app` — Responsive React + Tailwind + PWA + Capacitor UI (`npx cap sync android`)
+- `packages/desktop-app` — Electron desktop app with embedded bridge & tray
+- Opt out of background CLI auto-completion with `ALLINONE_NO_AUTOFIX=1`
+- Run all 11 end-to-end & security smoke tests: `npm run test:smoke`
+
+</details>
 
 ---
 
-### Agent Prerequisites (Automatic Half-Installed Completion)
-
-All in One connects directly to the AI coding agents already on your computer. On startup, the bridge automatically inspects your local setup: **if it detects a half-installed tool (for example, `Antigravity.app` is installed without the `agy` CLI, or `~/.claude/projects` / `~/.codex/sessions` exists without the CLI binary), it silently runs the official installer in the background and hot-refreshes readiness automatically** — while never installing tools you don't use. Set `ALLINONE_NO_AUTOFIX=1` to disable automatic background CLI completion.
-
-- **Codex**: `codex` CLI on `PATH`, or macOS `/Applications/ChatGPT.app` (bundled CLI auto-discovered; half-installed state auto-completed).
-- **Claude Code**: Authenticated `claude` CLI (auto-completed if local sessions/config exist without the binary).
-- **Antigravity**: Automatically installs official `agy` CLI when Antigravity Desktop/data is detected and reuses Desktop auth seamlessly (manual install: `curl -fsSL https://antigravity.google/cli/install.sh | bash` / Windows `irm https://antigravity.google/cli/install.ps1 | iex`).
-- **DeepSeek Harness**: Standalone bridge provides read-only history; mount `packages/dsh-mobile-hub` as a DSH Cordis plugin (see `cordis.patch.example.yml`) for full read/write.
-
----
-
-## Security & Disclaimer
+## 5. Security, Contributing & License
 
 Please review [SECURITY.md](./SECURITY.md) before deploying:
 
-1. **Self-Host Over HTTPS/WSS Only**: Traffic is encrypted in transit with TLS (HTTPS/WSS), while the relay routes messages and temporary uploads (not zero-knowledge E2EE). Only connect your PC bridge to a relay server you control.
-2. **Autonomous Execution Defaults**: For smooth remote coding, adapters default to autonomous/auto-approve modes (`--dangerously-skip-permissions` for Antigravity, `danger-full-access` for DSH, `acceptEdits` for Claude). See [SECURITY.md](./SECURITY.md) for how to restrict these permissions.
-3. **Affiliation Notice**: All in One is an independent open-source project and is not affiliated with, endorsed by, or sponsored by DeepSeek, OpenAI, Anthropic, or Google.
-
----
-
-## Testing, Contributing & License
-
-- End-to-end smoke suite: `npm run test:smoke`
-- Contribution guide: [CONTRIBUTING.md](./CONTRIBUTING.md)
-- License: [MIT](./LICENSE)
+1. **Self-Host Over HTTPS/WSS Only**: Traffic uses TLS (not zero-knowledge E2EE). Never connect your PC bridge to an untrusted third-party relay.
+2. **Autonomous Execution Defaults**: Adapters default to autonomous approval/edit presets for smooth remote coding; see [SECURITY.md](./SECURITY.md) for how to tighten them.
+3. **Affiliation Notice**: Independent open-source project; not affiliated with DeepSeek, OpenAI, Anthropic, or Google.
+4. **Contributing & License**: See [CONTRIBUTING.md](./CONTRIBUTING.md) · Licensed under [MIT](./LICENSE).

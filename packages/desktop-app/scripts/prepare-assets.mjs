@@ -187,11 +187,12 @@ function generateIcons() {
     writeFileSync(join(BUILD_DIR, 'icon.ico'), buildIcoFromPngBuffers(icoEntries))
     rmSync(iconsetDir, { recursive: true, force: true })
   } else {
-    // Fallback on non-macOS hosts: embed 512px PNG into .ico and use icon-192.png for tray
-    const icoEntries = [{ size: 256, buf: readFileSync(srcIcon512) }]
-    writeFileSync(join(BUILD_DIR, 'icon.ico'), buildIcoFromPngBuffers(icoEntries))
+    // Fallback on non-macOS hosts: embed spec-compliant <=256px PNG into .ico (192x192) and tray icon
     const src192 = join(MOBILE_PUBLIC, 'icon-192.png')
-    copyFileSync(existsSync(src192) ? src192 : srcIcon512, join(BUILD_DIR, 'tray-icon.png'))
+    const icoSrc = existsSync(src192) ? src192 : srcIcon512
+    const icoEntries = [{ size: existsSync(src192) ? 192 : 256, buf: readFileSync(icoSrc) }]
+    writeFileSync(join(BUILD_DIR, 'icon.ico'), buildIcoFromPngBuffers(icoEntries))
+    copyFileSync(icoSrc, join(BUILD_DIR, 'tray-icon.png'))
   }
 }
 
@@ -216,6 +217,7 @@ function buildCorePackages() {
     cwd: REPO_ROOT,
     env,
     stdio: 'inherit',
+    shell: process.platform === 'win32',
   })
 }
 

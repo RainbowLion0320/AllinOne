@@ -5,127 +5,57 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85&color=4D6BFE" alt="Download Latest Release" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22.13-339933.svg" alt="Node.js >= 22.13" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Mobile%20PWA-slate.svg" alt="Cross-Platform" />
   <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
 </p>
 
-**All in One** 是一套**自托管、零侵入、零额外 Token 消耗**的跨设备 AI 编程助手控台（Electron 桌面端 + 手机 PWA / Capacitor 原生壳 + 自建中转网关 + 本机桥接引擎）。
+**All in One** 是一套**傻瓜式安装、自托管、零侵入、0 额外 Token 消耗**的跨设备 AI 编程助手控台。
 
-只需在自己的手机和任意多台电脑上登录同一个账号，即可在手机或另一台电脑上**原位续聊**任意一台绑定电脑里的 **Codex / Claude Code / Antigravity / DeepSeek Harness** 全部本地对话，直接复用本机项目工作区、本地会话数据库与厂商 Prompt Cache。
-
----
-
-## 核心特性
-
-- **零侵入纯桥接 · 0 额外 Token**：不改写提示词、不注入代理层或额外上下文，直接通过各 AI 工具官方本地协议/CLI 读写原生会话，手机与电脑无缝接力。
-- **4 大主流 AI 工具统一原生接入**：
-
-  | 工具 | 接入方式 | 支持能力 | 前置要求 |
-  | :--- | :--- | :--- | :--- |
-  | **Codex** | 官方 `codex app-server --stdio`（读写分离双进程，每轮自动释放锁） | 全量读写会话、模型与推理强度切换、中断 | 已安装 Codex CLI 或 macOS `ChatGPT.app`（自动发现内置 `codex`） |
-  | **Claude Code** | 官方 `claude -p --resume --output-format stream-json` | 全量读写 `~/.claude/projects/` 会话、模型切换、中断 | 已安装并登录 `claude` CLI |
-  | **Antigravity** | 官方 `agy acp --app-data-dir antigravity` 热保活会话池 | 与桌面端共享登录态与会话历史、11 组模型与推理档位切换、长任务回调 | 已安装 Antigravity 及官方 [`agy` CLI](#各-ai-工具前置条件) |
-  | **DeepSeek Harness** | 原生 Cordis 插件 (`dsh-mobile-hub`) / 本地只读会话读取 | 插件挂载后全量读写与模型切换；独立桥接下自动只读历史 | 已安装 DeepSeek Harness（可选挂载插件开启写权限） |
-
-- **账号 + 一次性邀请码体系 · 多电脑自动互联**：
-  - 管理员通过 CLI 或 App 后台按需签发**严格一次性**邀请码（`INV-XXXX-XXXX`），用完即销毁；
-  - 同一账号在多台电脑登录后自动注册并在线互联，手机端与桌面端登录后自动发现名下全部在线电脑，一键无缝切换。
-- **一步到位桌面端（Electron Desktop App）**：
-  - 打包内置 Node 22 运行时、单文件桥接引擎、菜单栏/系统托盘常驻与桌面双栏 UI，目标电脑**无需手动安装 Node.js 或敲命令行**，安装后登录账号即自动上线并可随系统自启。
-- **移动端深度体验**：PWA 离线缓存与主屏安装、按项目/时间分组与增量翻页、本机截图安全代理预览与双指缩放、二维码扫码（含相册兜底）。
+只要在你的任意多台电脑和手机上登录同一个账号，就能随时在手机或另一台电脑上**原位续聊**本机的 **Codex / Claude Code / Antigravity / DeepSeek Harness** 全部对话，直接复用本机项目工作区与官方 Prompt Cache。
 
 ---
 
-## 系统架构
+## 一、傻瓜式安装（一步到位，无需配环境）
 
-```mermaid
-flowchart LR
-  subgraph Clients["客户端（登录同一账号）"]
-    M["手机端 PWA / Capacitor"]
-    D["桌面端 All in One Desktop<br/>(Electron 双栏 UI + 内置托盘桥接)"]
-  end
+### 场景 A：已有服务器地址和邀请码（普通用户 · 1 分钟上手）
 
-  subgraph Server["自托管中转服务器 (HTTPS / WSS)"]
-    R["@allinone/relay-server<br/>账号与一次性邀请码 · 多租户房间隔离<br/>一次性 WS Ticket · 临时附件中转"]
-  end
+**完全不需要安装 Node.js、不需要克隆代码、不需要敲命令行：**
 
-  subgraph PCs["名下任意多台电脑 (出站 WSS，无需公网 IP)"]
-    B1["Mac / Windows / Linux<br/>All in One 桌面内置桥接 或 单文件 CLI"]
-    A1["Codex / Claude Code / Antigravity / DSH"]
-    B1 <--> A1
-  end
+1. **安装电脑端（推荐一步到位安装包）**
+   - 前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载对应系统的安装包：
+     - **macOS (Apple Silicon)**：`All in One-*-arm64.dmg`（拖入「应用程序」即可）
+     - **Windows (x64)**：`All in One Setup *.exe`（双击下一步安装）
+   - 打开 **All in One** → 填入服务器地址 → 用邀请码注册或直接登录账号。
+   - 登录后会自动完成以下全部工作：
+     - 自动把当前电脑绑定到你的账号并启动内置后台桥接（关掉窗口也会常驻顶部菜单栏/系统托盘，手机端 24 小时可连）；
+     - 自动扫描本机已安装的 **Codex / Claude Code / Antigravity / DeepSeek Harness**；
+     - **半成品环境自动补齐**：若检测到你装了某款 AI 桌面应用或已有本地会话记录，但缺少对应官方 CLI（例如 macOS 装了 `Antigravity.app` 但没装 `agy` CLI），会在后台静默自动补装并热刷新就绪，无需手动折腾（未使用的工具绝不乱装）。
+   - *纯终端 / Linux 电脑也支持 1 行命令接入*：
+     - macOS / Linux：`curl -fsSL https://你的服务器/setup.sh | bash`
+     - Windows (PowerShell)：`irm https://你的服务器/setup.ps1 | iex`
 
-  M <-->|"HTTPS / WSS"| R
-  D <-->|"HTTPS / WSS"| R
-  R <-->|"出站 WSS"| B1
-```
+2. **连接手机端（免安装 App，iOS / Android 通用）**
+   - 用手机浏览器打开你的服务器地址（或服主发给你的邀请注册链接）→ 点击「**添加到主屏幕**」即可像原生 App 一样使用。
+   - 登录同一个账号后，手机端会自动发现并列出你名下所有在线电脑，随时一键切换操控。
 
----
-
-## 仓库结构
-
-```text
-AllinOne/
-├── packages/
-│   ├── shared/          # 统一 RPC / Event 协议与安全工具
-│   ├── relay-server/    # 自建中转网关（HTTPS/WSS + 账号/邀请码 + 多租户隔离 + 静态托管）
-│   ├── dsh-mobile-hub/  # 本机桥接引擎（4 大 AI 适配器 + 单文件便携 CLI + DSH 插件）
-│   ├── mobile-app/      # 响应式前端（React + Tailwind + PWA + Capacitor 壳）
-│   └── desktop-app/     # Electron 桌面总控客户端（内置桥接器 + 托盘 + DMG/NSIS 打包）
-├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
-├── scripts/             # 单文件桥接打包器 (build-portable-bridge.mjs) 与冒烟测试 (smoke-test.mjs)
-└── .github/workflows/   # CI 自动构建测试 & 桌面端自动打包工作流
-```
+> macOS 首次打开未签名 `.dmg` 若提示「无法验证开发者」，在「系统设置 → 隐私与安全性」点击「仍要打开」，或右键 App 点「打开」即可。
 
 ---
 
-## 快速开始
+### 场景 B：首次自建中转服务器（服主 · Docker 3 分钟上线）
 
-### 1. 本地开发联调（3 分钟跑通）
-
-> 环境要求：**Node.js >= 22.13.0**
+因为本项目为隐私优先的**纯自托管**架构，你需要在一台自己的 Linux 服务器上启动中转网关（内置 HTTPS 自动续期）：
 
 ```bash
-# 1. 克隆并安装依赖
-git clone https://github.com/RainbowLion0320/AllinOne.git
-cd AllinOne
-npm install
-
-# 2. 打包单文件 PC 桥接器 + 前端静态资源
-npm run build
-
-# 3. 生成首个管理员一次性邀请码（用于注册你的第一个账号）
-npm run admin -- invite create --count 1 --admin --note "管理员首号"
-
-# 4. 启动中转服务器（默认监听 http://127.0.0.1:8787）
-npm run start:relay
-```
-
-打开浏览器访问 `http://127.0.0.1:8787`：
-1. 切换到「注册」，输入刚才生成的邀请码创建你的管理员账号；
-2. 新开终端启动本机桥接（输入同一账号密码即可绑定本机）：
-   ```bash
-   node packages/mobile-app/public/downloads/allinone-bridge.mjs --server http://127.0.0.1:8787
-   ```
-3. 或直接运行 Electron 桌面端开发模式（同时包含双栏界面与内置桥接）：
-   ```bash
-   npm run dev:desktop
-   ```
-
----
-
-### 2. 自托管部署到 Linux 服务器（推荐 Docker + Caddy）
-
-```bash
-# 1. 在服务器上克隆仓库
+# 1. 拉取代码
 git clone https://github.com/RainbowLion0320/AllinOne.git
 cd AllinOne
 
 # 2. 将 deploy/Caddyfile 中的 ai.yourdomain.com 改为你的真实域名（DNS A 记录指向本服务器）
 
-# 3. 创建 deploy/.env（务必使用高强度随机密钥，切勿提交到 Git）
+# 3. 写入 deploy/.env（务必使用高强度随机密钥，切勿提交到 Git）
 cat > deploy/.env <<'EOF'
 CLIENT_ACCESS_TOKEN=请替换为至少16位高强度管理员密钥
 BRIDGE_SECRET=请替换为至少16位高强度桥接密钥
@@ -134,24 +64,19 @@ PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
-# 4. 一键构建并启动（自动构建单文件桥接器、前端 PWA 与 HTTPS 证书）
+# 4. 一键构建并启动（自动构建前端 PWA、便携桥接包并申请 HTTPS 证书）
 cd deploy
 docker compose --env-file .env up -d --build
-```
 
-#### 生成首个管理员邀请码（必做）
-
-首次启动后，通过容器内管理 CLI 生成你的第 1 个管理员一次性邀请码：
-
-```bash
+# 5. 生成你的首个管理员一次性邀请码（仅首次需要）
 docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
 docker compose restart allinone-relay
 ```
 
-> 拿到管理员账号并在 App/网页登录后，后续就可以直接在客户端的「邀请码管理」界面一键生成、查看和作废普通用户邀请码，**无需再登服务器或重启服务**。
+完成以上 5 步后，直接回到上方 **[场景 A](#场景-a已有服务器地址和邀请码普通用户--1-分钟上手)** 下载桌面端或打开 `https://ai.yourdomain.com`，用刚才的邀请码注册你的管理员账号即可！后续给朋友发一次性邀请码直接在 App 里的「邀请码管理」一键生成，**不用再登服务器**。
 
 <details>
-<summary>常用管理 CLI 命令</summary>
+<summary>服主常用管理命令（生成/查看/作废邀请码、查看用户）</summary>
 
 ```bash
 # 生成 3 个普通一次性邀请码
@@ -171,92 +96,137 @@ npm run admin -- users
 
 ---
 
-### 3. 连接电脑（3 种方式任选）
+## 二、核心特性与支持的 4 大 AI 工具
 
-#### 方式 A：All in One 桌面客户端（推荐 · 零配置一步到位）
+- **零侵入纯桥接 · 0 额外 Token**：不改写提示词、不注入冗余上下文，直接通过各工具官方本地协议/CLI 读写原生会话，手机与电脑无缝接力。
+- **跨设备双向互联**：不仅手机控电脑，装了桌面端的 Mac / Windows 之间也可以互控彼此名下的所有电脑。
+- **账号 + 严格一次性邀请码**：每人独立房间与凭证哈希落盘，跨账号完全不可见；多台电脑登录同一账号自动汇聚，一键切换。
+- **4 大主流 AI 编程工具原生接入**：
 
-自带内置 Node 运行时与托盘桥接器，支持 macOS (Apple Silicon) 与 Windows (x64) 打包：
+  | 工具 | 官方原生接入方式 | 核心能力 | 跨端同步说明 |
+  | :--- | :--- | :--- | :--- |
+  | **Codex** | `codex app-server --stdio`（读写分离双进程，每轮自动释放写锁） | 全量读写、模型与推理强度切换、中断 | 自动探测 PATH / macOS `ChatGPT.app` 内置 CLI，双端随时互切 |
+  | **Claude Code** | `claude -p --resume --output-format stream-json` | 全量读写 `~/.claude/projects/`、模型切换、中断 | 双端随时互切，半成品自动补装 CLI |
+  | **Antigravity** | `agy acp --app-data-dir antigravity` 热保活会话池 + 实时磁盘监听 | 与桌面端共享登录态与会话历史、11 组模型与思考档位切换、长任务后台续跑 | 桌面端 → All in One 秒级实时自动同步；若在 All in One 续聊了桌面端已打开的同一对话，切回 `Antigravity.app` 前请先重启一次桌面端以重载磁盘 |
+  | **DeepSeek Harness** | 原生 Cordis 插件 (`dsh-mobile-hub`) / 本地只读历史 | 挂载插件后全量读写与模型切换；独立桥接下自动只读历史 | 挂载插件后共享进程内状态，零延迟 |
+
+---
+
+## 三、系统架构
+
+```mermaid
+flowchart LR
+  subgraph Clients["客户端（登录同一账号）"]
+    M["手机端 PWA / Capacitor"]
+    D["桌面端 All in One Desktop<br/>(Electron 双栏 UI + 内置托盘桥接)"]
+  end
+
+  subgraph Server["自托管中转服务器 (HTTPS / WSS)"]
+    R["@allinone/relay-server<br/>账号与一次性邀请码 · 多租户隔离<br/>一次性 WS Ticket · 临时附件中转"]
+  end
+
+  subgraph PCs["名下任意多台电脑 (出站 WSS，无需公网 IP)"]
+    B1["Mac / Windows / Linux<br/>桌面内置桥接 或 单文件 CLI"]
+    A1["Codex / Claude Code / Antigravity / DSH"]
+    B1 <--> A1
+  end
+
+  M <-->|"HTTPS / WSS"| R
+  D <-->|"HTTPS / WSS"| R
+  R <-->|"出站 WSS"| B1
+```
+
+---
+
+## 四、开发者指南（源码构建与二次开发）
+
+> 本地开发与源码打包要求：**Node.js >= 22.13.0**
+
+<details>
+<summary>1. 本地 3 分钟开发联调</summary>
 
 ```bash
-# 将你自建的服务器地址写入仓库根目录 .env.local（已被 .gitignore 忽略）
+git clone https://github.com/RainbowLion0320/AllinOne.git
+cd AllinOne
+npm install
+npm run build
+
+# 生成首个管理员邀请码并启动本地中转服务 (http://127.0.0.1:8787)
+npm run admin -- invite create --count 1 --admin --note "dev"
+npm run start:relay
+
+# 新开终端运行 Electron 桌面端开发模式（自带双栏 UI 与内置本机桥接）
+npm run dev:desktop
+```
+
+</details>
+
+<details>
+<summary>2. 自行打包预置了你专属服务器地址的桌面安装包 (.dmg / .exe)</summary>
+
+如果你想给团队/朋友分发**打开就默认填好你服务器地址**的定制安装包：
+
+```bash
 cat > .env.local <<'EOF'
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
-# macOS 打包 .dmg（输出在 packages/desktop-app/release/）
-npm run pack:mac
-
-# Windows 打包 NSIS .exe 安装向导（在 Windows 上运行）
-npm run pack:win
+npm run pack:mac   # 输出 macOS arm64 .dmg -> packages/desktop-app/release/
+npm run pack:win   # 输出 Windows x64 .exe（在 Windows 下运行）
 ```
 
-安装打开并登录你的账号后，桌面端会自动把本机绑定到账号下并在后台常驻托盘；关闭窗口不会断开手机连接。
+> 也可以直接在自己 Fork 后的仓库 **Actions → Build Desktop Installers → Run workflow** 里填入 `relay_url`，让 GitHub Actions 云端自动打好 macOS + Windows 双端安装包。
 
-#### 方式 B：1 行命令行桥接（macOS / Linux / Windows 通用）
+</details>
 
-适合纯终端或服务器环境（需要本机已装 Node.js v18+，推荐 v22+）：
+<details>
+<summary>3. 编译 Capacitor 原生 Android / iOS 壳 & 挂载 DeepSeek Harness 插件</summary>
 
-- **macOS / Linux**：
-  ```bash
-  curl -fsSL https://ai.yourdomain.com/setup.sh | bash
-  ```
-- **Windows (PowerShell)**：
-  ```powershell
-  irm https://ai.yourdomain.com/setup.ps1 | iex
-  ```
-
-#### 方式 C：挂载为 DeepSeek Harness Desktop 插件（开启 DSH 全量写权限）
-
-1. 复制 `packages/dsh-mobile-hub/cordis.patch.example.yml` 为 `packages/dsh-mobile-hub/cordis.patch.yml`（已被 `.gitignore` 忽略），填入自建中转 `relayUrl` 与环境变量/密钥路径。
-2. 在 `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 中链接 `dsh-mobile-hub` 并加入 `dsh.profile.bundles`，重启 DeepSeek Harness 即可。
-
----
-
-### 4. 各 AI 工具前置条件（支持半成品静默自动补齐）
-
-All in One 本身不内置大模型或 API Key，而是直接驱动你电脑上已登录的本地工具。桥接器启动时会自动体检：**若检测到某个 AI 工具处于“半成品”状态（例如已安装 `Antigravity.app` 或已有 `~/.claude/projects`、`~/.codex/sessions` 会话数据，但缺少对应 CLI），会在后台静默自动安装官方 CLI 并热刷新就绪状态，无需手动干预；对未使用的工具则不会安装任何多余组件**（如需关闭自动补齐，可设置环境变量 `ALLINONE_NO_AUTOFIX=1`）。
-
-- **Codex**：已安装 `codex` CLI 或 macOS `/Applications/ChatGPT.app`（自动探测内置 `codex`；半成品状态自动补装）。
-- **Claude Code**：已安装并完成登录的 `claude` CLI（已有会话但缺 CLI 时自动补装）。
-- **Antigravity**：macOS 的 `Antigravity.app` 不内置命令行工具，桥接器检测到半成品状态会自动安装官方 `agy` CLI 并直接复用桌面端登录态（也支持手动安装：`curl -fsSL https://antigravity.google/cli/install.sh | bash` / Windows `irm https://antigravity.google/cli/install.ps1 | iex`）。
-- **DeepSeek Harness**：独立桥接自动支持历史会话只读；如需远程续聊请通过方式 C 挂载插件。
-
----
-
-### 5. 手机端安装
-
-- **PWA（推荐，iOS / Android 通用）**：用手机浏览器打开 `https://ai.yourdomain.com` →「添加到主屏幕」。
-- **Capacitor 原生壳（可选）**：修改 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 为你的 HTTPS 域名后执行：
+- **Capacitor 原生手机壳（可选）**：修改 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 为你的 HTTPS 域名后运行：
   ```bash
   cd packages/mobile-app
   npm run build
   npx cap sync android   # 或 ios
   npx cap open android
   ```
-  > 如需在纯内网 HTTP 调试 Android 壳，可在本地临时把 `cleartext` 设为 `true`，生产环境强烈建议保持 HTTPS 且 `cleartext: false`。
+- **DeepSeek Harness 插件模式（开启 DSH 写权限）**：
+  1. 复制 `packages/dsh-mobile-hub/cordis.patch.example.yml` 为 `packages/dsh-mobile-hub/cordis.patch.yml`（已被 `.gitignore` 忽略），填入 `relayUrl` 与密钥配置。
+  2. 在 `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 链接 `dsh-mobile-hub` 并加入 `dsh.profile.bundles`，重启 DSH 即可。
+- **关闭后台自动补装半成品 CLI**：设置环境变量 `ALLINONE_NO_AUTOFIX=1`。
 
----
+</details>
 
-## 安全模型与免责声明
+<details>
+<summary>4. 仓库目录结构与端到端冒烟测试</summary>
 
-在部署或使用前，请务必阅读完整的 [SECURITY.md](./SECURITY.md)：
+```text
+AllinOne/
+├── packages/
+│   ├── shared/          # 统一 RPC / Event 协议与安全校验
+│   ├── relay-server/    # 自建中转网关（HTTPS/WSS + 账号/邀请码 + 多租户隔离 + 静态托管）
+│   ├── dsh-mobile-hub/  # 本机桥接引擎（4 大 AI 适配器 + 自动环境补齐 + 单文件 CLI）
+│   ├── mobile-app/      # 响应式前端（React + Tailwind + PWA + Capacitor）
+│   └── desktop-app/     # Electron 桌面总控客户端（内置桥接 + 托盘 + DMG/NSIS 打包）
+├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
+├── scripts/             # 单文件桥接打包器与 11 项端到端冒烟测试
+└── .github/workflows/   # CI 自动构建测试 & 桌面端自动发版工作流
+```
 
-1. **必须自托管 + HTTPS/WSS**：本系统使用 HTTPS/WSS 保障传输加密，中转服务器需要路由消息和转发临时附件（非零知识端到端加密），**切勿将本机桥接连接到陌生人部署的第三方中转服务**。
-2. **默认高权限自动执行**：为了在手机端远程流畅完成编程任务，桥接器默认启用了自动审批/编辑模式（例如 Antigravity 的 `--dangerously-skip-permissions`、DSH 的 `danger-full-access`、Claude 的 `acceptEdits`）。你可以在配置文件或适配器选项中手动收紧权限，详情见 [SECURITY.md](./SECURITY.md)。
-3. **独立开源免责声明**：本项目为社区独立开源工具，与 DeepSeek、OpenAI、Anthropic、Google 无任何官方隶属、授权或合作关系；所有第三方品牌名称与图标均归各自权利人所有。
-
----
-
-## 端到端冒烟测试
-
+运行全部 11 项端到端冒烟与安全测试：
 ```bash
 npm run test:smoke
 ```
 
-测试覆盖：生产默认弱密钥拒启、一次性邀请码核销与作废、账号登录与多电脑自动发现、WS Ticket 防重放、Origin 校验、SSRF 拦截、限流保护、4 大应用模型拉取与会话读写隔离。
+</details>
 
-## 参与贡献 & 开源协议
+---
 
-- 欢迎提 Issue 或 PR，详情请参阅 [CONTRIBUTING.md](./CONTRIBUTING.md)。
-- 本项目基于 [MIT License](./LICENSE) 开源。
+## 五、安全模型、贡献与协议
+
+在部署或使用前，请阅读完整的 [SECURITY.md](./SECURITY.md)：
+
+1. **必须自托管 + HTTPS/WSS**：通信走 TLS 加密，中转服务器负责路由消息和临时附件（非零知识 E2EE），**切勿将本机桥接连接到陌生人部署的第三方服务器**。
+2. **默认高权限自动执行**：为保证远程编程流畅度，适配器默认以自动审批/编辑模式驱动本机 AI，可在配置中按需收紧权限（详见 [SECURITY.md](./SECURITY.md)）。
+3. **独立开源声明**：本项目为社区独立开源工具，与 DeepSeek、OpenAI、Anthropic、Google 无任何官方隶属或授权关系。
+4. **贡献 & 协议**：欢迎提 Issue / PR（见 [CONTRIBUTING.md](./CONTRIBUTING.md)），基于 [MIT License](./LICENSE) 开源。
