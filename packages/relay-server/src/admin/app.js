@@ -7,6 +7,12 @@
   const DARK_KEY = 'allinone_dark'
   const LANG_KEY = 'allinone_lang'
 
+  // Dynamically derive subpath mount prefix (works at root `/` or any reverse-proxy subpath like `/sub/admin`)
+  const RELAY_BASE_PATH = window.location.pathname
+    .replace(/\/admin(?:\/index\.html)?\/?$/i, '')
+    .replace(/\/+$/, '')
+  const RELAY_BASE_URL = `${window.location.origin}${RELAY_BASE_PATH}`
+
   const APP_COLORS = {
     dsh: { name: 'DeepSeek', badge: 'DSH', color: '#4D6BFE', bg: 'rgba(77,107,254,0.16)' },
     codex: { name: 'Codex', badge: 'CDX', color: '#10A37F', bg: 'rgba(16,163,127,0.16)' },
@@ -331,18 +337,20 @@
         const list = Array.isArray(parsed?.devices) ? parsed.devices : []
         const active = list.find((d) => d.id === parsed.activeDeviceId)
         const candidates = active ? [active, ...list.filter((d) => d.id !== active.id)] : list
-        const origin = window.location.origin.toLowerCase()
+        const targetBase = RELAY_BASE_URL.toLowerCase()
         for (const d of candidates) {
           if (!d?.token) continue
           const isAdm = d.role === 'admin' || d.roomId === 'owner'
           if (!isAdm) continue
-          let sameOrigin = !d.baseUrl
+          let matchesBase = !d.baseUrl
           if (d.baseUrl) {
             try {
-              sameOrigin = new URL(d.baseUrl).origin.toLowerCase() === origin
+              const u = new URL(d.baseUrl)
+              const savedBase = `${u.origin}${u.pathname.replace(/\/+$/, '')}`.toLowerCase()
+              matchesBase = savedBase === targetBase
             } catch {}
           }
-          if (sameOrigin) return d.token
+          if (matchesBase) return d.token
         }
       }
     } catch {}
@@ -375,7 +383,8 @@
     const headers = {}
     if (body !== null) headers['Content-Type'] = 'application/json'
     if (auth && state.token) headers.Authorization = `Bearer ${state.token}`
-    const res = await fetch(path, {
+    const cleanPath = String(path || '').startsWith('/') ? path : `/${path}`
+    const res = await fetch(`${RELAY_BASE_PATH}${cleanPath}`, {
       method,
       headers,
       ...(body !== null ? { body: JSON.stringify(body) } : {}),
@@ -1220,7 +1229,7 @@
         : isUsed
           ? `<span class="pill pill-subtle">${esc(bi('已使用', 'Used'))}</span>`
           : `<span class="pill pill-rose">${esc(bi('已作废', 'Revoked'))}</span>`
-      const regUrl = `${window.location.origin}/?invite=${encodeURIComponent(inv.code)}`
+      const regUrl = `${RELAY_BASE_URL}/?invite=${encodeURIComponent(inv.code)}`
       return `
         <div class="invite-card ${isActive ? 'active' : 'inactive'}">
           <div class="invite-code-row">

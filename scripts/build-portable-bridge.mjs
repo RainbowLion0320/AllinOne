@@ -14,6 +14,7 @@ import * as esbuild from 'esbuild'
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const rootDir = resolve(__dirname, '..')
 const entryPoint = resolve(rootDir, 'packages/dsh-mobile-hub/portable-cli.js')
+const dshIpcPluginEntry = resolve(rootDir, 'packages/dsh-mobile-hub/src/dsh-ipc-plugin-entry.js')
 const outFile = resolve(rootDir, 'packages/mobile-app/public/downloads/allinone-bridge.mjs')
 
 function readLocalEnvValue(key) {
@@ -45,6 +46,22 @@ const defaultServer = (
 
 mkdirSync(dirname(outFile), { recursive: true })
 
+// First bundle the zero-dependency DeepSeek Harness local IPC Cordis plugin so the portable
+// bridge / Desktop App can auto-install it into `~/.dsh/profiles/desktop` with zero external deps.
+const dshPluginBuild = await esbuild.build({
+  entryPoints: [dshIpcPluginEntry],
+  bundle: true,
+  write: false,
+  platform: 'node',
+  format: 'esm',
+  target: 'node22',
+  minify: true,
+  sourcemap: false,
+  legalComments: 'none',
+  external: ['node:*'],
+})
+const dshIpcPluginCode = dshPluginBuild.outputFiles?.[0]?.text || ''
+
 await esbuild.build({
   entryPoints: [entryPoint],
   outfile: outFile,
@@ -58,6 +75,7 @@ await esbuild.build({
   external: ['node:*', 'bufferutil', 'utf-8-validate'],
   define: {
     __ALLINONE_DEFAULT_SERVER__: JSON.stringify(defaultServer),
+    __ALLINONE_DSH_IPC_PLUGIN_CODE__: JSON.stringify(dshIpcPluginCode),
   },
   banner: {
     js: [

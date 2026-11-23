@@ -19,6 +19,9 @@ import WebSocket from 'ws'
 import { createRelayServer } from '../packages/relay-server/src/index.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
+import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
+import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local-ipc.js'
+import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
 import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
@@ -263,7 +266,7 @@ async function main() {
       },
     }
 
-    applyDshPlugin(mockCtx, { enableDispatchTools: true })
+    applyDshPlugin(mockCtx, { enableDispatchTools: true, enableLocalIpc: false })
     assert.deepEqual(registeredTools.sort(), [
       'allinone_apps_status',
       'allinone_dispatch_task',
@@ -2082,14 +2085,20 @@ async function main() {
         })
 
       try {
-        // 17.1 Static /admin dashboard serving & strict CSP headers
+        // 17.1 Static /admin dashboard serving, subpath-safe relative asset links & strict CSP headers
         const adminHtmlRes = await fetch(`${mBase}/admin`)
         assert.equal(adminHtmlRes.status, 200, 'GET /admin must serve dashboard HTML')
         assert.match(String(adminHtmlRes.headers.get('content-type') || ''), /text\/html/)
         assert.match(String(adminHtmlRes.headers.get('cache-control') || ''), /no-store/)
         assert.match(String(adminHtmlRes.headers.get('content-security-policy') || ''), /script-src 'self'/)
         const adminHtml = await adminHtmlRes.text()
-        assert.ok(adminHtml.includes('/admin/app.js') && adminHtml.includes('/admin/styles.css'))
+        assert.ok(adminHtml.includes('src="admin/app.js"') && adminHtml.includes('href="admin/styles.css"'), 'GET /admin must use subpath-safe relative admin/* asset URLs')
+        assert.equal(adminHtml.includes('href="/admin/'), false, 'GET /admin must not hardcode root-absolute /admin/ paths')
+
+        const adminSlashRes = await fetch(`${mBase}/admin/`)
+        assert.equal(adminSlashRes.status, 200, 'GET /admin/ must serve dashboard HTML')
+        const adminSlashHtml = await adminSlashRes.text()
+        assert.ok(adminSlashHtml.includes('src="./app.js"') && adminSlashHtml.includes('href="./styles.css"'), 'GET /admin/ must use subpath-safe ./* asset URLs')
 
         const adminJsRes = await fetch(`${mBase}/admin/app.js`)
         assert.equal(adminJsRes.status, 200)
@@ -2621,7 +2630,208 @@ async function main() {
         await new Promise((r) => secSmtp.close(r))
       }
     }
-    console.log('[smoke] 18/18 Security hardening (CSP, legacy kill-switches, new-IP alert, email 2FA, distributed lockout, safeStorage & TOCTOU SHA-256) OK')
+    console.log('[smoke] 18/19 Security hardening (CSP, legacy kill-switches, new-IP alert, email 2FA, distributed lockout, safeStorage & TOCTOU SHA-256) OK')
+
+    // 19. DeepSeek Harness authenticated localhost IPC bridge + zero-dep auto-installer
+    {
+      const ipcDshHome = join(tmpDir, 'dsh-ipc-home')
+      mkdirSync(join(ipcDshHome, 'storages'), { recursive: true })
+
+      // Mock live DSH Cordis ctx with a single synthetic agent supporting followup + ownEvents + abort
+      const mockSessions = new Map()
+      let seqCounter = 1
+      const createMockAgent = (sid, cwd) => {
+        const events = []
+        let aborted = false
+        let idleResolve = null
+        let idlePromise = Promise.resolve()
+        const session = {
+          id: sid,
+          meta: { cwd },
+          get seq() { return seqCounter },
+          ownEvents: () => events,
+        }
+        const agent = {
+          id: sid,
+          session,
+          followup: (userMsg) => {
+            const promptText = userMsg?.content?.[0]?.text || ''
+            events.push({ seq: ++seqCounter, type: 'user/message', data: { message: userMsg }, timestamp: Date.now() })
+            idlePromise = new Promise((r) => {
+              idleResolve = r
+              setTimeout(() => {
+                events.push({
+                  seq: ++seqCounter,
+                  type: 'assistant/message',
+                  data: {
+                    message: {
+                      id: `a-msg-${seqCounter}`,
+                      content: [
+                        { type: 'thinking', thinking: 'Checking IPC path...' },
+                        { type: 'text', text: `DSH IPC Reply to: ${promptText}` },
+                      ],
+                    },
+                  },
+                  timestamp: Date.now(),
+                })
+                r()
+              }, 80)
+            })
+          },
+          whenIdle: () => idlePromise,
+          abort: async () => { aborted = true; idleResolve?.() },
+          isAborted: () => aborted,
+        }
+        mockSessions.set(sid, { agent, session, title: sid })
+        return agent
+      }
+
+      const mockDshCtx = {
+        agents: {
+          get: (sid) => mockSessions.get(sid)?.agent,
+          create: async ({ sessionId, meta }) => {
+            const agent = createMockAgent(sessionId, meta?.cwd || process.cwd())
+            return { agent, dispose: async () => {} }
+          },
+        },
+        get: (name) => {
+          if (name === 'sessions') {
+            return {
+              get: (sid) => mockSessions.get(sid)?.session,
+              values: () => [...mockSessions.values()].map((x) => x.session),
+            }
+          }
+          if (name === 'sessionTitle') {
+            return {
+              get: (sess) => ({ title: mockSessions.get(sess?.id)?.title || sess?.id }),
+              rename: (sess, t) => {
+                const row = mockSessions.get(sess?.id)
+                if (row) row.title = t
+              },
+            }
+          }
+          return undefined
+        },
+      }
+
+      let ipcSrv = null
+      const liveDsh = new DshAdapter({
+        ctx: mockDshCtx,
+        config: { dshHome: ipcDshHome, cwd: process.cwd() },
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+        emitEvent: (ev, payload) => ipcSrv?.emitEvent(ev, payload),
+      })
+
+      const receivedEvents = []
+      const standaloneDsh = new DshAdapter({
+        ctx: null,
+        config: { dshHome: ipcDshHome, cwd: process.cwd() },
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+        emitEvent: (ev, payload) => receivedEvents.push({ ev, payload }),
+      })
+
+      try {
+        // Before IPC starts, standalone DSH adapter is read-only
+        const stBefore = await standaloneDsh.getStatus()
+        assert.equal(stBefore.available, true)
+        assert.equal(stBefore.writable, false)
+        assert.equal(stBefore.mode, 'standalone-readonly')
+
+        // Start authenticated loopback IPC server inside mock DSH
+        ipcSrv = await startDshLocalIpcServer({
+          dshAdapter: liveDsh,
+          dshHome: ipcDshHome,
+          log: { info: () => {}, warn: () => {}, error: () => {} },
+        })
+        assert.ok(ipcSrv.port > 0 && ipcSrv.token.length === 64)
+        assert.ok(existsSync(ipcSrv.ipcFile))
+
+        // Security checks: missing/wrong token -> 401; browser Origin header -> 403
+        const noAuthRes = await fetch(`http://127.0.0.1:${ipcSrv.port}/health`)
+        assert.equal(noAuthRes.status, 401, 'DSH local IPC must reject missing Bearer token with 401')
+        const crossOriginRes = await fetch(`http://127.0.0.1:${ipcSrv.port}/health`, {
+          headers: { Authorization: `Bearer ${ipcSrv.token}`, Origin: 'https://evil.example' },
+        })
+        assert.equal(crossOriginRes.status, 403, 'DSH local IPC must reject browser Origin header with 403')
+
+        // Standalone DSH adapter automatically discovers IPC & flips to RW!
+        const stLive = await standaloneDsh.getStatus()
+        assert.equal(stLive.available, true)
+        assert.equal(stLive.writable, true)
+        assert.equal(stLive.mode, 'dsh-local-ipc')
+
+        // Create session + send message + verify real-time SSE events arrive on standalone adapter!
+        const created = await standaloneDsh.createSession({ cwd: process.cwd(), title: 'IPC Test Chat' })
+        assert.equal(created.app, 'dsh')
+        assert.equal(created.writable, true)
+        assert.equal(created.title, 'IPC Test Chat')
+
+        const reply = await standaloneDsh.sendMessage(created.nativeId, { text: 'Hello DSH over IPC!' })
+        assert.ok(reply.finalText.includes('DSH IPC Reply to: Hello DSH over IPC!'))
+        // Wait briefly for final SSE frame flush
+        await new Promise((r) => setTimeout(r, 80))
+        const evTypes = receivedEvents.map((e) => e.ev)
+        assert.ok(evTypes.includes(EVENTS.STREAM_START), `Expected STREAM_START over SSE, got ${evTypes.join(',')}`)
+        assert.ok(evTypes.includes(EVENTS.STREAM_THINKING), 'Expected STREAM_THINKING over SSE')
+        assert.ok(evTypes.includes(EVENTS.STREAM_DELTA), 'Expected STREAM_DELTA over SSE')
+        assert.ok(evTypes.includes(EVENTS.STREAM_DONE), 'Expected STREAM_DONE over SSE')
+
+        const readBack = await standaloneDsh.readSession(created.nativeId)
+        assert.equal(readBack.writable, true)
+        assert.ok(readBack.messages.some((m) => m.role === 'assistant' && m.text.includes('Hello DSH over IPC!')))
+
+        // Closing IPC server cleanly removes descriptor & flips standalone back to read-only
+        await ipcSrv.close()
+        ipcSrv = null
+        assert.equal(existsSync(join(ipcDshHome, 'allinone-dsh-ipc.json')), false)
+        const stAfter = await standaloneDsh.getStatus()
+        assert.equal(stAfter.writable, false)
+        assert.equal(stAfter.mode, 'standalone-readonly')
+      } finally {
+        await standaloneDsh.dispose()
+        if (ipcSrv) await ipcSrv.close()
+        await liveDsh.dispose()
+      }
+
+      // Auto-installer idempotency & opt-out tests
+      const noDshRes = ensureDshLocalIpcPlugin({ dshHome: join(tmpDir, 'nonexistent-dsh'), env: {}, log: { info: () => {}, warn: () => {} } })
+      assert.equal(noDshRes.status, 'no-dsh-profile')
+
+      const fakeDshHome = join(tmpDir, 'fake-dsh-install')
+      const fakeProfileDir = join(fakeDshHome, 'profiles', 'desktop')
+      mkdirSync(fakeProfileDir, { recursive: true })
+      writeFileSync(
+        join(fakeProfileDir, 'package.json'),
+        JSON.stringify({ name: 'dsh-profile-desktop', dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } }, null, 2),
+        'utf8',
+      )
+      const optOutRes = ensureDshLocalIpcPlugin({ dshHome: fakeDshHome, env: { ALLINONE_NO_AUTOFIX: '1' }, log: { info: () => {}, warn: () => {} } })
+      assert.equal(optOutRes.status, 'skipped-opt-out')
+
+      const inst1 = ensureDshLocalIpcPlugin({ dshHome: fakeDshHome, env: {}, log: { info: () => {}, warn: () => {} } })
+      assert.equal(inst1.status, 'installed')
+      assert.ok(existsSync(join(fakeProfileDir, 'package.json.bak-before-allinone')))
+      assert.ok(existsSync(join(fakeProfileDir, 'node_modules', 'allinone-dsh-ipc', 'index.js')))
+      assert.ok(existsSync(join(fakeProfileDir, 'node_modules', 'allinone-dsh-ipc', 'cordis.patch.yml')))
+      const updatedPkg = JSON.parse(readFileSync(join(fakeProfileDir, 'package.json'), 'utf8'))
+      assert.ok(updatedPkg.dsh.profile.bundles.includes('allinone-dsh-ipc'))
+
+      const inst2 = ensureDshLocalIpcPlugin({ dshHome: fakeDshHome, env: {}, log: { info: () => {}, warn: () => {} } })
+      assert.equal(inst2.status, 'up-to-date')
+
+      // Existing dsh-mobile-hub profile must be left untouched
+      const hubDshHome = join(tmpDir, 'hub-dsh-home')
+      const hubProfileDir = join(hubDshHome, 'profiles', 'desktop')
+      mkdirSync(hubProfileDir, { recursive: true })
+      writeFileSync(
+        join(hubProfileDir, 'package.json'),
+        JSON.stringify({ name: 'dsh-profile-desktop', dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-mobile-hub'] } } }, null, 2),
+        'utf8',
+      )
+      const hubRes = ensureDshLocalIpcPlugin({ dshHome: hubDshHome, env: {}, log: { info: () => {}, warn: () => {} } })
+      assert.equal(hubRes.status, 'already-using-dsh-mobile-hub')
+    }
+    console.log('[smoke] 19/19 DeepSeek Harness authenticated localhost IPC bridge & auto-installer OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

@@ -18,12 +18,13 @@ import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
 import { renderQrSvg } from './src/helpers/qr-svg.js'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
+import { ensureDshLocalIpcPlugin } from './src/helpers/dsh-ipc-installer.js'
 
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
-const BRIDGE_VERSION = '0.4.0'
+const BRIDGE_VERSION = '0.4.1'
 
 function parseArgs(argv) {
   const opts = {
@@ -722,12 +723,43 @@ async function main() {
   }
 
   // Silently detect & auto-complete any half-installed AI CLIs in the background
-  // (e.g. Antigravity.app installed without `agy`, or ~/.claude/projects without `claude`)
+  // (e.g. Antigravity.app installed without `agy`, ~/.claude/projects without `claude`,
+  //  or DeepSeek Harness desktop profile without the authenticated local IPC plugin)
   // and hot-refresh adapter readiness + models with zero user prompts.
+  const dshLog = {
+    info: (msg) => console.log(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
+    warn: (msg) => console.warn(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
+  }
+  try {
+    ensureDshLocalIpcPlugin({ log: dshLog })
+  } catch {}
+
+  let lastDshWritable = null
+  const dshIpcWatchTimer = setInterval(async () => {
+    try {
+      const dshStatus = await orchestrator.adapters.dsh?.getStatus?.()
+      if (!dshStatus || !dshStatus.available) return
+      const nowWritable = Boolean(dshStatus.writable)
+      if (lastDshWritable !== null && nowWritable !== lastDshWritable) {
+        const freshApps = await orchestrator.getAppsStatus()
+        detectedApps = freshApps
+        link.setAppsMeta(freshApps)
+        const appSummary = freshApps
+          .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
+          .join(' | ')
+        console.log(`  本机 AI    : ${appSummary}`)
+      }
+      lastDshWritable = nowWritable
+    } catch {}
+  }, 10_000)
+  dshIpcWatchTimer.unref?.()
+
   void bridge.appsReadyPromise
     .catch(() => [])
-    .then(() =>
-      autoCompleteHalfInstalledClis({
+    .then((apps) => {
+      const dshApp = Array.isArray(apps) ? apps.find((a) => a.app === 'dsh') : null
+      if (dshApp) lastDshWritable = Boolean(dshApp.writable)
+      return autoCompleteHalfInstalledClis({
         stateDir: opts.stateDir,
         log: {
           info: (msg) => console.log(`[allinone] ${msg}`),
@@ -753,8 +785,8 @@ async function main() {
             try { writePairPage(false) } catch {}
           }
         },
-      }),
-    )
+      })
+    })
     .catch(() => {})
 
   // Interactive terminal controls

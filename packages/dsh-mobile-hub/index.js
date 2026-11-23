@@ -10,8 +10,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { dirname } from 'node:path'
+import { APPS } from './src/protocol.js'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { registerDshDispatchTools } from './src/dsh-tools.js'
+import { startDshLocalIpcServer } from './src/dsh-local-ipc.js'
 import { RelayBridgeLink } from './src/ws-client.js'
 
 export const name = 'mobile-hub'
@@ -48,15 +50,21 @@ export function apply(ctx, config = {}) {
   const statusFile = String(config.statusFile ?? '').trim()
   // Pure zero-invasion bridge mode by default: do NOT inject extra tools into DSH's prompt/tools list
   const enableDispatchTools = config.enableDispatchTools === true
+  const enableLocalIpc = config.enableLocalIpc !== false
+  // When using All in One Desktop App, prefer pure localhost IPC (`ipcOnly: true` or no relayUrl)
+  const ipcOnly = config.ipcOnly === true
 
   let link = null
+  let ipcServer = null
+  let ipcDisposed = false
 
   const orchestrator = new MultiAppOrchestrator({
     ctx,
-    config: { ...config, relayUrl, secret },
+    config: { ...config, relayUrl: ipcOnly ? '' : relayUrl, secret: ipcOnly ? '' : secret },
     log,
     onEvent: (event, payload) => {
       link?.pushEvent(event, payload)
+      ipcServer?.emitEvent?.(event, payload)
     },
   })
 
@@ -67,10 +75,56 @@ export function apply(ctx, config = {}) {
     log.info('mobile-hub: registered 6 DSH cross-app master dispatch tools (allinone_*)')
   }
 
-  if (!relayUrl || !secret) {
-    log.warn(
-      'mobile-hub: relay long-connection paused — configure config.relayUrl and Bridge Secret ' +
-      '(config.secretFile, config.secret, or env DSH_MOBILE_BRIDGE_SECRET) in cordis.patch.yml.',
+  // Expose authenticated localhost-only IPC (127.0.0.1 + 256-bit Bearer token + SSE)
+  // so All in One Desktop App / portable bridge on this machine can control DSH in full RW mode!
+  if (enableLocalIpc) {
+    const dshAdapter = orchestrator.adapters[APPS.DSH]
+    const startPromise = startDshLocalIpcServer({
+      dshAdapter,
+      dshHome: config.dshHome || '',
+      log,
+    })
+      .then(async (srv) => {
+        if (ipcDisposed) {
+          await srv.close().catch(() => {})
+          return null
+        }
+        ipcServer = srv
+        if (ipcOnly && statusFile) {
+          try {
+            mkdirSync(dirname(statusFile), { recursive: true })
+            writeFileSync(
+              statusFile,
+              JSON.stringify(
+                { state: 'ipc-ready', mode: 'local-ipc', port: srv.port, pid: process.pid, at: new Date().toISOString() },
+                null,
+                2,
+              ),
+            )
+          } catch {}
+        }
+        return srv
+      })
+      .catch((err) => {
+        log.warn?.(`mobile-hub: failed to start DSH local IPC server: ${String(err)}`)
+        return null
+      })
+
+    ctx.effect(() => async () => {
+      ipcDisposed = true
+      const srv = ipcServer || (await startPromise.catch(() => null))
+      ipcServer = null
+      if (srv) {
+        await srv.close().catch(() => {})
+      }
+    })
+  }
+
+  if (ipcOnly) {
+    log.info('mobile-hub: running in local-IPC-only mode for All in One Desktop App (no legacy relay socket).')
+  } else if (!relayUrl || !secret) {
+    log.info(
+      'mobile-hub: relayUrl/secret not set — serving DSH via authenticated local IPC for All in One Desktop App.',
     )
   } else {
     link = new RelayBridgeLink({

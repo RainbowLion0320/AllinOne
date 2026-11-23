@@ -234,6 +234,20 @@ export function App() {
     setNewChatCwd(cleanCwd)
     setNewChatApp(resolvedApp)
     setNewChatOpen(true)
+    // Silently refresh live app readiness (e.g. if DeepSeek Harness just started and opened local IPC)
+    const client = clientRef.current
+    if (client) {
+      const targetBridge = String(activeBridgeIdRef.current || '').trim()
+      const gen = deviceGenRef.current
+      client
+        .rpc(RPC.APPS_STATUS, {}, 12_000, targetBridge ? { bridgeId: targetBridge } : {})
+        .then((res) => {
+          if (deviceGenRef.current === gen && Array.isArray(res?.apps) && res.apps.length > 0) {
+            setAppsStatus(res.apps)
+          }
+        })
+        .catch(() => {})
+    }
   }, [sidebarFilterApp, selectedDraftApp, appsStatus])
 
   // Electron Desktop App integration: live local bridge status + auto-updater + menu shortcuts

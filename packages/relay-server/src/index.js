@@ -2118,7 +2118,16 @@ export function createRelayServer(options = {}) {
       const adminTarget = mapped ? join(ADMIN_DASHBOARD_DIR, mapped) : ''
       if (adminTarget && existsSync(adminTarget) && statSync(adminTarget).isFile()) {
         const ext = extname(adminTarget).toLowerCase()
-        const buf = readFileSync(adminTarget)
+        let buf = readFileSync(adminTarget)
+        if (ext === '.html' && pathname === '/admin') {
+          // Keep asset & back-to-app links subpath-safe when accessed without trailing slash (e.g. /subpath/admin)
+          const html = buf
+            .toString('utf8')
+            .replaceAll('href="./styles.css"', 'href="admin/styles.css"')
+            .replaceAll('src="./app.js"', 'src="admin/app.js"')
+            .replaceAll('href="../"', 'href="./"')
+          buf = Buffer.from(html, 'utf8')
+        }
         const headers = {
           'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
           'Content-Length': buf.length,

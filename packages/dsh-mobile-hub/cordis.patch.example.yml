@@ -1,20 +1,22 @@
-# Copy this file to `cordis.patch.yml` (gitignored) and replace with your own Relay Server URL.
+# Copy this file to `cordis.patch.yml` (gitignored).
+# Recommended with All in One Desktop App: keep `ipcOnly: true` so DeepSeek Harness
+# exposes only the authenticated localhost IPC server (127.0.0.1) to the Desktop App.
 - insert:
     - id: mobile-hub
       name: dsh-mobile-hub
       config:
-        # Your self-hosted Relay Server WSS endpoint
-        relayUrl: 'wss://ai.yourdomain.com/ws/bridge'
-        # Store BRIDGE_SECRET outside the repo (never commit secrets to Git)
-        # secretFile: '~/.dsh/secrets/allinone-bridge-secret.txt'
-        secretEnv: 'DSH_MOBILE_BRIDGE_SECRET'
-        # Display name shown in the mobile header
-        bridgeId: 'my-pc'
+        # Recommended when using All in One Desktop App (no duplicate relay connection):
+        ipcOnly: true
         # Optional default working directory for new chats
         cwd: ''
         # Default permission preset for new DSH sessions
         permissionPreset: 'danger-full-access'
         # Pure zero-invasion bridge mode: keep false to avoid injecting extra tools / token overhead
         enableDispatchTools: false
-        # Optional local connection status file for diagnostics
+        # Optional local status file for diagnostics
         # statusFile: '~/.dsh/allinone-mobile-hub-status.json'
+        # --- Legacy standalone DSH-plugin relay mode (only if NOT using Desktop App) ---
+        # ipcOnly: false
+        # relayUrl: 'wss://ai.yourdomain.com/ws/bridge'
+        # secretEnv: 'DSH_MOBILE_BRIDGE_SECRET'
+        # bridgeId: 'my-pc'

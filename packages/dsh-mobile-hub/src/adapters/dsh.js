@@ -5,6 +5,7 @@ import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
+import { DshLocalIpcClient } from '../dsh-local-ipc.js'
 
 /**
  * Build a properly identified DSH UserMessage.
@@ -198,7 +199,7 @@ export class DshAdapter {
     this.config = config
     this.log = log
     this.emitEvent = emitEvent || (() => {})
-    this.dshHome = getDshHome()
+    this.dshHome = String(config.dshHome ?? '').trim() || getDshHome()
     this.defaultCwd = resolve(
       String(config.cwd ?? '').trim() ||
         ctx?.get?.('workingDirectory')?.defaultDirectory ||
@@ -209,6 +210,28 @@ export class DshAdapter {
     this.activeTurns = new Map() // sessionId -> { agent, aborting, startedAt }
     this.ownedHandles = new Map()
     this.sessionModels = new Map() // sessionId -> { provider, model, reasoningEffort }
+    this.ipcClient = this.ctx
+      ? null
+      : new DshLocalIpcClient({
+          dshHome: this.dshHome,
+          emitEvent: this.emitEvent,
+          log: this.log,
+        })
+  }
+
+  hasDshPluginConfigured() {
+    const pkgPath = join(this.dshHome, 'profiles', 'desktop', 'package.json')
+    const pkg = readJsonSafe(pkgPath)
+    const bundles = pkg?.dsh?.profile?.bundles
+    if (!Array.isArray(bundles)) return false
+    return bundles.includes('dsh-mobile-hub') || bundles.includes('allinone-dsh-ipc')
+  }
+
+  getIpcUnavailableMessage() {
+    if (this.hasDshPluginConfigured()) {
+      return '未检测到运行中的 DeepSeek Harness 本地桥接服务。请先打开或重启一次 DeepSeek Harness 桌面端，之后即可直接新建并操控 DSH 对话。'
+    }
+    return 'DeepSeek Harness 尚需加载本机轻量桥接插件（All in One 正在后台自动配置）。请稍候片刻并重启一次 DeepSeek Harness 桌面端即可读写控制 DSH 会话。'
   }
 
   async listModels() {
@@ -295,14 +318,35 @@ export class DshAdapter {
 
   async getStatus() {
     const storagesExists = existsSync(join(this.dshHome, 'storages'))
+    if (this.isLive()) {
+      return {
+        app: APPS.DSH,
+        available: true,
+        writable: true,
+        mode: 'cordis-live',
+        detail: '已挂载到 DeepSeek Harness 核心引擎（零侵入纯桥接，0 额外 Token 与工具注入）',
+        activeCount: this.activeTurns.size,
+      }
+    }
+    const ipc = await this.ipcClient?.checkHealth()
+    if (ipc) {
+      return {
+        app: APPS.DSH,
+        available: true,
+        writable: true,
+        mode: 'dsh-local-ipc',
+        detail: '已通过本机安全 IPC 连接到运行中的 DeepSeek Harness 引擎（读写就绪）',
+        activeCount: ipc.activeCount || 0,
+      }
+    }
     return {
       app: APPS.DSH,
-      available: this.isLive() || storagesExists,
-      writable: this.isLive(),
-      mode: this.isLive() ? 'cordis-live' : 'standalone-readonly',
-      detail: this.isLive()
-        ? '已挂载到 DeepSeek Harness 核心引擎（零侵入纯桥接，0 额外 Token 与工具注入）'
-        : '独立调试模式（可浏览 DSH 历史；在 DeepSeek Harness 内启用插件后即可原位续聊）',
+      available: storagesExists,
+      writable: false,
+      mode: 'standalone-readonly',
+      detail: this.hasDshPluginConfigured()
+        ? '只读模式（打开或重启 DeepSeek Harness 桌面端后自动切换为读写就绪）'
+        : '只读模式（可浏览 DSH 历史；All in One 将自动安装本机 DSH 桥接插件，重启 DSH 后即可读写控制）',
       activeCount: this.activeTurns.size,
     }
   }
@@ -323,6 +367,14 @@ export class DshAdapter {
   }
 
   async listSessions({ limit = 80, search = '', includeArchived = false } = {}) {
+    if (!this.isLive() && this.ipcClient) {
+      const ipc = await this.ipcClient.checkHealth()
+      if (ipc) {
+        try {
+          return await this.ipcClient.call('listSessions', { limit, search, includeArchived })
+        } catch {}
+      }
+    }
     const wsPath = join(this.dshHome, 'storages', 'workspace.json')
     const wsData = readJsonSafe(wsPath)
     const archivedSet = new Set(wsData?.global?.archivedSessionIds || [])
@@ -445,6 +497,17 @@ export class DshAdapter {
 
   async readSession(sessionId, { limit = 25, cursor = null } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
+    if (!this.isLive() && this.ipcClient) {
+      const ipc = await this.ipcClient.checkHealth()
+      if (ipc) {
+        try {
+          return await this.ipcClient.call('readSession', {
+            sessionId,
+            options: { limit, cursor },
+          })
+        } catch {}
+      }
+    }
     let messages = []
     let title = sessionId
     let cwd = ''
@@ -592,6 +655,17 @@ export class DshAdapter {
   }
 
   async createSession({ cwd, title, model, provider, reasoningEffort } = {}) {
+    if (!this.isLive()) {
+      const ipc = await this.ipcClient?.checkHealth({ force: true })
+      if (ipc) {
+        return this.ipcClient.call(
+          'createSession',
+          { cwd, title, model, provider, reasoningEffort },
+          { timeoutMs: 30_000 },
+        )
+      }
+      throw new Error(this.getIpcUnavailableMessage())
+    }
     const targetCwd = resolve(String(cwd || '').trim() || this.defaultCwd)
     const sid = `mobile-${randomUUID().slice(0, 12)}`
     const { agent, sessionId } = await this.ensureAgent(sid, targetCwd, title || '手机端总控对话')
@@ -616,6 +690,20 @@ export class DshAdapter {
 
   async sendMessage(sessionId, { text, cwd, title, attachments = [], model, provider, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
+    if (!this.isLive()) {
+      const ipc = await this.ipcClient?.checkHealth({ force: true })
+      if (ipc) {
+        return this.ipcClient.call(
+          'sendMessage',
+          {
+            sessionId,
+            payload: { text, cwd, title, attachments, model, provider, reasoningEffort },
+          },
+          { timeoutMs: 30 * 60 * 1000, waitForEvents: true },
+        )
+      }
+      throw new Error(this.getIpcUnavailableMessage())
+    }
     const compositeId = makeCompositeId(APPS.DSH, sessionId)
     const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, cwd, title)
     const realCompositeId = makeCompositeId(APPS.DSH, resolvedId)
@@ -763,6 +851,12 @@ export class DshAdapter {
 
   async interrupt(sessionId) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
+    if (!this.isLive() && this.ipcClient) {
+      const ipc = await this.ipcClient.checkHealth()
+      if (ipc) {
+        return this.ipcClient.call('interrupt', { sessionId }, { timeoutMs: 10_000 })
+      }
+    }
     const active = this.activeTurns.get(sessionId)
     const agent = active?.agent || this.ctx?.agents?.get?.(sessionId)
     if (active) active.aborted = true
@@ -776,6 +870,7 @@ export class DshAdapter {
   }
 
   async dispose() {
+    this.ipcClient?.dispose()
     for (const handle of this.ownedHandles.values()) {
       try { await handle.dispose?.() } catch {}
     }
