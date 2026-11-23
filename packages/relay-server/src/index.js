@@ -4,13 +4,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, w
 import { extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
-import { RPC } from '@allinone/shared'
 import { createAuthManager } from './auth.js'
 import { createAccountStore, validateEmail, validatePassword } from './accounts.js'
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
-import { createRoomStore } from './rooms.js'
 import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -196,34 +194,17 @@ function setSecurityHeaders(req, res) {
 export function createRelayServer(options = {}) {
   const port = Number(options.port ?? process.env.PORT ?? 8787)
   const host = String(options.host ?? process.env.HOST ?? '0.0.0.0')
-  const clientAccessToken = String(options.clientAccessToken ?? process.env.CLIENT_ACCESS_TOKEN ?? 'allinone-dev-pass')
-  const bridgeSecret = String(options.bridgeSecret ?? process.env.BRIDGE_SECRET ?? 'allinone-dev-bridge')
-  const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '')
-  const registerInviteCode = String(options.registerInviteCode ?? process.env.REGISTER_INVITE_CODE ?? '').trim()
-  const disableLegacyOwnerAuth = parseEnvBool(
-    options.disableLegacyOwnerAuth ?? process.env.DISABLE_LEGACY_OWNER_AUTH,
-    false,
-  )
-  const disableLegacyRooms = parseEnvBool(
-    options.disableLegacyRooms ?? process.env.DISABLE_LEGACY_ROOMS,
-    false,
-  )
+  const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '').trim()
+  const adminBootstrapToken = String(options.adminBootstrapToken ?? process.env.ADMIN_BOOTSTRAP_TOKEN ?? '').trim()
   const publicRelayUrl = String(options.publicRelayUrl ?? process.env.PUBLIC_RELAY_URL ?? '').trim().replace(/\/+$/, '')
   const allowedOrigins = buildAllowedOriginsSet(
     publicRelayUrl,
     options.allowedOrigins ?? process.env.ALLOWED_ORIGINS ?? '',
   )
   const isProd = (options.nodeEnv ?? process.env.NODE_ENV) === 'production'
-  if (
-    isProd &&
-    !options.allowDevSecrets &&
-    (clientAccessToken === 'allinone-dev-pass' ||
-      bridgeSecret === 'allinone-dev-bridge' ||
-      clientAccessToken.trim().length < 8 ||
-      bridgeSecret.trim().length < 8)
-  ) {
+  if (isProd && !options.allowDevSecrets && jwtSecret.length < 16) {
     throw new Error(
-      'Refusing to start in production with default or weak CLIENT_ACCESS_TOKEN / BRIDGE_SECRET. Set strong secrets (>= 8 chars) in .env.',
+      'Refusing to start in production without a strong JWT_SECRET (>= 16 chars). Set JWT_SECRET in .env.',
     )
   }
 
@@ -233,33 +214,21 @@ export function createRelayServer(options = {}) {
   const uploadDir = resolve(
     options.uploadDir ?? (process.env.UPLOAD_DIR || resolve(__dirname, '../data/uploads')),
   )
-  const roomsFile = resolve(
-    options.roomsFile ?? (process.env.ROOMS_FILE || resolve(__dirname, '../data/rooms.json')),
-  )
   const accountsFile = resolve(
     options.accountsFile ?? (process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json')),
   )
   mkdirSync(uploadDir, { recursive: true })
   try { chmodSync(uploadDir, 0o700) } catch {}
 
-  const rooms = createRoomStore({ filePath: roomsFile })
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
   const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
   const startedAt = Date.now()
   const auth = createAuthManager({
-    clientAccessToken,
-    bridgeSecret,
     jwtSecret,
-    registerInviteCode,
-    getTokenVersion: (roomId) =>
-      String(roomId || '').startsWith('usr_')
-        ? accounts.getTokenVersion(roomId)
-        : rooms.getTokenVersion(roomId),
-    isSessionRevoked: (roomId, sid) =>
-      String(roomId || '').startsWith('usr_')
-        ? accounts.isSessionRevoked(roomId, sid)
-        : false,
+    adminBootstrapToken,
+    getTokenVersion: (roomId) => accounts.getTokenVersion(roomId),
+    isSessionRevoked: (roomId, sid) => accounts.isSessionRevoked(roomId, sid),
   })
 
   function getMergedAccountDevices(roomId, liveBridges = null) {
@@ -290,21 +259,16 @@ export function createRelayServer(options = {}) {
   }
 
   function getMergedClientSessions(roomId, { currentSid = '', currentClientId = '' } = {}) {
-    const rid = String(roomId || 'owner').trim() || 'owner'
-    const isAccount = rid.startsWith('usr_')
+    const rid = String(roomId || '').trim()
     const liveClients = hub.getClientList(rid)
-    const persisted = isAccount ? accounts.listUserSessions(rid) : []
+    const persisted = accounts.listUserSessions(rid)
     const liveBySid = new Map()
-    const legacyLive = []
 
     for (const c of liveClients) {
-      if (c.sid) {
-        const arr = liveBySid.get(c.sid) || []
-        arr.push(c)
-        liveBySid.set(c.sid, arr)
-      } else {
-        legacyLive.push(c)
-      }
+      if (!c.sid) continue
+      const arr = liveBySid.get(c.sid) || []
+      arr.push(c)
+      liveBySid.set(c.sid, arr)
     }
 
     const sessions = []
@@ -328,13 +292,11 @@ export function createRelayServer(options = {}) {
         ip: newestConn?.ip || p.ip || '',
         online: conns.length > 0,
         isCurrent,
-        legacy: false,
         createdAt: p.createdAt || newestConn?.connectedAt || 0,
         lastSeenAt: newestConn?.lastSeenAt || p.lastSeenAt || p.createdAt || 0,
       })
     }
 
-    // Live clients whose sid wasn't persisted yet (e.g., room/owner mode or restored token)
     for (const [sid, conns] of liveBySid.entries()) {
       if (seenSids.has(sid)) continue
       const newestConn = conns[0]
@@ -352,28 +314,8 @@ export function createRelayServer(options = {}) {
         ip: newestConn.ip || '',
         online: true,
         isCurrent,
-        legacy: !isAccount,
         createdAt: newestConn.connectedAt || 0,
         lastSeenAt: newestConn.lastSeenAt || newestConn.connectedAt || 0,
-      })
-    }
-
-    // Legacy live connections issued before v0.3.9 (no `sid` in JWT)
-    for (const c of legacyLive) {
-      const isCurrent = Boolean(currentClientId && c.clientId === currentClientId)
-      sessions.push({
-        sid: '',
-        clientId: c.clientId,
-        clientIds: [c.clientId],
-        connectionCount: 1,
-        deviceName: c.deviceName || 'Web Client',
-        clientKind: c.clientKind || 'web',
-        ip: c.ip || '',
-        online: true,
-        isCurrent,
-        legacy: true,
-        createdAt: c.connectedAt || 0,
-        lastSeenAt: c.lastSeenAt || c.connectedAt || 0,
       })
     }
 
@@ -424,58 +366,7 @@ export function createRelayServer(options = {}) {
     )
   }
 
-  // Small in-memory LRU cache for bridged PC images (strictly namespaced by roomId)
-  const BRIDGE_IMG_CACHE_MAX_ITEMS = 32
-  const BRIDGE_IMG_CACHE_MAX_BYTES = 48 * 1024 * 1024
-  const BRIDGE_IMG_CACHE_TTL_MS = 5 * 60 * 1000
-  const bridgeImgCache = new Map()
-  let bridgeImgCacheBytes = 0
-
-  function getCachedBridgeImage(key) {
-    const entry = bridgeImgCache.get(key)
-    if (!entry) return null
-    if (Date.now() - entry.cachedAt > BRIDGE_IMG_CACHE_TTL_MS) {
-      bridgeImgCache.delete(key)
-      bridgeImgCacheBytes -= entry.buf.length
-      return null
-    }
-    bridgeImgCache.delete(key)
-    bridgeImgCache.set(key, entry)
-    return entry
-  }
-
-  function setCachedBridgeImage(key, entry) {
-    if (entry.buf.length > BRIDGE_IMG_CACHE_MAX_BYTES / 2) return
-    const existing = bridgeImgCache.get(key)
-    if (existing) {
-      bridgeImgCache.delete(key)
-      bridgeImgCacheBytes -= existing.buf.length
-    }
-    while (
-      bridgeImgCache.size >= BRIDGE_IMG_CACHE_MAX_ITEMS ||
-      bridgeImgCacheBytes + entry.buf.length > BRIDGE_IMG_CACHE_MAX_BYTES
-    ) {
-      const oldestKey = bridgeImgCache.keys().next().value
-      if (!oldestKey) break
-      const oldest = bridgeImgCache.get(oldestKey)
-      bridgeImgCache.delete(oldestKey)
-      if (oldest) bridgeImgCacheBytes -= oldest.buf.length
-    }
-    bridgeImgCache.set(key, entry)
-    bridgeImgCacheBytes += entry.buf.length
-  }
-
-  function purgeRoomBridgeImgCache(roomId) {
-    const prefix = `${roomId}|`
-    for (const [key, entry] of bridgeImgCache.entries()) {
-      if (key.startsWith(prefix)) {
-        bridgeImgCache.delete(key)
-        bridgeImgCacheBytes -= entry.buf.length
-      }
-    }
-  }
-
-  // Periodic cleanup + quota enforcement for temporary uploads (prevents disk exhaustion DoS)
+  // Periodic cleanup + quota enforcement for temporary encrypted uploads (prevents disk exhaustion DoS)
   function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '') {
     try {
       const now = Date.now()
@@ -549,7 +440,7 @@ export function createRelayServer(options = {}) {
   function extractMediaToken(req, urlObj) {
     const headerTok = extractBearer(req)
     if (headerTok) return headerTok
-    return String(urlObj.searchParams.get('mt') || urlObj.searchParams.get('token') || '').trim()
+    return String(urlObj.searchParams.get('mt') || '').trim()
   }
 
   function getClientIp(req) {
@@ -569,26 +460,13 @@ export function createRelayServer(options = {}) {
 
   /**
    * Authenticate a PC Bridge request via HTTP headers ONLY (never URL query secrets!)
-   * Supports:
-   *  - Account device bridges (`usr_*` + per-PC `deviceSecret` -> authoritative `bridgeId`)
-   *  - Legacy multi-tenant room bridges (`rm_*` + room `bridgeSecret`)
-   *  - Legacy owner bridge (`owner` + `BRIDGE_SECRET`)
+   * Strictly requires account device bridges (`usr_*` + per-PC `deviceSecret` -> authoritative `bridgeId`).
    */
   function authenticateBridgeInfo(req, urlObj) {
     const secret = String(req.headers['x-bridge-secret'] || '').trim()
     const requestedRoom = String(req.headers['x-room-id'] || urlObj?.searchParams?.get('roomId') || '').trim()
-    if (!secret) return null
-    if (!requestedRoom || requestedRoom === 'owner') {
-      if (disableLegacyOwnerAuth) return null
-      return auth.verifyBridgeSecret(secret) ? { roomId: 'owner', bridgeId: '', deviceId: '', label: '' } : null
-    }
-    if (requestedRoom.startsWith('usr_')) {
-      return accounts.verifyDeviceBridge(requestedRoom, secret)
-    }
-    if (disableLegacyRooms) return null
-    return rooms.verifyBridge(requestedRoom, secret)
-      ? { roomId: requestedRoom, bridgeId: '', deviceId: '', label: '' }
-      : null
+    if (!secret || !requestedRoom.startsWith('usr_')) return null
+    return accounts.verifyDeviceBridge(requestedRoom, secret)
   }
 
   function authenticateBridge(req, urlObj) {
@@ -605,12 +483,10 @@ export function createRelayServer(options = {}) {
       sendJson(res, 403, { ok: false, error: '仅管理员可访问监控面板' })
       return null
     }
-    if (String(payload.room || '').startsWith('usr_')) {
-      const acct = accounts.getUserById(payload.room)
-      if (!acct || acct.role !== 'admin') {
-        sendJson(res, 403, { ok: false, error: '仅管理员可访问监控面板' })
-        return null
-      }
+    const acct = accounts.getUserById(payload.room)
+    if (!acct || acct.role !== 'admin') {
+      sendJson(res, 403, { ok: false, error: '仅管理员可访问监控面板' })
+      return null
     }
     return payload
   }
@@ -639,67 +515,14 @@ export function createRelayServer(options = {}) {
         sendJson(res, 200, { ok: true })
         return
       }
+      const bridges = hub.getBridgeList(user.room)
       sendJson(res, 200, {
         ok: true,
         roomId: user.room,
-        bridges: hub.getBridgeList(user.room),
+        bridges,
+        onlineBridges: bridges.filter((b) => b.online).length,
         uptimeSec: Math.round(process.uptime()),
-        ...(user.room === 'owner'
-          ? {
-              onlineBridges: hub.getOnlineBridgeCount(),
-              clients: hub.clients.size,
-              rooms: rooms.count() + 1,
-            }
-          : {}),
       })
-      return
-    }
-
-    // Multi-tenant: Register a brand-new isolated room for a PC (optionally invite-code gated)
-    if (pathname === '/api/rooms/register' && req.method === 'POST') {
-      if (disableLegacyRooms) {
-        sendJson(res, 403, { ok: false, error: '旧版匿名房间注册已禁用，请使用账号系统登录' })
-        return
-      }
-      const ip = getClientIp(req)
-      if (!auth.checkRegisterLimit(ip)) {
-        sendJson(res, 429, { ok: false, error: '创建设备过于频繁，请稍后再试' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        const invite = String(req.headers['x-invite-code'] || body.inviteCode || '').trim()
-        if (!auth.verifyRegisterInviteCode(invite)) {
-          auth.recordFailure(ip)
-          sendJson(res, 403, { ok: false, error: '需要有效的邀请码才能注册新设备' })
-          return
-        }
-        const created = rooms.registerRoom({ label: body.label || body.hostname || 'My PC' })
-        sendJson(res, 200, { ok: true, ...created })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Multi-tenant: Refresh 15-min pairing code for an existing PC bridge room
-    if (pathname === '/api/rooms/pair-code' && req.method === 'POST') {
-      if (disableLegacyRooms) {
-        sendJson(res, 403, { ok: false, error: '旧版匿名房间配对已禁用' })
-        return
-      }
-      const secret = String(req.headers['x-bridge-secret'] || '').trim()
-      const roomId = String(req.headers['x-room-id'] || '').trim()
-      if (!roomId || !secret || roomId === 'owner') {
-        sendJson(res, 401, { ok: false, error: '未授权的房间凭证' })
-        return
-      }
-      const refreshed = rooms.refreshPairCode(roomId, secret)
-      if (!refreshed) {
-        sendJson(res, 401, { ok: false, error: '房间密钥无效' })
-        return
-      }
-      sendJson(res, 200, { ok: true, ...refreshed })
       return
     }
 
@@ -744,7 +567,7 @@ export function createRelayServer(options = {}) {
         if (purpose === 'register') {
           const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
           const isBootstrapAdmin =
-            accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAccessPassword(inviteCode)
+            accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAdminBootstrapToken(inviteCode)
           if (!isBootstrapAdmin && !accounts.hasActiveInviteCode(inviteCode)) {
             auth.recordFailure(ip)
             sendJson(res, 400, { ok: false, error: '请先填写有效的一次性邀请码，再获取邮箱验证码' })
@@ -834,7 +657,7 @@ export function createRelayServer(options = {}) {
 
     // Account registration (strictly requires an admin-issued single-use invite code;
     // email binding is strictly optional when SMTP is configured;
-    // when 0 users exist yet, server CLIENT_ACCESS_TOKEN works once to bootstrap the first admin account)
+    // when 0 users exist yet, optional ADMIN_BOOTSTRAP_TOKEN works once to bootstrap the first admin account)
     if (pathname === '/api/account/register' && req.method === 'POST') {
       const ip = getClientIp(req)
       if (!auth.checkRateLimit(ip)) {
@@ -845,7 +668,7 @@ export function createRelayServer(options = {}) {
         const body = await readJsonBody(req)
         const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
         const isBootstrapAdmin =
-          accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAccessPassword(inviteCode)
+          accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAdminBootstrapToken(inviteCode)
 
         const rawEmail = String(body.email || '').trim()
         let verifiedEmail = ''
@@ -1024,7 +847,6 @@ export function createRelayServer(options = {}) {
         emailCodes.consumeCode({ purpose: 'reset', email: eCheck.email })
         auth.clearFailure(ip)
         auth.clearAccountFailure(eCheck.email)
-        purgeRoomBridgeImgCache(reset.user.userId)
         hub.disconnectRoomClients(reset.user.userId, 4401, 'Password reset')
         sendJson(res, 200, {
           ok: true,
@@ -1374,7 +1196,6 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: changed.error })
           return
         }
-        purgeRoomBridgeImgCache(payload.room)
         hub.disconnectRoomClients(payload.room, 4401, 'Password changed')
         const ip = getClientIp(req)
         const devInfo = parseClientDeviceInfo(body.deviceName || payload.dev || '', req.headers['user-agent'] || '', body.clientKind || '')
@@ -1484,17 +1305,12 @@ export function createRelayServer(options = {}) {
       if (!payload) return
       const serverHealth = collectServerHealth({
         uploadDir,
-        bridgeImgCacheItems: bridgeImgCache.size,
-        bridgeImgCacheBytes,
-        bridgeImgCacheMaxBytes: BRIDGE_IMG_CACHE_MAX_BYTES,
         mailer,
-        registerInviteGated: auth.hasRegisterInviteCode(),
         startedAt,
         version: RELAY_VERSION,
       })
       const overview = buildAdminOverview({
         accounts,
-        rooms,
         hub,
         serverHealth,
         currentAdminRoom: payload.room || '',
@@ -1505,7 +1321,7 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Admin Monitor: Kick / revoke a single client session for any user or legacy room
+    // Admin Monitor: Kick / revoke a single client session for any user
     if (pathname === '/api/admin/users/kick-session' && req.method === 'POST') {
       const payload = requireAdmin(req, res)
       if (!payload) return
@@ -1514,7 +1330,7 @@ export function createRelayServer(options = {}) {
         const targetRoom = String(body.userId || body.roomId || '').trim()
         const targetSid = String(body.sid || '').trim()
         const targetClientId = String(body.clientId || '').trim()
-        if (!targetRoom || (!targetSid && !targetClientId)) {
+        if (!targetRoom.startsWith('usr_') || (!targetSid && !targetClientId)) {
           sendJson(res, 400, { ok: false, error: '缺少目标用户或会话标识' })
           return
         }
@@ -1522,17 +1338,14 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: '不能踢出当前正在使用的管理员会话' })
           return
         }
-        let revokedPermanent = false
-        if (targetRoom.startsWith('usr_') && targetSid) {
-          revokedPermanent = accounts.revokeUserSession(targetRoom, targetSid)
-        }
+        const revokedPermanent = targetSid ? accounts.revokeUserSession(targetRoom, targetSid) : false
         const kickedConnections = hub.disconnectClient(
           targetRoom,
           { clientId: targetClientId, sid: targetSid },
           4401,
           'Session revoked by admin',
         )
-        const targetUser = targetRoom.startsWith('usr_') ? accounts.getUserById(targetRoom) : null
+        const targetUser = accounts.getUserById(targetRoom)
         hub.recordActivity({
           type: 'admin.kick',
           roomId: targetRoom,
@@ -1547,14 +1360,14 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Admin Monitor: Force sign-out ALL sessions for a user or legacy room
+    // Admin Monitor: Force sign-out ALL sessions for a user
     if (pathname === '/api/admin/users/revoke-all' && req.method === 'POST') {
       const payload = requireAdmin(req, res)
       if (!payload) return
       try {
         const body = await readJsonBody(req)
         const targetRoom = String(body.userId || body.roomId || '').trim()
-        if (!targetRoom) {
+        if (!targetRoom.startsWith('usr_')) {
           sendJson(res, 400, { ok: false, error: '缺少目标用户标识' })
           return
         }
@@ -1562,16 +1375,13 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: '不能在监控面板强制下线当前管理员自身' })
           return
         }
-        const revoked = targetRoom.startsWith('usr_')
-          ? accounts.revokeUserTokens(targetRoom)
-          : rooms.revokeRoomTokens(targetRoom)
+        const revoked = accounts.revokeUserTokens(targetRoom)
         if (!revoked) {
-          sendJson(res, 404, { ok: false, error: '找不到目标用户或房间' })
+          sendJson(res, 404, { ok: false, error: '找不到目标用户' })
           return
         }
-        purgeRoomBridgeImgCache(targetRoom)
         const disconnectedClients = hub.disconnectRoomClients(targetRoom, 4401, 'All sessions revoked by admin')
-        const targetUser = targetRoom.startsWith('usr_') ? accounts.getUserById(targetRoom) : null
+        const targetUser = accounts.getUserById(targetRoom)
         hub.recordActivity({
           type: 'admin.kick',
           roomId: targetRoom,
@@ -1599,8 +1409,8 @@ export function createRelayServer(options = {}) {
         const body = await readJsonBody(req)
         const targetRoom = String(body.roomId || body.userId || '').trim()
         const targetBridgeId = String(body.bridgeId || '').trim()
-        if (!targetRoom || !targetBridgeId) {
-          sendJson(res, 400, { ok: false, error: '缺少目标房间或桥接标识' })
+        if (!targetRoom.startsWith('usr_') || !targetBridgeId) {
+          sendJson(res, 400, { ok: false, error: '缺少目标用户或桥接标识' })
           return
         }
         const disconnected = hub.disconnectBridge(targetRoom, targetBridgeId, 4000, 'Disconnected by admin')
@@ -1608,7 +1418,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 404, { ok: false, error: '该电脑桥接当前不在线' })
           return
         }
-        const targetUser = targetRoom.startsWith('usr_') ? accounts.getUserById(targetRoom) : null
+        const targetUser = accounts.getUserById(targetRoom)
         hub.recordActivity({
           type: 'admin.kick',
           roomId: targetRoom,
@@ -1617,112 +1427,6 @@ export function createRelayServer(options = {}) {
           ip: getClientIp(req),
         })
         sendJson(res, 200, { ok: true, disconnected })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Revoke ALL active mobile tokens for a room or account (callable by either the PC bridge or an authenticated mobile client)
-    if (pathname === '/api/rooms/revoke' && req.method === 'POST') {
-      const bridgeRoom = authenticateBridge(req, urlObj)
-      const clientUser = bridgeRoom ? null : auth.verifySessionToken(extractBearer(req))
-      const targetRoom = bridgeRoom || clientUser?.room || null
-      if (!targetRoom) {
-        sendJson(res, 401, { ok: false, error: '未授权' })
-        return
-      }
-      const revoked = targetRoom.startsWith('usr_')
-        ? accounts.revokeUserTokens(targetRoom)
-        : rooms.revokeRoomTokens(targetRoom)
-      if (!revoked) {
-        sendJson(res, 404, { ok: false, error: '房间或账号不存在' })
-        return
-      }
-      purgeRoomBridgeImgCache(targetRoom)
-      const disconnectedClients = hub.disconnectRoomClients(targetRoom, 4401, 'Session revoked')
-      sendJson(res, 200, {
-        ok: true,
-        roomId: revoked.roomId,
-        tokenVersion: revoked.tokenVersion,
-        disconnectedClients,
-      })
-      return
-    }
-
-    // Multi-tenant: Mobile pairing via single-use 8-char Pairing Code or QR pairToken -> room-scoped 30-day JWT
-    if (pathname === '/api/auth/pair' && req.method === 'POST') {
-      if (disableLegacyRooms) {
-        sendJson(res, 403, { ok: false, error: '旧版扫码配对已禁用，请使用个人账号登录' })
-        return
-      }
-      const ip = getClientIp(req)
-      if (!auth.checkRateLimit(ip)) {
-        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        const result = rooms.exchangePair({
-          pairCode: body.pairCode || body.code || '',
-          pairToken: body.pairToken || body.token || '',
-        })
-        if (!result.ok) {
-          auth.recordFailure(ip)
-          sendJson(res, 401, { ok: false, error: result.error })
-          return
-        }
-        auth.clearFailure(ip)
-        const token = auth.signSessionToken(
-          result.roomId,
-          body.deviceName || 'mobile',
-          result.roomId,
-          result.tokenVersion,
-        )
-        sendJson(res, 200, {
-          ok: true,
-          token,
-          roomId: result.roomId,
-          label: result.label,
-          bridges: hub.getBridgeList(result.roomId),
-        })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Owner mobile login -> signed session token strictly scoped to `room = 'owner'`
-    if (pathname === '/api/auth/login' && req.method === 'POST') {
-      if (disableLegacyOwnerAuth) {
-        sendJson(res, 403, { ok: false, error: '旧版共享密钥登录已禁用，请使用个人账号登录' })
-        return
-      }
-      const ip = getClientIp(req)
-      if (!auth.checkRateLimit(ip)) {
-        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        if (!auth.verifyAccessPassword(body.password || body.token || '')) {
-          auth.recordFailure(ip)
-          sendJson(res, 401, { ok: false, error: '访问密钥不正确' })
-          return
-        }
-        auth.clearFailure(ip)
-        const token = auth.signSessionToken(
-          'owner',
-          body.deviceName || 'mobile',
-          'owner',
-          rooms.getTokenVersion('owner'),
-        )
-        sendJson(res, 200, {
-          ok: true,
-          token,
-          roomId: 'owner',
-          bridges: hub.getBridgeList('owner'),
-        })
       } catch {
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
@@ -1747,13 +1451,11 @@ export function createRelayServer(options = {}) {
         req.headers['user-agent'] || '',
         body?.clientKind || '',
       )
-      if (String(payload.room || '').startsWith('usr_') && payload.sid) {
-        accounts.touchUserSession(payload.room, payload.sid, {
-          deviceName: devInfo.deviceName,
-          clientKind: devInfo.clientKind,
-          ip: getClientIp(req),
-        })
-      }
+      accounts.touchUserSession(payload.room, payload.sid, {
+        deviceName: devInfo.deviceName,
+        clientKind: devInfo.clientKind,
+        ip: getClientIp(req),
+      })
       const { ticket, expiresAt } = auth.issueWsTicket(payload, {
         deviceName: devInfo.deviceName,
         clientKind: devInfo.clientKind,
@@ -1803,11 +1505,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: '不能踢出当前本机设备，如需退出请使用退出登录' })
           return
         }
-        const isAccount = String(payload.room || '').startsWith('usr_')
-        let revokedPermanent = false
-        if (isAccount && targetSid) {
-          revokedPermanent = accounts.revokeUserSession(payload.room, targetSid)
-        }
+        const revokedPermanent = targetSid ? accounts.revokeUserSession(payload.room, targetSid) : false
         const kickedConnections = hub.disconnectClient(
           payload.room,
           { clientId: targetClientId, sid: targetSid },
@@ -1822,7 +1520,6 @@ export function createRelayServer(options = {}) {
           ok: true,
           revokedPermanent,
           kickedConnections,
-          legacy: !revokedPermanent,
           ...merged,
         })
       } catch {
@@ -1831,7 +1528,7 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Nuclear security action: revoke EVERY other device/token (including offline & legacy JWTs) while keeping caller logged in with a fresh rotated JWT
+    // Revoke EVERY other device/token while keeping caller logged in with a fresh rotated JWT
     if (pathname === '/api/auth/sessions/revoke-others' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
@@ -1841,48 +1538,33 @@ export function createRelayServer(options = {}) {
       try {
         const body = await readJsonBody(req)
         const currentClientId = String(body.currentClientId || '').trim()
-        const targetRoom = String(payload.room || 'owner').trim() || 'owner'
-        const isAccount = targetRoom.startsWith('usr_')
+        const targetRoom = payload.room
         const ip = getClientIp(req)
         const devInfo = parseClientDeviceInfo(
           body.deviceName || payload.dev || '',
           req.headers['user-agent'] || '',
           body.clientKind || '',
         )
-        const revoked = isAccount
-          ? accounts.revokeUserTokens(targetRoom)
-          : rooms.revokeRoomTokens(targetRoom)
+        const revoked = accounts.revokeUserTokens(targetRoom)
         if (!revoked) {
-          sendJson(res, 404, { ok: false, error: '账号或房间不存在' })
+          sendJson(res, 404, { ok: false, error: '账号不存在' })
           return
         }
-        purgeRoomBridgeImgCache(targetRoom)
         const newSid = auth.generateSessionId()
-        let freshToken = ''
-        if (isAccount) {
-          const acctUser = accounts.getUserById(targetRoom)
-          accounts.recordUserSession(targetRoom, {
-            sid: newSid,
-            deviceName: devInfo.deviceName,
-            clientKind: devInfo.clientKind,
-            ip,
-          })
-          freshToken = auth.signSessionToken(
-            targetRoom,
-            devInfo.deviceName,
-            targetRoom,
-            revoked.tokenVersion,
-            { role: acctUser?.role || payload.role || 'user', username: acctUser?.username || payload.uname || '', sid: newSid },
-          )
-        } else {
-          freshToken = auth.signSessionToken(
-            targetRoom,
-            devInfo.deviceName,
-            targetRoom,
-            revoked.tokenVersion,
-            { role: payload.role || (targetRoom === 'owner' ? 'admin' : 'user'), sid: newSid },
-          )
-        }
+        const acctUser = accounts.getUserById(targetRoom)
+        accounts.recordUserSession(targetRoom, {
+          sid: newSid,
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip,
+        })
+        const freshToken = auth.signSessionToken(
+          targetRoom,
+          devInfo.deviceName,
+          targetRoom,
+          revoked.tokenVersion,
+          { role: acctUser?.role || payload.role || 'user', username: acctUser?.username || payload.uname || '', sid: newSid },
+        )
         const kickedConnections = hub.disconnectOtherRoomClients(
           targetRoom,
           { keepClientId: currentClientId, newSidForKept: newSid },
@@ -1907,7 +1589,29 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Issue a 15-minute read-only scoped media token for <img> / download links (cannot open WS or run RPCs)
+    // Revoke ALL active sessions for the authenticated account (including current terminal)
+    if (pathname === '/api/auth/sessions/revoke-all' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      const revoked = accounts.revokeUserTokens(payload.room)
+      if (!revoked) {
+        sendJson(res, 404, { ok: false, error: '账号不存在' })
+        return
+      }
+      const disconnectedClients = hub.disconnectRoomClients(payload.room, 4401, 'All sessions revoked')
+      sendJson(res, 200, {
+        ok: true,
+        roomId: revoked.roomId,
+        tokenVersion: revoked.tokenVersion,
+        disconnectedClients,
+      })
+      return
+    }
+
+    // Issue a 15-minute read-only scoped media token for downloading encrypted `/api/uploads/:id` ciphertext
     if (pathname === '/api/auth/media-token' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
@@ -1926,30 +1630,32 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
-      const isAccount = String(payload.room || '').startsWith('usr_')
-      const acctUser = isAccount ? accounts.getUserById(payload.room) : null
-      const roomMeta = isAccount ? null : rooms.getRoomMeta(payload.room)
+      const acctUser = accounts.getUserById(payload.room)
+      if (!acctUser) {
+        sendJson(res, 401, { ok: false, error: '账号不存在' })
+        return
+      }
       const bridges = hub.getBridgeList(payload.room)
       const clientSessions = getMergedClientSessions(payload.room, { currentSid: payload.sid || '' })
       sendJson(res, 200, {
         ok: true,
         user: payload,
         roomId: payload.room,
-        username: acctUser?.username || payload.uname || '',
-        email: acctUser?.email || '',
-        emailVerified: Boolean(acctUser?.emailVerified),
-        loginEmail2fa: Boolean(acctUser?.loginEmail2fa),
+        username: acctUser.username,
+        email: acctUser.email || '',
+        emailVerified: Boolean(acctUser.emailVerified),
+        loginEmail2fa: Boolean(acctUser.loginEmail2fa),
         emailEnabled: mailer.isConfigured(),
-        role: acctUser?.role || (payload.room === 'owner' ? 'admin' : 'user'),
-        label: acctUser ? `@${acctUser.username}` : roomMeta?.label || '',
-        ...(isAccount ? { devices: getMergedAccountDevices(payload.room, bridges) } : {}),
+        role: acctUser.role,
+        label: `@${acctUser.username}`,
+        devices: getMergedAccountDevices(payload.room, bridges),
         bridges,
         clientSessions,
       })
       return
     }
 
-    // Attachment upload (scoped strictly to caller's roomId)
+    // Encrypted attachment upload (strictly requires E2EE ciphertext scoped to caller's account roomId)
     if (pathname === '/api/uploads' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
@@ -1958,6 +1664,14 @@ export function createRelayServer(options = {}) {
       }
       try {
         const body = await readJsonBody(req, Math.ceil(MAX_UPLOAD_BYTES * 1.45))
+        if (body.encrypted !== true) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'E2EE_UPLOAD_REQUIRED',
+            error: '附件必须先经过端到端加密再上传',
+          })
+          return
+        }
         const rawBase64 = String(body.dataBase64 || '')
         const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',').pop() : rawBase64
         const buf = Buffer.from(cleanBase64, 'base64')
@@ -1965,19 +1679,15 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: '文件为空或超过 15MB 限制' })
           return
         }
-        const isEncrypted = Boolean(body.encrypted)
-        const safeName = isEncrypted
-          ? 'encrypted.bin'
-          : String(body.filename || 'upload.bin').replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_').slice(0, 100)
-        const ownerRoom = payload.room || 'owner'
+        const ownerRoom = payload.room
         pruneUploadsForQuota(buf.length, ownerRoom)
         const id = randomUUID()
         const meta = {
           id,
           roomId: ownerRoom,
-          filename: safeName,
-          mimeType: isEncrypted ? 'application/octet-stream' : String(body.mimeType || 'application/octet-stream'),
-          encrypted: isEncrypted,
+          filename: 'encrypted.bin',
+          mimeType: 'application/octet-stream',
+          encrypted: true,
           size: buf.length,
           createdAt: Date.now(),
         }
@@ -1989,7 +1699,7 @@ export function createRelayServer(options = {}) {
             id: meta.id,
             filename: meta.filename,
             mimeType: meta.mimeType,
-            encrypted: meta.encrypted,
+            encrypted: true,
             size: meta.size,
             createdAt: meta.createdAt,
             url: `/api/uploads/${id}`,
@@ -2001,77 +1711,7 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Proxy local PC image files strictly through the authenticated user's OWN room bridge
-    if (pathname === '/api/bridge-file' && (req.method === 'GET' || req.method === 'HEAD')) {
-      const payload = auth.verifyMediaToken(extractMediaToken(req, urlObj))
-      if (!payload) {
-        sendJson(res, 401, { ok: false, error: '未授权' })
-        return
-      }
-      const roomId = payload.room || 'owner'
-      const filePath = urlObj.searchParams.get('path') || ''
-      const cwd = urlObj.searchParams.get('cwd') || ''
-      const bridgeId = urlObj.searchParams.get('bridgeId') || undefined
-      const asDownload = urlObj.searchParams.get('download') === '1'
-      if (!filePath.trim()) {
-        sendJson(res, 400, { ok: false, error: '缺少 path 参数' })
-        return
-      }
-
-      const cacheKey = `${roomId}|${bridgeId || 'primary'}|${cwd}|${filePath}`
-      try {
-        let entry = getCachedBridgeImage(cacheKey)
-        if (!entry) {
-          const result = await hub.callBridge(
-            roomId,
-            RPC.FILE_READ,
-            { path: filePath, cwd },
-            { bridgeId, timeoutMs: 25_000 },
-          )
-          if (!result?.dataBase64 || !String(result.mimeType || '').startsWith('image/')) {
-            sendJson(res, 403, { ok: false, error: '仅支持预览图片文件' })
-            return
-          }
-          const buf = Buffer.from(result.dataBase64, 'base64')
-          entry = {
-            buf,
-            mimeType: result.mimeType,
-            filename: result.filename || 'image.png',
-            cachedAt: Date.now(),
-          }
-          setCachedBridgeImage(cacheKey, entry)
-        }
-
-        const headers = {
-          'Content-Type': entry.mimeType,
-          'Content-Length': entry.buf.length,
-          'Content-Disposition': `${asDownload ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(entry.filename)}`,
-          'Cache-Control': 'private, max-age=300',
-          'X-Content-Type-Options': 'nosniff',
-        }
-        if (entry.mimeType === 'image/svg+xml') {
-          headers['Content-Security-Policy'] = "default-src 'none'; sandbox"
-        }
-        res.writeHead(200, headers)
-        if (req.method === 'HEAD') res.end()
-        else res.end(entry.buf)
-      } catch (err) {
-        const msg = String(err?.message || err)
-        const status = err?.code === 'BRIDGE_OFFLINE'
-          ? 503
-          : err?.code === 'E2EE_KEY_REQUIRED' || err?.code === 'E2EE_KEY_MISMATCH'
-            ? 403
-          : /找不到/.test(msg)
-            ? 404
-            : /仅允许|不支持|拒绝访问/.test(msg)
-              ? 403
-              : 500
-        sendJson(res, status, { ok: false, error: msg })
-      }
-      return
-    }
-
-    // Attachment download (strictly isolated to the owning roomId!)
+    // Encrypted attachment download (strictly isolated to the owning account roomId)
     if (pathname.startsWith('/api/uploads/') && req.method === 'GET') {
       const bridgeRoom = authenticateBridge(req, urlObj)
       const clientUser = bridgeRoom ? null : auth.verifyMediaToken(extractMediaToken(req, urlObj))
@@ -2088,9 +1728,9 @@ export function createRelayServer(options = {}) {
         return
       }
       const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-      const fileRoom = meta.roomId || 'owner'
-      if (fileRoom !== callerRoom) {
-        sendJson(res, 403, { ok: false, error: '无权访问其他房间的文件' })
+      const fileRoom = meta.roomId
+      if (!fileRoom || fileRoom !== callerRoom) {
+        sendJson(res, 403, { ok: false, error: '无权访问其他账号的文件' })
         return
       }
       const data = readFileSync(binPath)
@@ -2099,12 +1739,10 @@ export function createRelayServer(options = {}) {
         try { unlinkSync(binPath) } catch {}
         try { unlinkSync(metaPath) } catch {}
       }
-      const safeMime = String(meta.mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase()
-      const disposition = SAFE_INLINE_IMAGE_MIMES.has(safeMime) ? 'inline' : 'attachment'
       res.writeHead(200, {
-        'Content-Type': meta.mimeType || 'application/octet-stream',
+        'Content-Type': 'application/octet-stream',
         'Content-Length': data.length,
-        'Content-Disposition': `${disposition}; filename*=UTF-8''${encodeURIComponent(meta.filename || 'upload.bin')}`,
+        'Content-Disposition': `attachment; filename*=UTF-8''encrypted.bin`,
         'Cache-Control': 'private, no-store',
         'X-Content-Type-Options': 'nosniff',
         'Content-Security-Policy': "default-src 'none'; sandbox",
@@ -2228,10 +1866,14 @@ export function createRelayServer(options = {}) {
 
     if (pathname === '/ws/bridge') {
       const bridgeIp = getClientIp(req)
-      const requestedRoom =
-        String(
-          req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || urlObj.searchParams.get('room') || '',
-        ).trim() || 'owner'
+      const requestedRoom = String(
+        req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '',
+      ).trim()
+      if (!requestedRoom.startsWith('usr_')) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+        socket.destroy()
+        return
+      }
       if (!auth.checkBridgeRateLimit(bridgeIp, requestedRoom)) {
         socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n')
         socket.destroy()
@@ -2245,15 +1887,18 @@ export function createRelayServer(options = {}) {
         return
       }
       auth.clearBridgeFailure(bridgeIp, requestedRoom)
+      const initialKeyId = String(
+        req.headers['x-e2ee-key-id'] || urlObj.searchParams.get('e2eeKeyId') || '',
+      ).trim()
       const meta = {
         roomId: bridgeAuth.roomId,
-        // For account-bound devices, enforce the authoritative bridgeId bound to that deviceSecret
         bridgeId: bridgeAuth.bridgeId || urlObj.searchParams.get('bridgeId') || 'home-pc',
         deviceId: bridgeAuth.deviceId || '',
         label: bridgeAuth.label || '',
         hostname: urlObj.searchParams.get('hostname') || bridgeAuth.hostname || 'PC',
         platform: urlObj.searchParams.get('platform') || bridgeAuth.platform || 'win32',
-        mode: urlObj.searchParams.get('mode') || 'dsh-plugin',
+        mode: urlObj.searchParams.get('mode') || 'desktop',
+        ...(initialKeyId ? { e2ee: { enabled: true, v: 1, keyId: initialKeyId } } : {}),
         ip: getClientIp(req),
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -2269,15 +1914,9 @@ export function createRelayServer(options = {}) {
         socket.destroy()
         return
       }
+      // Strictly require a single-use 30s ws-ticket (never accept master JWTs in URLs)
       const ticket = String(urlObj.searchParams.get('ticket') || '').trim()
-      let user = null
-      if (ticket) {
-        user = auth.consumeWsTicket(ticket)
-      } else {
-        // Fallback for older cached mobile clients or header-authenticated callers
-        const legacyTok = extractBearer(req) || String(urlObj.searchParams.get('token') || '').trim()
-        user = auth.verifySessionToken(legacyTok)
-      }
+      const user = ticket ? auth.consumeWsTicket(ticket) : null
       if (!user) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()
@@ -2286,14 +1925,12 @@ export function createRelayServer(options = {}) {
       const lastSeq = Number(urlObj.searchParams.get('lastSeq') || 0)
       const clientIp = getClientIp(req)
       const clientUa = String(req.headers['user-agent'] || '')
-      if (String(user?.room || '').startsWith('usr_') && user?.sid) {
-        const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
-        accounts.touchUserSession(user.room, user.sid, {
-          deviceName: devInfo.deviceName,
-          clientKind: devInfo.clientKind,
-          ip: clientIp,
-        })
-      }
+      const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
+      accounts.touchUserSession(user.room, user.sid, {
+        deviceName: devInfo.deviceName,
+        clientKind: devInfo.clientKind,
+        ip: clientIp,
+      })
       wss.handleUpgrade(req, socket, head, (ws) => {
         hub.registerClient(ws, user, { lastSeq, ip: clientIp, userAgent: clientUa })
       })
@@ -2313,8 +1950,8 @@ export function createRelayServer(options = {}) {
         console.log(`[relay] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
         console.log(`[relay] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
         console.log(`[relay] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
-        if (clientAccessToken === 'allinone-dev-pass' || bridgeSecret === 'allinone-dev-bridge') {
-          console.warn('[relay] WARNING: Using default dev secrets! Please set CLIENT_ACCESS_TOKEN and BRIDGE_SECRET in .env before deploying publicly.')
+        if (jwtSecret.length < 16) {
+          console.warn('[relay] WARNING: JWT_SECRET is not set — using an ephemeral random signing key (sessions will reset on restart). Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
         }
         resolveStart({ port: boundPort, host })
       })
@@ -2329,7 +1966,7 @@ export function createRelayServer(options = {}) {
       })
     })
 
-  return { server, wss, hub, rooms, accounts, mailer, start, close }
+  return { server, wss, hub, accounts, mailer, start, close }
 }
 
 // Run directly when invoked as main script

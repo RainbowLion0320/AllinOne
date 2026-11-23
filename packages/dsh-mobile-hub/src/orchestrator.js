@@ -211,8 +211,8 @@ export class MultiAppOrchestrator {
         this.log.warn?.(`mobile-hub: rejected untrusted attachment URL: ${rawUrl.slice(0, 120)}`)
         continue
       }
-      if (this.e2eeKey && !att.e2ee?.iv) {
-        this.log.warn?.(`mobile-hub: rejected unencrypted attachment while E2EE is enabled: ${String(att.filename || '').slice(0, 64)}`)
+      if (!this.e2eeKey || !att.e2ee?.iv) {
+        this.log.warn?.(`mobile-hub: rejected unencrypted attachment: ${String(att.filename || '').slice(0, 64)}`)
         continue
       }
       try {
@@ -231,18 +231,12 @@ export class MultiAppOrchestrator {
         if (arrBuf.byteLength === 0 || arrBuf.byteLength > MAX_DOWNLOAD_BYTES + 64) {
           throw new Error('Attachment size invalid or exceeds 15MB limit')
         }
-        let plainBytes = new Uint8Array(arrBuf)
-        if (this.e2eeKey) {
-          if (!att.e2ee?.iv) {
-            throw new Error('已开启端到端加密，拒绝下载未加密的附件')
-          }
-          plainBytes = await decryptBytes(this.e2eeKey, plainBytes, {
-            iv: att.e2ee.iv,
-            kid: att.e2ee.kid || '',
-            kind: 'upload',
-            roomId: this.roomId || 'owner',
-          })
-        }
+        const plainBytes = await decryptBytes(this.e2eeKey, new Uint8Array(arrBuf), {
+          iv: att.e2ee.iv,
+          kid: att.e2ee.kid || '',
+          kind: 'upload',
+          roomId: this.roomId,
+        })
         const rawBase = basename(String(att.filename || 'upload.bin'))
         const safe = rawBase
           .replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_')

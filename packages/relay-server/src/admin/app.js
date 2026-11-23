@@ -22,7 +22,6 @@
 
   const state = {
     token: '',
-    authMode: 'account', // 'account' | 'owner'
     lang: loadInitialLang(),
     theme: loadInitialTheme(), // 'dark' | 'light'
     activeTab: 'overview', // 'overview' | 'connections' | 'invites' | 'activity'
@@ -230,14 +229,10 @@
 
     setText('login-title', 'All in One 监控看板', 'All in One Monitor')
     setText('login-subtitle', '服务器全用户在线状态与轻量运维后台', 'Lightweight server & user status dashboard')
-    setText('mode-account-btn', '管理员账号', 'Admin Account')
-    setText('mode-owner-btn', '服务端密钥', 'Owner Secret')
     setText('lbl-username', '用户名或邮箱', 'Username or Email')
     setText('lbl-password', '密码', 'Password')
     setText('lbl-twofa', '邮箱 6 位登录验证码', '6-Digit Email Login Code')
     setPh('inp-twofa', '输入 6 位验证码', 'Enter 6-digit code')
-    setText('lbl-owner-key', '服务端访问密钥 (CLIENT_ACCESS_TOKEN)', 'Owner Access Token (CLIENT_ACCESS_TOKEN)')
-    setPh('inp-owner-key', '输入服务端访问密钥', 'Enter CLIENT_ACCESS_TOKEN')
     setText('lbl-remember', '在本机浏览器记住管理员登录态', 'Remember admin session on this browser')
     setText('btn-login', '登录监控后台', 'Sign In to Dashboard')
     setText('login-note', '按需拉取 · 无后台轮询 · 零额外常驻进程', 'On-demand · Zero idle polling · Zero extra processes')
@@ -279,7 +274,6 @@
 
     setText('users-section-title', '全部用户状态', 'All Users Status')
     setPh('user-search', '搜索用户名、邮箱、电脑、IP...', 'Search username, email, PC, IP...')
-    setText('legacy-title', '旧版房间 / 密钥模式连接', 'Legacy Rooms / Owner Mode')
     setText('live-bridges-title', '在线电脑桥接 (PC Bridges)', 'Online PC Bridges')
     setText('live-clients-title', '在线控制终端 (Mobile / Desktop / Web)', 'Online Controlling Terminals')
     setText('invites-title', '一次性注册邀请码', 'Single-Use Invite Codes')
@@ -340,7 +334,7 @@
         const targetBase = RELAY_BASE_URL.toLowerCase()
         for (const d of candidates) {
           if (!d?.token) continue
-          const isAdm = d.role === 'admin' || d.roomId === 'owner'
+          const isAdm = d.role === 'admin'
           if (!isAdm) continue
           let matchesBase = !d.baseUrl
           if (d.baseUrl) {
@@ -534,7 +528,6 @@
     renderKpis(d)
     renderInsights(d)
     renderUsersSection(d)
-    renderLegacyRooms(d)
     renderLiveConnections(d)
     renderInvites(d)
     renderActivity(d)
@@ -1053,35 +1046,6 @@
     `
   }
 
-  function renderLegacyRooms(d) {
-    const card = document.getElementById('legacy-rooms-card')
-    const rooms = d.legacyRooms || []
-    if (rooms.length === 0) {
-      card.classList.add('hidden')
-      return
-    }
-    card.classList.remove('hidden')
-    document.getElementById('legacy-hint').textContent = bi(
-      `${rooms.length} 个旧版房间`,
-      `${rooms.length} legacy room(s)`,
-    )
-    document.getElementById('legacy-rooms-list').innerHTML = rooms.map((r) => `
-      <div class="legacy-card">
-        <div class="detail-item-title">
-          <span class="dot ${(r.onlineBridgeCount > 0 || r.onlineClientCount > 0) ? 'dot-emerald' : 'dot-muted'}"></span>
-          <span>${esc(r.label)}</span>
-          <span class="pill pill-subtle mono">${esc(r.roomId)}</span>
-        </div>
-        <div class="detail-item-meta">
-          <span>${esc(bi(`在线电脑 ${r.onlineBridgeCount}`, `${r.onlineBridgeCount} PC(s) online`))}</span>
-          <span>${esc(bi(`在线终端 ${r.onlineClientCount}`, `${r.onlineClientCount} client(s) online`))}</span>
-          <span>RPC: ${esc(r.stats?.rpcCount || 0)}</span>
-          <span>${esc(fmtRelative(r.lastSeenAt))}</span>
-        </div>
-      </div>
-    `).join('')
-  }
-
   function renderLiveConnections(d) {
     const bridges = d.liveBridges || []
     const clients = d.liveClients || []
@@ -1330,17 +1294,6 @@
   // ---- Event Wiring ----
 
   function bindEvents() {
-    // Login mode tabs
-    document.querySelectorAll('.auth-tab').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        state.authMode = btn.dataset.mode === 'owner' ? 'owner' : 'account'
-        document.querySelectorAll('.auth-tab').forEach((b) => b.classList.toggle('active', b === btn))
-        document.getElementById('account-fields').classList.toggle('hidden', state.authMode !== 'account')
-        document.getElementById('owner-fields').classList.toggle('hidden', state.authMode !== 'owner')
-        document.getElementById('login-error').classList.add('hidden')
-      })
-    })
-
     // Login form submit
     document.getElementById('login-form').addEventListener('submit', async (e) => {
       e.preventDefault()
@@ -1351,43 +1304,31 @@
 
       try {
         const remember = document.getElementById('inp-remember').checked
-        let res
-        if (state.authMode === 'owner') {
-          const password = document.getElementById('inp-owner-key').value.trim()
-          if (!password) throw new Error(bi('请输入服务端访问密钥', 'Please enter CLIENT_ACCESS_TOKEN'))
-          res = await apiFetch('/api/auth/login', {
-            method: 'POST',
-            auth: false,
-            body: { password, deviceName: 'Admin Monitor' },
-          })
-        } else {
-          const username = document.getElementById('inp-username').value.trim()
-          const password = document.getElementById('inp-password').value
-          const twofaWrap = document.getElementById('twofa-field')
-          const twofaInput = document.getElementById('inp-twofa')
-          const emailCode = !twofaWrap.classList.contains('hidden') ? twofaInput.value.trim() : ''
-          if (!username || !password) throw new Error(bi('请输入管理员账号和密码', 'Please enter username and password'))
-          res = await apiFetch('/api/account/login', {
-            method: 'POST',
-            auth: false,
-            body: {
-              username,
-              password,
-              ...(emailCode ? { emailCode } : {}),
-              deviceName: 'Admin Monitor',
-              clientKind: 'web',
-            },
-          })
-          if (res.user?.role !== 'admin') {
-            throw new Error(bi('该账号不是管理员，无法进入服务器监控看板', 'This account is not an administrator'))
-          }
-          twofaWrap.classList.add('hidden')
-          twofaInput.value = ''
+        const username = document.getElementById('inp-username').value.trim()
+        const password = document.getElementById('inp-password').value
+        const twofaWrap = document.getElementById('twofa-field')
+        const twofaInput = document.getElementById('inp-twofa')
+        const emailCode = !twofaWrap.classList.contains('hidden') ? twofaInput.value.trim() : ''
+        if (!username || !password) throw new Error(bi('请输入管理员账号和密码', 'Please enter username and password'))
+        const res = await apiFetch('/api/account/login', {
+          method: 'POST',
+          auth: false,
+          body: {
+            username,
+            password,
+            ...(emailCode ? { emailCode } : {}),
+            deviceName: 'Admin Monitor',
+            clientKind: 'web',
+          },
+        })
+        if (res.user?.role !== 'admin') {
+          throw new Error(bi('该账号不是管理员，无法进入服务器监控看板', 'This account is not an administrator'))
         }
+        twofaWrap.classList.add('hidden')
+        twofaInput.value = ''
         state.token = res.token
         saveAdminToken(res.token, remember)
         document.getElementById('inp-password').value = ''
-        document.getElementById('inp-owner-key').value = ''
         await loadOverview()
         scheduleAutoRefresh()
       } catch (err) {

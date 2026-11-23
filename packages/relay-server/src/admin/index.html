@@ -36,11 +36,6 @@
           </div>
         </div>
 
-        <div class="auth-mode-tabs" role="tablist">
-          <button type="button" id="mode-account-btn" class="auth-tab active" data-mode="account">管理员账号</button>
-          <button type="button" id="mode-owner-btn" class="auth-tab" data-mode="owner">服务端密钥</button>
-        </div>
-
         <form id="login-form" class="login-form" autocomplete="on">
           <div id="account-fields">
             <label class="field">
@@ -58,13 +53,6 @@
               </label>
               <p id="twofa-hint" class="muted-text" style="margin-bottom:8px"></p>
             </div>
-          </div>
-
-          <div id="owner-fields" class="hidden">
-            <label class="field">
-              <span id="lbl-owner-key">CLIENT_ACCESS_TOKEN</span>
-              <input id="inp-owner-key" type="password" autocomplete="off" placeholder="输入服务端访问密钥" />
-            </label>
           </div>
 
           <label class="remember-row">
@@ -198,15 +186,6 @@
 
             <div id="user-filter-pills" class="filter-pills"></div>
             <div id="users-list" class="users-list"></div>
-          </div>
-
-          <!-- Legacy Rooms Section (shown only if owner/rm_* rooms exist) -->
-          <div id="legacy-rooms-card" class="card hidden">
-            <div class="card-header">
-              <h2 class="card-title" id="legacy-title">旧版房间 / 密钥模式连接</h2>
-              <span class="muted-text" id="legacy-hint"></span>
-            </div>
-            <div id="legacy-rooms-list" class="legacy-list"></div>
           </div>
         </section>
 

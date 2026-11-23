@@ -85,11 +85,12 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
 }
 
 /**
- * Strictly room-isolated multi-tenant WebSocket hub connecting:
- *  - PC Bridges (each bound to a single `roomId`: `'owner'` or `'rm_<id>'`)
- *  - Mobile App WebSocket clients (each JWT-bound to a single `roomId`)
+ * Strictly account-isolated, zero-knowledge E2EE WebSocket hub connecting:
+ *  - PC Bridges (each bound to a single account `roomId`: `'usr_<id>'`, mandatory E2EE)
+ *  - Mobile/Desktop/Web clients (each JWT-bound to a single account `roomId`)
  *
- * Guarantees Room A can NEVER see Room B's bridges, events, RPCs, or files.
+ * Guarantees Account A can NEVER see Account B's bridges, events, RPCs, or files,
+ * and Relay NEVER forwards plaintext RPCs or bridge events.
  */
 export class RelayHub {
   constructor({ log = console, getRoomDevices = null } = {}) {
@@ -118,7 +119,7 @@ export class RelayHub {
   }
 
   getOrCreateRoomStats(roomId) {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
     let st = this.roomStats.get(rid)
     if (!st) {
       if (this.roomStats.size >= ROOM_STATS_MAX) {
@@ -132,7 +133,7 @@ export class RelayHub {
   }
 
   getRoomStats(roomId) {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
     const st = this.roomStats.get(rid)
     return st
       ? { ...st }
@@ -224,11 +225,11 @@ export class RelayHub {
   }
 
   bridgeKey(roomId, bridgeId) {
-    return `${roomId || 'owner'}::${bridgeId || 'home-pc'}`
+    return `${String(roomId || '').trim()}::${bridgeId || 'home-pc'}`
   }
 
   getRoomEventState(roomId) {
-    const rid = roomId || 'owner'
+    const rid = String(roomId || '').trim()
     let st = this.roomEvents.get(rid)
     if (!st) {
       st = { seq: 0, buffer: [] }
@@ -245,8 +246,9 @@ export class RelayHub {
     return n
   }
 
-  getBridgeList(roomId = 'owner') {
-    const rid = roomId || 'owner'
+  getBridgeList(roomId) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return []
     const out = []
     for (const b of this.bridges.values()) {
       if (b.roomId !== rid) continue
@@ -257,7 +259,7 @@ export class RelayHub {
         online: b.ws.readyState === 1,
         hostname: b.meta?.hostname || b.bridgeId,
         platform: b.meta?.platform || 'unknown',
-        mode: b.meta?.mode || 'dsh-plugin',
+        mode: b.meta?.mode || 'desktop',
         apps: b.meta?.apps || [],
         e2ee: b.meta?.e2ee || null,
         connectedAt: b.connectedAt,
@@ -267,8 +269,9 @@ export class RelayHub {
     return out
   }
 
-  getPrimaryBridge(roomId = 'owner', requestedId) {
-    const rid = roomId || 'owner'
+  getPrimaryBridge(roomId, requestedId) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return null
     const reqId = String(requestedId || '').trim()
     if (reqId) {
       const b = this.bridges.get(this.bridgeKey(rid, reqId))
@@ -281,7 +284,11 @@ export class RelayHub {
   }
 
   registerBridge(ws, meta = {}) {
-    const roomId = String(meta.roomId || 'owner').trim() || 'owner'
+    const roomId = String(meta.roomId || '').trim()
+    if (!roomId.startsWith('usr_')) {
+      try { ws.close(4401, 'Invalid account room') } catch {}
+      return
+    }
     const bridgeId = String(meta.bridgeId || 'home-pc').trim() || 'home-pc'
     const key = this.bridgeKey(roomId, bridgeId)
     const existing = this.bridges.get(key)
@@ -343,16 +350,12 @@ export class RelayHub {
           if (pending.bridgeKey === key) {
             clearTimeout(pending.timer)
             this.pendingRpc.delete(relayReqId)
-            if (pending.reject) {
-              pending.reject(new Error('电脑端连接已断开，请稍后重试'))
-            } else {
-              this.sendToClient(pending.clientId, {
-                type: 'rpc.res',
-                id: pending.clientReqId,
-                ok: false,
-                error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
-              })
-            }
+            this.sendToClient(pending.clientId, {
+              type: 'rpc.res',
+              id: pending.clientReqId,
+              ok: false,
+              error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
+            })
           }
         }
         const bridges = this.getBridgeList(roomId)
@@ -367,8 +370,9 @@ export class RelayHub {
     })
   }
 
-  getClientList(roomId = 'owner') {
-    const rid = roomId || 'owner'
+  getClientList(roomId) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return []
     const out = []
     for (const [clientId, c] of this.clients.entries()) {
       if (c.roomId !== rid || c.ws.readyState !== 1) continue
@@ -387,7 +391,8 @@ export class RelayHub {
   }
 
   broadcastRoomClients(roomId) {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
+    if (!rid) return
     const clients = this.getClientList(rid)
     const frame = JSON.stringify({
       type: 'event',
@@ -410,7 +415,11 @@ export class RelayHub {
 
   registerClient(ws, user, { lastSeq = 0, ip = '', userAgent = '' } = {}) {
     const clientId = randomUUID()
-    const roomId = String(user?.room || 'owner').trim() || 'owner'
+    const roomId = String(user?.room || '').trim()
+    if (!roomId.startsWith('usr_')) {
+      try { ws.close(4401, 'Invalid account room') } catch {}
+      return
+    }
     const parsed = parseClientDeviceInfo(user?.dev || '', userAgent, user?.kind || '')
     const now = Date.now()
     const entry = {
@@ -506,7 +515,15 @@ export class RelayHub {
     if (msg.type === 'bridge.meta') {
       const bridge = this.bridges.get(key)
       if (bridge) {
-        bridge.meta = { ...bridge.meta, ...(msg.meta || {}) }
+        const nextMeta = { ...bridge.meta, ...(msg.meta || {}) }
+        if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
+          this.log.warn?.(`[relay] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
+          try {
+            bridge.ws.close(4008, 'E2EE required — upgrade bridge/desktop app to v0.4.4+')
+          } catch {}
+          return
+        }
+        bridge.meta = nextMeta
         const bridges = this.getBridgeList(roomId)
         const devices = this.resolveRoomDevices(roomId, bridges)
         this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
@@ -524,39 +541,38 @@ export class RelayHub {
       if (!pending || pending.roomId !== roomId) return
       clearTimeout(pending.timer)
       this.pendingRpc.delete(msg.id)
-      if (pending.resolve) {
-        if (msg.e2ee) {
-          const err = new Error('该电脑已开启端到端加密，禁止中转服务器明文读取')
-          err.code = 'E2EE_KEY_REQUIRED'
-          pending.reject(err)
-        } else if (msg.ok) {
-          pending.resolve(msg.result)
-        } else {
-          const err = new Error(msg.error?.message || 'RPC 执行失败')
-          if (msg.error?.code) err.code = msg.error.code
-          pending.reject(err)
-        }
-      } else if (msg.e2ee) {
+      if (msg.e2ee) {
         this.sendToClient(pending.clientId, {
           type: 'rpc.res',
           id: pending.clientReqId,
           ok: true,
           e2ee: msg.e2ee,
         })
+      } else if (msg.ok === false && msg.error) {
+        // Structured protocol errors (e.g. E2EE_KEY_MISMATCH / E2EE_REPLAY_DETECTED) carry no plaintext payload
+        this.sendToClient(pending.clientId, {
+          type: 'rpc.res',
+          id: pending.clientReqId,
+          ok: false,
+          error: msg.error,
+        })
       } else {
         this.sendToClient(pending.clientId, {
           type: 'rpc.res',
           id: pending.clientReqId,
-          ok: Boolean(msg.ok),
-          result: msg.result,
-          error: msg.error,
+          ok: false,
+          error: {
+            code: 'E2EE_KEY_REQUIRED',
+            message: '中转服务已强制端到端加密，拒绝明文响应',
+          },
         })
       }
       return
     }
 
     if (msg.type === 'event') {
-      this.broadcastEvent(roomId, bridgeId, msg.event, msg.payload, msg.e2ee || null)
+      if (!msg.e2ee) return
+      this.broadcastEvent(roomId, bridgeId, '__e2ee__', null, msg.e2ee)
     }
   }
 
@@ -590,6 +606,20 @@ export class RelayHub {
         return
       }
 
+      if (!msg.e2ee) {
+        this.sendToClient(clientId, {
+          type: 'rpc.res',
+          id: clientReqId,
+          ok: false,
+          error: {
+            code: 'E2EE_KEY_REQUIRED',
+            keyId: bridge.meta?.e2ee?.keyId || '',
+            message: '中转服务已强制开启端到端加密，请先同步电脑端密钥',
+          },
+        })
+        return
+      }
+
       const relayReqId = randomUUID()
       const timeoutMs = Number.isFinite(msg.timeoutMs)
         ? Math.min(Math.max(5_000, msg.timeoutMs), 600_000)
@@ -618,81 +648,22 @@ export class RelayHub {
       this.globalStats.totalRpcs += 1
       const rStats = this.getOrCreateRoomStats(roomId)
       rStats.rpcCount += 1
-      rStats.lastRpcMethod = msg.e2ee ? '__e2ee__' : String(msg.method || '').slice(0, 48)
-      rStats.lastRpcAt = rpcNow
-      rStats.lastActivityAt = rpcNow
-
-      if (msg.e2ee) {
-        this.sendRaw(bridge.ws, {
-          type: 'rpc.req',
-          id: relayReqId,
-          method: '__e2ee__',
-          e2ee: msg.e2ee,
-        })
-      } else {
-        this.sendRaw(bridge.ws, {
-          type: 'rpc.req',
-          id: relayReqId,
-          method: msg.method,
-          params: msg.params ?? {},
-        })
-      }
-    }
-  }
-
-  /**
-   * Direct Promise-based RPC call from Relay HTTP routes (e.g. `/api/bridge-file`)
-   * strictly scoped to the authenticated caller's `roomId`.
-   */
-  callBridge(roomId, method, params = {}, { bridgeId, timeoutMs = 30_000 } = {}) {
-    const rid = roomId || 'owner'
-    const requestedBridgeId = String(bridgeId || '').trim()
-    return new Promise((resolvePromise, rejectPromise) => {
-      const bridge = this.getPrimaryBridge(rid, requestedBridgeId)
-      if (!bridge) {
-        const err = new Error(
-          requestedBridgeId ? `目标电脑（${requestedBridgeId}）桥接未在线` : '电脑端桥接未在线',
-        )
-        err.code = 'BRIDGE_OFFLINE'
-        rejectPromise(err)
-        return
-      }
-      const relayReqId = randomUUID()
-      const timer = setTimeout(() => {
-        if (!this.pendingRpc.has(relayReqId)) return
-        this.pendingRpc.delete(relayReqId)
-        const err = new Error('读取电脑端文件超时')
-        err.code = 'RPC_TIMEOUT'
-        rejectPromise(err)
-      }, timeoutMs)
-
-      this.pendingRpc.set(relayReqId, {
-        resolve: resolvePromise,
-        reject: rejectPromise,
-        timer,
-        roomId: rid,
-        bridgeKey: this.bridgeKey(rid, bridge.bridgeId),
-      })
-
-      const rpcNow = Date.now()
-      this.globalStats.totalRpcs += 1
-      const rStats = this.getOrCreateRoomStats(rid)
-      rStats.rpcCount += 1
-      rStats.lastRpcMethod = String(method || '').slice(0, 48)
+      rStats.lastRpcMethod = '__e2ee__'
       rStats.lastRpcAt = rpcNow
       rStats.lastActivityAt = rpcNow
 
       this.sendRaw(bridge.ws, {
         type: 'rpc.req',
         id: relayReqId,
-        method,
-        params,
+        method: '__e2ee__',
+        e2ee: msg.e2ee,
       })
-    })
+    }
   }
 
   broadcastEvent(roomId, bridgeId, event, payload, e2ee = null) {
-    const rid = roomId || 'owner'
+    const rid = String(roomId || '').trim()
+    if (!rid) return
     const evState = this.getRoomEventState(rid)
     const now = Date.now()
     evState.seq += 1
@@ -743,7 +714,8 @@ export class RelayHub {
   }
 
   broadcastRoomDevices(roomId) {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
+    if (!rid) return
     const bridges = this.getBridgeList(rid)
     const devices = this.resolveRoomDevices(rid, bridges)
     this.broadcastEvent(rid, '', EVENTS.BRIDGE_STATUS, {
@@ -755,9 +727,9 @@ export class RelayHub {
   }
 
   disconnectBridge(roomId, bridgeId, code = 4401, reason = 'Device unbound') {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
     const bid = String(bridgeId || '').trim()
-    if (!bid) return false
+    if (!rid || !bid) return false
     const key = this.bridgeKey(rid, bid)
     const entry = this.bridges.get(key)
     if (!entry) return false
@@ -768,10 +740,10 @@ export class RelayHub {
   }
 
   disconnectClient(roomId, { clientId = '', sid = '' } = {}, code = 4401, reason = 'Session revoked') {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
     const targetCid = String(clientId || '').trim()
     const targetSid = String(sid || '').trim()
-    if (!targetCid && !targetSid) return 0
+    if (!rid || (!targetCid && !targetSid)) return 0
     let disconnected = 0
     const droppedClientIds = new Set()
     for (const [cid, client] of this.clients.entries()) {
@@ -800,7 +772,8 @@ export class RelayHub {
   }
 
   disconnectOtherRoomClients(roomId, { keepClientId = '', keepSid = '', newSidForKept = '' } = {}, code = 4401, reason = 'Session revoked') {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
+    if (!rid) return 0
     const keepCid = String(keepClientId || '').trim()
     const keepSession = String(keepSid || '').trim()
     let disconnected = 0
@@ -836,7 +809,8 @@ export class RelayHub {
   }
 
   disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {
-    const rid = String(roomId || 'owner').trim() || 'owner'
+    const rid = String(roomId || '').trim()
+    if (!rid) return 0
     let disconnected = 0
     const droppedClientIds = new Set()
     for (const [cid, client] of this.clients.entries()) {

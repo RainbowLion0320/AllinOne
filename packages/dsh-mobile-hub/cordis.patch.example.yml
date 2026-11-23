@@ -1,12 +1,10 @@
 # Copy this file to `cordis.patch.yml` (gitignored).
-# Recommended with All in One Desktop App: keep `ipcOnly: true` so DeepSeek Harness
-# exposes only the authenticated localhost IPC server (127.0.0.1) to the Desktop App.
+# DeepSeek Harness exposes an authenticated localhost-only IPC server (127.0.0.1)
+# to All in One Desktop App / Portable Bridge (which handles the single E2EE cloud link).
 - insert:
     - id: mobile-hub
       name: dsh-mobile-hub
       config:
-        # Recommended when using All in One Desktop App (no duplicate relay connection):
-        ipcOnly: true
         # Optional default working directory for new chats
         cwd: ''
         # Default permission preset for new DSH sessions
@@ -15,8 +13,3 @@
         enableDispatchTools: false
         # Optional local status file for diagnostics
         # statusFile: '~/.dsh/allinone-mobile-hub-status.json'
-        # --- Legacy standalone DSH-plugin relay mode (only if NOT using Desktop App) ---
-        # ipcOnly: false
-        # relayUrl: 'wss://ai.yourdomain.com/ws/bridge'
-        # secretEnv: 'DSH_MOBILE_BRIDGE_SECRET'
-        # bridgeId: 'my-pc'

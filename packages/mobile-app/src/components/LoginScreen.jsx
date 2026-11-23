@@ -25,24 +25,13 @@ import {
   detectDefaultServerUrl,
   fetchBootstrapStatus,
   loginAccount,
-  loginToRelay,
   normalizeBaseUrl,
-  pairWithRelay,
-  parsePairInput,
   registerAccount,
   resetAccountPassword,
   sendEmailVerificationCode,
 } from '../lib/wsClient.js'
 import { QrScannerModal } from './QrScannerModal.jsx'
 import { useI18n } from '../lib/i18n.jsx'
-
-function formatPairCodeDisplay(val) {
-  const trimmed = val.trim()
-  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('pt_')) return val
-  const clean = val.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8)
-  if (clean.length > 4) return `${clean.slice(0, 4)}-${clean.slice(4)}`
-  return clean
-}
 
 export function LoginScreen({
   onSuccess,
@@ -54,16 +43,15 @@ export function LoginScreen({
   onCancel = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
-  // 'login' | 'register' | 'reset' | 'pair' | 'password'
+  // 'login' | 'register' | 'reset'
   const [mode, setMode] = useState(() =>
-    autoOpenScanner ? 'pair' : initialInviteCode ? 'register' : 'login',
+    initialInviteCode || autoOpenScanner ? 'register' : 'login',
   )
   const [serverUrl, setServerUrl] = useState(() => initialServerUrl || detectDefaultServerUrl())
   const [showAdvancedServer, setShowAdvancedServer] = useState(() => {
     const init = String(initialServerUrl || detectDefaultServerUrl() || '')
     return !init || /your-relay\.example\.com/i.test(init)
   })
-  const [showLegacyOptions, setShowLegacyOptions] = useState(() => Boolean(autoOpenScanner))
   const [showSetupGuide, setShowSetupGuide] = useState(false)
   const [osTab, setOsTab] = useState('unix') // 'win' | 'unix'
   const [copiedCmd, setCopiedCmd] = useState(false)
@@ -82,9 +70,6 @@ export function LoginScreen({
   const [codeSending, setCodeSending] = useState(false)
   const [codeCooldown, setCodeCooldown] = useState(0)
 
-  // Legacy fields
-  const [pairInput, setPairInput] = useState('')
-  const [legacyPassword, setLegacyPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(initialError)
   const [infoMsg, setInfoMsg] = useState('')
@@ -168,65 +153,36 @@ export function LoginScreen({
     setTimeout(() => setCopiedCmd(false), 1800)
   }
 
-  const executePair = useCallback(async (rawInput, fromScanner = false) => {
-    const parsed = parsePairInput(rawInput)
-    if (!parsed.pairCode && !parsed.pairToken) {
-      setError(
-        fromScanner
-          ? bi('识别到的二维码不是 All in One 配对码，请扫描电脑端弹出的配对二维码', 'Invalid QR code. Please scan the pairing QR displayed on your PC.')
-          : bi('请输入电脑端显示的 8 位配对码，或点击「扫一扫」', 'Enter the 8-character pairing code from your PC, or tap Scan QR.'),
-      )
-      return
-    }
-    if (parsed.serverUrl) {
-      setServerUrl(parsed.serverUrl)
-    }
-    setError('')
-    setLoading(true)
-    try {
-      const targetServer = parsed.serverUrl || serverUrl
-      const result = await pairWithRelay(targetServer, {
-        pairCode: parsed.pairCode,
-        pairToken: parsed.pairToken,
-      })
-      onSuccess({
-        baseUrl: result.baseUrl,
-        token: result.token,
-        roomId: result.roomId,
-        label: result.label,
-        bridges: result.bridges,
-        authMode: 'pair',
-      })
-    } catch (err) {
-      setError(String(err?.message || err))
-    } finally {
-      setLoading(false)
-    }
-  }, [onSuccess, serverUrl])
-
   const handleQrDetected = useCallback((rawText) => {
     setScannerOpen(false)
-    // Also support scanning an invite link QR (`?invite=INV-...`)!
+    const trimmed = String(rawText || '').trim()
     try {
-      if (/^https?:\/\//i.test(rawText.trim())) {
-        const u = new URL(rawText.trim())
+      if (/^https?:\/\//i.test(trimmed)) {
+        const u = new URL(trimmed)
         const inv = u.searchParams.get('invite')
         if (inv) {
           const basePath = u.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '')
           setServerUrl(`${u.origin}${basePath}`)
           setInviteCode(inv.trim())
           setMode('register')
-          setShowLegacyOptions(false)
           setError('')
           return
         }
       }
     } catch {}
-    setMode('pair')
-    setShowLegacyOptions(true)
-    setPairInput(formatPairCodeDisplay(rawText))
-    void executePair(rawText, true)
-  }, [executePair])
+    if (/^INV-[A-Z0-9-]+$/i.test(trimmed)) {
+      setInviteCode(trimmed.toUpperCase())
+      setMode('register')
+      setError('')
+      return
+    }
+    setError(
+      bi(
+        '识别到的二维码不是有效的注册邀请码，请扫描管理员分享的邀请注册二维码',
+        'Invalid QR code. Please scan an invite registration QR code.',
+      ),
+    )
+  }, [bi])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -368,32 +324,6 @@ export function LoginScreen({
         setLoading(false)
       }
       return
-    }
-
-    if (mode === 'pair') {
-      await executePair(pairInput, false)
-      return
-    }
-
-    if (!legacyPassword.trim()) {
-      setError(bi('请输入管理员访问密钥', 'Please enter the admin access token'))
-      return
-    }
-    setLoading(true)
-    try {
-      const result = await loginToRelay(serverUrl, legacyPassword.trim())
-      onSuccess({
-        baseUrl: result.baseUrl,
-        token: result.token,
-        roomId: result.roomId || 'owner',
-        role: 'admin',
-        bridges: result.bridges,
-        authMode: 'password',
-      })
-    } catch (err) {
-      setError(String(err?.message || err))
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -601,11 +531,11 @@ export function LoginScreen({
                   <span>
                     {lang === 'en' ? (
                       <>
-                        First-time setup: enter your server&apos;s <strong>Admin Token (CLIENT_ACCESS_TOKEN)</strong> as the invite code below to create the first admin account.
+                        First-time setup: enter your server&apos;s <strong>Bootstrap Token (ADMIN_BOOTSTRAP_TOKEN)</strong> or CLI-generated admin invite code below to create the first admin account.
                       </>
                     ) : (
                       <>
-                        首次初始化：直接把服务器的 <strong>管理员密钥 (CLIENT_ACCESS_TOKEN)</strong> 填入下方邀请码框，即可注册首个管理员账号。
+                        首次初始化：填入服务器配置的 <strong>ADMIN_BOOTSTRAP_TOKEN</strong> 或 CLI 生成的管理员邀请码，即可注册首个管理员账号。
                       </>
                     )}
                   </span>
@@ -613,10 +543,23 @@ export function LoginScreen({
               )}
 
               <div>
-                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
-                  <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>{bi('邀请码', 'Invite Code')}</span>
-                </label>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>{bi('邀请码', 'Invite Code')}</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError('')
+                      setScannerOpen(true)
+                    }}
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#4D6BFE] hover:underline"
+                  >
+                    <ScanLine className="h-3 w-3" />
+                    <span>{bi('扫码填入', 'Scan QR')}</span>
+                  </button>
+                </div>
                 <input
                   type="text"
                   value={inviteCode}
@@ -827,92 +770,6 @@ export function LoginScreen({
             </>
           )}
 
-          {/* Legacy Pair Mode */}
-          {mode === 'pair' && (
-            <>
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('旧版配对码 / 扫码连接', 'Legacy Pair Code / QR')}</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode('login')
-                    setShowLegacyOptions(false)
-                    setError('')
-                  }}
-                  className="text-xs font-medium text-[#4D6BFE] hover:underline"
-                >
-                  {bi('返回账号登录', 'Account Sign In')}
-                </button>
-              </div>
-
-              <button
-                type="button"
-                disabled={loading}
-                onClick={() => {
-                  setError('')
-                  setScannerOpen(true)
-                }}
-                className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-3 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
-              >
-                <div className="flex min-w-0 items-center gap-2.5">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
-                    <ScanLine className="h-4.5 w-4.5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-bold text-[#2842C9] dark:text-white">{bi('扫一扫二维码', 'Scan QR Code')}</div>
-                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">{bi('支持旧版配对码或邀请注册二维码', 'Supports legacy pairing or invite sign-up QR')}</div>
-                  </div>
-                </div>
-                <ArrowRight className="h-4 w-4 shrink-0 text-[#4D6BFE]" />
-              </button>
-
-              <input
-                type="text"
-                value={pairInput}
-                onChange={(e) => setPairInput(formatPairCodeDisplay(e.target.value))}
-                placeholder={bi('输入 8 位配对码，例如：AB34-CD56', 'Enter 8-char code, e.g. AB34-CD56')}
-                autoCapitalize="characters"
-                autoCorrect="off"
-                spellCheck={false}
-                className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-center font-mono text-base font-bold tracking-[0.14em] text-slate-900 outline-none placeholder:font-sans placeholder:text-sm placeholder:font-normal placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
-              />
-            </>
-          )}
-
-          {/* Legacy Owner Password Mode */}
-          {mode === 'password' && (
-            <>
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('旧版管理员密钥登录', 'Legacy Admin Token Login')}</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode('login')
-                    setShowLegacyOptions(false)
-                    setError('')
-                  }}
-                  className="text-xs font-medium text-[#4D6BFE] hover:underline"
-                >
-                  {bi('返回账号登录', 'Account Sign In')}
-                </button>
-              </div>
-              <div>
-                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
-                  <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>{bi('管理员密钥 (CLIENT_ACCESS_TOKEN)', 'Admin Token (CLIENT_ACCESS_TOKEN)')}</span>
-                </label>
-                <input
-                  type="password"
-                  value={legacyPassword}
-                  onChange={(e) => setLegacyPassword(e.target.value)}
-                  placeholder={bi('输入服务器配置的访问口令', 'Enter server access token')}
-                  autoComplete="current-password"
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
-                />
-              </div>
-            </>
-          )}
-
           {/* Collapsible 1-line PC setup tip (hidden inside Desktop App since bridge is built in) */}
           {!isDesktopApp && (
           <div className="rounded-2xl border border-slate-200/70 bg-slate-50/80 dark:border-slate-700/70 dark:bg-[#16181F]">
@@ -1026,54 +883,10 @@ export function LoginScreen({
                   ? bi('登录', 'Sign In')
                   : mode === 'register'
                     ? bi('注册', 'Sign Up')
-                    : mode === 'reset'
-                      ? bi('重置密码', 'Reset Password')
-                      : mode === 'pair'
-                        ? bi('配对', 'Pair')
-                        : bi('登录', 'Sign In')}
+                    : bi('重置密码', 'Reset Password')}
             </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>
-
-          {/* Secondary / legacy login options */}
-          {isAccountTab && (
-            <div className="border-t border-slate-100 pt-2.5 dark:border-slate-800">
-              <button
-                type="button"
-                onClick={() => setShowLegacyOptions((v) => !v)}
-                className="flex w-full items-center justify-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-              >
-                <span>{bi('扫码 / 密钥登录', 'QR / Admin Token')}</span>
-                {showLegacyOptions ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-              </button>
-              {showLegacyOptions && (
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMode('pair')
-                      setError('')
-                    }}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 py-2 text-[11.5px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-[#16181F] dark:text-slate-300"
-                  >
-                    <QrCode className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('扫码 / 配对码', 'QR / Pair Code')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMode('password')
-                      setError('')
-                    }}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 py-2 text-[11.5px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-[#16181F] dark:text-slate-300"
-                  >
-                    <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('管理员密钥', 'Admin Token')}</span>
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
         </form>
       </div>
 

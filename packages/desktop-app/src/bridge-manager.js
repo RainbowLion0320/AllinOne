@@ -119,7 +119,7 @@ export function loadConfigDecrypted(filePath, secretStore = null) {
     out.e2eeKey = normalizeDesktopE2eeKey(out.e2eeKey)
     if (out.e2eeKey) shouldMigrate = true
   }
-  // Auto-migrate legacy plaintext credentials on disk to OS keychain / DPAPI encryption
+  // Auto-encrypt any plaintext credentials on disk into OS keychain / DPAPI storage
   if (shouldMigrate) {
     try {
       saveConfigSecure(filePath, out, secretStore)
@@ -141,27 +141,6 @@ function resolveBridgeScriptPath(isPackaged) {
     if (existsSync(p)) return p
   }
   throw new Error('找不到内置桥接程序 (allinone-bridge.mjs)')
-}
-
-function stopLegacyMacLaunchAgent() {
-  if (process.platform !== 'darwin') return
-  const plistPath = join(os.homedir(), 'Library', 'LaunchAgents', 'com.allinone.bridge.plist')
-  if (!existsSync(plistPath)) return
-  try {
-    const uid = typeof process.getuid === 'function' ? process.getuid() : null
-    if (uid !== null) {
-      execFileSync('launchctl', ['bootout', `gui/${uid}/com.allinone.bridge`], {
-        stdio: 'ignore',
-        timeout: 3000,
-      })
-    }
-  } catch {}
-  try {
-    execFileSync('launchctl', ['unload', '-w', plistPath], {
-      stdio: 'ignore',
-      timeout: 3000,
-    })
-  } catch {}
 }
 
 export class DesktopBridgeManager extends EventEmitter {
@@ -418,9 +397,6 @@ export class DesktopBridgeManager extends EventEmitter {
   async spawnBridgeProcess(cfg) {
     await this.killChild()
     if (this.disposed || !this.enabled) return
-
-    // Stop legacy LaunchAgent if present on macOS so it won't fight over the same bridgeId
-    stopLegacyMacLaunchAgent()
 
     const scriptPath = resolveBridgeScriptPath(this.isPackaged)
     const serverUrl = normalizeBaseUrl(cfg.serverUrl)

@@ -1248,24 +1248,6 @@ input:focus {
   background: var(--bg-hover);
 }
 
-/* Legacy Rooms */
-.legacy-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 12px;
-  padding: 14px 18px;
-}
-
-.legacy-card {
-  background: var(--bg-sub);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
 /* Invites */
 .inline-pills {
   display: flex;

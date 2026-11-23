@@ -1,7 +1,6 @@
 /**
  * Local persistent chat history cache on the user's phone (IndexedDB with memory fallback).
  * Guardrails against unbounded storage growth:
- *  - Auto-deletes legacy v1 database on startup
  *  - Max 40 sessions (LRU eviction)
  *  - Max 120 persisted messages per session (strictly preserves valid pagination cursors)
  *  - Max 12 MB total persisted size (byte-aware LRU eviction)
@@ -9,7 +8,6 @@
  */
 
 const DB_NAME = 'allinone_session_cache_v2'
-const LEGACY_DB_NAME = 'allinone_session_cache_v1'
 const STORE_NAME = 'sessions'
 
 const MAX_CACHED_SESSIONS = 40
@@ -19,15 +17,6 @@ const MAX_CACHE_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
 
 const memoryFallback = new Map()
 let dbPromise = null
-let legacyCleaned = false
-
-function cleanupLegacyDbOnce() {
-  if (legacyCleaned || typeof indexedDB === 'undefined') return
-  legacyCleaned = true
-  try {
-    indexedDB.deleteDatabase(LEGACY_DB_NAME)
-  } catch {}
-}
 
 function estimateBytes(obj) {
   try {
@@ -43,7 +32,6 @@ function estimateBytes(obj) {
 
 function openDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null)
-  cleanupLegacyDbOnce()
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve) => {
     try {
@@ -282,7 +270,6 @@ export async function clearSessionCache(scopeOrPrefix = '', { prefix = false } =
   const cleanScope = String(scopeOrPrefix || '').trim()
   if (!cleanScope) {
     memoryFallback.clear()
-    cleanupLegacyDbOnce()
     const db = await openDb()
     if (db) {
       await new Promise((resolve) => {

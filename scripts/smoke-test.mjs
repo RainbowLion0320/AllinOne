@@ -42,7 +42,6 @@ import {
 import { renderQrSvg as renderSharedQrSvg } from '../packages/shared/src/qr-svg.js'
 import {
   DEVICES_STORAGE_KEY,
-  LEGACY_AUTH_STORAGE_KEY,
   getActiveDevice,
   getCacheScopeKey,
   getDeviceDisplayName,
@@ -93,18 +92,92 @@ import {
   translate,
 } from '../packages/mobile-app/src/lib/i18n.js'
 
-const TEST_PASS = 'smoke-test-pass-123'
-const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
+const TEST_BOOTSTRAP_TOKEN = 'smoke-bootstrap-token-123'
+const SMOKE_ADMIN_PASS = 'SmokeAdminPass99!'
+
+async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-client', clientKind = 'web' } = {}) {
+  const ticketRes = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ deviceName, clientKind }),
+  })).json()
+  assert.equal(ticketRes.ok, true, 'POST /api/auth/ws-ticket should succeed')
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketRes.ticket)}`)
+  const pending = new Map()
+  const events = []
+  let hello = null
+  let closedCode = null
+  await new Promise((resolve, reject) => {
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw))
+      if (msg.type === 'hello') {
+        hello = msg
+        resolve()
+        return
+      }
+      if (msg.type === 'rpc.res') {
+        const p = pending.get(msg.id)
+        if (p) {
+          pending.delete(msg.id)
+          p.resolve(msg)
+        }
+      } else if (msg.type === 'event') {
+        events.push(msg)
+      }
+    })
+    ws.on('close', (code) => { closedCode = code })
+    ws.on('error', reject)
+  })
+  let reqSeq = 1
+  const sendEncryptedRpc = async (method, params = {}, { e2eeKey, roomId, bridgeId = '' } = {}) => {
+    const id = `t-${reqSeq++}`
+    const env = await encryptJson(
+      e2eeKey,
+      { method, params, cid: id, ts: Date.now() },
+      { kind: 'rpc.req', roomId },
+    )
+    const rawRes = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error(`RPC timeout: ${method}`))
+      }, 20_000)
+      pending.set(id, {
+        resolve: (m) => {
+          clearTimeout(timer)
+          resolve(m)
+        },
+      })
+      ws.send(JSON.stringify({
+        type: 'rpc.req',
+        id,
+        method: E2EE_METHOD_MARKER,
+        e2ee: env,
+        ...(bridgeId ? { bridgeId } : {}),
+      }))
+    })
+    if (rawRes.e2ee) {
+      const dec = await decryptJson(e2eeKey, rawRes.e2ee, { kind: 'rpc.res', roomId })
+      assert.equal(dec.cid, id, 'Decrypted RPC response cid must match request id')
+      if (dec.ok) return dec.result
+      const err = new Error(dec.error?.message || 'RPC error')
+      err.code = dec.error?.code || 'RPC_ERROR'
+      throw err
+    }
+    const err = new Error(rawRes.error?.message || 'RPC error')
+    err.code = rawRes.error?.code || 'RPC_ERROR'
+    throw err
+  }
+  return { ws, hello, events, sendEncryptedRpc, getClosedCode: () => closedCode }
+}
 
 async function main() {
   const tmpDir = mkdtempSync(join(os.tmpdir(), 'allinone-smoke-'))
-  // 1. Start Relay Server on ephemeral port
+  // 1. Start Relay Server on ephemeral port (strict Account Mode + mandatory E2EE)
   const relay = createRelayServer({
     port: 0,
     host: '127.0.0.1',
-    clientAccessToken: TEST_PASS,
-    bridgeSecret: TEST_BRIDGE_SECRET,
-    roomsFile: join(tmpDir, 'rooms.json'),
+    jwtSecret: 'smoke-test-jwt-secret-0123456789',
+    adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
     accountsFile: join(tmpDir, 'accounts.json'),
     uploadDir: join(tmpDir, 'uploads'),
   })
@@ -112,13 +185,7 @@ async function main() {
   const httpBase = `http://127.0.0.1:${port}`
   const wsBridgeUrl = `ws://127.0.0.1:${port}/ws/bridge`
 
-  // 2. Start Standalone PC Bridge (Owner room)
-  const bridge = startStandaloneBridge({
-    relayUrl: wsBridgeUrl,
-    secret: TEST_BRIDGE_SECRET,
-    bridgeId: 'smoke-pc',
-  })
-
+  let bridge = null
   let friendBridgeA = null
   let ownerBridge2 = null
   let portableChild = null
@@ -126,67 +193,83 @@ async function main() {
   let acctBridge2 = null
 
   try {
-    // Wait up to 5s for bridge to connect
-    for (let i = 0; i < 50; i++) {
-      if (relay.hub.getBridgeList('owner').some((b) => b.online)) break
-      await new Promise((r) => setTimeout(r, 100))
-    }
-    assert.equal(relay.hub.getBridgeList('owner').length, 1, 'PC bridge should be registered in owner room')
-    assert.equal(relay.hub.getBridgeList('owner')[0].online, true, 'PC bridge should be online')
-    console.log('[smoke] 1/6 Relay + Owner PC Bridge connected OK')
-
-    // 3. Login as mobile client
-    const loginRes = await fetch(`${httpBase}/api/auth/login`, {
+    // Bootstrap primary admin account & bind primary E2EE PC Bridge
+    const smokeAdmin = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: TEST_PASS, deviceName: 'smoke-phone' }),
+      body: JSON.stringify({
+        username: 'smoke_admin',
+        password: SMOKE_ADMIN_PASS,
+        inviteCode: TEST_BOOTSTRAP_TOKEN,
+        deviceName: 'smoke-phone',
+      }),
+    })).json()
+    assert.equal(smokeAdmin.ok, true)
+    assert.equal(smokeAdmin.user.role, 'admin')
+    assert.ok(smokeAdmin.roomId.startsWith('usr_'))
+
+    // Verify account login & wrong password rejection
+    const loginRes = await fetch(`${httpBase}/api/account/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'smoke_admin', password: SMOKE_ADMIN_PASS, deviceName: 'smoke-phone' }),
     })
     assert.equal(loginRes.status, 200)
     const loginData = await loginRes.json()
     assert.equal(loginData.ok, true)
     assert.ok(loginData.token, 'Should receive signed session token')
 
-    // Reject wrong password
-    const badRes = await fetch(`${httpBase}/api/auth/login`, {
+    const badRes = await fetch(`${httpBase}/api/account/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: 'wrong-password' }),
+      body: JSON.stringify({ username: 'smoke_admin', password: 'wrong-password' }),
     })
     assert.equal(badRes.status, 401)
-    console.log('[smoke] 2/5 Mobile auth & rejection OK')
+    console.log('[smoke] 1/6 Account auth & wrong-password rejection OK')
 
-    // 4. Connect mobile WS client & exercise RPCs across all 4 apps
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(loginData.token)}`)
-    let reqId = 1
-    const pending = new Map()
+    // 2. Register & start Standalone PC Bridge with mandatory E2EE
+    const smokeDev = await (await fetch(`${httpBase}/api/account/devices/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${loginData.token}`,
+      },
+      body: JSON.stringify({ label: 'Smoke-PC-1', hostname: 'smoke-pc', platform: process.platform }),
+    })).json()
+    assert.equal(smokeDev.ok, true)
+    const primaryE2eeKey = generateE2eeKey()
 
-    await new Promise((resolve, reject) => {
-      ws.on('message', (raw) => {
-        const msg = JSON.parse(String(raw))
-        if (msg.type === 'hello') resolve()
-        if (msg.type === 'rpc.res') {
-          const p = pending.get(msg.id)
-          if (p) {
-            pending.delete(msg.id)
-            if (msg.ok) p.resolve(msg.result)
-            else p.reject(new Error(msg.error?.message || 'RPC error'))
-          }
-        }
-      })
-      ws.on('error', reject)
+    bridge = startStandaloneBridge({
+      relayUrl: wsBridgeUrl,
+      secret: smokeDev.deviceSecret,
+      roomId: smokeAdmin.roomId,
+      bridgeId: smokeDev.bridgeId,
+      e2eeKey: primaryE2eeKey,
     })
 
+    // Wait up to 5s for E2EE bridge to connect
+    for (let i = 0; i < 50; i++) {
+      if (relay.hub.getBridgeList(smokeAdmin.roomId).some((b) => b.online && b.e2ee?.enabled)) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    assert.equal(relay.hub.getBridgeList(smokeAdmin.roomId).length, 1, 'PC bridge should be registered in account room')
+    assert.equal(relay.hub.getBridgeList(smokeAdmin.roomId)[0].online, true, 'PC bridge should be online')
+    assert.equal(relay.hub.getBridgeList(smokeAdmin.roomId)[0].e2ee?.enabled, true, 'PC bridge must advertise E2EE')
+    console.log('[smoke] 2/6 Relay + E2EE PC Bridge connected OK')
+
+    // 4. Connect mobile WS client via single-use ticket & exercise E2EE RPCs across all 4 apps
+    const cli = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'smoke-phone' })
     const rpc = (method, params = {}) =>
-      new Promise((resolve, reject) => {
-        const id = `t-${reqId++}`
-        pending.set(id, { resolve, reject })
-        ws.send(JSON.stringify({ type: 'rpc.req', id, method, params }))
+      cli.sendEncryptedRpc(method, params, {
+        e2eeKey: primaryE2eeKey,
+        roomId: smokeAdmin.roomId,
+        bridgeId: smokeDev.bridgeId,
       })
 
     const statusRes = await rpc(RPC.APPS_STATUS)
     assert.equal(statusRes.apps.length, 4, 'Should report status for all 4 apps')
     console.log(
-      '[smoke] 3/5 Apps status:',
+      '[smoke] 3/6 Apps status (E2EE):',
       statusRes.apps.map((a) => `${a.app}(avail=${a.available},rw=${a.writable})`).join(', '),
     )
 
@@ -203,7 +286,7 @@ async function main() {
       }
     }
     console.log(
-      '[smoke] 3.5/5 Models catalog:',
+      '[smoke] 3.5/6 Models catalog:',
       ['dsh', 'codex', 'claude', 'antigravity']
         .map((a) => `${a}=${modelsRes.catalog[a].models.length}(def:${modelsRes.catalog[a].defaultModel})`)
         .join(', '),
@@ -215,7 +298,7 @@ async function main() {
     for (const s of listRes.sessions) {
       byApp[s.app] = (byApp[s.app] || 0) + 1
     }
-    console.log('[smoke] 4/5 Sessions listed:', listRes.sessions.length, 'breakdown:', byApp)
+    console.log('[smoke] 4/6 Sessions listed:', listRes.sessions.length, 'breakdown:', byApp)
 
     // Read 1 real session from each app that has sessions + test cursor pagination if hasMore
     for (const app of ['dsh', 'codex', 'claude', 'antigravity']) {
@@ -237,26 +320,28 @@ async function main() {
       console.log(`  - read ${sample.id}: "${sample.title.slice(0, 32)}" (${readRes.session.messages.length} msgs, ${pageInfo})`)
     }
 
-    // 4.5 Verify authenticated PC local image proxy (/api/bridge-file) & non-image security guardrail
-    const imgUrl = `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&token=${encodeURIComponent(loginData.token)}`
-    const imgRes = await fetch(imgUrl)
-    assert.equal(imgRes.status, 200, 'Bridge image proxy should return 200 OK for valid PNG')
-    assert.equal(imgRes.headers.get('content-type'), 'image/png')
-    const imgBuf = Buffer.from(await imgRes.arrayBuffer())
-    assert.ok(imgBuf.length > 1000 && imgBuf[0] === 0x89 && imgBuf[1] === 0x50, 'Should return valid PNG binary')
+    // 4.5 Verify E2EE RPC.FILE_READ image loading, non-image security guardrail & deleted /api/bridge-file (404)
+    const fileRes = await rpc(RPC.FILE_READ, {
+      path: 'packages/mobile-app/public/icon-192.png',
+      cwd: process.cwd(),
+    })
+    assert.equal(fileRes.mimeType, 'image/png')
+    const imgBuf = Buffer.from(fileRes.dataBase64, 'base64')
+    assert.ok(imgBuf.length > 1000 && imgBuf[0] === 0x89 && imgBuf[1] === 0x50, 'Should return valid PNG binary over E2EE')
 
-    const blockedRes = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('package.json')}&cwd=${encodeURIComponent(process.cwd())}&token=${encodeURIComponent(loginData.token)}`,
+    await assert.rejects(
+      () => rpc(RPC.FILE_READ, { path: 'package.json', cwd: process.cwd() }),
+      /出于安全限制/,
+      'Non-image files must be blocked on RPC.FILE_READ',
     )
-    assert.equal(blockedRes.status, 403, 'Non-image files must be blocked with 403')
 
-    const unauthImgRes = await fetch(
+    const removedProxyRes = await fetch(
       `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}`,
     )
-    assert.equal(unauthImgRes.status, 401, 'Unauthenticated image requests must return 401')
-    console.log(`[smoke] 4.5/5 Bridge local image proxy OK (${imgBuf.length} bytes PNG, non-image blocked)`)
+    assert.equal(removedProxyRes.status, 404, 'Legacy /api/bridge-file endpoint must be permanently removed (404)')
+    console.log(`[smoke] 4.5/6 E2EE RPC.FILE_READ OK (${imgBuf.length} bytes PNG, non-image blocked, /api/bridge-file=404)`)
 
-    ws.close()
+    cli.ws.close()
 
     // 5. Verify DSH Cordis plugin registration registers all 6 master dispatch tools
     const registeredTools = []
@@ -293,7 +378,7 @@ async function main() {
     for (const fn of effects) await fn()
     console.log('[smoke] 5/6 DSH Cordis plugin & 6 master dispatch tools OK')
 
-    // 6. Strict Multi-Tenant Room Isolation & Portable Bridge Bundle Test
+    // 6. Strict Multi-Tenant Account Isolation, Deleted Legacy Routes & Encrypted Upload Isolation
     const pubHealthRes = await fetch(`${httpBase}/api/health`)
     const pubHealth = await pubHealthRes.json()
     assert.equal(pubHealth.ok, true)
@@ -306,103 +391,113 @@ async function main() {
     assert.equal(pubHealthRes.headers.get('referrer-policy'), 'no-referrer')
     assert.ok(String(pubHealthRes.headers.get('permissions-policy') || '').includes('camera=(self)'))
 
-    const ownerHealth = await (await fetch(`${httpBase}/api/health`, {
+    const adminHealth = await (await fetch(`${httpBase}/api/health`, {
       headers: { Authorization: `Bearer ${loginData.token}` },
     })).json()
-    assert.equal(ownerHealth.ok, true)
-    assert.equal(ownerHealth.roomId, 'owner')
-    assert.ok(ownerHealth.onlineBridges >= 1)
+    assert.equal(adminHealth.ok, true)
+    assert.equal(adminHealth.roomId, smokeAdmin.roomId)
+    assert.ok(adminHealth.onlineBridges >= 1)
 
-    // Register Room A and Room B
-    const regA = await (await fetch(`${httpBase}/api/rooms/register`, {
+    // Verify all legacy owner-key & room-pair endpoints are permanently removed (404)
+    for (const [method, path] of [
+      ['POST', '/api/auth/login'],
+      ['POST', '/api/auth/pair'],
+      ['POST', '/api/rooms/register'],
+      ['POST', '/api/rooms/pair-code'],
+      ['POST', '/api/rooms/revoke'],
+      ['GET', '/api/bridge-file'],
+    ]) {
+      const r = await fetch(`${httpBase}${path}`, {
+        method,
+        headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
+        body: method === 'POST' ? '{}' : undefined,
+      })
+      assert.equal(r.status, 404, `Removed legacy endpoint ${method} ${path} must return 404`)
+    }
+
+    // Create 2 isolated accounts (Friend A and Friend B) via admin invites
+    const invAB = await (await fetch(`${httpBase}/api/admin/invites`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${loginData.token}`,
+      },
+      body: JSON.stringify({ count: 2, note: 'multi-tenant-isolation' }),
+    })).json()
+    assert.equal(invAB.ok, true)
+    assert.equal(invAB.invites.length, 2)
+
+    const friendA = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'Friend-A-PC' }),
+      body: JSON.stringify({ username: 'friend_a', password: 'FriendAPass99!', inviteCode: invAB.invites[0].code }),
     })).json()
-    assert.equal(regA.ok, true)
-    assert.ok(regA.roomId.startsWith('rm_'))
-    assert.match(regA.pairCode, /^[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/)
+    assert.equal(friendA.ok, true)
+    assert.ok(friendA.roomId.startsWith('usr_'))
 
-    const regB = await (await fetch(`${httpBase}/api/rooms/register`, {
+    const friendB = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'Friend-B-PC' }),
+      body: JSON.stringify({ username: 'friend_b', password: 'FriendBPass99!', inviteCode: invAB.invites[1].code }),
     })).json()
-    assert.equal(regB.ok, true)
-    assert.notEqual(regA.roomId, regB.roomId)
+    assert.equal(friendB.ok, true)
+    assert.notEqual(friendA.roomId, friendB.roomId)
 
-    // Verify rooms.json stores ONLY hashes, never plaintext secrets/tokens
-    const persistedRooms = readFileSync(join(tmpDir, 'rooms.json'), 'utf8')
-    assert.equal(persistedRooms.includes(regA.bridgeSecret), false, 'rooms.json must NOT store plaintext bridgeSecret')
-    assert.equal(persistedRooms.includes(regA.pairToken), false, 'rooms.json must NOT store plaintext pairToken')
+    // Bind & connect Friend Bridge A with mandatory E2EE
+    const friendDevA = await (await fetch(`${httpBase}/api/account/devices/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${friendA.token}` },
+      body: JSON.stringify({ label: 'Friend-A-PC', hostname: 'friend-a-pc', platform: 'darwin' }),
+    })).json()
+    assert.equal(friendDevA.ok, true)
+    const friendE2eeKeyA = generateE2eeKey()
 
-    // Connect Friend Bridge A
     friendBridgeA = startStandaloneBridge({
       relayUrl: wsBridgeUrl,
-      secret: regA.bridgeSecret,
-      roomId: regA.roomId,
-      bridgeId: 'friend-a-pc',
+      secret: friendDevA.deviceSecret,
+      roomId: friendA.roomId,
+      bridgeId: friendDevA.bridgeId,
+      e2eeKey: friendE2eeKeyA,
       quiet: true,
     })
     for (let i = 0; i < 50; i++) {
-      if (relay.hub.getBridgeList(regA.roomId).some((b) => b.online)) break
+      if (relay.hub.getBridgeList(friendA.roomId).some((b) => b.online && b.e2ee?.enabled)) break
       await new Promise((r) => setTimeout(r, 100))
     }
-    assert.equal(relay.hub.getBridgeList(regA.roomId).length, 1)
-    assert.equal(relay.hub.getBridgeList('owner').length, 1, 'Owner room must still see ONLY 1 bridge')
-    assert.equal(relay.hub.getBridgeList('owner')[0].bridgeId, 'smoke-pc')
+    assert.equal(relay.hub.getBridgeList(friendA.roomId).length, 1)
+    assert.equal(relay.hub.getBridgeList(smokeAdmin.roomId).length, 1, 'Admin account must still see ONLY 1 bridge')
+    assert.equal(relay.hub.getBridgeList(friendB.roomId).length, 0, 'Friend B must NOT see Admin or Friend A bridges')
 
-    // Pair Phone A via lowercase no-hyphen pairCode (strictly single-use!)
-    const pairARes = await (await fetch(`${httpBase}/api/auth/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairCode: regA.pairCode.replace('-', '').toLowerCase() }),
-    })).json()
-    assert.equal(pairARes.ok, true)
-    assert.equal(pairARes.roomId, regA.roomId)
-    assert.equal(pairARes.bridges.length, 1)
-    assert.equal(pairARes.bridges[0].bridgeId, 'friend-a-pc')
+    // Verify WS hello isolation for Friend A (via single-use ticket)
+    const wsACli = await openTicketClientWs(httpBase, port, friendA.token, { deviceName: 'friend-a-phone' })
+    assert.equal(wsACli.hello.roomId, friendA.roomId)
+    assert.equal(wsACli.hello.bridges.length, 1)
+    assert.equal(wsACli.hello.bridges[0].bridgeId, friendDevA.bridgeId)
+    wsACli.ws.close()
 
-    // Second redemption of the same pairCode OR pairToken must fail immediately (single-use burn)
-    const replayCodeRes = await fetch(`${httpBase}/api/auth/pair`, {
+    // Plaintext /api/uploads must be rejected with 400 E2EE_UPLOAD_REQUIRED
+    const plainUploadRes = await fetch(`${httpBase}/api/uploads`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairCode: regA.pairCode }),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${loginData.token}`,
+      },
+      body: JSON.stringify({
+        filename: 'plain.txt',
+        mimeType: 'text/plain',
+        dataBase64: Buffer.from('not-encrypted').toString('base64'),
+      }),
     })
-    assert.equal(replayCodeRes.status, 401, 'Reusing an already-redeemed pairCode must return 401')
-    const replayTokRes = await fetch(`${httpBase}/api/auth/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairToken: regA.pairToken }),
+    assert.equal(plainUploadRes.status, 400, 'Plaintext /api/uploads must be rejected with 400')
+    const plainUploadJson = await plainUploadRes.json()
+    assert.equal(plainUploadJson.code, 'E2EE_UPLOAD_REQUIRED')
+
+    // Cross-account encrypted upload isolation check
+    const encAdminBlob = await encryptBytes(primaryE2eeKey, Buffer.from('admin-private-data', 'utf8'), {
+      kind: 'upload',
+      roomId: smokeAdmin.roomId,
     })
-    assert.equal(replayTokRes.status, 401, 'Reusing an already-redeemed pairToken must return 401')
-
-    // Pair Phone B via pairToken (no bridge connected in Room B)
-    const pairBRes = await (await fetch(`${httpBase}/api/auth/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairToken: regB.pairToken }),
-    })).json()
-    assert.equal(pairBRes.ok, true)
-    assert.equal(pairBRes.roomId, regB.roomId)
-    assert.equal(pairBRes.bridges.length, 0, 'Room B must NOT see Owner or Room A bridges')
-
-    // Verify WS hello isolation for Phone A
-    const wsA = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(pairARes.token)}`)
-    const helloA = await new Promise((resolve, reject) => {
-      wsA.on('message', (raw) => {
-        const m = JSON.parse(String(raw))
-        if (m.type === 'hello') resolve(m)
-      })
-      wsA.on('error', reject)
-    })
-    assert.equal(helloA.roomId, regA.roomId)
-    assert.equal(helloA.bridges.length, 1)
-    assert.equal(helloA.bridges[0].bridgeId, 'friend-a-pc')
-    wsA.close()
-
-    // Cross-room upload isolation check
-    const ownerUpload = await (await fetch(`${httpBase}/api/uploads`, {
+    const adminUpload = await (await fetch(`${httpBase}/api/uploads`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -411,205 +506,150 @@ async function main() {
       body: JSON.stringify({
         filename: 'secret.txt',
         mimeType: 'text/plain',
-        dataBase64: Buffer.from('owner-private-data').toString('base64'),
+        encrypted: true,
+        dataBase64: bytesToBase64(encAdminBlob.ciphertext),
       }),
     })).json()
-    assert.equal(ownerUpload.ok, true)
-    const ownerDl = await fetch(`${httpBase}${ownerUpload.upload.url}`, {
+    assert.equal(adminUpload.ok, true)
+
+    const adminMediaTok = await (await fetch(`${httpBase}/api/auth/media-token`, {
+      method: 'POST',
       headers: { Authorization: `Bearer ${loginData.token}` },
-    })
-    assert.equal(ownerDl.status, 200)
-    const crossPhoneDl = await fetch(`${httpBase}${ownerUpload.upload.url}`, {
-      headers: { Authorization: `Bearer ${pairARes.token}` },
-    })
-    assert.equal(crossPhoneDl.status, 403, 'Friend Phone A must be blocked (403) from Owner uploads')
-    const crossBridgeDl = await fetch(`${httpBase}${ownerUpload.upload.url}`, {
-      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
-    })
-    assert.equal(crossBridgeDl.status, 403, 'Friend Bridge A must be blocked (403) from Owner uploads')
-
-    // Cross-room bridge-file isolation check: Phone B (no bridge) cannot read Owner or Room A files
-    const crossImgRes = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&token=${encodeURIComponent(pairBRes.token)}`,
-    )
-    assert.equal(crossImgRes.status, 503, 'Room B with no bridge must get 503 (never fall back to Owner/Room A bridge)')
-
-    // Refresh pair code invalidates old code and issues new code
-    const badRefresh = await fetch(`${httpBase}/api/rooms/pair-code`, {
-      method: 'POST',
-      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': 'wrong-secret' },
-    })
-    assert.equal(badRefresh.status, 401)
-    const goodRefresh = await (await fetch(`${httpBase}/api/rooms/pair-code`, {
-      method: 'POST',
-      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
     })).json()
-    assert.equal(goodRefresh.ok, true)
-    assert.notEqual(goodRefresh.pairCode, regA.pairCode)
-    const oldCodeTry = await fetch(`${httpBase}/api/auth/pair`, {
+    const friendAMediaTok = await (await fetch(`${httpBase}/api/auth/media-token`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairCode: regA.pairCode }),
-    })
-    assert.equal(oldCodeTry.status, 401, 'Old pairCode must be invalidated after refresh')
+      headers: { Authorization: `Bearer ${friendA.token}` },
+    })).json()
 
-    // Live test of bundled single-file portable bridge in legacy pair mode (if built)
+    const adminDl = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`)
+    assert.equal(adminDl.status, 200)
+    const crossPhoneDl = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(friendAMediaTok.mediaToken)}`)
+    assert.equal(crossPhoneDl.status, 403, 'Friend A media token must be blocked (403) from Admin uploads')
+    const crossBridgeDl = await fetch(`${httpBase}${adminUpload.upload.url}`, {
+      headers: { 'X-Room-Id': friendA.roomId, 'X-Bridge-Secret': friendDevA.deviceSecret },
+    })
+    assert.equal(crossBridgeDl.status, 403, 'Friend Bridge A must be blocked (403) from Admin uploads')
+
     const bundlePath = join(process.cwd(), 'packages/mobile-app/public/downloads/allinone-bridge.mjs')
-    if (existsSync(bundlePath)) {
-      const portableStateDir = join(tmpDir, 'portable-home')
-      portableChild = spawn(process.execPath, [
-        bundlePath,
-        '--server', httpBase,
-        '--state-dir', portableStateDir,
-        '--name', 'Portable-Test-PC',
-        '--legacy-pair',
-        '--no-browser',
-      ], {
-        env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      let out = ''
-      portableChild.stdout.on('data', (d) => { out += String(d) })
-      portableChild.stderr.on('data', (d) => { out += String(d) })
-      for (let i = 0; i < 60; i++) {
-        if (existsSync(join(portableStateDir, 'pair.html')) && out.includes('已加密连接到中转服务器')) break
-        await new Promise((r) => setTimeout(r, 150))
-      }
-      assert.ok(existsSync(join(portableStateDir, 'config.json')), 'Portable bundle should write config.json')
-      const pairHtml = readFileSync(join(portableStateDir, 'pair.html'), 'utf8')
-      assert.ok(pairHtml.includes('<svg xmlns="http://www.w3.org/2000/svg"'), 'pair.html should embed offline SVG QR code')
-      assert.ok(out.includes('已加密连接到中转服务器'), `Portable bundle should connect to relay (output: ${out.slice(0, 300)})`)
-      portableChild.kill()
-      portableChild = null
-      console.log('[smoke] 6/6 Multi-tenant room isolation + single-file portable bundle OK')
-    } else {
-      console.log('[smoke] 6/6 Multi-tenant room isolation OK (portable bundle not built yet)')
-    }
+    console.log('[smoke] 6/6 Multi-tenant isolation, deleted legacy routes & encrypted upload isolation OK')
 
     // 7. Multi-device switching, /api/auth/me status probing, strict bridgeId routing, & scoped cache isolation
     const meA = await (await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${pairARes.token}` },
+      headers: { Authorization: `Bearer ${friendA.token}` },
     })).json()
     assert.equal(meA.ok, true)
-    assert.equal(meA.roomId, regA.roomId)
-    assert.equal(meA.label, 'Friend-A-PC', '/api/auth/me should return room label')
+    assert.equal(meA.roomId, friendA.roomId)
+    assert.equal(meA.username, 'friend_a')
     assert.equal(meA.bridges.length, 1)
     assert.equal(meA.bridges[0].online, true)
 
     const meB = await (await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${pairBRes.token}` },
+      headers: { Authorization: `Bearer ${friendB.token}` },
     })).json()
     assert.equal(meB.ok, true)
-    assert.equal(meB.label, 'Friend-B-PC')
+    assert.equal(meB.username, 'friend_b')
     assert.equal(meB.bridges.length, 0)
 
-    // Strict bridgeId routing with 2 simultaneous bridges in owner room
+    // Strict bridgeId routing with 2 simultaneous E2EE bridges in smoke_admin account
+    const smokeDev2 = await (await fetch(`${httpBase}/api/account/devices/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+      body: JSON.stringify({ label: 'Smoke-PC-2', hostname: 'smoke-pc-2', platform: process.platform }),
+    })).json()
+    assert.equal(smokeDev2.ok, true)
+    const secondE2eeKey = generateE2eeKey()
+
     ownerBridge2 = startStandaloneBridge({
       relayUrl: wsBridgeUrl,
-      secret: TEST_BRIDGE_SECRET,
-      bridgeId: 'smoke-pc-2',
+      secret: smokeDev2.deviceSecret,
+      roomId: smokeAdmin.roomId,
+      bridgeId: smokeDev2.bridgeId,
+      e2eeKey: secondE2eeKey,
       quiet: true,
     })
     for (let i = 0; i < 50; i++) {
-      if (relay.hub.getBridgeList('owner').filter((b) => b.online).length >= 2) break
+      if (relay.hub.getBridgeList(smokeAdmin.roomId).filter((b) => b.online).length >= 2) break
       await new Promise((r) => setTimeout(r, 100))
     }
-    assert.equal(relay.hub.getBridgeList('owner').filter((b) => b.online).length, 2, 'Owner room should support 2 simultaneous online bridges')
-
-    const imgBridge2 = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=smoke-pc-2&token=${encodeURIComponent(loginData.token)}`,
+    assert.equal(
+      relay.hub.getBridgeList(smokeAdmin.roomId).filter((b) => b.online).length,
+      2,
+      'Account room should support 2 simultaneous online E2EE bridges',
     )
-    assert.equal(imgBridge2.status, 200, 'Explicit online bridgeId should succeed')
 
-    const imgOfflineBridge = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=offline-pc-999&token=${encodeURIComponent(loginData.token)}`,
-    )
-    assert.equal(imgOfflineBridge.status, 503, 'Explicit offline bridgeId must return 503 and NEVER fall back to another online PC')
-
-    const wsMulti = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(loginData.token)}`)
-    const multiPending = new Map()
-    await new Promise((resolve, reject) => {
-      wsMulti.on('message', (raw) => {
-        const m = JSON.parse(String(raw))
-        if (m.type === 'hello') {
-          assert.equal(m.bridges.length, 2)
-          resolve()
-        }
-        if (m.type === 'rpc.res') {
-          const p = multiPending.get(m.id)
-          if (p) {
-            multiPending.delete(m.id)
-            p.resolve(m)
-          }
-        }
-      })
-      wsMulti.on('error', reject)
+    const wsMulti = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'smoke-multi' })
+    assert.equal(wsMulti.hello.bridges.length, 2)
+    const okRes2 = await wsMulti.sendEncryptedRpc(RPC.APPS_STATUS, {}, {
+      e2eeKey: secondE2eeKey,
+      roomId: smokeAdmin.roomId,
+      bridgeId: smokeDev2.bridgeId,
     })
-    const rpcWithBridge = (bridgeId) =>
-      new Promise((resolve) => {
-        const id = `mb-${Math.random().toString(36).slice(2, 8)}`
-        multiPending.set(id, { resolve })
-        wsMulti.send(JSON.stringify({ type: 'rpc.req', id, method: RPC.APPS_STATUS, params: {}, bridgeId }))
-      })
-    const okRes2 = await rpcWithBridge('smoke-pc-2')
-    assert.equal(okRes2.ok, true, 'RPC targeting online smoke-pc-2 should succeed')
-    const failOffline = await rpcWithBridge('offline-pc-999')
-    assert.equal(failOffline.ok, false)
-    assert.equal(failOffline.error?.code, 'BRIDGE_OFFLINE', 'RPC targeting offline bridgeId must fail strictly with BRIDGE_OFFLINE')
-    wsMulti.close()
+    assert.equal(okRes2.apps.length, 4, 'Encrypted RPC targeting online smoke-pc-2 should succeed')
+    await assert.rejects(
+      () => wsMulti.sendEncryptedRpc(RPC.APPS_STATUS, {}, {
+        e2eeKey: secondE2eeKey,
+        roomId: smokeAdmin.roomId,
+        bridgeId: 'offline-pc-999',
+      }),
+      (err) => err.code === 'BRIDGE_OFFLINE',
+      'RPC targeting offline bridgeId must fail strictly with BRIDGE_OFFLINE',
+    )
+    wsMulti.ws.close()
 
-    // Mobile multi-device store + legacy v1 migration + isolated cache test
+    // Mobile multi-account store: legacy owner/rm_* entries auto-purged + multi-account coexist + isolated cache
     const memStore = new Map()
     const fakeStorage = {
       getItem: (k) => (memStore.has(k) ? memStore.get(k) : null),
       setItem: (k, v) => memStore.set(k, String(v)),
       removeItem: (k) => memStore.delete(k),
     }
-    fakeStorage.setItem(LEGACY_AUTH_STORAGE_KEY, JSON.stringify({
-      baseUrl: httpBase,
-      token: pairARes.token,
-      roomId: regA.roomId,
-      label: 'Friend-A-PC',
-      bridges: pairARes.bridges,
+    fakeStorage.setItem(DEVICES_STORAGE_KEY, JSON.stringify({
+      activeDeviceId: 'stale-owner',
+      devices: [
+        { id: 'stale-owner', baseUrl: httpBase, token: 'old-owner-tok', roomId: 'owner', label: 'Legacy Owner' },
+        { id: 'stale-room', baseUrl: httpBase, token: 'old-rm-tok', roomId: 'rm_legacy1234', label: 'Legacy Room' },
+        { baseUrl: httpBase, token: friendA.token, roomId: friendA.roomId, username: 'friend_a', label: 'Friend-A-PC', bridges: meA.bridges },
+      ],
     }))
     let dState = loadDeviceState(fakeStorage)
-    assert.equal(dState.devices.length, 1, 'Legacy v1 auth should migrate into v2 device list')
-    assert.equal(memStore.has(DEVICES_STORAGE_KEY), true)
-    assert.equal(memStore.has(LEGACY_AUTH_STORAGE_KEY), false)
+    assert.equal(dState.devices.length, 1, 'Legacy owner and rm_* entries must be purged automatically on load')
+    assert.equal(dState.devices[0].roomId, friendA.roomId)
 
-    // Rename Device A and pair Device B (independent room) -> both coexist
+    // Rename Account A and add Account B -> both coexist
     const devAId = dState.devices[0].id
     dState = renameDevice(dState, devAId, '公司 Mac')
     const addedB = upsertDevice(dState, {
       baseUrl: httpBase,
-      token: pairBRes.token,
-      roomId: regB.roomId,
+      token: friendB.token,
+      roomId: friendB.roomId,
+      username: 'friend_b',
       label: '家里 Windows',
       bridges: [],
-      authMode: 'pair',
+      authMode: 'account',
     })
     assert.equal(addedB.isNew, true)
     dState = addedB.state
-    assert.equal(dState.devices.length, 2, 'Pairing 2nd PC must preserve 1st PC')
+    assert.equal(dState.devices.length, 2, 'Adding 2nd account must preserve 1st account')
     assert.equal(getActiveDevice(dState).id, addedB.device.id)
     assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac')
 
-    // Re-pairing Device A refreshes token in-place and preserves customName
+    // Re-logging into Account A refreshes token in-place and preserves customName
     const repairedA = upsertDevice(dState, {
       baseUrl: httpBase,
-      token: `${pairARes.token}-refreshed`,
-      roomId: regA.roomId,
+      token: `${friendA.token}-refreshed`,
+      roomId: friendA.roomId,
+      username: 'friend_a',
       label: 'Friend-A-PC',
-      bridges: pairARes.bridges,
-      authMode: 'pair',
+      bridges: meA.bridges,
+      authMode: 'account',
     })
     assert.equal(repairedA.isNew, false)
     dState = repairedA.state
     assert.equal(dState.devices.length, 2)
-    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac', 'Re-pairing must keep custom nickname')
-    assert.equal(dState.devices[0].token, `${pairARes.token}-refreshed`)
+    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac', 'Re-login must keep custom nickname')
+    assert.equal(dState.devices[0].token, `${friendA.token}-refreshed`)
 
-    // Switch back to Device B and verify save/reload persistence
+    // Switch back to Account B and verify save/reload persistence
     dState = selectDevice(dState, addedB.device.id)
     saveDeviceState(dState, fakeStorage)
     const reloaded = loadDeviceState(fakeStorage)
@@ -627,44 +667,42 @@ async function main() {
     assert.equal((await getSessionCacheStats(scopeA)).sessionCount, 1)
     assert.equal((await getSessionCacheStats(scopeB)).sessionCount, 1)
 
-    // Clearing Device A cache prefix leaves Device B cache untouched
+    // Clearing Account A cache prefix leaves Account B cache untouched
     await clearSessionCache(dState.devices[0].id, { prefix: true })
     assert.equal(await loadCachedSession('codex:shared-id', scopeA), null)
     assert.equal((await loadCachedSession('codex:shared-id', scopeB)).messages[0].text, 'from Win')
     await clearSessionCache()
 
-    // Removing Device B auto-falls back to Device A
+    // Removing Account B auto-falls back to Account A
     dState = removeDevice(dState, addedB.device.id)
     assert.equal(dState.devices.length, 1)
     assert.equal(dState.activeDeviceId, devAId)
 
-    // Image URL helper propagates bridgeId and prefers short-lived mediaToken (`mt=`) over master `token=`
-    const imgSrc = resolveImageSrc('/tmp/shot.png', {
+    // Image URL helper only signs `/api/uploads/...` with short-lived `mt=` mediaToken; local paths never fall back to removed `/api/bridge-file`
+    const uploadImgSrc = resolveImageSrc({ url: '/api/uploads/sample-id' }, {
       baseUrl: httpBase,
       mediaToken: 'mtok',
       token: 'master-tok',
-      cwd: '/work',
-      bridgeId: 'smoke-pc-2',
     })
-    assert.ok(imgSrc.includes('bridgeId=smoke-pc-2'), 'resolveImageSrc must include bridgeId query param')
-    assert.ok(imgSrc.includes('mt=mtok') && !imgSrc.includes('master-tok'), 'resolveImageSrc must prefer mt= mediaToken over master token')
+    assert.ok(uploadImgSrc.includes('mt=mtok') && !uploadImgSrc.includes('master-tok'), 'resolveImageSrc must use mt= mediaToken only')
+    const localImgSrc = resolveImageSrc('/tmp/shot.png', { baseUrl: httpBase, mediaToken: 'mtok' })
+    assert.equal(localImgSrc, '', 'Local paths must never build removed /api/bridge-file URLs')
     console.log('[smoke] 7/8 Multi-device store, status probe, strict bridgeId routing & scoped cache OK')
 
     // 8. Comprehensive Security Hardening Suite
-    // 8.1 Production default-secret refusal
+    // 8.1 Production missing/weak JWT_SECRET refusal
     assert.throws(
       () =>
         createRelayServer({
           port: 0,
           host: '127.0.0.1',
           nodeEnv: 'production',
-          clientAccessToken: 'allinone-dev-pass',
-          bridgeSecret: 'allinone-dev-bridge',
-          roomsFile: join(tmpDir, 'prod-rooms.json'),
+          jwtSecret: 'too-short',
+          accountsFile: join(tmpDir, 'prod-accounts.json'),
           uploadDir: join(tmpDir, 'prod-uploads'),
         }),
       /Refusing to start in production/,
-      'Production server must refuse to start with default dev secrets',
+      'Production server must refuse to start without a strong JWT_SECRET (>= 16 chars)',
     )
 
     // 8.2 Strict CORS & WebSocket CSWSH Origin allowlist
@@ -682,7 +720,17 @@ async function main() {
     })
     assert.equal(capCorsRes.headers.get('access-control-allow-origin'), 'https://localhost')
 
-    // 8.3 Single-use WS ticket & CSWSH origin block
+    // 8.3 Single-use WS ticket, CSWSH origin block & legacy ?token= query rejection
+    await assert.rejects(
+      () =>
+        new Promise((resolve, reject) => {
+          const legacyTokWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(loginData.token)}`)
+          legacyTokWs.on('open', () => { legacyTokWs.close(); resolve() })
+          legacyTokWs.on('error', reject)
+        }),
+      'Legacy /ws/client?token= query string must be strictly rejected',
+    )
+
     const ticketRes = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${loginData.token}` },
@@ -722,60 +770,46 @@ async function main() {
       'Reusing a single-use WS ticket must be rejected',
     )
 
-    // 8.4 Scoped read-only media token (works for images/uploads, rejected on session/WS/upload APIs)
-    const mediaTokRes = await (await fetch(`${httpBase}/api/auth/media-token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${loginData.token}` },
-    })).json()
-    assert.equal(mediaTokRes.ok, true)
-    assert.ok(mediaTokRes.mediaToken)
-
-    const mtImgRes = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&mt=${encodeURIComponent(mediaTokRes.mediaToken)}`,
+    // 8.4 Scoped read-only media token (works ONLY for /api/uploads/:id; master session token rejected on media endpoint & media token rejected on session APIs)
+    const mtUploadRes = await fetch(
+      `${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`,
     )
-    assert.equal(mtImgRes.status, 200, 'Media token must authorize GET /api/bridge-file')
+    assert.equal(mtUploadRes.status, 200, 'Scoped mediaToken must authorize GET /api/uploads/:id')
+    const rawSessionOnUpload = await fetch(
+      `${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(loginData.token)}`,
+    )
+    assert.equal(rawSessionOnUpload.status, 401, 'Master session JWT must NOT be accepted on scoped media endpoint')
     const mtOnMe = await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${mediaTokRes.mediaToken}` },
+      headers: { Authorization: `Bearer ${adminMediaTok.mediaToken}` },
     })
     assert.equal(mtOnMe.status, 401, 'Media token must NOT work as a full session token on /api/auth/me')
     const mtOnTicket = await fetch(`${httpBase}/api/auth/ws-ticket`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${mediaTokRes.mediaToken}` },
+      headers: { Authorization: `Bearer ${adminMediaTok.mediaToken}` },
     })
     assert.equal(mtOnTicket.status, 401, 'Media token must NOT mint WS tickets')
-    await assert.rejects(
-      () =>
-        new Promise((resolve, reject) => {
-          const mtWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(mediaTokRes.mediaToken)}`)
-          mtWs.on('open', () => { mtWs.close(); resolve() })
-          mtWs.on('error', reject)
-        }),
-      'Media token must NOT open /ws/client',
-    )
 
-    // 8.5 Bridge URL query secret rejection + ephemeral consume on non-image upload + safe headers
+    // 8.5 Bridge URL query secret rejection + ephemeral consume on encrypted upload + safe headers
     await assert.rejects(
       () =>
         new Promise((resolve, reject) => {
-          const qsBridge = new WebSocket(`ws://127.0.0.1:${port}/ws/bridge?secret=${encodeURIComponent(TEST_BRIDGE_SECRET)}`)
+          const qsBridge = new WebSocket(`ws://127.0.0.1:${port}/ws/bridge?room=${encodeURIComponent(smokeAdmin.roomId)}&secret=${encodeURIComponent(smokeDev.deviceSecret)}`)
           qsBridge.on('open', () => { qsBridge.close(); resolve() })
           qsBridge.on('error', reject)
         }),
       'Bridge WS must reject ?secret= in URL query string',
     )
-    const qsUploadTry = await fetch(`${httpBase}${ownerUpload.upload.url}?secret=${encodeURIComponent(TEST_BRIDGE_SECRET)}`)
+    const qsUploadTry = await fetch(`${httpBase}${adminUpload.upload.url}?secret=${encodeURIComponent(smokeDev.deviceSecret)}`)
     assert.equal(qsUploadTry.status, 401, 'Upload download must reject ?secret= in URL query string')
 
-    const bridgeConsumeRes = await fetch(`${httpBase}${ownerUpload.upload.url}?consume=1`, {
-      headers: { 'X-Bridge-Secret': TEST_BRIDGE_SECRET },
+    const bridgeConsumeRes = await fetch(`${httpBase}${adminUpload.upload.url}?consume=1`, {
+      headers: { 'X-Room-Id': smokeAdmin.roomId, 'X-Bridge-Secret': smokeDev.deviceSecret },
     })
     assert.equal(bridgeConsumeRes.status, 200)
     assert.ok(String(bridgeConsumeRes.headers.get('content-disposition') || '').startsWith('attachment'))
     assert.equal(bridgeConsumeRes.headers.get('content-security-policy'), "default-src 'none'; sandbox")
-    const afterConsumeRes = await fetch(`${httpBase}${ownerUpload.upload.url}`, {
-      headers: { Authorization: `Bearer ${loginData.token}` },
-    })
-    assert.equal(afterConsumeRes.status, 404, 'Consumed non-image upload must be deleted immediately from relay disk')
+    const afterConsumeRes = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`)
+    assert.equal(afterConsumeRes.status, 404, 'Consumed encrypted upload must be deleted immediately from relay disk')
 
     // 8.6 SSRF & X-Bridge-Secret leak defense in materializeAttachments
     let attackerHits = 0
@@ -788,8 +822,8 @@ async function main() {
     const attackerPort = attackerServer.address().port
     try {
       const matResult = await bridge.orchestrator.materializeAttachments([
-        { url: `http://127.0.0.1:${attackerPort}/steal`, filename: 'evil.txt', mimeType: 'text/plain' },
-        { url: '/api/uploads/../../etc/passwd', filename: 'trav.txt', mimeType: 'text/plain' },
+        { url: `http://127.0.0.1:${attackerPort}/steal`, filename: 'evil.txt', mimeType: 'text/plain', e2ee: { iv: 'AAAAAAAAAAAAAAAA' } },
+        { url: '/api/uploads/../../etc/passwd', filename: 'trav.txt', mimeType: 'text/plain', e2ee: { iv: 'AAAAAAAAAAAAAAAA' } },
         { localPath: '/etc/passwd', filename: 'passwd', mimeType: 'text/plain' },
       ])
       assert.equal(matResult.length, 0, 'Untrusted URLs and caller-supplied localPath must all be rejected')
@@ -801,10 +835,11 @@ async function main() {
     // 8.7 Symlink image bypass defense in readLocalFile
     const symlinkPath = join(tmpDir, 'disguised-secret.png')
     symlinkSync(join(process.cwd(), 'package.json'), symlinkPath)
-    const symlinkRes = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent(symlinkPath)}&mt=${encodeURIComponent(mediaTokRes.mediaToken)}`,
+    await assert.rejects(
+      () => bridge.orchestrator.readLocalFile({ path: symlinkPath }),
+      /出于安全限制/,
+      'Symlink pointing to non-image file must be blocked in readLocalFile',
     )
-    assert.equal(symlinkRes.status, 403, 'Symlink pointing to non-image file must be blocked with 403')
 
     // 8.8 Session ID path traversal & CLI argument injection defense
     await assert.rejects(() => bridge.orchestrator.readSession({ id: 'dsh:../../etc/passwd' }), /非法的/)
@@ -819,342 +854,356 @@ async function main() {
       /非法的/,
     )
 
-    // 8.9 Token revocation (`POST /api/rooms/revoke`) kicks active WS with 4401 and invalidates JWT + mediaToken
-    const mediaTokA = await (await fetch(`${httpBase}/api/auth/media-token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${pairARes.token}` },
-    })).json()
-    assert.equal(mediaTokA.ok, true)
-
-    const ticketA = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${pairARes.token}` },
-    })).json()
-    const wsRevoke = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketA.ticket)}`)
-    await new Promise((resolve, reject) => {
-      wsRevoke.on('message', (raw) => {
-        if (JSON.parse(String(raw)).type === 'hello') resolve()
-      })
-      wsRevoke.on('error', reject)
+    // 8.9 Token revocation (`POST /api/auth/sessions/revoke-all`) kicks active WS with 4401 and invalidates JWT + mediaToken
+    const encFriendBlob = await encryptBytes(friendE2eeKeyA, Buffer.from('friend-a-file', 'utf8'), {
+      kind: 'upload',
+      roomId: friendA.roomId,
     })
+    const friendUpload = await (await fetch(`${httpBase}/api/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${friendA.token}` },
+      body: JSON.stringify({
+        filename: 'a.txt',
+        mimeType: 'text/plain',
+        encrypted: true,
+        dataBase64: bytesToBase64(encFriendBlob.ciphertext),
+      }),
+    })).json()
+    assert.equal(friendUpload.ok, true)
+
+    const wsRevokeCli = await openTicketClientWs(httpBase, port, friendA.token, { deviceName: 'revoke-test-phone' })
     const closeCodePromise = new Promise((resolve) => {
-      wsRevoke.on('close', (code) => resolve(code))
+      wsRevokeCli.ws.on('close', (code) => resolve(code))
     })
 
-    const revokeRes = await (await fetch(`${httpBase}/api/rooms/revoke`, {
+    const revokeRes = await (await fetch(`${httpBase}/api/auth/sessions/revoke-all`, {
       method: 'POST',
-      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
+      headers: { Authorization: `Bearer ${friendA.token}` },
     })).json()
     assert.equal(revokeRes.ok, true)
     assert.equal(revokeRes.disconnectedClients, 1)
     assert.equal(await closeCodePromise, 4401, 'Revoked WS client must be kicked with code 4401')
 
     const revokedMe = await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${pairARes.token}` },
+      headers: { Authorization: `Bearer ${friendA.token}` },
     })
     assert.equal(revokedMe.status, 401, 'Revoked JWT must return 401 on /api/auth/me')
     const revokedMedia = await fetch(
-      `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&mt=${encodeURIComponent(mediaTokA.mediaToken)}`,
+      `${httpBase}${friendUpload.upload.url}?mt=${encodeURIComponent(friendAMediaTok.mediaToken)}`,
     )
-    assert.equal(revokedMedia.status, 401, 'Revoked room mediaToken must return 401')
+    assert.equal(revokedMedia.status, 401, 'Revoked account mediaToken must return 401')
 
-    // Re-pairing after revocation issues a fresh working token (tv=1)
-    const postRevokeRefresh = await (await fetch(`${httpBase}/api/rooms/pair-code`, {
-      method: 'POST',
-      headers: { 'X-Room-Id': regA.roomId, 'X-Bridge-Secret': regA.bridgeSecret },
-    })).json()
-    const postRevokePair = await (await fetch(`${httpBase}/api/auth/pair`, {
+    // Re-logging in after revocation issues a fresh working token (tv=1)
+    const postRevokeLogin = await (await fetch(`${httpBase}/api/account/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pairCode: postRevokeRefresh.pairCode }),
+      body: JSON.stringify({ username: 'friend_a', password: 'FriendAPass99!' }),
     })).json()
-    assert.equal(postRevokePair.ok, true)
+    assert.equal(postRevokeLogin.ok, true)
     const freshMe = await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${postRevokePair.token}` },
+      headers: { Authorization: `Bearer ${postRevokeLogin.token}` },
     })
-    assert.equal(freshMe.status, 200, 'Re-paired token after revocation must succeed')
+    assert.equal(freshMe.status, 200, 'Re-logged token after revocation must succeed')
 
     // 8.10 X-Forwarded-For spoofing resistance (uses rightmost trusted-proxy IP, ignores spoofed leftmost)
     for (let i = 0; i < 15; i += 1) {
-      const r = await fetch(`${httpBase}/api/auth/login`, {
+      const r = await fetch(`${httpBase}/api/account/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Forwarded-For': `1.2.3.${i + 1}, 203.0.113.9`,
         },
-        body: JSON.stringify({ password: 'bad-password' }),
+        body: JSON.stringify({ username: `nonexistent_user_${i}`, password: 'bad-password' }),
       })
       assert.equal(r.status, 401)
     }
-    const throttled = await fetch(`${httpBase}/api/auth/login`, {
+    const throttled = await fetch(`${httpBase}/api/account/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Forwarded-For': '9.9.9.9, 203.0.113.9',
       },
-      body: JSON.stringify({ password: 'bad-password' }),
+      body: JSON.stringify({ username: 'nonexistent_user_16', password: 'bad-password' }),
     })
     assert.equal(throttled.status, 429, 'Spoofing leftmost X-Forwarded-For must NOT bypass rate limit')
 
-    // 8.11 Optional REGISTER_INVITE_CODE gating
-    const gatedRelay = createRelayServer({
-      port: 0,
-      host: '127.0.0.1',
-      clientAccessToken: TEST_PASS,
-      bridgeSecret: TEST_BRIDGE_SECRET,
-      registerInviteCode: 'invite-top-secret',
-      roomsFile: join(tmpDir, 'gated-rooms.json'),
-      uploadDir: join(tmpDir, 'gated-uploads'),
+    // 8.11 Mandatory E2EE bridge enforcement: plaintext bridge without e2ee.enabled is closed with code 4008
+    const nonE2eeCloseCode = await new Promise((resolveCode, rejectCode) => {
+      const qs = new URLSearchParams({
+        roomId: smokeAdmin.roomId,
+        bridgeId: smokeDev2.bridgeId,
+        hostname: 'plain-pc',
+        platform: 'darwin',
+      })
+      const rawBr = new WebSocket(`ws://127.0.0.1:${port}/ws/bridge?${qs.toString()}`, {
+        headers: { 'X-Room-Id': smokeAdmin.roomId, 'X-Bridge-Secret': smokeDev2.deviceSecret },
+      })
+      rawBr.on('open', () => {
+        rawBr.send(JSON.stringify({ type: 'bridge.meta', meta: { apps: [] } }))
+      })
+      rawBr.on('close', (code) => resolveCode(code))
+      rawBr.on('error', rejectCode)
     })
-    const gatedAddr = await gatedRelay.start()
-    try {
-      const noInv = await fetch(`http://127.0.0.1:${gatedAddr.port}/api/rooms/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: 'Uninvited' }),
-      })
-      assert.equal(noInv.status, 403, 'Gated server must reject room registration without invite code')
-      const withInv = await fetch(`http://127.0.0.1:${gatedAddr.port}/api/rooms/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Invite-Code': 'invite-top-secret' },
-        body: JSON.stringify({ label: 'Invited-PC' }),
-      })
-      assert.equal(withInv.status, 200, 'Gated server must accept valid invite code')
-    } finally {
-      await gatedRelay.close()
-    }
+    assert.equal(nonE2eeCloseCode, 4008, 'Bridge sending bridge.meta without E2EE must be closed with code 4008')
 
     console.log('[smoke] 8/9 Security hardening suite OK (11 checks passed)')
 
-    // 9. Account System, Single-Use Invite Codes & Auto Multi-PC Discovery
-    const bootBefore = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
-    assert.equal(bootBefore.ok, true)
-    assert.equal(bootBefore.hasUsers, false, 'Fresh server should report hasUsers=false before first admin')
-
-    // Reject registration without valid invite
-    const badReg = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'nobody', password: 'Password123!', inviteCode: 'INV-AAAA-BBBB' }),
-    })
-    assert.equal(badReg.status, 400, 'Registration with invalid invite code must fail')
-
-    // Bootstrap first admin account using server CLIENT_ACCESS_TOKEN
-    const alicePass = 'AliceStrongPass99!'
-    const aliceReg = await (await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'alice', password: alicePass, inviteCode: TEST_PASS }),
-    })).json()
-    assert.equal(aliceReg.ok, true)
-    assert.equal(aliceReg.user.role, 'admin', 'First bootstrapped user must be admin')
-    assert.ok(aliceReg.roomId.startsWith('usr_'))
-
-    const bootAfter = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
-    assert.equal(bootAfter.hasUsers, true)
-
-    // Bootstrap key must NO LONGER work once 1st user exists
-    const secondBootTry = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'intruder', password: 'Password123!', inviteCode: TEST_PASS }),
-    })
-    assert.equal(secondBootTry.status, 400, 'CLIENT_ACCESS_TOKEN bootstrap must only work for the very first user')
-
-    // Admin generates 2 single-use invite codes
-    const invCreate = await (await fetch(`${httpBase}/api/admin/invites`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aliceReg.token}`,
-      },
-      body: JSON.stringify({ count: 2, note: 'smoke-friends' }),
-    })).json()
-    assert.equal(invCreate.ok, true)
-    assert.equal(invCreate.invites.length, 2)
-    const inv1 = invCreate.invites[0]
-    const inv2 = invCreate.invites[1]
-    assert.match(inv1.code, /^INV-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/)
-
-    // Bob registers with invite #1 -> succeeds as non-admin user
-    const bobReg = await (await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'bob', password: 'BobPassword88!', inviteCode: inv1.code.toLowerCase() }),
-    })).json()
-    assert.equal(bobReg.ok, true)
-    assert.equal(bobReg.user.role, 'user')
-
-    // Reusing invite #1 for Charlie must FAIL (strictly 1 user per invite code!)
-    const reuseInv1 = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv1.code }),
-    })
-    assert.equal(reuseInv1.status, 400, 'Single-use invite code must reject a 2nd user')
-
-    // Non-admin Bob cannot list or create invite codes
-    const bobAdminTry = await fetch(`${httpBase}/api/admin/invites`, {
-      headers: { Authorization: `Bearer ${bobReg.token}` },
-    })
-    assert.equal(bobAdminTry.status, 403, 'Non-admin user must receive 403 on /api/admin/invites')
-
-    // Admin revokes unused invite #2 -> Charlie cannot use it
-    const revokeInv2 = await (await fetch(`${httpBase}/api/admin/invites/revoke`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aliceReg.token}`,
-      },
-      body: JSON.stringify({ id: inv2.id }),
-    })).json()
-    assert.equal(revokeInv2.ok, true)
-    assert.equal(revokeInv2.invite.status, 'revoked')
-    const revokedInvTry = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv2.code }),
-    })
-    assert.equal(revokedInvTry.status, 400, 'Revoked invite code must be rejected')
-
-    // Verify accounts.json NEVER stores plaintext passwords
-    const persistedAccounts = readFileSync(join(tmpDir, 'accounts.json'), 'utf8')
-    assert.equal(persistedAccounts.includes(alicePass), false, 'accounts.json must NOT store plaintext password')
-
-    // Bind PC-1 via portable single-file CLI in account mode (verifying password is NEVER written to config.json!)
-    if (existsSync(bundlePath)) {
-      const acctStateDir = join(tmpDir, 'portable-account-home')
-      acctPortableChild = spawn(process.execPath, [
-        bundlePath,
-        '--server', httpBase,
-        '--state-dir', acctStateDir,
-        '--name', 'Alice-Mac',
-        '--username', 'alice',
-        '--password', alicePass,
-        '--no-browser',
-      ], {
-        env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
-        stdio: ['ignore', 'pipe', 'pipe'],
+    // 9. Account System, Single-Use Invite Codes & Auto Multi-PC Discovery (fresh server bootstrap test)
+    {
+      const acctRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'acct-test-jwt-secret-0123456789',
+        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
+        accountsFile: join(tmpDir, 'acct-accounts.json'),
+        uploadDir: join(tmpDir, 'acct-uploads'),
       })
-      let acctOut = ''
-      acctPortableChild.stdout.on('data', (d) => { acctOut += String(d) })
-      acctPortableChild.stderr.on('data', (d) => { acctOut += String(d) })
-      for (let i = 0; i < 60; i++) {
-        if (existsSync(join(acctStateDir, 'config.json')) && acctOut.includes('已加密连接到中转服务器')) break
-        await new Promise((r) => setTimeout(r, 150))
+      const { port: acctPort } = await acctRelay.start()
+      const acctHttpBase = `http://127.0.0.1:${acctPort}`
+      const acctWsBridgeUrl = `ws://127.0.0.1:${acctPort}/ws/bridge`
+      try {
+        const bootBefore = await (await fetch(`${acctHttpBase}/api/account/bootstrap-status`)).json()
+        assert.equal(bootBefore.ok, true)
+        assert.equal(bootBefore.hasUsers, false, 'Fresh server should report hasUsers=false before first admin')
+
+        // Reject registration without valid invite
+        const badReg = await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'nobody', password: 'Password123!', inviteCode: 'INV-AAAA-BBBB' }),
+        })
+        assert.equal(badReg.status, 400, 'Registration with invalid invite code must fail')
+
+        // Bootstrap first admin account using server ADMIN_BOOTSTRAP_TOKEN
+        const alicePass = 'AliceStrongPass99!'
+        const aliceReg = await (await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'alice', password: alicePass, inviteCode: TEST_BOOTSTRAP_TOKEN }),
+        })).json()
+        assert.equal(aliceReg.ok, true)
+        assert.equal(aliceReg.user.role, 'admin', 'First bootstrapped user must be admin')
+        assert.ok(aliceReg.roomId.startsWith('usr_'))
+
+        const bootAfter = await (await fetch(`${acctHttpBase}/api/account/bootstrap-status`)).json()
+        assert.equal(bootAfter.hasUsers, true)
+
+        // Bootstrap token must NO LONGER work once 1st user exists
+        const secondBootTry = await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'intruder', password: 'Password123!', inviteCode: TEST_BOOTSTRAP_TOKEN }),
+        })
+        assert.equal(secondBootTry.status, 400, 'ADMIN_BOOTSTRAP_TOKEN must only work for the very first user')
+
+        // Admin generates 2 single-use invite codes
+        const invCreate = await (await fetch(`${acctHttpBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceReg.token}`,
+          },
+          body: JSON.stringify({ count: 2, note: 'smoke-friends' }),
+        })).json()
+        assert.equal(invCreate.ok, true)
+        assert.equal(invCreate.invites.length, 2)
+        const inv1 = invCreate.invites[0]
+        const inv2 = invCreate.invites[1]
+        assert.match(inv1.code, /^INV-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/)
+
+        // Bob registers with invite #1 -> succeeds as non-admin user
+        const bobReg = await (await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'bob', password: 'BobPassword88!', inviteCode: inv1.code.toLowerCase() }),
+        })).json()
+        assert.equal(bobReg.ok, true)
+        assert.equal(bobReg.user.role, 'user')
+
+        // Reusing invite #1 for Charlie must FAIL (strictly 1 user per invite code!)
+        const reuseInv1 = await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv1.code }),
+        })
+        assert.equal(reuseInv1.status, 400, 'Single-use invite code must reject a 2nd user')
+
+        // Non-admin Bob cannot list or create invite codes
+        const bobAdminTry = await fetch(`${acctHttpBase}/api/admin/invites`, {
+          headers: { Authorization: `Bearer ${bobReg.token}` },
+        })
+        assert.equal(bobAdminTry.status, 403, 'Non-admin user must receive 403 on /api/admin/invites')
+
+        // Admin revokes unused invite #2 -> Charlie cannot use it
+        const revokeInv2 = await (await fetch(`${acctHttpBase}/api/admin/invites/revoke`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceReg.token}`,
+          },
+          body: JSON.stringify({ id: inv2.id }),
+        })).json()
+        assert.equal(revokeInv2.ok, true)
+        assert.equal(revokeInv2.invite.status, 'revoked')
+        const revokedInvTry = await fetch(`${acctHttpBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'charlie', password: 'CharliePass77!', inviteCode: inv2.code }),
+        })
+        assert.equal(revokedInvTry.status, 400, 'Revoked invite code must be rejected')
+
+        // Verify accounts.json NEVER stores plaintext passwords
+        const persistedAccounts = readFileSync(join(tmpDir, 'acct-accounts.json'), 'utf8')
+        assert.equal(persistedAccounts.includes(alicePass), false, 'accounts.json must NOT store plaintext password')
+
+        // Bind PC-1 via portable single-file CLI in account mode (verifying password is NEVER written & e2eeKey is auto-generated!)
+        if (existsSync(bundlePath)) {
+          const acctStateDir = join(tmpDir, 'portable-account-home')
+          acctPortableChild = spawn(process.execPath, [
+            bundlePath,
+            '--server', acctHttpBase,
+            '--state-dir', acctStateDir,
+            '--name', 'Alice-Mac',
+            '--username', 'alice',
+            '--password', alicePass,
+            '--no-browser',
+          ], {
+            env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          let acctOut = ''
+          acctPortableChild.stdout.on('data', (d) => { acctOut += String(d) })
+          acctPortableChild.stderr.on('data', (d) => { acctOut += String(d) })
+          for (let i = 0; i < 60; i++) {
+            if (existsSync(join(acctStateDir, 'config.json')) && acctOut.includes('已加密连接到中转服务器')) break
+            await new Promise((r) => setTimeout(r, 150))
+          }
+          assert.ok(acctOut.includes('已加密连接到中转服务器'), `Account portable CLI should connect (${acctOut.slice(0, 300)})`)
+          const pcCfgRaw = readFileSync(join(acctStateDir, 'config.json'), 'utf8')
+          assert.equal(pcCfgRaw.includes(alicePass), false, 'PC config.json must NEVER store account password!')
+          assert.ok(pcCfgRaw.includes('"mode": "account"'))
+          assert.ok(pcCfgRaw.includes('"e2eeKey"'), 'PC config.json must auto-generate mandatory e2eeKey')
+        }
+
+        // Bind PC-2 via /api/account/device-login and connect via standalone bridge (with mandatory E2EE)
+        const boundPc2 = await (await fetch(`${acctHttpBase}/api/account/device-login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'alice',
+            password: alicePass,
+            label: 'Alice-Win-Desktop',
+            hostname: 'WIN-HOME',
+            platform: 'win32',
+          }),
+        })).json()
+        assert.equal(boundPc2.ok, true)
+        assert.ok(boundPc2.deviceSecret.startsWith('dv_'))
+        assert.equal(
+          readFileSync(join(tmpDir, 'acct-accounts.json'), 'utf8').includes(boundPc2.deviceSecret),
+          false,
+          'accounts.json must NOT store plaintext deviceSecret',
+        )
+
+        acctBridge2 = startStandaloneBridge({
+          relayUrl: acctWsBridgeUrl,
+          secret: boundPc2.deviceSecret,
+          roomId: boundPc2.roomId,
+          bridgeId: boundPc2.bridgeId,
+          e2eeKey: generateE2eeKey(),
+          quiet: true,
+        })
+        const expectedCount = existsSync(bundlePath) ? 2 : 1
+        for (let i = 0; i < 50; i++) {
+          if (acctRelay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length >= expectedCount) break
+          await new Promise((r) => setTimeout(r, 100))
+        }
+
+        // Mobile login as Alice automatically discovers ALL bound online PCs!
+        const aliceLogin = await (await fetch(`${acctHttpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'alice', password: alicePass }),
+        })).json()
+        assert.equal(aliceLogin.ok, true)
+        assert.equal(aliceLogin.devices.length, expectedCount)
+        assert.ok(aliceLogin.devices.every((d) => d.online), 'All connected Alice PCs should show online automatically')
+
+        // Bob's account is strictly isolated (0 devices)
+        const bobLogin = await (await fetch(`${acctHttpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'bob', password: 'BobPassword88!' }),
+        })).json()
+        assert.equal(bobLogin.ok, true)
+        assert.equal(bobLogin.devices.length, 0, 'Bob must NEVER see Alice devices')
+
+        // Rename & then unbind PC-2 -> immediately invalidates PC-2 deviceSecret while PC-1 stays online
+        const renamedPc2 = await (await fetch(`${acctHttpBase}/api/account/devices/rename`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceLogin.token}`,
+          },
+          body: JSON.stringify({ deviceId: boundPc2.deviceId, label: '家里游戏主机' }),
+        })).json()
+        assert.equal(renamedPc2.ok, true)
+        assert.equal(renamedPc2.device.label, '家里游戏主机')
+
+        const removedPc2 = await (await fetch(`${acctHttpBase}/api/account/devices/remove`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceLogin.token}`,
+          },
+          body: JSON.stringify({ deviceId: boundPc2.deviceId }),
+        })).json()
+        assert.equal(removedPc2.ok, true)
+
+        const pc2StatusAfterRemove = await fetch(`${acctHttpBase}/api/account/device-status`, {
+          headers: { 'X-Room-Id': boundPc2.roomId, 'X-Bridge-Secret': boundPc2.deviceSecret },
+        })
+        assert.equal(pc2StatusAfterRemove.status, 401, 'Unbound PC deviceSecret must immediately return 401')
+        if (existsSync(bundlePath)) {
+          assert.equal(
+            acctRelay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length,
+            1,
+            'PC-1 must stay online after unbinding PC-2',
+          )
+        }
+
+        // Desktop App JWT-authenticated device registration (`POST /api/account/devices/register`) + `app://allinone` CORS
+        const desktopRegRes = await fetch(`${acctHttpBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceLogin.token}`,
+            Origin: 'app://allinone',
+          },
+          body: JSON.stringify({
+            label: 'Alice-Desktop-App',
+            hostname: 'ALICE-MBP',
+            platform: 'darwin',
+          }),
+        })
+        assert.equal(desktopRegRes.status, 200)
+        assert.equal(desktopRegRes.headers.get('access-control-allow-origin'), 'app://allinone')
+        const desktopBound = await desktopRegRes.json()
+        assert.equal(desktopBound.ok, true)
+        assert.ok(desktopBound.deviceSecret.startsWith('dv_'))
+        assert.equal(desktopBound.roomId, aliceReg.roomId)
+      } finally {
+        if (acctPortableChild) {
+          try { acctPortableChild.kill() } catch {}
+          acctPortableChild = null
+        }
+        if (acctBridge2) {
+          await acctBridge2.stop()
+          acctBridge2 = null
+        }
+        await acctRelay.close()
       }
-      assert.ok(acctOut.includes('已加密连接到中转服务器'), `Account portable CLI should connect (${acctOut.slice(0, 300)})`)
-      const pcCfgRaw = readFileSync(join(acctStateDir, 'config.json'), 'utf8')
-      assert.equal(pcCfgRaw.includes(alicePass), false, 'PC config.json must NEVER store account password!')
-      assert.ok(pcCfgRaw.includes('"mode": "account"'))
     }
-
-    // Bind PC-2 via /api/account/device-login and connect via standalone bridge
-    const boundPc2 = await (await fetch(`${httpBase}/api/account/device-login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: 'alice',
-        password: alicePass,
-        label: 'Alice-Win-Desktop',
-        hostname: 'WIN-HOME',
-        platform: 'win32',
-      }),
-    })).json()
-    assert.equal(boundPc2.ok, true)
-    assert.ok(boundPc2.deviceSecret.startsWith('dv_'))
-    assert.equal(
-      readFileSync(join(tmpDir, 'accounts.json'), 'utf8').includes(boundPc2.deviceSecret),
-      false,
-      'accounts.json must NOT store plaintext deviceSecret',
-    )
-
-    acctBridge2 = startStandaloneBridge({
-      relayUrl: wsBridgeUrl,
-      secret: boundPc2.deviceSecret,
-      roomId: boundPc2.roomId,
-      bridgeId: boundPc2.bridgeId,
-      quiet: true,
-    })
-    const expectedCount = existsSync(bundlePath) ? 2 : 1
-    for (let i = 0; i < 50; i++) {
-      if (relay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length >= expectedCount) break
-      await new Promise((r) => setTimeout(r, 100))
-    }
-
-    // Mobile login as Alice automatically discovers ALL bound online PCs!
-    const aliceLogin = await (await fetch(`${httpBase}/api/account/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'alice', password: alicePass }),
-    })).json()
-    assert.equal(aliceLogin.ok, true)
-    assert.equal(aliceLogin.devices.length, expectedCount)
-    assert.ok(aliceLogin.devices.every((d) => d.online), 'All connected Alice PCs should show online automatically')
-
-    // Bob's account is strictly isolated (0 devices)
-    const bobLogin = await (await fetch(`${httpBase}/api/account/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'bob', password: 'BobPassword88!' }),
-    })).json()
-    assert.equal(bobLogin.ok, true)
-    assert.equal(bobLogin.devices.length, 0, 'Bob must NEVER see Alice devices')
-
-    // Rename & then unbind PC-2 -> immediately invalidates PC-2 deviceSecret while PC-1 stays online
-    const renamedPc2 = await (await fetch(`${httpBase}/api/account/devices/rename`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aliceLogin.token}`,
-      },
-      body: JSON.stringify({ deviceId: boundPc2.deviceId, label: '家里游戏主机' }),
-    })).json()
-    assert.equal(renamedPc2.ok, true)
-    assert.equal(renamedPc2.device.label, '家里游戏主机')
-
-    const removedPc2 = await (await fetch(`${httpBase}/api/account/devices/remove`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aliceLogin.token}`,
-      },
-      body: JSON.stringify({ deviceId: boundPc2.deviceId }),
-    })).json()
-    assert.equal(removedPc2.ok, true)
-
-    const pc2StatusAfterRemove = await fetch(`${httpBase}/api/account/device-status`, {
-      headers: { 'X-Room-Id': boundPc2.roomId, 'X-Bridge-Secret': boundPc2.deviceSecret },
-    })
-    assert.equal(pc2StatusAfterRemove.status, 401, 'Unbound PC deviceSecret must immediately return 401')
-    if (existsSync(bundlePath)) {
-      assert.equal(
-        relay.hub.getBridgeList(aliceReg.roomId).filter((b) => b.online).length,
-        1,
-        'PC-1 must stay online after unbinding PC-2',
-      )
-    }
-
-    // Desktop App JWT-authenticated device registration (`POST /api/account/devices/register`) + `app://allinone` CORS
-    const desktopRegRes = await fetch(`${httpBase}/api/account/devices/register`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aliceLogin.token}`,
-        Origin: 'app://allinone',
-      },
-      body: JSON.stringify({
-        label: 'Alice-Desktop-App',
-        hostname: 'ALICE-MBP',
-        platform: 'darwin',
-      }),
-    })
-    assert.equal(desktopRegRes.status, 200)
-    assert.equal(desktopRegRes.headers.get('access-control-allow-origin'), 'app://allinone')
-    const desktopBound = await desktopRegRes.json()
-    assert.equal(desktopBound.ok, true)
-    assert.ok(desktopBound.deviceSecret.startsWith('dv_'))
-    assert.equal(desktopBound.roomId, aliceReg.roomId)
 
     console.log('[smoke] 9/10 Account system, single-use invite codes, desktop auto-bind & multi-PC discovery OK')
 
@@ -1397,10 +1446,9 @@ async function main() {
     const emailRelay = createRelayServer({
       port: 0,
       host: '127.0.0.1',
-      clientAccessToken: 'email-bootstrap-secret-99',
-      bridgeSecret: 'email-bridge-secret-99',
+      jwtSecret: 'email-jwt-secret-0123456789',
+      adminBootstrapToken: 'email-bootstrap-secret-99',
       uploadDir: join(tmpDir, 'email-uploads'),
-      roomsFile: join(tmpDir, 'email-rooms.json'),
       accountsFile: join(tmpDir, 'email-accounts.json'),
       smtpHost: '127.0.0.1',
       smtpPort: mockSmtpPort,
@@ -1891,9 +1939,8 @@ async function main() {
       const sessRelay = createRelayServer({
         port: 0,
         host: '127.0.0.1',
-        clientAccessToken: 'sess-owner-pass',
-        bridgeSecret: 'sess-bridge-sec',
-        roomsFile: join(tmpDir, 'sess-rooms.json'),
+        jwtSecret: 'sess-jwt-secret-0123456789',
+        adminBootstrapToken: 'sess-owner-pass',
         accountsFile: join(tmpDir, 'sess-accounts.json'),
         uploadDir: join(tmpDir, 'sess-uploads'),
       })
@@ -2053,9 +2100,8 @@ async function main() {
       const monRelay = createRelayServer({
         port: 0,
         host: '127.0.0.1',
-        clientAccessToken: 'mon-owner-secret',
-        bridgeSecret: 'mon-bridge-secret',
-        roomsFile: join(tmpDir, 'mon-rooms.json'),
+        jwtSecret: 'mon-jwt-secret-0123456789',
+        adminBootstrapToken: 'mon-owner-secret',
         accountsFile: join(tmpDir, 'mon-accounts.json'),
         uploadDir: join(tmpDir, 'mon-uploads'),
       })
@@ -2092,7 +2138,7 @@ async function main() {
           })
           let closedCode = null
           ws.on('open', () => {
-            ws.send(JSON.stringify({ type: 'bridge.meta', meta: { apps } }))
+            ws.send(JSON.stringify({ type: 'bridge.meta', meta: { apps, e2ee: { enabled: true, v: 1, keyId: '0123456789abcdef' } } }))
             resolveBr({ ws, getClosedCode: () => closedCode })
           })
           ws.on('close', (code) => { closedCode = code })
@@ -2232,6 +2278,7 @@ async function main() {
         assert.equal(ovRaw.includes(bobPc.deviceSecret), false, 'Overview must NEVER expose deviceSecret')
         const ov = JSON.parse(ovRaw)
         assert.equal(ov.ok, true)
+        assert.equal(ov.legacyRooms, undefined, 'Overview must NOT include removed legacyRooms field')
         assert.equal(ov.summary.totalUsers, 3)
         assert.equal(ov.summary.activeUsers, 1, 'Bob should be active (PC + client online)')
         assert.equal(ov.summary.bridgeOnlyUsers, 1, 'Admin should be bridge_only (PC online, no client WS)')
@@ -2292,7 +2339,7 @@ async function main() {
 
     // 18. Security Hardening v0.4.0:
     //     - Strict HTML CSP header
-    //     - DISABLE_LEGACY_OWNER_AUTH & DISABLE_LEGACY_ROOMS kill-switches
+    //     - Permanently removed legacy owner/room endpoints (404) & owner WS bridge (401)
     //     - New-IP login alert emails & optional Account Email Login 2FA
     //     - Per-account distributed multi-IP brute-force lockout & /ws/bridge auth rate limit
     //     - Electron safeStorage encrypted bridgeSecret & legacy plaintext auto-migration
@@ -2452,13 +2499,10 @@ async function main() {
       const secRelay = createRelayServer({
         port: 0,
         host: '127.0.0.1',
-        clientAccessToken: 'sec-bootstrap-pass-123',
-        bridgeSecret: 'sec-owner-bridge-123',
-        disableLegacyOwnerAuth: true,
-        disableLegacyRooms: true,
+        jwtSecret: 'sec-jwt-secret-0123456789',
+        adminBootstrapToken: 'sec-bootstrap-pass-123',
         staticDir: secStaticDir,
         uploadDir: join(tmpDir, 'sec-uploads'),
-        roomsFile: join(tmpDir, 'sec-rooms.json'),
         accountsFile: join(tmpDir, 'sec-accounts.json'),
         smtpHost: '127.0.0.1',
         smtpPort: secSmtpPort,
@@ -2481,20 +2525,20 @@ async function main() {
         assert.ok(csp.includes("frame-ancestors 'none'"), `Expected frame-ancestors none CSP, got: ${csp}`)
         assert.equal(csp.includes('unsafe-eval'), false)
 
-        // 18.3b Legacy kill-switches block /api/auth/login, owner WS bridge, and /api/rooms/register
+        // 18.3b Removed legacy routes return 404 and owner WS bridge is permanently rejected with 401
         const legOwnerRes = await fetch(`${sBase}/api/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password: 'sec-bootstrap-pass-123' }),
         })
-        assert.equal(legOwnerRes.status, 403, 'DISABLE_LEGACY_OWNER_AUTH must block /api/auth/login with 403')
+        assert.equal(legOwnerRes.status, 404, 'Removed /api/auth/login must return 404')
 
         const legRoomRes = await fetch(`${sBase}/api/rooms/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ label: 'legacy-pc' }),
         })
-        assert.equal(legRoomRes.status, 403, 'DISABLE_LEGACY_ROOMS must block /api/rooms/register with 403')
+        assert.equal(legRoomRes.status, 404, 'Removed /api/rooms/register must return 404')
 
         const ownerBridgeStatus = await new Promise((resolveStatus) => {
           const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=owner&secret=sec-owner-bridge-123&id=legacy-pc`)
@@ -2502,7 +2546,7 @@ async function main() {
           ws.on('open', () => { ws.close(); resolveStatus(101) })
           ws.on('error', () => {})
         })
-        assert.equal(ownerBridgeStatus, 401, 'DISABLE_LEGACY_OWNER_AUTH must reject owner bridge WS with 401')
+        assert.equal(ownerBridgeStatus, 401, 'Owner bridge WS must always be rejected with 401')
 
         // 18.3c Register admin with bound email -> login from NEW IP triggers security alert email
         const codeRes = await (await fetch(`${sBase}/api/account/email/send-code`, {
@@ -2602,12 +2646,16 @@ async function main() {
         })
         assert.equal(lockedRes.status, 429, 'Per-account distributed brute-force lockout must return 429 even from a fresh IP')
 
-        // 18.3f /ws/bridge auth failure rate-limiting (isolated per (ip, roomId) so stale legacy owner never blocks valid usr_* on same NAT IP)
+        // 18.3f /ws/bridge auth failure rate-limiting (isolated per (ip, roomId) so one bogus room never blocks valid usr_* on same NAT IP)
         let bridge429 = false
         for (let i = 0; i < 16; i += 1) {
           const status = await new Promise((resolveStatus) => {
-            const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=owner&secret=wrong&id=stale-pc`, {
-              headers: { 'X-Real-IP': '198.51.100.222' },
+            const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?roomId=usr_bogus00000000&bridgeId=stale-pc`, {
+              headers: {
+                'X-Real-IP': '198.51.100.222',
+                'X-Room-Id': 'usr_bogus00000000',
+                'X-Bridge-Secret': 'wrong',
+              },
             })
             ws.on('unexpected-response', (_req, res) => resolveStatus(res.statusCode))
             ws.on('open', () => { ws.close(); resolveStatus(101) })
@@ -2620,7 +2668,7 @@ async function main() {
         }
         assert.equal(bridge429, true, 'Repeated /ws/bridge auth failures for one room must hit 429 rate limit')
 
-        // A valid account bridge on the EXACT SAME IP must NOT be locked out by the stale `owner` room!
+        // A valid account bridge on the EXACT SAME IP must NOT be locked out by the bogus room!
         const validDev = await (await fetch(`${sBase}/api/account/devices/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secAdm.token}` },
@@ -2639,7 +2687,7 @@ async function main() {
           ws.on('open', () => { ws.close(); resolveStatus(101) })
           ws.on('error', () => {})
         })
-        assert.equal(sameIpValidStatus, 101, 'Stale room=owner 429 must NEVER block a valid usr_* bridge on the same IP')
+        assert.equal(sameIpValidStatus, 101, 'Bogus room 429 must NEVER block a valid usr_* bridge on the same IP')
       } finally {
         await secRelay.close()
         await new Promise((r) => secSmtp.close(r))
@@ -2928,22 +2976,22 @@ async function main() {
       assert.match(e2eeKeyId, /^[0-9a-f]{16}$/)
       assert.match(formatE2eeFingerprint(e2eeKeyId), /^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/)
 
-      const qrUri = encodeE2eeQrUri({ key: e2eeKey, roomId: aliceReg.roomId })
+      const qrUri = encodeE2eeQrUri({ key: e2eeKey, roomId: smokeAdmin.roomId })
       assert.ok(qrUri.startsWith('allinone-e2ee://v1?'))
       const parsedUri = parseE2eeQrInput(qrUri)
       assert.equal(parsedUri.key, e2eeKey)
-      assert.equal(parsedUri.roomId, aliceReg.roomId)
+      assert.equal(parsedUri.roomId, smokeAdmin.roomId)
       const parsedRaw = parseE2eeQrInput(e2eeKey)
       assert.equal(parsedRaw.key, e2eeKey)
       const sharedQrSvg = renderSharedQrSvg(qrUri)
       assert.ok(sharedQrSvg.includes('<svg xmlns="http://www.w3.org/2000/svg"'))
 
-      const sampleEnv = await encryptJson(e2eeKey, { secret: 'hello-e2ee' }, { kind: 'rpc.req', roomId: aliceReg.roomId })
-      const decOk = await decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.req', roomId: aliceReg.roomId })
+      const sampleEnv = await encryptJson(e2eeKey, { secret: 'hello-e2ee' }, { kind: 'rpc.req', roomId: smokeAdmin.roomId })
+      const decOk = await decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.req', roomId: smokeAdmin.roomId })
       assert.equal(decOk.secret, 'hello-e2ee')
       // Wrong AAD kind or roomId must fail GCM authentication
       await assert.rejects(
-        () => decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.res', roomId: aliceReg.roomId }),
+        () => decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.res', roomId: smokeAdmin.roomId }),
         /解密失败/,
       )
       await assert.rejects(
@@ -2953,7 +3001,7 @@ async function main() {
       // 1-char tamper in ciphertext must fail GCM authentication
       const tamperedCt = (sampleEnv.ct[0] === 'A' ? 'B' : 'A') + sampleEnv.ct.slice(1)
       await assert.rejects(
-        () => decryptJson(e2eeKey, { ...sampleEnv, ct: tamperedCt }, { kind: 'rpc.req', roomId: aliceReg.roomId }),
+        () => decryptJson(e2eeKey, { ...sampleEnv, ct: tamperedCt }, { kind: 'rpc.req', roomId: smokeAdmin.roomId }),
         /解密失败/,
       )
 
@@ -2968,7 +3016,7 @@ async function main() {
       const secCfgPath = join(tmpDir, 'desktop-e2ee-config.json')
       saveConfigSecure(
         secCfgPath,
-        { mode: 'account', roomId: aliceReg.roomId, bridgeSecret: 'dv_secret_123', e2eeKey },
+        { mode: 'account', roomId: smokeAdmin.roomId, bridgeSecret: 'dv_secret_123', e2eeKey },
         mockSafeStore,
       )
       const rawDiskCfg = readFileSync(secCfgPath, 'utf8')
@@ -2983,12 +3031,12 @@ async function main() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          username: 'alice',
-          password: alicePass,
-          label: 'Alice-E2EE-PC',
-          hostname: 'ALICE-E2EE',
+          username: 'smoke_admin',
+          password: SMOKE_ADMIN_PASS,
+          label: 'Smoke-E2EE-PC',
+          hostname: 'SMOKE-E2EE',
           platform: 'darwin',
-          bridgeId: 'alice-e2ee-pc',
+          bridgeId: 'smoke-e2ee-pc',
         }),
       })).json()
       assert.equal(e2eeDevice.ok, true)
@@ -3016,15 +3064,20 @@ async function main() {
         assert.equal(e2eeMeta.e2ee.keyId, e2eeKeyId)
         assert.equal(JSON.stringify(e2eeMeta).includes(e2eeKey), false, 'Relay must NEVER receive raw e2eeKey')
 
-        // Relay-initiated plaintext /api/bridge-file must be strictly rejected with 403 by the E2EE bridge!
+        // Legacy plaintext /api/bridge-file is permanently removed (404)
         const relayPlainImg = await fetch(
-          `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=${encodeURIComponent(e2eeDevice.bridgeId)}&token=${encodeURIComponent(aliceLogin.token)}`,
+          `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=${encodeURIComponent(e2eeDevice.bridgeId)}`,
         )
-        assert.equal(relayPlainImg.status, 403, 'E2EE bridge must reject relay plaintext /api/bridge-file with 403')
+        assert.equal(relayPlainImg.status, 404, 'Legacy /api/bridge-file must be permanently deleted (404)')
 
-        // Open client WS and test: plaintext rejection, wrong-key rejection, encrypted FILE_READ, replay block, encrypted event
+        // Open client WS via single-use ticket and test: plaintext rejection, wrong-key rejection, encrypted FILE_READ, replay block, encrypted event
+        const e2eeTicket = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${loginData.token}` },
+        })).json()
+        assert.equal(e2eeTicket.ok, true)
         const capturedWireFrames = []
-        e2eeWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(aliceLogin.token)}`)
+        e2eeWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(e2eeTicket.ticket)}`)
         const pendingMap = new Map()
         const rawEvents = []
         await new Promise((resolve, reject) => {
@@ -3166,7 +3219,7 @@ async function main() {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${aliceLogin.token}`,
+            Authorization: `Bearer ${loginData.token}`,
           },
           body: JSON.stringify({
             filename: 'secret-note.txt',
@@ -3196,22 +3249,25 @@ async function main() {
         assert.equal(readFileSync(materialized[0].localPath, 'utf8'), secretFileText)
         assert.ok(materialized[0].localPath.endsWith('secret-note.txt'))
 
-        // Unencrypted attachment missing `att.e2ee` must be rejected BEFORE download by E2EE bridge
-        const plainUpRes = await (await fetch(`${httpBase}/api/uploads`, {
+        // Relay strictly rejects plaintext upload (400 E2EE_UPLOAD_REQUIRED) AND bridge rejects attachments missing `att.e2ee`
+        const plainUpResp = await fetch(`${httpBase}/api/uploads`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${aliceLogin.token}`,
+            Authorization: `Bearer ${loginData.token}`,
           },
           body: JSON.stringify({
             filename: 'plain.txt',
             mimeType: 'text/plain',
             dataBase64: Buffer.from('unencrypted-data', 'utf8').toString('base64'),
           }),
-        })).json()
-        assert.equal(plainUpRes.ok, true)
+        })
+        assert.equal(plainUpResp.status, 400)
+        const plainUpJson = await plainUpResp.json()
+        assert.equal(plainUpJson.code, 'E2EE_UPLOAD_REQUIRED')
+
         const rejectedPlainAtt = await e2eeBridge.orchestrator.materializeAttachments([
-          { id: plainUpRes.upload.id, url: plainUpRes.upload.url, filename: 'plain.txt', mimeType: 'text/plain' },
+          { id: upRes.upload.id, url: upRes.upload.url, filename: 'plain.txt', mimeType: 'text/plain' },
         ])
         assert.equal(rejectedPlainAtt.length, 0)
       } finally {
@@ -3232,7 +3288,7 @@ async function main() {
     }
     if (ownerBridge2) await ownerBridge2.stop()
     if (friendBridgeA) await friendBridgeA.stop()
-    await bridge.stop()
+    if (bridge) await bridge.stop()
     await relay.close()
     try { rmSync(tmpDir, { recursive: true, force: true }) } catch {}
   }

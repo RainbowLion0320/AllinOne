@@ -37,7 +37,7 @@ export function normalizeImageKey(ref) {
     .toLowerCase()
 }
 
-export function resolveImageSrc(item, { baseUrl = '', token = '', mediaToken = '', cwd = '', bridgeId = '' } = {}) {
+export function resolveImageSrc(item, { baseUrl = '', mediaToken = '' } = {}) {
   const rawUrl = typeof item === 'string' ? '' : String(item?.url || '').trim()
   const rawPath = typeof item === 'string' ? String(item).trim() : String(item?.path || '').trim()
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
@@ -48,14 +48,12 @@ export function resolveImageSrc(item, { baseUrl = '', token = '', mediaToken = '
   }
 
   const cleanBase = String(baseUrl || '').replace(/\/+$/, '')
-  const authParamName = mediaToken ? 'mt' : 'token'
-  const authParamVal = mediaToken || token
 
-  // Relay-hosted uploaded attachment
+  // Relay-hosted encrypted uploaded attachment (downloaded via read-only media token `mt`, then decrypted locally)
   if (target.startsWith('/api/uploads/')) {
-    if (!cleanBase || !authParamVal) return ''
+    if (!cleanBase || !mediaToken) return ''
     const sep = target.includes('?') ? '&' : '?'
-    return `${cleanBase}${target}${sep}${authParamName}=${encodeURIComponent(authParamVal)}`
+    return `${cleanBase}${target}${sep}mt=${encodeURIComponent(mediaToken)}`
   }
 
   // External or direct HTTP(S) URL
@@ -63,33 +61,22 @@ export function resolveImageSrc(item, { baseUrl = '', token = '', mediaToken = '
     if (
       cleanBase &&
       target.startsWith(cleanBase) &&
-      (target.includes('/api/uploads/') || target.includes('/api/bridge-file')) &&
-      !target.includes('token=') &&
+      target.includes('/api/uploads/') &&
       !target.includes('mt=')
     ) {
-      if (!authParamVal) return ''
+      if (!mediaToken) return ''
       const sep = target.includes('?') ? '&' : '?'
-      return `${target}${sep}${authParamName}=${encodeURIComponent(authParamVal)}`
+      return `${target}${sep}mt=${encodeURIComponent(mediaToken)}`
     }
     return target
   }
 
-  // Local PC file path (Windows absolute, file:// URI, ~/..., or relative to session cwd)
-  if (!cleanBase || !authParamVal) return ''
-  const params = new URLSearchParams()
-  params.set('path', target)
-  if (cwd) params.set('cwd', cwd)
-  if (bridgeId) params.set('bridgeId', bridgeId)
-  params.set(authParamName, authParamVal)
-  return `${cleanBase}/api/bridge-file?${params.toString()}`
+  // Local PC file paths are exclusively loaded via E2EE RPC.FILE_READ (see e2eeMedia.js)
+  return ''
 }
 
 export function buildDownloadUrl(src) {
-  if (!src) return ''
-  if (src.includes('/api/bridge-file') && !src.includes('download=1')) {
-    return `${src}${src.includes('?') ? '&' : '?'}download=1`
-  }
-  return src
+  return src || ''
 }
 
 /**

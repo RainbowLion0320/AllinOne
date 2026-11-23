@@ -383,75 +383,6 @@ export async function adminRevokeInvite(baseUrl, token, { id }) {
   return data.invite
 }
 
-export async function loginToRelay(serverUrl, password) {
-  const base = normalizeBaseUrl(serverUrl)
-  const res = await fetch(`${base}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      password,
-      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
-    }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`连接失败 (HTTP ${res.status})`, `Connection failed (HTTP ${res.status})`))
-  }
-  return {
-    baseUrl: base,
-    token: data.token,
-    roomId: data.roomId || 'owner',
-    bridges: data.bridges || [],
-  }
-}
-
-export function parsePairInput(rawInput) {
-  const text = String(rawInput || '').trim()
-  if (!text) return { pairCode: '', pairToken: '', serverUrl: '' }
-
-  // Full pairing link pasted from PC terminal/QR (e.g. https://.../dsh/?pair=pt_xxx)
-  if (/^https?:\/\//i.test(text)) {
-    try {
-      const u = new URL(text)
-      const pairToken = u.searchParams.get('pair') || u.searchParams.get('token') || ''
-      const pairCode = u.searchParams.get('code') || ''
-      const basePath = u.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '')
-      const serverUrl = `${u.origin}${basePath}`
-      return { pairCode, pairToken, serverUrl }
-    } catch {}
-  }
-
-  if (text.startsWith('pt_')) {
-    return { pairCode: '', pairToken: text, serverUrl: '' }
-  }
-
-  return { pairCode: text, pairToken: '', serverUrl: '' }
-}
-
-export async function pairWithRelay(serverUrl, { pairCode = '', pairToken = '' } = {}) {
-  const base = normalizeBaseUrl(serverUrl)
-  const res = await fetch(`${base}/api/auth/pair`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      pairCode,
-      pairToken,
-      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
-    }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`配对失败 (HTTP ${res.status})`, `Pairing failed (HTTP ${res.status})`))
-  }
-  return {
-    baseUrl: base,
-    token: data.token,
-    roomId: data.roomId || '',
-    label: data.label || '',
-    bridges: data.bridges || [],
-  }
-}
-
 export async function probeDeviceStatus(device, timeoutMs = 5000) {
   if (!device?.baseUrl || !device?.token) {
     return { status: 'unreachable', bridges: [], label: '', roomId: device?.roomId || '' }
@@ -517,10 +448,6 @@ export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
       err.status = 401
       throw err
     }
-    if (res.status === 404) {
-      // Older relay server without ws-ticket support -> caller may fall back to legacy token query
-      return null
-    }
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok || !data.ticket) {
       throw new Error(data.error || L(`获取连接票据失败 (HTTP ${res.status})`, `Failed to obtain WS ticket (HTTP ${res.status})`))
@@ -541,7 +468,6 @@ export async function requestMediaToken(baseUrl, token, timeoutMs = 8000) {
       headers: { Authorization: `Bearer ${token}` },
       ...(controller ? { signal: controller.signal } : {}),
     })
-    if (res.status === 404) return { unsupported: true, mediaToken: '', expiresAt: 0 }
     if (res.status === 401) {
       const err = new Error(L('登录已失效', 'Session expired'))
       err.status = 401
@@ -551,7 +477,7 @@ export async function requestMediaToken(baseUrl, token, timeoutMs = 8000) {
     if (!res.ok || !data.ok || !data.mediaToken) {
       throw new Error(data.error || L(`获取媒体令牌失败 (HTTP ${res.status})`, `Failed to obtain media token (HTTP ${res.status})`))
     }
-    return { unsupported: false, mediaToken: data.mediaToken, expiresAt: data.expiresAt || 0 }
+    return { mediaToken: data.mediaToken, expiresAt: data.expiresAt || 0 }
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -559,7 +485,7 @@ export async function requestMediaToken(baseUrl, token, timeoutMs = 8000) {
 
 export async function revokeDeviceSessions(baseUrl, token) {
   const base = normalizeBaseUrl(baseUrl)
-  const res = await fetch(`${base}/api/rooms/revoke`, {
+  const res = await fetch(`${base}/api/auth/sessions/revoke-all`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   })
@@ -614,7 +540,6 @@ export async function revokeAuthSession(baseUrl, token, { sid = '', clientId = '
     totalCount: Number(data.totalCount) || 0,
     revokedPermanent: Boolean(data.revokedPermanent),
     kickedConnections: Number(data.kickedConnections) || 0,
-    legacy: Boolean(data.legacy),
   }
 }
 
@@ -655,7 +580,7 @@ export class MobileRelayClient {
   constructor({ baseUrl, token, bridgeId = '', roomId = '', e2eeKeys = {} }) {
     this.baseUrl = normalizeBaseUrl(baseUrl)
     this.token = token
-    this.roomId = String(roomId || 'owner').trim() || 'owner'
+    this.roomId = String(roomId || '').trim()
     this.targetBridgeId = String(bridgeId || '').trim()
     this.e2eeKeys = { ...(e2eeKeys || {}) }
     this._inboundEventQueue = Promise.resolve()
@@ -696,10 +621,7 @@ export class MobileRelayClient {
     if (!bridge) {
       bridge = this.bridges.find((b) => b.online) || this.bridges[0] || null
     }
-    if (!bridge?.e2ee?.enabled) {
-      return { enabled: false, ready: true, keyId: '', key: '' }
-    }
-    const keyId = String(bridge.e2ee.keyId || '').trim()
+    const keyId = String(bridge?.e2ee?.keyId || '').trim()
     const key = keyId ? String(this.e2eeKeys[keyId] || '').trim() : ''
     return {
       enabled: true,
@@ -806,7 +728,7 @@ export class MobileRelayClient {
     if (this.closed || gen !== this.connectGen) return
 
     const url = toWsUrl(this.baseUrl, '/ws/client', {
-      ...(ticket ? { ticket } : { token: this.token }),
+      ticket,
       lastSeq: this.lastSeq > 0 ? this.lastSeq : undefined,
     })
 
@@ -874,39 +796,40 @@ export class MobileRelayClient {
             .catch((err) => p.reject(err))
           return
         }
-        // If this request was sent over E2EE, reject any forged unencrypted success response
-        if (p.e2eeKey && msg.ok) {
+        // Strictly reject any forged unencrypted success response
+        if (msg.ok) {
           const err = new Error(L('拒绝接收未加密的异常响应', 'Rejected unexpected plaintext response on E2EE channel'))
           err.code = 'E2EE_UNEXPECTED_PLAINTEXT'
           p.reject(err)
           return
         }
-        if (msg.ok) p.resolve(msg.result)
-        else {
-          const err = new Error(msg.error?.message || L('RPC 执行失败', 'RPC execution failed'))
-          if (msg.error?.code) err.code = msg.error.code
-          if (msg.error?.keyId) err.keyId = msg.error.keyId
-          p.reject(err)
-        }
+        const err = new Error(msg.error?.message || L('RPC 执行失败', 'RPC execution failed'))
+        if (msg.error?.code) err.code = msg.error.code
+        if (msg.error?.keyId) err.keyId = msg.error.keyId
+        p.reject(err)
         return
       }
 
       if (msg.type === 'event') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
         if (!msg.e2ee) {
+          // Only relay-originated control metadata events are unencrypted; drop any plaintext bridge events
           if (msg.event === 'bridge.status') {
             if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
             if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
             this.emitStatus()
+            for (const fn of this.eventListeners) {
+              try { fn(msg.event, msg.payload, msg) } catch {}
+            }
           } else if (msg.event === 'clients.status') {
             if (Array.isArray(msg.payload?.clients)) {
               this.liveClients = msg.payload.clients
               this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
               this.emitStatus()
             }
-          }
-          for (const fn of this.eventListeners) {
-            try { fn(msg.event, msg.payload, msg) } catch {}
+            for (const fn of this.eventListeners) {
+              try { fn(msg.event, msg.payload, msg) } catch {}
+            }
           }
           return
         }
@@ -991,7 +914,7 @@ export class MobileRelayClient {
         ? String(options.bridgeId || '').trim()
         : this.targetBridgeId
       const e2eeCtx = this.getBridgeE2eeContext(bridgeId)
-      if (e2eeCtx.enabled && !e2eeCtx.ready) {
+      if (!e2eeCtx.ready) {
         const err = new Error(
           L(
             '该电脑已开启端到端加密，请先扫描电脑端二维码同步密钥',
@@ -1010,61 +933,48 @@ export class MobileRelayClient {
         reject(new Error(L('请求超时，请检查电脑端连接状态', 'Request timed out. Check your computer connection.')))
       }, timeoutMs)
 
-      if (e2eeCtx.enabled) {
-        this.pending.set(id, {
-          resolve,
-          reject,
-          timer,
-          cid: id,
-          e2eeKey: e2eeCtx.key,
-          e2eeKeyId: e2eeCtx.keyId,
-        })
-        encryptJson(
-          e2eeCtx.key,
-          { method, params, cid: id, ts: Date.now() },
-          { kind: 'rpc.req', roomId: this.roomId },
-        )
-          .then((e2ee) => {
-            if (!this.pending.has(id)) return
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-              clearTimeout(timer)
-              this.pending.delete(id)
-              reject(new Error(L('尚未连接到中转服务器，正在重连...', 'Not connected to relay server, reconnecting...')))
-              return
-            }
-            this.ws.send(JSON.stringify({
-              type: 'rpc.req',
-              id,
-              method: E2EE_METHOD_MARKER,
-              e2ee,
-              timeoutMs,
-              ...(bridgeId ? { bridgeId } : {}),
-            }))
-          })
-          .catch((err) => {
-            if (!this.pending.has(id)) return
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timer,
+        cid: id,
+        e2eeKey: e2eeCtx.key,
+        e2eeKeyId: e2eeCtx.keyId,
+      })
+      encryptJson(
+        e2eeCtx.key,
+        { method, params, cid: id, ts: Date.now() },
+        { kind: 'rpc.req', roomId: this.roomId },
+      )
+        .then((e2ee) => {
+          if (!this.pending.has(id)) return
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             clearTimeout(timer)
             this.pending.delete(id)
-            reject(err)
-          })
-        return
-      }
-
-      this.pending.set(id, { resolve, reject, timer, cid: id, e2eeKey: '', e2eeKeyId: '' })
-      this.ws.send(JSON.stringify({
-        type: 'rpc.req',
-        id,
-        method,
-        params,
-        timeoutMs,
-        ...(bridgeId ? { bridgeId } : {}),
-      }))
+            reject(new Error(L('尚未连接到中转服务器，正在重连...', 'Not connected to relay server, reconnecting...')))
+            return
+          }
+          this.ws.send(JSON.stringify({
+            type: 'rpc.req',
+            id,
+            method: E2EE_METHOD_MARKER,
+            e2ee,
+            timeoutMs,
+            ...(bridgeId ? { bridgeId } : {}),
+          }))
+        })
+        .catch((err) => {
+          if (!this.pending.has(id)) return
+          clearTimeout(timer)
+          this.pending.delete(id)
+          reject(err)
+        })
     })
   }
 
   async uploadFile(file) {
     const e2eeCtx = this.getBridgeE2eeContext(this.targetBridgeId)
-    if (e2eeCtx.enabled && !e2eeCtx.ready) {
+    if (!e2eeCtx.ready) {
       const err = new Error(
         L(
           '该电脑已开启端到端加密，请先扫描电脑端二维码同步密钥后再发送附件',
@@ -1076,50 +986,11 @@ export class MobileRelayClient {
       throw err
     }
 
-    if (e2eeCtx.enabled) {
-      const rawBytes = new Uint8Array(await file.arrayBuffer())
-      const enc = await encryptBytes(e2eeCtx.key, rawBytes, {
-        kind: 'upload',
-        roomId: this.roomId,
-      })
-      const res = await fetch(`${this.baseUrl}/api/uploads`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.token}`,
-        },
-        body: JSON.stringify({
-          filename: 'encrypted.bin',
-          mimeType: 'application/octet-stream',
-          encrypted: true,
-          dataBase64: bytesToBase64(enc.ciphertext),
-        }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || L('上传失败', 'Upload failed'))
-      }
-      const realMime = file.type || 'application/octet-stream'
-      const localPreviewUrl = realMime.startsWith('image/') && typeof URL?.createObjectURL === 'function'
-        ? URL.createObjectURL(file)
-        : ''
-      return {
-        ...data.upload,
-        filename: file.name,
-        mimeType: realMime,
-        size: file.size,
-        e2ee: { v: enc.v, kid: enc.kid, iv: enc.iv },
-        ...(localPreviewUrl ? { localPreviewUrl } : {}),
-      }
-    }
-
-    const dataBase64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(String(reader.result || ''))
-      reader.onerror = () => reject(new Error(L('读取文件失败', 'Failed to read file')))
-      reader.readAsDataURL(file)
+    const rawBytes = new Uint8Array(await file.arrayBuffer())
+    const enc = await encryptBytes(e2eeCtx.key, rawBytes, {
+      kind: 'upload',
+      roomId: this.roomId,
     })
-
     const res = await fetch(`${this.baseUrl}/api/uploads`, {
       method: 'POST',
       headers: {
@@ -1127,15 +998,27 @@ export class MobileRelayClient {
         Authorization: `Bearer ${this.token}`,
       },
       body: JSON.stringify({
-        filename: file.name,
-        mimeType: file.type || 'application/octet-stream',
-        dataBase64,
+        filename: 'encrypted.bin',
+        mimeType: 'application/octet-stream',
+        encrypted: true,
+        dataBase64: bytesToBase64(enc.ciphertext),
       }),
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
       throw new Error(data.error || L('上传失败', 'Upload failed'))
     }
-    return data.upload
+    const realMime = file.type || 'application/octet-stream'
+    const localPreviewUrl = realMime.startsWith('image/') && typeof URL?.createObjectURL === 'function'
+      ? URL.createObjectURL(file)
+      : ''
+    return {
+      ...data.upload,
+      filename: file.name,
+      mimeType: realMime,
+      size: file.size,
+      e2ee: { v: enc.v, kid: enc.kid, iv: enc.iv },
+      ...(localPreviewUrl ? { localPreviewUrl } : {}),
+    }
   }
 }

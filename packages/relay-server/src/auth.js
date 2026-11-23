@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
-const MEDIA_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes (read-only image/upload scope)
+const MEDIA_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes (read-only encrypted upload download scope)
 const WS_TICKET_TTL_MS = 30 * 1000 // 30 seconds (strictly single-use)
 const MAX_WS_TICKETS = 2000
 const MAX_RATE_LIMIT_ENTRIES = 5000
@@ -15,30 +15,24 @@ export function safeEqual(a, b) {
 }
 
 /**
- * Create a lightweight HMAC-SHA256 signed bearer token manager for multi-tenant mobile clients.
- * Supports:
- *  - Room-scoped 30-day session tokens with revocable `tokenVersion` (`tv`)
- *  - 30-second single-use WebSocket handshake tickets (`ws-ticket`)
- *  - 15-minute read-only scoped media tokens (`media`) so long-lived JWTs never appear in URLs
- *  - Optional registration invite code (`registerInviteCode`)
+ * Account-based HMAC-SHA256 bearer token manager for multi-tenant All in One clients.
+ * Strictly requires `usr_*` account rooms, explicit scopes (`session` / `media`),
+ * revocable `tokenVersion` (`tv`), per-device `sid`, and single-use `ws-ticket` handshakes.
  */
 export function createAuthManager({
-  clientAccessToken,
-  bridgeSecret,
-  jwtSecret,
-  registerInviteCode = '',
+  jwtSecret = '',
+  adminBootstrapToken = '',
   getTokenVersion = null,
   isSessionRevoked = null,
-}) {
-  const signingKey = jwtSecret && jwtSecret.trim().length >= 16
-    ? jwtSecret.trim()
-    : createHmac('sha256', 'allinone-relay-key-v1')
-        .update(`${clientAccessToken}::${bridgeSecret}`)
-        .digest('hex')
+} = {}) {
+  const cleanJwtSecret = String(jwtSecret || '').trim()
+  const signingKey = cleanJwtSecret.length >= 16
+    ? cleanJwtSecret
+    : randomBytes(32).toString('hex')
 
-  const inviteSecret = String(registerInviteCode || '').trim()
+  const bootstrapSecret = String(adminBootstrapToken || '').trim()
 
-  // Per-IP rate limit for login/pair attempts
+  // Per-IP rate limit for login/register attempts
   const failures = new Map()
   const MAX_FAILS = 15
   const WINDOW_MS = 10 * 60 * 1000
@@ -48,16 +42,10 @@ export function createAuthManager({
   const MAX_ACCT_FAILS = 10
   const ACCT_WINDOW_MS = 15 * 60 * 1000
 
-  // Per-(IP, roomId) rate limit for /ws/bridge auth failures so one stale/disabled
-  // legacy room (e.g. `owner`) on a shared NAT IP can never lock out valid `usr_*` bridges or user logins
+  // Per-(IP, roomId) rate limit for /ws/bridge auth failures
   const bridgeFailures = new Map()
   const MAX_BRIDGE_FAILS = 15
   const BRIDGE_WINDOW_MS = 10 * 60 * 1000
-
-  // Per-IP rate limit for room registrations
-  const registrations = new Map()
-  const MAX_REG_PER_HOUR = 20
-  const REG_WINDOW_MS = 60 * 60 * 1000
 
   // Short-lived single-use WS handshake tickets: ticket -> { user, exp }
   const wsTickets = new Map()
@@ -146,14 +134,14 @@ export function createAuthManager({
     if (key) accountFailures.delete(key)
   }
 
-  function makeBridgeRateKey(ip, roomId) {
-    const cleanIp = String(ip || '').trim() || 'unknown'
-    const cleanRoom = String(roomId || '').trim().toLowerCase().slice(0, 64) || 'owner'
-    return `${cleanIp}|${cleanRoom}`
+  function normalizeBridgeKey(ip, roomId) {
+    const cleanIp = String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+    const cleanRoom = String(roomId || '').trim().slice(0, 64)
+    return `${cleanIp}::${cleanRoom}`
   }
 
   function checkBridgeRateLimit(ip, roomId) {
-    const key = makeBridgeRateKey(ip, roomId)
+    const key = normalizeBridgeKey(ip, roomId)
     const now = Date.now()
     const entry = bridgeFailures.get(key)
     if (!entry) return true
@@ -165,7 +153,7 @@ export function createAuthManager({
   }
 
   function recordBridgeFailure(ip, roomId) {
-    const key = makeBridgeRateKey(ip, roomId)
+    const key = normalizeBridgeKey(ip, roomId)
     const now = Date.now()
     pruneMap(bridgeFailures, BRIDGE_WINDOW_MS, now)
     const entry = bridgeFailures.get(key)
@@ -177,20 +165,7 @@ export function createAuthManager({
   }
 
   function clearBridgeFailure(ip, roomId) {
-    bridgeFailures.delete(makeBridgeRateKey(ip, roomId))
-  }
-
-  function checkRegisterLimit(ip) {
-    const now = Date.now()
-    pruneMap(registrations, REG_WINDOW_MS, now)
-    const entry = registrations.get(ip)
-    if (!entry || now - entry.firstAt > REG_WINDOW_MS) {
-      registrations.set(ip, { count: 1, firstAt: now })
-      return true
-    }
-    if (entry.count >= MAX_REG_PER_HOUR) return false
-    entry.count += 1
-    return true
+    bridgeFailures.delete(normalizeBridgeKey(ip, roomId))
   }
 
   function signRawPayload(payload) {
@@ -211,7 +186,9 @@ export function createAuthManager({
       const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
       if (!payload || typeof payload !== 'object') return null
       if (typeof payload.exp !== 'number' || Date.now() > payload.exp) return null
-      if (!payload.room) payload.room = 'owner'
+      if (typeof payload.room !== 'string' || !payload.room.startsWith('usr_')) return null
+      if (typeof payload.sid !== 'string' || !payload.sid.trim()) return null
+      if (typeof payload.tv !== 'number' || !Number.isFinite(payload.tv)) return null
       return payload
     } catch {
       return null
@@ -222,15 +199,13 @@ export function createAuthManager({
     if (typeof getTokenVersion !== 'function') return true
     const currentTv = Number(getTokenVersion(payload.room))
     if (!Number.isFinite(currentTv) || currentTv < 0) return false
-    // Backward compatibility: legacy tokens issued prior to v0.1.21 lack `tv` -> treat as 0
-    const tokenTv = Number.isFinite(Number(payload.tv)) ? Number(payload.tv) : 0
-    return tokenTv === currentTv
+    return payload.tv === currentTv
   }
 
   function isSessionActive(payload) {
     if (!isTokenVersionCurrent(payload)) return false
-    if (payload?.sid && typeof isSessionRevoked === 'function') {
-      if (isSessionRevoked(payload.room, payload.sid)) return false
+    if (typeof isSessionRevoked === 'function' && isSessionRevoked(payload.room, payload.sid)) {
+      return false
     }
     return true
   }
@@ -240,21 +215,24 @@ export function createAuthManager({
   }
 
   function signSessionToken(
-    subject = 'owner',
-    deviceName = 'mobile',
-    roomId = 'owner',
+    subject,
+    deviceName = 'Web Client',
+    roomId,
     tokenVersion = 0,
-    { role = '', username = '', sid = '' } = {},
+    { role = 'user', username = '', sid = '' } = {},
   ) {
-    const room = String(roomId || 'owner').trim() || 'owner'
+    const room = String(roomId || '').trim()
+    if (!room.startsWith('usr_')) {
+      throw new Error(`Invalid account roomId: ${room}`)
+    }
     const tv = Number.isFinite(Number(tokenVersion)) ? Math.max(0, Math.floor(Number(tokenVersion))) : 0
     const now = Date.now()
-    const effectiveRole = role || (room === 'owner' ? 'admin' : 'user')
+    const effectiveRole = role === 'admin' ? 'admin' : 'user'
     const sessionId = String(sid || '').trim() || generateSessionId()
     return signRawPayload({
-      sub: subject,
+      sub: String(subject || room),
       room,
-      dev: String(deviceName || 'mobile').slice(0, 64),
+      dev: String(deviceName || 'Web Client').slice(0, 64),
       sid: sessionId,
       tv,
       role: effectiveRole,
@@ -266,29 +244,29 @@ export function createAuthManager({
   }
 
   function isAdminPayload(payload) {
-    if (!payload) return false
-    return payload.role === 'admin' || payload.room === 'owner'
+    return Boolean(payload && payload.role === 'admin' && String(payload.room || '').startsWith('usr_'))
   }
 
   function verifySessionToken(token) {
     const payload = verifyRawToken(token)
-    if (!payload) return null
-    // Reject media-only tokens or unknown scopes; allow legacy tokens without `scope`
-    if (payload.scope && payload.scope !== 'session') return null
+    if (!payload || payload.scope !== 'session') return null
     if (!isSessionActive(payload)) return null
     return payload
   }
 
   function signMediaToken(sessionPayload) {
-    const room = String(sessionPayload?.room || 'owner').trim() || 'owner'
-    const tv = Number.isFinite(Number(sessionPayload?.tv)) ? Number(sessionPayload.tv) : 0
+    const room = String(sessionPayload?.room || '').trim()
     const sid = String(sessionPayload?.sid || '').trim()
+    if (!room.startsWith('usr_') || !sid) {
+      throw new Error('Invalid session payload for media token')
+    }
+    const tv = Number.isFinite(Number(sessionPayload?.tv)) ? Number(sessionPayload.tv) : 0
     const now = Date.now()
     const exp = now + MEDIA_TOKEN_TTL_MS
     const mediaToken = signRawPayload({
-      sub: sessionPayload?.sub || room,
+      sub: sessionPayload.sub || room,
       room,
-      ...(sid ? { sid } : {}),
+      sid,
       tv,
       scope: 'media',
       iat: now,
@@ -299,9 +277,7 @@ export function createAuthManager({
 
   function verifyMediaToken(token) {
     const payload = verifyRawToken(token)
-    if (!payload) return null
-    // Accept read-only `media` tokens AND session tokens (for backward compatibility)
-    if (payload.scope && payload.scope !== 'media' && payload.scope !== 'session') return null
+    if (!payload || payload.scope !== 'media') return null
     if (!isSessionActive(payload)) return null
     return payload
   }
@@ -316,11 +292,11 @@ export function createAuthManager({
     wsTickets.set(ticket, {
       user: {
         sub: sessionPayload.sub,
-        room: sessionPayload.room || 'owner',
-        dev: cleanDev || sessionPayload.dev || 'mobile',
+        room: sessionPayload.room,
+        dev: cleanDev || sessionPayload.dev || 'Web Client',
         ...(cleanKind ? { kind: cleanKind } : {}),
-        ...(sessionPayload.sid ? { sid: String(sessionPayload.sid) } : {}),
-        tv: Number.isFinite(Number(sessionPayload.tv)) ? Number(sessionPayload.tv) : 0,
+        sid: String(sessionPayload.sid),
+        tv: Number(sessionPayload.tv),
       },
       exp,
     })
@@ -332,28 +308,15 @@ export function createAuthManager({
     if (!clean) return null
     const entry = wsTickets.get(clean)
     if (!entry) return null
-    // Strictly single-use: delete immediately on lookup
     wsTickets.delete(clean)
     if (Date.now() > entry.exp) return null
     if (!isSessionActive(entry.user)) return null
     return entry.user
   }
 
-  function verifyAccessPassword(password) {
-    return safeEqual(password, clientAccessToken)
-  }
-
-  function verifyBridgeSecret(secret) {
-    return safeEqual(secret, bridgeSecret)
-  }
-
-  function hasRegisterInviteCode() {
-    return inviteSecret.length > 0
-  }
-
-  function verifyRegisterInviteCode(code) {
-    if (!inviteSecret) return true
-    return safeEqual(code, inviteSecret)
+  function verifyAdminBootstrapToken(token) {
+    if (!bootstrapSecret) return false
+    return safeEqual(token, bootstrapSecret)
   }
 
   return {
@@ -366,7 +329,6 @@ export function createAuthManager({
     checkBridgeRateLimit,
     recordBridgeFailure,
     clearBridgeFailure,
-    checkRegisterLimit,
     generateSessionId,
     signSessionToken,
     verifySessionToken,
@@ -375,9 +337,6 @@ export function createAuthManager({
     verifyMediaToken,
     issueWsTicket,
     consumeWsTicket,
-    verifyAccessPassword,
-    verifyBridgeSecret,
-    hasRegisterInviteCode,
-    verifyRegisterInviteCode,
+    verifyAdminBootstrapToken,
   }
 }

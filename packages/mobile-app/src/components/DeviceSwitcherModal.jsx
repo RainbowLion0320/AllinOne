@@ -993,12 +993,12 @@ export function DeviceSwitcherModal({
             </div>
           )}
 
-          {/* Other saved accounts or legacy rooms */}
+          {/* Other saved accounts */}
           {otherEntries.length > 0 && (
             <div className="space-y-2">
               {isAccountMode && (
                 <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
-                  {bi('其他连接', 'Other Connections')}
+                  {bi('其他账号', 'Other Accounts')}
                 </div>
               )}
               {otherEntries.map((device) => {
@@ -1029,7 +1029,6 @@ export function DeviceSwitcherModal({
                 const platformLabel = formatPlatformLabel(primaryBridge?.platform || device.lastPlatform)
                 const isEditing = editingId === device.id
                 const isConfirmingDelete = confirmDeleteId === device.id
-                const isAcct = device.authMode === 'account' || String(device.roomId || '').startsWith('usr_')
 
                 return (
                   <div
@@ -1058,26 +1057,20 @@ export function DeviceSwitcherModal({
                               : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300'
                           }`}
                         >
-                          {isAcct ? <User className="h-4.5 w-4.5" /> : <Monitor className="h-4.5 w-4.5" />}
+                          <User className="h-4.5 w-4.5" />
                         </div>
 
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="truncate text-[13.5px] font-semibold text-slate-900 dark:text-white">
-                              {isAcct && device.username ? `@${device.username}` : displayName}
+                              {device.username ? `@${device.username}` : displayName}
                             </span>
                             <StatusPill status={status} onlineCount={onlineBridges.length} />
                           </div>
 
-                          {(platformLabel || !isAcct) && (
+                          {platformLabel && (
                             <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-400">
-                              {platformLabel && <span>{platformLabel}</span>}
-                              {!isAcct && (
-                                <>
-                                  {platformLabel && <span>·</span>}
-                                  <span>{device.roomId === 'owner' ? bi('密钥', 'Token') : bi('旧版配对', 'Legacy Pair')}</span>
-                                </>
-                              )}
+                              <span>{platformLabel}</span>
                             </div>
                           )}
                         </div>
@@ -1085,16 +1078,6 @@ export function DeviceSwitcherModal({
 
                       {!isEditing && !isConfirmingDelete && (
                         <div className="flex shrink-0 items-center gap-0.5">
-                          {!isAcct && (
-                            <button
-                              type="button"
-                              onClick={() => startRename(device.id, device.customName || displayName)}
-                              title={bi('重命名电脑', 'Rename computer')}
-                              className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700/70 dark:hover:text-slate-200"
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                          )}
                           <button
                             type="button"
                             onClick={() => {
@@ -1110,44 +1093,10 @@ export function DeviceSwitcherModal({
                       )}
                     </div>
 
-                    {isEditing && (
-                      <form
-                        onSubmit={(e) => {
-                          e.preventDefault()
-                          void commitRename(device.id, false)
-                        }}
-                        className="mt-2.5 flex items-center gap-1.5"
-                      >
-                        <input
-                          type="text"
-                          value={editDraft}
-                          onChange={(e) => setEditDraft(e.target.value)}
-                          autoFocus
-                          maxLength={40}
-                          placeholder={bi('输入备注名', 'Enter nickname')}
-                          className="min-w-0 flex-1 rounded-xl border border-[#4D6BFE] bg-white px-2.5 py-1.5 text-xs text-slate-900 outline-none dark:bg-[#14161D] dark:text-white"
-                        />
-                        <button
-                          type="submit"
-                          className="inline-flex h-7.5 items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 text-xs font-semibold text-white"
-                        >
-                          <Check className="h-3.5 w-3.5" />
-                          <span>{t('common.save')}</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setEditingId(null); setEditDraft('') }}
-                          className="rounded-xl p-1.5 text-slate-400"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </form>
-                    )}
-
                     {isConfirmingDelete && (
                       <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
                         <div className="flex items-center justify-between gap-2">
-                          <span>{bi('移除此设备并清空本地缓存？', 'Remove device and clear local cache?')}</span>
+                          <span>{bi('移除此账号并清空本地缓存？', 'Remove account and clear local cache?')}</span>
                           <button
                             type="button"
                             onClick={() => setConfirmDeleteId(null)}
@@ -1197,35 +1146,6 @@ export function DeviceSwitcherModal({
                           <KeyRound className="h-3 w-3" />
                           <span>{bi('重新登录', 'Sign In')}</span>
                         </button>
-                      </div>
-                    )}
-
-                    {/* Same-room multi-bridge selector for legacy owner rooms */}
-                    {!isAcct && (onlineBridges.length > 1 || (isActive && !activeBridgeId && onlineBridges.length === 1)) && !isConfirmingDelete && (
-                      <div className="mt-2 border-t border-slate-200/70 pt-2 dark:border-slate-700/70">
-                        <div className="flex flex-wrap gap-1.5">
-                          {onlineBridges.map((b) => {
-                            const isSelectedBridge = isActive && b.bridgeId === activeBridgeId
-                            return (
-                              <button
-                                key={b.bridgeId}
-                                type="button"
-                                onClick={() => {
-                                  onSelectDevice?.(device.id, b.bridgeId)
-                                  onClose()
-                                }}
-                                className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-[11.5px] font-medium transition ${
-                                  isSelectedBridge
-                                    ? 'border-[#4D6BFE] bg-[#4D6BFE] text-white'
-                                    : 'border-slate-200 bg-white text-slate-700 hover:border-[#4D6BFE]/50 dark:border-slate-700 dark:bg-[#232734] dark:text-slate-200'
-                                }`}
-                              >
-                                <span className={`h-1.5 w-1.5 rounded-full ${isSelectedBridge ? 'bg-white' : 'bg-emerald-500'}`} />
-                                <span className="max-w-[140px] truncate">{b.hostname || b.bridgeId}</span>
-                              </button>
-                            )
-                          })}
-                        </div>
                       </div>
                     )}
                   </div>

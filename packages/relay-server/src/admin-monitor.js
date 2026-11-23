@@ -112,11 +112,10 @@ export function collectServerHealth({
 
 /**
  * Assemble a complete, read-only admin monitoring snapshot of all users, bound PCs,
- * controlling client sessions, legacy rooms, live connections, invite codes, and recent events.
+ * controlling client sessions, live connections, invite codes, and recent events.
  */
 export function buildAdminOverview({
   accounts,
-  rooms,
   hub,
   serverHealth,
   currentAdminRoom = '',
@@ -135,12 +134,6 @@ export function buildAdminOverview({
   for (const u of rawUsers) {
     ownerNameByRoom.set(u.userId, `@${u.username}`)
   }
-
-  const rawLegacyRooms = rooms.listRooms()
-  for (const r of rawLegacyRooms) {
-    ownerNameByRoom.set(r.roomId, r.label || r.roomId)
-  }
-  ownerNameByRoom.set('owner', 'Owner (Legacy)')
 
   // Group live bridges & clients by roomId
   const bridgesByRoom = new Map()
@@ -213,15 +206,11 @@ export function buildAdminOverview({
 
     // Merge persisted + live controlling client sessions
     const liveBySid = new Map()
-    const legacyLive = []
     for (const c of roomClients) {
-      if (c.sid) {
-        const arr = liveBySid.get(c.sid) || []
-        arr.push(c)
-        liveBySid.set(c.sid, arr)
-      } else {
-        legacyLive.push(c)
-      }
+      if (!c.sid) continue
+      const arr = liveBySid.get(c.sid) || []
+      arr.push(c)
+      liveBySid.set(c.sid, arr)
     }
 
     const sessions = []
@@ -257,20 +246,6 @@ export function buildAdminOverview({
         isCurrentAdmin: Boolean(currentAdminRoom === u.userId && currentAdminSid && sid === currentAdminSid),
         createdAt: newest.connectedAt || 0,
         lastSeenAt: newest.lastSeenAt || newest.connectedAt || 0,
-      })
-    }
-    for (const c of legacyLive) {
-      sessions.push({
-        sid: '',
-        clientId: c.clientId,
-        connectionCount: 1,
-        deviceName: c.deviceName || 'Web Client',
-        clientKind: c.clientKind || 'web',
-        ip: c.ip || '',
-        online: true,
-        isCurrentAdmin: false,
-        createdAt: c.connectedAt || 0,
-        lastSeenAt: c.lastSeenAt || c.connectedAt || 0,
       })
     }
     sessions.sort((a, b) => Number(b.online) - Number(a.online) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
@@ -351,52 +326,6 @@ export function buildAdminOverview({
       (b.createdAt || 0) - (a.createdAt || 0),
   )
 
-  // Legacy rooms (`owner` if live connections exist + `rm_*` rooms)
-  const legacyRooms = []
-  const ownerBridges = bridgesByRoom.get('owner') || []
-  const ownerClients = clientsByRoom.get('owner') || []
-  if (ownerBridges.length > 0 || ownerClients.length > 0) {
-    legacyRooms.push({
-      roomId: 'owner',
-      label: 'Owner (Legacy Key Mode)',
-      onlineBridgeCount: ownerBridges.filter((b) => b.online).length,
-      onlineClientCount: ownerClients.length,
-      bridges: ownerBridges.map((b) => ({
-        ...b,
-        apps: normalizeApps(b.apps),
-      })),
-      clients: ownerClients,
-      stats: hub.getRoomStats('owner'),
-      createdAt: 0,
-      lastSeenAt: Math.max(
-        hub.getRoomStats('owner').lastActivityAt || 0,
-        ...ownerBridges.map((b) => b.lastSeen || 0),
-        ...ownerClients.map((c) => c.lastSeenAt || 0),
-      ),
-    })
-  }
-  for (const r of rawLegacyRooms) {
-    const rb = bridgesByRoom.get(r.roomId) || []
-    const rc = clientsByRoom.get(r.roomId) || []
-    legacyRooms.push({
-      roomId: r.roomId,
-      label: r.label || r.roomId,
-      pairedCount: r.pairedCount || 0,
-      onlineBridgeCount: rb.filter((b) => b.online).length,
-      onlineClientCount: rc.length,
-      bridges: rb.map((b) => ({ ...b, apps: normalizeApps(b.apps) })),
-      clients: rc,
-      stats: hub.getRoomStats(r.roomId),
-      createdAt: r.createdAt || 0,
-      lastSeenAt: Math.max(r.lastSeenAt || 0, hub.getRoomStats(r.roomId).lastActivityAt || 0),
-    })
-  }
-  legacyRooms.sort(
-    (a, b) =>
-      (b.onlineBridgeCount + b.onlineClientCount) - (a.onlineBridgeCount + a.onlineClientCount) ||
-      (b.lastSeenAt || 0) - (a.lastSeenAt || 0),
-  )
-
   const liveBridges = allBridges
     .filter((b) => b.online)
     .map((b) => ({
@@ -425,8 +354,6 @@ export function buildAdminOverview({
   }))
 
   const onlineUsers = userStatusDist.active + userStatusDist.bridgeOnly + userStatusDist.clientOnly
-  const legacyOnlineBridges = legacyRooms.reduce((acc, r) => acc + r.onlineBridgeCount, 0)
-  const legacyOnlineClients = legacyRooms.reduce((acc, r) => acc + r.onlineClientCount, 0)
 
   return {
     ok: true,
@@ -448,9 +375,6 @@ export function buildAdminOverview({
       totalEvents: metrics.totalEvents,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
-      legacyRoomsCount: legacyRooms.length,
-      legacyOnlineBridges,
-      legacyOnlineClients,
     },
     distributions: {
       userStatus: userStatusDist,
@@ -459,7 +383,6 @@ export function buildAdminOverview({
       clientKinds,
     },
     users,
-    legacyRooms,
     liveBridges,
     liveClients,
     invites,

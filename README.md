@@ -61,8 +61,6 @@ cd AllinOne
 
 # 3. 创建 deploy/.env，填入你的随机密钥
 cat > deploy/.env <<'EOF'
-CLIENT_ACCESS_TOKEN=替换成你的高强度管理员密钥
-BRIDGE_SECRET=替换成你的高强度桥接密钥
 JWT_SECRET=替换成32位以上随机串
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com

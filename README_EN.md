@@ -61,8 +61,6 @@ cd AllinOne
 
 # 3. Create deploy/.env with strong random secrets
 cat > deploy/.env <<'EOF'
-CLIENT_ACCESS_TOKEN=replace-with-strong-admin-token
-BRIDGE_SECRET=replace-with-strong-bridge-secret
 JWT_SECRET=replace-with-32-plus-char-random-secret
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com

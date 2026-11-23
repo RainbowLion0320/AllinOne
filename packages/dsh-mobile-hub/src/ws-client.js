@@ -13,10 +13,10 @@ const REPLAY_WINDOW_MS = 10 * 60 * 1000 // 10 minutes
 const MAX_SEEN_IVS = 4000
 
 /**
- * Resilient outbound WebSocket client connecting home PC (DSH plugin) -> Relay Server.
- * Supports optional Zero-Knowledge AES-256-GCM End-to-End Encryption (E2EE):
- * when `e2eeKey` is provided, every RPC request/response and streaming event is
- * end-to-end encrypted before touching the Relay Server, and unencrypted RPCs are rejected.
+ * Resilient outbound WebSocket client connecting home PC -> Relay Server.
+ * Mandatory Zero-Knowledge AES-256-GCM End-to-End Encryption (E2EE):
+ * every RPC request/response and streaming event is end-to-end encrypted
+ * before touching the Relay Server, and unencrypted RPCs are strictly rejected.
  */
 export class RelayBridgeLink {
   constructor({
@@ -24,25 +24,31 @@ export class RelayBridgeLink {
     secret,
     roomId = '',
     bridgeId = 'home-pc',
-    mode = 'dsh-plugin',
+    mode = 'desktop',
     e2eeKey = '',
     log = console,
     onRpc,
     onState,
   }) {
+    const cleanRoomId = String(roomId || '').trim()
+    if (!cleanRoomId.startsWith('usr_')) {
+      throw new Error('RelayBridgeLink requires an account roomId (usr_*)')
+    }
+    const cleanE2eeKey = normalizeE2eeKey(e2eeKey)
+    if (!cleanE2eeKey) {
+      throw new Error('RelayBridgeLink requires a valid 256-bit E2EE key')
+    }
     this.relayUrl = relayUrl
     this.secret = secret
-    this.roomId = roomId
+    this.roomId = cleanRoomId
     this.bridgeId = bridgeId
     this.mode = mode
-    this.e2eeKey = normalizeE2eeKey(e2eeKey)
+    this.e2eeKey = cleanE2eeKey
     this.e2eeKeyId = ''
-    this.e2eeReady = this.e2eeKey
-      ? computeE2eeKeyId(this.e2eeKey).then((kid) => {
-          this.e2eeKeyId = kid
-          return kid
-        })
-      : Promise.resolve('')
+    this.e2eeReady = computeE2eeKeyId(this.e2eeKey).then((kid) => {
+      this.e2eeKeyId = kid
+      return kid
+    })
     this.seenReqIvs = new Map()
     this._eventQueue = Promise.resolve()
     this.log = log
@@ -58,18 +64,16 @@ export class RelayBridgeLink {
   }
 
   getAadRoomId() {
-    return String(this.roomId || 'owner').trim() || 'owner'
+    return this.roomId
   }
 
   async sendBridgeMeta() {
-    if (this.e2eeKey && !this.e2eeKeyId) {
+    if (!this.e2eeKeyId) {
       await this.e2eeReady
     }
     const meta = {
       ...(this.metaApps.length > 0 ? { apps: this.metaApps } : {}),
-      e2ee: this.e2eeKey
-        ? { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId }
-        : { enabled: false },
+      e2ee: { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId },
     }
     this.send({ type: 'bridge.meta', meta })
   }
@@ -115,7 +119,8 @@ export class RelayBridgeLink {
     u.searchParams.set('hostname', os.hostname())
     u.searchParams.set('platform', process.platform)
     u.searchParams.set('mode', this.mode)
-    if (this.roomId) u.searchParams.set('roomId', this.roomId)
+    u.searchParams.set('roomId', this.roomId)
+    if (this.e2eeKeyId) u.searchParams.set('e2eeKeyId', this.e2eeKeyId)
     return u.toString()
   }
 
@@ -139,8 +144,9 @@ export class RelayBridgeLink {
     try {
       const headers = {
         'X-Bridge-Secret': this.secret,
+        'X-Room-Id': this.roomId,
+        ...(this.e2eeKeyId ? { 'X-E2EE-Key-Id': this.e2eeKeyId } : {}),
       }
-      if (this.roomId) headers['X-Room-Id'] = this.roomId
       ws = new WebSocket(this.buildUrl(), {
         headers,
         handshakeTimeout: 15_000,
@@ -158,7 +164,7 @@ export class RelayBridgeLink {
       this.attempt = 0
       this.lastPongAt = Date.now()
       this.log.info?.(
-        `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}"${this.e2eeKey ? ' (E2EE AES-256-GCM)' : ''}`,
+        `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}" (E2EE AES-256-GCM)`,
       )
       this.emitState('connected', this.relayUrl)
       await this.sendBridgeMeta()
@@ -179,25 +185,7 @@ export class RelayBridgeLink {
       }
 
       if (msg.type === 'rpc.req') {
-        const id = msg.id
-        if (this.e2eeKey) {
-          await this.handleEncryptedRpc(id, msg)
-          return
-        }
-        try {
-          const result = await this.onRpc(msg.method, msg.params || {})
-          this.send({ type: 'rpc.res', id, ok: true, result })
-        } catch (err) {
-          this.send({
-            type: 'rpc.res',
-            id,
-            ok: false,
-            error: {
-              code: err?.code || 'RPC_ERROR',
-              message: String(err?.message || err),
-            },
-          })
-        }
+        await this.handleEncryptedRpc(msg.id, msg)
       }
     })
 
@@ -371,10 +359,6 @@ export class RelayBridgeLink {
   }
 
   pushEvent(event, payload) {
-    if (!this.e2eeKey) {
-      this.send({ type: 'event', event, payload })
-      return
-    }
     const aadRoom = this.getAadRoomId()
     // Preserve strict FIFO ordering across async AES-GCM encryptions for streaming deltas
     this._eventQueue = this._eventQueue

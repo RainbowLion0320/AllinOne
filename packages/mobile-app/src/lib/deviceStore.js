@@ -1,7 +1,6 @@
 import { bi, getCurrentLang } from './i18n.js'
 
 export const DEVICES_STORAGE_KEY = 'allinone_devices_v2'
-export const LEGACY_AUTH_STORAGE_KEY = 'allinone_dsh_auth_v1'
 
 function getDefaultStorage() {
   try {
@@ -19,9 +18,9 @@ export function normalizeDeviceBaseUrl(input) {
   return trimmed
 }
 
-export function makeDeviceId(baseUrl, roomId = 'owner') {
+export function makeDeviceId(baseUrl, roomId) {
   const cleanBase = normalizeDeviceBaseUrl(baseUrl)
-  const cleanRoom = String(roomId || 'owner').trim() || 'owner'
+  const cleanRoom = String(roomId || '').trim()
   return `${cleanBase}::${cleanRoom}`
 }
 
@@ -63,26 +62,20 @@ function sanitizeDevice(raw) {
   if (!raw || typeof raw !== 'object') return null
   const baseUrl = normalizeDeviceBaseUrl(raw.baseUrl)
   const token = String(raw.token || '').trim()
-  if (!baseUrl || !token) return null
-  const roomId = String(raw.roomId || 'owner').trim() || 'owner'
+  const roomId = String(raw.roomId || '').trim()
+  if (!baseUrl || !token || !roomId.startsWith('usr_')) return null
   const id = String(raw.id || makeDeviceId(baseUrl, roomId)).trim()
   const firstBridge = Array.isArray(raw.bridges)
     ? raw.bridges.find((b) => b?.online) || raw.bridges[0] || null
     : null
   const now = Date.now()
-  const authMode =
-    raw.authMode === 'account' || roomId.startsWith('usr_')
-      ? 'account'
-      : raw.authMode === 'password' || (raw.authMode !== 'pair' && roomId === 'owner')
-        ? 'password'
-        : 'pair'
-  const role = raw.role === 'admin' || roomId === 'owner' ? 'admin' : raw.role === 'user' ? 'user' : ''
+  const role = raw.role === 'admin' ? 'admin' : 'user'
   return {
     id,
     baseUrl,
     token,
     roomId,
-    authMode,
+    authMode: 'account',
     username: String(raw.username || '').trim().slice(0, 32),
     email: String(raw.email || '').trim().slice(0, 254),
     loginEmail2fa: Boolean(raw.loginEmail2fa),
@@ -105,7 +98,6 @@ export function createEmptyDeviceState() {
 export function loadDeviceState(storage = getDefaultStorage()) {
   if (!storage) return createEmptyDeviceState()
 
-  // 1. Try v2 multi-device store
   try {
     const rawV2 = storage.getItem(DEVICES_STORAGE_KEY)
     if (rawV2) {
@@ -126,24 +118,6 @@ export function loadDeviceState(storage = getDefaultStorage()) {
     }
   } catch {}
 
-  // 2. Migrate seamlessly from legacy single-device v1 auth
-  try {
-    const rawV1 = storage.getItem(LEGACY_AUTH_STORAGE_KEY)
-    if (rawV1) {
-      const parsed = JSON.parse(rawV1)
-      const migrated = sanitizeDevice(parsed)
-      if (migrated) {
-        const nextState = {
-          version: 2,
-          activeDeviceId: migrated.id,
-          devices: [migrated],
-        }
-        saveDeviceState(nextState, storage)
-        return nextState
-      }
-    }
-  } catch {}
-
   return createEmptyDeviceState()
 }
 
@@ -156,8 +130,6 @@ export function saveDeviceState(state, storage = getDefaultStorage()) {
       devices: Array.isArray(state?.devices) ? state.devices : [],
     }
     storage.setItem(DEVICES_STORAGE_KEY, JSON.stringify(payload))
-    // Clean up legacy single-device key so deleted devices are never resurrected on reload
-    storage.removeItem(LEGACY_AUTH_STORAGE_KEY)
   } catch {}
 }
 
@@ -384,31 +356,14 @@ export function removeDevice(state, deviceId) {
   }
 }
 
-export function getDeviceDisplayName(device, activeBridge = null, onlineBridgeCount = 0, lang = getCurrentLang()) {
+export function getDeviceDisplayName(device, activeBridge = null, _onlineBridgeCount = 0, lang = getCurrentLang()) {
   if (!device) return bi(lang, '未选择电脑', 'No Computer')
-  if (device.authMode === 'account' || String(device.roomId || '').startsWith('usr_')) {
-    if (activeBridge) {
-      return activeBridge.label || activeBridge.hostname || activeBridge.bridgeId
-    }
-    if (device.lastHostname) return device.lastHostname
-    return device.username ? `@${device.username}` : device.label || bi(lang, '我的账号', 'My Account')
+  if (activeBridge) {
+    return activeBridge.label || activeBridge.hostname || activeBridge.bridgeId
   }
-  const baseName =
-    device.customName ||
-    activeBridge?.hostname ||
-    device.lastHostname ||
-    device.label ||
-    (device.roomId === 'owner' ? bi(lang, '我的主电脑', 'My Primary PC') : device.roomId)
-
-  if (onlineBridgeCount > 1 && activeBridge) {
-    const bridgeName = activeBridge.hostname || activeBridge.bridgeId
-    if (device.customName && bridgeName && bridgeName !== device.customName) {
-      return `${device.customName} · ${bridgeName}`
-    }
-    return bridgeName || baseName
-  }
-
-  return baseName
+  if (device.customName) return device.customName
+  if (device.lastHostname) return device.lastHostname
+  return device.username ? `@${device.username}` : device.label || bi(lang, '我的账号', 'My Account')
 }
 
 export function getCacheScopeKey(device, bridgeId = '') {

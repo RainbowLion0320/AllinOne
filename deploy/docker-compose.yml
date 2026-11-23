@@ -13,11 +13,9 @@ services:
       PORT: 8787
       HOST: 0.0.0.0
       # 请在同目录创建 .env 文件或直接替换下面的密钥（勿提交到 Git）
-      CLIENT_ACCESS_TOKEN: ${CLIENT_ACCESS_TOKEN:?请设置手机访问密钥}
-      BRIDGE_SECRET: ${BRIDGE_SECRET:?请设置PC桥接密钥}
-      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_SECRET: ${JWT_SECRET:?请设置至少 16 位随机 JWT_SECRET（可用 openssl rand -hex 32 生成）}
+      ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
       PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-}
-      REGISTER_INVITE_CODE: ${REGISTER_INVITE_CODE:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-465}

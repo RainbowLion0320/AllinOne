@@ -20,7 +20,6 @@ import {
   detectDefaultServerUrl,
   fetchAuthSessions,
   listAccountDevices,
-  pairWithRelay,
   probeDeviceStatus,
   removeAccountDevice,
   renameAccountDevice,
@@ -79,7 +78,6 @@ export function App() {
   const { lang, bi, t } = useI18n()
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
   const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
-  const [autoPairing, setAutoPairing] = useState(false)
   const [pairError, setPairError] = useState('')
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
@@ -95,7 +93,7 @@ export function App() {
   })
   const [liveOnlineClientCount, setLiveOnlineClientCount] = useState(0)
   const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
-  const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '', unsupported: false })
+  const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '' })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
@@ -140,12 +138,8 @@ export function App() {
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
-  const isAccountMode = Boolean(
-    activeDevice && (activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_')),
-  )
-  const isAdmin = Boolean(
-    activeDevice && (activeDevice.role === 'admin' || activeDevice.roomId === 'owner'),
-  )
+  const isAccountMode = Boolean(activeDevice && String(activeDevice.roomId || '').startsWith('usr_'))
+  const isAdmin = Boolean(activeDevice && activeDevice.role === 'admin')
 
   const onlineBridges = useMemo(() => bridges.filter((b) => b.online), [bridges])
 
@@ -157,7 +151,7 @@ export function App() {
       const matched = onlineBridges.find((b) => b.bridgeId === preferredId)
       if (matched) {
         chosen = matched
-      } else if ((activeDevice.roomId === 'owner' || isAccountMode) && (activeSession || sessions.length > 0)) {
+      } else if (activeSession || sessions.length > 0) {
         // Never silently reroute mid-conversation to a different online computer
         return null
       }
@@ -453,64 +447,27 @@ export function App() {
     }
   }, [resetTransientWorkspace, showToast])
 
-  // Auto-handle QR code link (?pair=pt_xxx / ?code=XXXX-XXXX) or Invite Registration link (?invite=INV-XXXX-XXXX)
+  // Auto-handle Invite Registration link (?invite=INV-XXXX-XXXX)
   useEffect(() => {
     if (typeof window === 'undefined') return
     const params = new URLSearchParams(window.location.search)
     const inviteCode = (params.get('invite') || '').trim()
-    const pairToken = (params.get('pair') || '').trim()
-    const pairCode = (params.get('code') || '').trim()
-    if (!inviteCode && !pairToken && !pairCode) return
+    if (!inviteCode) return
 
-    // Strip sensitive params from address bar immediately
+    // Strip invite param from address bar immediately
     params.delete('invite')
-    params.delete('pair')
-    params.delete('code')
     const cleanQuery = params.toString()
     const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash || ''}`
     try { window.history.replaceState({}, '', cleanUrl) } catch {}
 
-    if (inviteCode) {
-      setPairError('')
-      setAddingDevice({
-        open: true,
-        serverUrl: detectDefaultServerUrl(),
-        openScanner: false,
-        inviteCode,
-      })
-      return
-    }
-
-    let cancelled = false
-    setAutoPairing(true)
     setPairError('')
-    pairWithRelay(detectDefaultServerUrl(), { pairToken, pairCode })
-      .then((res) => {
-        if (cancelled) return
-        handleDeviceAuthenticated({
-          baseUrl: res.baseUrl,
-          token: res.token,
-          roomId: res.roomId,
-          label: res.label,
-          bridges: res.bridges,
-          authMode: 'pair',
-        })
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setPairError(String(err?.message || err || biLang(getCurrentLang(), '扫码自动配对失败，请重试', 'QR auto-pairing failed. Please retry.')))
-        if (deviceStateRef.current.devices.length > 0) {
-          setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl(), openScanner: false, inviteCode: '' })
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setAutoPairing(false)
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [handleDeviceAuthenticated])
+    setAddingDevice({
+      open: true,
+      serverUrl: detectDefaultServerUrl(),
+      openScanner: false,
+      inviteCode,
+    })
+  }, [])
 
   // Sync live hostname / platform / selectedBridgeId back to saved device metadata
   useEffect(() => {
@@ -568,7 +525,7 @@ export function App() {
   // Mint and auto-refresh a short-lived 15-min read-only media token so the 30-day master JWT never appears in image URLs
   useEffect(() => {
     if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || connState === 'unauthorized') {
-      setMediaAuth({ deviceId: '', mediaToken: '', unsupported: false })
+      setMediaAuth({ deviceId: '', mediaToken: '' })
       return
     }
     let cancelled = false
@@ -585,7 +542,6 @@ export function App() {
           setMediaAuth({
             deviceId,
             mediaToken: res.mediaToken || '',
-            unsupported: Boolean(res.unsupported),
           })
         })
         .catch(() => {})
@@ -641,9 +597,8 @@ export function App() {
     const matched = mediaAuth.deviceId === activeDevice?.id
     return {
       baseUrl: activeDevice?.baseUrl || '',
-      roomId: activeDevice?.roomId || 'owner',
+      roomId: activeDevice?.roomId || '',
       mediaToken: matched ? mediaAuth.mediaToken : '',
-      token: matched && mediaAuth.unsupported ? activeDevice?.token || '' : '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       client: clientRef.current,
@@ -657,11 +612,9 @@ export function App() {
     activeDevice?.id,
     activeDevice?.baseUrl,
     activeDevice?.roomId,
-    activeDevice?.token,
     activeDevice?.e2eeKeys,
     mediaAuth.deviceId,
     mediaAuth.mediaToken,
-    mediaAuth.unsupported,
     activeSession?.cwd,
     activeBridgeId,
     activeBridgeE2ee.active,
@@ -1043,9 +996,9 @@ export function App() {
     }
   }, [])
 
-  // Connect WebSocket whenever the active saved computer/account changes
+  // Connect WebSocket whenever the active saved account changes
   useEffect(() => {
-    if (autoPairing || !activeDevice?.token || !activeDevice?.baseUrl) {
+    if (!activeDevice?.token || !activeDevice?.baseUrl) {
       setConnState('disconnected')
       setBridges([])
       setAccountDevices([])
@@ -1053,29 +1006,25 @@ export function App() {
     }
 
     setBridges([])
-    if (!(activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_'))) {
-      setAccountDevices([])
-    } else {
-      // Also refresh persisted account profile (role/username/devices) cleanly on mount/switch
-      probeDeviceStatus(activeDevice, 5000)
-        .then((res) => {
-          if (Array.isArray(res.devices)) setAccountDevices(res.devices)
-          if (res.username || res.role) {
-            setDeviceState((prev) =>
-              updateDeviceMeta(prev, activeDevice.id, {
-                ...(res.username ? { username: res.username } : {}),
-                ...(res.role ? { role: res.role } : {}),
-              }),
-            )
-          }
-        })
-        .catch(() => {})
-    }
+    // Refresh persisted account profile (role/username/devices) cleanly on mount/switch
+    probeDeviceStatus(activeDevice, 5000)
+      .then((res) => {
+        if (Array.isArray(res.devices)) setAccountDevices(res.devices)
+        if (res.username || res.role) {
+          setDeviceState((prev) =>
+            updateDeviceMeta(prev, activeDevice.id, {
+              ...(res.username ? { username: res.username } : {}),
+              ...(res.role ? { role: res.role } : {}),
+            }),
+          )
+        }
+      })
+      .catch(() => {})
 
     const client = new MobileRelayClient({
       baseUrl: activeDevice.baseUrl,
       token: activeDevice.token,
-      roomId: activeDevice.roomId || 'owner',
+      roomId: activeDevice.roomId,
       bridgeId: activeDevice.selectedBridgeId || '',
       e2eeKeys: activeDevice.e2eeKeys || {},
     })
@@ -1225,7 +1174,7 @@ export function App() {
         clientRef.current = null
       }
     }
-  }, [autoPairing, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl])
+  }, [activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl])
 
   const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
     const cleanBridgeId = String(bridgeId || '').trim()
@@ -1340,12 +1289,7 @@ export function App() {
         })
         setClientSessions({ supported: true, ...res })
         setLiveOnlineClientCount(res.onlineCount)
-        const curLang = getCurrentLang()
-        showToast(
-          res.legacy
-            ? biLang(curLang, '已断开该设备连接（旧凭证请点「下线其他」彻底作废）', 'Disconnected device (use "Sign Out Others" to permanently revoke legacy token)')
-            : biLang(curLang, '已将该设备踢下线', 'Signed out device'),
-        )
+        showToast(biLang(getCurrentLang(), '已将该设备踢下线', 'Signed out device'))
       } catch (err) {
         showToast(String(err?.message || err))
       }
@@ -1763,20 +1707,6 @@ export function App() {
     } catch (err) {
       alert(String(err?.message || err))
     }
-  }
-
-  if (autoPairing) {
-    return (
-      <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-b from-[#F5F8FF] to-white px-6 text-center dark:from-[#16171A] dark:to-[#111216]">
-        <div className="mb-4 h-16 w-16 overflow-hidden rounded-2xl bg-[#03080E] shadow-xl ring-1 ring-white/10">
-          <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
-        </div>
-        <div className="flex items-center gap-2 text-sm font-semibold text-slate-800 dark:text-white">
-          <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-          <span>{bi('正在配对...', 'Pairing...')}</span>
-        </div>
-      </div>
-    )
   }
 
   if (!activeDevice || addingDevice.open) {

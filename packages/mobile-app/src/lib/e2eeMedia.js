@@ -49,10 +49,10 @@ export function needsE2eeMediaLoad(item, imageContext = {}) {
     return true
   }
 
-  // Local PC file path when E2EE is active on the current bridge -> must load over encrypted RPC.FILE_READ
+  // Local PC file path -> always load over E2EE-encrypted RPC.FILE_READ
   const isHttp = /^https?:\/\//i.test(target)
   const isUpload = target.startsWith('/api/uploads/')
-  if (!isHttp && !isUpload && imageContext?.e2eeActive) {
+  if (!isHttp && !isUpload) {
     return true
   }
 
@@ -110,7 +110,7 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
         iv: item.e2ee.iv,
         kid: item.e2ee.kid || '',
         kind: 'upload',
-        roomId: imageContext?.roomId || 'owner',
+        roomId: imageContext?.roomId || '',
       })
       const blob = new Blob([plainBytes], { type: item.mimeType || 'image/png' })
       const url = URL.createObjectURL(blob)

@@ -34,12 +34,15 @@ loadDotEnv(resolve(__dirname, '../relay-server/.env'))
 
 export function startStandaloneBridge(options = {}) {
   const relayUrl = options.relayUrl || process.env.RELAY_URL || 'ws://127.0.0.1:8787/ws/bridge'
-  const secret = options.secret || process.env.DSH_MOBILE_BRIDGE_SECRET || process.env.BRIDGE_SECRET || 'allinone-dev-bridge'
-  const roomId = options.roomId || process.env.ROOM_ID || ''
+  const secret = String(options.secret || process.env.ALLINONE_BRIDGE_SECRET || '').trim()
+  const roomId = String(options.roomId || process.env.ALLINONE_ROOM_ID || '').trim()
   const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
   const bridgeId = options.bridgeId || process.env.BRIDGE_ID || defaultBridgeId
   const mode = options.mode || 'standalone'
-  const e2eeKey = options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? ''
+  const e2eeKey = String(options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? '').trim()
+  if (!roomId.startsWith('usr_') || !secret || !e2eeKey) {
+    throw new Error('startStandaloneBridge requires account roomId (usr_*), device secret, and 256-bit e2eeKey')
+  }
   const cwd = options.cwd || process.env.DEFAULT_CWD || resolve(__dirname, '../..')
   const log = options.log || console
 
