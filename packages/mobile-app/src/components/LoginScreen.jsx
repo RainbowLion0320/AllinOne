@@ -6,22 +6,23 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Eye,
+  EyeOff,
   Globe,
-  KeyRound,
   Lock,
   Mail,
-  QrCode,
+  Moon,
   ScanLine,
   Server,
   ShieldCheck,
   Sparkles,
+  Sun,
   Terminal,
   Ticket,
   User,
   UserPlus,
 } from 'lucide-react'
 import {
-  DEFAULT_PROD_SERVER,
   detectDefaultServerUrl,
   fetchBootstrapStatus,
   loginAccount,
@@ -33,6 +34,9 @@ import {
 import { QrScannerModal } from './QrScannerModal.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 
+const LOGIN_INPUT_CLS =
+  'w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white focus:ring-2 focus:ring-[#4D6BFE]/15 dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26] dark:focus:ring-[#4D6BFE]/25'
+
 export function LoginScreen({
   onSuccess,
   initialError = '',
@@ -40,6 +44,8 @@ export function LoginScreen({
   initialServerUrl = '',
   initialInviteCode = '',
   autoOpenScanner = false,
+  darkMode = false,
+  onToggleDark = null,
   onCancel = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
@@ -63,6 +69,7 @@ export function LoginScreen({
   const [username, setUsername] = useState('')
   const [accountPassword, setAccountPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [inviteCode, setInviteCode] = useState(initialInviteCode || '')
   const [email, setEmail] = useState('')
   const [emailCode, setEmailCode] = useState('')
@@ -333,8 +340,19 @@ export function LoginScreen({
   return (
     <div className="relative flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
       {isDesktopApp && <div className="app-drag fixed inset-x-0 top-0 z-10 h-9" />}
-      {/* Floating bilingual switcher on login screen */}
-      <div className="app-no-drag pt-safe fixed top-3 right-4 z-20">
+      {/* Floating theme + bilingual switcher on login screen */}
+      <div className="app-no-drag pt-safe fixed top-3 right-4 z-20 flex items-center gap-2">
+        {onToggleDark && (
+          <button
+            type="button"
+            onClick={onToggleDark}
+            aria-label={darkMode ? bi('切换浅色主题', 'Switch to light mode') : bi('切换深色主题', 'Switch to dark mode')}
+            title={darkMode ? bi('切换浅色主题', 'Switch to light mode') : bi('切换深色主题', 'Switch to dark mode')}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-slate-200/80 bg-white/90 text-slate-600 shadow-xs backdrop-blur-md transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/80 dark:bg-[#1E2028]/90 dark:text-slate-300 dark:hover:text-[#7E96FF]"
+          >
+            {darkMode ? <Sun className="h-3.5 w-3.5 text-amber-400" /> : <Moon className="h-3.5 w-3.5 text-slate-600" />}
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
@@ -428,7 +446,7 @@ export function LoginScreen({
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className={LOGIN_INPUT_CLS}
                 />
               </div>
 
@@ -454,20 +472,31 @@ export function LoginScreen({
                     </button>
                   )}
                 </div>
-                <input
-                  type="password"
-                  value={accountPassword}
-                  onChange={(e) => {
-                    setAccountPassword(e.target.value)
-                    if (login2fa.required) {
-                      setLogin2fa({ required: false, maskedEmail: '' })
-                      setEmailCode('')
-                    }
-                  }}
-                  placeholder={bi('输入账号密码', 'Enter password')}
-                  autoComplete="current-password"
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
-                />
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={accountPassword}
+                    onChange={(e) => {
+                      setAccountPassword(e.target.value)
+                      if (login2fa.required) {
+                        setLogin2fa({ required: false, maskedEmail: '' })
+                        setEmailCode('')
+                      }
+                    }}
+                    placeholder={bi('输入账号密码', 'Enter password')}
+                    autoComplete="current-password"
+                    className={`${LOGIN_INPUT_CLS} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? bi('隐藏密码', 'Hide password') : bi('显示密码', 'Show password')}
+                    className="absolute top-1/2 right-2.5 -translate-y-1/2 rounded-lg p-1.5 text-slate-400 transition hover:text-slate-600 dark:text-slate-400 dark:hover:text-slate-200"
+                  >
+                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
               </div>
 
               {login2fa.required && (
@@ -490,7 +519,7 @@ export function LoginScreen({
                       onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                       placeholder={bi('6 位登录验证码', '6-digit login code')}
                       autoComplete="one-time-code"
-                      className="min-w-0 flex-1 rounded-2xl border border-[#4D6BFE] bg-white px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal dark:bg-[#16171A] dark:text-white"
+                      className={`${LOGIN_INPUT_CLS} min-w-0 flex-1 border-[#4D6BFE] bg-white font-mono tracking-widest placeholder:font-sans placeholder:tracking-normal dark:border-[#4D6BFE]`}
                     />
                     <button
                       type="button"
@@ -568,7 +597,7 @@ export function LoginScreen({
                   autoCapitalize="characters"
                   autoCorrect="off"
                   spellCheck={false}
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm font-semibold tracking-wider text-slate-900 outline-none transition placeholder:font-sans placeholder:font-normal placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className={`${LOGIN_INPUT_CLS} font-mono font-semibold tracking-wider placeholder:font-sans placeholder:font-normal placeholder:tracking-normal`}
                 />
               </div>
 
@@ -586,7 +615,7 @@ export function LoginScreen({
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className={LOGIN_INPUT_CLS}
                 />
               </div>
 
@@ -602,7 +631,7 @@ export function LoginScreen({
                     onChange={(e) => setAccountPassword(e.target.value)}
                     placeholder={bi('至少 8 位', 'At least 8 chars')}
                     autoComplete="new-password"
-                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                    className={`${LOGIN_INPUT_CLS} px-3`}
                   />
                 </div>
                 <div>
@@ -615,7 +644,7 @@ export function LoginScreen({
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder={bi('再次输入', 'Re-enter password')}
                     autoComplete="new-password"
-                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                    className={`${LOGIN_INPUT_CLS} px-3`}
                   />
                 </div>
               </div>
@@ -639,7 +668,7 @@ export function LoginScreen({
                       autoCapitalize="none"
                       autoCorrect="off"
                       spellCheck={false}
-                      className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                      className={LOGIN_INPUT_CLS}
                     />
                   </div>
 
@@ -653,7 +682,7 @@ export function LoginScreen({
                         onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                         placeholder={bi('6 位邮箱验证码', '6-digit email code')}
                         autoComplete="one-time-code"
-                        className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                        className={`${LOGIN_INPUT_CLS} min-w-0 flex-1 font-mono tracking-widest placeholder:font-sans placeholder:tracking-normal`}
                       />
                       <button
                         type="button"
@@ -709,7 +738,7 @@ export function LoginScreen({
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
-                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className={LOGIN_INPUT_CLS}
                 />
               </div>
 
@@ -722,7 +751,7 @@ export function LoginScreen({
                   onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   placeholder={bi('6 位邮箱验证码', '6-digit email code')}
                   autoComplete="one-time-code"
-                  className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className={`${LOGIN_INPUT_CLS} min-w-0 flex-1 font-mono tracking-widest placeholder:font-sans placeholder:tracking-normal`}
                 />
                 <button
                   type="button"
@@ -750,7 +779,7 @@ export function LoginScreen({
                     onChange={(e) => setAccountPassword(e.target.value)}
                     placeholder={bi('至少 8 位', 'At least 8 chars')}
                     autoComplete="new-password"
-                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                    className={`${LOGIN_INPUT_CLS} px-3`}
                   />
                 </div>
                 <div>
@@ -763,7 +792,7 @@ export function LoginScreen({
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder={bi('再次输入', 'Re-enter password')}
                     autoComplete="new-password"
-                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                    className={`${LOGIN_INPUT_CLS} px-3`}
                   />
                 </div>
               </div>
@@ -846,7 +875,7 @@ export function LoginScreen({
                   value={serverUrl}
                   onChange={(e) => setServerUrl(e.target.value)}
                   placeholder={detectDefaultServerUrl()}
-                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
                 />
                 <button
                   type="button"

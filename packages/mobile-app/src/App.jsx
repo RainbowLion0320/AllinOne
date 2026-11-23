@@ -1717,6 +1717,8 @@ export function App() {
         initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
         initialInviteCode={addingDevice.inviteCode || ''}
         autoOpenScanner={Boolean(addingDevice.open && addingDevice.openScanner)}
+        darkMode={darkMode}
+        onToggleDark={() => setDarkMode((v) => !v)}
         onCancel={
           activeDevice
             ? () => {
@@ -1962,7 +1964,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: false })}
-                className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200"
+                className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
               >
                 <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
                 <span>{bi('手动粘贴恢复密钥', 'Paste Recovery Key')}</span>

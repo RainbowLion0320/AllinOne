@@ -526,7 +526,7 @@ export function DeviceSwitcherModal({
                         autoCapitalize="none"
                         autoCorrect="off"
                         spellCheck={false}
-                        className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
+                        className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
                       />
                       <div className="flex items-center gap-1.5">
                         <input
@@ -537,7 +537,7 @@ export function DeviceSwitcherModal({
                           onChange={(e) => setEmailCodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
                           placeholder={bi('6 位验证码', '6-digit code')}
                           autoComplete="one-time-code"
-                          className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
+                          className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
                         />
                         <button
                           type="button"

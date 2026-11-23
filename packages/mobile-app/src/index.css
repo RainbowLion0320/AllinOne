@@ -20,6 +20,22 @@ html, body, #root {
   -webkit-tap-highlight-color: transparent;
 }
 
+html.dark {
+  color-scheme: dark;
+}
+
+/* Keep Chromium / Electron / Safari autofilled inputs dark & legible in dark mode */
+html.dark input:-webkit-autofill,
+html.dark input:-webkit-autofill:hover,
+html.dark input:-webkit-autofill:focus,
+html.dark textarea:-webkit-autofill {
+  -webkit-text-fill-color: #f8fafc;
+  caret-color: #f8fafc;
+  -webkit-box-shadow: 0 0 0 1000px #16171a inset;
+  box-shadow: 0 0 0 1000px #16171a inset;
+  transition: background-color 99999s ease-in-out 0s;
+}
+
 .pt-safe {
   padding-top: max(0.5rem, var(--safe-top));
 }
