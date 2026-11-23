@@ -253,7 +253,7 @@ export function SidebarDrawer({
           }`}
         >
           <div className="app-no-drag flex min-w-0 items-center gap-2.5">
-            <img src="./icon-192.png" alt="All in One" className="h-8 w-8 rounded-xl bg-[#03080E] ring-1 ring-white/10" />
+            <img src="./icon-192.png" alt="All in One" className="h-8 w-8 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
             <div className="min-w-0">
               <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
                 All in One

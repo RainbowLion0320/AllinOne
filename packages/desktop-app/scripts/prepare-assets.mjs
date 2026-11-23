@@ -98,32 +98,26 @@ function encodeRgbaPng(width, height, rgba) {
 }
 
 /**
- * Draw crisp concentric-ring "All in One" monochrome template icon for macOS menu bar.
+ * Draw crisp single-ring ("One") monochrome template icon for macOS menu bar.
  * Black pixels with anti-aliased alpha so macOS auto-renders white on dark bar & black on light bar.
  */
 function renderTrayTemplatePng(size) {
   const rgba = Buffer.alloc(size * size * 4)
   const cx = (size - 1) / 2
   const cy = (size - 1) / 2
-  const outerR = size * 0.42
-  const outerW = Math.max(1.4, size * 0.095)
-  const innerR = size * 0.20
-  const innerW = Math.max(1.2, size * 0.085)
-  const dotR = size * 0.075
+  const ringR = size * 0.34
+  const ringW = Math.max(2.1, size * 0.165)
 
   const smoothAlpha = (dist, targetR, halfW) => {
     const d = Math.abs(dist - targetR)
     const edge = halfW - d
-    return Math.max(0, Math.min(1, edge + 0.65))
+    return Math.max(0, Math.min(1, edge + 0.6))
   }
 
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       const dist = Math.hypot(x - cx, y - cy)
-      const aOuter = smoothAlpha(dist, outerR, outerW / 2)
-      const aInner = smoothAlpha(dist, innerR, innerW / 2)
-      const aDot = Math.max(0, Math.min(1, dotR - dist + 0.65))
-      const alpha = Math.max(aOuter, aInner, aDot)
+      const alpha = smoothAlpha(dist, ringR, ringW / 2)
       const idx = (y * size + x) * 4
       rgba[idx] = 0
       rgba[idx + 1] = 0
