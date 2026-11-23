@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
@@ -95,8 +96,9 @@ function normalizeThreadSummary(t) {
   }
 }
 
-function normalizeCodexTurns(turns = []) {
+export function normalizeCodexTurns(turns = []) {
   const messages = []
+  let milestoneEpoch = 0
   for (const turn of turns) {
     let currentAssistant = null
     const ensureAssistant = (ts, fallbackId) => {
@@ -107,6 +109,7 @@ function normalizeCodexTurns(turns = []) {
           text: '',
           thinking: '',
           tools: [],
+          branchEpoch: milestoneEpoch,
           ts: toEpochMs(ts || turn.startedAt || Date.now()),
         }
         messages.push(currentAssistant)
@@ -166,6 +169,11 @@ function normalizeCodexTurns(turns = []) {
         const a = ensureAssistant(ts, item.id)
         if (item.text) {
           a.text = a.text ? `${a.text}\n\n${item.text}` : item.text
+          a.ts = ts || a.ts
+          // Close this assistant milestone bubble so long autonomous multi-step runs render
+          // each progress update chronologically with its preceding commands (matching Codex Desktop).
+          milestoneEpoch += 1
+          currentAssistant = null
         }
       } else if (item.type === 'commandExecution') {
         const a = ensureAssistant(ts)
@@ -217,6 +225,118 @@ function normalizeCodexTurns(turns = []) {
     if (!out.tools || out.tools.length === 0) delete out.tools
     return out
   })
+}
+
+/**
+ * Zero-OOM tail-seek fallback for giant / legacy Codex JSONL rollout files (even >2 GB)
+ * when `codex app-server` fails to deserialize an older stored thread item across CLI upgrades.
+ * Reads ONLY the tail `maxBytes` (default 2 MB) directly from disk in <5 ms.
+ */
+export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limit = 14 } = {}) {
+  const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
+  if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
+    return []
+  }
+  let fd = null
+  try {
+    fd = openSync(cleanPath, 'r')
+    const totalSize = fstatSync(fd).size
+    if (totalSize <= 0) return []
+    const readLen = Math.min(totalSize, maxBytes)
+    const startOffset = totalSize - readLen
+    const buf = Buffer.alloc(readLen)
+    readSync(fd, buf, 0, readLen, startOffset)
+    const rawText = buf.toString('utf8')
+    const lines = rawText.split(/\r?\n/)
+    // Drop first partial line if we started mid-file
+    if (startOffset > 0 && lines.length > 0) lines.shift()
+
+    const messages = []
+    let milestoneEpoch = 0
+    let currentAssistant = null
+    const ensureAssistant = (ts, idHint) => {
+      if (!currentAssistant) {
+        currentAssistant = {
+          id: idHint || `cdx-tail-a-${messages.length}`,
+          role: 'assistant',
+          text: '',
+          thinking: '',
+          tools: [],
+          branchEpoch: milestoneEpoch,
+          ts: toEpochMs(ts || Date.now()),
+        }
+        messages.push(currentAssistant)
+      }
+      return currentAssistant
+    }
+
+    for (const line of lines) {
+      if (!line || line[0] !== '{') continue
+      let obj
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const ts = toEpochMs(obj.timestamp || Date.now())
+      if (obj.type === 'response_item' && obj.payload && typeof obj.payload === 'object') {
+        const p = obj.payload
+        if (p.type === 'message') {
+          const role = p.role === 'user' ? 'user' : p.role === 'assistant' ? 'assistant' : ''
+          if (!role) continue
+          const text = (Array.isArray(p.content) ? p.content : [])
+            .map((c) => (c?.type === 'output_text' || c?.type === 'input_text' || c?.type === 'text' ? c.text || '' : ''))
+            .filter(Boolean)
+            .join('\n')
+            .trim()
+          if (!text) continue
+          if (role === 'user') {
+            currentAssistant = null
+            messages.push({ id: p.id || `cdx-tail-u-${messages.length}`, role: 'user', text, ts })
+          } else {
+            const a = ensureAssistant(ts, p.id)
+            a.text = a.text ? `${a.text}\n\n${text}` : text
+            a.ts = ts
+            milestoneEpoch += 1
+            currentAssistant = null
+          }
+        } else if (p.type === 'reasoning') {
+          const summaries = (Array.isArray(p.summary) ? p.summary : [])
+            .map((s) => (typeof s === 'string' ? s : s?.text || ''))
+            .filter(Boolean)
+          if (summaries.length > 0) {
+            const a = ensureAssistant(ts, p.id)
+            a.thinking = a.thinking ? `${a.thinking}\n${summaries.join('\n')}` : summaries.join('\n')
+          }
+        } else if (p.type === 'custom_tool_call' || p.type === 'function_call' || p.type === 'local_shell_call') {
+          const a = ensureAssistant(ts, p.call_id || p.id)
+          a.tools.push({
+            id: p.call_id || p.id || `cdx-tail-t-${a.tools.length}`,
+            name: p.name || (p.type === 'local_shell_call' ? 'command' : 'tool'),
+            input: p.input ?? p.arguments ?? p.action ?? {},
+            status: 'completed',
+            output: '',
+          })
+        }
+      } else if (obj.type === 'event_msg' && obj.payload?.type === 'agent_message' && obj.payload?.message) {
+        const a = ensureAssistant(ts)
+        a.text = a.text ? `${a.text}\n\n${obj.payload.message}` : String(obj.payload.message)
+        a.ts = ts
+        milestoneEpoch += 1
+        currentAssistant = null
+      }
+    }
+
+    const compacted = mergeAndCompactMessages(messages)
+    const sliceLen = Math.max(6, Math.min(Number(limit) || 14, 30))
+    return compacted.slice(-sliceLen)
+  } catch {
+    return []
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+  }
 }
 
 /**
@@ -316,7 +436,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.2' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.3' },
         capabilities: null,
       })
         .then((res) => {
@@ -797,21 +917,49 @@ export class CodexAdapter {
     let hasMore = false
 
     const targetBubbles = Math.max(6, Math.min(Number(limit) || 12, 30))
-    const maxRawBatches = 24 // up to 2,400 raw items per page (~70ms) so heavy tool runs still return real turns
+    const maxRawBatches = 16 // up to 1,600 raw items per page so heavy tool runs stay fast & complete
+    let hitDeserializationBoundary = false
 
-    try {
+    {
       const collectedDesc = []
       let curCursor = cursor || null
       let userCount = 0
       let agentTextCount = 0
 
       for (let batch = 0; batch < maxRawBatches; batch += 1) {
-        const itemsRes = await this.rpc('thread/items/list', {
-          threadId,
-          limit: 100,
-          sortDirection: 'desc',
-          ...(curCursor ? { cursor: curCursor } : {}),
-        })
+        let itemsRes = null
+        try {
+          itemsRes = await this.rpc('thread/items/list', {
+            threadId,
+            limit: 100,
+            sortDirection: 'desc',
+            ...(curCursor ? { cursor: curCursor } : {}),
+          })
+        } catch (batchErr) {
+          // If batch 0 fails because a legacy corrupt item sits inside the newest 100 items,
+          // retry once with a smaller window (20 items) to still rescue the latest replies.
+          if (batch === 0 && collectedDesc.length === 0) {
+            try {
+              itemsRes = await this.rpc('thread/items/list', {
+                threadId,
+                limit: 20,
+                sortDirection: 'desc',
+                ...(curCursor ? { cursor: curCursor } : {}),
+              })
+            } catch {
+              itemsRes = null
+            }
+          }
+          if (!itemsRes) {
+            // Preserve every valid item already fetched in earlier batches!
+            hitDeserializationBoundary = true
+            curCursor = null
+            this.log.warn?.(
+              `codex: thread/items/list stopped at batch ${batch} for ${threadId} (kept ${collectedDesc.length} items): ${String(batchErr?.message || batchErr)}`,
+            )
+            break
+          }
+        }
         const chunk = Array.isArray(itemsRes?.data) ? itemsRes.data : []
         if (chunk.length > 0) {
           collectedDesc.push(...chunk)
@@ -823,12 +971,13 @@ export class CodexAdapter {
         }
         curCursor = itemsRes?.nextCursor || null
         if (!curCursor || chunk.length === 0) break
-        // Stop once we have enough real user+assistant Q&A turns to fill a mobile screen comfortably
+        // Stop once we have enough real Q&A turns OR enough autonomous assistant milestones
         if (userCount >= Math.max(3, Math.ceil(targetBubbles / 2))) break
         if (userCount >= 2 && agentTextCount >= targetBubbles) break
+        if (agentTextCount >= Math.max(6, targetBubbles)) break
       }
 
-      nextCursor = curCursor ? String(curCursor) : null
+      nextCursor = hitDeserializationBoundary ? null : curCursor ? String(curCursor) : null
       hasMore = Boolean(nextCursor)
 
       const entries = collectedDesc.slice().reverse()
@@ -853,8 +1002,6 @@ export class CodexAdapter {
         }
         messages = mergeAndCompactMessages(normalizeCodexTurns(turns))
       }
-    } catch {
-      // Fallback for legacy non-paginated threads
     }
 
     if (messages.length === 0 && !cursor && !pendingNew) {
@@ -866,6 +1013,17 @@ export class CodexAdapter {
         hasMore = start > 0
         nextCursor = null
       } catch {}
+    }
+
+    // Final safety net: zero-OOM tail-seek JSONL reader for giant/legacy rollout files
+    // (also rescues fuller recent history when a corrupt schema item sits near the newest items)
+    if (!cursor && !pendingNew && t.path && (messages.length === 0 || (hitDeserializationBoundary && messages.length < 4))) {
+      const tailMsgs = readCodexRolloutTail(t.path, { limit: targetBubbles })
+      if (tailMsgs.length > messages.length) {
+        messages = tailMsgs
+        hasMore = false
+        nextCursor = null
+      }
     }
 
     const pref = this.sessionPrefs.get(threadId)

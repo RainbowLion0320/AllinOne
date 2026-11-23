@@ -24,6 +24,7 @@ import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
+import { normalizeCodexTurns, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
 import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
 import {
   DEVICES_STORAGE_KEY,
@@ -2867,8 +2868,43 @@ async function main() {
       )
       const hubRes = ensureDshLocalIpcPlugin({ dshHome: hubDshHome, env: {}, log: { info: () => {}, warn: () => {} } })
       assert.equal(hubRes.status, 'already-using-dsh-mobile-hub')
+
+      // Codex autonomous multi-milestone turn separation & tail-seek JSONL fallback (giant/corrupt rollout guard)
+      const autoMsgs = normalizeCodexTurns([
+        {
+          id: 'auto-turn-1',
+          startedAt: Date.now(),
+          items: [
+            { id: 'cmd1', type: 'commandExecution', command: 'echo step1', status: 'completed', aggregatedOutput: 'step1' },
+            { id: 'am1', type: 'agentMessage', text: 'Milestone 1 reached.' },
+            { id: 'cmd2', type: 'commandExecution', command: 'echo step2', status: 'completed', aggregatedOutput: 'step2' },
+            { id: 'am2', type: 'agentMessage', text: 'Milestone 2 reached.' },
+          ],
+        },
+      ])
+      assert.equal(autoMsgs.length, 2, 'Autonomous multi-step Codex turns must keep each agentMessage milestone separate')
+      assert.equal(autoMsgs[0].text, 'Milestone 1 reached.')
+      assert.equal(autoMsgs[1].text, 'Milestone 2 reached.')
+      assert.notEqual(autoMsgs[0].branchEpoch, autoMsgs[1].branchEpoch)
+
+      const fakeRollout = join(tmpDir, 'rollout-giant.jsonl')
+      writeFileSync(
+        fakeRollout,
+        [
+          '{corrupt-old-line',
+          JSON.stringify({ timestamp: '2026-11-23T10:00:00Z', type: 'response_item', payload: { type: 'message', role: 'user', id: 'u1', content: [{ type: 'input_text', text: 'Start goal' }] } }),
+          JSON.stringify({ timestamp: '2026-11-23T10:01:00Z', type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'c1', name: 'shell', input: 'ls' } }),
+          JSON.stringify({ timestamp: '2026-11-23T10:02:00Z', type: 'response_item', payload: { type: 'message', role: 'assistant', id: 'a1', content: [{ type: 'output_text', text: 'Round 460 done' }] } }),
+        ].join('\n'),
+        'utf8',
+      )
+      const tailMsgs = readCodexRolloutTail(`\\\\?\\${fakeRollout}`, { limit: 10 })
+      assert.equal(tailMsgs.length, 2)
+      assert.equal(tailMsgs[0].text, 'Start goal')
+      assert.equal(tailMsgs[1].text, 'Round 460 done')
+      assert.equal(tailMsgs[1].toolCount, 1)
     }
-    console.log('[smoke] 19/19 DeepSeek Harness authenticated localhost IPC bridge & auto-installer OK')
+    console.log('[smoke] 19/19 DeepSeek Harness IPC, auto-installer & Codex autonomous/giant rollout resilience OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
