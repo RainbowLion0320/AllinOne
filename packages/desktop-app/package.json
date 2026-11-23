@@ -9,11 +9,13 @@
   "main": "src/main.js",
   "scripts": {
     "prepare:assets": "node scripts/prepare-assets.mjs",
+    "clean:release": "node scripts/clean-release.mjs --all",
+    "prune:release": "node scripts/clean-release.mjs --prune",
     "dev": "node scripts/prepare-assets.mjs && electron .",
-    "pack:mac": "node scripts/prepare-assets.mjs && electron-builder --mac",
-    "pack:mac-dir": "node scripts/prepare-assets.mjs && electron-builder --mac --dir",
-    "pack:win": "node scripts/prepare-assets.mjs && electron-builder --win",
-    "pack:all": "node scripts/prepare-assets.mjs && electron-builder --mac --win"
+    "pack:mac": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --mac && node scripts/clean-release.mjs --prune",
+    "pack:mac-dir": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --mac --dir",
+    "pack:win": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --win && node scripts/clean-release.mjs --prune",
+    "pack:all": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --mac --win && node scripts/clean-release.mjs --prune"
   },
   "devDependencies": {
     "electron": "35.7.5",
