@@ -2657,6 +2657,40 @@ async function main() {
           followup: (userMsg) => {
             const promptText = userMsg?.content?.[0]?.text || ''
             events.push({ seq: ++seqCounter, type: 'user/message', data: { message: userMsg }, timestamp: Date.now() })
+            // Inject synthetic DSH runtime/system user/message events (must be filtered out of chat history!)
+            events.push({
+              seq: ++seqCounter,
+              type: 'user/message',
+              data: {
+                id: `sys-rt-${seqCounter}`,
+                role: 'user',
+                source: { kind: 'runtime-context', form: 'snapshot' },
+                content: [{ type: 'text', text: '<system-reminder>Runtime context info</system-reminder>' }],
+              },
+              timestamp: Date.now(),
+            })
+            events.push({
+              seq: ++seqCounter,
+              type: 'user/message',
+              data: {
+                id: `sys-sk-${seqCounter}`,
+                role: 'user',
+                source: { kind: 'skill-catalog', form: 'catalog' },
+                content: [{ type: 'text', text: '<system-reminder><available_skills>secret</available_skills></system-reminder>' }],
+              },
+              timestamp: Date.now(),
+            })
+            events.push({
+              seq: ++seqCounter,
+              type: 'user/message',
+              data: {
+                id: `sys-tm-${seqCounter}`,
+                role: 'user',
+                source: { kind: 'time-context', form: 'snapshot' },
+                content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 1: 2026-11-23T18:09:37+08:00' }],
+              },
+              timestamp: Date.now(),
+            })
             idlePromise = new Promise((r) => {
               idleResolve = r
               setTimeout(() => {
@@ -2778,6 +2812,9 @@ async function main() {
 
         const readBack = await standaloneDsh.readSession(created.nativeId)
         assert.equal(readBack.writable, true)
+        const userMsgs = readBack.messages.filter((m) => m.role === 'user')
+        assert.equal(userMsgs.length, 1, 'Synthetic DSH runtime-context/skill-catalog/time-context events must be filtered out')
+        assert.equal(userMsgs[0].text, 'Hello DSH over IPC!')
         assert.ok(readBack.messages.some((m) => m.role === 'assistant' && m.text.includes('Hello DSH over IPC!')))
 
         // Closing IPC server cleanly removes descriptor & flips standalone back to read-only

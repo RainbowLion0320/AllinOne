@@ -24,7 +24,7 @@ const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
-const BRIDGE_VERSION = '0.4.1'
+const BRIDGE_VERSION = '0.4.2'
 
 function parseArgs(argv) {
   const opts = {

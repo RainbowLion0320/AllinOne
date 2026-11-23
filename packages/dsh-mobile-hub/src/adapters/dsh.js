@@ -60,6 +60,23 @@ function extractDshImageBlock(b) {
 }
 
 /**
+ * Identify synthetic runtime/system injections that DSH stores as `user/message` events
+ * (e.g. `runtime-context`, `skill-catalog`, `time-context`, `agent-instructions`, `tool-jobs`),
+ * so they never render as fake user bubbles in All in One.
+ */
+function isDshInternalSystemUserMessage(ev, text) {
+  const srcKind = String(ev?.data?.message?.source?.kind ?? ev?.data?.source?.kind ?? '')
+    .trim()
+    .toLowerCase()
+  if (srcKind && srcKind !== 'user') return true
+  const trimmed = String(text || '').trim()
+  if (!trimmed) return false
+  if (/^<system-reminder>[\s\S]*<\/system-reminder>$/i.test(trimmed)) return true
+  if (/^Time sampled while preparing turn \d+, step \d+:/i.test(trimmed)) return true
+  return false
+}
+
+/**
  * Extract normalized messages from live DSH `session.ownEvents()`.
  */
 function parseDshEvents(events) {
@@ -84,6 +101,9 @@ function parseDshEvents(events) {
             .filter(Boolean)
             .join('\n')
         : String(ev.data?.text ?? '')
+      if (isDshInternalSystemUserMessage(ev, text)) {
+        continue
+      }
       if (text.trim().length > 0 || images.length > 0) {
         messages.push({
           id: ev.data?.message?.id || ev.data?.id || `u-${ev.seq}`,
@@ -501,10 +521,18 @@ export class DshAdapter {
       const ipc = await this.ipcClient.checkHealth()
       if (ipc) {
         try {
-          return await this.ipcClient.call('readSession', {
+          const remote = await this.ipcClient.call('readSession', {
             sessionId,
             options: { limit, cursor },
           })
+          // Defense-in-depth: filter synthetic system-reminder bubbles even if the running DSH process
+          // still has an older plugin loaded in memory before restart.
+          if (remote && Array.isArray(remote.messages)) {
+            remote.messages = remote.messages.filter(
+              (m) => !(m?.role === 'user' && isDshInternalSystemUserMessage(null, m.text)),
+            )
+          }
+          return remote
         } catch {}
       }
     }
