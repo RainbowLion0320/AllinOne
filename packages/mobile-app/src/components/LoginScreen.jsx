@@ -897,12 +897,12 @@ export function LoginScreen({
                   type="url"
                   value={serverUrl}
                   onChange={(e) => setServerUrl(e.target.value)}
-                  placeholder={DEFAULT_PROD_SERVER}
+                  placeholder={detectDefaultServerUrl()}
                   className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                 />
                 <button
                   type="button"
-                  onClick={() => setServerUrl(normalizeBaseUrl(DEFAULT_PROD_SERVER))}
+                  onClick={() => setServerUrl(detectDefaultServerUrl())}
                   className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
                 >
                   默认

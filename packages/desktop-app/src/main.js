@@ -68,6 +68,7 @@ function readRuntimeConfig() {
 const runtimeConfig = readRuntimeConfig()
 const DEFAULT_SERVER_URL = String(
   process.env.ALLINONE_SERVER ||
+  process.env.PUBLIC_RELAY_URL ||
   process.env.VITE_RELAY_URL ||
   runtimeConfig.defaultServerUrl ||
   '',

@@ -20,6 +20,36 @@ const BUILD_DIR = join(DESKTOP_ROOT, 'build')
 const RENDERER_DIR = join(DESKTOP_ROOT, 'renderer')
 const BRIDGE_DIR = join(DESKTOP_ROOT, 'bridge-runtime')
 
+function readLocalEnvValue(key) {
+  if (process.env[key]) return process.env[key]
+  for (const name of ['.env.local', '.env']) {
+    const p = join(REPO_ROOT, name)
+    if (!existsSync(p)) continue
+    for (const line of readFileSync(p, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const eq = trimmed.indexOf('=')
+      if (eq === -1) continue
+      if (trimmed.slice(0, eq).trim() !== key) continue
+      let val = trimmed.slice(eq + 1).trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1)
+      }
+      if (val) return val
+    }
+  }
+  return ''
+}
+
+function resolveDefaultRelayUrl() {
+  return String(
+    readLocalEnvValue('PUBLIC_RELAY_URL') ||
+    readLocalEnvValue('VITE_RELAY_URL') ||
+    readLocalEnvValue('ALLINONE_SERVER') ||
+    '',
+  ).trim().replace(/\/+$/, '')
+}
+
 // ---------------------------------------------------------------------------
 // Minimal pure-Node PNG encoder for crisp monochrome macOS Tray Template Icons
 // ---------------------------------------------------------------------------
@@ -200,7 +230,7 @@ function buildCorePackages() {
   if (skipBuild && existsSync(join(MOBILE_DIST, 'index.html'))) {
     return
   }
-  const relayUrl = String(process.env.PUBLIC_RELAY_URL || process.env.VITE_RELAY_URL || '').trim().replace(/\/+$/, '')
+  const relayUrl = resolveDefaultRelayUrl()
   const env = {
     ...process.env,
     ...(relayUrl ? { PUBLIC_RELAY_URL: relayUrl, VITE_RELAY_URL: relayUrl } : {}),
@@ -251,14 +281,13 @@ function stageRendererAndBridge() {
   }
   copyFileSync(builtBridge, join(BRIDGE_DIR, 'allinone-bridge.mjs'))
 
-  const defaultServerUrl = String(process.env.PUBLIC_RELAY_URL || process.env.VITE_RELAY_URL || '')
-    .trim()
-    .replace(/\/+$/, '')
+  const defaultServerUrl = resolveDefaultRelayUrl()
   writeFileSync(
     join(DESKTOP_ROOT, 'runtime-config.json'),
     JSON.stringify({ defaultServerUrl }, null, 2),
     'utf8',
   )
+  console.log(`[desktop:prepare] Wrote runtime-config.json (defaultServerUrl=${defaultServerUrl || '(empty)'})`)
 }
 
 buildCorePackages()
