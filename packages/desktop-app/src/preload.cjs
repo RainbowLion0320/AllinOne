@@ -5,7 +5,7 @@ const initInfo = ipcRenderer.sendSync('desktop:get-init') || {}
 contextBridge.exposeInMainWorld('allinoneDesktop', {
   isDesktop: true,
   platform: initInfo.platform || process.platform,
-  version: initInfo.version || '0.3.4',
+  version: initInfo.version || '0.3.5',
   defaultServerUrl: initInfo.defaultServerUrl || '',
   getBridgeStatus: () => ipcRenderer.invoke('bridge:status'),
   syncAccount: (account) => ipcRenderer.invoke('bridge:sync-account', account),

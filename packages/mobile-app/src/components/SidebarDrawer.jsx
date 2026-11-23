@@ -552,24 +552,19 @@ export function SidebarDrawer({
                 <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
               )}
             </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
-                  {username ? `@${username}` : activeDeviceName || '设置'}
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
+                {username ? `@${username}` : activeDeviceName || '设置'}
+              </span>
+              {hasUpdate ? (
+                <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
+                  有更新
                 </span>
-                {hasUpdate ? (
-                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
-                    有更新
-                  </span>
-                ) : isAdmin ? (
-                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
-                    管理员
-                  </span>
-                ) : null}
-              </div>
-              <div className="text-[10.5px] text-slate-400">
-                {hasUpdate ? '点击进入设置一键更新' : '账号、主题、缓存与关于'}
-              </div>
+              ) : isAdmin ? (
+                <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
+                  管理员
+                </span>
+              ) : null}
             </div>
             <Settings className="h-4 w-4 shrink-0 text-slate-400" />
           </button>
