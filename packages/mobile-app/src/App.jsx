@@ -452,6 +452,15 @@ export function App() {
     return [...map.values()]
   }, [workspaces, sessions])
 
+  const selectedDraftWorkspaceObj = useMemo(() => {
+    if (!selectedDraftCwd) return null
+    const lower = selectedDraftCwd.toLowerCase()
+    const hit = effectiveWorkspaces.find((w) => w.path.toLowerCase() === lower)
+    if (hit) return hit
+    const parts = selectedDraftCwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean)
+    return { name: parts[parts.length - 1] || selectedDraftCwd, path: selectedDraftCwd }
+  }, [selectedDraftCwd, effectiveWorkspaces])
+
   // Mint and auto-refresh a short-lived 15-min read-only media token so the 30-day master JWT never appears in image URLs
   useEffect(() => {
     if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || connState === 'unauthorized') {
@@ -1491,15 +1500,6 @@ export function App() {
       (!activeModelPref.provider || !m.provider || m.provider === activeModelPref.provider),
   ) || (activeCatalog?.models || []).find((m) => m.id === activeModelPref.model)
   const currentStream = activeSession ? streamingBySession[activeSession.id] : null
-
-  const selectedDraftWorkspaceObj = useMemo(() => {
-    if (!selectedDraftCwd) return null
-    const lower = selectedDraftCwd.toLowerCase()
-    const hit = effectiveWorkspaces.find((w) => w.path.toLowerCase() === lower)
-    if (hit) return hit
-    const parts = selectedDraftCwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean)
-    return { name: parts[parts.length - 1] || selectedDraftCwd, path: selectedDraftCwd }
-  }, [selectedDraftCwd, effectiveWorkspaces])
 
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const currentWorkspaceLabel = activeSession?.workspace || selectedDraftWorkspaceObj?.name || ''

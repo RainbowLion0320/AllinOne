@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
 import net from 'node:net'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
@@ -1578,7 +1578,61 @@ async function main() {
       await new Promise((r) => mockSmtp.close(r))
     }
 
-    console.log('[smoke] 12/12 Zero-dependency SMTP mailer, optional email register, email login, bind & password reset OK')
+    console.log('[smoke] 12/13 Zero-dependency SMTP mailer, optional email register, email login, bind & password reset OK')
+
+    // 13. Static React Rules-of-Hooks guard across all mobile/desktop JSX components
+    {
+      const scanJsx = (dir) => {
+        const out = []
+        for (const ent of readdirSync(dir, { withFileTypes: true })) {
+          const p = join(dir, ent.name)
+          if (ent.isDirectory()) out.push(...scanJsx(p))
+          else if (ent.name.endsWith('.jsx')) out.push(p)
+        }
+        return out
+      }
+      const violations = []
+      for (const f of scanJsx(join(process.cwd(), 'packages/mobile-app/src'))) {
+        const lines = readFileSync(f, 'utf8').split(/\r?\n/)
+        let curComp = ''
+        let compDepth = -1
+        let earlyReturnLine = -1
+        let depth = 0
+        for (let i = 0; i < lines.length; i += 1) {
+          const line = lines[i]
+          const clean = line.replace(/'(?:\\.|[^'])*'|"(?:\\.|[^"])*"|`(?:\\.|[^`])*`|\/\/.*$/g, '')
+          if (!curComp) {
+            const m = clean.match(/^(?:export\s+)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*=\s*(?:React\.)?memo\s*\(\s*function\s*\w*)/)
+            if (m) {
+              curComp = m[1] || m[2]
+              compDepth = depth
+              earlyReturnLine = -1
+            }
+          }
+          if (curComp && depth === compDepth + 1) {
+            if (/^\s*if\s*\(/.test(clean) && (/\breturn\b/.test(clean) || (lines[i + 1] && /^\s+return\b/.test(lines[i + 1])))) {
+              if (earlyReturnLine === -1) earlyReturnLine = i + 1
+            }
+            if (earlyReturnLine !== -1 && /\buse(State|Effect|Memo|Callback|Ref|LayoutEffect|Context|Reducer)\s*\(/.test(clean)) {
+              violations.push(`${f}:${i + 1} (${curComp}) hook after early return at L${earlyReturnLine}`)
+            }
+          }
+          for (const ch of clean) {
+            if (ch === '{') depth += 1
+            else if (ch === '}') {
+              depth -= 1
+              if (curComp && depth === compDepth) {
+                curComp = ''
+                compDepth = -1
+                earlyReturnLine = -1
+              }
+            }
+          }
+        }
+      }
+      assert.deepEqual(violations, [], `React hook order violations found:\n${violations.join('\n')}`)
+    }
+    console.log('[smoke] 13/13 React Rules-of-Hooks static guard across all JSX components OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
