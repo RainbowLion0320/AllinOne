@@ -2,10 +2,14 @@
 
 Because **All in One** allows remote control of AI coding agents running on your personal computers, please carefully review its security architecture and trust boundaries before deploying.
 
-## 1. Trust Boundary & Self-Hosting Requirement
+## 1. Trust Boundary & Zero-Knowledge End-to-End Encryption (E2EE)
 
-- **Self-hosted only**: The relay server (`@allinone/relay-server`) authenticates clients, isolates tenant rooms, routes RPC/event messages, and temporarily relays uploaded attachments.
-- **Transport encryption (TLS), not zero-knowledge E2EE**: All production deployments must terminate **HTTPS / WSS** (e.g., via Caddy or Nginx in `deploy/`). The relay server can inspect payloads passing through it in memory, so **never connect your PC bridge to an untrusted third-party relay server**.
+- **Zero-Knowledge E2EE (AES-256-GCM)**:
+  - Each computer bridge automatically generates a random **256-bit room key** locally (protected on Desktop via macOS Keychain / Windows DPAPI `safeStorage`, and `0600` config permissions on CLI). The raw key is **never sent to or stored on the relay server**.
+  - All WebSocket RPC requests (including method names, prompts, file paths, and workspace metadata), RPC responses, real-time streaming events, uploaded attachments (`/api/uploads`), and local PC image previews (`RPC.FILE_READ`) are encrypted end-to-end with **AES-256-GCM** using fresh 96-bit random IVs, 128-bit authentication tags, AAD context binding (`version | kind | roomId | keyId`), request/response correlation IDs, and 10-minute IV replay protection.
+  - When E2EE is enabled on a PC bridge, the bridge strictly rejects any unencrypted RPCs (including relay-initiated plaintext `/api/bridge-file` calls) and any unencrypted attachment downloads.
+  - New mobile/web clients sync the 256-bit key locally via an offline SVG QR code (`allinone-e2ee://v1?...`) or recovery key paste; key rotation on the Desktop App immediately revokes lost devices without affecting local chat history.
+- **Transport encryption (TLS)**: All production deployments must still terminate **HTTPS / WSS** (e.g., via Caddy or Nginx in `deploy/`) to protect authentication flows, metadata, and transport integrity.
 - **Account & Credential Storage**:
   - Account passwords are stored as salted `scrypt` hashes (`N=16384, r=8, p=1`) verified with `crypto.timingSafeEqual`.
   - Per-PC `deviceSecret` values are stored server-side only as salted SHA-256 hashes.

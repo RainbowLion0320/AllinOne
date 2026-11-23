@@ -44,6 +44,21 @@ export function formatServerHost(baseUrl) {
   }
 }
 
+function sanitizeE2eeKeysMap(rawMap) {
+  if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) return {}
+  const out = {}
+  let count = 0
+  for (const [kid, val] of Object.entries(rawMap)) {
+    if (count >= 16) break
+    const cleanKid = String(kid || '').trim().toLowerCase()
+    const cleanVal = String(val || '').trim()
+    if (!/^[0-9a-f]{16}$/.test(cleanKid) || !/^[A-Za-z0-9_-]{42,44}$/.test(cleanVal)) continue
+    out[cleanKid] = cleanVal
+    count += 1
+  }
+  return out
+}
+
 function sanitizeDevice(raw) {
   if (!raw || typeof raw !== 'object') return null
   const baseUrl = normalizeDeviceBaseUrl(raw.baseUrl)
@@ -77,6 +92,7 @@ function sanitizeDevice(raw) {
     lastHostname: String(raw.lastHostname || firstBridge?.hostname || '').trim().slice(0, 64),
     lastPlatform: String(raw.lastPlatform || firstBridge?.platform || '').trim().slice(0, 32),
     selectedBridgeId: String(raw.selectedBridgeId || firstBridge?.bridgeId || '').trim().slice(0, 64),
+    e2eeKeys: sanitizeE2eeKeysMap(raw.e2eeKeys),
     addedAt: Number.isFinite(raw.addedAt) ? raw.addedAt : now,
     lastUsedAt: Number.isFinite(raw.lastUsedAt) ? raw.lastUsedAt : now,
   }
@@ -182,6 +198,10 @@ export function upsertDevice(state, payload) {
       lastHostname: incoming.lastHostname || existing.lastHostname,
       lastPlatform: incoming.lastPlatform || existing.lastPlatform,
       selectedBridgeId: existing.selectedBridgeId || incoming.selectedBridgeId,
+      e2eeKeys: {
+        ...sanitizeE2eeKeysMap(existing.e2eeKeys),
+        ...sanitizeE2eeKeysMap(incoming.e2eeKeys),
+      },
       lastUsedAt: now,
     }
     const nextDevices = baseState.devices.slice()
@@ -308,6 +328,15 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
       changed = true
     }
   }
+  if (patch.e2eeKeys !== undefined) {
+    const merged = sanitizeE2eeKeysMap(patch.e2eeKeys)
+    const prevJson = JSON.stringify(cur.e2eeKeys || {})
+    const nextJson = JSON.stringify(merged)
+    if (nextJson !== prevJson) {
+      next.e2eeKeys = merged
+      changed = true
+    }
+  }
 
   if (!changed) return state
   const nextDevices = state.devices.slice()
@@ -320,6 +349,17 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
 
 export function renameDevice(state, deviceId, customName) {
   return updateDeviceMeta(state, deviceId, { customName })
+}
+
+export function upsertDeviceE2eeKey(state, deviceId, keyId, key) {
+  if (!state || !Array.isArray(state.devices) || !deviceId || !keyId || !key) return state
+  const target = state.devices.find((d) => d.id === deviceId)
+  if (!target) return state
+  const merged = {
+    ...(target.e2eeKeys || {}),
+    [String(keyId).trim().toLowerCase()]: String(key).trim(),
+  }
+  return updateDeviceMeta(state, deviceId, { e2eeKeys: merged })
 }
 
 export function removeDevice(state, deviceId) {

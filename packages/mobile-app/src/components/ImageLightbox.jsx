@@ -12,12 +12,15 @@ import {
   ZoomOut,
 } from 'lucide-react'
 import { buildDownloadUrl, getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
+import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 /**
  * Sleek inline image preview card rendered inside chat messages.
  * Always keeps <img> eagerly mounted (never display:none with loading="lazy") so mobile
  * browsers & Android WebView load images reliably every single time.
+ * Supports Zero-Knowledge E2EE image decryption (local PC images via encrypted RPC.FILE_READ
+ * and encrypted relay uploads via Web Crypto AES-256-GCM).
  */
 export function ChatImageCard({
   item,
@@ -28,10 +31,15 @@ export function ChatImageCard({
   const { bi } = useI18n()
   const [status, setStatus] = useState('loading') // 'loading' | 'loaded' | 'error'
   const [retryNonce, setRetryNonce] = useState(0)
+  const [e2eeSrc, setE2eeSrc] = useState('')
   const imgRef = useRef(null)
 
-  const baseSrc = resolveImageSrc(item, imageContext)
-  const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:')
+  const needsE2ee = needsE2eeMediaLoad(item, imageContext)
+  const directSrc = needsE2ee
+    ? ''
+    : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item, imageContext)
+  const baseSrc = needsE2ee ? e2eeSrc : directSrc
+  const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
 
@@ -39,8 +47,47 @@ export function ChatImageCard({
   const rawHint = item?.path || item?.raw || ''
 
   useEffect(() => {
+    if (!needsE2ee) {
+      setE2eeSrc('')
+      return
+    }
+    let cancelled = false
+    setStatus('loading')
+    loadE2eeImageUrl(item, imageContext, { forceRefresh: retryNonce > 0 })
+      .then((blobUrl) => {
+        if (cancelled) return
+        if (!blobUrl) {
+          setStatus('error')
+          return
+        }
+        setE2eeSrc(blobUrl)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setE2eeSrc('')
+          setStatus('error')
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    needsE2ee,
+    item?.path,
+    item?.url,
+    item?.raw,
+    item?.e2ee?.iv,
+    item?.e2ee?.kid,
+    imageContext?.bridgeId,
+    imageContext?.cwd,
+    imageContext?.e2eeKeyId,
+    imageContext?.e2eeActive,
+    retryNonce,
+  ])
+
+  useEffect(() => {
     if (!src) {
-      setStatus('error')
+      if (!needsE2ee) setStatus('error')
       return
     }
     const el = imgRef.current
@@ -49,9 +96,9 @@ export function ChatImageCard({
     } else {
       setStatus('loading')
     }
-  }, [src])
+  }, [src, needsE2ee])
 
-  if (!baseSrc) return null
+  if (!needsE2ee && !directSrc) return null
 
   return (
     <div
@@ -95,6 +142,7 @@ export function ChatImageCard({
                 <span className="max-w-[85%] truncate">{bi(`正在加载 ${label}...`, `Loading ${label}...`)}</span>
               </div>
             )}
+            {src && (
             <img
               ref={imgRef}
               src={src}
@@ -107,6 +155,7 @@ export function ChatImageCard({
                 status === 'loaded' ? 'opacity-100 group-hover:scale-[1.01]' : 'opacity-0'
               }`}
             />
+            )}
           </div>
 
           <div className="flex items-center justify-between gap-2 border-t border-slate-200/70 bg-white/95 px-3 py-1.5 text-[11px] text-slate-600 dark:border-slate-700/70 dark:bg-[#20232D]/95 dark:text-slate-300">
@@ -129,7 +178,10 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
   if (!Array.isArray(images) || images.length === 0) return null
 
   const resolvedList = images.map((item) => {
-    const src = resolveImageSrc(item, imageContext)
+    const needsE2ee = needsE2eeMediaLoad(item, imageContext)
+    const src = needsE2ee
+      ? ''
+      : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item, imageContext)
     const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
     return {
       item,
@@ -143,13 +195,18 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
     <div className={`mt-2.5 flex flex-wrap gap-2 ${compact ? 'justify-end' : ''}`}>
       {resolvedList.map((entry, idx) => (
         <ChatImageCard
-          key={`${entry.src || idx}-${idx}`}
+          key={`${entry.rawPath || entry.src || idx}-${idx}`}
           item={entry.item}
           imageContext={imageContext}
           compact={compact || images.length > 1}
-          onOpen={() =>
+          onOpen={(opened) =>
             imageContext?.onOpenImage?.({
-              images: resolvedList.map(({ src, label, rawPath }) => ({ src, label, rawPath })),
+              images: resolvedList.map((e, i) => ({
+                item: e.item,
+                src: i === idx && opened?.src ? opened.src : e.src,
+                label: e.label,
+                rawPath: e.rawPath,
+              })),
               index: idx,
             })
           }
@@ -160,19 +217,45 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
 }
 
 /**
- * Full-screen zoomable mobile image viewer (supports 1x / 2x / 3x zoom, pan, multi-image nav, & download).
+ * Full-screen zoomable mobile image viewer (supports 1x / 2x / 3x zoom, pan, multi-image nav, E2EE decryption & download).
  */
-export function ImageLightbox({ state, onClose }) {
+export function ImageLightbox({ state, imageContext = null, onClose }) {
   const { bi } = useI18n()
   const [index, setIndex] = useState(0)
   const [zoom, setZoom] = useState(1)
+  const [resolvedMap, setResolvedMap] = useState({})
 
   useEffect(() => {
     if (state) {
       setIndex(state.index || 0)
       setZoom(1)
+      setResolvedMap({})
     }
   }, [state])
+
+  const current = state?.images?.[index] || state?.images?.[0] || null
+  const currentNeedsE2ee = Boolean(
+    current &&
+      !current.src &&
+      current.item &&
+      imageContext &&
+      needsE2eeMediaLoad(current.item, imageContext),
+  )
+
+  useEffect(() => {
+    if (!currentNeedsE2ee || !current?.item || resolvedMap[index]) return
+    let cancelled = false
+    loadE2eeImageUrl(current.item, imageContext)
+      .then((blobUrl) => {
+        if (!cancelled && blobUrl) {
+          setResolvedMap((prev) => ({ ...prev, [index]: blobUrl }))
+        }
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [currentNeedsE2ee, current?.item, imageContext, index, resolvedMap])
 
   useEffect(() => {
     if (!state) return
@@ -190,11 +273,11 @@ export function ImageLightbox({ state, onClose }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [state, onClose])
 
-  if (!state || !Array.isArray(state.images) || state.images.length === 0) return null
+  if (!state || !Array.isArray(state.images) || state.images.length === 0 || !current) return null
 
-  const current = state.images[index] || state.images[0]
   const total = state.images.length
-  const downloadHref = buildDownloadUrl(current.src)
+  const activeSrc = resolvedMap[index] || current.src || ''
+  const downloadHref = buildDownloadUrl(activeSrc)
 
   const cycleZoom = () => {
     setZoom((z) => (z === 1 ? 2 : z === 2 ? 3 : 1))
@@ -262,20 +345,27 @@ export function ImageLightbox({ state, onClose }) {
           if (e.target === e.currentTarget) onClose()
         }}
       >
-        <img
-          src={current.src}
-          alt={current.label || 'preview'}
-          onClick={(e) => {
-            e.stopPropagation()
-            cycleZoom()
-          }}
-          style={{
-            width: zoom === 1 ? 'auto' : `${zoom * 100}%`,
-            maxWidth: zoom === 1 ? '100%' : 'none',
-            maxHeight: zoom === 1 ? '100%' : 'none',
-          }}
-          className="cursor-zoom-in rounded-lg object-contain shadow-2xl transition-all duration-150 select-none"
-        />
+        {activeSrc ? (
+          <img
+            src={activeSrc}
+            alt={current.label || 'preview'}
+            onClick={(e) => {
+              e.stopPropagation()
+              cycleZoom()
+            }}
+            style={{
+              width: zoom === 1 ? 'auto' : `${zoom * 100}%`,
+              maxWidth: zoom === 1 ? '100%' : 'none',
+              maxHeight: zoom === 1 ? '100%' : 'none',
+            }}
+            className="cursor-zoom-in rounded-lg object-contain shadow-2xl transition-all duration-150 select-none"
+          />
+        ) : (
+          <div className="flex flex-col items-center gap-2 text-xs text-white/70">
+            <Loader2 className="h-6 w-6 animate-spin text-[#4D6BFE]" />
+            <span>{bi('正在端到端解密图片...', 'Decrypting image end-to-end...')}</span>
+          </div>
+        )}
 
         {total > 1 && (
           <>

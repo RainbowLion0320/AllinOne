@@ -1,9 +1,22 @@
 import os from 'node:os'
 import WebSocket from 'ws'
+import {
+  E2EE_EVENT_MARKER,
+  E2EE_VERSION,
+  computeE2eeKeyId,
+  decryptJson,
+  encryptJson,
+  normalizeE2eeKey,
+} from './helpers/e2ee.js'
+
+const REPLAY_WINDOW_MS = 10 * 60 * 1000 // 10 minutes
+const MAX_SEEN_IVS = 4000
 
 /**
  * Resilient outbound WebSocket client connecting home PC (DSH plugin) -> Relay Server.
- * Uses `ws` library (same proven approach as dsh-wecom-bot) with heartbeat & exponential backoff.
+ * Supports optional Zero-Knowledge AES-256-GCM End-to-End Encryption (E2EE):
+ * when `e2eeKey` is provided, every RPC request/response and streaming event is
+ * end-to-end encrypted before touching the Relay Server, and unencrypted RPCs are rejected.
  */
 export class RelayBridgeLink {
   constructor({
@@ -12,6 +25,7 @@ export class RelayBridgeLink {
     roomId = '',
     bridgeId = 'home-pc',
     mode = 'dsh-plugin',
+    e2eeKey = '',
     log = console,
     onRpc,
     onState,
@@ -21,6 +35,16 @@ export class RelayBridgeLink {
     this.roomId = roomId
     this.bridgeId = bridgeId
     this.mode = mode
+    this.e2eeKey = normalizeE2eeKey(e2eeKey)
+    this.e2eeKeyId = ''
+    this.e2eeReady = this.e2eeKey
+      ? computeE2eeKeyId(this.e2eeKey).then((kid) => {
+          this.e2eeKeyId = kid
+          return kid
+        })
+      : Promise.resolve('')
+    this.seenReqIvs = new Map()
+    this._eventQueue = Promise.resolve()
     this.log = log
     this.onRpc = onRpc
     this.onState = onState
@@ -33,14 +57,33 @@ export class RelayBridgeLink {
     this.metaApps = []
   }
 
+  getAadRoomId() {
+    return String(this.roomId || 'owner').trim() || 'owner'
+  }
+
+  async sendBridgeMeta() {
+    if (this.e2eeKey && !this.e2eeKeyId) {
+      await this.e2eeReady
+    }
+    const meta = {
+      ...(this.metaApps.length > 0 ? { apps: this.metaApps } : {}),
+      e2ee: this.e2eeKey
+        ? { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId }
+        : { enabled: false },
+    }
+    this.send({ type: 'bridge.meta', meta })
+  }
+
   setAppsMeta(apps) {
     this.metaApps = apps
-    this.send({ type: 'bridge.meta', meta: { apps } })
+    void this.sendBridgeMeta()
   }
 
   start() {
     this.stopped = false
-    this.connect()
+    void this.e2eeReady.finally(() => {
+      if (!this.stopped) this.connect()
+    })
     return () => this.stop()
   }
 
@@ -76,6 +119,18 @@ export class RelayBridgeLink {
     return u.toString()
   }
 
+  pruneSeenIvs(now) {
+    if (this.seenReqIvs.size < MAX_SEEN_IVS) return
+    for (const [iv, seenAt] of this.seenReqIvs.entries()) {
+      if (now - seenAt > REPLAY_WINDOW_MS) this.seenReqIvs.delete(iv)
+    }
+    while (this.seenReqIvs.size >= MAX_SEEN_IVS) {
+      const oldest = this.seenReqIvs.keys().next().value
+      if (!oldest) break
+      this.seenReqIvs.delete(oldest)
+    }
+  }
+
   connect() {
     if (this.stopped) return
     this.emitState('connecting', this.relayUrl)
@@ -99,14 +154,14 @@ export class RelayBridgeLink {
 
     this.ws = ws
 
-    ws.on('open', () => {
+    ws.on('open', async () => {
       this.attempt = 0
       this.lastPongAt = Date.now()
-      this.log.info?.(`mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}"`)
+      this.log.info?.(
+        `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}"${this.e2eeKey ? ' (E2EE AES-256-GCM)' : ''}`,
+      )
       this.emitState('connected', this.relayUrl)
-      if (this.metaApps.length > 0) {
-        this.send({ type: 'bridge.meta', meta: { apps: this.metaApps } })
-      }
+      await this.sendBridgeMeta()
       this.startHeartbeat()
     })
 
@@ -125,6 +180,10 @@ export class RelayBridgeLink {
 
       if (msg.type === 'rpc.req') {
         const id = msg.id
+        if (this.e2eeKey) {
+          await this.handleEncryptedRpc(id, msg)
+          return
+        }
         try {
           const result = await this.onRpc(msg.method, msg.params || {})
           this.send({ type: 'rpc.res', id, ok: true, result })
@@ -163,6 +222,110 @@ export class RelayBridgeLink {
       this.log.warn?.(`mobile-hub: relay socket error: ${String(err?.message || err)}`)
       this.emitState('error', String(err?.message || err))
     })
+  }
+
+  async handleEncryptedRpc(id, msg) {
+    if (!this.e2eeKeyId) await this.e2eeReady
+    const aadRoom = this.getAadRoomId()
+
+    // Strictly reject unencrypted RPCs (including any relay-initiated plaintext calls)
+    if (!msg.e2ee) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_KEY_REQUIRED',
+          keyId: this.e2eeKeyId,
+          message: '该电脑已开启端到端加密，请先扫描电脑端二维码同步端到端密钥',
+        },
+      })
+      return
+    }
+
+    if (msg.e2ee.kid && msg.e2ee.kid !== this.e2eeKeyId) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_KEY_MISMATCH',
+          keyId: this.e2eeKeyId,
+          message: '端到端密钥不匹配，请重新扫描电脑端二维码同步最新密钥',
+        },
+      })
+      return
+    }
+
+    let decrypted
+    try {
+      decrypted = await decryptJson(this.e2eeKey, msg.e2ee, { kind: 'rpc.req', roomId: aadRoom })
+    } catch (err) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: err?.code || 'E2EE_DECRYPT_FAILED',
+          keyId: this.e2eeKeyId,
+          message: String(err?.message || '端到端解密失败'),
+        },
+      })
+      return
+    }
+
+    const now = Date.now()
+    const ivKey = String(msg.e2ee.iv || '')
+    this.pruneSeenIvs(now)
+    const prevSeen = this.seenReqIvs.get(ivKey)
+    if (prevSeen && now - prevSeen <= REPLAY_WINDOW_MS) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_REPLAY_DETECTED',
+          message: '检测到重复的加密请求，已拒绝执行',
+        },
+      })
+      return
+    }
+    if (typeof decrypted?.ts === 'number' && Math.abs(now - decrypted.ts) > REPLAY_WINDOW_MS) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_STALE_TIMESTAMP',
+          message: '加密请求时间偏差过大，请校准本机与手机系统时间后重试',
+        },
+      })
+      return
+    }
+    this.seenReqIvs.set(ivKey, now)
+
+    const cid = String(decrypted?.cid || '')
+    let innerRes
+    try {
+      const result = await this.onRpc(decrypted.method, decrypted.params || {})
+      innerRes = { ok: true, cid, result }
+    } catch (err) {
+      innerRes = {
+        ok: false,
+        cid,
+        error: {
+          code: err?.code || 'RPC_ERROR',
+          message: String(err?.message || err),
+        },
+      }
+    }
+
+    try {
+      const enc = await encryptJson(this.e2eeKey, innerRes, { kind: 'rpc.res', roomId: aadRoom })
+      this.send({ type: 'rpc.res', id, ok: true, e2ee: enc })
+    } catch (err) {
+      this.log.warn?.(`mobile-hub: failed encrypting rpc.res: ${String(err?.message || err)}`)
+    }
   }
 
   startHeartbeat() {
@@ -208,6 +371,21 @@ export class RelayBridgeLink {
   }
 
   pushEvent(event, payload) {
-    this.send({ type: 'event', event, payload })
+    if (!this.e2eeKey) {
+      this.send({ type: 'event', event, payload })
+      return
+    }
+    const aadRoom = this.getAadRoomId()
+    // Preserve strict FIFO ordering across async AES-GCM encryptions for streaming deltas
+    this._eventQueue = this._eventQueue
+      .then(async () => {
+        if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN) return
+        if (!this.e2eeKeyId) await this.e2eeReady
+        const enc = await encryptJson(this.e2eeKey, { event, payload }, { kind: 'event', roomId: aadRoom })
+        this.send({ type: 'event', event: E2EE_EVENT_MARKER, e2ee: enc })
+      })
+      .catch((err) => {
+        this.log.warn?.(`mobile-hub: failed encrypting event ${event}: ${String(err?.message || err)}`)
+      })
   }
 }

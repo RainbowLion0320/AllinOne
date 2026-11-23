@@ -174,6 +174,7 @@ export class RelayHub {
         mode: b.meta?.mode || 'dsh-plugin',
         ip: b.meta?.ip || '',
         apps: Array.isArray(b.meta?.apps) ? b.meta.apps : [],
+        e2ee: b.meta?.e2ee || null,
         connectedAt: b.connectedAt,
         lastSeen: b.lastSeen,
       })
@@ -258,6 +259,7 @@ export class RelayHub {
         platform: b.meta?.platform || 'unknown',
         mode: b.meta?.mode || 'dsh-plugin',
         apps: b.meta?.apps || [],
+        e2ee: b.meta?.e2ee || null,
         connectedAt: b.connectedAt,
         lastSeen: b.lastSeen,
       })
@@ -523,8 +525,24 @@ export class RelayHub {
       clearTimeout(pending.timer)
       this.pendingRpc.delete(msg.id)
       if (pending.resolve) {
-        if (msg.ok) pending.resolve(msg.result)
-        else pending.reject(new Error(msg.error?.message || 'RPC 执行失败'))
+        if (msg.e2ee) {
+          const err = new Error('该电脑已开启端到端加密，禁止中转服务器明文读取')
+          err.code = 'E2EE_KEY_REQUIRED'
+          pending.reject(err)
+        } else if (msg.ok) {
+          pending.resolve(msg.result)
+        } else {
+          const err = new Error(msg.error?.message || 'RPC 执行失败')
+          if (msg.error?.code) err.code = msg.error.code
+          pending.reject(err)
+        }
+      } else if (msg.e2ee) {
+        this.sendToClient(pending.clientId, {
+          type: 'rpc.res',
+          id: pending.clientReqId,
+          ok: true,
+          e2ee: msg.e2ee,
+        })
       } else {
         this.sendToClient(pending.clientId, {
           type: 'rpc.res',
@@ -538,7 +556,7 @@ export class RelayHub {
     }
 
     if (msg.type === 'event') {
-      this.broadcastEvent(roomId, bridgeId, msg.event, msg.payload)
+      this.broadcastEvent(roomId, bridgeId, msg.event, msg.payload, msg.e2ee || null)
     }
   }
 
@@ -600,16 +618,25 @@ export class RelayHub {
       this.globalStats.totalRpcs += 1
       const rStats = this.getOrCreateRoomStats(roomId)
       rStats.rpcCount += 1
-      rStats.lastRpcMethod = String(msg.method || '').slice(0, 48)
+      rStats.lastRpcMethod = msg.e2ee ? '__e2ee__' : String(msg.method || '').slice(0, 48)
       rStats.lastRpcAt = rpcNow
       rStats.lastActivityAt = rpcNow
 
-      this.sendRaw(bridge.ws, {
-        type: 'rpc.req',
-        id: relayReqId,
-        method: msg.method,
-        params: msg.params ?? {},
-      })
+      if (msg.e2ee) {
+        this.sendRaw(bridge.ws, {
+          type: 'rpc.req',
+          id: relayReqId,
+          method: '__e2ee__',
+          e2ee: msg.e2ee,
+        })
+      } else {
+        this.sendRaw(bridge.ws, {
+          type: 'rpc.req',
+          id: relayReqId,
+          method: msg.method,
+          params: msg.params ?? {},
+        })
+      }
     }
   }
 
@@ -664,7 +691,7 @@ export class RelayHub {
     })
   }
 
-  broadcastEvent(roomId, bridgeId, event, payload) {
+  broadcastEvent(roomId, bridgeId, event, payload, e2ee = null) {
     const rid = roomId || 'owner'
     const evState = this.getRoomEventState(rid)
     const now = Date.now()
@@ -673,13 +700,21 @@ export class RelayHub {
     const rStats = this.getOrCreateRoomStats(rid)
     rStats.eventCount += 1
     rStats.lastActivityAt = now
-    const envelope = {
-      seq: evState.seq,
-      ts: now,
-      bridgeId,
-      event,
-      payload,
-    }
+    const envelope = e2ee
+      ? {
+          seq: evState.seq,
+          ts: now,
+          bridgeId,
+          event: '__e2ee__',
+          e2ee,
+        }
+      : {
+          seq: evState.seq,
+          ts: now,
+          bridgeId,
+          event,
+          payload,
+        }
     evState.buffer.push(envelope)
     if (evState.buffer.length > EVENT_BUFFER_SIZE) {
       evState.buffer.shift()

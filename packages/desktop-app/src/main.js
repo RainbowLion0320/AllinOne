@@ -548,6 +548,18 @@ function registerIpc() {
     return bridgeManager.toggleEnabled()
   })
 
+  ipcMain.handle('bridge:e2ee-get', (_event, roomId) => {
+    return bridgeManager.getE2eeInfo(roomId)
+  })
+
+  ipcMain.handle('bridge:e2ee-set', async (_event, roomId, key) => {
+    return bridgeManager.setE2eeKey(roomId, key)
+  })
+
+  ipcMain.handle('bridge:e2ee-rotate', async (_event, roomId) => {
+    return bridgeManager.rotateE2eeKey(roomId)
+  })
+
   ipcMain.handle('desktop:toggle-auto-launch', () => {
     const next = !getAutoLaunchEnabled()
     setAutoLaunchEnabled(next)

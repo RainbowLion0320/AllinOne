@@ -1,3 +1,10 @@
+import {
+  E2EE_METHOD_MARKER,
+  bytesToBase64,
+  decryptJson,
+  encryptBytes,
+  encryptJson,
+} from '@allinone/shared/e2ee'
 import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
@@ -645,10 +652,13 @@ export async function revokeOtherAuthSessions(baseUrl, token, currentClientId = 
  * Mobile WebSocket RPC + Stream client with automatic reconnect & catch-up replay.
  */
 export class MobileRelayClient {
-  constructor({ baseUrl, token, bridgeId = '' }) {
+  constructor({ baseUrl, token, bridgeId = '', roomId = '', e2eeKeys = {} }) {
     this.baseUrl = normalizeBaseUrl(baseUrl)
     this.token = token
+    this.roomId = String(roomId || 'owner').trim() || 'owner'
     this.targetBridgeId = String(bridgeId || '').trim()
+    this.e2eeKeys = { ...(e2eeKeys || {}) }
+    this._inboundEventQueue = Promise.resolve()
     this.ws = null
     this.closed = false
     this.openedOnce = false
@@ -671,6 +681,32 @@ export class MobileRelayClient {
 
   setTargetBridgeId(bridgeId) {
     this.targetBridgeId = String(bridgeId || '').trim()
+  }
+
+  setE2eeKeys(keysMap) {
+    this.e2eeKeys = { ...(keysMap || {}) }
+  }
+
+  getBridgeE2eeContext(bridgeId = '') {
+    const cleanId = String(bridgeId || this.targetBridgeId || '').trim()
+    let bridge = null
+    if (cleanId) {
+      bridge = this.bridges.find((b) => b.bridgeId === cleanId) || null
+    }
+    if (!bridge) {
+      bridge = this.bridges.find((b) => b.online) || this.bridges[0] || null
+    }
+    if (!bridge?.e2ee?.enabled) {
+      return { enabled: false, ready: true, keyId: '', key: '' }
+    }
+    const keyId = String(bridge.e2ee.keyId || '').trim()
+    const key = keyId ? String(this.e2eeKeys[keyId] || '').trim() : ''
+    return {
+      enabled: true,
+      ready: Boolean(key),
+      keyId,
+      key,
+    }
   }
 
   updateToken(newToken) {
@@ -811,27 +847,84 @@ export class MobileRelayClient {
         if (!p) return
         clearTimeout(p.timer)
         this.pending.delete(msg.id)
+        if (msg.e2ee) {
+          const decryptKey = p.e2eeKey || (msg.e2ee.kid ? this.e2eeKeys[msg.e2ee.kid] : '')
+          if (!decryptKey) {
+            const err = new Error(L('缺少端到端解密密钥，请先扫码同步密钥', 'Missing E2EE key. Scan the QR code on your computer to sync.'))
+            err.code = 'E2EE_KEY_REQUIRED'
+            err.keyId = String(msg.e2ee.kid || '')
+            p.reject(err)
+            return
+          }
+          decryptJson(decryptKey, msg.e2ee, { kind: 'rpc.res', roomId: this.roomId })
+            .then((inner) => {
+              if (p.cid && inner?.cid && inner.cid !== p.cid) {
+                const err = new Error(L('端到端响应编号校验失败', 'E2EE response correlation mismatch'))
+                err.code = 'E2EE_CORRELATION_MISMATCH'
+                p.reject(err)
+                return
+              }
+              if (inner?.ok) p.resolve(inner.result)
+              else {
+                const err = new Error(inner?.error?.message || L('RPC 执行失败', 'RPC execution failed'))
+                if (inner?.error?.code) err.code = inner.error.code
+                p.reject(err)
+              }
+            })
+            .catch((err) => p.reject(err))
+          return
+        }
+        // If this request was sent over E2EE, reject any forged unencrypted success response
+        if (p.e2eeKey && msg.ok) {
+          const err = new Error(L('拒绝接收未加密的异常响应', 'Rejected unexpected plaintext response on E2EE channel'))
+          err.code = 'E2EE_UNEXPECTED_PLAINTEXT'
+          p.reject(err)
+          return
+        }
         if (msg.ok) p.resolve(msg.result)
-        else p.reject(new Error(msg.error?.message || L('RPC 执行失败', 'RPC execution failed')))
+        else {
+          const err = new Error(msg.error?.message || L('RPC 执行失败', 'RPC execution failed'))
+          if (msg.error?.code) err.code = msg.error.code
+          if (msg.error?.keyId) err.keyId = msg.error.keyId
+          p.reject(err)
+        }
         return
       }
 
       if (msg.type === 'event') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
-        if (msg.event === 'bridge.status') {
-          if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
-          if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
-          this.emitStatus()
-        } else if (msg.event === 'clients.status') {
-          if (Array.isArray(msg.payload?.clients)) {
-            this.liveClients = msg.payload.clients
-            this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
+        if (!msg.e2ee) {
+          if (msg.event === 'bridge.status') {
+            if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
+            if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
             this.emitStatus()
+          } else if (msg.event === 'clients.status') {
+            if (Array.isArray(msg.payload?.clients)) {
+              this.liveClients = msg.payload.clients
+              this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
+              this.emitStatus()
+            }
           }
+          for (const fn of this.eventListeners) {
+            try { fn(msg.event, msg.payload, msg) } catch {}
+          }
+          return
         }
-        for (const fn of this.eventListeners) {
-          try { fn(msg.event, msg.payload, msg) } catch {}
-        }
+        const key = msg.e2ee.kid ? this.e2eeKeys[msg.e2ee.kid] : ''
+        if (!key) return
+        // Decrypt & dispatch encrypted bridge events strictly in FIFO order
+        const roomIdSnap = this.roomId
+        const envSnap = msg.e2ee
+        const rawMsg = msg
+        this._inboundEventQueue = this._inboundEventQueue
+          .then(async () => {
+            const inner = await decryptJson(key, envSnap, { kind: 'event', roomId: roomIdSnap })
+            if (!inner?.event) return
+            for (const fn of this.eventListeners) {
+              try { fn(inner.event, inner.payload, rawMsg) } catch {}
+            }
+          })
+          .catch(() => {})
       }
     }
 
@@ -897,12 +990,67 @@ export class MobileRelayClient {
       const bridgeId = options.bridgeId !== undefined
         ? String(options.bridgeId || '').trim()
         : this.targetBridgeId
+      const e2eeCtx = this.getBridgeE2eeContext(bridgeId)
+      if (e2eeCtx.enabled && !e2eeCtx.ready) {
+        const err = new Error(
+          L(
+            '该电脑已开启端到端加密，请先扫描电脑端二维码同步密钥',
+            'This computer requires End-to-End Encryption. Scan its QR code to sync the key.',
+          ),
+        )
+        err.code = 'E2EE_KEY_REQUIRED'
+        err.keyId = e2eeCtx.keyId
+        reject(err)
+        return
+      }
+
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return
         this.pending.delete(id)
         reject(new Error(L('请求超时，请检查电脑端连接状态', 'Request timed out. Check your computer connection.')))
       }, timeoutMs)
-      this.pending.set(id, { resolve, reject, timer })
+
+      if (e2eeCtx.enabled) {
+        this.pending.set(id, {
+          resolve,
+          reject,
+          timer,
+          cid: id,
+          e2eeKey: e2eeCtx.key,
+          e2eeKeyId: e2eeCtx.keyId,
+        })
+        encryptJson(
+          e2eeCtx.key,
+          { method, params, cid: id, ts: Date.now() },
+          { kind: 'rpc.req', roomId: this.roomId },
+        )
+          .then((e2ee) => {
+            if (!this.pending.has(id)) return
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+              clearTimeout(timer)
+              this.pending.delete(id)
+              reject(new Error(L('尚未连接到中转服务器，正在重连...', 'Not connected to relay server, reconnecting...')))
+              return
+            }
+            this.ws.send(JSON.stringify({
+              type: 'rpc.req',
+              id,
+              method: E2EE_METHOD_MARKER,
+              e2ee,
+              timeoutMs,
+              ...(bridgeId ? { bridgeId } : {}),
+            }))
+          })
+          .catch((err) => {
+            if (!this.pending.has(id)) return
+            clearTimeout(timer)
+            this.pending.delete(id)
+            reject(err)
+          })
+        return
+      }
+
+      this.pending.set(id, { resolve, reject, timer, cid: id, e2eeKey: '', e2eeKeyId: '' })
       this.ws.send(JSON.stringify({
         type: 'rpc.req',
         id,
@@ -915,6 +1063,56 @@ export class MobileRelayClient {
   }
 
   async uploadFile(file) {
+    const e2eeCtx = this.getBridgeE2eeContext(this.targetBridgeId)
+    if (e2eeCtx.enabled && !e2eeCtx.ready) {
+      const err = new Error(
+        L(
+          '该电脑已开启端到端加密，请先扫描电脑端二维码同步密钥后再发送附件',
+          'Sync the E2EE key before uploading files to this encrypted computer.',
+        ),
+      )
+      err.code = 'E2EE_KEY_REQUIRED'
+      err.keyId = e2eeCtx.keyId
+      throw err
+    }
+
+    if (e2eeCtx.enabled) {
+      const rawBytes = new Uint8Array(await file.arrayBuffer())
+      const enc = await encryptBytes(e2eeCtx.key, rawBytes, {
+        kind: 'upload',
+        roomId: this.roomId,
+      })
+      const res = await fetch(`${this.baseUrl}/api/uploads`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          filename: 'encrypted.bin',
+          mimeType: 'application/octet-stream',
+          encrypted: true,
+          dataBase64: bytesToBase64(enc.ciphertext),
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || L('上传失败', 'Upload failed'))
+      }
+      const realMime = file.type || 'application/octet-stream'
+      const localPreviewUrl = realMime.startsWith('image/') && typeof URL?.createObjectURL === 'function'
+        ? URL.createObjectURL(file)
+        : ''
+      return {
+        ...data.upload,
+        filename: file.name,
+        mimeType: realMime,
+        size: file.size,
+        e2ee: { v: enc.v, kid: enc.kid, iv: enc.iv },
+        ...(localPreviewUrl ? { localPreviewUrl } : {}),
+      }
+    }
+
     const dataBase64 = await new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(String(reader.result || ''))

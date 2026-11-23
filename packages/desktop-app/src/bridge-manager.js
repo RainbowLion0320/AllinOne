@@ -10,6 +10,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   appendFileSync,
@@ -40,6 +41,35 @@ function readJsonSafe(filePath) {
   }
 }
 
+function normalizeDesktopE2eeKey(raw) {
+  const clean = String(raw || '').trim().replace(/\s+/g, '')
+  if (!clean || !/^[A-Za-z0-9+/_=-]+$/.test(clean)) return ''
+  try {
+    const std = clean.replace(/-/g, '+').replace(/_/g, '/')
+    const pad = (4 - (std.length % 4)) % 4
+    const buf = Buffer.from(`${std}${'='.repeat(pad)}`, 'base64')
+    if (buf.length !== 32) return ''
+    return buf.toString('base64url')
+  } catch {
+    return ''
+  }
+}
+
+function generateDesktopE2eeKey() {
+  return randomBytes(32).toString('base64url')
+}
+
+function computeDesktopE2eeKeyId(rawKey) {
+  const key = normalizeDesktopE2eeKey(rawKey)
+  if (!key) return ''
+  const rawBytes = Buffer.from(key, 'base64url')
+  return createHash('sha256')
+    .update('allinone-e2ee-v1-id:')
+    .update(rawBytes)
+    .digest('hex')
+    .slice(0, 16)
+}
+
 export function saveConfigSecure(filePath, data, secretStore = null) {
   const payload = { ...data }
   if (secretStore && payload.bridgeSecret) {
@@ -51,6 +81,15 @@ export function saveConfigSecure(filePath, data, secretStore = null) {
       }
     } catch {}
   }
+  if (secretStore && payload.e2eeKey) {
+    try {
+      const enc = secretStore.encrypt(String(payload.e2eeKey))
+      if (enc) {
+        payload.e2eeKeyEnc = enc
+        delete payload.e2eeKey
+      }
+    } catch {}
+  }
   writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8')
   try { chmodSync(filePath, 0o600) } catch {}
 }
@@ -58,23 +97,35 @@ export function saveConfigSecure(filePath, data, secretStore = null) {
 export function loadConfigDecrypted(filePath, secretStore = null) {
   const raw = readJsonSafe(filePath)
   if (!raw) return null
-  if (raw.bridgeSecretEnc && !raw.bridgeSecret && secretStore) {
+  const out = { ...raw }
+  let shouldMigrate = false
+  if (out.bridgeSecretEnc && !out.bridgeSecret && secretStore) {
     try {
-      const dec = secretStore.decrypt(raw.bridgeSecretEnc)
-      if (dec) {
-        return { ...raw, bridgeSecret: dec }
-      }
+      const dec = secretStore.decrypt(out.bridgeSecretEnc)
+      if (!dec) return null
+      out.bridgeSecret = dec
     } catch {
       return null
     }
+  } else if (out.bridgeSecret && !out.bridgeSecretEnc && secretStore) {
+    shouldMigrate = true
   }
-  // Auto-migrate legacy plaintext bridgeSecret on disk to OS keychain / DPAPI encryption
-  if (raw.bridgeSecret && !raw.bridgeSecretEnc && secretStore) {
+  if (out.e2eeKeyEnc && !out.e2eeKey && secretStore) {
     try {
-      saveConfigSecure(filePath, raw, secretStore)
+      const dec = secretStore.decrypt(out.e2eeKeyEnc)
+      if (dec) out.e2eeKey = normalizeDesktopE2eeKey(dec)
+    } catch {}
+  } else if (out.e2eeKey && !out.e2eeKeyEnc && secretStore) {
+    out.e2eeKey = normalizeDesktopE2eeKey(out.e2eeKey)
+    if (out.e2eeKey) shouldMigrate = true
+  }
+  // Auto-migrate legacy plaintext credentials on disk to OS keychain / DPAPI encryption
+  if (shouldMigrate) {
+    try {
+      saveConfigSecure(filePath, out, secretStore)
     } catch {}
   }
-  return raw
+  return out
 }
 
 function resolveBridgeScriptPath(isPackaged) {
@@ -166,6 +217,7 @@ export class DesktopBridgeManager extends EventEmitter {
       bridgeId: this.deviceMeta?.bridgeId || '',
       username: this.deviceMeta?.username || this.activeAccount?.username || '',
       serverUrl: this.deviceMeta?.serverUrl || this.activeAccount?.baseUrl || '',
+      e2eeKeyId: this.deviceMeta?.e2eeKeyId || '',
       appsSummary: this.appsSummary,
       autofixText: this.autofixText,
       error: this.error,
@@ -282,6 +334,10 @@ export class DesktopBridgeManager extends EventEmitter {
             label: check.data?.label || cfg.label || os.hostname() || 'My-PC',
             username: check.data?.username || cfg.username || username,
           }
+          if (!normalizeDesktopE2eeKey(readyCfg.e2eeKey)) {
+            readyCfg.e2eeKey = generateDesktopE2eeKey()
+            saveConfigSecure(this.configPath, readyCfg, this.secretStore)
+          }
         }
       }
 
@@ -298,6 +354,7 @@ export class DesktopBridgeManager extends EventEmitter {
           deviceId: bound.deviceId,
           bridgeId: bound.bridgeId,
           bridgeSecret: bound.deviceSecret,
+          e2eeKey: generateDesktopE2eeKey(),
           label: bound.label || os.hostname() || 'My-PC',
           createdAt: Date.now(),
         }
@@ -312,6 +369,7 @@ export class DesktopBridgeManager extends EventEmitter {
         roomId: readyCfg.roomId,
         username: readyCfg.username || username,
         serverUrl: readyCfg.serverUrl,
+        e2eeKeyId: computeDesktopE2eeKeyId(readyCfg.e2eeKey),
       }
 
       await this.spawnBridgeProcess(readyCfg)
@@ -335,12 +393,17 @@ export class DesktopBridgeManager extends EventEmitter {
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId?.startsWith('usr_') || !cfg.bridgeSecret || !cfg.serverUrl) {
       return this.getStatus()
     }
+    if (!normalizeDesktopE2eeKey(cfg.e2eeKey)) {
+      cfg.e2eeKey = generateDesktopE2eeKey()
+      saveConfigSecure(this.configPath, cfg, this.secretStore)
+    }
     this.deviceMeta = {
       label: cfg.label || os.hostname() || 'My-PC',
       bridgeId: cfg.bridgeId || cfg.label || os.hostname() || 'My-PC',
       roomId: cfg.roomId,
       username: cfg.username || '',
       serverUrl: normalizeBaseUrl(cfg.serverUrl),
+      e2eeKeyId: computeDesktopE2eeKeyId(cfg.e2eeKey),
     }
     try {
       await this.spawnBridgeProcess(cfg)
@@ -386,6 +449,7 @@ export class DesktopBridgeManager extends EventEmitter {
           ALLINONE_HOME: this.stateDir,
           ALLINONE_PC_NAME: label,
           ...(cfg.bridgeSecret ? { ALLINONE_BRIDGE_SECRET: cfg.bridgeSecret } : {}),
+          ...(cfg.e2eeKey ? { ALLINONE_E2EE_KEY: cfg.e2eeKey } : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -528,6 +592,76 @@ export class DesktopBridgeManager extends EventEmitter {
       return this.syncAccount(this.activeAccount)
     }
     return this.startFromSavedConfigIfPresent()
+  }
+
+  getE2eeInfo(expectedRoomId = '') {
+    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
+    if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
+      return { enabled: false, key: '', keyId: '', roomId: '' }
+    }
+    if (expectedRoomId && cfg.roomId !== expectedRoomId) {
+      return { enabled: false, key: '', keyId: '', roomId: cfg.roomId }
+    }
+    let key = normalizeDesktopE2eeKey(cfg.e2eeKey)
+    if (!key) {
+      key = generateDesktopE2eeKey()
+      cfg.e2eeKey = key
+      saveConfigSecure(this.configPath, cfg, this.secretStore)
+    }
+    const keyId = computeDesktopE2eeKeyId(key)
+    if (this.deviceMeta && this.deviceMeta.roomId === cfg.roomId) {
+      this.deviceMeta.e2eeKeyId = keyId
+    }
+    return {
+      enabled: true,
+      key,
+      keyId,
+      roomId: cfg.roomId,
+      bridgeId: cfg.bridgeId || this.deviceMeta?.bridgeId || '',
+    }
+  }
+
+  async setE2eeKey(expectedRoomId = '', rawKey = '') {
+    const normalized = normalizeDesktopE2eeKey(rawKey)
+    if (!normalized) {
+      throw new Error('无效的端到端密钥格式（应为 43 位 Base64URL 密钥）')
+    }
+    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
+    if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
+      throw new Error('本机尚未绑定账号，请先登录')
+    }
+    if (expectedRoomId && cfg.roomId !== expectedRoomId) {
+      throw new Error('当前登录账号与本机桥接账号不一致')
+    }
+    cfg.e2eeKey = normalized
+    saveConfigSecure(this.configPath, cfg, this.secretStore)
+    const keyId = computeDesktopE2eeKeyId(normalized)
+    this.deviceMeta = {
+      ...(this.deviceMeta || {}),
+      label: cfg.label || os.hostname() || 'My-PC',
+      bridgeId: cfg.bridgeId || cfg.label || os.hostname() || 'My-PC',
+      roomId: cfg.roomId,
+      username: cfg.username || '',
+      serverUrl: normalizeBaseUrl(cfg.serverUrl),
+      e2eeKeyId: keyId,
+    }
+    this.appendLog(`Updated local E2EE key (fingerprint=${keyId}); restarting embedded bridge...`)
+    if (this.enabled && !this.disposed) {
+      await this.spawnBridgeProcess(cfg)
+    } else {
+      this.emitStatus()
+    }
+    return {
+      ok: true,
+      key: normalized,
+      keyId,
+      roomId: cfg.roomId,
+      bridgeId: cfg.bridgeId || '',
+    }
+  }
+
+  async rotateE2eeKey(expectedRoomId = '') {
+    return this.setE2eeKey(expectedRoomId, generateDesktopE2eeKey())
   }
 
   async dispose() {

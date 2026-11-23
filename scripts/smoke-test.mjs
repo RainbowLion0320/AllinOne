@@ -27,6 +27,20 @@ import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-m
 import { normalizeCodexTurns, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
 import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
 import {
+  E2EE_METHOD_MARKER,
+  bytesToBase64,
+  computeE2eeKeyId,
+  decryptBytes,
+  decryptJson,
+  encodeE2eeQrUri,
+  encryptBytes,
+  encryptJson,
+  formatE2eeFingerprint,
+  generateE2eeKey,
+  parseE2eeQrInput,
+} from '../packages/shared/src/e2ee.js'
+import { renderQrSvg as renderSharedQrSvg } from '../packages/shared/src/qr-svg.js'
+import {
   DEVICES_STORAGE_KEY,
   LEGACY_AUTH_STORAGE_KEY,
   getActiveDevice,
@@ -2904,7 +2918,308 @@ async function main() {
       assert.equal(tailMsgs[1].text, 'Round 460 done')
       assert.equal(tailMsgs[1].toolCount, 1)
     }
-    console.log('[smoke] 19/19 DeepSeek Harness IPC, auto-installer & Codex autonomous/giant rollout resilience OK')
+    console.log('[smoke] 19/20 DeepSeek Harness IPC, auto-installer & Codex autonomous/giant rollout resilience OK')
+
+    // 20. Zero-Knowledge End-to-End Encryption (AES-256-GCM, Random Key + QR Sync, Replay Defense, Blind Relay & Encrypted Uploads)
+    {
+      // 20a. Key generation, fingerprint, QR URI round-trip & AAD/tamper integrity
+      const e2eeKey = generateE2eeKey()
+      const e2eeKeyId = await computeE2eeKeyId(e2eeKey)
+      assert.match(e2eeKeyId, /^[0-9a-f]{16}$/)
+      assert.match(formatE2eeFingerprint(e2eeKeyId), /^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/)
+
+      const qrUri = encodeE2eeQrUri({ key: e2eeKey, roomId: aliceReg.roomId })
+      assert.ok(qrUri.startsWith('allinone-e2ee://v1?'))
+      const parsedUri = parseE2eeQrInput(qrUri)
+      assert.equal(parsedUri.key, e2eeKey)
+      assert.equal(parsedUri.roomId, aliceReg.roomId)
+      const parsedRaw = parseE2eeQrInput(e2eeKey)
+      assert.equal(parsedRaw.key, e2eeKey)
+      const sharedQrSvg = renderSharedQrSvg(qrUri)
+      assert.ok(sharedQrSvg.includes('<svg xmlns="http://www.w3.org/2000/svg"'))
+
+      const sampleEnv = await encryptJson(e2eeKey, { secret: 'hello-e2ee' }, { kind: 'rpc.req', roomId: aliceReg.roomId })
+      const decOk = await decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.req', roomId: aliceReg.roomId })
+      assert.equal(decOk.secret, 'hello-e2ee')
+      // Wrong AAD kind or roomId must fail GCM authentication
+      await assert.rejects(
+        () => decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.res', roomId: aliceReg.roomId }),
+        /解密失败/,
+      )
+      await assert.rejects(
+        () => decryptJson(e2eeKey, sampleEnv, { kind: 'rpc.req', roomId: 'usr_other_room' }),
+        /解密失败/,
+      )
+      // 1-char tamper in ciphertext must fail GCM authentication
+      const tamperedCt = (sampleEnv.ct[0] === 'A' ? 'B' : 'A') + sampleEnv.ct.slice(1)
+      await assert.rejects(
+        () => decryptJson(e2eeKey, { ...sampleEnv, ct: tamperedCt }, { kind: 'rpc.req', roomId: aliceReg.roomId }),
+        /解密失败/,
+      )
+
+      // 20b. Desktop safeStorage config encryption for e2eeKey
+      const mockSafeStore = {
+        encrypt: (plain) => Buffer.from(`ENC:${plain}`, 'utf8').toString('base64'),
+        decrypt: (b64) => {
+          const s = Buffer.from(b64, 'base64').toString('utf8')
+          return s.startsWith('ENC:') ? s.slice(4) : ''
+        },
+      }
+      const secCfgPath = join(tmpDir, 'desktop-e2ee-config.json')
+      saveConfigSecure(
+        secCfgPath,
+        { mode: 'account', roomId: aliceReg.roomId, bridgeSecret: 'dv_secret_123', e2eeKey },
+        mockSafeStore,
+      )
+      const rawDiskCfg = readFileSync(secCfgPath, 'utf8')
+      assert.equal(rawDiskCfg.includes(e2eeKey), false, 'Desktop config.json must NOT store plaintext e2eeKey when safeStorage is active')
+      assert.equal(rawDiskCfg.includes('dv_secret_123'), false)
+      const loadedCfg = loadConfigDecrypted(secCfgPath, mockSafeStore)
+      assert.equal(loadedCfg.e2eeKey, e2eeKey)
+      assert.equal(loadedCfg.bridgeSecret, 'dv_secret_123')
+
+      // 20c. Live E2EE PC Bridge connected to Relay Server (blind relay verification!)
+      const e2eeDevice = await (await fetch(`${httpBase}/api/account/device-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'alice',
+          password: alicePass,
+          label: 'Alice-E2EE-PC',
+          hostname: 'ALICE-E2EE',
+          platform: 'darwin',
+          bridgeId: 'alice-e2ee-pc',
+        }),
+      })).json()
+      assert.equal(e2eeDevice.ok, true)
+
+      const e2eeBridge = startStandaloneBridge({
+        relayUrl: wsBridgeUrl,
+        secret: e2eeDevice.deviceSecret,
+        roomId: e2eeDevice.roomId,
+        bridgeId: e2eeDevice.bridgeId,
+        e2eeKey,
+        inboundDir: join(tmpDir, 'e2ee-inbound'),
+        quiet: true,
+      })
+
+      let e2eeWs = null
+      try {
+        for (let i = 0; i < 50; i++) {
+          const list = relay.hub.getBridgeList(e2eeDevice.roomId)
+          const found = list.find((b) => b.bridgeId === e2eeDevice.bridgeId && b.e2ee?.enabled)
+          if (found) break
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        const e2eeMeta = relay.hub.getBridgeList(e2eeDevice.roomId).find((b) => b.bridgeId === e2eeDevice.bridgeId)
+        assert.ok(e2eeMeta?.e2ee?.enabled, 'Bridge metadata must advertise E2EE enabled')
+        assert.equal(e2eeMeta.e2ee.keyId, e2eeKeyId)
+        assert.equal(JSON.stringify(e2eeMeta).includes(e2eeKey), false, 'Relay must NEVER receive raw e2eeKey')
+
+        // Relay-initiated plaintext /api/bridge-file must be strictly rejected with 403 by the E2EE bridge!
+        const relayPlainImg = await fetch(
+          `${httpBase}/api/bridge-file?path=${encodeURIComponent('packages/mobile-app/public/icon-192.png')}&cwd=${encodeURIComponent(process.cwd())}&bridgeId=${encodeURIComponent(e2eeDevice.bridgeId)}&token=${encodeURIComponent(aliceLogin.token)}`,
+        )
+        assert.equal(relayPlainImg.status, 403, 'E2EE bridge must reject relay plaintext /api/bridge-file with 403')
+
+        // Open client WS and test: plaintext rejection, wrong-key rejection, encrypted FILE_READ, replay block, encrypted event
+        const capturedWireFrames = []
+        e2eeWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(aliceLogin.token)}`)
+        const pendingMap = new Map()
+        const rawEvents = []
+        await new Promise((resolve, reject) => {
+          e2eeWs.on('message', (raw) => {
+            const text = String(raw)
+            capturedWireFrames.push(text)
+            const msg = JSON.parse(text)
+            if (msg.type === 'hello') {
+              resolve()
+              return
+            }
+            if (msg.type === 'rpc.res') {
+              const p = pendingMap.get(msg.id)
+              if (p) {
+                pendingMap.delete(msg.id)
+                p.resolve(msg)
+              }
+            } else if (msg.type === 'event') {
+              rawEvents.push(msg)
+            }
+          })
+          e2eeWs.on('error', reject)
+        })
+
+        const sendWsFrame = (frame) =>
+          new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`WS timeout ${frame.id}`)), 15_000)
+            pendingMap.set(frame.id, {
+              resolve: (m) => {
+                clearTimeout(timer)
+                resolve(m)
+              },
+            })
+            e2eeWs.send(JSON.stringify(frame))
+          })
+
+        // 1) Plaintext RPC rejected with E2EE_KEY_REQUIRED
+        const plainTry = await sendWsFrame({
+          type: 'rpc.req',
+          id: 'e2ee-plain-1',
+          bridgeId: e2eeDevice.bridgeId,
+          method: RPC.APPS_STATUS,
+          params: {},
+        })
+        assert.equal(plainTry.ok, false)
+        assert.equal(plainTry.error?.code, 'E2EE_KEY_REQUIRED')
+
+        // 2) Wrong key rejected with E2EE_KEY_MISMATCH
+        const wrongKey = generateE2eeKey()
+        const wrongEnv = await encryptJson(
+          wrongKey,
+          { method: RPC.APPS_STATUS, params: {}, cid: 'e2ee-wrong-1', ts: Date.now() },
+          { kind: 'rpc.req', roomId: e2eeDevice.roomId },
+        )
+        const wrongTry = await sendWsFrame({
+          type: 'rpc.req',
+          id: 'e2ee-wrong-1',
+          bridgeId: e2eeDevice.bridgeId,
+          method: E2EE_METHOD_MARKER,
+          e2ee: wrongEnv,
+        })
+        assert.equal(wrongTry.ok, false)
+        assert.equal(wrongTry.error?.code, 'E2EE_KEY_MISMATCH')
+
+        // 3) Valid E2EE encrypted RPC.FILE_READ (verifies image bytes & path stay opaque on relay!)
+        const fileReqEnv = await encryptJson(
+          e2eeKey,
+          {
+            method: RPC.FILE_READ,
+            params: { path: 'packages/mobile-app/public/icon-192.png', cwd: process.cwd() },
+            cid: 'e2ee-file-1',
+            ts: Date.now(),
+          },
+          { kind: 'rpc.req', roomId: e2eeDevice.roomId },
+        )
+        const encFileRes = await sendWsFrame({
+          type: 'rpc.req',
+          id: 'e2ee-file-1',
+          bridgeId: e2eeDevice.bridgeId,
+          method: E2EE_METHOD_MARKER,
+          e2ee: fileReqEnv,
+        })
+        assert.equal(encFileRes.ok, true)
+        assert.ok(encFileRes.e2ee?.ct, 'RPC response must be an E2EE ciphertext envelope')
+        assert.equal(encFileRes.result, undefined, 'Encrypted RPC response must not include plaintext result')
+        assert.equal(JSON.stringify(encFileRes).includes('image/png'), false, 'Ciphertext must not expose mimeType')
+        const decFileRes = await decryptJson(e2eeKey, encFileRes.e2ee, {
+          kind: 'rpc.res',
+          roomId: e2eeDevice.roomId,
+        })
+        assert.equal(decFileRes.ok, true)
+        assert.equal(decFileRes.cid, 'e2ee-file-1')
+        assert.equal(decFileRes.result.mimeType, 'image/png')
+        assert.ok(Buffer.from(decFileRes.result.dataBase64, 'base64').subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])))
+
+        // Verify relay room stats NEVER recorded plaintext RPC method name
+        assert.equal(relay.hub.getRoomStats(e2eeDevice.roomId).lastRpcMethod, E2EE_METHOD_MARKER)
+
+        // 4) Replaying exact same encrypted rpc.req envelope must be rejected by bridge
+        const replayRes = await sendWsFrame({
+          type: 'rpc.req',
+          id: 'e2ee-replay-1',
+          bridgeId: e2eeDevice.bridgeId,
+          method: E2EE_METHOD_MARKER,
+          e2ee: fileReqEnv,
+        })
+        assert.equal(replayRes.ok, false)
+        assert.equal(replayRes.error?.code, 'E2EE_REPLAY_DETECTED', 'Replayed ciphertext IV must be rejected')
+
+        // 5) Encrypted streaming event -> Relay buffer contains ONLY ciphertext, client decrypts secret token!
+        const secretToken = 'ZERO_KNOWLEDGE_SECRET_DELTA_987654'
+        e2eeBridge.link.pushEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:s1', delta: secretToken })
+        for (let i = 0; i < 30; i++) {
+          if (rawEvents.some((e) => e.e2ee?.ct)) break
+          await new Promise((r) => setTimeout(r, 50))
+        }
+        const encEvent = rawEvents.find((e) => e.e2ee?.ct)
+        assert.ok(encEvent, 'Client must receive E2EE-wrapped streaming event')
+        assert.equal(encEvent.event, '__e2ee__')
+        assert.equal(
+          JSON.stringify(relay.hub.getRoomEventState(e2eeDevice.roomId).buffer).includes(secretToken),
+          false,
+          'Relay event catch-up buffer must NEVER contain plaintext streaming tokens',
+        )
+        const decEvent = await decryptJson(e2eeKey, encEvent.e2ee, {
+          kind: 'event',
+          roomId: e2eeDevice.roomId,
+        })
+        assert.equal(decEvent.event, EVENTS.STREAM_DELTA)
+        assert.equal(decEvent.payload.delta, secretToken)
+
+        // 6) Encrypted Attachment Upload -> relay disk holds ONLY ciphertext & generic metadata, bridge decrypts cleanly!
+        const secretFileText = 'TOP_SECRET_ATTACHMENT_CONTENT_ALPHA_2026'
+        const encUpload = await encryptBytes(e2eeKey, Buffer.from(secretFileText, 'utf8'), {
+          kind: 'upload',
+          roomId: e2eeDevice.roomId,
+        })
+        const upRes = await (await fetch(`${httpBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceLogin.token}`,
+          },
+          body: JSON.stringify({
+            filename: 'secret-note.txt',
+            mimeType: 'text/plain',
+            encrypted: true,
+            dataBase64: bytesToBase64(encUpload.ciphertext),
+          }),
+        })).json()
+        assert.equal(upRes.ok, true)
+        assert.equal(upRes.upload.filename, 'encrypted.bin', 'Relay must strip original filename for encrypted uploads')
+        assert.equal(upRes.upload.mimeType, 'application/octet-stream')
+        const relayBinDisk = readFileSync(join(tmpDir, 'uploads', `${upRes.upload.id}.bin`))
+        const relayMetaDisk = readFileSync(join(tmpDir, 'uploads', `${upRes.upload.id}.json`), 'utf8')
+        assert.equal(relayBinDisk.toString('utf8').includes(secretFileText), false, 'Relay disk .bin must hold ciphertext only')
+        assert.equal(relayMetaDisk.includes('secret-note.txt'), false, 'Relay disk .json must not store original filename')
+
+        const materialized = await e2eeBridge.orchestrator.materializeAttachments([
+          {
+            id: upRes.upload.id,
+            url: upRes.upload.url,
+            filename: 'secret-note.txt',
+            mimeType: 'text/plain',
+            e2ee: { v: encUpload.v, kid: encUpload.kid, iv: encUpload.iv },
+          },
+        ])
+        assert.equal(materialized.length, 1)
+        assert.equal(readFileSync(materialized[0].localPath, 'utf8'), secretFileText)
+        assert.ok(materialized[0].localPath.endsWith('secret-note.txt'))
+
+        // Unencrypted attachment missing `att.e2ee` must be rejected BEFORE download by E2EE bridge
+        const plainUpRes = await (await fetch(`${httpBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${aliceLogin.token}`,
+          },
+          body: JSON.stringify({
+            filename: 'plain.txt',
+            mimeType: 'text/plain',
+            dataBase64: Buffer.from('unencrypted-data', 'utf8').toString('base64'),
+          }),
+        })).json()
+        assert.equal(plainUpRes.ok, true)
+        const rejectedPlainAtt = await e2eeBridge.orchestrator.materializeAttachments([
+          { id: plainUpRes.upload.id, url: plainUpRes.upload.url, filename: 'plain.txt', mimeType: 'text/plain' },
+        ])
+        assert.equal(rejectedPlainAtt.length, 0)
+      } finally {
+        if (e2eeWs) try { e2eeWs.close() } catch {}
+        await e2eeBridge.stop()
+      }
+    }
+    console.log('[smoke] 20/20 Zero-Knowledge E2EE (AES-256-GCM, QR sync, replay defense, blind relay & encrypted uploads) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

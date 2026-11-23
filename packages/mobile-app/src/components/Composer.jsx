@@ -130,7 +130,7 @@ export function Composer({
           <div className="mb-2 flex flex-wrap gap-2 px-1">
             {attachments.map((att) => {
               const isImg = String(att.mimeType || '').startsWith('image/')
-              const thumbSrc = isImg ? resolveImageSrc({ url: att.url }, imageContext) : ''
+              const thumbSrc = isImg ? (att.localPreviewUrl || resolveImageSrc({ url: att.url }, imageContext)) : ''
               return isImg && thumbSrc ? (
                 <div
                   key={att.id}

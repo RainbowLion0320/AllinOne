@@ -54,16 +54,16 @@ function renderPlainTokens(segment, imageContext, keyRef) {
     if (token.startsWith('`')) {
       const inner = token.slice(1, -1)
       if (imageContext && isImageTarget(inner)) {
-        const src = resolveImageSrc(inner, imageContext)
+        const src = imageContext.e2eeActive ? '' : resolveImageSrc(inner, imageContext)
         const label = getImageLabel(inner)
         parts.push(
           <button
             key={`imgc-${keyRef.n++}`}
             type="button"
             onClick={() =>
-              src &&
+              (src || imageContext.e2eeActive) &&
               imageContext.onOpenImage?.({
-                images: [{ src, label, rawPath: inner }],
+                images: [{ item: { path: inner, name: label }, src, label, rawPath: inner }],
                 index: 0,
               })
             }
@@ -90,16 +90,16 @@ function renderPlainTokens(segment, imageContext, keyRef) {
         </strong>,
       )
     } else if (imageContext && isImageTarget(token)) {
-      const src = resolveImageSrc(token, imageContext)
+      const src = imageContext.e2eeActive ? '' : resolveImageSrc(token, imageContext)
       const label = getImageLabel(token)
       parts.push(
         <button
           key={`imgp-${keyRef.n++}`}
           type="button"
           onClick={() =>
-            src &&
+            (src || imageContext.e2eeActive) &&
             imageContext.onOpenImage?.({
-              images: [{ src, label, rawPath: token }],
+              images: [{ item: { path: token, name: label }, src, label, rawPath: token }],
               index: 0,
             })
           }
@@ -139,16 +139,18 @@ function renderInline(text, imageContext) {
 
     const isImg = item.isImage || isImageTarget(item.dest)
     if (isImg && imageContext) {
-      const src = resolveImageSrc(item.dest, imageContext)
+      const isRemoteHttp = /^https?:\/\//i.test(item.dest)
+      const useE2ee = Boolean(imageContext.e2eeActive && !isRemoteHttp)
+      const src = useE2ee ? '' : resolveImageSrc(item.dest, imageContext)
       const label = item.label || getImageLabel(item.dest)
       parts.push(
         <button
           key={`imgl-${keyRef.n++}`}
           type="button"
           onClick={() =>
-            src &&
+            (src || useE2ee) &&
             imageContext.onOpenImage?.({
-              images: [{ src, label, rawPath: item.dest }],
+              images: [{ item: { path: item.dest, name: label }, src, label, rawPath: item.dest }],
               index: 0,
             })
           }

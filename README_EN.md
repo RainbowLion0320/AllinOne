@@ -109,6 +109,7 @@ SMTP_FROM=All in One <your-email@gmail.com>
 | **DeepSeek Harness** | Native Cordis plugin (`dsh-mobile-hub`) | Read/write & model switching as plugin; read-only history standalone | Plugin setup in Developer Guide below |
 
 - **Multi-Device Control**: Sign in with the same account on phones and desktops to operate any of your online computers.
+- **Zero-Knowledge End-to-End Encryption (E2EE)**: Each desktop bridge automatically generates a random 256-bit key (stored in OS Keychain / DPAPI). All prompts, streaming replies, attachments, and local image previews are encrypted with `AES-256-GCM` end-to-end so the relay server only forwards opaque ciphertext; sync new phones via offline QR scan.
 - **Single-Use Invites**: Issue `INV-XXXX-XXXX` codes on demand with strict per-account isolation.
 - **Native Sessions**: Uses each agent's local storage and official protocol directly so context and prompt caches carry over seamlessly.
 

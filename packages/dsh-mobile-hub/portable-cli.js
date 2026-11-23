@@ -19,6 +19,13 @@ import { RelayBridgeLink } from './src/ws-client.js'
 import { renderQrSvg } from './src/helpers/qr-svg.js'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
 import { ensureDshLocalIpcPlugin } from './src/helpers/dsh-ipc-installer.js'
+import {
+  computeE2eeKeyId,
+  encodeE2eeQrUri,
+  formatE2eeFingerprint,
+  generateE2eeKey,
+  normalizeE2eeKey,
+} from './src/helpers/e2ee.js'
 
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
@@ -35,6 +42,8 @@ function parseArgs(argv) {
     username: process.env.ALLINONE_USERNAME || '',
     password: process.env.ALLINONE_PASSWORD || '',
     inviteCode: process.env.ALLINONE_INVITE || '',
+    e2eeKey: process.env.ALLINONE_E2EE_KEY || '',
+    noE2ee: process.env.ALLINONE_NO_E2EE === '1',
     logout: false,
     legacyPair: false,
     reset: false,
@@ -57,6 +66,9 @@ function parseArgs(argv) {
     else if (a.startsWith('--state-dir=')) opts.stateDir = a.slice('--state-dir='.length)
     else if (a === '--invite') opts.inviteCode = argv[++i] || opts.inviteCode
     else if (a.startsWith('--invite=')) opts.inviteCode = a.slice('--invite='.length)
+    else if (a === '--e2ee-key') opts.e2eeKey = argv[++i] || opts.e2eeKey
+    else if (a.startsWith('--e2ee-key=')) opts.e2eeKey = a.slice('--e2ee-key='.length)
+    else if (a === '--no-e2ee') opts.noE2ee = true
     else if (a === '--logout' || a === '--login') opts.logout = true
     else if (a === '--legacy-pair') opts.legacyPair = true
     else if (a === '--reset') opts.reset = true
@@ -86,10 +98,12 @@ function readConfig(configPath) {
   try {
     const parsed = JSON.parse(readFileSync(configPath, 'utf8'))
     const envSecret = String(process.env.ALLINONE_BRIDGE_SECRET || '').trim()
+    const envE2eeKey = normalizeE2eeKey(process.env.ALLINONE_E2EE_KEY || '')
     if (parsed?.roomId && (parsed?.bridgeSecret || envSecret)) {
       return {
         ...parsed,
         bridgeSecret: parsed.bridgeSecret || envSecret,
+        e2eeKey: normalizeE2eeKey(parsed.e2eeKey || '') || envE2eeKey || '',
       }
     }
   } catch {}
@@ -101,6 +115,9 @@ function saveConfig(configPath, cfg) {
   // Never downgrade Electron safeStorage encrypted config back to plaintext on label/username sync
   if (toPersist.bridgeSecretEnc && process.env.ALLINONE_BRIDGE_SECRET) {
     delete toPersist.bridgeSecret
+  }
+  if (toPersist.e2eeKeyEnc && process.env.ALLINONE_E2EE_KEY) {
+    delete toPersist.e2eeKey
   }
   writeFileSync(configPath, JSON.stringify(toPersist, null, 2), 'utf8')
   try { chmodSync(configPath, 0o600) } catch {}
@@ -231,7 +248,7 @@ async function interactiveAccountLogin(serverUrl, label) {
   throw new Error('连续多次账号验证失败，已退出。')
 }
 
-function printAccountBanner({ serverUrl, username, roomId, bridgeId, label, apps, devices = [] }) {
+function printAccountBanner({ serverUrl, username, roomId, bridgeId, label, apps, devices = [], e2eeFingerprint = '' }) {
   const appSummary = (apps || [])
     .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
     .join(' | ')
@@ -243,6 +260,9 @@ function printAccountBanner({ serverUrl, username, roomId, bridgeId, label, apps
   console.log(`  中转服务器 : ${serverUrl}`)
   console.log(`  登录账号   : @${username} (${roomId})`)
   console.log(`  本机标识   : ${bridgeId}`)
+  if (e2eeFingerprint) {
+    console.log(`  端到端加密 : 已开启 (AES-256-GCM · 指纹 ${e2eeFingerprint})`)
+  }
   if (appSummary) console.log(`  本机 AI    : ${appSummary}`)
   if (devices.length > 0) {
     const onlineCount = devices.filter((d) => d.online).length
@@ -250,12 +270,48 @@ function printAccountBanner({ serverUrl, username, roomId, bridgeId, label, apps
   }
   console.log('--------------------------------------------------------------')
   console.log('  ★ 手机端打开 App / 网页登录同一账号，即可自动连接本机！')
+  if (e2eeFingerprint) {
+    console.log('  ★ 首次在新手机连接时，输入 [K] 回车扫码同步本机端到端密钥')
+  }
   console.log('  ★ 保持本窗口运行即可远程操控本机 AI（可最小化）')
   if (process.stdin.isTTY) {
-    console.log('  操作提示：[S] 查看全部电脑  |  [R] 踢出全部手机  |  [Ctrl+C] 退出')
+    console.log('  操作提示：[K] 密钥二维码  |  [S] 查看电脑  |  [R] 踢出手机  |  [Ctrl+C] 退出')
   }
   console.log('==============================================================')
   console.log('')
+}
+
+function buildE2eeKeyHtml({ username, roomId, label, e2eeKey, e2eeFingerprint }) {
+  const qrUri = encodeE2eeQrUri({ key: e2eeKey, roomId })
+  const qrSvg = renderQrSvg(qrUri, { pixelSize: 260, darkColor: '#0F172A', lightColor: '#FFFFFF' })
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>All in One · 端到端加密密钥同步</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#0F172A; color:#F8FAFC; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC',sans-serif; padding:24px; }
+  .card { max-width:420px; width:100%; background:#1E293B; border:1px solid #334155; border-radius:24px; padding:28px; text-align:center; box-shadow:0 24px 60px rgba(0,0,0,.45); }
+  h1 { margin:0 0 6px; font-size:20px; }
+  .sub { color:#94A3B8; font-size:13px; margin:0 0 20px; }
+  .qr { display:inline-block; background:#fff; padding:16px; border-radius:18px; }
+  .fp { margin:16px 0 8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; color:#38BDF8; letter-spacing:1px; }
+  .key { margin-top:12px; background:#0F172A; border:1px solid #334155; border-radius:12px; padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; word-break:break-all; color:#E2E8F0; user-select:all; }
+  .warn { margin-top:14px; font-size:12px; color:#FBBF24; line-height:1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>端到端加密密钥同步</h1>
+    <p class="sub">${escapeHtml(label)} · @${escapeHtml(username || roomId)}</p>
+    <div class="qr">${qrSvg}</div>
+    <div class="fp">密钥指纹：${escapeHtml(e2eeFingerprint)}</div>
+    <div class="key">${escapeHtml(e2eeKey)}</div>
+    <p class="warn">请使用手机端 All in One 扫描上方二维码同步密钥。此密钥仅保存在你的本地设备，中转服务器永远不会获取，请勿泄露给他人。</p>
+  </div>
+</body>
+</html>`
 }
 
 async function registerNewRoom(serverUrl, label, inviteCode = '') {
@@ -605,6 +661,43 @@ async function main() {
   }
 
   const isAccountMode = String(cfg.roomId || '').startsWith('usr_')
+  const e2eeHtmlPath = join(opts.stateDir, 'e2ee-key.html')
+
+  let activeE2eeKey = ''
+  let e2eeKeyId = ''
+  let e2eeFingerprint = ''
+  if (isAccountMode && !opts.noE2ee) {
+    const candidate = normalizeE2eeKey(opts.e2eeKey || cfg.e2eeKey || '')
+    if (candidate) {
+      activeE2eeKey = candidate
+      if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !process.env.ALLINONE_E2EE_KEY) {
+        cfg.e2eeKey = candidate
+        saveConfig(configPath, cfg)
+      }
+    } else {
+      activeE2eeKey = generateE2eeKey()
+      cfg.e2eeKey = activeE2eeKey
+      saveConfig(configPath, cfg)
+    }
+    e2eeKeyId = await computeE2eeKeyId(activeE2eeKey)
+    e2eeFingerprint = formatE2eeFingerprint(e2eeKeyId)
+  }
+
+  const writeE2eeKeyPage = (openNow = false) => {
+    if (!activeE2eeKey) return
+    const html = buildE2eeKeyHtml({
+      username: cfg.username || cfg.roomId,
+      roomId: cfg.roomId,
+      label: cfg.label || opts.label,
+      e2eeKey: activeE2eeKey,
+      e2eeFingerprint,
+    })
+    writeFileSync(e2eeHtmlPath, html, { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(e2eeHtmlPath, 0o600) } catch {}
+    if (openNow && !opts.noBrowser) {
+      openFileInBrowser(e2eeHtmlPath)
+    }
+  }
 
   let detectedApps = []
   const writePairPage = (openNow = false) => {
@@ -640,6 +733,7 @@ async function main() {
       relayUrl: wsBridgeUrl,
       secret: cfg.bridgeSecret,
       roomId: cfg.roomId,
+      e2eeKey: activeE2eeKey,
       cwd: opts.cwd,
       inboundDir: join(opts.stateDir, 'uploads'),
     },
@@ -652,6 +746,7 @@ async function main() {
     roomId: cfg.roomId,
     bridgeId: cfg.bridgeId,
     mode: 'portable',
+    e2eeKey: activeE2eeKey,
     log: quietLog,
     onRpc: (method, params) => orchestrator.handleRpc(method, params),
     onState: (state, detail) => {
@@ -701,6 +796,7 @@ async function main() {
       label: cfg.label || opts.label,
       apps: detectedApps,
       devices: accountDevices,
+      e2eeFingerprint,
     })
   } else {
     writePairPage(true)
@@ -795,6 +891,15 @@ async function main() {
     rl = readline.createInterface({ input: process.stdin, output: process.stdout })
     rl.on('line', async (line) => {
       const cmd = line.trim().toLowerCase()
+      if (isAccountMode && activeE2eeKey && (cmd === 'k' || cmd === 'key' || cmd === 'e2ee')) {
+        writeE2eeKeyPage(true)
+        console.log('')
+        console.log(`[allinone] 端到端加密密钥指纹：${e2eeFingerprint}`)
+        console.log(`[allinone] 恢复密钥（仅本机与手机保存）：${activeE2eeKey}`)
+        console.log(`[allinone] 已生成离线二维码页面：${e2eeHtmlPath}`)
+        console.log('')
+        return
+      }
       if (isAccountMode && (cmd === 's' || cmd === 'status' || cmd === '')) {
         try {
           const st = await fetchDeviceAccountStatus(opts.server, cfg.roomId, cfg.bridgeSecret)

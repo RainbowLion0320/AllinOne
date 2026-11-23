@@ -5,10 +5,15 @@ import {
   ChevronDown,
   KeyRound,
   Loader2,
+  Lock,
   Menu,
+  ScanLine,
+  ShieldCheck,
   SquarePen,
   WifiOff,
 } from 'lucide-react'
+import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
+import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
 import {
   MobileRelayClient,
   bindAccountEmail,
@@ -37,6 +42,7 @@ import {
   selectDevice,
   updateDeviceMeta,
   upsertDevice,
+  upsertDeviceE2eeKey,
 } from './lib/deviceStore.js'
 import {
   clearSessionCache,
@@ -64,6 +70,7 @@ import { ShareModal } from './components/ShareModal.jsx'
 import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
 import { InviteManagerModal } from './components/InviteManagerModal.jsx'
 import { SettingsModal } from './components/SettingsModal.jsx'
+import { E2eeSyncModal } from './components/E2eeSyncModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 import { useI18n } from './lib/i18n.jsx'
 import { bi as biLang, getCurrentLang } from './lib/i18n.js'
@@ -102,6 +109,7 @@ export function App() {
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [e2eeModal, setE2eeModal] = useState({ open: false, tab: 'auto', autoOpenScanner: false })
   const [lightboxState, setLightboxState] = useState(null)
 
   const [appsStatus, setAppsStatus] = useState([])
@@ -304,6 +312,12 @@ export function App() {
         })
         .then((st) => {
           if (st) setDesktopBridge(st)
+          return desktopApi.getE2eeInfo?.(activeDevice.roomId)
+        })
+        .then((info) => {
+          if (info?.enabled && info.key && info.keyId && activeDevice?.id) {
+            setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, info.keyId, info.key))
+          }
         })
         .catch(() => {})
     } else if (!activeDevice && hadDesktopAccountRef.current) {
@@ -312,6 +326,22 @@ export function App() {
       desktopApi.stopBridge?.().catch(() => {})
     }
   }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, activeDevice?.roomId, activeDevice?.username, activeDevice?.authMode])
+
+  // Keep Desktop UI's local E2EE key ring synced with the embedded bridge key (zero friction on the host PC!)
+  useEffect(() => {
+    if (!desktopApi || !activeDevice?.id || !activeDevice?.roomId?.startsWith('usr_')) return
+    let cancelled = false
+    desktopApi
+      .getE2eeInfo?.(activeDevice.roomId)
+      .then((info) => {
+        if (cancelled || !info?.enabled || !info.key || !info.keyId) return
+        setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, info.keyId, info.key))
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [desktopApi, activeDevice?.id, activeDevice?.roomId, desktopBridge?.e2eeKeyId, desktopBridge?.state])
 
   // Desktop keyboard shortcuts (Cmd/Ctrl+N new chat, Cmd/Ctrl+K switch computer, Esc close modals)
   useEffect(() => {
@@ -337,6 +367,7 @@ export function App() {
       }
       if (e.key === 'Escape') {
         if (lightboxState) setLightboxState(null)
+        else if (e2eeModal.open) setE2eeModal((prev) => ({ ...prev, open: false }))
         else if (modelPickerOpen) setModelPickerOpen(false)
         else if (newChatOpen) setNewChatOpen(false)
         else if (settingsOpen) setSettingsOpen(false)
@@ -348,7 +379,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -390,6 +421,7 @@ export function App() {
     setNewChatApp('')
     setModelPickerOpen(false)
     setLightboxState(null)
+    clearE2eeMediaCache()
   }, [])
 
   const handleDeviceAuthenticated = useCallback((payload) => {
@@ -575,30 +607,71 @@ export function App() {
     }
   }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, connState])
 
+  const activeBridgeE2ee = useMemo(() => {
+    const raw = activeBridge?.e2ee || null
+    const enabled = Boolean(raw?.enabled && raw?.keyId)
+    const keyId = enabled ? String(raw.keyId) : ''
+    const keysMap = activeDevice?.e2eeKeys || {}
+    const matchedKey = keyId ? String(keysMap[keyId] || '') : ''
+    const locked = Boolean(enabled && !matchedKey)
+    const desktopKeyId = desktopBridge?.e2eeKeyId && keysMap[desktopBridge.e2eeKeyId] ? desktopBridge.e2eeKeyId : ''
+    const fallbackKeyId = desktopKeyId || Object.keys(keysMap)[0] || ''
+    const shareableKeyId = matchedKey ? keyId : fallbackKeyId
+    const shareableKey = shareableKeyId ? String(keysMap[shareableKeyId] || '') : ''
+    return {
+      enabled,
+      keyId,
+      matchedKey,
+      locked,
+      active: Boolean(enabled && matchedKey),
+      shareableKey,
+      shareableKeyId,
+    }
+  }, [activeBridge?.e2ee, activeDevice?.e2eeKeys, desktopBridge?.e2eeKeyId])
+
+  const e2eeLocked = activeBridgeE2ee.locked
+  const e2eeLockedRef = useRef(e2eeLocked)
+  e2eeLockedRef.current = e2eeLocked
+
+  useEffect(() => {
+    clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
+  }, [activeDevice?.e2eeKeys])
+
   const imageContext = useMemo(() => {
     const matched = mediaAuth.deviceId === activeDevice?.id
     return {
       baseUrl: activeDevice?.baseUrl || '',
+      roomId: activeDevice?.roomId || 'owner',
       mediaToken: matched ? mediaAuth.mediaToken : '',
       token: matched && mediaAuth.unsupported ? activeDevice?.token || '' : '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
+      client: clientRef.current,
+      e2eeActive: activeBridgeE2ee.active,
+      e2eeKey: activeBridgeE2ee.matchedKey,
+      e2eeKeyId: activeBridgeE2ee.keyId,
+      e2eeKeys: activeDevice?.e2eeKeys || {},
       onOpenImage: setLightboxState,
     }
   }, [
     activeDevice?.id,
     activeDevice?.baseUrl,
+    activeDevice?.roomId,
     activeDevice?.token,
+    activeDevice?.e2eeKeys,
     mediaAuth.deviceId,
     mediaAuth.mediaToken,
     mediaAuth.unsupported,
     activeSession?.cwd,
     activeBridgeId,
+    activeBridgeE2ee.active,
+    activeBridgeE2ee.matchedKey,
+    activeBridgeE2ee.keyId,
   ])
 
   const loadWorkspaceData = useCallback(async (bridgeOverride = '') => {
     const client = clientRef.current
-    if (!client) return
+    if (!client || e2eeLockedRef.current) return
     const targetBridge = String(bridgeOverride || activeBridgeIdRef.current || '').trim()
     if (targetBridge) client.setTargetBridgeId(targetBridge)
     const gen = deviceGenRef.current
@@ -627,12 +700,13 @@ export function App() {
     }
   }, [])
 
-  // Trigger workspace load whenever connected target device/bridge is ready or changes
+  // Trigger workspace load whenever connected target device/bridge is ready or E2EE unlocks
   useEffect(() => {
-    if (connState !== 'connected' || !activeDevice?.id || !activeBridgeId) return
+    if (connState !== 'connected' || !activeDevice?.id || !activeBridgeId || e2eeLocked) return
     clientRef.current?.setTargetBridgeId(activeBridgeId)
+    clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
     void loadWorkspaceData(activeBridgeId)
-  }, [connState, activeDevice?.id, activeBridgeId, loadWorkspaceData])
+  }, [connState, activeDevice?.id, activeBridgeId, e2eeLocked, loadWorkspaceData])
 
   // Auto-sync app readiness & model catalog whenever the active bridge broadcasts updated meta.apps
   // (e.g. after background auto-completion finishes installing a missing CLI like `agy` / `claude` / `codex`).
@@ -1001,7 +1075,9 @@ export function App() {
     const client = new MobileRelayClient({
       baseUrl: activeDevice.baseUrl,
       token: activeDevice.token,
+      roomId: activeDevice.roomId || 'owner',
       bridgeId: activeDevice.selectedBridgeId || '',
+      e2eeKeys: activeDevice.e2eeKeys || {},
     })
     clientRef.current = client
 
@@ -1398,6 +1474,54 @@ export function App() {
     [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
   )
 
+  const handleImportE2eeKey = useCallback(
+    async (rawKey, keyId, { applyToDesktopBridge = false } = {}) => {
+      if (!activeDevice?.id || !rawKey || !keyId) return
+      let finalKey = rawKey
+      let finalKeyId = keyId
+      if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId) {
+        const res = await desktopApi.setE2eeKey(activeDevice.roomId, rawKey)
+        if (res?.key && res?.keyId) {
+          finalKey = res.key
+          finalKeyId = res.keyId
+        }
+        const st = await desktopApi.getBridgeStatus?.().catch(() => null)
+        if (st) setDesktopBridge(st)
+      }
+      const nextKeys = {
+        ...(activeDevice.e2eeKeys || {}),
+        [finalKeyId]: finalKey,
+      }
+      clientRef.current?.setE2eeKeys(nextKeys)
+      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, finalKeyId, finalKey))
+      showToast(
+        biLang(
+          getCurrentLang(),
+          `端到端密钥已同步 (${formatE2eeFingerprint(finalKeyId).slice(0, 9)})`,
+          `E2EE key synced (${formatE2eeFingerprint(finalKeyId).slice(0, 9)})`,
+        ),
+      )
+    },
+    [activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, desktopApi, showToast],
+  )
+
+  const handleRotateDesktopE2eeKey = useCallback(async () => {
+    if (!desktopApi?.rotateE2eeKey || !activeDevice?.id || !activeDevice?.roomId) return
+    const res = await desktopApi.rotateE2eeKey(activeDevice.roomId)
+    if (res?.key && res?.keyId) {
+      const nextKeys = {
+        ...(activeDevice.e2eeKeys || {}),
+        [res.keyId]: res.key,
+      }
+      clientRef.current?.setE2eeKeys(nextKeys)
+      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, res.keyId, res.key))
+    }
+    const st = await desktopApi.getBridgeStatus?.().catch(() => null)
+    if (st) setDesktopBridge(st)
+    clearE2eeMediaCache()
+    showToast(biLang(getCurrentLang(), '已轮换端到端密钥并重启本机桥接', 'Rotated E2EE key and restarted local bridge'))
+  }, [desktopApi, activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, showToast])
+
   const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
     const target = devices.find((d) => d.id === deviceId)
     if (revokeAll && target?.baseUrl && target?.token) {
@@ -1553,10 +1677,19 @@ export function App() {
       role: 'user',
       text: displayUserText,
       ...(imgAtts.length > 0
-        ? { images: imgAtts.map((a) => ({ url: a.url, name: a.filename, mimeType: a.mimeType })) }
+        ? {
+            images: imgAtts.map((a) => ({
+              url: a.url,
+              name: a.filename,
+              mimeType: a.mimeType,
+              ...(a.e2ee ? { e2ee: a.e2ee } : {}),
+              ...(a.localPreviewUrl ? { localPreviewUrl: a.localPreviewUrl } : {}),
+            })),
+          }
         : {}),
       ts: Date.now(),
     }
+    const wireAttachments = attachments.map(({ localPreviewUrl: _drop, ...rest }) => rest)
     const nextWithUser = [...messagesRef.current, userMsg]
     setMessages(nextWithUser)
     void saveCachedSession(
@@ -1583,7 +1716,7 @@ export function App() {
           id: target.id,
           text: finalText,
           cwd: target.cwd,
-          attachments,
+          attachments: wireAttachments,
           wait: false,
           ...(activePref.model ? { model: activePref.model } : {}),
           ...(activePref.provider ? { provider: activePref.provider } : {}),
@@ -1747,26 +1880,56 @@ export function App() {
                 {activeSession?.title || 'All in One'}
               </span>
             </button>
-            <button
-              type="button"
-              onClick={() => setDeviceSwitcherOpen(true)}
-              aria-label={bi('切换控制的电脑', 'Switch computer')}
-              className="mt-0.5 inline-flex max-w-[260px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
-            >
-              <span
-                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  connState === 'unauthorized'
-                    ? 'bg-rose-500'
-                    : connState === 'connected' && bridgeOnline
-                      ? 'bg-emerald-500'
-                      : connState === 'connecting'
-                        ? 'bg-amber-400'
-                        : 'bg-rose-400'
-                }`}
-              />
-              <span className="truncate">{headerSubtitle}</span>
-              <ChevronDown className="h-3 w-3 shrink-0 opacity-65" />
-            </button>
+            <div className="mt-0.5 flex items-center justify-center gap-1">
+              <button
+                type="button"
+                onClick={() => setDeviceSwitcherOpen(true)}
+                aria-label={bi('切换控制的电脑', 'Switch computer')}
+                className="inline-flex max-w-[230px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
+              >
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    connState === 'unauthorized'
+                      ? 'bg-rose-500'
+                      : connState === 'connected' && bridgeOnline
+                        ? 'bg-emerald-500'
+                        : connState === 'connecting'
+                          ? 'bg-amber-400'
+                          : 'bg-rose-400'
+                  }`}
+                />
+                <span className="truncate">{headerSubtitle}</span>
+                <ChevronDown className="h-3 w-3 shrink-0 opacity-65" />
+              </button>
+              {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setE2eeModal({
+                      open: true,
+                      tab: e2eeLocked ? 'import' : 'show',
+                      autoOpenScanner: false,
+                    })
+                  }
+                  title={
+                    e2eeLocked
+                      ? bi('需扫码同步端到端加密密钥', 'Sync E2EE key')
+                      : bi(
+                          `端到端加密已开启 (AES-256-GCM · ${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
+                          `End-to-End Encrypted (AES-256-GCM · ${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
+                        )
+                  }
+                  className={`inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold transition active:scale-95 ${
+                    e2eeLocked
+                      ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
+                      : 'bg-emerald-500/12 text-emerald-600 hover:bg-emerald-500/20 dark:text-emerald-400'
+                  }`}
+                >
+                  {e2eeLocked ? <Lock className="h-2.5 w-2.5" /> : <ShieldCheck className="h-2.5 w-2.5" />}
+                  {e2eeLocked && <span>{bi('同步密钥', 'Unlock')}</span>}
+                </button>
+              )}
+            </div>
           </div>
 
           <button
@@ -1835,7 +1998,53 @@ export function App() {
         </div>
       )}
 
-      {/* Main Chat Viewport */}
+      {/* Main Chat Viewport (or E2EE Key Sync Lock Screen when bridge is E2EE-protected and key is not yet synced) */}
+      {connState === 'connected' && bridgeOnline && e2eeLocked ? (
+        <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
+          <div className="w-full max-w-sm rounded-3xl border border-slate-200/80 bg-slate-50/70 p-6 shadow-sm dark:border-slate-800 dark:bg-[#1C1F27]">
+            <div className="mx-auto mb-3.5 flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-500">
+              <Lock className="h-6 w-6" />
+            </div>
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">
+              {bi('需要同步端到端加密密钥', 'Sync End-to-End Encryption Key')}
+            </h2>
+            <p className="mt-1.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+              {bi(
+                `「${activeDeviceName}」已启用零知识端到端加密（AES-256-GCM），中转服务器不存储任何密钥。请扫描电脑端二维码同步密钥以解锁会话。`,
+                `${activeDeviceName} uses zero-knowledge AES-256-GCM encryption. Scan the QR code on your computer to sync the key and unlock.`,
+              )}
+            </p>
+            {activeBridgeE2ee.keyId && (
+              <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1 font-mono text-[11px] font-semibold text-slate-600 ring-1 ring-slate-200/80 dark:bg-[#14171F] dark:text-slate-300 dark:ring-slate-700/80">
+                <span>{bi('密钥指纹', 'Fingerprint')}:</span>
+                <span className="text-[#4D6BFE]">{formatE2eeFingerprint(activeBridgeE2ee.keyId)}</span>
+              </div>
+            )}
+            <div className="mt-5 space-y-2">
+              <button
+                type="button"
+                onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+              >
+                <ScanLine className="h-4 w-4" />
+                <span>{bi('扫一扫电脑端二维码', 'Scan Computer QR Code')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: false })}
+                className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200"
+              >
+                <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                <span>{bi('手动粘贴恢复密钥', 'Paste Recovery Key')}</span>
+              </button>
+            </div>
+            <p className="mt-3.5 text-[11px] text-slate-400">
+              {bi('路径：电脑端「设置 → 端到端加密」或 CLI 终端按 K 键', 'On PC: Settings → End-to-End Encryption, or press K in CLI')}
+            </p>
+          </div>
+        </div>
+      ) : (
+      <>
       <ChatView
         session={activeSession}
         messages={messages}
@@ -1871,7 +2080,7 @@ export function App() {
         draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
         activeApp={activeApp}
         streaming={Boolean(currentStream?.active)}
-        disabled={!bridgeOnline || connState !== 'connected'}
+        disabled={!bridgeOnline || connState !== 'connected' || e2eeLocked}
         needsWorkspace={!activeSession && !selectedDraftCwd}
         targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
         onSwitchAppClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
@@ -1898,6 +2107,8 @@ export function App() {
         onSend={handleSend}
         onInterrupt={handleInterrupt}
       />
+      </>
+      )}
       </div>
 
       {/* Multi-Computer Switcher & Account Device Manager Modal */}
@@ -2060,10 +2271,38 @@ export function App() {
         onSendBindEmailCode={handleSendBindEmailCode}
         onBindAccountEmail={handleBindAccountEmail}
         onToggleLogin2fa={handleToggleLoginEmail2fa}
+        e2eeStatus={{
+          enabled: activeBridgeE2ee.active,
+          locked: activeBridgeE2ee.locked,
+          keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
+        }}
+        onOpenE2eeSync={() =>
+          setE2eeModal({
+            open: true,
+            tab: e2eeLocked ? 'import' : 'auto',
+            autoOpenScanner: false,
+          })
+        }
         onRemoveDevice={handleRemoveDevice}
       />
+      {/* Zero-Knowledge End-to-End Encryption (E2EE) QR Key Sync Modal */}
+      <E2eeSyncModal
+        open={e2eeModal.open}
+        onClose={() => setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))}
+        roomId={activeDevice?.roomId || ''}
+        username={activeDevice?.username || ''}
+        bridgeName={activeDeviceName}
+        bridgeE2ee={activeBridge?.e2ee || null}
+        activeKey={activeBridgeE2ee.shareableKey}
+        activeKeyId={activeBridgeE2ee.shareableKeyId}
+        isDesktopApp={Boolean(desktopApi)}
+        initialTab={e2eeModal.tab}
+        autoOpenScanner={e2eeModal.autoOpenScanner}
+        onImportKey={handleImportE2eeKey}
+        onRotateDesktopKey={desktopApi ? handleRotateDesktopE2eeKey : null}
+      />
       {/* Full-Screen Zoomable Image Lightbox */}
-      <ImageLightbox state={lightboxState} onClose={() => setLightboxState(null)} />
+      <ImageLightbox state={lightboxState} imageContext={imageContext} onClose={() => setLightboxState(null)} />
     </div>
   )
 }

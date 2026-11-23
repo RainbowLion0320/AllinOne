@@ -39,6 +39,7 @@ export function startStandaloneBridge(options = {}) {
   const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
   const bridgeId = options.bridgeId || process.env.BRIDGE_ID || defaultBridgeId
   const mode = options.mode || 'standalone'
+  const e2eeKey = options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? ''
   const cwd = options.cwd || process.env.DEFAULT_CWD || resolve(__dirname, '../..')
   const log = options.log || console
 
@@ -49,6 +50,7 @@ export function startStandaloneBridge(options = {}) {
       relayUrl,
       secret,
       roomId,
+      e2eeKey,
       cwd,
       ...(options.inboundDir ? { inboundDir: options.inboundDir } : {}),
     },
@@ -62,6 +64,7 @@ export function startStandaloneBridge(options = {}) {
     roomId,
     bridgeId,
     mode,
+    e2eeKey,
     log,
     onRpc: (method, params) => orchestrator.handleRpc(method, params),
     onState: (state, detail) => {

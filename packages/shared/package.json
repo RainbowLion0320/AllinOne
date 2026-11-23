@@ -6,6 +6,8 @@
   "type": "module",
   "main": "./src/protocol.js",
   "exports": {
-    ".": "./src/protocol.js"
+    ".": "./src/protocol.js",
+    "./e2ee": "./src/e2ee.js",
+    "./qr-svg": "./src/qr-svg.js"
   }
 }

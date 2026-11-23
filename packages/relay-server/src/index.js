@@ -277,6 +277,7 @@ export function createRelayServer(options = {}) {
         platform: b?.platform || dev.platform || 'unknown',
         online: Boolean(b?.online),
         apps: b?.apps || [],
+        e2ee: b?.e2ee || null,
         mode: b?.mode || 'portable',
         connectedAt: b?.connectedAt || 0,
         lastSeenAt: b?.lastSeen || dev.lastSeenAt || dev.createdAt || 0,
@@ -1964,7 +1965,10 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: '文件为空或超过 15MB 限制' })
           return
         }
-        const safeName = String(body.filename || 'upload.bin').replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_').slice(0, 100)
+        const isEncrypted = Boolean(body.encrypted)
+        const safeName = isEncrypted
+          ? 'encrypted.bin'
+          : String(body.filename || 'upload.bin').replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_').slice(0, 100)
         const ownerRoom = payload.room || 'owner'
         pruneUploadsForQuota(buf.length, ownerRoom)
         const id = randomUUID()
@@ -1972,7 +1976,8 @@ export function createRelayServer(options = {}) {
           id,
           roomId: ownerRoom,
           filename: safeName,
-          mimeType: String(body.mimeType || 'application/octet-stream'),
+          mimeType: isEncrypted ? 'application/octet-stream' : String(body.mimeType || 'application/octet-stream'),
+          encrypted: isEncrypted,
           size: buf.length,
           createdAt: Date.now(),
         }
@@ -1984,6 +1989,7 @@ export function createRelayServer(options = {}) {
             id: meta.id,
             filename: meta.filename,
             mimeType: meta.mimeType,
+            encrypted: meta.encrypted,
             size: meta.size,
             createdAt: meta.createdAt,
             url: `/api/uploads/${id}`,
@@ -2053,6 +2059,8 @@ export function createRelayServer(options = {}) {
         const msg = String(err?.message || err)
         const status = err?.code === 'BRIDGE_OFFLINE'
           ? 503
+          : err?.code === 'E2EE_KEY_REQUIRED' || err?.code === 'E2EE_KEY_MISMATCH'
+            ? 403
           : /找不到/.test(msg)
             ? 404
             : /仅允许|不支持|拒绝访问/.test(msg)
