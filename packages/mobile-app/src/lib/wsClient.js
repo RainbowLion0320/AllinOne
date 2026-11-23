@@ -78,10 +78,10 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
       ...(controller ? { signal: controller.signal } : {}),
     })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok || !data.ok) return { hasUsers: true }
-    return { hasUsers: Boolean(data.hasUsers) }
+    if (!res.ok || !data.ok) return { hasUsers: true, emailEnabled: false }
+    return { hasUsers: Boolean(data.hasUsers), emailEnabled: Boolean(data.emailEnabled) }
   } catch {
-    return { hasUsers: true }
+    return { hasUsers: true, emailEnabled: false }
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -107,6 +107,8 @@ export async function loginAccount(serverUrl, { username, password }) {
     token: data.token,
     roomId: data.roomId || data.user?.userId || '',
     username: data.user?.username || String(username || '').trim(),
+    email: data.user?.email || '',
+    emailVerified: Boolean(data.user?.emailVerified),
     role: data.user?.role || 'user',
     label: `@${data.user?.username || String(username || '').trim()}`,
     devices: Array.isArray(data.devices) ? data.devices : [],
@@ -114,8 +116,9 @@ export async function loginAccount(serverUrl, { username, password }) {
   }
 }
 
-export async function registerAccount(serverUrl, { username, password, inviteCode }) {
+export async function registerAccount(serverUrl, { username, password, inviteCode, email = '', emailCode = '' }) {
   const base = normalizeBaseUrl(serverUrl)
+  const cleanEmail = String(email || '').trim()
   const res = await fetch(`${base}/api/account/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -123,6 +126,7 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
       username: String(username || '').trim(),
       password: String(password ?? ''),
       inviteCode: String(inviteCode || '').trim(),
+      ...(cleanEmail ? { email: cleanEmail, emailCode: String(emailCode || '').trim() } : {}),
       deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
     }),
   })
@@ -135,11 +139,77 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
     token: data.token,
     roomId: data.roomId || data.user?.userId || '',
     username: data.user?.username || String(username || '').trim(),
+    email: data.user?.email || '',
+    emailVerified: Boolean(data.user?.emailVerified),
     role: data.user?.role || 'user',
     label: `@${data.user?.username || String(username || '').trim()}`,
     devices: Array.isArray(data.devices) ? data.devices : [],
     bridges: Array.isArray(data.bridges) ? data.bridges : [],
   }
+}
+
+export async function sendEmailVerificationCode(serverUrl, { purpose, email, inviteCode = '', token = '' }) {
+  const base = normalizeBaseUrl(serverUrl)
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(`${base}/api/account/email/send-code`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      purpose,
+      email: String(email || '').trim(),
+      ...(inviteCode ? { inviteCode: String(inviteCode).trim() } : {}),
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    const err = new Error(data.error || `发送验证码失败 (HTTP ${res.status})`)
+    if (data.retryAfterSec) err.retryAfterSec = Number(data.retryAfterSec)
+    throw err
+  }
+  return {
+    cooldownSec: Number(data.cooldownSec) || 60,
+    expiresInSec: Number(data.expiresInSec) || 600,
+    message: data.message || '验证码已发送，请查收邮件',
+  }
+}
+
+export async function bindAccountEmail(baseUrl, token, { email, code }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/email/bind`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      email: String(email || '').trim(),
+      code: String(code || '').trim(),
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `绑定邮箱失败 (HTTP ${res.status})`)
+  }
+  return data.user
+}
+
+export async function resetAccountPassword(serverUrl, { email, code, newPassword }) {
+  const base = normalizeBaseUrl(serverUrl)
+  const res = await fetch(`${base}/api/account/password/reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: String(email || '').trim(),
+      code: String(code || '').trim(),
+      newPassword: String(newPassword ?? ''),
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `重置密码失败 (HTTP ${res.status})`)
+  }
+  return { username: data.username || '' }
 }
 
 export async function listAccountDevices(baseUrl, token) {
@@ -338,6 +408,9 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
       devices: Array.isArray(data.devices) ? data.devices : null,
       label: String(data.label || ''),
       username: String(data.username || ''),
+      email: String(data.email || ''),
+      emailVerified: Boolean(data.emailVerified),
+      emailEnabled: Boolean(data.emailEnabled),
       role: String(data.role || ''),
       roomId: String(data.roomId || device.roomId || ''),
     }

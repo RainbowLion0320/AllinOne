@@ -223,8 +223,11 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                   <div key={u.userId} className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <span className="truncate font-semibold text-slate-800 dark:text-slate-100">@{u.username}</span>
+                      {u.email && (
+                        <span className="truncate text-[10.5px] text-slate-400">{u.email}</span>
+                      )}
                       {u.role === 'admin' && (
-                        <span className="rounded bg-[#4D6BFE]/15 px-1.5 py-0.2 text-[10px] font-semibold text-[#4D6BFE]">
+                        <span className="shrink-0 rounded bg-[#4D6BFE]/15 px-1.5 py-0.2 text-[10px] font-semibold text-[#4D6BFE]">
                           管理员
                         </span>
                       )}

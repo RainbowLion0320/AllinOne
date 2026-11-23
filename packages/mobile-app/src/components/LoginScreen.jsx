@@ -8,9 +8,11 @@ import {
   Copy,
   KeyRound,
   Lock,
+  Mail,
   QrCode,
   ScanLine,
   Server,
+  ShieldCheck,
   Sparkles,
   Terminal,
   Ticket,
@@ -27,6 +29,8 @@ import {
   pairWithRelay,
   parsePairInput,
   registerAccount,
+  resetAccountPassword,
+  sendEmailVerificationCode,
 } from '../lib/wsClient.js'
 import { QrScannerModal } from './QrScannerModal.jsx'
 
@@ -47,7 +51,7 @@ export function LoginScreen({
   autoOpenScanner = false,
   onCancel = null,
 }) {
-  // 'login' | 'register' | 'pair' | 'password'
+  // 'login' | 'register' | 'reset' | 'pair' | 'password'
   const [mode, setMode] = useState(() =>
     autoOpenScanner ? 'pair' : initialInviteCode ? 'register' : 'login',
   )
@@ -62,18 +66,24 @@ export function LoginScreen({
   const [copiedCmd, setCopiedCmd] = useState(false)
   const [scannerOpen, setScannerOpen] = useState(Boolean(autoOpenScanner))
   const [hasUsers, setHasUsers] = useState(true)
+  const [emailEnabled, setEmailEnabled] = useState(false)
 
   // Account fields
   const [username, setUsername] = useState('')
   const [accountPassword, setAccountPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [inviteCode, setInviteCode] = useState(initialInviteCode || '')
+  const [email, setEmail] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [codeSending, setCodeSending] = useState(false)
+  const [codeCooldown, setCodeCooldown] = useState(0)
 
   // Legacy fields
   const [pairInput, setPairInput] = useState('')
   const [legacyPassword, setLegacyPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(initialError)
+  const [infoMsg, setInfoMsg] = useState('')
 
   useEffect(() => {
     if (initialError) setError(initialError)
@@ -95,12 +105,52 @@ export function LoginScreen({
   useEffect(() => {
     let cancelled = false
     fetchBootstrapStatus(effectiveServer).then((st) => {
-      if (!cancelled) setHasUsers(st.hasUsers)
+      if (!cancelled) {
+        setHasUsers(st.hasUsers)
+        setEmailEnabled(Boolean(st.emailEnabled))
+      }
     })
     return () => {
       cancelled = true
     }
   }, [effectiveServer])
+
+  useEffect(() => {
+    if (codeCooldown <= 0) return undefined
+    const timer = setTimeout(() => {
+      setCodeCooldown((prev) => (prev > 1 ? prev - 1 : 0))
+    }, 1000)
+    return () => clearTimeout(timer)
+  }, [codeCooldown])
+
+  const handleSendEmailCode = async (purpose) => {
+    setError('')
+    setInfoMsg('')
+    const cleanEmail = email.trim()
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+      setError('请先输入有效的邮箱地址')
+      return
+    }
+    if (purpose === 'register' && !inviteCode.trim()) {
+      setError('请先填写邀请码，再获取邮箱验证码')
+      return
+    }
+    setCodeSending(true)
+    try {
+      const res = await sendEmailVerificationCode(serverUrl, {
+        purpose,
+        email: cleanEmail,
+        inviteCode: purpose === 'register' ? inviteCode.trim() : '',
+      })
+      setCodeCooldown(res.cooldownSec || 60)
+      setInfoMsg(res.message || '验证码已发送，请查收邮件')
+    } catch (err) {
+      if (err?.retryAfterSec) setCodeCooldown(err.retryAfterSec)
+      setError(String(err?.message || err))
+    } finally {
+      setCodeSending(false)
+    }
+  }
 
   const winSetupCmd = `irm ${effectiveServer}/setup.ps1 | iex`
   const unixSetupCmd = `curl -fsSL ${effectiveServer}/setup.sh | bash`
@@ -177,10 +227,11 @@ export function LoginScreen({
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
+    setInfoMsg('')
 
     if (mode === 'login') {
       if (!username.trim() || !accountPassword) {
-        setError('请输入用户名和密码')
+        setError(emailEnabled ? '请输入用户名/邮箱和密码' : '请输入用户名和密码')
         return
       }
       setLoading(true)
@@ -194,6 +245,7 @@ export function LoginScreen({
           token: result.token,
           roomId: result.roomId,
           username: result.username,
+          email: result.email,
           role: result.role,
           label: result.label,
           devices: result.devices,
@@ -225,24 +277,76 @@ export function LoginScreen({
         setError('两次输入的密码不一致')
         return
       }
+      const cleanEmail = emailEnabled ? email.trim() : ''
+      if (cleanEmail) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+          setError('请输入有效的邮箱地址，或留空直接注册')
+          return
+        }
+        if (!/^\d{6}$/.test(emailCode.trim())) {
+          setError('请输入邮箱收到的 6 位验证码，或清空邮箱直接注册')
+          return
+        }
+      }
       setLoading(true)
       try {
         const result = await registerAccount(serverUrl, {
           username: username.trim(),
           password: accountPassword,
           inviteCode: inviteCode.trim(),
+          ...(cleanEmail ? { email: cleanEmail, emailCode: emailCode.trim() } : {}),
         })
         onSuccess({
           baseUrl: result.baseUrl,
           token: result.token,
           roomId: result.roomId,
           username: result.username,
+          email: result.email,
           role: result.role,
           label: result.label,
           devices: result.devices,
           bridges: result.bridges,
           authMode: 'account',
         })
+      } catch (err) {
+        setError(String(err?.message || err))
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    if (mode === 'reset') {
+      const cleanEmail = email.trim()
+      if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+        setError('请输入账号绑定的邮箱地址')
+        return
+      }
+      if (!/^\d{6}$/.test(emailCode.trim())) {
+        setError('请输入 6 位邮箱验证码')
+        return
+      }
+      if (accountPassword.length < 8) {
+        setError('新密码长度至少需要 8 位')
+        return
+      }
+      if (accountPassword !== confirmPassword) {
+        setError('两次输入的新密码不一致')
+        return
+      }
+      setLoading(true)
+      try {
+        const res = await resetAccountPassword(serverUrl, {
+          email: cleanEmail,
+          code: emailCode.trim(),
+          newPassword: accountPassword,
+        })
+        setMode('login')
+        setUsername(res.username || cleanEmail)
+        setAccountPassword('')
+        setConfirmPassword('')
+        setEmailCode('')
+        setInfoMsg('密码已重置，请使用新密码登录')
       } catch (err) {
         setError(String(err?.message || err))
       } finally {
@@ -320,6 +424,7 @@ export function LoginScreen({
                 onClick={() => {
                   setMode('login')
                   setError('')
+                  setInfoMsg('')
                 }}
                 className={`flex items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold transition ${
                   mode === 'login'
@@ -335,6 +440,7 @@ export function LoginScreen({
                 onClick={() => {
                   setMode('register')
                   setError('')
+                  setInfoMsg('')
                 }}
                 className={`flex items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold transition ${
                   mode === 'register'
@@ -354,13 +460,13 @@ export function LoginScreen({
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <User className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>用户名</span>
+                  <span>{emailEnabled ? '用户名 / 邮箱' : '用户名'}</span>
                 </label>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="输入你的用户名"
+                  placeholder={emailEnabled ? '输入用户名或已绑定邮箱' : '输入你的用户名'}
                   autoComplete="username"
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -370,10 +476,27 @@ export function LoginScreen({
               </div>
 
               <div>
-                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
-                  <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>密码</span>
-                </label>
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>密码</span>
+                  </label>
+                  {emailEnabled && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMode('reset')
+                        setError('')
+                        setInfoMsg('')
+                        setEmailCode('')
+                        if (username.includes('@') && !email) setEmail(username.trim())
+                      }}
+                      className="text-[11.5px] font-medium text-[#4D6BFE] hover:underline"
+                    >
+                      忘记密码？
+                    </button>
+                  )}
+                </div>
                 <input
                   type="password"
                   value={accountPassword}
@@ -451,6 +574,154 @@ export function LoginScreen({
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
                     <span>确认密码</span>
+                  </label>
+                  <input
+                    type="password"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    placeholder="再次输入"
+                    autoComplete="new-password"
+                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  />
+                </div>
+              </div>
+
+              {emailEnabled && (
+                <div className="space-y-2">
+                  <div>
+                    <label className="mb-1.5 flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Mail className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                        <span>绑定邮箱</span>
+                      </span>
+                      <span className="text-[11px] font-normal text-slate-400">选填</span>
+                    </label>
+                    <input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="用于邮箱登录与找回密码（可留空）"
+                      autoComplete="email"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                    />
+                  </div>
+
+                  {email.trim().length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={emailCode}
+                        onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        placeholder="6 位邮箱验证码"
+                        autoComplete="one-time-code"
+                        className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                      />
+                      <button
+                        type="button"
+                        disabled={codeSending || codeCooldown > 0}
+                        onClick={() => handleSendEmailCode('register')}
+                        className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] transition hover:bg-[#E7EEFF] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
+                      >
+                        {codeSending
+                          ? '发送中...'
+                          : codeCooldown > 0
+                            ? `${codeCooldown}s`
+                            : '获取验证码'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Forgot Password / Email OTP Reset Form */}
+          {mode === 'reset' && (
+            <>
+              <div className="flex items-center justify-between">
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  <ShieldCheck className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                  <span>通过邮箱重置密码</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('login')
+                    setError('')
+                    setInfoMsg('')
+                  }}
+                  className="text-xs font-medium text-[#4D6BFE] hover:underline"
+                >
+                  返回登录
+                </button>
+              </div>
+
+              <div>
+                <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                  <Mail className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                  <span>已绑定邮箱</span>
+                </label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="输入账号绑定的邮箱地址"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={emailCode}
+                  onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="6 位邮箱验证码"
+                  autoComplete="one-time-code"
+                  className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                />
+                <button
+                  type="button"
+                  disabled={codeSending || codeCooldown > 0}
+                  onClick={() => handleSendEmailCode('reset')}
+                  className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] transition hover:bg-[#E7EEFF] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
+                >
+                  {codeSending
+                    ? '发送中...'
+                    : codeCooldown > 0
+                      ? `${codeCooldown}s`
+                      : '获取验证码'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>新密码</span>
+                  </label>
+                  <input
+                    type="password"
+                    value={accountPassword}
+                    onChange={(e) => setAccountPassword(e.target.value)}
+                    placeholder="至少 8 位"
+                    autoComplete="new-password"
+                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <span>确认新密码</span>
                   </label>
                   <input
                     type="password"
@@ -640,6 +911,12 @@ export function LoginScreen({
             )}
           </div>
 
+          {infoMsg && (
+            <div className="rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
+              {infoMsg}
+            </div>
+          )}
+
           {error && (
             <div className="rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
               {error}
@@ -658,9 +935,11 @@ export function LoginScreen({
                   ? '登录'
                   : mode === 'register'
                     ? '注册'
-                    : mode === 'pair'
-                      ? '配对'
-                      : '登录'}
+                    : mode === 'reset'
+                      ? '重置密码'
+                      : mode === 'pair'
+                        ? '配对'
+                        : '登录'}
             </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>

@@ -6,6 +6,7 @@ import {
   Laptop,
   Loader2,
   LogOut,
+  Mail,
   Monitor,
   Pencil,
   Plus,
@@ -83,6 +84,7 @@ export function DeviceSwitcherModal({
   activeBridges = [],
   accountDevices = [],
   isAdmin = false,
+  emailEnabled = false,
   desktopBridge = null,
   onToggleDesktopBridge = null,
   onToggleDesktopAutoLaunch = null,
@@ -94,6 +96,8 @@ export function DeviceSwitcherModal({
   onRenameAccountDevice,
   onRemoveAccountDevice,
   onRefreshAccountDevices,
+  onSendBindEmailCode = null,
+  onBindAccountEmail = null,
   onOpenInviteManager,
 }) {
   const [probes, setProbes] = useState({})
@@ -103,6 +107,14 @@ export function DeviceSwitcherModal({
   const [confirmDeleteId, setConfirmDeleteId] = useState(null)
   const [confirmLogoutAccount, setConfirmLogoutAccount] = useState(false)
   const [copiedCmd, setCopiedCmd] = useState('')
+  const [showEmailPanel, setShowEmailPanel] = useState(false)
+  const [emailDraft, setEmailDraft] = useState('')
+  const [emailCodeDraft, setEmailCodeDraft] = useState('')
+  const [emailSending, setEmailSending] = useState(false)
+  const [emailBinding, setEmailBinding] = useState(false)
+  const [emailCooldown, setEmailCooldown] = useState(0)
+  const [emailError, setEmailError] = useState('')
+  const [emailInfo, setEmailInfo] = useState('')
 
   const activeEntry = devices.find((d) => d.id === activeDeviceId) || null
   const isAccountMode = Boolean(
@@ -133,10 +145,11 @@ export function DeviceSwitcherModal({
           const result = await probeDeviceStatus(d, 5000)
           setProbes((prev) => ({ ...prev, [d.id]: result }))
           const firstOnline = result.bridges.find((b) => b.online) || result.bridges[0] || null
-          if (firstOnline || result.label || result.username) {
+          if (firstOnline || result.label || result.username || result.email) {
             onSyncDeviceMeta?.(d.id, {
               ...(result.label ? { label: result.label } : {}),
               ...(result.username ? { username: result.username } : {}),
+              ...(result.email !== undefined ? { email: result.email } : {}),
               ...(result.role ? { role: result.role } : {}),
               ...(firstOnline?.hostname ? { lastHostname: firstOnline.hostname } : {}),
               ...(firstOnline?.platform ? { lastPlatform: firstOnline.platform } : {}),
@@ -154,12 +167,74 @@ export function DeviceSwitcherModal({
       setEditingId(null)
       setConfirmDeleteId(null)
       setConfirmLogoutAccount(false)
+      setShowEmailPanel(false)
+      setEmailDraft('')
+      setEmailCodeDraft('')
+      setEmailError('')
+      setEmailInfo('')
       return
     }
     void runProbeAll(devices)
   }, [open, devices.length, runProbeAll])
 
+  useEffect(() => {
+    if (emailCooldown <= 0) return undefined
+    const t = setTimeout(() => setEmailCooldown((v) => (v > 1 ? v - 1 : 0)), 1000)
+    return () => clearTimeout(t)
+  }, [emailCooldown])
+
   if (!open) return null
+
+  const handleSendBindCode = async () => {
+    setEmailError('')
+    setEmailInfo('')
+    const clean = emailDraft.trim()
+    if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
+      setEmailError('请输入有效的邮箱地址')
+      return
+    }
+    if (!onSendBindEmailCode) return
+    setEmailSending(true)
+    try {
+      const res = await onSendBindEmailCode(clean)
+      setEmailCooldown(res?.cooldownSec || 60)
+      setEmailInfo(res?.message || '验证码已发送，请查收邮件')
+    } catch (err) {
+      if (err?.retryAfterSec) setEmailCooldown(err.retryAfterSec)
+      setEmailError(String(err?.message || err))
+    } finally {
+      setEmailSending(false)
+    }
+  }
+
+  const handleCommitBindEmail = async (e) => {
+    e.preventDefault()
+    setEmailError('')
+    setEmailInfo('')
+    const clean = emailDraft.trim()
+    const code = emailCodeDraft.trim()
+    if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
+      setEmailError('请输入有效的邮箱地址')
+      return
+    }
+    if (!/^\d{6}$/.test(code)) {
+      setEmailError('请输入 6 位邮箱验证码')
+      return
+    }
+    if (!onBindAccountEmail) return
+    setEmailBinding(true)
+    try {
+      await onBindAccountEmail(clean, code)
+      setShowEmailPanel(false)
+      setEmailDraft('')
+      setEmailCodeDraft('')
+      setEmailInfo('')
+    } catch (err) {
+      setEmailError(String(err?.message || err))
+    } finally {
+      setEmailBinding(false)
+    }
+  }
 
   const copyBindCmd = async (kind, cmd) => {
     try { await navigator.clipboard.writeText(cmd) } catch {}
@@ -313,15 +388,42 @@ export function DeviceSwitcherModal({
                         @{activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}
                       </span>
                     </div>
-                    {accountDevices.length > 1 && (
-                      <div className="truncate text-[10.5px] text-slate-400">
-                        {onlineAcctCount}/{accountDevices.length} 在线
-                      </div>
-                    )}
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10.5px] text-slate-400">
+                      {activeEntry.email ? (
+                        <span className="truncate">{activeEntry.email}</span>
+                      ) : emailEnabled ? (
+                        <span>未绑定邮箱</span>
+                      ) : null}
+                      {accountDevices.length > 1 && (
+                        <span className="shrink-0">
+                          {onlineAcctCount}/{accountDevices.length} 在线
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
 
                 <div className="flex shrink-0 items-center gap-1">
+                  {(emailEnabled || isAdmin) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmLogoutAccount(false)
+                        setEmailError('')
+                        setEmailInfo('')
+                        setShowEmailPanel((v) => !v)
+                      }}
+                      title={activeEntry.email ? '更换绑定邮箱' : '绑定邮箱'}
+                      className={`inline-flex items-center gap-1 rounded-xl px-2 py-1.5 text-[11px] font-medium transition ${
+                        showEmailPanel
+                          ? 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#A9BDFF]'
+                          : 'text-slate-500 hover:bg-white/80 hover:text-[#4D6BFE] dark:text-slate-300 dark:hover:bg-slate-800/80'
+                      }`}
+                    >
+                      <Mail className="h-3.5 w-3.5" />
+                      <span>{activeEntry.email ? '换绑' : '绑邮箱'}</span>
+                    </button>
+                  )}
                   {isAdmin && onOpenInviteManager && (
                     <button
                       type="button"
@@ -337,7 +439,10 @@ export function DeviceSwitcherModal({
                   )}
                   <button
                     type="button"
-                    onClick={() => setConfirmLogoutAccount((v) => !v)}
+                    onClick={() => {
+                      setShowEmailPanel(false)
+                      setConfirmLogoutAccount((v) => !v)
+                    }}
                     title="退出或管理当前账号"
                     className="rounded-xl p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-950/40"
                   >
@@ -345,6 +450,88 @@ export function DeviceSwitcherModal({
                   </button>
                 </div>
               </div>
+
+              {showEmailPanel && (
+                <div className="mt-2.5 rounded-xl border border-slate-200/80 bg-white/95 p-3 dark:border-slate-700/80 dark:bg-[#151821]">
+                  {emailEnabled ? (
+                    <form onSubmit={handleCommitBindEmail} className="space-y-2">
+                      <div className="flex items-center justify-between text-[11.5px]">
+                        <span className="font-semibold text-slate-700 dark:text-slate-200">
+                          {activeEntry.email ? '更换绑定邮箱' : '绑定邮箱'}
+                        </span>
+                        <span className="text-[10.5px] text-slate-400">用于邮箱登录与找回密码</span>
+                      </div>
+                      <input
+                        type="email"
+                        value={emailDraft}
+                        onChange={(e) => setEmailDraft(e.target.value)}
+                        placeholder={activeEntry.email ? `新邮箱（当前：${activeEntry.email}）` : '输入要绑定的邮箱地址'}
+                        autoComplete="email"
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          value={emailCodeDraft}
+                          onChange={(e) => setEmailCodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          placeholder="6 位验证码"
+                          autoComplete="one-time-code"
+                          className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
+                        />
+                        <button
+                          type="button"
+                          disabled={emailSending || emailCooldown > 0}
+                          onClick={handleSendBindCode}
+                          className="shrink-0 rounded-xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-2.5 py-2 text-[11px] font-semibold text-[#2842C9] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
+                        >
+                          {emailSending ? '发送中' : emailCooldown > 0 ? `${emailCooldown}s` : '获取验证码'}
+                        </button>
+                      </div>
+                      {emailInfo && (
+                        <div className="rounded-lg bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                          {emailInfo}
+                        </div>
+                      )}
+                      {emailError && (
+                        <div className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">
+                          {emailError}
+                        </div>
+                      )}
+                      <div className="flex justify-end gap-1.5 pt-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setShowEmailPanel(false)}
+                          className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={emailBinding}
+                          className="rounded-lg bg-[#4D6BFE] px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
+                        >
+                          {emailBinding ? '绑定中...' : '确认绑定'}
+                        </button>
+                      </div>
+                    </form>
+                  ) : (
+                    <div className="space-y-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                      <div className="font-semibold text-slate-700 dark:text-slate-200">服务器尚未启用邮件服务</div>
+                      <p>
+                        在服务器 <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code>{' '}
+                        配置免费的 QQ / 163 / Gmail SMTP（<code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>、
+                        <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>、
+                        <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code>）并重启中转服务后，即可开启邮箱绑定与自助找回密码。
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {confirmLogoutAccount && (
                 <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">

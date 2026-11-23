@@ -103,7 +103,8 @@ if (cmd === 'users') {
     process.exit(0)
   }
   for (const u of users) {
-    console.log(`${u.userId}  @${u.username.padEnd(18)}  role=${u.role.padEnd(5)}  devices=${u.deviceCount}`)
+    const emailPart = u.email ? `  email=${u.email}` : ''
+    console.log(`${u.userId}  @${u.username.padEnd(18)}  role=${u.role.padEnd(5)}  devices=${u.deviceCount}${emailPart}`)
   }
   process.exit(0)
 }

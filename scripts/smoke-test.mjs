@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
+import net from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
@@ -1280,7 +1281,304 @@ async function main() {
     assert.equal(loadLastSessionId('dev1::pc1'), '')
     assert.equal(loadLastWorkspace('dev1::pc1'), '')
 
-    console.log('[smoke] 11/11 Antigravity split-brain transcript resilience, cache reconciliation, live watcher & per-session drafts OK')
+    console.log('[smoke] 11/12 Antigravity split-brain transcript resilience, cache reconciliation, live watcher & per-session drafts OK')
+
+    // 12. Optional email binding (zero-dependency SMTP), email login, post-login bind & self-service password reset
+    const noEmailBootstrap = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
+    assert.equal(noEmailBootstrap.emailEnabled, false, 'Unconfigured relay must report emailEnabled=false')
+    const noEmailSendRes = await fetch(`${httpBase}/api/account/email/send-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purpose: 'reset', email: 'test@example.com' }),
+    })
+    assert.equal(noEmailSendRes.status, 503, 'Unconfigured relay must reject send-code with 503')
+
+    const smtpInbox = []
+    const mockSmtp = net.createServer((sock) => {
+      let buf = ''
+      let state = 'cmd' // 'cmd' | 'auth_user' | 'auth_pass' | 'data'
+      let cur = { authUser: '', authPass: '', mailFrom: '', rcptTo: '', rawData: '' }
+      sock.write('220 mock-smtp.local ESMTP Ready\r\n')
+      sock.on('data', (chunk) => {
+        buf += chunk.toString('utf8')
+        while (true) {
+          if (state === 'data') {
+            const endIdx = buf.indexOf('\r\n.\r\n')
+            if (endIdx === -1) break
+            cur.rawData = buf.slice(0, endIdx)
+            buf = buf.slice(endIdx + 5)
+            // Decode UTF-8 base64 plain-text part to extract 6-digit code
+            const b64Match = cur.rawData.match(/Content-Type: text\/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/)
+            const decodedText = b64Match ? Buffer.from(b64Match[1].replace(/\r?\n/g, ''), 'base64').toString('utf8') : cur.rawData
+            const codeMatch = decodedText.match(/\b(\d{6})\b/)
+            smtpInbox.push({ ...cur, decodedText, code: codeMatch ? codeMatch[1] : '' })
+            cur = { authUser: cur.authUser, authPass: cur.authPass, mailFrom: '', rcptTo: '', rawData: '' }
+            state = 'cmd'
+            sock.write('250 2.0.0 OK queued\r\n')
+            continue
+          }
+          const nl = buf.indexOf('\n')
+          if (nl === -1) break
+          const line = buf.slice(0, nl).replace(/\r$/, '')
+          buf = buf.slice(nl + 1)
+          if (state === 'auth_user') {
+            cur.authUser = Buffer.from(line, 'base64').toString('utf8')
+            state = 'auth_pass'
+            sock.write('334 UGFzc3dvcmQ6\r\n')
+          } else if (state === 'auth_pass') {
+            cur.authPass = Buffer.from(line, 'base64').toString('utf8')
+            state = 'cmd'
+            sock.write('235 2.7.0 Authentication successful\r\n')
+          } else if (/^EHLO /i.test(line)) {
+            sock.write('250-mock-smtp.local\r\n250-AUTH LOGIN PLAIN\r\n250 OK\r\n')
+          } else if (/^AUTH LOGIN$/i.test(line)) {
+            state = 'auth_user'
+            sock.write('334 VXNlcm5hbWU6\r\n')
+          } else if (/^MAIL FROM:/i.test(line)) {
+            cur.mailFrom = line.slice(10).trim()
+            sock.write('250 OK\r\n')
+          } else if (/^RCPT TO:/i.test(line)) {
+            cur.rcptTo = line.slice(8).trim()
+            sock.write('250 OK\r\n')
+          } else if (/^DATA$/i.test(line)) {
+            state = 'data'
+            sock.write('354 End data with <CR><LF>.<CR><LF>\r\n')
+          } else if (/^QUIT$/i.test(line)) {
+            sock.write('221 Bye\r\n')
+            sock.end()
+          } else {
+            sock.write('250 OK\r\n')
+          }
+        }
+      })
+    })
+    await new Promise((r) => mockSmtp.listen(0, '127.0.0.1', r))
+    const mockSmtpPort = mockSmtp.address().port
+
+    const emailRelay = createRelayServer({
+      port: 0,
+      host: '127.0.0.1',
+      clientAccessToken: 'email-bootstrap-secret-99',
+      bridgeSecret: 'email-bridge-secret-99',
+      uploadDir: join(tmpDir, 'email-uploads'),
+      roomsFile: join(tmpDir, 'email-rooms.json'),
+      accountsFile: join(tmpDir, 'email-accounts.json'),
+      smtpHost: '127.0.0.1',
+      smtpPort: mockSmtpPort,
+      smtpSecure: false,
+      smtpStarttls: false,
+      smtpUser: 'noreply@example.com',
+      smtpPass: 'smtp-auth-secret',
+      smtpFrom: 'All in One <noreply@example.com>',
+      emailCodeOptions: { cooldownMs: 1200 },
+    })
+    try {
+      const { port: emailRelayPort } = await emailRelay.start()
+      const emailHttpBase = `http://127.0.0.1:${emailRelayPort}`
+
+      const bsEmail = await (await fetch(`${emailHttpBase}/api/account/bootstrap-status`)).json()
+      assert.equal(bsEmail.emailEnabled, true, 'SMTP-configured relay must report emailEnabled=true')
+      assert.equal(bsEmail.hasUsers, false)
+
+      // 12a. Bootstrap admin WITHOUT email (email is strictly optional during registration)
+      const evaReg = await (await fetch(`${emailHttpBase}/api/account/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'eva',
+          password: 'EvaAdminPassword1!',
+          inviteCode: 'email-bootstrap-secret-99',
+        }),
+      })).json()
+      assert.equal(evaReg.ok, true)
+      assert.equal(evaReg.user.email, '')
+      assert.equal(evaReg.user.emailVerified, false)
+
+      // Generate 2 invites
+      const invBatch = await (await fetch(`${emailHttpBase}/api/admin/invites`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${evaReg.token}`,
+        },
+        body: JSON.stringify({ count: 2, note: 'email-test' }),
+      })).json()
+      const [invEmail1, invEmail2] = invBatch.invites
+
+      // 12b. Invalid invite code must NOT trigger SMTP send (protects free SMTP quota)
+      const badInvSend = await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: 'INV-FAKE-0000' }),
+      })
+      assert.equal(badInvSend.status, 400)
+      assert.equal(smtpInbox.length, 0, 'Invalid invite code must never send an SMTP email')
+
+      // 12c. Valid invite -> real SMTP delivery + AUTH LOGIN verification + cooldown guard
+      const regCodeRes = await (await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: invEmail1.code }),
+      })).json()
+      assert.equal(regCodeRes.ok, true)
+      assert.equal(smtpInbox.length, 1)
+      assert.equal(smtpInbox[0].authUser, 'noreply@example.com')
+      assert.equal(smtpInbox[0].authPass, 'smtp-auth-secret')
+      assert.equal(smtpInbox[0].rcptTo, '<dave@example.com>')
+      assert.match(smtpInbox[0].code, /^\d{6}$/)
+      assert.ok(smtpInbox[0].decodedText.includes('注册账号'))
+
+      // Immediate resend hits 429 cooldown
+      const cooldownRes = await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: invEmail1.code }),
+      })
+      assert.equal(cooldownRes.status, 429, 'Immediate resend must be rate-limited by cooldown')
+
+      // 12d. Register Dave WITH verified email
+      const daveReg = await (await fetch(`${emailHttpBase}/api/account/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'dave',
+          password: 'DavePassword123!',
+          inviteCode: invEmail1.code,
+          email: 'dave@example.com',
+          emailCode: smtpInbox[0].code,
+        }),
+      })).json()
+      assert.equal(daveReg.ok, true)
+      assert.equal(daveReg.user.email, 'dave@example.com')
+      assert.equal(daveReg.user.emailVerified, true)
+
+      // 12e. Login via bound EMAIL works on both /api/account/login and /api/account/device-login
+      const daveEmailLogin = await (await fetch(`${emailHttpBase}/api/account/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'DAVE@Example.com', password: 'DavePassword123!' }),
+      })).json()
+      assert.equal(daveEmailLogin.ok, true)
+      assert.equal(daveEmailLogin.user.username, 'dave')
+      assert.equal(daveEmailLogin.user.email, 'dave@example.com')
+
+      const daveDeviceLogin = await (await fetch(`${emailHttpBase}/api/account/device-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'dave@example.com', password: 'DavePassword123!', label: 'Dave-PC' }),
+      })).json()
+      assert.equal(daveDeviceLogin.ok, true)
+      assert.equal(daveDeviceLogin.username, 'dave')
+
+      // 12f. Register Frank WITHOUT email, then bind email post-login via /api/account/email/bind
+      const frankReg = await (await fetch(`${emailHttpBase}/api/account/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'frank',
+          password: 'FrankPassword123!',
+          inviteCode: invEmail2.code,
+        }),
+      })).json()
+      assert.equal(frankReg.ok, true)
+      assert.equal(frankReg.user.email, '')
+
+      // Duplicate email rejected on bind
+      const dupBindSend = await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${frankReg.token}`,
+        },
+        body: JSON.stringify({ purpose: 'bind', email: 'dave@example.com' }),
+      })
+      assert.equal(dupBindSend.status, 400, 'Already-bound email must be rejected')
+
+      const bindSendRes = await (await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${frankReg.token}`,
+        },
+        body: JSON.stringify({ purpose: 'bind', email: 'frank@example.com' }),
+      })).json()
+      assert.equal(bindSendRes.ok, true)
+      assert.equal(smtpInbox.length, 2)
+
+      const bindConfirm = await (await fetch(`${emailHttpBase}/api/account/email/bind`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${frankReg.token}`,
+        },
+        body: JSON.stringify({ email: 'frank@example.com', code: smtpInbox[1].code }),
+      })).json()
+      assert.equal(bindConfirm.ok, true)
+      assert.equal(bindConfirm.user.email, 'frank@example.com')
+      assert.equal(bindConfirm.user.emailVerified, true)
+
+      const frankMe = await (await fetch(`${emailHttpBase}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${frankReg.token}` },
+      })).json()
+      assert.equal(frankMe.email, 'frank@example.com')
+      assert.equal(frankMe.emailVerified, true)
+      assert.equal(frankMe.emailEnabled, true)
+
+      // 12g. Self-service password reset: unbound email sends 0 SMTP messages; bound email resets & revokes old JWT!
+      const unknownResetSend = await (await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: 'reset', email: 'nobody@example.com' }),
+      })).json()
+      assert.equal(unknownResetSend.ok, true, 'Unbound reset request must return neutral ok response')
+      assert.equal(smtpInbox.length, 2, 'Unbound email must NOT send any SMTP message')
+
+      const daveResetSend = await (await fetch(`${emailHttpBase}/api/account/email/send-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: 'reset', email: 'dave@example.com' }),
+      })).json()
+      assert.equal(daveResetSend.ok, true)
+      assert.equal(smtpInbox.length, 3)
+
+      const daveResetConfirm = await (await fetch(`${emailHttpBase}/api/account/password/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'dave@example.com',
+          code: smtpInbox[2].code,
+          newPassword: 'DaveNewPassword99!',
+        }),
+      })).json()
+      assert.equal(daveResetConfirm.ok, true)
+      assert.equal(daveResetConfirm.username, 'dave')
+
+      // Old JWT is immediately revoked after password reset
+      const oldTokenMe = await fetch(`${emailHttpBase}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${daveEmailLogin.token}` },
+      })
+      assert.equal(oldTokenMe.status, 401, 'Old session token must be revoked after password reset')
+
+      // Old password fails, new password succeeds via email login
+      const oldPassTry = await fetch(`${emailHttpBase}/api/account/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'dave@example.com', password: 'DavePassword123!' }),
+      })
+      assert.equal(oldPassTry.status, 401)
+      const newPassLogin = await (await fetch(`${emailHttpBase}/api/account/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'dave@example.com', password: 'DaveNewPassword99!' }),
+      })).json()
+      assert.equal(newPassLogin.ok, true)
+      assert.equal(newPassLogin.user.username, 'dave')
+    } finally {
+      await emailRelay.close()
+      await new Promise((r) => mockSmtp.close(r))
+    }
+
+    console.log('[smoke] 12/12 Zero-dependency SMTP mailer, optional email register, email login, bind & password reset OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

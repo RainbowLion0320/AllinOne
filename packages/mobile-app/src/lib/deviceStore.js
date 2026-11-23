@@ -67,6 +67,7 @@ function sanitizeDevice(raw) {
     roomId,
     authMode,
     username: String(raw.username || '').trim().slice(0, 32),
+    email: String(raw.email || '').trim().slice(0, 254),
     role,
     customName: String(raw.customName || '').trim().slice(0, 40),
     label: String(raw.label || '').trim().slice(0, 64),
@@ -172,6 +173,7 @@ export function upsertDevice(state, payload) {
       roomId: incoming.roomId,
       authMode: incoming.authMode,
       username: incoming.username || existing.username || '',
+      email: incoming.email !== undefined && incoming.email !== '' ? incoming.email : existing.email || '',
       role: incoming.role || existing.role || '',
       label: incoming.label || existing.label,
       lastHostname: incoming.lastHostname || existing.lastHostname,
@@ -251,6 +253,13 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
     const val = String(patch.username || '').trim().slice(0, 32)
     if (val && val !== cur.username) {
       next.username = val
+      changed = true
+    }
+  }
+  if (patch.email !== undefined) {
+    const val = String(patch.email || '').trim().slice(0, 254)
+    if (val !== (cur.email || '')) {
+      next.email = val
       changed = true
     }
   }

@@ -19,6 +19,14 @@ services:
       PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-}
       REGISTER_INVITE_CODE: ${REGISTER_INVITE_CODE:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SECURE: ${SMTP_SECURE:-true}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM: ${RESEND_FROM:-}
     volumes:
       - relay_data:/app/packages/relay-server/data
     ports:

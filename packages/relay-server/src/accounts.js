@@ -5,6 +5,7 @@ import { safeEqual } from './auth.js'
 
 const INVITE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ' // No 0/O/1/I ambiguity
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
+const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;:"']{2,}$/
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
 
@@ -67,6 +68,17 @@ export function validateUsername(raw) {
   return { ok: true, username: u, usernameLower: u.toLowerCase() }
 }
 
+export function validateEmail(raw) {
+  const email = String(raw || '').trim()
+  if (!email) {
+    return { ok: false, error: '请输入邮箱地址' }
+  }
+  if (email.length > 254 || /[\r\n\0]/.test(email) || !EMAIL_RE.test(email)) {
+    return { ok: false, error: '请输入有效的邮箱地址' }
+  }
+  return { ok: true, email, emailLower: email.toLowerCase() }
+}
+
 export function validatePassword(raw) {
   const p = String(raw ?? '')
   if (p.length < 8) {
@@ -92,6 +104,8 @@ export function createAccountStore({ filePath }) {
   const usersById = new Map()
   /** @type {Map<string, string>} */
   const userIdByLower = new Map()
+  /** @type {Map<string, string>} */
+  const userIdByEmailLower = new Map()
   /** @type {Map<string, any>} */
   const invitesById = new Map()
 
@@ -101,15 +115,24 @@ export function createAccountStore({ filePath }) {
       const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
       for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
         if (!u?.userId || !u?.username) continue
+        const rawEmail = String(u.email || '').trim()
+        const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
         const normalized = {
           ...u,
           usernameLower: String(u.usernameLower || u.username).toLowerCase(),
+          email: rawEmail,
+          emailLower,
+          emailVerified: Boolean(rawEmail && u.emailVerified),
+          emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
           role: u.role === 'admin' ? 'admin' : 'user',
           tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
           devices: Array.isArray(u.devices) ? u.devices : [],
         }
         usersById.set(normalized.userId, normalized)
         userIdByLower.set(normalized.usernameLower, normalized.userId)
+        if (normalized.emailLower) {
+          userIdByEmailLower.set(normalized.emailLower, normalized.userId)
+        }
       }
       for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
         if (!inv?.id || !inv?.code) continue
@@ -154,6 +177,8 @@ export function createAccountStore({ filePath }) {
     return {
       userId: u.userId,
       username: u.username,
+      email: u.email || '',
+      emailVerified: Boolean(u.email && u.emailVerified),
       role: u.role,
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
@@ -224,7 +249,40 @@ export function createAccountStore({ filePath }) {
     return { ok: true, invite: { ...target } }
   }
 
-  function registerUser({ username, password, inviteCode = '', isBootstrapAdmin = false } = {}) {
+  function hasActiveInviteCode(inviteCode) {
+    const normalized = normalizeInviteCode(inviteCode)
+    if (!normalized) return false
+    for (const inv of invitesById.values()) {
+      if (inv.status === 'active' && safeEqual(inv.code, normalized)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  function isEmailTaken(email, excludeUserId = '') {
+    const lower = String(email || '').trim().toLowerCase()
+    if (!lower) return false
+    const ownerId = userIdByEmailLower.get(lower)
+    return Boolean(ownerId && ownerId !== excludeUserId)
+  }
+
+  function getUserByEmail(email) {
+    const lower = String(email || '').trim().toLowerCase()
+    if (!lower) return null
+    const userId = userIdByEmailLower.get(lower)
+    if (!userId) return null
+    return sanitizeUser(usersById.get(userId))
+  }
+
+  function registerUser({
+    username,
+    password,
+    inviteCode = '',
+    email = '',
+    emailVerified = false,
+    isBootstrapAdmin = false,
+  } = {}) {
     const uCheck = validateUsername(username)
     if (!uCheck.ok) return uCheck
     const pCheck = validatePassword(password)
@@ -232,6 +290,18 @@ export function createAccountStore({ filePath }) {
 
     if (userIdByLower.has(uCheck.usernameLower)) {
       return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+    }
+
+    let cleanEmail = ''
+    let cleanEmailLower = ''
+    if (String(email || '').trim()) {
+      const eCheck = validateEmail(email)
+      if (!eCheck.ok) return eCheck
+      if (userIdByEmailLower.has(eCheck.emailLower)) {
+        return { ok: false, error: '该邮箱已被其他账号绑定' }
+      }
+      cleanEmail = eCheck.email
+      cleanEmailLower = eCheck.emailLower
     }
 
     let matchedInvite = null
@@ -268,6 +338,10 @@ export function createAccountStore({ filePath }) {
       userId,
       username: uCheck.username,
       usernameLower: uCheck.usernameLower,
+      email: cleanEmail,
+      emailLower: cleanEmailLower,
+      emailVerified: Boolean(cleanEmail && emailVerified),
+      emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
       role,
       passwordSalt: salt,
       passwordHash: hash,
@@ -281,6 +355,9 @@ export function createAccountStore({ filePath }) {
 
     usersById.set(userId, record)
     userIdByLower.set(record.usernameLower, userId)
+    if (record.emailLower) {
+      userIdByEmailLower.set(record.emailLower, userId)
+    }
     save()
 
     return {
@@ -290,10 +367,13 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function authenticateUser(username, password) {
-    const lower = String(username || '').trim().toLowerCase()
+  function authenticateUser(identifier, password) {
+    const lower = String(identifier || '').trim().toLowerCase()
     if (!lower || !password) return null
-    const userId = userIdByLower.get(lower)
+    let userId = userIdByLower.get(lower)
+    if (!userId && lower.includes('@')) {
+      userId = userIdByEmailLower.get(lower)
+    }
     if (!userId) return null
     const record = usersById.get(userId)
     if (!record) return null
@@ -306,6 +386,50 @@ export function createAccountStore({ filePath }) {
       user: sanitizeUser(record),
       devices: record.devices.map(sanitizeDeviceRecord),
     }
+  }
+
+  function setUserEmail(userId, email, { verified = true } = {}) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    const eCheck = validateEmail(email)
+    if (!eCheck.ok) return eCheck
+    const existingOwner = userIdByEmailLower.get(eCheck.emailLower)
+    if (existingOwner && existingOwner !== userId) {
+      return { ok: false, error: '该邮箱已被其他账号绑定' }
+    }
+    if (record.emailLower && record.emailLower !== eCheck.emailLower) {
+      if (userIdByEmailLower.get(record.emailLower) === userId) {
+        userIdByEmailLower.delete(record.emailLower)
+      }
+    }
+    record.email = eCheck.email
+    record.emailLower = eCheck.emailLower
+    record.emailVerified = Boolean(verified)
+    record.emailVerifiedAt = verified ? Date.now() : 0
+    userIdByEmailLower.set(record.emailLower, userId)
+    save()
+    return { ok: true, user: sanitizeUser(record) }
+  }
+
+  function resetPasswordByEmail(email, newPassword) {
+    const eCheck = validateEmail(email)
+    if (!eCheck.ok) return eCheck
+    const pCheck = validatePassword(newPassword)
+    if (!pCheck.ok) return pCheck
+    const userId = userIdByEmailLower.get(eCheck.emailLower)
+    if (!userId) {
+      return { ok: false, error: '该邮箱未绑定任何账号' }
+    }
+    const record = usersById.get(userId)
+    if (!record) {
+      return { ok: false, error: '账号不存在' }
+    }
+    const { salt, hash } = hashPassword(pCheck.password)
+    record.passwordSalt = salt
+    record.passwordHash = hash
+    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    save()
+    return { ok: true, user: sanitizeUser(record) }
   }
 
   function changePassword(userId, currentPassword, newPassword) {
@@ -451,8 +575,13 @@ export function createAccountStore({ filePath }) {
     createInvites,
     listInvites,
     revokeInvite,
+    hasActiveInviteCode,
+    isEmailTaken,
+    getUserByEmail,
     registerUser,
     authenticateUser,
+    setUserEmail,
+    resetPasswordByEmail,
     changePassword,
     bindDevice,
     verifyDeviceBridge,

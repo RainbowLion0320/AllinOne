@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import {
   MobileRelayClient,
+  bindAccountEmail,
   detectDefaultServerUrl,
   listAccountDevices,
   pairWithRelay,
@@ -19,6 +20,7 @@ import {
   renameAccountDevice,
   requestMediaToken,
   revokeDeviceSessions,
+  sendEmailVerificationCode,
 } from './lib/wsClient.js'
 import {
   getActiveDevice,
@@ -69,6 +71,7 @@ export function App() {
   const [connState, setConnState] = useState('disconnected')
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
+  const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
   const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '', unsupported: false })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -1142,10 +1145,78 @@ export function App() {
   const handleRefreshAccountDevices = useCallback(async () => {
     if (!activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) return
     try {
-      const res = await listAccountDevices(activeDevice.baseUrl, activeDevice.token)
-      setAccountDevices(res.devices)
+      const [devRes, meRes] = await Promise.all([
+        listAccountDevices(activeDevice.baseUrl, activeDevice.token).catch(() => null),
+        probeDeviceStatus(activeDevice, 5000).catch(() => null),
+      ])
+      if (devRes) setAccountDevices(devRes.devices)
+      if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
+        setServerEmailEnabled(Boolean(meRes.emailEnabled))
+        setDeviceState((prev) =>
+          updateDeviceMeta(prev, activeDevice.id, {
+            ...(meRes.username ? { username: meRes.username } : {}),
+            ...(meRes.role ? { role: meRes.role } : {}),
+            email: meRes.email || '',
+          }),
+        )
+      }
     } catch {}
-  }, [activeDevice?.baseUrl, activeDevice?.token, isAccountMode])
+  }, [activeDevice, isAccountMode])
+
+  useEffect(() => {
+    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) {
+      setServerEmailEnabled(false)
+      return
+    }
+    let cancelled = false
+    probeDeviceStatus(activeDevice, 5000)
+      .then((res) => {
+        if (cancelled || !res || res.status === 'expired' || res.status === 'unreachable') return
+        setServerEmailEnabled(Boolean(res.emailEnabled))
+        setDeviceState((prev) =>
+          updateDeviceMeta(prev, activeDevice.id, {
+            ...(res.username ? { username: res.username } : {}),
+            ...(res.role ? { role: res.role } : {}),
+            email: res.email || '',
+          }),
+        )
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, isAccountMode])
+
+  const handleSendBindEmailCode = useCallback(
+    async (targetEmail) => {
+      if (!activeDevice?.baseUrl || !activeDevice?.token) {
+        throw new Error('未登录账号')
+      }
+      return sendEmailVerificationCode(activeDevice.baseUrl, {
+        purpose: 'bind',
+        email: targetEmail,
+        token: activeDevice.token,
+      })
+    },
+    [activeDevice?.baseUrl, activeDevice?.token],
+  )
+
+  const handleBindAccountEmail = useCallback(
+    async (targetEmail, code) => {
+      if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) {
+        throw new Error('未登录账号')
+      }
+      const user = await bindAccountEmail(activeDevice.baseUrl, activeDevice.token, {
+        email: targetEmail,
+        code,
+      })
+      const boundEmail = user?.email || targetEmail
+      setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { email: boundEmail }))
+      showToast(`已绑定邮箱 ${boundEmail}`)
+      return user
+    },
+    [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
+  )
 
   const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
     const target = devices.find((d) => d.id === deviceId)
@@ -1677,6 +1748,7 @@ export function App() {
         activeBridges={bridges}
         accountDevices={accountDevices}
         isAdmin={isAdmin}
+        emailEnabled={serverEmailEnabled}
         desktopBridge={desktopBridge}
         onToggleDesktopBridge={
           desktopApi
@@ -1708,6 +1780,8 @@ export function App() {
         onRenameAccountDevice={handleRenameAccountDevice}
         onRemoveAccountDevice={handleRemoveAccountDevice}
         onRefreshAccountDevices={handleRefreshAccountDevices}
+        onSendBindEmailCode={handleSendBindEmailCode}
+        onBindAccountEmail={handleBindAccountEmail}
         onOpenInviteManager={() => setInviteManagerOpen(true)}
       />
 

@@ -78,6 +78,24 @@ docker compose restart allinone-relay
 
 Then follow **1. Install the Client** above to register your admin account. Additional single-use invite codes can be created and revoked directly inside the app UI.
 
+<details>
+<summary>Optional: Enable free email binding & self-service password reset (SMTP / Resend)</summary>
+
+Add any standard SMTP credentials (such as Gmail, QQ Mail, or 163 Mail on TLS port 465) to `deploy/.env` and restart the relay to enable optional email binding during signup, email login, post-login email binding, and forgot-password reset:
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+SMTP_FROM=All in One <your-email@gmail.com>
+```
+
+> Resend HTTPS API (`RESEND_API_KEY` + `RESEND_FROM`) is also supported. When omitted, accounts work with username + password + invite code.
+
+</details>
+
 ---
 
 ## Supported Agents

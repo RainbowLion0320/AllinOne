@@ -79,6 +79,24 @@ docker compose restart allinone-relay
 接着按上面的 **「1. 安装客户端」** 注册你的管理员账号。之后可以直接在客户端的「邀请码管理」里随时生成和作废一次性邀请码。
 
 <details>
+<summary>可选：开启免费邮箱绑定与自助找回密码（QQ / 163 / Gmail SMTP）</summary>
+
+在 `deploy/.env`（或 `packages/relay-server/.env`）中补充任意免费邮箱的 SMTP 授权码并重启中转服务，即可开启注册选填邮箱、邮箱登录、账号补绑/换绑邮箱及「忘记密码」重置：
+
+```env
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=你的邮箱@qq.com
+SMTP_PASS=邮箱设置里生成的SMTP授权码
+SMTP_FROM=All in One <你的邮箱@qq.com>
+```
+
+> 也可使用 `RESEND_API_KEY` + `RESEND_FROM` 通过 Resend HTTPS API 发送；未配置时自动以用户名 + 密码 + 邀请码模式运行。
+
+</details>
+
+<details>
 <summary>常用管理命令</summary>
 
 ```bash

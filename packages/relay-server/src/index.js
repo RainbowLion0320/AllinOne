@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { RPC } from '@allinone/shared'
 import { createAuthManager } from './auth.js'
-import { createAccountStore } from './accounts.js'
+import { createAccountStore, validateEmail, validatePassword } from './accounts.js'
+import { createEmailCodeStore } from './emailCodes.js'
+import { createMailer } from './mailer.js'
 import { RelayHub } from './hub.js'
 import { createRoomStore } from './rooms.js'
 
@@ -202,6 +204,8 @@ export function createRelayServer(options = {}) {
 
   const rooms = createRoomStore({ filePath: roomsFile })
   const accounts = createAccountStore({ filePath: accountsFile })
+  const mailer = createMailer(options)
+  const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
   const auth = createAuthManager({
     clientAccessToken,
     bridgeSecret,
@@ -466,16 +470,137 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Account bootstrap check (tiny boolean so first-time UI knows whether an admin account already exists)
+    // Account bootstrap check (tiny status so UI knows whether an admin exists & whether SMTP email is enabled)
     if (pathname === '/api/account/bootstrap-status' && req.method === 'GET') {
       sendJson(res, 200, {
         ok: true,
         hasUsers: accounts.userCount() > 0,
+        emailEnabled: mailer.isConfigured(),
       })
       return
     }
 
+    // Send 6-digit email verification code for optional register binding, post-login email bind, or password reset
+    if (pathname === '/api/account/email/send-code' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
+      if (!mailer.isConfigured()) {
+        sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP）' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const purpose = String(body.purpose || '').trim()
+        if (purpose !== 'register' && purpose !== 'bind' && purpose !== 'reset') {
+          sendJson(res, 400, { ok: false, error: '不支持的验证码用途' })
+          return
+        }
+        const eCheck = validateEmail(body.email)
+        if (!eCheck.ok) {
+          sendJson(res, 400, { ok: false, error: eCheck.error })
+          return
+        }
+
+        let targetUserId = ''
+        let targetUsername = ''
+        let shouldDeliver = true
+
+        if (purpose === 'register') {
+          const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
+          const isBootstrapAdmin =
+            accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAccessPassword(inviteCode)
+          if (!isBootstrapAdmin && !accounts.hasActiveInviteCode(inviteCode)) {
+            auth.recordFailure(ip)
+            sendJson(res, 400, { ok: false, error: '请先填写有效的一次性邀请码，再获取邮箱验证码' })
+            return
+          }
+          if (accounts.isEmailTaken(eCheck.email)) {
+            sendJson(res, 400, { ok: false, error: '该邮箱已被其他账号绑定' })
+            return
+          }
+        } else if (purpose === 'bind') {
+          const payload = auth.verifySessionToken(extractBearer(req))
+          if (!payload || !String(payload.room || '').startsWith('usr_')) {
+            sendJson(res, 401, { ok: false, error: '请先登录账号后再绑定邮箱' })
+            return
+          }
+          const curUser = accounts.getUserById(payload.room)
+          if (!curUser) {
+            sendJson(res, 401, { ok: false, error: '账号不存在' })
+            return
+          }
+          if (accounts.isEmailTaken(eCheck.email, payload.room)) {
+            sendJson(res, 400, { ok: false, error: '该邮箱已被其他账号绑定' })
+            return
+          }
+          if (curUser.email && curUser.email.toLowerCase() === eCheck.emailLower && curUser.emailVerified) {
+            sendJson(res, 400, { ok: false, error: '当前账号已绑定该邮箱' })
+            return
+          }
+          targetUserId = payload.room
+          targetUsername = curUser.username
+        } else if (purpose === 'reset') {
+          const matchedUser = accounts.getUserByEmail(eCheck.email)
+          if (!matchedUser) {
+            // Do not reveal whether the email is registered and do not spend SMTP quota
+            shouldDeliver = false
+          } else {
+            targetUserId = matchedUser.userId
+            targetUsername = matchedUser.username
+          }
+        }
+
+        const issued = emailCodes.issueCode({
+          purpose,
+          email: eCheck.email,
+          ip,
+          userId: targetUserId,
+        })
+        if (!issued.ok) {
+          sendJson(res, 429, {
+            ok: false,
+            error: issued.error,
+            ...(issued.retryAfterSec ? { retryAfterSec: issued.retryAfterSec } : {}),
+          })
+          return
+        }
+
+        if (shouldDeliver) {
+          try {
+            await mailer.sendVerificationCode({
+              to: eCheck.email,
+              code: issued.code,
+              purpose,
+              username: targetUsername,
+            })
+          } catch (err) {
+            issued.rollback()
+            console.error(`[relay] Failed to send ${purpose} verification email:`, err?.message || err)
+            sendJson(res, 502, { ok: false, error: '验证码发送失败，请稍后重试或检查邮件服务配置' })
+            return
+          }
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          cooldownSec: issued.cooldownSec,
+          expiresInSec: issued.expiresInSec,
+          message:
+            purpose === 'reset'
+              ? '如果该邮箱已绑定账号，验证码已发送（10 分钟内有效）'
+              : '验证码已发送至邮箱（10 分钟内有效）',
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
     // Account registration (strictly requires an admin-issued single-use invite code;
+    // email binding is strictly optional when SMTP is configured;
     // when 0 users exist yet, server CLIENT_ACCESS_TOKEN works once to bootstrap the first admin account)
     if (pathname === '/api/account/register' && req.method === 'POST') {
       const ip = getClientIp(req)
@@ -489,16 +614,51 @@ export function createRelayServer(options = {}) {
         const isBootstrapAdmin =
           accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAccessPassword(inviteCode)
 
+        const rawEmail = String(body.email || '').trim()
+        let verifiedEmail = ''
+        if (rawEmail) {
+          if (!mailer.isConfigured()) {
+            sendJson(res, 400, { ok: false, error: '服务器尚未开启邮箱验证，请留空邮箱直接注册' })
+            return
+          }
+          const eCheck = validateEmail(rawEmail)
+          if (!eCheck.ok) {
+            sendJson(res, 400, { ok: false, error: eCheck.error })
+            return
+          }
+          if (accounts.isEmailTaken(eCheck.email)) {
+            sendJson(res, 400, { ok: false, error: '该邮箱已被其他账号绑定' })
+            return
+          }
+          const codeCheck = emailCodes.verifyCode({
+            purpose: 'register',
+            email: eCheck.email,
+            code: body.emailCode,
+            consume: false,
+          })
+          if (!codeCheck.ok) {
+            auth.recordFailure(ip)
+            sendJson(res, 400, { ok: false, error: codeCheck.error })
+            return
+          }
+          verifiedEmail = eCheck.email
+        }
+
         const result = accounts.registerUser({
           username: body.username,
           password: body.password,
           inviteCode,
+          email: verifiedEmail,
+          emailVerified: Boolean(verifiedEmail),
           isBootstrapAdmin,
         })
         if (!result.ok) {
           auth.recordFailure(ip)
           sendJson(res, 400, { ok: false, error: result.error })
           return
+        }
+        if (verifiedEmail) {
+          emailCodes.consumeCode({ purpose: 'register', email: verifiedEmail })
         }
         auth.clearFailure(ip)
         const user = result.user
@@ -523,6 +683,104 @@ export function createRelayServer(options = {}) {
       return
     }
 
+    // Bind or replace verified email for an authenticated account
+    if (pathname === '/api/account/email/bind' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
+        return
+      }
+      if (!mailer.isConfigured()) {
+        sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP）' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const eCheck = validateEmail(body.email)
+        if (!eCheck.ok) {
+          sendJson(res, 400, { ok: false, error: eCheck.error })
+          return
+        }
+        const codeCheck = emailCodes.verifyCode({
+          purpose: 'bind',
+          email: eCheck.email,
+          code: body.code,
+          userId: payload.room,
+          consume: false,
+        })
+        if (!codeCheck.ok) {
+          sendJson(res, 400, { ok: false, error: codeCheck.error })
+          return
+        }
+        const updated = accounts.setUserEmail(payload.room, eCheck.email, { verified: true })
+        if (!updated.ok) {
+          sendJson(res, 400, { ok: false, error: updated.error })
+          return
+        }
+        emailCodes.consumeCode({ purpose: 'bind', email: eCheck.email })
+        sendJson(res, 200, { ok: true, user: updated.user })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Self-service password reset using verified email OTP (revokes all active sessions immediately)
+    if (pathname === '/api/account/password/reset' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
+      if (!mailer.isConfigured()) {
+        sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP）' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const eCheck = validateEmail(body.email)
+        if (!eCheck.ok) {
+          sendJson(res, 400, { ok: false, error: eCheck.error })
+          return
+        }
+        const pCheck = validatePassword(body.newPassword)
+        if (!pCheck.ok) {
+          sendJson(res, 400, { ok: false, error: pCheck.error })
+          return
+        }
+        const matchedUser = accounts.getUserByEmail(eCheck.email)
+        const codeCheck = emailCodes.verifyCode({
+          purpose: 'reset',
+          email: eCheck.email,
+          code: body.code,
+          userId: matchedUser?.userId || '',
+          consume: false,
+        })
+        if (!codeCheck.ok || !matchedUser) {
+          auth.recordFailure(ip)
+          sendJson(res, 400, { ok: false, error: codeCheck.ok ? '邮箱验证码无效或已过期' : codeCheck.error })
+          return
+        }
+        const reset = accounts.resetPasswordByEmail(eCheck.email, pCheck.password)
+        if (!reset.ok) {
+          auth.recordFailure(ip)
+          sendJson(res, 400, { ok: false, error: reset.error })
+          return
+        }
+        emailCodes.consumeCode({ purpose: 'reset', email: eCheck.email })
+        auth.clearFailure(ip)
+        purgeRoomBridgeImgCache(reset.user.userId)
+        hub.disconnectRoomClients(reset.user.userId, 4401, 'Password reset')
+        sendJson(res, 200, {
+          ok: true,
+          username: reset.user.username,
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
     // Account mobile/web login -> room-scoped JWT bound to `usr_<id>` + auto-returns all bound PCs!
     if (pathname === '/api/account/login' && req.method === 'POST') {
       const ip = getClientIp(req)
@@ -535,7 +793,7 @@ export function createRelayServer(options = {}) {
         const verified = accounts.authenticateUser(body.username, body.password)
         if (!verified) {
           auth.recordFailure(ip)
-          sendJson(res, 401, { ok: false, error: '用户名或密码不正确' })
+          sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
         auth.clearFailure(ip)
@@ -574,7 +832,7 @@ export function createRelayServer(options = {}) {
         const verified = accounts.authenticateUser(body.username, body.password)
         if (!verified) {
           auth.recordFailure(ip)
-          sendJson(res, 401, { ok: false, error: '用户名或密码不正确' })
+          sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
         auth.clearFailure(ip)
@@ -941,6 +1199,9 @@ export function createRelayServer(options = {}) {
         user: payload,
         roomId: payload.room,
         username: acctUser?.username || payload.uname || '',
+        email: acctUser?.email || '',
+        emailVerified: Boolean(acctUser?.emailVerified),
+        emailEnabled: mailer.isConfigured(),
         role: acctUser?.role || (payload.room === 'owner' ? 'admin' : 'user'),
         label: acctUser ? `@${acctUser.username}` : roomMeta?.label || '',
         ...(isAccount ? { devices: getMergedAccountDevices(payload.room, bridges) } : {}),
@@ -1234,6 +1495,7 @@ export function createRelayServer(options = {}) {
         const boundPort = typeof addr === 'object' && addr ? addr.port : port
         console.log(`[relay] AllinOne Relay Server listening on http://${host}:${boundPort}`)
         console.log(`[relay] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
+        console.log(`[relay] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
         if (clientAccessToken === 'allinone-dev-pass' || bridgeSecret === 'allinone-dev-bridge') {
           console.warn('[relay] WARNING: Using default dev secrets! Please set CLIENT_ACCESS_TOKEN and BRIDGE_SECRET in .env before deploying publicly.')
         }
@@ -1250,7 +1512,7 @@ export function createRelayServer(options = {}) {
       })
     })
 
-  return { server, wss, hub, rooms, accounts, start, close }
+  return { server, wss, hub, rooms, accounts, mailer, start, close }
 }
 
 // Run directly when invoked as main script
