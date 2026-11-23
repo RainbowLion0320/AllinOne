@@ -187,7 +187,7 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
         },
         cwd: {
           type: 'string',
-          description: '可选。新建对话时的工作目录绝对路径（例如 `G:\\tools\\AllinOne`）。',
+          description: '可选。新建对话时的工作目录绝对路径（例如 `/path/to/your-project`）。',
         },
         title: {
           type: 'string',

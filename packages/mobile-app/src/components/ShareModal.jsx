@@ -17,6 +17,8 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 
+const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
+const RELEASES_URL = String(import.meta.env.VITE_RELEASES_URL || '').trim() || DEFAULT_RELEASES_URL
 const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
 
 function resolveApkUrl(base) {
@@ -59,11 +61,12 @@ export function ShareModal({
         ]
       : []),
     '',
-    '【第 1 步：手机注册并登录账号】',
-    `• 网页入口（推荐添加到主屏幕）：${webUrl}`,
-    ...(apkUrl ? [`• Android App：下载安装 ${apkUrl}`] : []),
+    '【第 1 步：下载客户端或打开网页注册】',
+    `• 桌面端 & Android 安装包（GitHub Releases）：${RELEASES_URL}`,
+    `• 手机网页入口（推荐添加到主屏幕）：${webUrl}`,
+    ...(apkUrl && apkUrl !== RELEASES_URL ? [`• Android 直链：${apkUrl}`] : []),
     '',
-    '【第 2 步：在你的电脑运行 1 行命令（或安装桌面客户端）并登录同一账号】',
+    '【第 2 步：在你的电脑登录同一账号（或运行 1 行命令）】',
     `• macOS / Linux: ${unixCmd}`,
     `• Windows (PowerShell): ${winCmd}`,
     '登录成功后，手机端和桌面端即可自动发现并连接你的全部电脑。',
@@ -237,14 +240,31 @@ export function ShareModal({
           </div>
         </div>
 
-        {/* Step 2: Mobile links */}
+        {/* Step 2: Installers (GitHub Releases) & Web links */}
         <div className="mb-3.5 space-y-2 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171E]">
           <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100">
             <Smartphone className="h-3.5 w-3.5 text-[#4D6BFE]" />
-            手机端入口
+            安装包与入口
           </div>
 
-          {apkUrl && (
+          <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">
+                <Download className="h-3.5 w-3.5 text-emerald-500" />
+                <span>桌面端 / Android 安装包 (GitHub)</span>
+              </div>
+              <div className="truncate text-[10.5px] text-slate-400">{RELEASES_URL}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => copyText('releases', RELEASES_URL)}
+              className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              {copiedKey === 'releases' ? '已复制' : '复制'}
+            </button>
+          </div>
+
+          {apkUrl && apkUrl !== RELEASES_URL && (
             <div className="flex items-center justify-between gap-2 rounded-xl bg-white px-3 py-2 dark:bg-[#1E222D]">
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800 dark:text-slate-100">

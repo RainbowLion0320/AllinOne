@@ -79,6 +79,7 @@ jobs:
             ### Downloads
             - **macOS (Apple Silicon)**: `All.in.One-*-arm64.dmg`
             - **Windows (x64)**: `All.in.One.Setup.*.exe`
+            - **Android**: See `All-in-One-Android.apk` on Releases (auto hot-updates UI) or install via Mobile Browser PWA (**Add to Home Screen**).
 
             > **macOS first launch**: Open-source builds are ad-hoc signed without an Apple Developer notarization certificate. If Gatekeeper blocks the first launch, allow it in **System Settings → Privacy & Security → Open Anyway**, or run `xattr -cr "/Applications/All in One.app"` once in Terminal.
           files: release-artifacts/*

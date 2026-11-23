@@ -19,6 +19,8 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 
+const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
+const RELEASES_URL = String(import.meta.env.VITE_RELEASES_URL || '').trim() || DEFAULT_RELEASES_URL
 const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
 
 function resolveApkUrl(base) {
@@ -114,7 +116,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
       '给你分享一个 All in One 一次性注册邀请码（仅限 1 人使用）：',
       `邀请码：${inv.code}`,
       `注册直达链接：${regUrl}`,
-      ...(apkUrl ? [`Android App 下载：${apkUrl}`] : []),
+      `客户端安装包（Windows / macOS / Android）：${RELEASES_URL}`,
+      ...(apkUrl && apkUrl !== RELEASES_URL ? [`Android 直链：${apkUrl}`] : []),
       '',
       '注册完账号后，在自己电脑安装桌面端或运行 1 行命令并登录同一账号即可自动连接所有电脑：',
       `• macOS / Linux: curl -fsSL ${cleanBase}/setup.sh | bash`,

@@ -43,7 +43,8 @@ Linux 或纯终端环境可直接运行一行命令接入：
 
 #### 手机端
 
-用手机浏览器打开服务器地址，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
+- **Android**：在 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载 `All-in-One-Android.apk` 安装（自动热更新最新界面），或直接在浏览器打开服务器地址。
+- **iOS / 通用网页**：用手机浏览器打开服务器地址，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
 
 ---
 
