@@ -77,7 +77,7 @@ docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite cr
 docker compose restart allinone-relay
 ```
 
-接着按上面的 **「1. 安装客户端」** 注册你的管理员账号。之后可以直接在客户端的「邀请码管理」里随时生成和作废一次性邀请码。
+接着按上面的 **「1. 安装客户端」** 注册你的管理员账号。之后可以直接在客户端的「邀请码管理」里随时生成和作废一次性邀请码，或访问 **`https://你的服务器/admin`**（也可在客户端「设置 → 服务器监控看板」直达）按需查看全服用户在线状态、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询消耗）。
 
 <details>
 <summary>可选：开启免费邮箱绑定与自助找回密码（QQ / 163 / Gmail SMTP）</summary>

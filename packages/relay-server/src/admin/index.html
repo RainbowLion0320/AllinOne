@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>All in One · 服务器监控看板</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128' fill='none'%3E%3Cdefs%3E%3ClinearGradient id='bg' x1='64' y1='0' x2='64' y2='128' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0%25' stop-color='%23141822'/%3E%3Cstop offset='100%25' stop-color='%2307090F'/%3E%3C/linearGradient%3E%3ClinearGradient id='ring' x1='64' y1='18' x2='64' y2='110' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0%25' stop-color='%23F2FAFF'/%3E%3Cstop offset='28%25' stop-color='%234CC9FA'/%3E%3Cstop offset='68%25' stop-color='%233B82F6'/%3E%3Cstop offset='100%25' stop-color='%236C63FF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='128' height='128' rx='30' fill='url(%23bg)'/%3E%3Ccircle cx='64' cy='64' r='37' stroke='url(%23ring)' stroke-width='15'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/admin/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-root">
+    <!-- Login View -->
+    <div id="login-view" class="login-shell hidden">
+      <div class="login-card">
+        <div class="login-brand">
+          <svg class="brand-logo" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="lg-bg" x1="64" y1="0" x2="64" y2="128" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#141822" />
+                <stop offset="100%" stop-color="#07090F" />
+              </linearGradient>
+              <linearGradient id="lg-ring" x1="64" y1="18" x2="64" y2="110" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#F2FAFF" />
+                <stop offset="28%" stop-color="#4CC9FA" />
+                <stop offset="68%" stop-color="#3B82F6" />
+                <stop offset="100%" stop-color="#6C63FF" />
+              </linearGradient>
+            </defs>
+            <rect width="128" height="128" rx="30" fill="url(#lg-bg)" />
+            <circle cx="64" cy="64" r="37" stroke="url(#lg-ring)" stroke-width="15" />
+          </svg>
+          <div>
+            <h1 id="login-title">All in One 监控看板</h1>
+            <p id="login-subtitle">服务器全用户在线状态与轻量运维后台</p>
+          </div>
+        </div>
+
+        <div class="auth-mode-tabs" role="tablist">
+          <button type="button" id="mode-account-btn" class="auth-tab active" data-mode="account">管理员账号</button>
+          <button type="button" id="mode-owner-btn" class="auth-tab" data-mode="owner">服务端密钥</button>
+        </div>
+
+        <form id="login-form" class="login-form" autocomplete="on">
+          <div id="account-fields">
+            <label class="field">
+              <span id="lbl-username">用户名或邮箱</span>
+              <input id="inp-username" type="text" autocomplete="username" placeholder="admin" />
+            </label>
+            <label class="field">
+              <span id="lbl-password">密码</span>
+              <input id="inp-password" type="password" autocomplete="current-password" placeholder="••••••••" />
+            </label>
+            <div id="twofa-field" class="hidden">
+              <label class="field">
+                <span id="lbl-twofa">邮箱 6 位登录验证码</span>
+                <input id="inp-twofa" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="输入 6 位验证码" class="mono" />
+              </label>
+              <p id="twofa-hint" class="muted-text" style="margin-bottom:8px"></p>
+            </div>
+          </div>
+
+          <div id="owner-fields" class="hidden">
+            <label class="field">
+              <span id="lbl-owner-key">CLIENT_ACCESS_TOKEN</span>
+              <input id="inp-owner-key" type="password" autocomplete="off" placeholder="输入服务端访问密钥" />
+            </label>
+          </div>
+
+          <label class="remember-row">
+            <input id="inp-remember" type="checkbox" />
+            <span id="lbl-remember">在本机浏览器记住管理员登录态</span>
+          </label>
+
+          <div id="login-error" class="alert-error hidden" role="alert"></div>
+
+          <button type="submit" id="btn-login" class="btn btn-primary btn-block">登录监控后台</button>
+        </form>
+
+        <div class="login-footer">
+          <span id="login-note">按需拉取 · 无后台轮询 · 零额外常驻进程</span>
+          <div class="login-footer-actions">
+            <button type="button" id="login-lang-btn" class="btn-link">EN</button>
+            <button type="button" id="login-theme-btn" class="btn-link">浅色</button>
+            <a href="/" class="btn-link" id="login-back-app">返回应用</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Dashboard View -->
+    <div id="dashboard-view" class="dashboard-shell hidden">
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="topbar-left">
+            <svg class="brand-logo sm" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+              <defs>
+                <linearGradient id="tb-bg" x1="64" y1="0" x2="64" y2="128" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stop-color="#141822" />
+                  <stop offset="100%" stop-color="#07090F" />
+                </linearGradient>
+                <linearGradient id="tb-ring" x1="64" y1="18" x2="64" y2="110" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stop-color="#F2FAFF" />
+                  <stop offset="28%" stop-color="#4CC9FA" />
+                  <stop offset="68%" stop-color="#3B82F6" />
+                  <stop offset="100%" stop-color="#6C63FF" />
+                </linearGradient>
+              </defs>
+              <rect width="128" height="128" rx="30" fill="url(#tb-bg)" />
+              <circle cx="64" cy="64" r="37" stroke="url(#tb-ring)" stroke-width="15" />
+            </svg>
+            <div class="topbar-title-wrap">
+              <div class="topbar-title-row">
+                <span class="topbar-title" id="tb-title">All in One 监控看板</span>
+                <span class="pill pill-subtle mono" id="tb-version">v0.3.9</span>
+                <span class="pill pill-emerald" id="tb-idle-badge">按需 · 0 空载</span>
+              </div>
+              <div class="topbar-sub" id="tb-subtitle">—</div>
+            </div>
+          </div>
+
+          <div class="topbar-right">
+            <div class="refresh-control">
+              <select id="auto-refresh-select" class="select-compact" aria-label="自动刷新间隔">
+                <option value="0">自动刷新：关</option>
+                <option value="10">每 10 秒</option>
+                <option value="30">每 30 秒</option>
+                <option value="60">每 60 秒</option>
+              </select>
+              <button type="button" id="btn-refresh" class="btn btn-primary btn-sm" title="快捷键 R">
+                <svg id="refresh-icon" class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+                <span id="lbl-refresh">刷新</span>
+              </button>
+            </div>
+            <button type="button" id="btn-lang" class="btn btn-ghost btn-sm">EN</button>
+            <button type="button" id="btn-theme" class="btn btn-ghost btn-sm" aria-label="切换主题">浅色</button>
+            <a href="/" class="btn btn-ghost btn-sm" id="btn-open-app">应用</a>
+            <button type="button" id="btn-logout" class="btn btn-ghost btn-sm danger-hover">退出</button>
+          </div>
+        </div>
+
+        <nav class="subnav" aria-label="看板导航">
+          <div class="subnav-inner">
+            <button type="button" class="nav-tab active" data-tab="overview">
+              <span data-i18n="tab.overview">用户与总览</span>
+              <span class="nav-badge" id="badge-users">0</span>
+            </button>
+            <button type="button" class="nav-tab" data-tab="connections">
+              <span data-i18n="tab.connections">实时连接</span>
+              <span class="nav-badge emerald" id="badge-live">0</span>
+            </button>
+            <button type="button" class="nav-tab" data-tab="invites">
+              <span data-i18n="tab.invites">邀请码</span>
+              <span class="nav-badge" id="badge-invites">0</span>
+            </button>
+            <button type="button" class="nav-tab" data-tab="activity">
+              <span data-i18n="tab.activity">事件日志</span>
+              <span class="nav-badge" id="badge-activity">0</span>
+            </button>
+            <div class="subnav-spacer"></div>
+            <span class="last-updated" id="last-updated">—</span>
+          </div>
+        </nav>
+      </header>
+
+      <main class="main-wrap">
+        <div id="global-error" class="alert-error hidden" role="alert"></div>
+
+        <!-- TAB 1: Overview & Users -->
+        <section id="tab-overview" class="tab-panel">
+          <!-- KPI Strip -->
+          <div id="kpi-grid" class="kpi-grid"></div>
+
+          <!-- Visual Insights Row -->
+          <div id="insights-grid" class="insights-grid"></div>
+
+          <!-- All Users Panel -->
+          <div class="card users-card">
+            <div class="card-header users-toolbar">
+              <div class="users-title-group">
+                <h2 class="card-title" id="users-section-title">全部用户状态</h2>
+                <span class="muted-text" id="users-count-hint"></span>
+              </div>
+              <div class="users-controls">
+                <div class="search-box">
+                  <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                  <input id="user-search" type="search" placeholder="搜索用户名、邮箱、电脑、IP..." />
+                </div>
+                <select id="user-sort" class="select-compact" aria-label="排序方式">
+                  <option value="status">在线优先</option>
+                  <option value="recent">最近活跃</option>
+                  <option value="rpcs">请求最多</option>
+                  <option value="newest">最新注册</option>
+                </select>
+                <button type="button" id="btn-expand-all" class="btn btn-ghost btn-sm">展开全部</button>
+              </div>
+            </div>
+
+            <div id="user-filter-pills" class="filter-pills"></div>
+            <div id="users-list" class="users-list"></div>
+          </div>
+
+          <!-- Legacy Rooms Section (shown only if owner/rm_* rooms exist) -->
+          <div id="legacy-rooms-card" class="card hidden">
+            <div class="card-header">
+              <h2 class="card-title" id="legacy-title">旧版房间 / 密钥模式连接</h2>
+              <span class="muted-text" id="legacy-hint"></span>
+            </div>
+            <div id="legacy-rooms-list" class="legacy-list"></div>
+          </div>
+        </section>
+
+        <!-- TAB 2: Live Connections -->
+        <section id="tab-connections" class="tab-panel hidden">
+          <div class="conn-grid">
+            <div class="card">
+              <div class="card-header">
+                <h2 class="card-title" id="live-bridges-title">在线电脑桥接 (PC Bridges)</h2>
+                <span class="pill pill-emerald" id="live-bridges-count">0</span>
+              </div>
+              <div id="live-bridges-body" class="table-wrap"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h2 class="card-title" id="live-clients-title">在线控制终端 (Mobile / Desktop / Web)</h2>
+                <span class="pill pill-brand" id="live-clients-count">0</span>
+              </div>
+              <div id="live-clients-body" class="table-wrap"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: Invite Codes -->
+        <section id="tab-invites" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title" id="invites-title">一次性注册邀请码</h2>
+                <p class="muted-text" id="invites-subtitle">一码一人，注册成功后立即核销</p>
+              </div>
+              <div id="invite-stats-pills" class="inline-pills"></div>
+            </div>
+
+            <form id="invite-create-form" class="invite-form">
+              <div class="qty-group" id="invite-qty-group">
+                <button type="button" class="qty-btn active" data-qty="1">1</button>
+                <button type="button" class="qty-btn" data-qty="3">3</button>
+                <button type="button" class="qty-btn" data-qty="5">5</button>
+                <button type="button" class="qty-btn" data-qty="10">10</button>
+              </div>
+              <input id="invite-note" type="text" maxlength="60" placeholder="备注（如：给朋友 / 测试账号）" class="invite-note-input" />
+              <label class="inline-check">
+                <input id="invite-grant-admin" type="checkbox" />
+                <span id="lbl-grant-admin">管理员权限</span>
+              </label>
+              <button type="submit" id="btn-create-invite" class="btn btn-primary btn-sm">生成邀请码</button>
+            </form>
+
+            <div id="invite-filter-pills" class="filter-pills"></div>
+            <div id="invites-list" class="invites-grid"></div>
+          </div>
+        </section>
+
+        <!-- TAB 4: Activity Feed -->
+        <section id="tab-activity" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title" id="activity-title">近期运行事件（纯内存环形缓存）</h2>
+                <p class="muted-text" id="activity-subtitle">仅记录连接与管理元事件，不落盘、不记录任何对话内容（最多保留最近 80 条）</p>
+              </div>
+              <div id="activity-filter-pills" class="inline-pills"></div>
+            </div>
+            <div id="activity-list" class="activity-list"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

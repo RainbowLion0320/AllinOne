@@ -23,7 +23,7 @@ const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
-const BRIDGE_VERSION = '0.3.9'
+const BRIDGE_VERSION = '0.4.0'
 
 function parseArgs(argv) {
   const opts = {
@@ -84,13 +84,24 @@ function readConfig(configPath) {
   if (!existsSync(configPath)) return null
   try {
     const parsed = JSON.parse(readFileSync(configPath, 'utf8'))
-    if (parsed?.roomId && parsed?.bridgeSecret) return parsed
+    const envSecret = String(process.env.ALLINONE_BRIDGE_SECRET || '').trim()
+    if (parsed?.roomId && (parsed?.bridgeSecret || envSecret)) {
+      return {
+        ...parsed,
+        bridgeSecret: parsed.bridgeSecret || envSecret,
+      }
+    }
   } catch {}
   return null
 }
 
 function saveConfig(configPath, cfg) {
-  writeFileSync(configPath, JSON.stringify(cfg, null, 2), 'utf8')
+  const toPersist = { ...cfg }
+  // Never downgrade Electron safeStorage encrypted config back to plaintext on label/username sync
+  if (toPersist.bridgeSecretEnc && process.env.ALLINONE_BRIDGE_SECRET) {
+    delete toPersist.bridgeSecret
+  }
+  writeFileSync(configPath, JSON.stringify(toPersist, null, 2), 'utf8')
   try { chmodSync(configPath, 0o600) } catch {}
 }
 

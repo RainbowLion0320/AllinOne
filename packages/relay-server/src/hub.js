@@ -3,6 +3,8 @@ import { EVENTS } from '@allinone/shared'
 
 const EVENT_BUFFER_SIZE = 200
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
+const ACTIVITY_LOG_MAX = 80
+const ROOM_STATS_MAX = 2000
 
 /**
  * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
@@ -101,6 +103,114 @@ export class RelayHub {
     this.pendingRpc = new Map()
     /** @type {Map<string, { seq: number, buffer: any[] }>} */
     this.roomEvents = new Map()
+    /** @type {Map<string, { rpcCount: number, eventCount: number, lastActivityAt: number, lastRpcMethod: string, lastRpcAt: number }>} */
+    this.roomStats = new Map()
+    this.globalStats = {
+      startedAt: Date.now(),
+      totalRpcs: 0,
+      totalEvents: 0,
+      totalBridgeConnects: 0,
+      totalClientConnects: 0,
+    }
+    /** @type {Array<{ id: number, ts: number, type: string, roomId: string, label: string, detail: string, ip: string }>} */
+    this.activityLog = []
+    this._activitySeq = 0
+  }
+
+  getOrCreateRoomStats(roomId) {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    let st = this.roomStats.get(rid)
+    if (!st) {
+      if (this.roomStats.size >= ROOM_STATS_MAX) {
+        const oldestKey = this.roomStats.keys().next().value
+        if (oldestKey) this.roomStats.delete(oldestKey)
+      }
+      st = { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
+      this.roomStats.set(rid, st)
+    }
+    return st
+  }
+
+  getRoomStats(roomId) {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const st = this.roomStats.get(rid)
+    return st
+      ? { ...st }
+      : { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
+  }
+
+  recordActivity({ type, roomId = '', label = '', detail = '', ip = '' } = {}) {
+    this._activitySeq += 1
+    this.activityLog.push({
+      id: this._activitySeq,
+      ts: Date.now(),
+      type: String(type || 'info').slice(0, 32),
+      roomId: String(roomId || '').slice(0, 64),
+      label: String(label || '').slice(0, 64),
+      detail: String(detail || '').slice(0, 120),
+      ip: String(ip || '').slice(0, 64),
+    })
+    if (this.activityLog.length > ACTIVITY_LOG_MAX) {
+      this.activityLog.splice(0, this.activityLog.length - ACTIVITY_LOG_MAX)
+    }
+  }
+
+  getActivityLog(limit = 60) {
+    const n = Math.max(1, Math.min(ACTIVITY_LOG_MAX, Math.floor(Number(limit) || 60)))
+    return this.activityLog.slice(-n).reverse()
+  }
+
+  getAllBridges() {
+    const out = []
+    for (const b of this.bridges.values()) {
+      out.push({
+        roomId: b.roomId,
+        bridgeId: b.bridgeId,
+        deviceId: b.meta?.deviceId || '',
+        label: b.meta?.label || b.meta?.hostname || b.bridgeId,
+        online: b.ws.readyState === 1,
+        hostname: b.meta?.hostname || b.bridgeId,
+        platform: b.meta?.platform || 'unknown',
+        mode: b.meta?.mode || 'dsh-plugin',
+        ip: b.meta?.ip || '',
+        apps: Array.isArray(b.meta?.apps) ? b.meta.apps : [],
+        connectedAt: b.connectedAt,
+        lastSeen: b.lastSeen,
+      })
+    }
+    return out.sort((a, b) => Number(b.online) - Number(a.online) || (b.connectedAt || 0) - (a.connectedAt || 0))
+  }
+
+  getAllClients() {
+    const out = []
+    for (const [clientId, c] of this.clients.entries()) {
+      if (c.ws.readyState !== 1) continue
+      out.push({
+        clientId,
+        roomId: c.roomId,
+        sid: c.sid || '',
+        deviceName: c.deviceName || 'Web Client',
+        clientKind: c.clientKind || 'web',
+        ip: c.ip || '',
+        connectedAt: c.connectedAt,
+        lastSeenAt: c.lastSeenAt || c.connectedAt,
+        online: true,
+      })
+    }
+    return out.sort((a, b) => (b.connectedAt || 0) - (a.connectedAt || 0))
+  }
+
+  getMetricsSummary() {
+    let onlineClients = 0
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === 1) onlineClients += 1
+    }
+    return {
+      ...this.globalStats,
+      pendingRpcCount: this.pendingRpc.size,
+      onlineBridgeCount: this.getOnlineBridgeCount(),
+      onlineClientCount: onlineClients,
+    }
   }
 
   resolveRoomDevices(roomId, liveBridges = null) {
@@ -182,6 +292,16 @@ export class RelayHub {
     const now = Date.now()
     const entry = { roomId, bridgeId, ws, meta, connectedAt: now, lastSeen: now }
     this.bridges.set(key, entry)
+    this.globalStats.totalBridgeConnects += 1
+    const rStats = this.getOrCreateRoomStats(roomId)
+    rStats.lastActivityAt = now
+    this.recordActivity({
+      type: 'bridge.online',
+      roomId,
+      label: meta.label || meta.hostname || bridgeId,
+      detail: `${meta.platform || 'unknown'} · ${meta.mode || 'bridge'}`,
+      ip: meta.ip || '',
+    })
     this.log.info(
       `[relay] Bridge connected: room=${roomId} id=${bridgeId} (${meta.hostname || 'unknown'}, mode=${meta.mode || 'unknown'})`,
     )
@@ -209,6 +329,13 @@ export class RelayHub {
     ws.on('close', () => {
       if (this.bridges.get(key)?.ws === ws) {
         this.bridges.delete(key)
+        this.recordActivity({
+          type: 'bridge.offline',
+          roomId,
+          label: entry.meta?.label || entry.meta?.hostname || bridgeId,
+          detail: entry.meta?.platform || '',
+          ip: entry.meta?.ip || '',
+        })
         this.log.info(`[relay] Bridge disconnected: room=${roomId} id=${bridgeId}`)
         for (const [relayReqId, pending] of this.pendingRpc.entries()) {
           if (pending.bridgeKey === key) {
@@ -296,6 +423,16 @@ export class RelayHub {
       lastSeenAt: now,
     }
     this.clients.set(clientId, entry)
+    this.globalStats.totalClientConnects += 1
+    const rStats = this.getOrCreateRoomStats(roomId)
+    rStats.lastActivityAt = now
+    this.recordActivity({
+      type: 'client.online',
+      roomId,
+      label: parsed.deviceName,
+      detail: parsed.clientKind,
+      ip: entry.ip,
+    })
     this.log.info(`[relay] Mobile client connected: ${clientId} (room=${roomId}, dev=${parsed.deviceName}, ip=${entry.ip || 'unknown'})`)
 
     const evState = this.getRoomEventState(roomId)
@@ -342,6 +479,13 @@ export class RelayHub {
       const existed = this.clients.delete(clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
       if (existed) {
+        this.recordActivity({
+          type: 'client.offline',
+          roomId,
+          label: entry.deviceName,
+          detail: entry.clientKind,
+          ip: entry.ip,
+        })
         this.broadcastRoomClients(roomId)
       }
     })
@@ -452,6 +596,14 @@ export class RelayHub {
         bridgeKey: this.bridgeKey(roomId, bridge.bridgeId),
       })
 
+      const rpcNow = Date.now()
+      this.globalStats.totalRpcs += 1
+      const rStats = this.getOrCreateRoomStats(roomId)
+      rStats.rpcCount += 1
+      rStats.lastRpcMethod = String(msg.method || '').slice(0, 48)
+      rStats.lastRpcAt = rpcNow
+      rStats.lastActivityAt = rpcNow
+
       this.sendRaw(bridge.ws, {
         type: 'rpc.req',
         id: relayReqId,
@@ -495,6 +647,14 @@ export class RelayHub {
         bridgeKey: this.bridgeKey(rid, bridge.bridgeId),
       })
 
+      const rpcNow = Date.now()
+      this.globalStats.totalRpcs += 1
+      const rStats = this.getOrCreateRoomStats(rid)
+      rStats.rpcCount += 1
+      rStats.lastRpcMethod = String(method || '').slice(0, 48)
+      rStats.lastRpcAt = rpcNow
+      rStats.lastActivityAt = rpcNow
+
       this.sendRaw(bridge.ws, {
         type: 'rpc.req',
         id: relayReqId,
@@ -507,10 +667,15 @@ export class RelayHub {
   broadcastEvent(roomId, bridgeId, event, payload) {
     const rid = roomId || 'owner'
     const evState = this.getRoomEventState(rid)
+    const now = Date.now()
     evState.seq += 1
+    this.globalStats.totalEvents += 1
+    const rStats = this.getOrCreateRoomStats(rid)
+    rStats.eventCount += 1
+    rStats.lastActivityAt = now
     const envelope = {
       seq: evState.seq,
-      ts: Date.now(),
+      ts: now,
       bridgeId,
       event,
       payload,

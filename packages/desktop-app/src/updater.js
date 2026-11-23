@@ -205,6 +205,7 @@ export class DesktopUpdater extends EventEmitter {
     downloadDir = join(os.tmpdir(), 'allinone-updates'),
     apiUrl = '',
     allowLocalhost = false,
+    requireSha256 = true,
     getLang = () => 'zh',
   } = {}) {
     super()
@@ -215,6 +216,7 @@ export class DesktopUpdater extends EventEmitter {
     this.downloadDir = downloadDir
     this.apiUrl = apiUrl || `https://api.github.com/repos/${repo}/releases/latest`
     this.allowLocalhost = allowLocalhost
+    this.requireSha256 = requireSha256 !== false
     this.getLang = typeof getLang === 'function' ? getLang : () => 'zh'
     this.abortController = null
 
@@ -406,8 +408,18 @@ export class DesktopUpdater extends EventEmitter {
         error: this.bi('拒绝从不受信任的下载地址拉取安装包', 'Blocked download from untrusted host'),
       })
     }
+    if (this.requireSha256 && !expectedSha256) {
+      return this.setState({
+        status: 'error',
+        error: this.bi(
+          '安装包缺少官方 SHA-256 校验摘要，出于安全已阻止自动更新，请前往 GitHub Releases 手动核验下载',
+          'Installer is missing an official SHA-256 digest. Automatic update blocked for security; please verify on GitHub Releases.',
+        ),
+      })
+    }
 
     mkdirSync(this.downloadDir, { recursive: true })
+    try { chmodSync(this.downloadDir, 0o700) } catch {}
     const safeName = assetName.replace(/[^a-zA-Z0-9._-]/g, '_')
     const finalPath = join(this.downloadDir, safeName)
     const partPath = `${finalPath}.part`
@@ -548,6 +560,29 @@ export class DesktopUpdater extends EventEmitter {
         status: 'error',
         error: this.bi('安装包文件不存在，请重新下载', 'Installer file missing. Please download again.'),
       })
+    }
+
+    // Re-verify SHA-256 right before execution to defeat local file tampering (TOCTOU)
+    const expectedSha256 = String(this.state.expectedSha256 || '').trim().toLowerCase()
+    if (this.requireSha256 && !expectedSha256) {
+      return this.setState({
+        status: 'error',
+        error: this.bi('安装包缺少 SHA-256 摘要，已取消安装', 'Installer missing SHA-256 digest; installation aborted.'),
+      })
+    }
+    if (expectedSha256) {
+      const currentSha = await sha256File(installerPath).catch(() => '')
+      if (!currentSha || currentSha !== expectedSha256) {
+        try { unlinkSync(installerPath) } catch {}
+        return this.setState({
+          status: 'error',
+          downloadedPath: '',
+          error: this.bi(
+            '安装前复核 SHA-256 校验失败，文件可能已被篡改，已删除并中止安装',
+            'Pre-install SHA-256 verification failed. File discarded for security.',
+          ),
+        })
+      }
     }
 
     this.setState({ status: 'installing', error: '' })

@@ -10,7 +10,7 @@ export default defineConfig({
   base: './',
   envDir: '../..',
   define: {
-    __APP_VERSION__: JSON.stringify(pkg.version || '0.3.9'),
+    __APP_VERSION__: JSON.stringify(pkg.version || '0.4.0'),
   },
   plugins: [
     react(),
@@ -51,7 +51,7 @@ export default defineConfig({
         navigateFallback: null,
         runtimeCaching: [
           {
-            urlPattern: ({ request }) => request.mode === 'navigate',
+            urlPattern: ({ request, url }) => request.mode === 'navigate' && !url.pathname.startsWith('/admin'),
             handler: 'NetworkFirst',
             options: {
               cacheName: 'pages-cache',

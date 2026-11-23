@@ -119,20 +119,31 @@ export function detectClientDeviceMeta() {
   return { deviceName: browser || 'Web Client', clientKind: 'web' }
 }
 
-export async function loginAccount(serverUrl, { username, password }) {
+export async function loginAccount(serverUrl, { username, password, emailCode = '' }) {
   const base = normalizeBaseUrl(serverUrl)
   const devMeta = detectClientDeviceMeta()
+  const cleanCode = String(emailCode || '').trim()
   const res = await fetch(`${base}/api/account/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       username: String(username || '').trim(),
       password: String(password ?? ''),
+      ...(cleanCode ? { emailCode: cleanCode } : {}),
       deviceName: devMeta.deviceName,
       clientKind: devMeta.clientKind,
     }),
   })
   const data = await res.json().catch(() => ({}))
+  if (data.requires2fa && !data.ok) {
+    return {
+      requires2fa: true,
+      maskedEmail: String(data.maskedEmail || ''),
+      cooldownSec: Number(data.cooldownSec) || 0,
+      message: String(data.message || ''),
+      error: String(data.error || ''),
+    }
+  }
   if (!res.ok || !data.ok) {
     throw new Error(data.error || L(`登录失败 (HTTP ${res.status})`, `Sign in failed (HTTP ${res.status})`))
   }
@@ -143,11 +154,29 @@ export async function loginAccount(serverUrl, { username, password }) {
     username: data.user?.username || String(username || '').trim(),
     email: data.user?.email || '',
     emailVerified: Boolean(data.user?.emailVerified),
+    loginEmail2fa: Boolean(data.user?.loginEmail2fa),
     role: data.user?.role || 'user',
     label: `@${data.user?.username || String(username || '').trim()}`,
     devices: Array.isArray(data.devices) ? data.devices : [],
     bridges: Array.isArray(data.bridges) ? data.bridges : [],
   }
+}
+
+export async function setAccountLogin2fa(baseUrl, token, enabled) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/security/2fa`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ enabled: Boolean(enabled) }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`设置二次验证失败 (HTTP ${res.status})`, `Failed to update 2FA setting (HTTP ${res.status})`))
+  }
+  return data.user
 }
 
 export async function registerAccount(serverUrl, { username, password, inviteCode, email = '', emailCode = '' }) {
@@ -446,6 +475,7 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
       username: String(data.username || ''),
       email: String(data.email || ''),
       emailVerified: Boolean(data.emailVerified),
+      loginEmail2fa: Boolean(data.loginEmail2fa),
       emailEnabled: Boolean(data.emailEnabled),
       role: String(data.role || ''),
       roomId: String(data.roomId || device.roomId || ''),

@@ -70,6 +70,7 @@ function sanitizeDevice(raw) {
     authMode,
     username: String(raw.username || '').trim().slice(0, 32),
     email: String(raw.email || '').trim().slice(0, 254),
+    loginEmail2fa: Boolean(raw.loginEmail2fa),
     role,
     customName: String(raw.customName || '').trim().slice(0, 40),
     label: String(raw.label || '').trim().slice(0, 64),
@@ -269,6 +270,13 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
     const val = String(patch.email || '').trim().slice(0, 254)
     if (val !== (cur.email || '')) {
       next.email = val
+      changed = true
+    }
+  }
+  if (patch.loginEmail2fa !== undefined) {
+    const val = Boolean(patch.loginEmail2fa)
+    if (val !== Boolean(cur.loginEmail2fa)) {
+      next.loginEmail2fa = val
       changed = true
     }
   }

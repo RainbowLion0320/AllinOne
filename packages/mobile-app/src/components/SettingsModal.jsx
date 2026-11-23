@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import {
+  Activity,
   Check,
   ChevronRight,
   Download,
@@ -18,6 +19,7 @@ import {
   RotateCw,
   Settings,
   Share2,
+  ShieldCheck,
   Sun,
   Ticket,
   Trash2,
@@ -83,6 +85,7 @@ export function SettingsModal({
   onOpenInviteManager = null,
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
+  onToggleLogin2fa = null,
   onRemoveDevice = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
@@ -122,7 +125,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '0.3.9'
+    '0.4.0'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -394,6 +397,20 @@ export function SettingsModal({
                 </div>
               )}
 
+              {isAccountMode && emailEnabled && boundEmail && onToggleLogin2fa && (
+                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
+                  <div className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+                    <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                    <span>{bi('登录邮箱二次验证', 'Email Login 2FA')}</span>
+                  </div>
+                  <ToggleSwitch
+                    checked={Boolean(activeDevice?.loginEmail2fa)}
+                    onChange={() => onToggleLogin2fa(!activeDevice?.loginEmail2fa)}
+                    label={bi('切换登录邮箱二次验证', 'Toggle email login 2FA')}
+                  />
+                </div>
+              )}
+
               {activeDevice?.id && onRemoveDevice && (
                 <div className="border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
                   {!confirmLogout ? (
@@ -617,6 +634,21 @@ export function SettingsModal({
                   </span>
                   <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
                 </button>
+              )}
+              {isAdmin && activeDevice?.baseUrl && (
+                <a
+                  href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={onClose}
+                  className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Activity className="h-3.5 w-3.5 text-emerald-500" />
+                    <span>{bi('服务器监控看板', 'Server Monitor')}</span>
+                  </span>
+                  <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
+                </a>
               )}
               <div className="flex items-center justify-between gap-2 px-3.5 py-2.5">
                 <div className="flex min-w-0 items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">

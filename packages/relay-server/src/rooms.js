@@ -234,6 +234,19 @@ export function createRoomStore({ filePath }) {
     }
   }
 
+  function listRooms() {
+    return [...rooms.values()]
+      .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
+      .map((r) => ({
+        roomId: r.roomId,
+        label: r.label || r.roomId,
+        tokenVersion: Number(r.tokenVersion || 0),
+        pairedCount: Number(r.pairedCount || 0),
+        createdAt: r.createdAt || 0,
+        lastSeenAt: r.lastSeenAt || 0,
+      }))
+  }
+
   return {
     registerRoom,
     verifyBridge,
@@ -242,6 +255,7 @@ export function createRoomStore({ filePath }) {
     getTokenVersion,
     revokeRoomTokens,
     getRoomMeta,
+    listRooms,
     count: () => rooms.size,
   }
 }

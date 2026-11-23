@@ -78,6 +78,7 @@ export function LoginScreen({
   const [inviteCode, setInviteCode] = useState(initialInviteCode || '')
   const [email, setEmail] = useState('')
   const [emailCode, setEmailCode] = useState('')
+  const [login2fa, setLogin2fa] = useState({ required: false, maskedEmail: '' })
   const [codeSending, setCodeSending] = useState(false)
   const [codeCooldown, setCodeCooldown] = useState(0)
 
@@ -242,13 +243,24 @@ export function LoginScreen({
         const result = await loginAccount(serverUrl, {
           username: username.trim(),
           password: accountPassword,
+          ...(login2fa.required ? { emailCode: emailCode.trim() } : {}),
         })
+        if (result.requires2fa) {
+          setLogin2fa({ required: true, maskedEmail: result.maskedEmail || '' })
+          if (result.cooldownSec > 0) setCodeCooldown(result.cooldownSec)
+          if (result.error) setError(result.error)
+          else if (result.message) setInfoMsg(result.message)
+          return
+        }
+        setLogin2fa({ required: false, maskedEmail: '' })
+        setEmailCode('')
         onSuccess({
           baseUrl: result.baseUrl,
           token: result.token,
           roomId: result.roomId,
           username: result.username,
           email: result.email,
+          loginEmail2fa: Boolean(result.loginEmail2fa),
           role: result.role,
           label: result.label,
           devices: result.devices,
@@ -515,12 +527,68 @@ export function LoginScreen({
                 <input
                   type="password"
                   value={accountPassword}
-                  onChange={(e) => setAccountPassword(e.target.value)}
+                  onChange={(e) => {
+                    setAccountPassword(e.target.value)
+                    if (login2fa.required) {
+                      setLogin2fa({ required: false, maskedEmail: '' })
+                      setEmailCode('')
+                    }
+                  }}
                   placeholder={bi('输入账号密码', 'Enter password')}
                   autoComplete="current-password"
                   className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                 />
               </div>
+
+              {login2fa.required && (
+                <div>
+                  <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <ShieldCheck className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>
+                      {login2fa.maskedEmail
+                        ? bi(`邮箱验证码（${login2fa.maskedEmail}）`, `Email Code (${login2fa.maskedEmail})`)
+                        : bi('邮箱二次验证码', 'Email 2FA Code')}
+                    </span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      autoFocus
+                      value={emailCode}
+                      onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder={bi('6 位登录验证码', '6-digit login code')}
+                      autoComplete="one-time-code"
+                      className="min-w-0 flex-1 rounded-2xl border border-[#4D6BFE] bg-white px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal dark:bg-[#16171A] dark:text-white"
+                    />
+                    <button
+                      type="button"
+                      disabled={loading || codeCooldown > 0}
+                      onClick={async () => {
+                        setError('')
+                        setInfoMsg('')
+                        setLoading(true)
+                        try {
+                          const res = await loginAccount(serverUrl, {
+                            username: username.trim(),
+                            password: accountPassword,
+                          })
+                          if (res.cooldownSec > 0) setCodeCooldown(res.cooldownSec)
+                          if (res.message) setInfoMsg(res.message)
+                        } catch (err) {
+                          setError(String(err?.message || err))
+                        } finally {
+                          setLoading(false)
+                        }
+                      }}
+                      className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] disabled:opacity-55 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
+                    >
+                      {codeCooldown > 0 ? `${codeCooldown}s` : bi('重发', 'Resend')}
+                    </button>
+                  </div>
+                </div>
+              )}
             </>
           )}
 

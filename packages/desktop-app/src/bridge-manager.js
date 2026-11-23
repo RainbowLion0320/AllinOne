@@ -40,9 +40,41 @@ function readJsonSafe(filePath) {
   }
 }
 
-function saveConfigSecure(filePath, data) {
-  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8')
+export function saveConfigSecure(filePath, data, secretStore = null) {
+  const payload = { ...data }
+  if (secretStore && payload.bridgeSecret) {
+    try {
+      const enc = secretStore.encrypt(String(payload.bridgeSecret))
+      if (enc) {
+        payload.bridgeSecretEnc = enc
+        delete payload.bridgeSecret
+      }
+    } catch {}
+  }
+  writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8')
   try { chmodSync(filePath, 0o600) } catch {}
+}
+
+export function loadConfigDecrypted(filePath, secretStore = null) {
+  const raw = readJsonSafe(filePath)
+  if (!raw) return null
+  if (raw.bridgeSecretEnc && !raw.bridgeSecret && secretStore) {
+    try {
+      const dec = secretStore.decrypt(raw.bridgeSecretEnc)
+      if (dec) {
+        return { ...raw, bridgeSecret: dec }
+      }
+    } catch {
+      return null
+    }
+  }
+  // Auto-migrate legacy plaintext bridgeSecret on disk to OS keychain / DPAPI encryption
+  if (raw.bridgeSecret && !raw.bridgeSecretEnc && secretStore) {
+    try {
+      saveConfigSecure(filePath, raw, secretStore)
+    } catch {}
+  }
+  return raw
 }
 
 function resolveBridgeScriptPath(isPackaged) {
@@ -82,10 +114,11 @@ function stopLegacyMacLaunchAgent() {
 }
 
 export class DesktopBridgeManager extends EventEmitter {
-  constructor({ isPackaged = false, getAutoLaunch = () => false } = {}) {
+  constructor({ isPackaged = false, getAutoLaunch = () => false, secretStore = null } = {}) {
     super()
     this.isPackaged = isPackaged
     this.getAutoLaunch = getAutoLaunch
+    this.secretStore = secretStore
     this.stateDir = join(os.homedir(), '.allinone-bridge')
     this.configPath = join(this.stateDir, 'config.json')
     this.logPath = join(this.stateDir, 'desktop-bridge.log')
@@ -231,7 +264,7 @@ export class DesktopBridgeManager extends EventEmitter {
 
     try {
       this.ensureStateDir()
-      let cfg = readJsonSafe(this.configPath)
+      let cfg = loadConfigDecrypted(this.configPath, this.secretStore)
       let readyCfg = null
 
       if (
@@ -268,7 +301,7 @@ export class DesktopBridgeManager extends EventEmitter {
           label: bound.label || os.hostname() || 'My-PC',
           createdAt: Date.now(),
         }
-        saveConfigSecure(this.configPath, readyCfg)
+        saveConfigSecure(this.configPath, readyCfg, this.secretStore)
         this.appendLog(`Bound PC successfully: bridgeId=${readyCfg.bridgeId}`)
       }
 
@@ -298,7 +331,7 @@ export class DesktopBridgeManager extends EventEmitter {
    */
   async startFromSavedConfigIfPresent() {
     if (this.disposed || !this.enabled || this.proc) return this.getStatus()
-    const cfg = readJsonSafe(this.configPath)
+    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId?.startsWith('usr_') || !cfg.bridgeSecret || !cfg.serverUrl) {
       return this.getStatus()
     }
@@ -352,6 +385,7 @@ export class DesktopBridgeManager extends EventEmitter {
           ALLINONE_SERVER: serverUrl,
           ALLINONE_HOME: this.stateDir,
           ALLINONE_PC_NAME: label,
+          ...(cfg.bridgeSecret ? { ALLINONE_BRIDGE_SECRET: cfg.bridgeSecret } : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -441,7 +475,7 @@ export class DesktopBridgeManager extends EventEmitter {
       clearTimeout(this.restartTimer)
       this.restartTimer = setTimeout(() => {
         if (this.disposed || !this.enabled) return
-        const latestCfg = readJsonSafe(this.configPath) || cfg
+        const latestCfg = loadConfigDecrypted(this.configPath, this.secretStore) || cfg
         void this.spawnBridgeProcess(latestCfg)
       }, delayMs)
     })

@@ -61,6 +61,10 @@ import {
   pickReleaseAsset,
 } from '../packages/desktop-app/src/updater.js'
 import {
+  loadConfigDecrypted,
+  saveConfigSecure,
+} from '../packages/desktop-app/src/bridge-manager.js'
+import {
   LANG_STORAGE_KEY,
   MESSAGES,
   bi,
@@ -2024,7 +2028,579 @@ async function main() {
         await sessRelay.close()
       }
     }
-    console.log('[smoke] 16/16 Active controlling devices monitor, live WS push, per-device kick & revoke-others OK')
+    console.log('[smoke] 16/17 Active controlling devices monitor, live WS push, per-device kick & revoke-others OK')
+
+    // 17. Lightweight Admin Monitoring Dashboard (/admin, /api/admin/overview, bridge disconnect, session kick & revoke-all)
+    {
+      const monRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        clientAccessToken: 'mon-owner-secret',
+        bridgeSecret: 'mon-bridge-secret',
+        roomsFile: join(tmpDir, 'mon-rooms.json'),
+        accountsFile: join(tmpDir, 'mon-accounts.json'),
+        uploadDir: join(tmpDir, 'mon-uploads'),
+      })
+      const { port: mPort } = await monRelay.start()
+      const mBase = `http://127.0.0.1:${mPort}`
+      const mSockets = []
+
+      const connectClientWs = (token, deviceName, clientKind) =>
+        new Promise((resolveWs, rejectWs) => {
+          fetch(`${mBase}/api/auth/ws-ticket`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ deviceName, clientKind }),
+          })
+            .then((r) => r.json())
+            .then((d) => {
+              const ws = new WebSocket(`ws://127.0.0.1:${mPort}/ws/client?ticket=${encodeURIComponent(d.ticket)}`)
+              let closedCode = null
+              ws.on('message', (raw) => {
+                const msg = JSON.parse(String(raw))
+                if (msg.type === 'hello') resolveWs({ ws, hello: msg, getClosedCode: () => closedCode })
+              })
+              ws.on('close', (code) => { closedCode = code })
+              ws.on('error', rejectWs)
+            })
+            .catch(rejectWs)
+        })
+
+      const connectBridgeWs = ({ roomId, deviceSecret, bridgeId, hostname, platform, apps }) =>
+        new Promise((resolveBr, rejectBr) => {
+          const qs = new URLSearchParams({ roomId, bridgeId, hostname, platform, mode: 'desktop' })
+          const ws = new WebSocket(`ws://127.0.0.1:${mPort}/ws/bridge?${qs.toString()}`, {
+            headers: { 'X-Room-Id': roomId, 'X-Bridge-Secret': deviceSecret },
+          })
+          let closedCode = null
+          ws.on('open', () => {
+            ws.send(JSON.stringify({ type: 'bridge.meta', meta: { apps } }))
+            resolveBr({ ws, getClosedCode: () => closedCode })
+          })
+          ws.on('close', (code) => { closedCode = code })
+          ws.on('error', rejectBr)
+        })
+
+      try {
+        // 17.1 Static /admin dashboard serving & strict CSP headers
+        const adminHtmlRes = await fetch(`${mBase}/admin`)
+        assert.equal(adminHtmlRes.status, 200, 'GET /admin must serve dashboard HTML')
+        assert.match(String(adminHtmlRes.headers.get('content-type') || ''), /text\/html/)
+        assert.match(String(adminHtmlRes.headers.get('cache-control') || ''), /no-store/)
+        assert.match(String(adminHtmlRes.headers.get('content-security-policy') || ''), /script-src 'self'/)
+        const adminHtml = await adminHtmlRes.text()
+        assert.ok(adminHtml.includes('/admin/app.js') && adminHtml.includes('/admin/styles.css'))
+
+        const adminJsRes = await fetch(`${mBase}/admin/app.js`)
+        assert.equal(adminJsRes.status, 200)
+        const adminCssRes = await fetch(`${mBase}/admin/styles.css`)
+        assert.equal(adminCssRes.status, 200)
+        const admin404Res = await fetch(`${mBase}/admin/does-not-exist`)
+        assert.equal(admin404Res.status, 404)
+
+        // 17.2 Unauthenticated /api/admin/overview must return 401
+        const unauthMon = await fetch(`${mBase}/api/admin/overview`)
+        assert.equal(unauthMon.status, 401, 'Unauthenticated /api/admin/overview must return 401')
+
+        // 17.3 Bootstrap admin + 2 regular users (bob active, carol offline)
+        const admReg = await fetch(`${mBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'mon_admin',
+            password: 'Password123!',
+            inviteCode: 'mon-owner-secret',
+            deviceName: 'Windows Desktop',
+            clientKind: 'desktop',
+          }),
+        }).then((r) => r.json())
+        assert.equal(admReg.ok, true)
+
+        const invRes = await fetch(`${mBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
+          body: JSON.stringify({ count: 2, note: 'monitor test' }),
+        }).then((r) => r.json())
+        assert.equal(invRes.invites.length, 2)
+
+        const bobReg = await fetch(`${mBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'mon_bob',
+            password: 'Password123!',
+            inviteCode: invRes.invites[0].code,
+            deviceName: 'iPhone · Safari',
+            clientKind: 'mobile',
+          }),
+        }).then((r) => r.json())
+        assert.equal(bobReg.ok, true)
+
+        const carolReg = await fetch(`${mBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'mon_carol',
+            password: 'Password123!',
+            inviteCode: invRes.invites[1].code,
+            deviceName: 'macOS · Chrome',
+            clientKind: 'web',
+          }),
+        }).then((r) => r.json())
+        assert.equal(carolReg.ok, true)
+
+        // Non-admin Bob must get 403 on /api/admin/overview and admin action routes
+        const bobOverview = await fetch(`${mBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${bobReg.token}` },
+        })
+        assert.equal(bobOverview.status, 403, 'Non-admin user must receive 403 on /api/admin/overview')
+
+        // Bind a PC for Bob and bring both Bob's PC bridge and Bob's phone WS online; bring Admin's bridge only online
+        const bobPc = await fetch(`${mBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bobReg.token}` },
+          body: JSON.stringify({ label: 'Bob-MacBook', hostname: 'bob-mbp', platform: 'darwin' }),
+        }).then((r) => r.json())
+        assert.equal(bobPc.ok, true)
+
+        const admPc = await fetch(`${mBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
+          body: JSON.stringify({ label: 'Admin-WinPC', hostname: 'admin-pc', platform: 'win32' }),
+        }).then((r) => r.json())
+        assert.equal(admPc.ok, true)
+
+        const bobBr = await connectBridgeWs({
+          roomId: bobReg.roomId,
+          deviceSecret: bobPc.deviceSecret,
+          bridgeId: bobPc.bridgeId,
+          hostname: 'bob-mbp',
+          platform: 'darwin',
+          apps: [
+            { app: 'codex', available: true, writable: true },
+            { app: 'claude', available: true, writable: true },
+          ],
+        })
+        mSockets.push(bobBr.ws)
+
+        const admBr = await connectBridgeWs({
+          roomId: admReg.roomId,
+          deviceSecret: admPc.deviceSecret,
+          bridgeId: admPc.bridgeId,
+          hostname: 'admin-pc',
+          platform: 'win32',
+          apps: [{ app: 'antigravity', available: true, writable: true }],
+        })
+        mSockets.push(admBr.ws)
+
+        const bobCli = await connectClientWs(bobReg.token, 'iPhone · Safari', 'mobile')
+        mSockets.push(bobCli.ws)
+        await new Promise((r) => setTimeout(r, 100))
+
+        // 17.4 Fetch /api/admin/overview as admin and validate counts, statuses, telemetry & zero secret leakage
+        const ovRes = await fetch(`${mBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${admReg.token}` },
+        })
+        assert.equal(ovRes.status, 200)
+        const ovRaw = await ovRes.text()
+        assert.equal(ovRaw.includes('passwordHash'), false, 'Overview must NEVER expose passwordHash')
+        assert.equal(ovRaw.includes('secretHash'), false, 'Overview must NEVER expose device secretHash')
+        assert.equal(ovRaw.includes(bobPc.deviceSecret), false, 'Overview must NEVER expose deviceSecret')
+        const ov = JSON.parse(ovRaw)
+        assert.equal(ov.ok, true)
+        assert.equal(ov.summary.totalUsers, 3)
+        assert.equal(ov.summary.activeUsers, 1, 'Bob should be active (PC + client online)')
+        assert.equal(ov.summary.bridgeOnlyUsers, 1, 'Admin should be bridge_only (PC online, no client WS)')
+        assert.equal(ov.summary.offlineUsers, 1, 'Carol should be offline')
+        assert.equal(ov.summary.onlineBridges, 2)
+        assert.equal(ov.summary.onlineClients, 1)
+        assert.equal(ov.distributions.apps.codex.writable, 1)
+        assert.equal(ov.distributions.apps.antigravity.writable, 1)
+        assert.equal(ov.distributions.bridgePlatforms.darwin, 1, 'darwin platform must not be misclassified as win32')
+        assert.equal(ov.distributions.bridgePlatforms.win32, 1)
+        assert.ok(ov.server.node.rssBytes > 0 && ov.server.host.totalMemBytes > 0)
+        assert.ok(ov.activity.length >= 4, 'Activity ring buffer should capture register/bridge/client events')
+
+        const bobRow = ov.users.find((u) => u.username === 'mon_bob')
+        assert.equal(bobRow.status, 'active')
+        assert.equal(bobRow.devices[0].online, true)
+        assert.equal(bobRow.sessions[0].online, true)
+
+        // 17.5 Admin disconnects Bob's bridge & kicks Bob's session & prevents self-lockout
+        const selfRevokeTry = await fetch(`${mBase}/api/admin/users/revoke-all`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
+          body: JSON.stringify({ userId: admReg.roomId }),
+        })
+        assert.equal(selfRevokeTry.status, 400, 'Admin must not be able to force-revoke themselves from monitor')
+
+        const discRes = await fetch(`${mBase}/api/admin/bridges/disconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
+          body: JSON.stringify({ roomId: bobReg.roomId, bridgeId: bobPc.bridgeId }),
+        }).then((r) => r.json())
+        assert.equal(discRes.ok, true)
+        await new Promise((r) => setTimeout(r, 80))
+        assert.equal(bobBr.getClosedCode(), 4000, 'Admin bridge disconnect should close WS with 4000')
+
+        const kickBobRes = await fetch(`${mBase}/api/admin/users/revoke-all`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
+          body: JSON.stringify({ userId: bobReg.roomId }),
+        }).then((r) => r.json())
+        assert.equal(kickBobRes.ok, true)
+        assert.equal(kickBobRes.disconnectedClients, 1)
+        await new Promise((r) => setTimeout(r, 80))
+        assert.equal(bobCli.getClosedCode(), 4401, 'Force sign-out must close Bob client WS with 4401')
+
+        const bobAfterRevoke = await fetch(`${mBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${bobReg.token}` },
+        })
+        assert.equal(bobAfterRevoke.status, 401, 'Bob token must be rejected after admin force sign-out')
+      } finally {
+        for (const ws of mSockets) {
+          try { ws.close() } catch {}
+        }
+        await monRelay.close()
+      }
+    }
+    console.log('[smoke] 17/18 Admin monitoring dashboard (/admin, /api/admin/overview, disconnect & kick) OK')
+
+    // 18. Security Hardening v0.4.0:
+    //     - Strict HTML CSP header
+    //     - DISABLE_LEGACY_OWNER_AUTH & DISABLE_LEGACY_ROOMS kill-switches
+    //     - New-IP login alert emails & optional Account Email Login 2FA
+    //     - Per-account distributed multi-IP brute-force lockout & /ws/bridge auth rate limit
+    //     - Electron safeStorage encrypted bridgeSecret & legacy plaintext auto-migration
+    //     - DesktopUpdater mandatory SHA-256 & pre-install TOCTOU tamper detection
+    {
+      // 18.1 Electron safeStorage config encryption + legacy plaintext auto-migration
+      const encDir = join(tmpDir, 'bridge-sec')
+      mkdirSync(encDir, { recursive: true })
+      const cfgFile = join(encDir, 'config.json')
+      const mockSecretStore = {
+        encrypt: (plain) => `enc_v1:${Buffer.from(plain, 'utf8').toString('base64')}`,
+        decrypt: (enc) => {
+          if (!String(enc || '').startsWith('enc_v1:')) throw new Error('bad cipher')
+          return Buffer.from(enc.slice(7), 'base64').toString('utf8')
+        },
+      }
+      saveConfigSecure(cfgFile, { mode: 'account', roomId: 'usr_sec', bridgeSecret: 'dv_top_secret_99' }, mockSecretStore)
+      const rawEncJson = JSON.parse(readFileSync(cfgFile, 'utf8'))
+      assert.equal(rawEncJson.bridgeSecret, undefined, 'Plaintext bridgeSecret must not be saved when secretStore is active')
+      assert.ok(String(rawEncJson.bridgeSecretEnc || '').startsWith('enc_v1:'))
+      const decCfg = loadConfigDecrypted(cfgFile, mockSecretStore)
+      assert.equal(decCfg.bridgeSecret, 'dv_top_secret_99')
+
+      // Legacy plaintext config auto-migrates to encrypted storage on load
+      const legacyFile = join(encDir, 'legacy.json')
+      writeFileSync(legacyFile, JSON.stringify({ mode: 'account', roomId: 'usr_old', bridgeSecret: 'dv_legacy_plain' }), 'utf8')
+      const migratedCfg = loadConfigDecrypted(legacyFile, mockSecretStore)
+      assert.equal(migratedCfg.bridgeSecret, 'dv_legacy_plain')
+      const afterMigrateDisk = JSON.parse(readFileSync(legacyFile, 'utf8'))
+      assert.equal(afterMigrateDisk.bridgeSecret, undefined, 'Legacy plaintext config must auto-migrate to encrypted storage')
+      assert.ok(String(afterMigrateDisk.bridgeSecretEnc || '').startsWith('enc_v1:'))
+
+      // 18.2 DesktopUpdater mandatory SHA-256 + pre-install TOCTOU tamper detection
+      const secPayload = Buffer.alloc(32 * 1024, 0x42)
+      const secSha = createHash('sha256').update(secPayload).digest('hex')
+      const secUpdServer = http.createServer((req, res) => {
+        const base = `http://127.0.0.1:${secUpdServer.address().port}`
+        if (req.url === '/no-digest') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            tag_name: 'v0.4.1',
+            assets: [{ name: 'All.in.One.Setup.0.4.1.exe', size: secPayload.length, browser_download_url: `${base}/bin` }],
+          }))
+          return
+        }
+        if (req.url === '/with-digest') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            tag_name: 'v0.4.1',
+            assets: [{ name: 'All.in.One.Setup.0.4.1.exe', size: secPayload.length, digest: `sha256:${secSha}`, browser_download_url: `${base}/bin` }],
+          }))
+          return
+        }
+        if (req.url === '/bin') {
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(secPayload.length) })
+          res.end(secPayload)
+          return
+        }
+        res.writeHead(404)
+        res.end('not found')
+      })
+      await new Promise((r) => secUpdServer.listen(0, '127.0.0.1', r))
+      const secUpdPort = secUpdServer.address().port
+      const secUpdDir = join(tmpDir, 'sec-updater-dir')
+      try {
+        // Missing SHA-256 digest must be blocked by default (requireSha256=true)
+        const noDigestUpd = new DesktopUpdater({
+          currentVersion: '0.4.0',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: secUpdDir,
+          apiUrl: `http://127.0.0.1:${secUpdPort}/no-digest`,
+          allowLocalhost: true,
+        })
+        await noDigestUpd.checkForUpdates()
+        const noDigestDl = await noDigestUpd.downloadUpdate()
+        assert.equal(noDigestDl.status, 'error', 'Missing SHA-256 digest must fail download by default')
+        assert.match(noDigestDl.error, /SHA-256/)
+
+        // Pre-install TOCTOU tampering must fail installAndRestart() and delete tampered file
+        const toctouUpd = new DesktopUpdater({
+          currentVersion: '0.4.0',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: secUpdDir,
+          apiUrl: `http://127.0.0.1:${secUpdPort}/with-digest`,
+          allowLocalhost: true,
+        })
+        await toctouUpd.checkForUpdates()
+        const okDl = await toctouUpd.downloadUpdate()
+        assert.equal(okDl.status, 'downloaded')
+        assert.ok(existsSync(okDl.downloadedPath))
+        // Tamper 1 byte on disk after download completes
+        const tampered = Buffer.from(secPayload)
+        tampered[0] ^= 0xff
+        writeFileSync(okDl.downloadedPath, tampered)
+        const instRes = await toctouUpd.installAndRestart({
+          exePath: 'C:\\fake\\All in One.exe',
+          isPackaged: true,
+          onQuit: () => {},
+        })
+        assert.equal(instRes.status, 'error', 'Tampered installer must be rejected before launch')
+        assert.match(instRes.error, /SHA-256/)
+        assert.equal(instRes.downloadedPath, '')
+        assert.equal(existsSync(okDl.downloadedPath), false, 'Tampered installer file must be deleted from disk')
+      } finally {
+        try { secUpdServer.closeAllConnections?.() } catch {}
+        await new Promise((r) => secUpdServer.close(r))
+      }
+
+      // 18.3 Hardened Relay: CSP, Legacy Kill-Switches, New-IP Alert Email, Email 2FA, Distributed Lockout & WS Rate-Limit
+      const secInbox = []
+      const secSmtp = net.createServer((sock) => {
+        let buf = ''
+        let state = 'cmd'
+        let cur = { rcptTo: '', rawData: '' }
+        sock.write('220 sec-smtp.local ESMTP Ready\r\n')
+        sock.on('data', (chunk) => {
+          buf += chunk.toString('utf8')
+          while (true) {
+            if (state === 'data') {
+              const endIdx = buf.indexOf('\r\n.\r\n')
+              if (endIdx === -1) break
+              cur.rawData = buf.slice(0, endIdx)
+              buf = buf.slice(endIdx + 5)
+              const b64Match = cur.rawData.match(/Content-Type: text\/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/)
+              const decodedText = b64Match ? Buffer.from(b64Match[1].replace(/\r?\n/g, ''), 'base64').toString('utf8') : cur.rawData
+              const codeMatch = decodedText.match(/\b(\d{6})\b/)
+              secInbox.push({ ...cur, decodedText, code: codeMatch ? codeMatch[1] : '' })
+              cur = { rcptTo: '', rawData: '' }
+              state = 'cmd'
+              sock.write('250 OK\r\n')
+              continue
+            }
+            const nl = buf.indexOf('\n')
+            if (nl === -1) break
+            const line = buf.slice(0, nl).replace(/\r$/, '')
+            buf = buf.slice(nl + 1)
+            if (state === 'auth_user') { state = 'auth_pass'; sock.write('334 UGFzc3dvcmQ6\r\n') }
+            else if (state === 'auth_pass') { state = 'cmd'; sock.write('235 OK\r\n') }
+            else if (/^EHLO /i.test(line)) sock.write('250-sec-smtp.local\r\n250-AUTH LOGIN\r\n250 OK\r\n')
+            else if (/^AUTH LOGIN$/i.test(line)) { state = 'auth_user'; sock.write('334 VXNlcm5hbWU6\r\n') }
+            else if (/^RCPT TO:/i.test(line)) { cur.rcptTo = line.slice(8).trim(); sock.write('250 OK\r\n') }
+            else if (/^DATA$/i.test(line)) { state = 'data'; sock.write('354 Go\r\n') }
+            else if (/^QUIT$/i.test(line)) { sock.write('221 Bye\r\n'); sock.end() }
+            else sock.write('250 OK\r\n')
+          }
+        })
+      })
+      await new Promise((r) => secSmtp.listen(0, '127.0.0.1', r))
+      const secSmtpPort = secSmtp.address().port
+
+      const secStaticDir = join(tmpDir, 'sec-static')
+      mkdirSync(secStaticDir, { recursive: true })
+      writeFileSync(join(secStaticDir, 'index.html'), '<!doctype html><html><body>ok</body></html>', 'utf8')
+
+      const secRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        clientAccessToken: 'sec-bootstrap-pass-123',
+        bridgeSecret: 'sec-owner-bridge-123',
+        disableLegacyOwnerAuth: true,
+        disableLegacyRooms: true,
+        staticDir: secStaticDir,
+        uploadDir: join(tmpDir, 'sec-uploads'),
+        roomsFile: join(tmpDir, 'sec-rooms.json'),
+        accountsFile: join(tmpDir, 'sec-accounts.json'),
+        smtpHost: '127.0.0.1',
+        smtpPort: secSmtpPort,
+        smtpSecure: false,
+        smtpStarttls: false,
+        smtpUser: 'sec@example.com',
+        smtpPass: 'sec-pass',
+        smtpFrom: 'All in One <sec@example.com>',
+        emailCodeOptions: { cooldownMs: 500 },
+      })
+      try {
+        const { port: secPort } = await secRelay.start()
+        const sBase = `http://127.0.0.1:${secPort}`
+
+        // 18.3a Strict HTML CSP header
+        const htmlRes = await fetch(`${sBase}/`)
+        assert.equal(htmlRes.status, 200)
+        const csp = htmlRes.headers.get('content-security-policy') || ''
+        assert.ok(csp.includes("script-src 'self'"), `Expected strict script-src CSP, got: ${csp}`)
+        assert.ok(csp.includes("frame-ancestors 'none'"), `Expected frame-ancestors none CSP, got: ${csp}`)
+        assert.equal(csp.includes('unsafe-eval'), false)
+
+        // 18.3b Legacy kill-switches block /api/auth/login, owner WS bridge, and /api/rooms/register
+        const legOwnerRes = await fetch(`${sBase}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: 'sec-bootstrap-pass-123' }),
+        })
+        assert.equal(legOwnerRes.status, 403, 'DISABLE_LEGACY_OWNER_AUTH must block /api/auth/login with 403')
+
+        const legRoomRes = await fetch(`${sBase}/api/rooms/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: 'legacy-pc' }),
+        })
+        assert.equal(legRoomRes.status, 403, 'DISABLE_LEGACY_ROOMS must block /api/rooms/register with 403')
+
+        const ownerBridgeStatus = await new Promise((resolveStatus) => {
+          const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=owner&secret=sec-owner-bridge-123&id=legacy-pc`)
+          ws.on('unexpected-response', (_req, res) => resolveStatus(res.statusCode))
+          ws.on('open', () => { ws.close(); resolveStatus(101) })
+          ws.on('error', () => {})
+        })
+        assert.equal(ownerBridgeStatus, 401, 'DISABLE_LEGACY_OWNER_AUTH must reject owner bridge WS with 401')
+
+        // 18.3c Register admin with bound email -> login from NEW IP triggers security alert email
+        const codeRes = await (await fetch(`${sBase}/api/account/email/send-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ purpose: 'register', email: 'secadmin@example.com', inviteCode: 'sec-bootstrap-pass-123' }),
+        })).json()
+        assert.equal(codeRes.ok, true)
+        assert.equal(secInbox.length, 1)
+
+        const secAdm = await (await fetch(`${sBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.1' },
+          body: JSON.stringify({
+            username: 'secadmin',
+            password: 'SecAdminPassword1!',
+            inviteCode: 'sec-bootstrap-pass-123',
+            email: 'secadmin@example.com',
+            emailCode: secInbox[0].code,
+            deviceName: 'MacBook-Pro',
+          }),
+        })).json()
+        assert.equal(secAdm.ok, true)
+
+        // Login from a brand-new IP -> triggers new-device/new-IP security alert email!
+        const newIpLogin = await (await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '203.0.113.77' },
+          body: JSON.stringify({ username: 'secadmin', password: 'SecAdminPassword1!', deviceName: 'Unknown-Browser' }),
+        })).json()
+        assert.equal(newIpLogin.ok, true)
+        // Wait briefly for fire-and-forget alert SMTP delivery
+        await new Promise((r) => setTimeout(r, 150))
+        assert.equal(secInbox.length, 2, 'New-IP login must send a security alert email')
+        assert.ok(secInbox[1].decodedText.includes('203.0.113.77'), 'Alert email must include the new login IP')
+        assert.ok(secInbox[1].decodedText.includes('Unknown-Browser'), 'Alert email must include the device name')
+
+        // 18.3d Enable optional Email Login 2FA -> login requires 6-digit OTP
+        const enable2fa = await (await fetch(`${sBase}/api/account/security/2fa`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secAdm.token}` },
+          body: JSON.stringify({ enabled: true }),
+        })).json()
+        assert.equal(enable2fa.ok, true)
+        assert.equal(enable2fa.user.loginEmail2fa, true)
+
+        const me2fa = await (await fetch(`${sBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${secAdm.token}` },
+        })).json()
+        assert.equal(me2fa.loginEmail2fa, true)
+
+        // Step 1 of 2FA login (no emailCode) -> 200 { ok: false, requires2fa: true } + dispatches 6-digit OTP email
+        const step1Res = await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '203.0.113.77' },
+          body: JSON.stringify({ username: 'secadmin', password: 'SecAdminPassword1!' }),
+        })
+        assert.equal(step1Res.status, 200)
+        const step1Data = await step1Res.json()
+        assert.equal(step1Data.ok, false)
+        assert.equal(step1Data.requires2fa, true)
+        assert.ok(step1Data.maskedEmail.includes('@example.com'))
+        assert.equal(secInbox.length, 3, '2FA challenge must send a 6-digit OTP email')
+        const otp2fa = secInbox[2].code
+        assert.match(otp2fa, /^\d{6}$/)
+
+        // Wrong 2FA code -> 401
+        const bad2fa = await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '203.0.113.77' },
+          body: JSON.stringify({ username: 'secadmin', password: 'SecAdminPassword1!', emailCode: '000000' }),
+        })
+        assert.equal(bad2fa.status, 401)
+
+        // Correct 2FA code -> 200 ok + token
+        const ok2fa = await (await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '203.0.113.77' },
+          body: JSON.stringify({ username: 'secadmin', password: 'SecAdminPassword1!', emailCode: otp2fa }),
+        })).json()
+        assert.equal(ok2fa.ok, true)
+        assert.ok(ok2fa.token)
+
+        // 18.3e Distributed multi-IP per-account brute-force lockout (10 bad attempts across 10 different IPs -> 11th blocked with 429!)
+        for (let i = 1; i <= 10; i += 1) {
+          const r = await fetch(`${sBase}/api/account/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Real-IP': `198.51.100.${10 + i}` },
+            body: JSON.stringify({ username: 'secadmin', password: `WrongPass-${i}!` }),
+          })
+          assert.equal(r.status, 401, `Attempt ${i} should return 401`)
+        }
+        const lockedRes = await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.250' },
+          body: JSON.stringify({ username: 'secadmin', password: 'SecAdminPassword1!' }),
+        })
+        assert.equal(lockedRes.status, 429, 'Per-account distributed brute-force lockout must return 429 even from a fresh IP')
+
+        // 18.3f /ws/bridge auth failure rate-limiting
+        let bridge429 = false
+        for (let i = 0; i < 16; i += 1) {
+          const status = await new Promise((resolveStatus) => {
+            const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=usr_fake&secret=wrong&id=pc`, {
+              headers: { 'X-Real-IP': '198.51.100.222' },
+            })
+            ws.on('unexpected-response', (_req, res) => resolveStatus(res.statusCode))
+            ws.on('open', () => { ws.close(); resolveStatus(101) })
+            ws.on('error', () => {})
+          })
+          if (status === 429) {
+            bridge429 = true
+            break
+          }
+        }
+        assert.equal(bridge429, true, 'Repeated /ws/bridge auth failures from one IP must hit 429 rate limit')
+      } finally {
+        await secRelay.close()
+        await new Promise((r) => secSmtp.close(r))
+      }
+    }
+    console.log('[smoke] 18/18 Security hardening (CSP, legacy kill-switches, new-IP alert, email 2FA, distributed lockout, safeStorage & TOCTOU SHA-256) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

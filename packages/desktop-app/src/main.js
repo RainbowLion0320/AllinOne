@@ -15,6 +15,7 @@ import {
   ipcMain,
   nativeImage,
   protocol,
+  safeStorage,
   shell,
 } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -140,9 +141,21 @@ function setAutoLaunchEnabled(enabled) {
   return getAutoLaunchEnabled()
 }
 
+const desktopSecretStore = {
+  encrypt(plaintext) {
+    if (!safeStorage?.isEncryptionAvailable?.()) return ''
+    return safeStorage.encryptString(String(plaintext)).toString('base64')
+  },
+  decrypt(base64Cipher) {
+    if (!safeStorage?.isEncryptionAvailable?.() || !base64Cipher) return ''
+    return safeStorage.decryptString(Buffer.from(String(base64Cipher), 'base64'))
+  },
+}
+
 const bridgeManager = new DesktopBridgeManager({
   isPackaged: app.isPackaged,
   getAutoLaunch: getAutoLaunchEnabled,
+  secretStore: desktopSecretStore,
 })
 
 const devUpdateApiUrl = !app.isPackaged
@@ -151,7 +164,7 @@ const devUpdateApiUrl = !app.isPackaged
 
 const updater = new DesktopUpdater({
   currentVersion: app.getVersion(),
-  downloadDir: join(app.getPath('temp'), 'allinone-updates'),
+  downloadDir: join(app.getPath('userData'), 'updates'),
   getLang: () => currentLang,
   ...(devUpdateApiUrl ? { apiUrl: devUpdateApiUrl, allowLocalhost: true } : {}),
 })
@@ -483,9 +496,17 @@ function registerStaticProtocol() {
       }
       const buf = readFileSync(target)
       const mime = MIME_TYPES[extname(target).toLowerCase()] || 'application/octet-stream'
+      const headers = {
+        'Content-Type': mime,
+        'X-Content-Type-Options': 'nosniff',
+      }
+      if (extname(target).toLowerCase() === '.html') {
+        headers['Content-Security-Policy'] =
+          "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https: http:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
+      }
       return new Response(buf, {
         status: 200,
-        headers: { 'Content-Type': mime },
+        headers,
       })
     } catch {
       return new Response('Not Found', { status: 404 })

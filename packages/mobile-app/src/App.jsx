@@ -24,6 +24,7 @@ import {
   revokeDeviceSessions,
   revokeOtherAuthSessions,
   sendEmailVerificationCode,
+  setAccountLogin2fa,
 } from './lib/wsClient.js'
 import {
   getActiveDevice,
@@ -1299,6 +1300,7 @@ export function App() {
             ...(meRes.username ? { username: meRes.username } : {}),
             ...(meRes.role ? { role: meRes.role } : {}),
             email: meRes.email || '',
+            loginEmail2fa: Boolean(meRes.loginEmail2fa),
           }),
         )
       }
@@ -1320,6 +1322,7 @@ export function App() {
             ...(res.username ? { username: res.username } : {}),
             ...(res.role ? { role: res.role } : {}),
             email: res.email || '',
+            loginEmail2fa: Boolean(res.loginEmail2fa),
           }),
         )
       })
@@ -1356,6 +1359,27 @@ export function App() {
       setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { email: boundEmail }))
       showToast(biLang(getCurrentLang(), `已绑定邮箱 ${boundEmail}`, `Linked email ${boundEmail}`))
       return user
+    },
+    [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
+  )
+
+  const handleToggleLoginEmail2fa = useCallback(
+    async (enabled) => {
+      if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) return
+      try {
+        const user = await setAccountLogin2fa(activeDevice.baseUrl, activeDevice.token, enabled)
+        setDeviceState((prev) =>
+          updateDeviceMeta(prev, activeDevice.id, { loginEmail2fa: Boolean(user?.loginEmail2fa) }),
+        )
+        const curLang = getCurrentLang()
+        showToast(
+          user?.loginEmail2fa
+            ? biLang(curLang, '已开启登录邮箱二次验证', 'Email login 2FA enabled')
+            : biLang(curLang, '已关闭登录邮箱二次验证', 'Email login 2FA disabled'),
+        )
+      } catch (err) {
+        showToast(String(err?.message || err))
+      }
     },
     [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
   )
@@ -2021,6 +2045,7 @@ export function App() {
         onOpenInviteManager={() => setInviteManagerOpen(true)}
         onSendBindEmailCode={handleSendBindEmailCode}
         onBindAccountEmail={handleBindAccountEmail}
+        onToggleLogin2fa={handleToggleLoginEmail2fa}
         onRemoveDevice={handleRemoveDevice}
       />
       {/* Full-Screen Zoomable Image Lightbox */}

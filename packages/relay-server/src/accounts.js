@@ -124,6 +124,8 @@ export function createAccountStore({ filePath }) {
           emailLower,
           emailVerified: Boolean(rawEmail && u.emailVerified),
           emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
+          loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
+          knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
           role: u.role === 'admin' ? 'admin' : 'user',
           tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
           devices: Array.isArray(u.devices) ? u.devices : [],
@@ -181,6 +183,7 @@ export function createAccountStore({ filePath }) {
       username: u.username,
       email: u.email || '',
       emailVerified: Boolean(u.email && u.emailVerified),
+      loginEmail2fa: Boolean(u.email && u.emailVerified && u.loginEmail2fa),
       role: u.role,
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
@@ -344,6 +347,8 @@ export function createAccountStore({ filePath }) {
       emailLower: cleanEmailLower,
       emailVerified: Boolean(cleanEmail && emailVerified),
       emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
+      loginEmail2fa: false,
+      knownLoginIps: [],
       role,
       passwordSalt: salt,
       passwordHash: hash,
@@ -683,6 +688,38 @@ export function createAccountStore({ filePath }) {
     return true
   }
 
+  function setLoginEmail2fa(userId, enabled) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    const next = Boolean(enabled)
+    if (next && (!record.email || !record.emailVerified)) {
+      return { ok: false, error: '请先绑定并验证邮箱，再开启登录二次验证' }
+    }
+    record.loginEmail2fa = next
+    save()
+    return { ok: true, user: sanitizeUser(record) }
+  }
+
+  function checkAndRememberLoginContext(userId, { deviceName = '', ip = '' } = {}) {
+    const record = usersById.get(userId)
+    if (!record) return { isNewContext: false }
+    const cleanIp = String(ip || '').trim()
+    const cleanName = String(deviceName || '').trim()
+    if (!Array.isArray(record.knownLoginIps)) record.knownLoginIps = []
+    const hadHistory = record.knownLoginIps.length > 0 || (Array.isArray(record.sessions) && record.sessions.length > 0)
+    const knownByIp = Boolean(cleanIp && record.knownLoginIps.includes(cleanIp))
+    const knownBySession = Boolean(
+      Array.isArray(record.sessions) &&
+      record.sessions.some((s) => s.ip === cleanIp && (!cleanName || s.deviceName === cleanName)),
+    )
+    const isNewContext = Boolean(hadHistory && cleanIp && !knownByIp && !knownBySession)
+    if (cleanIp) {
+      record.knownLoginIps = [cleanIp, ...record.knownLoginIps.filter((x) => x !== cleanIp)].slice(0, 12)
+      save()
+    }
+    return { isNewContext }
+  }
+
   function revokeUserTokens(userId) {
     const record = usersById.get(userId)
     if (!record) return null
@@ -699,6 +736,38 @@ export function createAccountStore({ filePath }) {
       .map(sanitizeUser)
   }
 
+  /**
+   * Read-only sanitized user snapshot for the admin monitoring dashboard.
+   * Never mutates persisted state or exposes password / deviceSecret hashes.
+   */
+  function listUsersForAdmin() {
+    const now = Date.now()
+    return [...usersById.values()]
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .map((u) => {
+        const revoked = u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {}
+        const activeSessions = (Array.isArray(u.sessions) ? u.sessions : [])
+          .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !revoked[s.sid])
+          .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
+          .slice(0, MAX_USER_SESSIONS)
+          .map((s) => ({
+            sid: s.sid,
+            deviceName: s.deviceName || '',
+            clientKind: s.clientKind || 'web',
+            ip: s.ip || '',
+            createdAt: Number(s.createdAt) || 0,
+            lastSeenAt: Number(s.lastSeenAt) || Number(s.createdAt) || 0,
+          }))
+        return {
+          ...sanitizeUser(u),
+          invitedBy: u.invitedBy || '',
+          inviteId: u.inviteId || '',
+          devices: (Array.isArray(u.devices) ? u.devices : []).map(sanitizeDeviceRecord),
+          sessions: activeSessions,
+        }
+      })
+  }
+
   return {
     userCount: () => usersById.size,
     createInvites,
@@ -710,6 +779,8 @@ export function createAccountStore({ filePath }) {
     registerUser,
     authenticateUser,
     setUserEmail,
+    setLoginEmail2fa,
+    checkAndRememberLoginContext,
     resetPasswordByEmail,
     changePassword,
     bindDevice,
@@ -726,5 +797,6 @@ export function createAccountStore({ filePath }) {
     revokeUserSession,
     revokeUserTokens,
     listUsers,
+    listUsersForAdmin,
   }
 }

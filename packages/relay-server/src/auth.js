@@ -43,6 +43,11 @@ export function createAuthManager({
   const MAX_FAILS = 15
   const WINDOW_MS = 10 * 60 * 1000
 
+  // Per-account rate limit to block distributed multi-IP credential stuffing
+  const accountFailures = new Map()
+  const MAX_ACCT_FAILS = 10
+  const ACCT_WINDOW_MS = 15 * 60 * 1000
+
   // Per-IP rate limit for room registrations
   const registrations = new Map()
   const MAX_REG_PER_HOUR = 20
@@ -98,6 +103,41 @@ export function createAuthManager({
 
   function clearFailure(ip) {
     failures.delete(ip)
+  }
+
+  function normalizeAccountKey(identifier) {
+    return String(identifier || '').trim().toLowerCase().slice(0, 128)
+  }
+
+  function checkAccountRateLimit(identifier) {
+    const key = normalizeAccountKey(identifier)
+    if (!key) return true
+    const now = Date.now()
+    const entry = accountFailures.get(key)
+    if (!entry) return true
+    if (now - entry.firstAt > ACCT_WINDOW_MS) {
+      accountFailures.delete(key)
+      return true
+    }
+    return entry.count < MAX_ACCT_FAILS
+  }
+
+  function recordAccountFailure(identifier) {
+    const key = normalizeAccountKey(identifier)
+    if (!key) return
+    const now = Date.now()
+    pruneMap(accountFailures, ACCT_WINDOW_MS, now)
+    const entry = accountFailures.get(key)
+    if (!entry || now - entry.firstAt > ACCT_WINDOW_MS) {
+      accountFailures.set(key, { count: 1, firstAt: now })
+    } else {
+      entry.count += 1
+    }
+  }
+
+  function clearAccountFailure(identifier) {
+    const key = normalizeAccountKey(identifier)
+    if (key) accountFailures.delete(key)
   }
 
   function checkRegisterLimit(ip) {
@@ -280,6 +320,9 @@ export function createAuthManager({
     checkRateLimit,
     recordFailure,
     clearFailure,
+    checkAccountRateLimit,
+    recordAccountFailure,
+    clearAccountFailure,
     checkRegisterLimit,
     generateSessionId,
     signSessionToken,

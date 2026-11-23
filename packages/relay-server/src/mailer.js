@@ -349,7 +349,9 @@ function buildVerificationEmailContent({ code, purpose, username = '' }) {
       ? '重置密码'
       : purpose === 'bind'
         ? '绑定邮箱'
-        : '注册账号'
+        : purpose === 'login_2fa'
+          ? '登录二次验证'
+          : '注册账号'
 
   const subject = `[All in One] 你的${purposeLabel}验证码：${code}`
   const greeting = username ? `你好 @${username}：` : '你好：'
@@ -474,10 +476,47 @@ export function createMailer(options = {}) {
     return { ok: true }
   }
 
+  async function sendLoginAlert({ to, username = '', deviceName = '', ip = '', at = Date.now() }) {
+    const safeUser = String(username || '').replace(/[<>]/g, '')
+    const safeDevice = String(deviceName || 'Unknown Device').replace(/[<>]/g, '')
+    const safeIp = String(ip || 'unknown').replace(/[<>]/g, '')
+    const timeStr = new Date(at || Date.now()).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+    const subject = `[All in One] 新设备登录提醒 · ${safeDevice}`
+    const text = [
+      `你好${safeUser ? ` @${safeUser}` : ''}：`,
+      '',
+      '检测到你的 All in One 账号刚刚在新设备或新网络 IP 上登录：',
+      `  • 设备：${safeDevice}`,
+      `  • 来源 IP：${safeIp}`,
+      `  • 时间：${timeStr}`,
+      '',
+      '如果这是你本人操作，可直接忽略本邮件。',
+      '如非本人操作，请立即打开 All in One →「我的电脑」→「已登录终端」点击「下线其他」，并尽快修改密码。',
+    ].join('\n')
+    const html = `<!doctype html>
+<html lang="zh-CN">
+<body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;color:#1e293b;">
+  <div style="max-width:460px;margin:0 auto;background:#ffffff;border-radius:16px;padding:26px 24px;border:1px solid #e2e8f0;">
+    <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:12px;">All in One · 安全提醒</div>
+    <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#334155;">你好${safeUser ? ` <strong>@${safeUser}</strong>` : ''}，检测到你的账号刚刚在新设备或新网络登录：</p>
+    <div style="margin:14px 0;padding:14px 16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:13px;line-height:1.8;color:#334155;">
+      <div><strong>设备：</strong>${safeDevice}</div>
+      <div><strong>来源 IP：</strong><code>${safeIp}</code></div>
+      <div><strong>时间：</strong>${timeStr}</div>
+    </div>
+    <p style="margin:14px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">如为本人操作，请忽略此邮件；如非本人操作，请立即在客户端「我的电脑 → 已登录终端」点击<strong>「下线其他」</strong>并修改密码。</p>
+  </div>
+</body>
+</html>`
+    await sendMail({ to, subject, text, html })
+    return { ok: true }
+  }
+
   return {
     isConfigured,
     getProvider,
     sendMail,
     sendVerificationCode,
+    sendLoginAlert,
   }
 }
