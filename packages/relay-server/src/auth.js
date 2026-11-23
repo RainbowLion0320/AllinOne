@@ -48,6 +48,12 @@ export function createAuthManager({
   const MAX_ACCT_FAILS = 10
   const ACCT_WINDOW_MS = 15 * 60 * 1000
 
+  // Per-(IP, roomId) rate limit for /ws/bridge auth failures so one stale/disabled
+  // legacy room (e.g. `owner`) on a shared NAT IP can never lock out valid `usr_*` bridges or user logins
+  const bridgeFailures = new Map()
+  const MAX_BRIDGE_FAILS = 15
+  const BRIDGE_WINDOW_MS = 10 * 60 * 1000
+
   // Per-IP rate limit for room registrations
   const registrations = new Map()
   const MAX_REG_PER_HOUR = 20
@@ -138,6 +144,40 @@ export function createAuthManager({
   function clearAccountFailure(identifier) {
     const key = normalizeAccountKey(identifier)
     if (key) accountFailures.delete(key)
+  }
+
+  function makeBridgeRateKey(ip, roomId) {
+    const cleanIp = String(ip || '').trim() || 'unknown'
+    const cleanRoom = String(roomId || '').trim().toLowerCase().slice(0, 64) || 'owner'
+    return `${cleanIp}|${cleanRoom}`
+  }
+
+  function checkBridgeRateLimit(ip, roomId) {
+    const key = makeBridgeRateKey(ip, roomId)
+    const now = Date.now()
+    const entry = bridgeFailures.get(key)
+    if (!entry) return true
+    if (now - entry.firstAt > BRIDGE_WINDOW_MS) {
+      bridgeFailures.delete(key)
+      return true
+    }
+    return entry.count < MAX_BRIDGE_FAILS
+  }
+
+  function recordBridgeFailure(ip, roomId) {
+    const key = makeBridgeRateKey(ip, roomId)
+    const now = Date.now()
+    pruneMap(bridgeFailures, BRIDGE_WINDOW_MS, now)
+    const entry = bridgeFailures.get(key)
+    if (!entry || now - entry.firstAt > BRIDGE_WINDOW_MS) {
+      bridgeFailures.set(key, { count: 1, firstAt: now })
+    } else {
+      entry.count += 1
+    }
+  }
+
+  function clearBridgeFailure(ip, roomId) {
+    bridgeFailures.delete(makeBridgeRateKey(ip, roomId))
   }
 
   function checkRegisterLimit(ip) {
@@ -323,6 +363,9 @@ export function createAuthManager({
     checkAccountRateLimit,
     recordAccountFailure,
     clearAccountFailure,
+    checkBridgeRateLimit,
+    recordBridgeFailure,
+    clearBridgeFailure,
     checkRegisterLimit,
     generateSessionId,
     signSessionToken,

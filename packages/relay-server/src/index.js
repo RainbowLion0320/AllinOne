@@ -2211,19 +2211,23 @@ export function createRelayServer(options = {}) {
 
     if (pathname === '/ws/bridge') {
       const bridgeIp = getClientIp(req)
-      if (!auth.checkRateLimit(bridgeIp)) {
+      const requestedRoom =
+        String(
+          req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || urlObj.searchParams.get('room') || '',
+        ).trim() || 'owner'
+      if (!auth.checkBridgeRateLimit(bridgeIp, requestedRoom)) {
         socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n')
         socket.destroy()
         return
       }
       const bridgeAuth = authenticateBridgeInfo(req, urlObj)
       if (!bridgeAuth) {
-        auth.recordFailure(bridgeIp)
+        auth.recordBridgeFailure(bridgeIp, requestedRoom)
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()
         return
       }
-      auth.clearFailure(bridgeIp)
+      auth.clearBridgeFailure(bridgeIp, requestedRoom)
       const meta = {
         roomId: bridgeAuth.roomId,
         // For account-bound devices, enforce the authoritative bridgeId bound to that deviceSecret

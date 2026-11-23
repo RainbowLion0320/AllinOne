@@ -2578,11 +2578,11 @@ async function main() {
         })
         assert.equal(lockedRes.status, 429, 'Per-account distributed brute-force lockout must return 429 even from a fresh IP')
 
-        // 18.3f /ws/bridge auth failure rate-limiting
+        // 18.3f /ws/bridge auth failure rate-limiting (isolated per (ip, roomId) so stale legacy owner never blocks valid usr_* on same NAT IP)
         let bridge429 = false
         for (let i = 0; i < 16; i += 1) {
           const status = await new Promise((resolveStatus) => {
-            const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=usr_fake&secret=wrong&id=pc`, {
+            const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?room=owner&secret=wrong&id=stale-pc`, {
               headers: { 'X-Real-IP': '198.51.100.222' },
             })
             ws.on('unexpected-response', (_req, res) => resolveStatus(res.statusCode))
@@ -2594,7 +2594,28 @@ async function main() {
             break
           }
         }
-        assert.equal(bridge429, true, 'Repeated /ws/bridge auth failures from one IP must hit 429 rate limit')
+        assert.equal(bridge429, true, 'Repeated /ws/bridge auth failures for one room must hit 429 rate limit')
+
+        // A valid account bridge on the EXACT SAME IP must NOT be locked out by the stale `owner` room!
+        const validDev = await (await fetch(`${sBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secAdm.token}` },
+          body: JSON.stringify({ label: 'Nat-Safe-PC', hostname: 'Nat-Safe-PC', platform: 'win32' }),
+        })).json()
+        assert.equal(validDev.ok, true)
+        const sameIpValidStatus = await new Promise((resolveStatus) => {
+          const ws = new WebSocket(`ws://127.0.0.1:${secPort}/ws/bridge?roomId=${validDev.roomId}&bridgeId=${validDev.bridgeId}`, {
+            headers: {
+              'X-Real-IP': '198.51.100.222',
+              'X-Room-Id': validDev.roomId,
+              'X-Bridge-Secret': validDev.deviceSecret,
+            },
+          })
+          ws.on('unexpected-response', (_req, res) => resolveStatus(res.statusCode))
+          ws.on('open', () => { ws.close(); resolveStatus(101) })
+          ws.on('error', () => {})
+        })
+        assert.equal(sameIpValidStatus, 101, 'Stale room=owner 429 must NEVER block a valid usr_* bridge on the same IP')
       } finally {
         await secRelay.close()
         await new Promise((r) => secSmtp.close(r))
