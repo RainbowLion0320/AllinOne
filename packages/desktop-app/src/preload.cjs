@@ -5,7 +5,7 @@ const initInfo = ipcRenderer.sendSync('desktop:get-init') || {}
 contextBridge.exposeInMainWorld('allinoneDesktop', {
   isDesktop: true,
   platform: initInfo.platform || process.platform,
-  version: initInfo.version || '0.3.3',
+  version: initInfo.version || '0.3.4',
   defaultServerUrl: initInfo.defaultServerUrl || '',
   getBridgeStatus: () => ipcRenderer.invoke('bridge:status'),
   syncAccount: (account) => ipcRenderer.invoke('bridge:sync-account', account),
@@ -13,6 +13,19 @@ contextBridge.exposeInMainWorld('allinoneDesktop', {
   toggleBridge: () => ipcRenderer.invoke('bridge:toggle'),
   toggleAutoLaunch: () => ipcRenderer.invoke('desktop:toggle-auto-launch'),
   openLog: () => ipcRenderer.invoke('bridge:open-log'),
+  getUpdateState: () => ipcRenderer.invoke('updater:state'),
+  checkForUpdates: () => ipcRenderer.invoke('updater:check'),
+  downloadUpdate: () => ipcRenderer.invoke('updater:download'),
+  cancelUpdateDownload: () => ipcRenderer.invoke('updater:cancel'),
+  installUpdate: () => ipcRenderer.invoke('updater:install'),
+  onUpdateState: (callback) => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, payload) => {
+      try { callback(payload) } catch {}
+    }
+    ipcRenderer.on('updater:state-changed', handler)
+    return () => ipcRenderer.removeListener('updater:state-changed', handler)
+  },
   onBridgeStatus: (callback) => {
     if (typeof callback !== 'function') return () => {}
     const handler = (_event, payload) => {

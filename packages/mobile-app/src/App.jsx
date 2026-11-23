@@ -110,6 +110,7 @@ export function App() {
   const [streamingBySession, setStreamingBySession] = useState({})
   const [approvals, setApprovals] = useState([])
   const [desktopBridge, setDesktopBridge] = useState(null)
+  const [updateState, setUpdateState] = useState(null)
 
   const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
   const isMacDesktop = desktopApi?.platform === 'darwin'
@@ -220,16 +221,23 @@ export function App() {
     setNewChatOpen(true)
   }, [sidebarFilterApp, selectedDraftApp, appsStatus])
 
-  // Electron Desktop App integration: live local bridge status + menu shortcuts + keyboard shortcuts
+  // Electron Desktop App integration: live local bridge status + auto-updater + menu shortcuts
   useEffect(() => {
     if (!desktopApi) return
     let unsubStatus = null
     let unsubMenu = null
+    let unsubUpdate = null
     desktopApi.getBridgeStatus?.().then((st) => {
       if (st) setDesktopBridge(st)
     }).catch(() => {})
+    desktopApi.getUpdateState?.().then((st) => {
+      if (st) setUpdateState(st)
+    }).catch(() => {})
     if (typeof desktopApi.onBridgeStatus === 'function') {
       unsubStatus = desktopApi.onBridgeStatus((st) => setDesktopBridge(st))
+    }
+    if (typeof desktopApi.onUpdateState === 'function') {
+      unsubUpdate = desktopApi.onUpdateState((st) => setUpdateState(st))
     }
     if (typeof desktopApi.onMenuAction === 'function') {
       unsubMenu = desktopApi.onMenuAction((action) => {
@@ -243,6 +251,7 @@ export function App() {
     }
     return () => {
       try { unsubStatus?.() } catch {}
+      try { unsubUpdate?.() } catch {}
       try { unsubMenu?.() } catch {}
     }
   }, [desktopApi, openNewChatModal])
@@ -1567,6 +1576,7 @@ export function App() {
         username={activeDevice?.username || ''}
         isAdmin={isAdmin}
         isMacDesktop={isMacDesktop}
+        hasUpdate={updateState?.status === 'available' || updateState?.status === 'downloaded'}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
       />
@@ -1895,6 +1905,11 @@ export function App() {
             : null
         }
         onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
+        updateState={updateState}
+        onCheckUpdate={desktopApi ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) } : null}
+        onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
+        onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
+        onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
         onOpenShare={() => setShareOpen(true)}
         onOpenInviteManager={() => setInviteManagerOpen(true)}

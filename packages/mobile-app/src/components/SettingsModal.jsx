@@ -2,10 +2,10 @@ import React, { useEffect, useState } from 'react'
 import {
   Check,
   ChevronRight,
+  Download,
   ExternalLink,
   FileText,
   HardDrive,
-  Info,
   Laptop,
   Loader2,
   LogOut,
@@ -13,6 +13,8 @@ import {
   Monitor,
   Moon,
   Power,
+  RefreshCw,
+  RotateCw,
   Settings,
   Share2,
   Sun,
@@ -75,6 +77,11 @@ export function SettingsModal({
   onToggleDesktopBridge = null,
   onToggleDesktopAutoLaunch = null,
   onOpenDesktopLog = null,
+  updateState = null,
+  onCheckUpdate = null,
+  onDownloadUpdate = null,
+  onCancelUpdate = null,
+  onInstallUpdate = null,
   onOpenDeviceSwitcher = null,
   onOpenShare = null,
   onOpenInviteManager = null,
@@ -118,7 +125,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '0.3.3'
+    '0.3.4'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -588,10 +595,10 @@ export function SettingsModal({
             </div>
           </section>
 
-          {/* Section 6: About & Version */}
+          {/* Section 6: About & Built-in Updater */}
           <section>
             <div className="mb-1.5 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
-              关于
+              关于与更新
             </div>
             <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#22252E]">
               <div className="flex items-center justify-between gap-3 px-4 py-3">
@@ -613,8 +620,169 @@ export function SettingsModal({
                     </div>
                   </div>
                 </div>
-                <Info className="h-4 w-4 shrink-0 text-slate-300 dark:text-slate-600" />
+                {desktopApi && onCheckUpdate ? (
+                  <button
+                    type="button"
+                    disabled={
+                      updateState?.status === 'checking' ||
+                      updateState?.status === 'downloading' ||
+                      updateState?.status === 'installing'
+                    }
+                    onClick={() => onCheckUpdate()}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-[11.5px] font-semibold text-slate-700 transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${updateState?.status === 'checking' ? 'animate-spin text-[#4D6BFE]' : ''}`}
+                    />
+                    <span>{updateState?.status === 'checking' ? '检查中...' : '检查更新'}</span>
+                  </button>
+                ) : (
+                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    自动热更新
+                  </span>
+                )}
               </div>
+
+              {/* Desktop in-app updater status & 1-click download/install panel */}
+              {desktopApi && updateState && updateState.status !== 'idle' && (
+                <div className="px-4 py-3 text-xs">
+                  {updateState.status === 'checking' && (
+                    <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
+                      <span>正在从 GitHub Releases 检查最新版本...</span>
+                    </div>
+                  )}
+
+                  {updateState.status === 'up-to-date' && (
+                    <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-300">
+                      <Check className="h-3.5 w-3.5" />
+                      <span>当前已是最新版本 (v{updateState.latestVersion || appVersion})</span>
+                    </div>
+                  )}
+
+                  {updateState.status === 'available' && (
+                    <div className="space-y-2.5 rounded-xl border border-[#4D6BFE]/30 bg-[#F3F6FF] p-3 dark:border-[#4D6BFE]/35 dark:bg-[#1C2338]">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="font-bold text-[#2842C9] dark:text-white">
+                            发现新版本 v{updateState.latestVersion}
+                          </div>
+                          <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                            {updateState.assetName
+                              ? `${updateState.assetName}${updateState.assetSize ? ` · ${formatBytesCompact(updateState.assetSize)}` : ''}`
+                              : '可前往 GitHub Releases 下载更新'}
+                          </div>
+                        </div>
+                        {updateState.downloadUrl && onDownloadUpdate ? (
+                          <button
+                            type="button"
+                            onClick={() => onDownloadUpdate()}
+                            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[#4D6BFE] px-3 py-1.5 text-[11.5px] font-semibold text-white shadow-xs active:scale-95"
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                            <span>下载更新</span>
+                          </button>
+                        ) : (
+                          <a
+                            href={updateState.releaseUrl || RELEASES_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE] px-3 py-1.5 text-[11.5px] font-semibold text-white"
+                          >
+                            <span>去下载</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                      </div>
+                      <div className="text-[10.5px] text-slate-500 dark:text-slate-400">
+                        支持原位覆盖升级，无需手动卸载，账号与本机桥接配置完整保留。
+                      </div>
+                    </div>
+                  )}
+
+                  {updateState.status === 'downloading' && (
+                    <div className="space-y-2 rounded-xl border border-slate-200/80 bg-slate-50 p-3 dark:border-slate-700/80 dark:bg-[#171A23]">
+                      <div className="flex items-center justify-between gap-2 text-[11.5px]">
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">
+                          正在下载 v{updateState.latestVersion} · {updateState.percent}%
+                        </span>
+                        <span className="font-mono text-[10.5px] text-slate-400">
+                          {formatBytesCompact(updateState.downloadedBytes)}
+                          {updateState.totalBytes > 0 ? ` / ${formatBytesCompact(updateState.totalBytes)}` : ''}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                        <div
+                          className="h-full rounded-full bg-[#4D6BFE] transition-all duration-200"
+                          style={{ width: `${Math.max(4, Math.min(100, updateState.percent || 0))}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => onCancelUpdate?.()}
+                          className="rounded-lg px-2 py-0.5 text-[11px] text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+                        >
+                          取消下载
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {updateState.status === 'downloaded' && (
+                    <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-200/80 bg-emerald-50/80 p-3 dark:border-emerald-900/60 dark:bg-emerald-950/35">
+                      <div className="min-w-0">
+                        <div className="font-bold text-emerald-700 dark:text-emerald-300">
+                          v{updateState.latestVersion} 已就绪
+                          {updateState.expectedSha256 ? '（SHA-256 校验通过）' : ''}
+                        </div>
+                        <div className="mt-0.5 text-[10.5px] text-emerald-600/80 dark:text-emerald-400/80">
+                          点击后将自动原位覆盖安装并重新打开应用
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onInstallUpdate?.()}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-1.5 text-[11.5px] font-semibold text-white shadow-xs hover:bg-emerald-500 active:scale-95"
+                      >
+                        <RotateCw className="h-3.5 w-3.5" />
+                        <span>重启并更新</span>
+                      </button>
+                    </div>
+                  )}
+
+                  {updateState.status === 'installing' && (
+                    <div className="flex items-center gap-2 text-[#4D6BFE]">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>正在启动原位更新程序并自动重启...</span>
+                    </div>
+                  )}
+
+                  {updateState.status === 'error' && (
+                    <div className="space-y-1.5 rounded-xl bg-rose-50 px-3 py-2 text-[11.5px] text-rose-600 dark:bg-rose-950/45 dark:text-rose-300">
+                      <div>{updateState.error || '检查或下载更新失败'}</div>
+                      <div className="flex items-center gap-3 pt-0.5">
+                        <button
+                          type="button"
+                          onClick={() => onCheckUpdate?.()}
+                          className="font-semibold text-[#4D6BFE] hover:underline"
+                        >
+                          重试
+                        </button>
+                        <a
+                          href={updateState.releaseUrl || RELEASES_URL}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-0.5 text-slate-500 hover:underline dark:text-slate-300"
+                        >
+                          <span>手动去 GitHub 下载</span>
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <a
                 href={RELEASES_URL}
@@ -622,7 +790,7 @@ export function SettingsModal({
                 rel="noopener noreferrer"
                 className="flex w-full items-center justify-between px-4 py-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
               >
-                <span>检查更新 / 下载安装包 (GitHub Releases)</span>
+                <span>GitHub Releases 全部版本</span>
                 <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
               </a>
 

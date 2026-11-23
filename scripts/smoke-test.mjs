@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import http from 'node:http'
 import net from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -53,6 +54,11 @@ import {
   saveLastSessionId,
   saveLastWorkspace,
 } from '../packages/mobile-app/src/lib/draftStore.js'
+import {
+  DesktopUpdater,
+  compareSemver,
+  pickReleaseAsset,
+} from '../packages/desktop-app/src/updater.js'
 
 const TEST_PASS = 'smoke-test-pass-123'
 const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
@@ -1632,7 +1638,171 @@ async function main() {
       }
       assert.deepEqual(violations, [], `React hook order violations found:\n${violations.join('\n')}`)
     }
-    console.log('[smoke] 13/13 React Rules-of-Hooks static guard across all JSX components OK')
+    console.log('[smoke] 13/14 React Rules-of-Hooks static guard across all JSX components OK')
+
+    // 14. Built-in Desktop Auto-Updater (semver, asset selection, streamed download, SHA-256 verification, cache reuse)
+    {
+      assert.equal(compareSemver('0.3.4', '0.3.3'), 1)
+      assert.equal(compareSemver('v0.10.0', '0.3.9'), 1)
+      assert.equal(compareSemver('0.3.3', 'v0.3.3'), 0)
+      assert.equal(compareSemver('0.3.4', '0.3.4-beta.1'), 1)
+      assert.equal(compareSemver('0.3.2', '0.3.3'), -1)
+
+      const sampleAssets = [
+        { name: 'All-in-One-Android.apk', browser_download_url: 'https://github.com/a/b/All-in-One-Android.apk' },
+        { name: 'All.in.One-0.3.4-arm64.dmg', browser_download_url: 'https://github.com/a/b/All.in.One-0.3.4-arm64.dmg' },
+        { name: 'All.in.One.Setup.0.3.4.exe', browser_download_url: 'https://github.com/a/b/All.in.One.Setup.0.3.4.exe' },
+      ]
+      assert.equal(pickReleaseAsset(sampleAssets, 'win32', 'x64')?.name, 'All.in.One.Setup.0.3.4.exe')
+      assert.equal(pickReleaseAsset(sampleAssets, 'darwin', 'arm64')?.name, 'All.in.One-0.3.4-arm64.dmg')
+
+      const fakePayload = Buffer.alloc(64 * 1024, 0x5a)
+      const validSha = createHash('sha256').update(fakePayload).digest('hex')
+      let downloadHits = 0
+      const mockReleaseServer = http.createServer((req, res) => {
+        const base = `http://127.0.0.1:${mockReleaseServer.address().port}`
+        if (req.url === '/releases/latest') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            tag_name: 'v0.3.4',
+            html_url: 'https://github.com/RainbowLion0320/AllinOne/releases/tag/v0.3.4',
+            body: 'Built-in updater release',
+            published_at: '2026-11-23T00:00:00Z',
+            assets: [
+              {
+                name: 'All.in.One.Setup.0.3.4.exe',
+                size: fakePayload.length,
+                digest: `sha256:${validSha}`,
+                browser_download_url: `${base}/download/All.in.One.Setup.0.3.4.exe`,
+              },
+            ],
+          }))
+          return
+        }
+        if (req.url === '/releases/corrupt') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            tag_name: 'v0.3.5',
+            html_url: 'https://github.com/RainbowLion0320/AllinOne/releases/tag/v0.3.5',
+            assets: [
+              {
+                name: 'All.in.One.Setup.0.3.5.exe',
+                size: fakePayload.length,
+                digest: `sha256:${'0'.repeat(64)}`,
+                browser_download_url: `${base}/download/All.in.One.Setup.0.3.4.exe`,
+              },
+            ],
+          }))
+          return
+        }
+        if (req.url === '/download/All.in.One.Setup.0.3.4.exe') {
+          downloadHits += 1
+          res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(fakePayload.length),
+          })
+          res.write(fakePayload.subarray(0, 32 * 1024))
+          setTimeout(() => {
+            res.end(fakePayload.subarray(32 * 1024))
+          }, 20)
+          return
+        }
+        res.writeHead(404)
+        res.end('not found')
+      })
+
+      await new Promise((r) => mockReleaseServer.listen(0, '127.0.0.1', r))
+      const updPort = mockReleaseServer.address().port
+      const updDir = join(tmpDir, 'updater-cache')
+      try {
+        // 14.1 Check -> available -> download -> SHA-256 verified -> cached reuse
+        const updater = new DesktopUpdater({
+          currentVersion: '0.3.3',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: updDir,
+          apiUrl: `http://127.0.0.1:${updPort}/releases/latest`,
+          allowLocalhost: true,
+        })
+        const seenStatuses = []
+        updater.on('state', (s) => seenStatuses.push(s.status))
+
+        const chk = await updater.checkForUpdates()
+        assert.equal(chk.status, 'available')
+        assert.equal(chk.latestVersion, '0.3.4')
+        assert.equal(chk.expectedSha256, validSha)
+
+        const dl = await updater.downloadUpdate()
+        assert.equal(dl.status, 'downloaded')
+        assert.equal(dl.percent, 100)
+        assert.ok(existsSync(dl.downloadedPath), 'Downloaded installer must exist on disk')
+        assert.equal(Buffer.compare(readFileSync(dl.downloadedPath), fakePayload), 0)
+        assert.ok(seenStatuses.includes('downloading'), 'Must emit downloading state')
+        assert.equal(downloadHits, 1)
+
+        // Second check on a fresh updater instance reuses verified cached installer
+        const updaterReuse = new DesktopUpdater({
+          currentVersion: '0.3.3',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: updDir,
+          apiUrl: `http://127.0.0.1:${updPort}/releases/latest`,
+          allowLocalhost: true,
+        })
+        const reused = await updaterReuse.checkForUpdates()
+        assert.equal(reused.status, 'downloaded', 'Verified cached installer should be reused immediately')
+        assert.equal(downloadHits, 1)
+
+        // 14.2 Corrupted SHA-256 digest must fail and discard partial file
+        const corruptUpdater = new DesktopUpdater({
+          currentVersion: '0.3.3',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: updDir,
+          apiUrl: `http://127.0.0.1:${updPort}/releases/corrupt`,
+          allowLocalhost: true,
+        })
+        const corruptChk = await corruptUpdater.checkForUpdates()
+        assert.equal(corruptChk.status, 'available')
+        const corruptDl = await corruptUpdater.downloadUpdate()
+        assert.equal(corruptDl.status, 'error')
+        assert.match(corruptDl.error, /SHA-256/)
+        assert.equal(existsSync(join(updDir, 'All.in.One.Setup.0.3.5.exe')), false)
+        assert.equal(existsSync(join(updDir, 'All.in.One.Setup.0.3.5.exe.part')), false)
+
+        // 14.3 Already up-to-date
+        const upToDateUpdater = new DesktopUpdater({
+          currentVersion: '0.3.4',
+          platform: 'win32',
+          arch: 'x64',
+          downloadDir: updDir,
+          apiUrl: `http://127.0.0.1:${updPort}/releases/latest`,
+          allowLocalhost: true,
+        })
+        const same = await upToDateUpdater.checkForUpdates()
+        assert.equal(same.status, 'up-to-date')
+
+        // 14.4 Reject untrusted download host when allowLocalhost=false
+        const strictUpdater = new DesktopUpdater({
+          currentVersion: '0.3.3',
+          platform: 'win32',
+          downloadDir: updDir,
+          allowLocalhost: false,
+        })
+        strictUpdater.setState({
+          status: 'available',
+          assetName: 'evil.exe',
+          downloadUrl: 'https://evil.example.com/evil.exe',
+        })
+        const blocked = await strictUpdater.downloadUpdate()
+        assert.equal(blocked.status, 'error')
+        assert.match(blocked.error, /不受信任/)
+      } finally {
+        try { mockReleaseServer.closeAllConnections?.() } catch {}
+        await new Promise((r) => mockReleaseServer.close(r))
+      }
+    }
+    console.log('[smoke] 14/14 Built-in desktop auto-updater (semver, download, SHA-256, cache reuse & host guard) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

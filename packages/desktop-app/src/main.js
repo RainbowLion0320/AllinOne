@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
+import { DesktopUpdater } from './updater.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const APP_ROOT = resolve(__dirname, '..')
@@ -99,6 +100,16 @@ function setAutoLaunchEnabled(enabled) {
 const bridgeManager = new DesktopBridgeManager({
   isPackaged: app.isPackaged,
   getAutoLaunch: getAutoLaunchEnabled,
+})
+
+const devUpdateApiUrl = !app.isPackaged
+  ? String(process.env.ALLINONE_UPDATE_API_URL || '').trim()
+  : ''
+
+const updater = new DesktopUpdater({
+  currentVersion: app.getVersion(),
+  downloadDir: join(app.getPath('temp'), 'allinone-updates'),
+  ...(devUpdateApiUrl ? { apiUrl: devUpdateApiUrl, allowLocalhost: true } : {}),
 })
 
 function loadWindowBounds() {
@@ -267,6 +278,18 @@ function refreshTrayMenu() {
     { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
     { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
     { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+    {
+      label:
+        updater.getState().status === 'available' || updater.getState().status === 'downloaded'
+          ? `发现新版本 v${updater.getState().latestVersion}`
+          : '检查更新...',
+      click: () => {
+        sendMenuAction('settings')
+        if (updater.getState().status !== 'downloading') {
+          void updater.checkForUpdates()
+        }
+      },
+    },
     { type: 'separator' },
     {
       label: st.enabled ? '暂停本机远程桥接' : '开启本机远程桥接',
@@ -316,6 +339,13 @@ function buildAppMenu() {
             label: app.name,
             submenu: [
               { role: 'about', label: '关于 All in One' },
+              {
+                label: '检查更新...',
+                click: () => {
+                  sendMenuAction('settings')
+                  void updater.checkForUpdates()
+                },
+              },
               { type: 'separator' },
               { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
               { type: 'separator' },
@@ -341,6 +371,13 @@ function buildAppMenu() {
         { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
         { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
         { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+        {
+          label: '检查更新...',
+          click: () => {
+            sendMenuAction('settings')
+            void updater.checkForUpdates()
+          },
+        },
         { type: 'separator' },
         isMac ? { role: 'close', label: '关闭窗口' } : { role: 'quit', label: '退出' },
       ],
@@ -445,6 +482,24 @@ function registerIpc() {
     }
     return shell.openPath(bridgeManager.stateDir)
   })
+
+  ipcMain.handle('updater:state', () => updater.getState())
+  ipcMain.handle('updater:check', () => updater.checkForUpdates({ silent: false }))
+  ipcMain.handle('updater:download', () => updater.downloadUpdate())
+  ipcMain.handle('updater:cancel', () => updater.cancelDownload())
+  ipcMain.handle('updater:install', async () => {
+    return updater.installAndRestart({
+      exePath: app.getPath('exe'),
+      pid: process.pid,
+      isPackaged: app.isPackaged,
+      openExternalPath: (p) => shell.openPath(p),
+      onQuit: async () => {
+        isQuitting = true
+        try { await bridgeManager.dispose() } catch {}
+        app.quit()
+      },
+    })
+  })
 }
 
 // Single-instance guard
@@ -477,11 +532,26 @@ if (!gotLock) {
       }
     })
 
+    updater.on('state', (st) => {
+      refreshTrayMenu()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('updater:state-changed', st)
+      }
+    })
+
     refreshTrayMenu()
     createMainWindow()
 
     // Immediately resume background bridge if this PC already has an account binding
     void bridgeManager.startFromSavedConfigIfPresent()
+
+    // Quietly check GitHub Releases for a newer version shortly after startup
+    const startupCheckTimer = setTimeout(() => {
+      if (!isQuitting) {
+        void updater.checkForUpdates({ silent: true })
+      }
+    }, 8_000)
+    startupCheckTimer.unref?.()
   })
 
   app.on('activate', () => {
