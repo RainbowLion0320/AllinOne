@@ -79,6 +79,49 @@ let mainWindow = null
 let tray = null
 let isQuitting = false
 
+function normalizeLang(input) {
+  const raw = String(input || '').trim().toLowerCase()
+  if (raw === 'en' || raw.startsWith('en-') || raw.startsWith('en_')) return 'en'
+  if (raw === 'zh' || raw.startsWith('zh-') || raw.startsWith('zh_')) return 'zh'
+  return ''
+}
+
+function loadSavedLangPref() {
+  try {
+    const p = join(app.getPath('userData'), 'prefs.json')
+    if (existsSync(p)) {
+      const parsed = JSON.parse(readFileSync(p, 'utf8'))
+      const norm = normalizeLang(parsed?.lang)
+      if (norm) return norm
+    }
+  } catch {}
+  try {
+    return normalizeLang(app.getLocale()) || 'zh'
+  } catch {
+    return 'zh'
+  }
+}
+
+function saveLangPref(lang) {
+  const norm = normalizeLang(lang) || 'zh'
+  try {
+    const dir = app.getPath('userData')
+    mkdirSync(dir, { recursive: true })
+    const p = join(dir, 'prefs.json')
+    let cur = {}
+    try {
+      if (existsSync(p)) cur = JSON.parse(readFileSync(p, 'utf8')) || {}
+    } catch {}
+    writeFileSync(p, JSON.stringify({ ...cur, lang: norm }, null, 2), 'utf8')
+  } catch {}
+  return norm
+}
+
+let currentLang = 'zh'
+function bi(zh, en) {
+  return currentLang === 'en' ? en : zh
+}
+
 function getAutoLaunchEnabled() {
   try {
     return Boolean(app.getLoginItemSettings()?.openAtLogin)
@@ -109,6 +152,7 @@ const devUpdateApiUrl = !app.isPackaged
 const updater = new DesktopUpdater({
   currentVersion: app.getVersion(),
   downloadDir: join(app.getPath('temp'), 'allinone-updates'),
+  getLang: () => currentLang,
   ...(devUpdateApiUrl ? { apiUrl: devUpdateApiUrl, allowLocalhost: true } : {}),
 })
 
@@ -258,31 +302,32 @@ function refreshTrayMenu() {
   const st = bridgeManager.getStatus()
   const stateLabel =
     st.state === 'connected'
-      ? `● 本机在线 · ${st.label}`
+      ? bi(`● 本机在线 · ${st.label}`, `● Local PC Online · ${st.label}`)
       : st.state === 'starting' || st.state === 'binding'
-        ? `◐ 连接中 · ${st.label}`
+        ? bi(`◐ 连接中 · ${st.label}`, `◐ Connecting · ${st.label}`)
         : st.state === 'paused'
-          ? `○ 本机桥接已暂停`
+          ? bi('○ 本机桥接已暂停', '○ Local Bridge Paused')
           : st.state === 'error'
-            ? `✕ 桥接异常`
-            : `○ 未登录账号`
+            ? bi('✕ 桥接异常', '✕ Bridge Error')
+            : bi('○ 未登录账号', '○ Not Signed In')
 
   tray.setToolTip(`All in One — ${stateLabel}`)
 
+  const updState = updater.getState()
   const menu = Menu.buildFromTemplate([
     { label: stateLabel, enabled: false },
     ...(st.autofixText ? [{ label: `↻ ${st.autofixText}`, enabled: false }] : []),
-    ...(st.username ? [{ label: `账号：@${st.username}`, enabled: false }] : []),
+    ...(st.username ? [{ label: bi(`账号：@${st.username}`, `Account: @${st.username}`), enabled: false }] : []),
     { type: 'separator' },
-    { label: '打开 All in One', click: () => showMainWindow() },
-    { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
-    { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
-    { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+    { label: bi('打开 All in One', 'Open All in One'), click: () => showMainWindow() },
+    { label: bi('新建对话', 'New Chat'), accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
+    { label: bi('切换电脑', 'Switch Computer'), accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
+    { label: bi('设置...', 'Settings...'), accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
     {
       label:
-        updater.getState().status === 'available' || updater.getState().status === 'downloaded'
-          ? `发现新版本 v${updater.getState().latestVersion}`
-          : '检查更新...',
+        updState.status === 'available' || updState.status === 'downloaded'
+          ? bi(`发现新版本 v${updState.latestVersion}`, `Update Available (v${updState.latestVersion})`)
+          : bi('检查更新...', 'Check for Updates...'),
       click: () => {
         sendMenuAction('settings')
         if (updater.getState().status !== 'downloading') {
@@ -292,13 +337,15 @@ function refreshTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: st.enabled ? '暂停本机远程桥接' : '开启本机远程桥接',
+      label: st.enabled
+        ? bi('暂停本机远程桥接', 'Pause Local Bridge')
+        : bi('开启本机远程桥接', 'Enable Local Bridge'),
       click: () => {
         void bridgeManager.toggleEnabled()
       },
     },
     {
-      label: '开机自动启动',
+      label: bi('开机自动启动', 'Launch at Login'),
       type: 'checkbox',
       checked: getAutoLaunchEnabled(),
       click: (item) => {
@@ -308,7 +355,7 @@ function refreshTrayMenu() {
       },
     },
     {
-      label: '查看桥接日志',
+      label: bi('查看桥接日志', 'Open Bridge Logs'),
       click: () => {
         bridgeManager.ensureStateDir()
         if (existsSync(bridgeManager.logPath)) {
@@ -320,7 +367,7 @@ function refreshTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: '退出 All in One',
+      label: bi('退出 All in One', 'Quit All in One'),
       click: () => {
         isQuitting = true
         app.quit()
@@ -338,23 +385,23 @@ function buildAppMenu() {
           {
             label: app.name,
             submenu: [
-              { role: 'about', label: '关于 All in One' },
+              { role: 'about', label: bi('关于 All in One', 'About All in One') },
               {
-                label: '检查更新...',
+                label: bi('检查更新...', 'Check for Updates...'),
                 click: () => {
                   sendMenuAction('settings')
                   void updater.checkForUpdates()
                 },
               },
               { type: 'separator' },
-              { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+              { label: bi('设置...', 'Settings...'), accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
               { type: 'separator' },
-              { role: 'hide', label: '隐藏 All in One' },
-              { role: 'hideOthers', label: '隐藏其他' },
-              { role: 'unhide', label: '显示全部' },
+              { role: 'hide', label: bi('隐藏 All in One', 'Hide All in One') },
+              { role: 'hideOthers', label: bi('隐藏其他', 'Hide Others') },
+              { role: 'unhide', label: bi('显示全部', 'Show All') },
               { type: 'separator' },
               {
-                label: '退出 All in One',
+                label: bi('退出 All in One', 'Quit All in One'),
                 accelerator: 'CmdOrCtrl+Q',
                 click: () => {
                   isQuitting = true
@@ -366,52 +413,54 @@ function buildAppMenu() {
         ]
       : []),
     {
-      label: '文件',
+      label: bi('文件', 'File'),
       submenu: [
-        { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
-        { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
-        { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+        { label: bi('新建对话', 'New Chat'), accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
+        { label: bi('切换电脑', 'Switch Computer'), accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
+        { label: bi('设置...', 'Settings...'), accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
         {
-          label: '检查更新...',
+          label: bi('检查更新...', 'Check for Updates...'),
           click: () => {
             sendMenuAction('settings')
             void updater.checkForUpdates()
           },
         },
         { type: 'separator' },
-        isMac ? { role: 'close', label: '关闭窗口' } : { role: 'quit', label: '退出' },
+        isMac
+          ? { role: 'close', label: bi('关闭窗口', 'Close Window') }
+          : { role: 'quit', label: bi('退出', 'Quit') },
       ],
     },
     {
-      label: '编辑',
+      label: bi('编辑', 'Edit'),
       submenu: [
-        { role: 'undo', label: '撤销' },
-        { role: 'redo', label: '重做' },
+        { role: 'undo', label: bi('撤销', 'Undo') },
+        { role: 'redo', label: bi('重做', 'Redo') },
         { type: 'separator' },
-        { role: 'cut', label: '剪切' },
-        { role: 'copy', label: '拷贝' },
-        { role: 'paste', label: '粘贴' },
-        { role: 'selectAll', label: '全选' },
+        { role: 'cut', label: bi('剪切', 'Cut') },
+        { role: 'copy', label: bi('拷贝', 'Copy') },
+        { role: 'paste', label: bi('粘贴', 'Paste') },
+        { role: 'selectAll', label: bi('全选', 'Select All') },
       ],
     },
     {
-      label: '视图',
+      label: bi('视图', 'View'),
       submenu: [
-        { role: 'reload', label: '重新加载' },
-        { role: 'toggleDevTools', label: '开发者工具' },
+        { role: 'reload', label: bi('重新加载', 'Reload') },
+        { role: 'toggleDevTools', label: bi('开发者工具', 'Developer Tools') },
         { type: 'separator' },
-        { role: 'resetZoom', label: '实际大小' },
-        { role: 'zoomIn', label: '放大' },
-        { role: 'zoomOut', label: '缩小' },
+        { role: 'resetZoom', label: bi('实际大小', 'Actual Size') },
+        { role: 'zoomIn', label: bi('放大', 'Zoom In') },
+        { role: 'zoomOut', label: bi('缩小', 'Zoom Out') },
         { type: 'separator' },
-        { role: 'togglefullscreen', label: '进入全屏幕' },
+        { role: 'togglefullscreen', label: bi('进入全屏幕', 'Toggle Full Screen') },
       ],
     },
     {
-      label: '窗口',
+      label: bi('窗口', 'Window'),
       submenu: [
-        { role: 'minimize', label: '最小化' },
-        { role: 'zoom', label: '缩放' },
+        { role: 'minimize', label: bi('最小化', 'Minimize') },
+        { role: 'zoom', label: bi('缩放', 'Zoom') },
       ],
     },
   ]
@@ -450,7 +499,18 @@ function registerIpc() {
       platform: process.platform,
       version: app.getVersion(),
       defaultServerUrl: DEFAULT_SERVER_URL,
+      lang: currentLang,
     }
+  })
+
+  ipcMain.handle('desktop:set-language', (_event, lang) => {
+    const next = saveLangPref(lang)
+    if (next !== currentLang) {
+      currentLang = next
+      buildAppMenu()
+      refreshTrayMenu()
+    }
+    return currentLang
   })
 
   ipcMain.handle('bridge:status', () => bridgeManager.getStatus())
@@ -513,6 +573,7 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     app.setName('All in One')
+    currentLang = loadSavedLangPref()
     registerStaticProtocol()
     registerIpc()
     buildAppMenu()

@@ -1,3 +1,5 @@
+import { bi, getCurrentLang } from './i18n.js'
+
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)$/i
 
 export function stripQueryHash(raw) {
@@ -12,7 +14,7 @@ export function isImageTarget(raw) {
   return IMAGE_EXT_RE.test(clean)
 }
 
-export function getImageLabel(raw, fallback = '图片') {
+export function getImageLabel(raw, fallback = bi(getCurrentLang(), '图片', 'Image')) {
   const s = String(raw || '').trim()
   if (!s) return fallback
   if (s.startsWith('data:image/')) return fallback

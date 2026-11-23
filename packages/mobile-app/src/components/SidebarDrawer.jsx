@@ -16,14 +16,20 @@ import {
   X,
 } from 'lucide-react'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { useI18n } from '../lib/i18n.jsx'
+import { bi as biLang, translate } from '../lib/i18n.js'
 
-const FILTER_TABS = [
-  { id: 'all', label: '全部', color: '#4D6BFE' },
-  { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
-  { id: 'codex', label: 'Codex', color: '#10A37F' },
-  { id: 'claude', label: 'Claude', color: '#D97757' },
-  { id: 'antigravity', label: 'Antigravity', color: '#7C5CFF' },
-]
+function getFilterTabs(lang) {
+  return [
+    { id: 'all', label: translate(lang, 'common.all'), color: '#4D6BFE' },
+    { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
+    { id: 'codex', label: 'Codex', color: '#10A37F' },
+    { id: 'claude', label: 'Claude', color: '#D97757' },
+    { id: 'antigravity', label: 'Antigravity', color: '#7C5CFF' },
+  ]
+}
+
+const UNGROUPED_KEY = '__ungrouped__'
 
 function normalizeProjectKey(s) {
   const rawWs = String(s.workspace || '').trim()
@@ -33,19 +39,23 @@ function normalizeProjectKey(s) {
     const parts = cwd.split(/[\\/]/).filter(Boolean)
     if (parts.length > 0) return parts[parts.length - 1]
   }
-  return rawWs || '未分组'
+  return rawWs || UNGROUPED_KEY
 }
 
-function groupByProject(sessions) {
+function groupByProject(sessions, lang) {
+  const ungroupedLabel = biLang(lang, '未分组', 'Ungrouped')
   const map = new Map()
   for (const s of sessions) {
-    const name = normalizeProjectKey(s)
-    const key = name.toLowerCase()
+    const rawName = normalizeProjectKey(s)
+    const isUngrouped = rawName === UNGROUPED_KEY
+    const name = isUngrouped ? ungroupedLabel : rawName
+    const key = rawName.toLowerCase()
     let group = map.get(key)
     if (!group) {
       group = {
         key,
         label: name,
+        isUngrouped,
         cwd: s.cwd || '',
         latestAt: 0,
         hasRunning: false,
@@ -65,25 +75,25 @@ function groupByProject(sessions) {
     g.items.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))
   }
   groups.sort((a, b) => {
-    // Keep '未分组' at the bottom unless it's the only group
-    if (a.label === '未分组' && b.label !== '未分组') return 1
-    if (b.label === '未分组' && a.label !== '未分组') return -1
+    // Keep Ungrouped at the bottom unless it's the only group
+    if (a.isUngrouped && !b.isUngrouped) return 1
+    if (b.isUngrouped && !a.isUngrouped) return -1
     return b.latestAt - a.latestAt
   })
   return groups
 }
 
-function groupByTime(sessions) {
+function groupByTime(sessions, lang) {
   const now = new Date()
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
   const startOfYesterday = startOfToday - 86_400_000
   const startOf7Days = startOfToday - 7 * 86_400_000
 
   const groups = [
-    { key: 'today', label: '今天', items: [] },
-    { key: 'yesterday', label: '昨天', items: [] },
-    { key: 'week', label: '近 7 天', items: [] },
-    { key: 'older', label: '更早', items: [] },
+    { key: 'today', label: translate(lang, 'time.today'), items: [] },
+    { key: 'yesterday', label: translate(lang, 'time.yesterday'), items: [] },
+    { key: 'week', label: translate(lang, 'time.week'), items: [] },
+    { key: 'older', label: translate(lang, 'time.older'), items: [] },
   ]
 
   for (const s of sessions) {
@@ -98,6 +108,7 @@ function groupByTime(sessions) {
 }
 
 function SessionRow({ session, isActive, showProjectSubtitle, onSelect }) {
+  const { bi } = useI18n()
   const meta = APP_META[session.app] || APP_META.dsh
   return (
     <button
@@ -116,13 +127,13 @@ function SessionRow({ session, isActive, showProjectSubtitle, onSelect }) {
         </span>
         {session.status === 'running' && (
           <span
-            title="运行中"
+            title={bi('运行中', 'Running')}
             className="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
           />
         )}
         {session.readOnlyDesktop && (
           <span className="shrink-0 rounded bg-slate-200/80 px-1 py-0.5 text-[9px] text-slate-500 dark:bg-slate-700/80 dark:text-slate-300">
-            历史
+            {bi('历史', 'History')}
           </span>
         )}
       </div>
@@ -159,6 +170,7 @@ export function SidebarDrawer({
   onOpenSettings,
   onOpenDeviceSwitcher,
 }) {
+  const { lang, bi, t } = useI18n()
   const [uncontrolledFilterApp, setUncontrolledFilterApp] = useState('all')
   const filterApp = controlledFilterApp ?? uncontrolledFilterApp
   const setFilterApp = (next) => {
@@ -188,8 +200,9 @@ export function SidebarDrawer({
     })
   }, [sessions, filterApp, search])
 
-  const projectGroups = useMemo(() => groupByProject(filtered), [filtered])
-  const timeGroups = useMemo(() => groupByTime(filtered), [filtered])
+  const filterTabs = useMemo(() => getFilterTabs(lang), [lang])
+  const projectGroups = useMemo(() => groupByProject(filtered, lang), [filtered, lang])
+  const timeGroups = useMemo(() => groupByTime(filtered, lang), [filtered, lang])
 
   const activeProjectKey = useMemo(() => {
     const active = sessions.find((s) => s.id === activeSessionId)
@@ -252,7 +265,7 @@ export function SidebarDrawer({
             <button
               type="button"
               onClick={onRefresh}
-              aria-label="刷新会话列表"
+              aria-label={bi('刷新会话列表', 'Refresh conversations')}
               className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
@@ -260,7 +273,7 @@ export function SidebarDrawer({
             <button
               type="button"
               onClick={onClose}
-              aria-label="关闭侧边栏"
+              aria-label={bi('关闭侧边栏', 'Close sidebar')}
               className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <X className="h-4 w-4" />
@@ -294,18 +307,18 @@ export function SidebarDrawer({
             </div>
 
             <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-slate-800 dark:text-white">
-              {activeDeviceName || '我的电脑'}
+              {activeDeviceName || bi('我的电脑', 'My Computer')}
             </span>
 
             {connState === 'unauthorized' ? (
               <span className="shrink-0 rounded-md bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-500 dark:bg-rose-950/50 dark:text-rose-300">
-                已过期
+                {t('common.expired')}
               </span>
             ) : connState === 'connecting' ? (
-              <span className="shrink-0 text-[10.5px] text-amber-500">连接中</span>
+              <span className="shrink-0 text-[10.5px] text-amber-500">{t('common.connecting')}</span>
             ) : !(connState === 'connected' && bridgeOnline) ? (
               <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                离线
+                {t('common.offline')}
               </span>
             ) : null}
 
@@ -324,7 +337,7 @@ export function SidebarDrawer({
             className="flex w-full items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
           >
             <Plus className="h-4 w-4 stroke-[2.5]" />
-            <span>新对话</span>
+            <span>{t('common.newChat')}</span>
           </button>
         </div>
 
@@ -336,7 +349,7 @@ export function SidebarDrawer({
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="搜索对话..."
+              placeholder={bi('搜索对话...', 'Search chats...')}
               className="w-full rounded-xl border border-slate-200/80 bg-white py-2 pr-3 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#14161B] dark:text-slate-100"
             />
           </div>
@@ -345,7 +358,7 @@ export function SidebarDrawer({
         {/* Vendor Icon Filter Bar (5-column grid, zero clipping) */}
         <div className="px-4 pb-2">
           <div className="grid grid-cols-5 gap-1.5">
-            {FILTER_TABS.map((tab) => {
+            {filterTabs.map((tab) => {
               const active = filterApp === tab.id
               const count =
                 tab.id === 'all'
@@ -356,7 +369,7 @@ export function SidebarDrawer({
                   key={tab.id}
                   type="button"
                   title={`${tab.label} (${count})`}
-                  aria-label={`筛选 ${tab.label}`}
+                  aria-label={bi(`筛选 ${tab.label}`, `Filter ${tab.label}`)}
                   onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
                   className={`relative flex h-10 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
                     active
@@ -406,7 +419,7 @@ export function SidebarDrawer({
               }`}
             >
               <Folder className="h-3 w-3" />
-              <span>按项目</span>
+              <span>{bi('按项目', 'Projects')}</span>
             </button>
             <button
               type="button"
@@ -418,7 +431,7 @@ export function SidebarDrawer({
               }`}
             >
               <Clock className="h-3 w-3" />
-              <span>按时间</span>
+              <span>{bi('按时间', 'Recent')}</span>
             </button>
           </div>
 
@@ -428,7 +441,7 @@ export function SidebarDrawer({
               onClick={toggleAllProjects}
               className="text-slate-400 hover:text-[#4D6BFE]"
             >
-              {allExpanded ? '折叠' : '展开'}
+              {allExpanded ? bi('折叠', 'Collapse') : bi('展开', 'Expand')}
             </button>
           )}
         </div>
@@ -437,7 +450,7 @@ export function SidebarDrawer({
         <div className="flex-1 overflow-y-auto px-3 pb-4">
           {filtered.length === 0 ? (
             <div className="py-12 text-center text-xs text-slate-400">
-              {bridgeOnline ? '暂无匹配的对话' : '等待电脑端上线...'}
+              {bridgeOnline ? bi('暂无匹配的对话', 'No matching conversations') : bi('等待电脑端上线...', 'Waiting for computer to come online...')}
             </div>
           ) : groupMode === 'project' ? (
             <div className="space-y-1.5">
@@ -478,7 +491,7 @@ export function SidebarDrawer({
                       {group.cwd && (
                         <button
                           type="button"
-                          title={`在 ${group.label} 新建对话`}
+                          title={bi(`在 ${group.label} 新建对话`, `New chat in ${group.label}`)}
                           onClick={() => {
                             onClose()
                             onNewChat(group.cwd, filterApp !== 'all' ? filterApp : '')
@@ -543,7 +556,7 @@ export function SidebarDrawer({
               onClose()
               onOpenSettings?.()
             }}
-            aria-label="打开设置"
+            aria-label={bi('打开设置', 'Open Settings')}
             className="flex w-full items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
           >
             <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
@@ -554,15 +567,15 @@ export function SidebarDrawer({
             </div>
             <div className="flex min-w-0 flex-1 items-center gap-1.5">
               <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
-                {username ? `@${username}` : activeDeviceName || '设置'}
+                {username ? `@${username}` : activeDeviceName || t('common.settings')}
               </span>
               {hasUpdate ? (
                 <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
-                  有更新
+                  {bi('有更新', 'Update')}
                 </span>
               ) : isAdmin ? (
                 <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
-                  管理员
+                  {t('common.admin')}
                 </span>
               ) : null}
             </div>

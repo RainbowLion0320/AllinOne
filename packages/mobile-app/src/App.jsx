@@ -61,8 +61,11 @@ import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
 import { InviteManagerModal } from './components/InviteManagerModal.jsx'
 import { SettingsModal } from './components/SettingsModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
+import { useI18n } from './lib/i18n.jsx'
+import { bi as biLang, getCurrentLang } from './lib/i18n.js'
 
 export function App() {
+  const { lang, bi, t } = useI18n()
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
   const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
   const [autoPairing, setAutoPairing] = useState(false)
@@ -156,8 +159,8 @@ export function App() {
       const bound = accountDevices.find((d) => d.bridgeId === activeDevice.selectedBridgeId)
       if (bound) return bound.label || bound.hostname || bound.bridgeId
     }
-    return getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length)
-  }, [activeDevice, activeBridge, onlineBridges.length, isAccountMode, accountDevices])
+    return getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length, lang)
+  }, [activeDevice, activeBridge, onlineBridges.length, isAccountMode, accountDevices, lang])
   const cacheScope = useMemo(
     () => getCacheScopeKey(activeDevice, activeBridgeId),
     [activeDevice, activeBridgeId],
@@ -373,16 +376,21 @@ export function App() {
     setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
     setDeviceSwitcherOpen(false)
     if (preview.device) {
+      const curLang = getCurrentLang()
       if (payload.authMode === 'account') {
         const onlineN = (payload.devices || payload.bridges || []).filter((x) => x.online).length
         showToast(
           onlineN > 0
-            ? `已登录 @${payload.username} · 发现 ${onlineN} 台在线电脑`
-            : `已登录 @${payload.username}`,
+            ? biLang(curLang, `已登录 @${payload.username} · 发现 ${onlineN} 台在线电脑`, `Signed in as @${payload.username} · ${onlineN} PC${onlineN === 1 ? '' : 's'} online`)
+            : biLang(curLang, `已登录 @${payload.username}`, `Signed in as @${payload.username}`),
         )
       } else {
-        const name = getDeviceDisplayName(preview.device)
-        showToast(preview.isNew ? `已添加并切换到 ${name}` : `已更新并切换到 ${name}`)
+        const name = getDeviceDisplayName(preview.device, null, 0, curLang)
+        showToast(
+          preview.isNew
+            ? biLang(curLang, `已添加并切换到 ${name}`, `Added and switched to ${name}`)
+            : biLang(curLang, `已更新并切换到 ${name}`, `Updated and switched to ${name}`),
+        )
       }
     }
   }, [resetTransientWorkspace, showToast])
@@ -432,7 +440,7 @@ export function App() {
       })
       .catch((err) => {
         if (cancelled) return
-        setPairError(String(err?.message || err || '扫码自动配对失败，请重试'))
+        setPairError(String(err?.message || err || biLang(getCurrentLang(), '扫码自动配对失败，请重试', 'QR auto-pairing failed. Please retry.')))
         if (deviceStateRef.current.devices.length > 0) {
           setAddingDevice({ open: true, serverUrl: detectDefaultServerUrl(), openScanner: false, inviteCode: '' })
         }
@@ -925,7 +933,7 @@ export function App() {
       }
     } catch (err) {
       if (deviceGenRef.current === gen) {
-        setOlderError(String(err?.message || err || '加载更早历史失败'))
+        setOlderError(String(err?.message || err || biLang(getCurrentLang(), '加载更早历史失败', 'Failed to load earlier history')))
       }
     } finally {
       loadingOlderLockRef.current = false
@@ -1056,7 +1064,7 @@ export function App() {
       } else if (event === EVENTS.STREAM_ERROR) {
         setStreamingBySession((prev) => {
           const cur = prev[sid] || { active: false, text: '', thinking: '', tools: [] }
-          return { ...prev, [sid]: { ...cur, active: false, error: payload.message || '执行出错' } }
+          return { ...prev, [sid]: { ...cur, active: false, error: payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error') } }
         })
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
       } else if (event === EVENTS.STREAM_DONE) {
@@ -1143,8 +1151,8 @@ export function App() {
       const name =
         isSameDevice && (targetAcctPc || targetBridgeObj)
           ? targetAcctPc?.label || targetBridgeObj?.label || targetBridgeObj?.hostname || cleanBridgeId
-          : getDeviceDisplayName(target)
-      showToast(`已切换到 ${name}`)
+          : getDeviceDisplayName(target, null, 0, getCurrentLang())
+      showToast(biLang(getCurrentLang(), `已切换到 ${name}`, `Switched to ${name}`))
     }
   }, [activeDevice?.id, activeDevice?.selectedBridgeId, devices, accountDevices, onlineBridges, resetTransientWorkspace, showToast])
 
@@ -1164,7 +1172,7 @@ export function App() {
         label: newLabel,
       })
       setAccountDevices(nextList)
-      showToast(`已重命名为 ${newLabel}`)
+      showToast(biLang(getCurrentLang(), `已重命名为 ${newLabel}`, `Renamed to ${newLabel}`))
     } catch (err) {
       showToast(String(err?.message || err))
     }
@@ -1183,7 +1191,7 @@ export function App() {
           updateDeviceMeta(prev, activeDevice.id, { selectedBridgeId: '' }),
         )
       }
-      showToast('已解绑并断开该电脑')
+      showToast(biLang(getCurrentLang(), '已解绑并断开该电脑', 'Computer unlinked and disconnected'))
     } catch (err) {
       showToast(String(err?.message || err))
     }
@@ -1237,7 +1245,7 @@ export function App() {
   const handleSendBindEmailCode = useCallback(
     async (targetEmail) => {
       if (!activeDevice?.baseUrl || !activeDevice?.token) {
-        throw new Error('未登录账号')
+        throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
       }
       return sendEmailVerificationCode(activeDevice.baseUrl, {
         purpose: 'bind',
@@ -1251,7 +1259,7 @@ export function App() {
   const handleBindAccountEmail = useCallback(
     async (targetEmail, code) => {
       if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) {
-        throw new Error('未登录账号')
+        throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
       }
       const user = await bindAccountEmail(activeDevice.baseUrl, activeDevice.token, {
         email: targetEmail,
@@ -1259,7 +1267,7 @@ export function App() {
       })
       const boundEmail = user?.email || targetEmail
       setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { email: boundEmail }))
-      showToast(`已绑定邮箱 ${boundEmail}`)
+      showToast(biLang(getCurrentLang(), `已绑定邮箱 ${boundEmail}`, `Linked email ${boundEmail}`))
       return user
     },
     [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
@@ -1286,14 +1294,19 @@ export function App() {
     }
     setDeviceState((prev) => removeDevice(prev, deviceId))
     if (target) {
-      const name = getDeviceDisplayName(target)
-      showToast(revokeAll ? `已吊销 ${name} 全部手机凭证并移除` : `已移除 ${name}`)
+      const curLang = getCurrentLang()
+      const name = getDeviceDisplayName(target, null, 0, curLang)
+      showToast(
+        revokeAll
+          ? biLang(curLang, `已吊销 ${name} 全部设备凭证并移除`, `Revoked all sessions and removed ${name}`)
+          : biLang(curLang, `已移除 ${name}`, `Removed ${name}`),
+      )
     }
   }, [activeDevice?.id, devices, resetTransientWorkspace, showToast])
 
   const handleCreateSession = async ({ app, cwd, title, model, provider, reasoningEffort }) => {
     const client = clientRef.current
-    if (!client) throw new Error('未连接到服务器')
+    if (!client) throw new Error(biLang(getCurrentLang(), '未连接到服务器', 'Not connected to server'))
     const gen = deviceGenRef.current
     const targetBridge = activeBridgeIdRef.current
     const res = await client.rpc(
@@ -1371,7 +1384,7 @@ export function App() {
       // Strictly require an explicitly chosen project directory before creating a new conversation
       const explicitCwd = String(selectedDraftCwd || '').trim()
       if (!explicitCwd) {
-        showToast('请先选择目标项目目录')
+        showToast(bi('请先选择目标项目目录', 'Please select a target project directory first'))
         openNewChatModal('', effectiveDefaultApp)
         return
       }
@@ -1380,7 +1393,7 @@ export function App() {
         target = await handleCreateSession({
           app: effectiveDefaultApp,
           cwd: explicitCwd,
-          title: text.slice(0, 28) || '新对话',
+          title: text.slice(0, 28) || t('common.newChat'),
           model: initPref.model || undefined,
           provider: initPref.provider || undefined,
           reasoningEffort: initPref.reasoningEffort || undefined,
@@ -1396,7 +1409,7 @@ export function App() {
     const finalText = text
 
     // Optimistically replace generic placeholder title on first user message
-    const genericTitle = /^(新 |手机端总控对话|[0-9a-f]{8}-[0-9a-f]{4}-)/i.test(target.title || '')
+    const genericTitle = /^(新 |新对话|New Chat|手机端总控对话|[0-9a-f]{8}-[0-9a-f]{4}-)/i.test(target.title || '')
     if (genericTitle && finalText.trim().length > 0) {
       const nextTitle = finalText.trim().replace(/\s+/g, ' ').slice(0, 36)
       setActiveSession((prev) => (prev && prev.id === target.id ? { ...prev, title: nextTitle } : prev))
@@ -1408,7 +1421,7 @@ export function App() {
     const nonImgAtts = attachments.filter((a) => !String(a.mimeType || '').startsWith('image/'))
     const displayUserText =
       nonImgAtts.length > 0
-        ? `${finalText}${finalText ? '\n' : ''}[附件: ${nonImgAtts.map((a) => a.filename).join(', ')}]`
+        ? `${finalText}${finalText ? '\n' : ''}[${bi('附件', 'Attachment')}: ${nonImgAtts.map((a) => a.filename).join(', ')}]`
         : finalText
     const userMsg = {
       id: `msg-u-${Date.now()}`,
@@ -1502,7 +1515,7 @@ export function App() {
         </div>
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-800 dark:text-white">
           <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-          <span>正在配对...</span>
+          <span>{bi('正在配对...', 'Pairing...')}</span>
         </div>
       </div>
     )
@@ -1542,15 +1555,15 @@ export function App() {
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const currentWorkspaceLabel = activeSession?.workspace || selectedDraftWorkspaceObj?.name || ''
   const headerSubtitle = (() => {
-    if (connState === 'unauthorized') return `${activeDeviceName} · 已过期`
-    if (connState !== 'connected') return `${activeDeviceName} · 连接中`
-    if (!bridgeOnline) return `${activeDeviceName} · 离线`
+    if (connState === 'unauthorized') return `${activeDeviceName} · ${t('common.expired')}`
+    if (connState !== 'connected') return `${activeDeviceName} · ${t('common.connecting')}`
+    if (!bridgeOnline) return `${activeDeviceName} · ${t('common.offline')}`
     if (hasMultipleTargets) {
       return currentWorkspaceLabel
         ? `${activeDeviceName} · ${currentWorkspaceLabel}`
         : activeDeviceName
     }
-    return currentWorkspaceLabel || activeDeviceName || '已连接'
+    return currentWorkspaceLabel || activeDeviceName || bi('已连接', 'Connected')
   })()
 
   return (
@@ -1589,7 +1602,7 @@ export function App() {
           <button
             type="button"
             onClick={() => setDrawerOpen(true)}
-            aria-label="打开对话列表"
+            aria-label={bi('打开对话列表', 'Open conversations')}
             className="app-no-drag relative flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 lg:hidden dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <Menu className="h-5 w-5" />
@@ -1612,7 +1625,7 @@ export function App() {
             <button
               type="button"
               onClick={() => setDeviceSwitcherOpen(true)}
-              aria-label="切换控制的电脑"
+              aria-label={bi('切换控制的电脑', 'Switch computer')}
               className="mt-0.5 inline-flex max-w-[260px] items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] text-slate-500 transition hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <span
@@ -1634,7 +1647,7 @@ export function App() {
           <button
             type="button"
             onClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
-            aria-label="新建对话"
+            aria-label={t('common.newChat')}
             className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <SquarePen className="h-4.5 w-4.5" />
@@ -1646,13 +1659,13 @@ export function App() {
       {connState === 'unauthorized' && (
         <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
           <KeyRound className="h-3.5 w-3.5 shrink-0" />
-          <span>登录已过期</span>
+          <span>{bi('登录已过期', 'Session expired')}</span>
           <button
             type="button"
             onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false, inviteCode: '' })}
             className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
           >
-            {isAccountMode ? '重新登录' : '重新配对'}
+            {isAccountMode ? bi('重新登录', 'Sign In Again') : bi('重新配对', 'Pair Again')}
           </button>
           {devices.length > 1 && (
             <button
@@ -1660,7 +1673,7 @@ export function App() {
               onClick={() => setDeviceSwitcherOpen(true)}
               className="rounded-lg border border-rose-300 bg-white px-2 py-0.5 text-[11px] font-medium text-rose-600 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-200"
             >
-              切换
+              {t('common.switch')}
             </button>
           )}
         </div>
@@ -1672,8 +1685,8 @@ export function App() {
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
           <span>
             {isAccountMode && accountDevices.length === 0
-              ? '尚未绑定电脑'
-              : `${activeDeviceName} 离线`}
+              ? bi('尚未绑定电脑', 'No computer linked')
+              : `${activeDeviceName} ${t('common.offline')}`}
           </span>
           {(devices.length > 1 || onlineBridges.length > 0 || isAccountMode) && (
             <button
@@ -1682,7 +1695,7 @@ export function App() {
               className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
             >
               <ArrowLeftRight className="h-3 w-3" />
-              <span>{isAccountMode && accountDevices.length === 0 ? '绑定' : '切换'}</span>
+              <span>{isAccountMode && accountDevices.length === 0 ? bi('绑定', 'Link') : t('common.switch')}</span>
             </button>
           )}
         </div>

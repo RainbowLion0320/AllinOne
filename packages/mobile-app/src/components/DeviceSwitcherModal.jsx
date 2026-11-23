@@ -23,13 +23,16 @@ import {
   getDeviceDisplayName,
 } from '../lib/deviceStore.js'
 import { probeDeviceStatus } from '../lib/wsClient.js'
+import { useI18n } from '../lib/i18n.jsx'
+import { translate } from '../lib/i18n.js'
 
 function StatusPill({ status, onlineCount = 0 }) {
+  const { bi, t } = useI18n()
   if (status === 'probing' || status === 'connecting') {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10.5px] font-medium text-amber-600 dark:bg-amber-950/50 dark:text-amber-300">
         <Loader2 className="h-2.5 w-2.5 animate-spin" />
-        <span>{status === 'connecting' ? '连接中' : '检测中'}</span>
+        <span>{status === 'connecting' ? t('common.connecting') : bi('检测中', 'Checking')}</span>
       </span>
     )
   }
@@ -37,7 +40,7 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-300">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-        <span>{onlineCount > 1 ? `${onlineCount} 在线` : '在线'}</span>
+        <span>{onlineCount > 1 ? bi(`${onlineCount} 在线`, `${onlineCount} online`) : t('common.online')}</span>
       </span>
     )
   }
@@ -45,7 +48,7 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[10.5px] font-medium text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
         <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
-        <span>已过期</span>
+        <span>{t('common.expired')}</span>
       </span>
     )
   }
@@ -53,25 +56,25 @@ function StatusPill({ status, onlineCount = 0 }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
         <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-        <span>异常</span>
+        <span>{t('common.error')}</span>
       </span>
     )
   }
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
       <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-      <span>离线</span>
+      <span>{t('common.offline')}</span>
     </span>
   )
 }
 
-function formatRelativeSeen(ts) {
+function formatRelativeSeen(ts, lang) {
   if (!ts) return ''
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000))
-  if (diffSec < 60) return '刚刚在线'
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`
-  return `${Math.floor(diffSec / 86400)} 天前`
+  if (diffSec < 60) return translate(lang, 'time.justNow')
+  if (diffSec < 3600) return translate(lang, 'time.minsAgo', { n: Math.floor(diffSec / 60) })
+  if (diffSec < 86400) return translate(lang, 'time.hoursAgo', { n: Math.floor(diffSec / 3600) })
+  return translate(lang, 'time.daysAgo', { n: Math.floor(diffSec / 86400) })
 }
 
 export function DeviceSwitcherModal({
@@ -100,6 +103,7 @@ export function DeviceSwitcherModal({
   onBindAccountEmail = null,
   onOpenInviteManager,
 }) {
+  const { lang, bi, t } = useI18n()
   const [probes, setProbes] = useState({})
   const [probingAll, setProbingAll] = useState(false)
   const [editingId, setEditingId] = useState(null)
@@ -190,7 +194,7 @@ export function DeviceSwitcherModal({
     setEmailInfo('')
     const clean = emailDraft.trim()
     if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
-      setEmailError('请输入有效的邮箱地址')
+      setEmailError(bi('请输入有效的邮箱地址', 'Please enter a valid email address'))
       return
     }
     if (!onSendBindEmailCode) return
@@ -198,7 +202,7 @@ export function DeviceSwitcherModal({
     try {
       const res = await onSendBindEmailCode(clean)
       setEmailCooldown(res?.cooldownSec || 60)
-      setEmailInfo(res?.message || '验证码已发送，请查收邮件')
+      setEmailInfo(res?.message || bi('验证码已发送，请查收邮件', 'Verification code sent. Please check your inbox.'))
     } catch (err) {
       if (err?.retryAfterSec) setEmailCooldown(err.retryAfterSec)
       setEmailError(String(err?.message || err))
@@ -214,11 +218,11 @@ export function DeviceSwitcherModal({
     const clean = emailDraft.trim()
     const code = emailCodeDraft.trim()
     if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
-      setEmailError('请输入有效的邮箱地址')
+      setEmailError(bi('请输入有效的邮箱地址', 'Please enter a valid email address'))
       return
     }
     if (!/^\d{6}$/.test(code)) {
-      setEmailError('请输入 6 位邮箱验证码')
+      setEmailError(bi('请输入 6 位邮箱验证码', 'Please enter the 6-digit verification code'))
       return
     }
     if (!onBindAccountEmail) return
@@ -279,7 +283,7 @@ export function DeviceSwitcherModal({
               <Laptop className="h-4 w-4" />
             </div>
             <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
-              我的电脑
+              {bi('我的电脑', 'My Computers')}
               <span className="ml-1.5 text-xs font-medium text-slate-400">
                 ({isAccountMode ? accountDevices.length : devices.length})
               </span>
@@ -290,8 +294,8 @@ export function DeviceSwitcherModal({
             <button
               type="button"
               onClick={() => runProbeAll(devices)}
-              aria-label="刷新设备在线状态"
-              title="刷新在线状态"
+              aria-label={bi('刷新设备在线状态', 'Refresh online status')}
+              title={bi('刷新在线状态', 'Refresh status')}
               className="rounded-xl p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             >
               <RefreshCw className={`h-4 w-4 ${probingAll ? 'animate-spin' : ''}`} />
@@ -299,7 +303,7 @@ export function DeviceSwitcherModal({
             <button
               type="button"
               onClick={onClose}
-              aria-label="关闭电脑列表"
+              aria-label={bi('关闭电脑列表', 'Close computers list')}
               className="rounded-xl p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             >
               <X className="h-4.5 w-4.5" />
@@ -326,16 +330,16 @@ export function DeviceSwitcherModal({
                 />
                 <div className="min-w-0">
                   <div className="truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
-                    本机桥接 ·{' '}
+                    {bi('本机桥接', 'Local Bridge')} ·{' '}
                     {desktopBridge.state === 'connected'
-                      ? '在线'
+                      ? t('common.online')
                       : desktopBridge.state === 'starting' || desktopBridge.state === 'binding'
-                        ? '启动中'
+                        ? bi('启动中', 'Starting')
                         : desktopBridge.state === 'paused'
-                          ? '已暂停'
+                          ? bi('已暂停', 'Paused')
                           : desktopBridge.state === 'error'
-                            ? '异常'
-                            : '未启动'}
+                            ? t('common.error')
+                            : bi('未启动', 'Stopped')}
                   </div>
                   {desktopBridge.error && (
                     <div className="truncate text-[10.5px] text-rose-500">{desktopBridge.error}</div>
@@ -354,7 +358,7 @@ export function DeviceSwitcherModal({
                         : 'bg-white text-slate-500 border border-slate-200 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-400'
                     }`}
                   >
-                    {desktopBridge.autoLaunch ? '自启开' : '自启关'}
+                    {desktopBridge.autoLaunch ? bi('自启开', 'Auto-start On') : bi('自启关', 'Auto-start Off')}
                   </button>
                 )}
                 {onToggleDesktopBridge && (
@@ -367,7 +371,7 @@ export function DeviceSwitcherModal({
                         : 'bg-[#4D6BFE] text-white'
                     }`}
                   >
-                    {desktopBridge.enabled ? '暂停' : '开启'}
+                    {desktopBridge.enabled ? bi('暂停', 'Pause') : bi('开启', 'Start')}
                   </button>
                 )}
               </div>
@@ -392,11 +396,11 @@ export function DeviceSwitcherModal({
                       {activeEntry.email ? (
                         <span className="truncate">{activeEntry.email}</span>
                       ) : emailEnabled ? (
-                        <span>未绑定邮箱</span>
+                        <span>{bi('未绑定邮箱', 'No email linked')}</span>
                       ) : null}
                       {accountDevices.length > 1 && (
                         <span className="shrink-0">
-                          {onlineAcctCount}/{accountDevices.length} 在线
+                          {bi(`${onlineAcctCount}/${accountDevices.length} 在线`, `${onlineAcctCount}/${accountDevices.length} online`)}
                         </span>
                       )}
                     </div>
@@ -413,7 +417,7 @@ export function DeviceSwitcherModal({
                         setEmailInfo('')
                         setShowEmailPanel((v) => !v)
                       }}
-                      title={activeEntry.email ? '更换绑定邮箱' : '绑定邮箱'}
+                      title={activeEntry.email ? bi('更换绑定邮箱', 'Change email') : bi('绑定邮箱', 'Link email')}
                       className={`inline-flex items-center gap-1 rounded-xl px-2 py-1.5 text-[11px] font-medium transition ${
                         showEmailPanel
                           ? 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#A9BDFF]'
@@ -421,7 +425,7 @@ export function DeviceSwitcherModal({
                       }`}
                     >
                       <Mail className="h-3.5 w-3.5" />
-                      <span>{activeEntry.email ? '换绑' : '绑邮箱'}</span>
+                      <span>{activeEntry.email ? bi('换绑', 'Email') : bi('绑邮箱', 'Email')}</span>
                     </button>
                   )}
                   {isAdmin && onOpenInviteManager && (
@@ -434,7 +438,7 @@ export function DeviceSwitcherModal({
                       className="inline-flex items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 py-1.5 text-[11px] font-semibold text-white active:scale-95"
                     >
                       <Ticket className="h-3 w-3" />
-                      <span>邀请码</span>
+                      <span>{bi('邀请码', 'Invites')}</span>
                     </button>
                   )}
                   <button
@@ -443,7 +447,7 @@ export function DeviceSwitcherModal({
                       setShowEmailPanel(false)
                       setConfirmLogoutAccount((v) => !v)
                     }}
-                    title="退出或管理当前账号"
+                    title={bi('退出或管理当前账号', 'Sign out account')}
                     className="rounded-xl p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-950/40"
                   >
                     <LogOut className="h-4 w-4" />
@@ -457,15 +461,15 @@ export function DeviceSwitcherModal({
                     <form onSubmit={handleCommitBindEmail} className="space-y-2">
                       <div className="flex items-center justify-between text-[11.5px]">
                         <span className="font-semibold text-slate-700 dark:text-slate-200">
-                          {activeEntry.email ? '更换绑定邮箱' : '绑定邮箱'}
+                          {activeEntry.email ? bi('更换绑定邮箱', 'Change Email') : bi('绑定邮箱', 'Link Email')}
                         </span>
-                        <span className="text-[10.5px] text-slate-400">用于邮箱登录与找回密码</span>
+                        <span className="text-[10.5px] text-slate-400">{bi('用于邮箱登录与找回密码', 'For login & password reset')}</span>
                       </div>
                       <input
                         type="email"
                         value={emailDraft}
                         onChange={(e) => setEmailDraft(e.target.value)}
-                        placeholder={activeEntry.email ? `新邮箱（当前：${activeEntry.email}）` : '输入要绑定的邮箱地址'}
+                        placeholder={activeEntry.email ? bi(`新邮箱（当前：${activeEntry.email}）`, `New email (current: ${activeEntry.email})`) : bi('输入要绑定的邮箱地址', 'Enter email address')}
                         autoComplete="email"
                         autoCapitalize="none"
                         autoCorrect="off"
@@ -479,7 +483,7 @@ export function DeviceSwitcherModal({
                           maxLength={6}
                           value={emailCodeDraft}
                           onChange={(e) => setEmailCodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                          placeholder="6 位验证码"
+                          placeholder={bi('6 位验证码', '6-digit code')}
                           autoComplete="one-time-code"
                           className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white"
                         />
@@ -489,7 +493,7 @@ export function DeviceSwitcherModal({
                           onClick={handleSendBindCode}
                           className="shrink-0 rounded-xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-2.5 py-2 text-[11px] font-semibold text-[#2842C9] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
                         >
-                          {emailSending ? '发送中' : emailCooldown > 0 ? `${emailCooldown}s` : '获取验证码'}
+                          {emailSending ? bi('发送中', 'Sending') : emailCooldown > 0 ? `${emailCooldown}s` : bi('获取验证码', 'Send Code')}
                         </button>
                       </div>
                       {emailInfo && (
@@ -508,25 +512,36 @@ export function DeviceSwitcherModal({
                           onClick={() => setShowEmailPanel(false)}
                           className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
                         >
-                          取消
+                          {t('common.cancel')}
                         </button>
                         <button
                           type="submit"
                           disabled={emailBinding}
                           className="rounded-lg bg-[#4D6BFE] px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
                         >
-                          {emailBinding ? '绑定中...' : '确认绑定'}
+                          {emailBinding ? bi('绑定中...', 'Linking...') : bi('确认绑定', 'Confirm')}
                         </button>
                       </div>
                     </form>
                   ) : (
                     <div className="space-y-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-                      <div className="font-semibold text-slate-700 dark:text-slate-200">服务器尚未启用邮件服务</div>
+                      <div className="font-semibold text-slate-700 dark:text-slate-200">{bi('服务器尚未启用邮件服务', 'Email Service Not Configured')}</div>
                       <p>
-                        在服务器 <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code>{' '}
-                        配置免费的 QQ / 163 / Gmail SMTP（<code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>、
-                        <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>、
-                        <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code>）并重启中转服务后，即可开启邮箱绑定与自助找回密码。
+                        {lang === 'en' ? (
+                          <>
+                            Configure <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>,{' '}
+                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>, and{' '}
+                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code> in the relay server{' '}
+                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code> and restart to enable email linking and password reset.
+                          </>
+                        ) : (
+                          <>
+                            在服务器 <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code>{' '}
+                            配置免费的 QQ / 163 / Gmail SMTP（<code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>、
+                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>、
+                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code>）并重启中转服务后，即可开启邮箱绑定与自助找回密码。
+                          </>
+                        )}
                       </p>
                     </div>
                   )}
@@ -536,13 +551,13 @@ export function DeviceSwitcherModal({
               {confirmLogoutAccount && (
                 <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
                   <div className="flex items-center justify-between gap-2">
-                    <span>退出账号 @{activeEntry.username}？</span>
+                    <span>{bi(`退出账号 @${activeEntry.username}？`, `Sign out @${activeEntry.username}?`)}</span>
                     <button
                       type="button"
                       onClick={() => setConfirmLogoutAccount(false)}
                       className="rounded-lg bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
                     >
-                      取消
+                      {t('common.cancel')}
                     </button>
                   </div>
                   <div className="flex flex-wrap justify-end gap-1.5">
@@ -554,7 +569,7 @@ export function DeviceSwitcherModal({
                       }}
                       className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
                     >
-                      仅退出本手机
+                      {bi('仅退出本设备', 'This Device Only')}
                     </button>
                     <button
                       type="button"
@@ -564,7 +579,7 @@ export function DeviceSwitcherModal({
                       }}
                       className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
                     >
-                      退出并踢出全部手机
+                      {bi('退出并吊销全部设备', 'Sign Out All Devices')}
                     </button>
                   </div>
                 </div>
@@ -572,7 +587,7 @@ export function DeviceSwitcherModal({
 
               {activeConnState === 'unauthorized' && (
                 <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">
-                  <span>当前账号登录已失效，请重新登录</span>
+                  <span>{bi('当前账号登录已失效，请重新登录', 'Session expired. Please sign in again.')}</span>
                   <button
                     type="button"
                     onClick={() => {
@@ -581,7 +596,7 @@ export function DeviceSwitcherModal({
                     }}
                     className="rounded-lg bg-rose-500 px-2.5 py-1 font-semibold text-white"
                   >
-                    重新登录
+                    {bi('重新登录', 'Sign In Again')}
                   </button>
                 </div>
               )}
@@ -595,10 +610,18 @@ export function DeviceSwitcherModal({
                 <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-700/80 dark:bg-[#151820]">
                   <Terminal className="mx-auto mb-2 h-6 w-6 text-[#4D6BFE]" />
                   <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    尚未绑定电脑
+                    {bi('尚未绑定电脑', 'No Computers Linked')}
                   </div>
                   <p className="mt-1 text-[11px] text-slate-400">
-                    在电脑终端运行下方命令并登录 <strong>@{activeEntry?.username}</strong>
+                    {lang === 'en' ? (
+                      <>
+                        Run the command below on your computer and sign in as <strong>@{activeEntry?.username}</strong>
+                      </>
+                    ) : (
+                      <>
+                        在电脑终端运行下方命令并登录 <strong>@{activeEntry?.username}</strong>
+                      </>
+                    )}
                   </p>
                   <div className="mt-2.5 space-y-1.5 text-left">
                     {[
@@ -670,7 +693,7 @@ export function DeviceSwitcherModal({
                                 {!pc.online && pc.lastSeenAt > 0 && (
                                   <>
                                     {platformLabel && <span>·</span>}
-                                    <span>{formatRelativeSeen(pc.lastSeenAt)}</span>
+                                    <span>{formatRelativeSeen(pc.lastSeenAt, lang)}</span>
                                   </>
                                 )}
                               </div>
@@ -683,7 +706,7 @@ export function DeviceSwitcherModal({
                             <button
                               type="button"
                               onClick={() => startRename(editKey, pc.label || pc.hostname)}
-                              title="重命名电脑"
+                              title={bi('重命名电脑', 'Rename computer')}
                               className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700/70 dark:hover:text-slate-200"
                             >
                               <Pencil className="h-3.5 w-3.5" />
@@ -694,7 +717,7 @@ export function DeviceSwitcherModal({
                                 setEditingId(null)
                                 setConfirmDeleteId(editKey)
                               }}
-                              title="解绑此电脑"
+                              title={bi('解绑此电脑', 'Unlink computer')}
                               className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-950/40"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
@@ -717,7 +740,7 @@ export function DeviceSwitcherModal({
                             onChange={(e) => setEditDraft(e.target.value)}
                             autoFocus
                             maxLength={40}
-                            placeholder="输入备注名"
+                            placeholder={bi('输入备注名', 'Enter nickname')}
                             className="min-w-0 flex-1 rounded-xl border border-[#4D6BFE] bg-white px-2.5 py-1.5 text-xs text-slate-900 outline-none dark:bg-[#14161D] dark:text-white"
                           />
                           <button
@@ -725,7 +748,7 @@ export function DeviceSwitcherModal({
                             className="inline-flex h-7.5 items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 text-xs font-semibold text-white"
                           >
                             <Check className="h-3.5 w-3.5" />
-                            <span>保存</span>
+                            <span>{t('common.save')}</span>
                           </button>
                           <button
                             type="button"
@@ -739,14 +762,14 @@ export function DeviceSwitcherModal({
 
                       {isConfirmingUnbind && (
                         <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                          <span>解绑此电脑？</span>
+                          <span>{bi('解绑此电脑？', 'Unlink this computer?')}</span>
                           <div className="flex shrink-0 items-center gap-1.5">
                             <button
                               type="button"
                               onClick={() => setConfirmDeleteId(null)}
                               className="rounded-lg bg-white px-2 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-200"
                             >
-                              取消
+                              {t('common.cancel')}
                             </button>
                             <button
                               type="button"
@@ -756,7 +779,7 @@ export function DeviceSwitcherModal({
                               }}
                               className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
                             >
-                              确认解绑
+                              {bi('确认解绑', 'Unlink')}
                             </button>
                           </div>
                         </div>
@@ -773,7 +796,7 @@ export function DeviceSwitcherModal({
             <div className="space-y-2">
               {isAccountMode && (
                 <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
-                  其他连接
+                  {bi('其他连接', 'Other Connections')}
                 </div>
               )}
               {otherEntries.map((device) => {
@@ -800,7 +823,7 @@ export function DeviceSwitcherModal({
                   status = 'probing'
                 }
 
-                const displayName = getDeviceDisplayName(device, primaryBridge, 1)
+                const displayName = getDeviceDisplayName(device, primaryBridge, 1, lang)
                 const platformLabel = formatPlatformLabel(primaryBridge?.platform || device.lastPlatform)
                 const isEditing = editingId === device.id
                 const isConfirmingDelete = confirmDeleteId === device.id
@@ -850,7 +873,7 @@ export function DeviceSwitcherModal({
                               {!isAcct && (
                                 <>
                                   {platformLabel && <span>·</span>}
-                                  <span>{device.roomId === 'owner' ? '密钥' : '旧版配对'}</span>
+                                  <span>{device.roomId === 'owner' ? bi('密钥', 'Token') : bi('旧版配对', 'Legacy Pair')}</span>
                                 </>
                               )}
                             </div>
@@ -864,7 +887,7 @@ export function DeviceSwitcherModal({
                             <button
                               type="button"
                               onClick={() => startRename(device.id, device.customName || displayName)}
-                              title="重命名电脑"
+                              title={bi('重命名电脑', 'Rename computer')}
                               className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700 dark:hover:bg-slate-700/70 dark:hover:text-slate-200"
                             >
                               <Pencil className="h-3.5 w-3.5" />
@@ -876,7 +899,7 @@ export function DeviceSwitcherModal({
                               setEditingId(null)
                               setConfirmDeleteId(device.id)
                             }}
-                            title="移除"
+                            title={t('common.remove')}
                             className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-950/40"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -899,7 +922,7 @@ export function DeviceSwitcherModal({
                           onChange={(e) => setEditDraft(e.target.value)}
                           autoFocus
                           maxLength={40}
-                          placeholder="输入备注名"
+                          placeholder={bi('输入备注名', 'Enter nickname')}
                           className="min-w-0 flex-1 rounded-xl border border-[#4D6BFE] bg-white px-2.5 py-1.5 text-xs text-slate-900 outline-none dark:bg-[#14161D] dark:text-white"
                         />
                         <button
@@ -907,7 +930,7 @@ export function DeviceSwitcherModal({
                           className="inline-flex h-7.5 items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 text-xs font-semibold text-white"
                         >
                           <Check className="h-3.5 w-3.5" />
-                          <span>保存</span>
+                          <span>{t('common.save')}</span>
                         </button>
                         <button
                           type="button"
@@ -922,13 +945,13 @@ export function DeviceSwitcherModal({
                     {isConfirmingDelete && (
                       <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
                         <div className="flex items-center justify-between gap-2">
-                          <span>移除此设备并清空本地缓存？</span>
+                          <span>{bi('移除此设备并清空本地缓存？', 'Remove device and clear local cache?')}</span>
                           <button
                             type="button"
                             onClick={() => setConfirmDeleteId(null)}
                             className="shrink-0 rounded-lg bg-white px-2 py-1 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-200"
                           >
-                            取消
+                            {t('common.cancel')}
                           </button>
                         </div>
                         <div className="flex flex-wrap items-center justify-end gap-1.5">
@@ -940,7 +963,7 @@ export function DeviceSwitcherModal({
                             }}
                             className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
                           >
-                            仅移除本机
+                            {bi('仅移除本机', 'This Device Only')}
                           </button>
                           {status !== 'expired' && (
                             <button
@@ -951,7 +974,7 @@ export function DeviceSwitcherModal({
                               }}
                               className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
                             >
-                              移除并踢出全部手机
+                              {bi('移除并吊销全部设备', 'Remove & Revoke All')}
                             </button>
                           )}
                         </div>
@@ -960,7 +983,7 @@ export function DeviceSwitcherModal({
 
                     {status === 'expired' && !isConfirmingDelete && (
                       <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50/70 px-3 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/35 dark:text-rose-300">
-                        <span>登录已过期，重新登录即可恢复</span>
+                        <span>{bi('登录已过期，重新登录即可恢复', 'Session expired. Sign in again to reconnect.')}</span>
                         <button
                           type="button"
                           onClick={() => {
@@ -970,7 +993,7 @@ export function DeviceSwitcherModal({
                           className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-rose-500 px-2.5 py-1 font-semibold text-white"
                         >
                           <KeyRound className="h-3 w-3" />
-                          <span>重新登录</span>
+                          <span>{bi('重新登录', 'Sign In')}</span>
                         </button>
                       </div>
                     )}
@@ -1022,7 +1045,7 @@ export function DeviceSwitcherModal({
               className="col-span-3 flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
             >
               <Plus className="h-4 w-4" />
-              <span>{isAccountMode ? '添加账号' : '登录账号'}</span>
+              <span>{isAccountMode ? bi('添加账号', 'Add Account') : bi('登录账号', 'Sign In')}</span>
             </button>
 
             <button
@@ -1034,7 +1057,7 @@ export function DeviceSwitcherModal({
               className="col-span-2 flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 active:scale-[0.98] dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
             >
               <ScanLine className="h-4 w-4" />
-              <span>扫码</span>
+              <span>{bi('扫码', 'Scan QR')}</span>
             </button>
           </div>
         </div>

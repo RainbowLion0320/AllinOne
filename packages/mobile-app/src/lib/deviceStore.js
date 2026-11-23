@@ -1,3 +1,5 @@
+import { bi, getCurrentLang } from './i18n.js'
+
 export const DEVICES_STORAGE_KEY = 'allinone_devices_v2'
 export const LEGACY_AUTH_STORAGE_KEY = 'allinone_dsh_auth_v1'
 
@@ -327,21 +329,21 @@ export function removeDevice(state, deviceId) {
   }
 }
 
-export function getDeviceDisplayName(device, activeBridge = null, onlineBridgeCount = 0) {
-  if (!device) return '未选择电脑'
+export function getDeviceDisplayName(device, activeBridge = null, onlineBridgeCount = 0, lang = getCurrentLang()) {
+  if (!device) return bi(lang, '未选择电脑', 'No Computer')
   if (device.authMode === 'account' || String(device.roomId || '').startsWith('usr_')) {
     if (activeBridge) {
       return activeBridge.label || activeBridge.hostname || activeBridge.bridgeId
     }
     if (device.lastHostname) return device.lastHostname
-    return device.username ? `@${device.username}` : device.label || '我的账号'
+    return device.username ? `@${device.username}` : device.label || bi(lang, '我的账号', 'My Account')
   }
   const baseName =
     device.customName ||
     activeBridge?.hostname ||
     device.lastHostname ||
     device.label ||
-    (device.roomId === 'owner' ? '我的主电脑' : device.roomId)
+    (device.roomId === 'owner' ? bi(lang, '我的主电脑', 'My Primary PC') : device.roomId)
 
   if (onlineBridgeCount > 1 && activeBridge) {
     const bridgeName = activeBridge.hostname || activeBridge.bridgeId

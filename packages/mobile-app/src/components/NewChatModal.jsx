@@ -3,6 +3,7 @@ import { APP_LIST, APP_META } from '@allinone/shared'
 import { ChevronRight, FolderOpen, Loader2, SlidersHorizontal, Sparkles, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel } from './VendorIcon.jsx'
 import { ModelPickerSheet } from './ModelPickerSheet.jsx'
+import { useI18n } from '../lib/i18n.jsx'
 
 export function NewChatModal({
   open,
@@ -14,6 +15,7 @@ export function NewChatModal({
   modelsCatalog = {},
   onCreate,
 }) {
+  const { lang, bi, t } = useI18n()
   const [app, setApp] = useState('dsh')
   const [cwd, setCwd] = useState(initialCwd || '')
   const [title, setTitle] = useState('')
@@ -120,7 +122,7 @@ export function NewChatModal({
           className="pb-safe max-h-[90vh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1E2028]"
         >
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-base font-bold text-slate-900 dark:text-white">新对话</h3>
+            <h3 className="text-base font-bold text-slate-900 dark:text-white">{t('common.newChat')}</h3>
             <button
               type="button"
               onClick={onClose}
@@ -135,7 +137,7 @@ export function NewChatModal({
             <div>
               <div className="mb-2 flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-500 dark:text-slate-400">
-                  应用
+                  {bi('应用', 'Tool')}
                 </span>
                 <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-300">
                   <span>{selectedAppMeta.shortName}</span>
@@ -143,7 +145,7 @@ export function NewChatModal({
                     <>
                       <span className="text-slate-300 dark:text-slate-600">·</span>
                       <span className={selectedAppStatus?.available ? 'text-amber-500' : 'text-slate-400'}>
-                        {selectedAppStatus?.available ? '只读' : '未就绪'}
+                        {selectedAppStatus?.available ? bi('只读', 'Read-only') : bi('未就绪', 'Unavailable')}
                       </span>
                     </>
                   )}
@@ -158,7 +160,7 @@ export function NewChatModal({
                     <button
                       key={appId}
                       type="button"
-                      title={`${meta.name} (${status?.writable ? '可读写' : status?.available ? '仅只读' : '未就绪'})`}
+                      title={`${meta.name} (${status?.writable ? bi('可读写', 'Read/Write') : status?.available ? bi('仅只读', 'Read-only') : bi('未就绪', 'Unavailable')})`}
                       aria-label={meta.name}
                       onClick={() => setApp(appId)}
                       className={`relative flex h-12 items-center justify-center rounded-2xl border transition active:scale-95 ${
@@ -196,7 +198,7 @@ export function NewChatModal({
               <div className="mb-2 flex items-center">
                 <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
                   <SlidersHorizontal className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  模型
+                  {bi('模型', 'Model')}
                 </span>
               </div>
 
@@ -208,7 +210,7 @@ export function NewChatModal({
               >
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
-                    {activeModelObj?.name || model || '默认模型'}
+                    {activeModelObj?.name || model || bi('默认模型', 'Default Model')}
                   </div>
                   {activeModelObj?.providerName && (
                     <div className="text-[10.5px] text-slate-400">
@@ -223,7 +225,7 @@ export function NewChatModal({
                 <div className="mt-2.5">
                   <div className="mb-1.5 flex items-center gap-1 text-[11px] text-slate-400">
                     <Sparkles className="h-3 w-3 text-[#4D6BFE]" />
-                    <span>推理强度</span>
+                    <span>{bi('推理强度', 'Reasoning Effort')}</span>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {activeEfforts.map((eff) => {
@@ -239,7 +241,7 @@ export function NewChatModal({
                               : 'border border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#20232C] dark:text-slate-300'
                           }`}
                         >
-                          {formatEffortLabel(eff)}
+                          {formatEffortLabel(eff, lang)}
                         </button>
                       )
                     })}
@@ -252,13 +254,13 @@ export function NewChatModal({
             <div>
               <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
                 <FolderOpen className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                工作目录
+                {bi('工作目录', 'Working Directory')}
               </label>
               <input
                 type="text"
                 value={cwd}
                 onChange={(e) => setCwd(e.target.value)}
-                placeholder="默认目录"
+                placeholder={bi('默认目录', 'Default directory')}
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-100"
               />
               {workspaces?.length > 0 && (
@@ -280,13 +282,13 @@ export function NewChatModal({
             {/* Optional title */}
             <div>
               <label className="mb-1.5 block text-xs font-medium text-slate-500 dark:text-slate-400">
-                标题（可选）
+                {bi('标题（可选）', 'Title (optional)')}
               </label>
               <input
                 type="text"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="自动命名"
+                placeholder={bi('自动命名', 'Auto-generated')}
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-100"
               />
             </div>
@@ -297,7 +299,7 @@ export function NewChatModal({
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-60"
             >
               {creating && <Loader2 className="h-4 w-4 animate-spin" />}
-              <span>{creating ? '创建中...' : '开始对话'}</span>
+              <span>{creating ? bi('创建中...', 'Creating...') : bi('开始对话', 'Start Chat')}</span>
             </button>
           </form>
         </div>

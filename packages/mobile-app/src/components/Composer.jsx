@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
+import { useI18n } from '../lib/i18n.jsx'
 import { resolveImageSrc } from '../lib/imageUrls.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
@@ -21,6 +22,7 @@ export function Composer({
   onSend,
   onInterrupt,
 }) {
+  const { lang, bi } = useI18n()
   const [text, setText] = useState(() => loadDraft(draftKey).text)
   const [attachments, setAttachments] = useState(() => loadDraft(draftKey).attachments)
   const [uploading, setUploading] = useState(false)
@@ -88,7 +90,7 @@ export function Composer({
         })
       }
     } catch (err) {
-      alert(`上传失败：${err.message || err}`)
+      alert(bi(`上传失败：${err.message || err}`, `Upload failed: ${err.message || err}`))
     } finally {
       setUploading(false)
     }
@@ -115,10 +117,10 @@ export function Composer({
 
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !disabled && !uploading && !needsWorkspace
   const placeholderText = needsWorkspace
-    ? '请先在上方选择目标项目目录...'
+    ? bi('请先在上方选择目标项目目录...', 'Select a project directory above first...')
     : targetWorkspaceName
-      ? `在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`
-      : `给 ${meta.shortName} 发送消息...`
+      ? bi(`在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName} in ${targetWorkspaceName}...`)
+      : bi(`给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName}...`)
 
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
@@ -183,7 +185,7 @@ export function Composer({
               <button
                 type="button"
                 onClick={onSwitchAppClick}
-                title={`当前应用：${meta.name}（点击新建或切换应用）`}
+                title={bi(`当前应用：${meta.name}（点击新建或切换应用）`, `Current app: ${meta.name} (click to start or switch)`)}
                 className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
               >
                 <VendorIcon app={activeApp} size={14} />
@@ -194,16 +196,16 @@ export function Composer({
                 <button
                   type="button"
                   onClick={onOpenModelPicker}
-                  title="切换模型与推理强度"
+                  title={bi('切换模型与推理强度', 'Switch model & reasoning effort')}
                   className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:border-[#4D6BFE]/50 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
                 >
                   <SlidersHorizontal className="h-3 w-3 shrink-0 text-[#4D6BFE]" />
                   <span className="max-w-[136px] truncate">
-                    {formatModelShort(modelPref?.model, modelDisplayName)}
+                    {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (
                     <span className="shrink-0 rounded-full bg-[#4D6BFE]/12 px-1.5 py-0.2 text-[10px] font-semibold text-[#3552E8] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                      {formatEffortLabel(modelPref.reasoningEffort)}
+                      {formatEffortLabel(modelPref.reasoningEffort, lang)}
                     </span>
                   )}
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />
@@ -223,7 +225,7 @@ export function Composer({
                 type="button"
                 disabled={uploading || disabled}
                 onClick={() => fileRef.current?.click()}
-                aria-label="上传图片或文件"
+                aria-label={bi('上传图片或文件', 'Upload image or file')}
                 className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-200/70 disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-700/60"
               >
                 {uploading ? (
@@ -237,7 +239,7 @@ export function Composer({
                 <button
                   type="button"
                   onClick={onInterrupt}
-                  aria-label="停止生成"
+                  aria-label={bi('停止生成', 'Stop generating')}
                   className="flex h-8 w-8 items-center justify-center rounded-full bg-rose-500 text-white shadow-xs transition active:scale-95"
                 >
                   <Square className="h-3.5 w-3.5 fill-current" />
@@ -247,7 +249,7 @@ export function Composer({
                   type="button"
                   disabled={!canSend}
                   onClick={handleSubmit}
-                  aria-label="发送"
+                  aria-label={bi('发送', 'Send')}
                   className="flex h-8 w-8 items-center justify-center rounded-full bg-[#4D6BFE] text-white shadow-xs transition active:scale-95 disabled:bg-slate-300 dark:disabled:bg-slate-700"
                 >
                   <ArrowUp className="h-4.5 w-4.5 stroke-[2.5]" />

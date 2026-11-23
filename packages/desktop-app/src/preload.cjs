@@ -5,8 +5,10 @@ const initInfo = ipcRenderer.sendSync('desktop:get-init') || {}
 contextBridge.exposeInMainWorld('allinoneDesktop', {
   isDesktop: true,
   platform: initInfo.platform || process.platform,
-  version: initInfo.version || '0.3.5',
+  version: initInfo.version || '0.3.6',
   defaultServerUrl: initInfo.defaultServerUrl || '',
+  initialLang: initInfo.lang || '',
+  setLanguage: (lang) => ipcRenderer.invoke('desktop:set-language', lang),
   getBridgeStatus: () => ipcRenderer.invoke('bridge:status'),
   syncAccount: (account) => ipcRenderer.invoke('bridge:sync-account', account),
   stopBridge: () => ipcRenderer.invoke('bridge:stop'),

@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { Check, Copy, Image as ImageIcon } from 'lucide-react'
+import { useI18n } from './i18n.jsx'
 import {
   getImageLabel,
   isImageTarget,
@@ -8,6 +9,7 @@ import {
 } from './imageUrls.js'
 
 function CodeBlock({ language, code }) {
+  const { t } = useI18n()
   const [copied, setCopied] = useState(false)
 
   const handleCopy = () => {
@@ -27,7 +29,7 @@ function CodeBlock({ language, code }) {
           className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-slate-200/60 dark:hover:bg-slate-700/60"
         >
           {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
-          <span>{copied ? '已复制' : '复制'}</span>
+          <span>{copied ? t('common.copied') : t('common.copy')}</span>
         </button>
       </div>
       <pre className="overflow-x-auto p-3.5 text-[13px] leading-relaxed text-slate-800 dark:text-slate-200">

@@ -142,6 +142,7 @@ export class DesktopUpdater extends EventEmitter {
     downloadDir = join(os.tmpdir(), 'allinone-updates'),
     apiUrl = '',
     allowLocalhost = false,
+    getLang = () => 'zh',
   } = {}) {
     super()
     this.currentVersion = String(currentVersion || '0.0.0').replace(/^v/i, '')
@@ -151,6 +152,7 @@ export class DesktopUpdater extends EventEmitter {
     this.downloadDir = downloadDir
     this.apiUrl = apiUrl || `https://api.github.com/repos/${repo}/releases/latest`
     this.allowLocalhost = allowLocalhost
+    this.getLang = typeof getLang === 'function' ? getLang : () => 'zh'
     this.abortController = null
 
     this.state = {
@@ -171,6 +173,10 @@ export class DesktopUpdater extends EventEmitter {
       checkedAt: 0,
       error: '',
     }
+  }
+
+  bi(zh, en) {
+    return String(this.getLang?.() || '').toLowerCase().startsWith('en') ? en : zh
   }
 
   getState() {
@@ -209,12 +215,12 @@ export class DesktopUpdater extends EventEmitter {
       }
 
       if (!res.ok) {
-        throw new Error(`GitHub API 返回 HTTP ${res.status}`)
+        throw new Error(this.bi(`GitHub API 返回 HTTP ${res.status}`, `GitHub API returned HTTP ${res.status}`))
       }
       const release = await res.json()
       const latestVersion = String(release.tag_name || '').trim().replace(/^v/i, '')
       if (!parseSemver(latestVersion)) {
-        throw new Error(`无法解析远端版本号: ${release.tag_name || '(空)'}`)
+        throw new Error(this.bi(`无法解析远端版本号: ${release.tag_name || '(空)'}`, `Invalid remote version tag: ${release.tag_name || '(empty)'}`))
       }
 
       const releaseUrl = String(release.html_url || `https://github.com/${this.repo}/releases/latest`)
@@ -306,8 +312,8 @@ export class DesktopUpdater extends EventEmitter {
         return this.getState()
       }
       const msg = err?.name === 'AbortError'
-        ? '检查更新超时，请稍后重试或检查网络'
-        : String(err?.message || err || '检查更新失败')
+        ? this.bi('检查更新超时，请稍后重试或检查网络', 'Update check timed out. Please check your network and retry.')
+        : String(err?.message || err || this.bi('检查更新失败', 'Failed to check for updates'))
       return this.setState({
         status: 'error',
         checkedAt: Date.now(),
@@ -325,13 +331,16 @@ export class DesktopUpdater extends EventEmitter {
     if (!downloadUrl || !assetName) {
       return this.setState({
         status: 'error',
-        error: '当前版本暂无匹配此系统的自动安装包，请前往 GitHub Releases 手动下载',
+        error: this.bi(
+          '当前版本暂无匹配此系统的自动安装包，请前往 GitHub Releases 手动下载',
+          'No matching installer for this platform. Please download manually from GitHub Releases.',
+        ),
       })
     }
     if (!isAllowedDownloadUrl(downloadUrl, this.allowLocalhost)) {
       return this.setState({
         status: 'error',
-        error: '拒绝从不受信任的下载地址拉取安装包',
+        error: this.bi('拒绝从不受信任的下载地址拉取安装包', 'Blocked download from untrusted host'),
       })
     }
 
@@ -359,10 +368,10 @@ export class DesktopUpdater extends EventEmitter {
         signal: controller.signal,
       })
       if (!res.ok) {
-        throw new Error(`下载安装包失败 (HTTP ${res.status})`)
+        throw new Error(this.bi(`下载安装包失败 (HTTP ${res.status})`, `Installer download failed (HTTP ${res.status})`))
       }
       if (res.url && !isAllowedDownloadUrl(res.url, this.allowLocalhost)) {
-        throw new Error('下载重定向到了不受信任的域名')
+        throw new Error(this.bi('下载重定向到了不受信任的域名', 'Download redirected to an untrusted host'))
       }
 
       const contentLen = Number(res.headers.get('content-length') || 0)
@@ -410,7 +419,7 @@ export class DesktopUpdater extends EventEmitter {
       const actualSha256 = hash.digest('hex').toLowerCase()
       if (expectedSha256 && actualSha256 !== expectedSha256) {
         try { unlinkSync(partPath) } catch {}
-        throw new Error('安装包 SHA-256 校验失败，已自动丢弃，请重试下载')
+        throw new Error(this.bi('安装包 SHA-256 校验失败，已自动丢弃，请重试下载', 'Installer SHA-256 verification failed. Discarded corrupted file, please retry.'))
       }
 
       try { unlinkSync(finalPath) } catch {}
@@ -474,7 +483,7 @@ export class DesktopUpdater extends EventEmitter {
     if (!installerPath || !existsSync(installerPath)) {
       return this.setState({
         status: 'error',
-        error: '安装包文件不存在，请重新下载',
+        error: this.bi('安装包文件不存在，请重新下载', 'Installer file missing. Please download again.'),
       })
     }
 

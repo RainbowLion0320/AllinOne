@@ -59,6 +59,16 @@ import {
   compareSemver,
   pickReleaseAsset,
 } from '../packages/desktop-app/src/updater.js'
+import {
+  LANG_STORAGE_KEY,
+  MESSAGES,
+  bi,
+  detectInitialLang,
+  loadSavedLang,
+  normalizeLang,
+  saveLang,
+  translate,
+} from '../packages/mobile-app/src/lib/i18n.js'
 
 const TEST_PASS = 'smoke-test-pass-123'
 const TEST_BRIDGE_SECRET = 'smoke-test-bridge-456'
@@ -1802,7 +1812,42 @@ async function main() {
         await new Promise((r) => mockReleaseServer.close(r))
       }
     }
-    console.log('[smoke] 14/14 Built-in desktop auto-updater (semver, download, SHA-256, cache reuse & host guard) OK')
+    console.log('[smoke] 14/15 Built-in desktop auto-updater (semver, download, SHA-256, cache reuse & host guard) OK')
+
+    // 15. Bilingual i18n store (zh/en detection, persistence, dictionary parity & interpolation)
+    {
+      assert.equal(normalizeLang('zh-CN'), 'zh')
+      assert.equal(normalizeLang('en-US'), 'en')
+      assert.equal(normalizeLang('EN'), 'en')
+      assert.equal(normalizeLang('fr-FR'), null)
+
+      const mem = new Map()
+      const langStorage = {
+        getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+        setItem: (k, v) => mem.set(k, String(v)),
+      }
+      assert.equal(detectInitialLang(langStorage, { language: 'en-US' }), 'en')
+      assert.equal(detectInitialLang(langStorage, { language: 'zh-Hans-CN' }), 'zh')
+      saveLang('en', langStorage)
+      assert.equal(langStorage.getItem(LANG_STORAGE_KEY), 'en')
+      assert.equal(loadSavedLang(langStorage), 'en')
+      assert.equal(detectInitialLang(langStorage, { language: 'zh-CN' }), 'en', 'Saved language must override browser locale')
+
+      assert.deepEqual(
+        Object.keys(MESSAGES.zh).sort(),
+        Object.keys(MESSAGES.en).sort(),
+        'zh and en dictionaries must have identical key sets',
+      )
+      assert.equal(translate('zh', 'time.minsAgo', { n: 5 }), '5 分钟前')
+      assert.equal(translate('en', 'time.minsAgo', { n: 5 }), '5m ago')
+      assert.equal(bi('zh', '设置', 'Settings'), '设置')
+      assert.equal(bi('en', '设置', 'Settings'), 'Settings')
+      assert.equal(getDeviceDisplayName(null, null, 0, 'en'), 'No Computer')
+      assert.equal(getDeviceDisplayName(null, null, 0, 'zh'), '未选择电脑')
+      // Restore cache to default zh for clean test end
+      saveLang('zh', langStorage)
+    }
+    console.log('[smoke] 15/15 Bilingual i18n (zh/en detection, persistence & dictionary parity) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

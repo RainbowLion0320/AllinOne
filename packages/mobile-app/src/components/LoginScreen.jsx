@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Globe,
   KeyRound,
   Lock,
   Mail,
@@ -33,6 +34,7 @@ import {
   sendEmailVerificationCode,
 } from '../lib/wsClient.js'
 import { QrScannerModal } from './QrScannerModal.jsx'
+import { useI18n } from '../lib/i18n.jsx'
 
 function formatPairCodeDisplay(val) {
   const trimmed = val.trim()
@@ -51,6 +53,7 @@ export function LoginScreen({
   autoOpenScanner = false,
   onCancel = null,
 }) {
+  const { lang, setLang, bi, t } = useI18n()
   // 'login' | 'register' | 'reset' | 'pair' | 'password'
   const [mode, setMode] = useState(() =>
     autoOpenScanner ? 'pair' : initialInviteCode ? 'register' : 'login',
@@ -128,11 +131,11 @@ export function LoginScreen({
     setInfoMsg('')
     const cleanEmail = email.trim()
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
-      setError('请先输入有效的邮箱地址')
+      setError(bi('请先输入有效的邮箱地址', 'Please enter a valid email address'))
       return
     }
     if (purpose === 'register' && !inviteCode.trim()) {
-      setError('请先填写邀请码，再获取邮箱验证码')
+      setError(bi('请先填写邀请码，再获取邮箱验证码', 'Enter your invite code before requesting a verification code'))
       return
     }
     setCodeSending(true)
@@ -143,7 +146,7 @@ export function LoginScreen({
         inviteCode: purpose === 'register' ? inviteCode.trim() : '',
       })
       setCodeCooldown(res.cooldownSec || 60)
-      setInfoMsg(res.message || '验证码已发送，请查收邮件')
+      setInfoMsg(res.message || bi('验证码已发送，请查收邮件', 'Verification code sent. Please check your inbox.'))
     } catch (err) {
       if (err?.retryAfterSec) setCodeCooldown(err.retryAfterSec)
       setError(String(err?.message || err))
@@ -169,8 +172,8 @@ export function LoginScreen({
     if (!parsed.pairCode && !parsed.pairToken) {
       setError(
         fromScanner
-          ? '识别到的二维码不是 All in One 配对码，请扫描电脑端弹出的配对二维码'
-          : '请输入电脑端显示的 8 位配对码，或点击「扫一扫」',
+          ? bi('识别到的二维码不是 All in One 配对码，请扫描电脑端弹出的配对二维码', 'Invalid QR code. Please scan the pairing QR displayed on your PC.')
+          : bi('请输入电脑端显示的 8 位配对码，或点击「扫一扫」', 'Enter the 8-character pairing code from your PC, or tap Scan QR.'),
       )
       return
     }
@@ -231,7 +234,7 @@ export function LoginScreen({
 
     if (mode === 'login') {
       if (!username.trim() || !accountPassword) {
-        setError(emailEnabled ? '请输入用户名/邮箱和密码' : '请输入用户名和密码')
+        setError(emailEnabled ? bi('请输入用户名/邮箱和密码', 'Please enter username/email and password') : bi('请输入用户名和密码', 'Please enter username and password'))
         return
       }
       setLoading(true)
@@ -262,29 +265,29 @@ export function LoginScreen({
 
     if (mode === 'register') {
       if (!inviteCode.trim()) {
-        setError('请输入管理员提供的一次性邀请码')
+        setError(bi('请输入管理员提供的一次性邀请码', 'Please enter your single-use invite code'))
         return
       }
       if (!username.trim()) {
-        setError('请输入用户名（3~32 位字母/数字/下划线）')
+        setError(bi('请输入用户名（3~32 位字母/数字/下划线）', 'Please enter a username (3-32 letters, numbers, or underscores)'))
         return
       }
       if (accountPassword.length < 8) {
-        setError('密码长度至少需要 8 位')
+        setError(bi('密码长度至少需要 8 位', 'Password must be at least 8 characters'))
         return
       }
       if (accountPassword !== confirmPassword) {
-        setError('两次输入的密码不一致')
+        setError(bi('两次输入的密码不一致', 'Passwords do not match'))
         return
       }
       const cleanEmail = emailEnabled ? email.trim() : ''
       if (cleanEmail) {
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
-          setError('请输入有效的邮箱地址，或留空直接注册')
+          setError(bi('请输入有效的邮箱地址，或留空直接注册', 'Enter a valid email address, or leave blank to skip'))
           return
         }
         if (!/^\d{6}$/.test(emailCode.trim())) {
-          setError('请输入邮箱收到的 6 位验证码，或清空邮箱直接注册')
+          setError(bi('请输入邮箱收到的 6 位验证码，或清空邮箱直接注册', 'Enter the 6-digit email code, or clear email to skip'))
           return
         }
       }
@@ -319,19 +322,19 @@ export function LoginScreen({
     if (mode === 'reset') {
       const cleanEmail = email.trim()
       if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
-        setError('请输入账号绑定的邮箱地址')
+        setError(bi('请输入账号绑定的邮箱地址', 'Please enter your linked email address'))
         return
       }
       if (!/^\d{6}$/.test(emailCode.trim())) {
-        setError('请输入 6 位邮箱验证码')
+        setError(bi('请输入 6 位邮箱验证码', 'Please enter the 6-digit email code'))
         return
       }
       if (accountPassword.length < 8) {
-        setError('新密码长度至少需要 8 位')
+        setError(bi('新密码长度至少需要 8 位', 'New password must be at least 8 characters'))
         return
       }
       if (accountPassword !== confirmPassword) {
-        setError('两次输入的新密码不一致')
+        setError(bi('两次输入的新密码不一致', 'New passwords do not match'))
         return
       }
       setLoading(true)
@@ -346,7 +349,7 @@ export function LoginScreen({
         setAccountPassword('')
         setConfirmPassword('')
         setEmailCode('')
-        setInfoMsg('密码已重置，请使用新密码登录')
+        setInfoMsg(bi('密码已重置，请使用新密码登录', 'Password reset successful. Sign in with your new password.'))
       } catch (err) {
         setError(String(err?.message || err))
       } finally {
@@ -361,7 +364,7 @@ export function LoginScreen({
     }
 
     if (!legacyPassword.trim()) {
-      setError('请输入管理员访问密钥')
+      setError(bi('请输入管理员访问密钥', 'Please enter the admin access token'))
       return
     }
     setLoading(true)
@@ -386,8 +389,20 @@ export function LoginScreen({
   const isDesktopApp = typeof window !== 'undefined' && Boolean(window.allinoneDesktop)
 
   return (
-    <div className="flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
+    <div className="relative flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
       {isDesktopApp && <div className="app-drag fixed inset-x-0 top-0 z-10 h-9" />}
+      {/* Floating bilingual switcher on login screen */}
+      <div className="app-no-drag pt-safe fixed top-3 right-4 z-20">
+        <button
+          type="button"
+          onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
+          aria-label={bi('切换语言', 'Switch language')}
+          className="inline-flex items-center gap-1.5 rounded-full border border-slate-200/80 bg-white/90 px-3 py-1.5 text-[11.5px] font-semibold text-slate-600 shadow-xs backdrop-blur-md transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/80 dark:bg-[#1E2028]/90 dark:text-slate-300"
+        >
+          <Globe className="h-3.5 w-3.5 text-[#4D6BFE]" />
+          <span>{lang === 'en' ? '中文' : 'EN'}</span>
+        </button>
+      </div>
       <div className="w-full max-w-sm">
         {isAddingDevice && onCancel && (
           <div className="pt-safe mb-3 flex items-center">
@@ -397,7 +412,7 @@ export function LoginScreen({
               className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               <ArrowLeft className="h-4 w-4" />
-              <span>返回</span>
+              <span>{t('common.back')}</span>
             </button>
           </div>
         )}
@@ -408,7 +423,7 @@ export function LoginScreen({
             <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
           </div>
           <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
-            {isAddingDevice ? '添加账号' : 'All in One'}
+            {isAddingDevice ? bi('添加账号', 'Add Account') : 'All in One'}
           </h1>
         </div>
 
@@ -433,7 +448,7 @@ export function LoginScreen({
                 }`}
               >
                 <User className="h-3.5 w-3.5" />
-                <span>登录</span>
+                <span>{bi('登录', 'Sign In')}</span>
               </button>
               <button
                 type="button"
@@ -449,7 +464,7 @@ export function LoginScreen({
                 }`}
               >
                 <UserPlus className="h-3.5 w-3.5" />
-                <span>注册</span>
+                <span>{bi('注册', 'Sign Up')}</span>
               </button>
             </div>
           )}
@@ -460,13 +475,13 @@ export function LoginScreen({
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <User className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>{emailEnabled ? '用户名 / 邮箱' : '用户名'}</span>
+                  <span>{emailEnabled ? bi('用户名 / 邮箱', 'Username / Email') : bi('用户名', 'Username')}</span>
                 </label>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder={emailEnabled ? '输入用户名或已绑定邮箱' : '输入你的用户名'}
+                  placeholder={emailEnabled ? bi('输入用户名或已绑定邮箱', 'Enter username or linked email') : bi('输入你的用户名', 'Enter your username')}
                   autoComplete="username"
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -479,7 +494,7 @@ export function LoginScreen({
                 <div className="mb-1.5 flex items-center justify-between gap-2">
                   <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                     <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>密码</span>
+                    <span>{bi('密码', 'Password')}</span>
                   </label>
                   {emailEnabled && (
                     <button
@@ -493,7 +508,7 @@ export function LoginScreen({
                       }}
                       className="text-[11.5px] font-medium text-[#4D6BFE] hover:underline"
                     >
-                      忘记密码？
+                      {bi('忘记密码？', 'Forgot password?')}
                     </button>
                   )}
                 </div>
@@ -501,7 +516,7 @@ export function LoginScreen({
                   type="password"
                   value={accountPassword}
                   onChange={(e) => setAccountPassword(e.target.value)}
-                  placeholder="输入账号密码"
+                  placeholder={bi('输入账号密码', 'Enter password')}
                   autoComplete="current-password"
                   className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                 />
@@ -516,7 +531,15 @@ export function LoginScreen({
                 <div className="flex items-start gap-2 rounded-2xl border border-[#4D6BFE]/30 bg-[#F2F5FF] px-3 py-2 text-[11.5px] leading-relaxed text-[#2842C9] dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]">
                   <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span>
-                    首次初始化：直接把服务器的 <strong>管理员密钥 (CLIENT_ACCESS_TOKEN)</strong> 填入下方邀请码框，即可注册首个管理员账号。
+                    {lang === 'en' ? (
+                      <>
+                        First-time setup: enter your server&apos;s <strong>Admin Token (CLIENT_ACCESS_TOKEN)</strong> as the invite code below to create the first admin account.
+                      </>
+                    ) : (
+                      <>
+                        首次初始化：直接把服务器的 <strong>管理员密钥 (CLIENT_ACCESS_TOKEN)</strong> 填入下方邀请码框，即可注册首个管理员账号。
+                      </>
+                    )}
                   </span>
                 </div>
               )}
@@ -524,7 +547,7 @@ export function LoginScreen({
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>邀请码</span>
+                  <span>{bi('邀请码', 'Invite Code')}</span>
                 </label>
                 <input
                   type="text"
@@ -541,13 +564,13 @@ export function LoginScreen({
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <User className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>用户名</span>
+                  <span>{bi('用户名', 'Username')}</span>
                 </label>
                 <input
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="3~32 位字母、数字或下划线"
+                  placeholder={bi('3~32 位字母、数字或下划线', '3-32 letters, numbers, or _')}
                   autoComplete="username"
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -560,26 +583,26 @@ export function LoginScreen({
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
                     <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>密码</span>
+                    <span>{bi('密码', 'Password')}</span>
                   </label>
                   <input
                     type="password"
                     value={accountPassword}
                     onChange={(e) => setAccountPassword(e.target.value)}
-                    placeholder="至少 8 位"
+                    placeholder={bi('至少 8 位', 'At least 8 chars')}
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
                 </div>
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
-                    <span>确认密码</span>
+                    <span>{bi('确认密码', 'Confirm Password')}</span>
                   </label>
                   <input
                     type="password"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
-                    placeholder="再次输入"
+                    placeholder={bi('再次输入', 'Re-enter password')}
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
@@ -592,15 +615,15 @@ export function LoginScreen({
                     <label className="mb-1.5 flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300">
                       <span className="inline-flex items-center gap-1.5">
                         <Mail className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                        <span>绑定邮箱</span>
+                        <span>{bi('绑定邮箱', 'Email')}</span>
                       </span>
-                      <span className="text-[11px] font-normal text-slate-400">选填</span>
+                      <span className="text-[11px] font-normal text-slate-400">{bi('选填', 'Optional')}</span>
                     </label>
                     <input
                       type="email"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
-                      placeholder="用于邮箱登录与找回密码（可留空）"
+                      placeholder={bi('用于邮箱登录与找回密码（可留空）', 'For email login & password reset (optional)')}
                       autoComplete="email"
                       autoCapitalize="none"
                       autoCorrect="off"
@@ -617,7 +640,7 @@ export function LoginScreen({
                         maxLength={6}
                         value={emailCode}
                         onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                        placeholder="6 位邮箱验证码"
+                        placeholder={bi('6 位邮箱验证码', '6-digit email code')}
                         autoComplete="one-time-code"
                         className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                       />
@@ -628,10 +651,10 @@ export function LoginScreen({
                         className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] transition hover:bg-[#E7EEFF] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
                       >
                         {codeSending
-                          ? '发送中...'
+                          ? bi('发送中...', 'Sending...')
                           : codeCooldown > 0
                             ? `${codeCooldown}s`
-                            : '获取验证码'}
+                            : bi('获取验证码', 'Send Code')}
                       </button>
                     </div>
                   )}
@@ -646,7 +669,7 @@ export function LoginScreen({
               <div className="flex items-center justify-between">
                 <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
                   <ShieldCheck className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>通过邮箱重置密码</span>
+                  <span>{bi('通过邮箱重置密码', 'Reset Password via Email')}</span>
                 </span>
                 <button
                   type="button"
@@ -657,20 +680,20 @@ export function LoginScreen({
                   }}
                   className="text-xs font-medium text-[#4D6BFE] hover:underline"
                 >
-                  返回登录
+                  {bi('返回登录', 'Back to Sign In')}
                 </button>
               </div>
 
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <Mail className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>已绑定邮箱</span>
+                  <span>{bi('已绑定邮箱', 'Linked Email')}</span>
                 </label>
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="输入账号绑定的邮箱地址"
+                  placeholder={bi('输入账号绑定的邮箱地址', 'Enter your linked email address')}
                   autoComplete="email"
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -686,7 +709,7 @@ export function LoginScreen({
                   maxLength={6}
                   value={emailCode}
                   onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  placeholder="6 位邮箱验证码"
+                  placeholder={bi('6 位邮箱验证码', '6-digit email code')}
                   autoComplete="one-time-code"
                   className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 font-mono text-sm tracking-widest text-slate-900 outline-none transition placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                 />
@@ -697,10 +720,10 @@ export function LoginScreen({
                   className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] transition hover:bg-[#E7EEFF] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
                 >
                   {codeSending
-                    ? '发送中...'
+                    ? bi('发送中...', 'Sending...')
                     : codeCooldown > 0
                       ? `${codeCooldown}s`
-                      : '获取验证码'}
+                      : bi('获取验证码', 'Send Code')}
                 </button>
               </div>
 
@@ -708,26 +731,26 @@ export function LoginScreen({
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
                     <Lock className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>新密码</span>
+                    <span>{bi('新密码', 'New Password')}</span>
                   </label>
                   <input
                     type="password"
                     value={accountPassword}
                     onChange={(e) => setAccountPassword(e.target.value)}
-                    placeholder="至少 8 位"
+                    placeholder={bi('至少 8 位', 'At least 8 chars')}
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
                 </div>
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
-                    <span>确认新密码</span>
+                    <span>{bi('确认新密码', 'Confirm Password')}</span>
                   </label>
                   <input
                     type="password"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
-                    placeholder="再次输入"
+                    placeholder={bi('再次输入', 'Re-enter password')}
                     autoComplete="new-password"
                     className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                   />
@@ -740,7 +763,7 @@ export function LoginScreen({
           {mode === 'pair' && (
             <>
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">旧版配对码 / 扫码连接</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('旧版配对码 / 扫码连接', 'Legacy Pair Code / QR')}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -750,7 +773,7 @@ export function LoginScreen({
                   }}
                   className="text-xs font-medium text-[#4D6BFE] hover:underline"
                 >
-                  返回账号登录
+                  {bi('返回账号登录', 'Account Sign In')}
                 </button>
               </div>
 
@@ -768,8 +791,8 @@ export function LoginScreen({
                     <ScanLine className="h-4.5 w-4.5" />
                   </div>
                   <div className="min-w-0">
-                    <div className="text-[13px] font-bold text-[#2842C9] dark:text-white">扫一扫二维码</div>
-                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">支持旧版配对码或邀请注册二维码</div>
+                    <div className="text-[13px] font-bold text-[#2842C9] dark:text-white">{bi('扫一扫二维码', 'Scan QR Code')}</div>
+                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">{bi('支持旧版配对码或邀请注册二维码', 'Supports legacy pairing or invite sign-up QR')}</div>
                   </div>
                 </div>
                 <ArrowRight className="h-4 w-4 shrink-0 text-[#4D6BFE]" />
@@ -779,7 +802,7 @@ export function LoginScreen({
                 type="text"
                 value={pairInput}
                 onChange={(e) => setPairInput(formatPairCodeDisplay(e.target.value))}
-                placeholder="输入 8 位配对码，例如：AB34-CD56"
+                placeholder={bi('输入 8 位配对码，例如：AB34-CD56', 'Enter 8-char code, e.g. AB34-CD56')}
                 autoCapitalize="characters"
                 autoCorrect="off"
                 spellCheck={false}
@@ -792,7 +815,7 @@ export function LoginScreen({
           {mode === 'password' && (
             <>
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">旧版管理员密钥登录</span>
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('旧版管理员密钥登录', 'Legacy Admin Token Login')}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -802,19 +825,19 @@ export function LoginScreen({
                   }}
                   className="text-xs font-medium text-[#4D6BFE] hover:underline"
                 >
-                  返回账号登录
+                  {bi('返回账号登录', 'Account Sign In')}
                 </button>
               </div>
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>管理员密钥 (CLIENT_ACCESS_TOKEN)</span>
+                  <span>{bi('管理员密钥 (CLIENT_ACCESS_TOKEN)', 'Admin Token (CLIENT_ACCESS_TOKEN)')}</span>
                 </label>
                 <input
                   type="password"
                   value={legacyPassword}
                   onChange={(e) => setLegacyPassword(e.target.value)}
-                  placeholder="输入服务器配置的访问口令"
+                  placeholder={bi('输入服务器配置的访问口令', 'Enter server access token')}
                   autoComplete="current-password"
                   className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#16171A] dark:text-white"
                 />
@@ -832,7 +855,7 @@ export function LoginScreen({
             >
               <span className="inline-flex items-center gap-1.5">
                 <Terminal className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>电脑端绑定命令</span>
+                <span>{bi('电脑端绑定命令', 'PC Bridge Setup Command')}</span>
               </span>
               {showSetupGuide ? <ChevronUp className="h-3.5 w-3.5 text-slate-400" /> : <ChevronDown className="h-3.5 w-3.5 text-slate-400" />}
             </button>
@@ -870,7 +893,7 @@ export function LoginScreen({
                     type="button"
                     onClick={handleCopySetupCmd}
                     className="shrink-0 rounded-lg bg-white/10 p-1.5 text-white hover:bg-white/20"
-                    title="复制命令"
+                    title={bi('复制命令', 'Copy command')}
                   >
                     {copiedCmd ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
                   </button>
@@ -888,7 +911,7 @@ export function LoginScreen({
               className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
             >
               <Server className="h-3 w-3" />
-              <span>服务器：{effectiveServer.replace(/^https?:\/\//, '')}</span>
+              <span>{bi('服务器：', 'Server: ')}{effectiveServer.replace(/^https?:\/\//, '')}</span>
               {showAdvancedServer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             </button>
             {showAdvancedServer && (
@@ -905,7 +928,7 @@ export function LoginScreen({
                   onClick={() => setServerUrl(detectDefaultServerUrl())}
                   className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
                 >
-                  默认
+                  {t('common.default')}
                 </button>
               </div>
             )}
@@ -930,16 +953,16 @@ export function LoginScreen({
           >
             <span>
               {loading
-                ? '验证中...'
+                ? bi('验证中...', 'Verifying...')
                 : mode === 'login'
-                  ? '登录'
+                  ? bi('登录', 'Sign In')
                   : mode === 'register'
-                    ? '注册'
+                    ? bi('注册', 'Sign Up')
                     : mode === 'reset'
-                      ? '重置密码'
+                      ? bi('重置密码', 'Reset Password')
                       : mode === 'pair'
-                        ? '配对'
-                        : '登录'}
+                        ? bi('配对', 'Pair')
+                        : bi('登录', 'Sign In')}
             </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>
@@ -952,7 +975,7 @@ export function LoginScreen({
                 onClick={() => setShowLegacyOptions((v) => !v)}
                 className="flex w-full items-center justify-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
               >
-                <span>扫码 / 密钥登录</span>
+                <span>{bi('扫码 / 密钥登录', 'QR / Admin Token')}</span>
                 {showLegacyOptions ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
               </button>
               {showLegacyOptions && (
@@ -966,7 +989,7 @@ export function LoginScreen({
                     className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 py-2 text-[11.5px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-[#16181F] dark:text-slate-300"
                   >
                     <QrCode className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>扫码 / 配对码</span>
+                    <span>{bi('扫码 / 配对码', 'QR / Pair Code')}</span>
                   </button>
                   <button
                     type="button"
@@ -977,7 +1000,7 @@ export function LoginScreen({
                     className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 py-2 text-[11.5px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-[#16181F] dark:text-slate-300"
                   >
                     <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>管理员密钥</span>
+                    <span>{bi('管理员密钥', 'Admin Token')}</span>
                   </button>
                 </div>
               )}

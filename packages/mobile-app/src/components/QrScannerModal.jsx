@@ -9,6 +9,8 @@ import {
   ScanLine,
   X,
 } from 'lucide-react'
+import { useI18n } from '../lib/i18n.jsx'
+import { bi as biLang, getCurrentLang } from '../lib/i18n.js'
 
 let jsQrPromise = null
 function loadJsQr() {
@@ -47,13 +49,13 @@ async function decodeQrFromImageFile(file) {
     const img = await new Promise((resolve, reject) => {
       const el = new Image()
       el.onload = () => resolve(el)
-      el.onerror = () => reject(new Error('无法读取该图片'))
+      el.onerror = () => reject(new Error(biLang(getCurrentLang(), '无法读取该图片', 'Unable to read image')))
       el.src = objUrl
     })
 
     const w = img.naturalWidth || img.width
     const h = img.naturalHeight || img.height
-    if (!w || !h) throw new Error('图片尺寸无效')
+    if (!w || !h) throw new Error(biLang(getCurrentLang(), '图片尺寸无效', 'Invalid image dimensions'))
 
     // 1. Try native hardware BarcodeDetector first if supported
     const detector = createNativeQrDetector()
@@ -69,7 +71,7 @@ async function decodeQrFromImageFile(file) {
     const jsQR = await loadJsQr()
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) throw new Error('浏览器不支持画布解码')
+    if (!ctx) throw new Error(biLang(getCurrentLang(), '浏览器不支持画布解码', 'Canvas decoding is not supported'))
 
     const attempts = [
       { x: 0, y: 0, w, h, maxDim: 1200 },
@@ -90,6 +92,7 @@ async function decodeQrFromImageFile(file) {
 }
 
 export function QrScannerModal({ open, onClose, onDetected }) {
+  const { bi } = useI18n()
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
@@ -152,7 +155,10 @@ export function QrScannerModal({ open, onClose, onDetected }) {
     const start = async () => {
       if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
         setCamState('error')
-        setCamError('当前环境不支持实时调用摄像头，请使用下方「拍照识别」或「相册选图」。')
+        setCamError(bi(
+          '当前环境不支持实时调用摄像头，请使用下方「拍照识别」或「相册选图」。',
+          'Live camera is unavailable here. Use "Take Photo" or "Choose Photo" below.',
+        ))
         return
       }
 
@@ -174,11 +180,20 @@ export function QrScannerModal({ open, onClose, onDetected }) {
           const name = String(err2?.name || '')
           setCamState('error')
           if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-            setCamError('未获得实时摄像头权限（请检查应用摄像头权限，或直接点下方「拍照识别 / 相册选图」）。')
+            setCamError(bi(
+              '未获得实时摄像头权限（请检查应用摄像头权限，或直接点下方「拍照识别 / 相册选图」）。',
+              'Camera permission denied. Allow camera access or use "Take Photo / Choose Photo" below.',
+            ))
           } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-            setCamError('未检测到可用摄像头，请使用下方「相册选图」。')
+            setCamError(bi(
+              '未检测到可用摄像头，请使用下方「相册选图」。',
+              'No camera detected. Use "Choose Photo" below.',
+            ))
           } else {
-            setCamError(`无法启动实时相机（${err2?.message || name || '未知错误'}），请改用下方「拍照识别」或「相册选图」。`)
+            setCamError(bi(
+              `无法启动实时相机（${err2?.message || name || '未知错误'}），请改用下方「拍照识别」或「相册选图」。`,
+              `Could not start live camera (${err2?.message || name || 'Unknown error'}). Use "Take Photo" or "Choose Photo" below.`,
+            ))
           }
           return
         }
@@ -275,10 +290,13 @@ export function QrScannerModal({ open, onClose, onDetected }) {
       if (found) {
         emitDetected(found)
       } else {
-        setImageError('未在图片中识别到二维码，请对准电脑二维码清晰拍摄或放大截屏后重试。')
+        setImageError(bi(
+          '未在图片中识别到二维码，请对准电脑二维码清晰拍摄或放大截屏后重试。',
+          'No QR code detected in the image. Take a clearer photo or zoomed screenshot and try again.',
+        ))
       }
     } catch (err) {
-      setImageError(String(err?.message || err || '识别图片二维码失败'))
+      setImageError(String(err?.message || err || bi('识别图片二维码失败', 'Failed to decode QR code')))
     } finally {
       setDecodingImage(false)
     }
@@ -296,14 +314,14 @@ export function QrScannerModal({ open, onClose, onDetected }) {
             stopCamera()
             onClose?.()
           }}
-          aria-label="关闭扫码"
+          aria-label={bi('关闭扫码', 'Close scanner')}
           className="flex h-10 w-10 items-center justify-center rounded-full bg-white/12 text-white backdrop-blur-md active:scale-95"
         >
           <X className="h-5 w-5" />
         </button>
 
         <div className="text-center">
-          <div className="text-sm font-semibold">扫一扫</div>
+          <div className="text-sm font-semibold">{bi('扫一扫', 'Scan QR')}</div>
         </div>
 
         <div className="flex h-10 w-10 items-center justify-end">
@@ -311,7 +329,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
             <button
               type="button"
               onClick={handleToggleTorch}
-              aria-label={torchOn ? '关闭闪光灯' : '开启闪光灯'}
+              aria-label={torchOn ? bi('关闭闪光灯', 'Turn off flashlight') : bi('开启闪光灯', 'Turn on flashlight')}
               className={`flex h-10 w-10 items-center justify-center rounded-full backdrop-blur-md active:scale-95 ${
                 torchOn ? 'bg-amber-400 text-slate-900' : 'bg-white/12 text-white'
               }`}
@@ -347,7 +365,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
               <div className="absolute inset-x-4 top-1/2 h-0.5 -translate-y-1/2 animate-pulse rounded-full bg-gradient-to-r from-transparent via-[#4D6BFE] to-transparent shadow-[0_0_12px_#4D6BFE]" />
             </div>
             <p className="mt-6 rounded-full bg-black/45 px-4 py-1.5 text-xs text-white/85 backdrop-blur-sm">
-              将二维码放入框内即可自动识别连接
+              {bi('将二维码放入框内即可自动识别连接', 'Align QR code inside frame to connect automatically')}
             </p>
           </div>
         )}
@@ -356,8 +374,8 @@ export function QrScannerModal({ open, onClose, onDetected }) {
         {camState === 'starting' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <Loader2 className="h-8 w-8 animate-spin text-[#4D6BFE]" />
-            <div className="text-sm font-medium text-white/90">正在启动摄像头...</div>
-            <div className="text-xs text-white/50">如弹出权限请求请点击「允许」</div>
+            <div className="text-sm font-medium text-white/90">{bi('正在启动摄像头...', 'Starting camera...')}</div>
+            <div className="text-xs text-white/50">{bi('如弹出权限请求请点击「允许」', 'Tap "Allow" if prompted for camera access')}</div>
           </div>
         )}
 
@@ -367,7 +385,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
             <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-white/10 text-[#8CA3FF]">
               <ScanLine className="h-8 w-8" />
             </div>
-            <div className="text-base font-semibold text-white">使用拍照或相册识别二维码</div>
+            <div className="text-base font-semibold text-white">{bi('使用拍照或相册识别二维码', 'Scan via Camera Photo or Gallery')}</div>
             <p className="mt-2 max-w-xs text-xs leading-relaxed text-white/65">{camError}</p>
             <button
               type="button"
@@ -375,7 +393,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
               className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-white/12 px-3.5 py-2 text-xs font-medium text-white hover:bg-white/20 active:scale-95"
             >
               <RefreshCw className="h-3.5 w-3.5" />
-              <span>重试开启实时扫码</span>
+              <span>{bi('重试开启实时扫码', 'Retry Live Camera')}</span>
             </button>
           </div>
         )}
@@ -384,7 +402,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
         {decodingImage && (
           <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2.5 bg-black/75 backdrop-blur-sm">
             <Loader2 className="h-7 w-7 animate-spin text-[#4D6BFE]" />
-            <span className="text-sm font-medium text-white">正在识别图片中的二维码...</span>
+            <span className="text-sm font-medium text-white">{bi('正在识别图片中的二维码...', 'Decoding QR code...')}</span>
           </div>
         )}
       </div>
@@ -422,7 +440,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
             className="flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-xs font-semibold text-white shadow-lg shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-50"
           >
             <Camera className="h-4 w-4" />
-            <span>拍照识别二维码</span>
+            <span>{bi('拍照识别二维码', 'Take Photo')}</span>
           </button>
 
           <button
@@ -432,7 +450,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
             className="flex items-center justify-center gap-2 rounded-2xl bg-white/14 py-3 text-xs font-semibold text-white backdrop-blur-md transition hover:bg-white/20 active:scale-[0.98] disabled:opacity-50"
           >
             <ImageIcon className="h-4 w-4" />
-            <span>从相册选图</span>
+            <span>{bi('从相册选图', 'Choose Photo')}</span>
           </button>
         </div>
       </div>

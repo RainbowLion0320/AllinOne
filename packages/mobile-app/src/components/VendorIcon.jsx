@@ -1,5 +1,6 @@
 import React from 'react'
 import { APP_META } from '@allinone/shared'
+import { bi, getCurrentLang, translate } from '../lib/i18n.js'
 
 export const EFFORT_LABELS = {
   off: '关闭',
@@ -12,15 +13,18 @@ export const EFFORT_LABELS = {
   ultra: 'Ultra',
 }
 
-export function formatEffortLabel(effort) {
+export function formatEffortLabel(effort, lang = getCurrentLang()) {
   if (!effort) return ''
-  return EFFORT_LABELS[String(effort).toLowerCase()] || effort
+  const key = String(effort).toLowerCase()
+  const dictKey = `effort.${key}`
+  const val = translate(lang, dictKey)
+  return val === dictKey ? (EFFORT_LABELS[key] || effort) : val
 }
 
-export function formatModelShort(modelId, modelName) {
+export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {
   const raw = String(modelName || modelId || '').trim()
-  if (!raw) return '默认模型'
-  if (raw === 'default' || raw.startsWith('默认模型')) return '默认'
+  if (!raw) return bi(lang, '默认模型', 'Default')
+  if (raw === 'default' || raw.startsWith('默认模型')) return bi(lang, '默认', 'Default')
   return raw
     .replace(/\s*\(Alias\)\s*/gi, '')
     .replace(/^Claude\s+/i, '')

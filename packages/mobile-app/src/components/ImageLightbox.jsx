@@ -12,6 +12,7 @@ import {
   ZoomOut,
 } from 'lucide-react'
 import { buildDownloadUrl, getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
+import { useI18n } from '../lib/i18n.jsx'
 
 /**
  * Sleek inline image preview card rendered inside chat messages.
@@ -24,6 +25,7 @@ export function ChatImageCard({
   onOpen,
   compact = false,
 }) {
+  const { bi } = useI18n()
   const [status, setStatus] = useState('loading') // 'loading' | 'loaded' | 'error'
   const [retryNonce, setRetryNonce] = useState(0)
   const imgRef = useRef(null)
@@ -77,7 +79,7 @@ export function ChatImageCard({
             className="inline-flex items-center gap-1 rounded-lg bg-white px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE] shadow-2xs active:scale-95 dark:bg-[#252936]"
           >
             <RefreshCw className="h-3 w-3" />
-            <span>重试加载</span>
+            <span>{bi('重试加载', 'Retry')}</span>
           </button>
         </div>
       ) : (
@@ -90,7 +92,7 @@ export function ChatImageCard({
             {status === 'loading' && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-slate-100/90 text-xs text-slate-400 dark:bg-[#1B1E27]/90">
                 <Loader2 className="h-5 w-5 animate-spin text-[#4D6BFE]" />
-                <span className="max-w-[85%] truncate">正在加载 {label}...</span>
+                <span className="max-w-[85%] truncate">{bi(`正在加载 ${label}...`, `Loading ${label}...`)}</span>
               </div>
             )}
             <img
@@ -111,7 +113,7 @@ export function ChatImageCard({
             <span className="truncate font-medium">{label}</span>
             <span className="inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium text-[#4D6BFE]">
               <Maximize2 className="h-3 w-3" />
-              <span>查看大图</span>
+              <span>{bi('查看大图', 'View full')}</span>
             </span>
           </div>
         </button>
@@ -161,6 +163,7 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
  * Full-screen zoomable mobile image viewer (supports 1x / 2x / 3x zoom, pan, multi-image nav, & download).
  */
 export function ImageLightbox({ state, onClose }) {
+  const { bi } = useI18n()
   const [index, setIndex] = useState(0)
   const [zoom, setZoom] = useState(1)
 
@@ -209,7 +212,7 @@ export function ImageLightbox({ state, onClose }) {
       >
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold">
-            {current.label || '查看图片'}
+            {current.label || bi('查看图片', 'Image Preview')}
             {total > 1 && <span className="ml-2 text-xs text-white/60">{index + 1}/{total}</span>}
           </div>
           {current.rawPath && (
@@ -221,7 +224,7 @@ export function ImageLightbox({ state, onClose }) {
           <button
             type="button"
             onClick={cycleZoom}
-            title="缩放"
+            title={bi('缩放', 'Zoom')}
             className="inline-flex h-9 items-center gap-1 rounded-xl bg-white/10 px-2.5 text-xs font-medium hover:bg-white/20 active:scale-95"
           >
             {zoom > 1 ? <ZoomOut className="h-4 w-4" /> : <ZoomIn className="h-4 w-4" />}
@@ -234,7 +237,7 @@ export function ImageLightbox({ state, onClose }) {
               download={current.label || 'image.png'}
               target="_blank"
               rel="noreferrer"
-              title="保存图片"
+              title={bi('保存图片', 'Save image')}
               className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 hover:bg-white/20 active:scale-95"
             >
               <Download className="h-4 w-4" />
@@ -244,7 +247,7 @@ export function ImageLightbox({ state, onClose }) {
           <button
             type="button"
             onClick={onClose}
-            aria-label="关闭预览"
+            aria-label={bi('关闭预览', 'Close preview')}
             className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 hover:bg-white/20 active:scale-95"
           >
             <X className="h-5 w-5" />
@@ -283,7 +286,7 @@ export function ImageLightbox({ state, onClose }) {
                 setIndex((i) => (i - 1 + total) % total)
                 setZoom(1)
               }}
-              aria-label="上一张"
+              aria-label={bi('上一张', 'Previous image')}
               className="fixed top-1/2 left-3 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/20 active:scale-95"
             >
               <ChevronLeft className="h-5 w-5" />
@@ -295,7 +298,7 @@ export function ImageLightbox({ state, onClose }) {
                 setIndex((i) => (i + 1) % total)
                 setZoom(1)
               }}
-              aria-label="下一张"
+              aria-label={bi('下一张', 'Next image')}
               className="fixed top-1/2 right-3 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/20 active:scale-95"
             >
               <ChevronRight className="h-5 w-5" />
@@ -306,7 +309,7 @@ export function ImageLightbox({ state, onClose }) {
 
       {/* Bottom hint */}
       <div className="pb-safe py-2 text-center text-[11px] text-white/45">
-        点击图片切换 1x / 2x / 3x 放大 · 放大后可拖动查看细节
+        {bi('点击图片切换 1x / 2x / 3x 放大 · 放大后可拖动查看细节', 'Click image to toggle 1x / 2x / 3x zoom · Drag to pan when zoomed')}
       </div>
     </div>
   )

@@ -23,8 +23,11 @@ import { MarkdownView } from '../lib/markdown.jsx'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
 import { ChatImageGallery } from './ImageLightbox.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { useI18n } from '../lib/i18n.jsx'
+import { bi as biLang } from '../lib/i18n.js'
 
 function ThinkingBlock({ text, streaming }) {
+  const { bi } = useI18n()
   const [open, setOpen] = useState(false)
   if (!text) return null
   return (
@@ -35,7 +38,7 @@ function ThinkingBlock({ text, streaming }) {
         className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-200/80 dark:bg-[#232630] dark:text-slate-300"
       >
         <Brain className="h-3.5 w-3.5 text-[#4D6BFE]" />
-        <span>{streaming ? '深度思考中...' : '已深度思考'}</span>
+        <span>{streaming ? bi('深度思考中...', 'Thinking...') : bi('已深度思考', 'Thought process')}</span>
         {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
       </button>
       {open && (
@@ -48,6 +51,7 @@ function ThinkingBlock({ text, streaming }) {
 }
 
 function ToolCallDetailRow({ tool }) {
+  const { bi } = useI18n()
   const [open, setOpen] = useState(false)
   const isOrchestratorTool = String(tool.name || '').startsWith('allinone_')
 
@@ -80,7 +84,7 @@ function ToolCallDetailRow({ tool }) {
         )}
 
         <span className="shrink-0 font-semibold text-slate-700 dark:text-slate-200">
-          {isOrchestratorTool ? `总控 · ${tool.name.replace('allinone_', '')}` : tool.name}
+          {isOrchestratorTool ? `${bi('总控', 'Dispatch')} · ${tool.name.replace('allinone_', '')}` : tool.name}
         </span>
         <span className="flex-1 truncate font-mono text-[11px] text-slate-500 dark:text-slate-400">
           {inputSummary.slice(0, 80)}
@@ -96,7 +100,7 @@ function ToolCallDetailRow({ tool }) {
         <div className="space-y-2 bg-slate-50/70 px-3 py-2 font-mono text-[11px] dark:bg-[#16181F]/80">
           {inputSummary && (
             <div>
-              <div className="mb-0.5 text-[10px] font-semibold uppercase text-slate-400">参数</div>
+              <div className="mb-0.5 text-[10px] font-semibold uppercase text-slate-400">{bi('参数', 'Input')}</div>
               <pre className="max-h-36 overflow-auto whitespace-pre-wrap text-slate-700 dark:text-slate-300">
                 {typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}
               </pre>
@@ -104,7 +108,7 @@ function ToolCallDetailRow({ tool }) {
           )}
           {tool.output && (
             <div>
-              <div className="mb-0.5 text-[10px] font-semibold uppercase text-slate-400">输出</div>
+              <div className="mb-0.5 text-[10px] font-semibold uppercase text-slate-400">{bi('输出', 'Output')}</div>
               <pre className="max-h-48 overflow-auto whitespace-pre-wrap text-slate-600 dark:text-slate-300">
                 {tool.output}
               </pre>
@@ -116,18 +120,18 @@ function ToolCallDetailRow({ tool }) {
   )
 }
 
-function summarizeToolCounts(tools) {
+function summarizeToolCounts(tools, lang) {
   const counts = new Map()
   for (const t of tools) {
     const raw = String(t.name || 'tool')
     const label = raw.startsWith('allinone_')
-      ? '总控调度'
+      ? biLang(lang, '总控调度', 'dispatch')
       : raw === 'command' || raw === 'Bash' || raw === 'run_command'
-        ? '命令'
+        ? biLang(lang, '命令', 'cmd')
         : raw === 'file_change' || raw === 'Edit' || raw === 'Write' || raw === 'edit_file'
-          ? '文件变更'
+          ? biLang(lang, '文件变更', 'edit')
           : raw === 'web_search' || raw === 'WebSearch'
-            ? '搜索'
+            ? biLang(lang, '搜索', 'search')
             : raw
     counts.set(label, (counts.get(label) || 0) + 1)
   }
@@ -140,6 +144,7 @@ function summarizeToolCounts(tools) {
  * Users can tap to expand individual tool details only when needed.
  */
 function ToolCallsGroup({ tools, totalToolCount = null, streaming = false }) {
+  const { lang, bi } = useI18n()
   const [expanded, setExpanded] = useState(false)
   if (!Array.isArray(tools) || tools.length === 0) return null
 
@@ -147,7 +152,7 @@ function ToolCallsGroup({ tools, totalToolCount = null, streaming = false }) {
   const hasError = tools.some((t) => t.status === 'error')
   const hasOrchestrator = tools.some((t) => String(t.name || '').startsWith('allinone_'))
   const doneCount = tools.filter((t) => t.status !== 'running').length
-  const summaryText = summarizeToolCounts(tools)
+  const summaryText = summarizeToolCounts(tools, lang)
   const displayCount = Math.max(tools.length, Number(totalToolCount || 0))
 
   return (
@@ -173,8 +178,8 @@ function ToolCallsGroup({ tools, totalToolCount = null, streaming = false }) {
 
         <span className="truncate">
           {streaming && runningTool
-            ? `执行 ${runningTool.name} (${doneCount}/${tools.length})`
-            : `${displayCount} 次工具 · ${summaryText}`}
+            ? bi(`执行 ${runningTool.name} (${doneCount}/${tools.length})`, `Running ${runningTool.name} (${doneCount}/${tools.length})`)
+            : bi(`${displayCount} 次工具 · ${summaryText}`, `${displayCount} tool${displayCount === 1 ? '' : 's'} · ${summaryText}`)}
         </span>
 
         {expanded ? (
@@ -317,6 +322,7 @@ export function ChatView({
   imageContext,
   onResolveApproval,
 }) {
+  const { bi, t } = useI18n()
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
   const topSentinelRef = useRef(null)
@@ -635,7 +641,7 @@ export function ChatView({
             <ArrowUp
               className={`h-3.5 w-3.5 transition-transform ${pullPx >= 26 ? 'rotate-0' : 'rotate-180'}`}
             />
-            <span>{pullPx >= 26 ? '松开加载' : '下拉加载更早'}</span>
+            <span>{pullPx >= 26 ? bi('松开加载', 'Release to load') : bi('下拉加载更早', 'Pull down to load earlier')}</span>
           </div>
         )}
 
@@ -645,7 +651,7 @@ export function ChatView({
             {loadingOlder ? (
               <div className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-[11px] font-medium text-slate-500 dark:bg-[#232630] dark:text-slate-300">
                 <Loader2 className="h-3 w-3 animate-spin text-[#4D6BFE]" />
-                <span>加载中...</span>
+                <span>{t('common.loading')}</span>
               </div>
             ) : olderError ? (
               <button
@@ -654,7 +660,7 @@ export function ChatView({
                 className="inline-flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-[11px] font-medium text-rose-600 active:scale-95 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
               >
                 <AlertTriangle className="h-3 w-3" />
-                <span>加载失败，点击重试</span>
+                <span>{bi('加载失败，点击重试', 'Load failed, tap to retry')}</span>
               </button>
             ) : (
               <button
@@ -663,7 +669,7 @@ export function ChatView({
                 className="inline-flex items-center gap-1.5 rounded-full border border-slate-200/80 bg-white px-3 py-1 text-[11px] font-medium text-slate-500 shadow-2xs transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/80 dark:bg-[#20232C] dark:text-slate-300"
               >
                 <History className="h-3 w-3 text-[#4D6BFE]" />
-                <span>加载更早消息</span>
+                <span>{bi('加载更早消息', 'Load earlier messages')}</span>
               </button>
             )}
           </div>
@@ -683,7 +689,7 @@ export function ChatView({
             <span className="flex-1">{session.syncWarning}</span>
             <button
               type="button"
-              aria-label="关闭同步提示"
+              aria-label={bi('关闭同步提示', 'Dismiss sync notice')}
               onClick={() => setDismissedSyncWarnKey(syncWarnKey)}
               className="rounded-lg p-0.5 text-amber-700/70 hover:bg-amber-200/50 hover:text-amber-900 dark:text-amber-300/70 dark:hover:bg-amber-800/40"
             >
@@ -696,7 +702,7 @@ export function ChatView({
         {loadingSession && (
           <div className="flex items-center justify-center py-16 text-xs text-slate-400">
             <Loader2 className="mr-2 h-4 w-4 animate-spin text-[#4D6BFE]" />
-            加载中...
+            {t('common.loading')}
           </div>
         )}
 
@@ -756,7 +762,7 @@ export function ChatView({
                 {/* Explicit Project Directory Selector (prevents blind sends to unknown directories) */}
                 <div className="mt-6 w-full max-w-md">
                   <div className="mb-2 text-[11px] font-medium text-slate-400 dark:text-slate-500">
-                    {selectedWorkspace ? '目标项目' : '请选择目标项目后开始对话'}
+                    {selectedWorkspace ? bi('目标项目', 'Target Project') : bi('请选择目标项目后开始对话', 'Select a project directory to start chatting')}
                   </div>
                   <div className="flex flex-wrap justify-center gap-1.5">
                     {workspaces.slice(0, 6).map((w) => {
@@ -784,7 +790,7 @@ export function ChatView({
                       className="inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:border-[#4D6BFE]/60 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700 dark:text-slate-400"
                     >
                       <FolderPlus className="h-3.5 w-3.5" />
-                      <span>选择目录</span>
+                      <span>{bi('选择目录', 'Choose Folder')}</span>
                     </button>
                   </div>
                   {selectedWorkspace && (
@@ -833,7 +839,7 @@ export function ChatView({
                   ) : (
                     <div className="inline-flex items-center gap-2 py-1 text-sm text-slate-400">
                       <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-                      <span>思考中...</span>
+                      <span>{bi('思考中...', 'Thinking...')}</span>
                     </div>
                   )}
                 </div>
@@ -844,7 +850,7 @@ export function ChatView({
             {!streamingState?.active && session?.syncState?.externalRunning && (
               <div className="flex items-center gap-2 py-1 text-xs text-slate-400 dark:text-slate-500">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
-                <span>桌面端正在运行此对话，进度自动实时同步中...</span>
+                <span>{bi('桌面端正在运行此对话，进度自动实时同步中...', 'Running on Desktop, syncing live progress...')}</span>
               </div>
             )}
 
@@ -875,7 +881,7 @@ export function ChatView({
                 </pre>
                 {apr.cwd && (
                   <div className="mt-1 text-[10.5px] text-amber-800/70 dark:text-amber-300/70">
-                    目录：{apr.cwd}
+                    {bi('目录：', 'Directory: ')}{apr.cwd}
                   </div>
                 )}
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -909,7 +915,7 @@ export function ChatView({
       {showScrollBottom && (
         <button
           type="button"
-          aria-label="回到底部最新消息"
+          aria-label={bi('回到底部最新消息', 'Scroll to latest')}
           onClick={() => {
             userInteractedRef.current = false
             scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })

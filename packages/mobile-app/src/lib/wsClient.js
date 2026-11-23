@@ -1,3 +1,6 @@
+import { bi, getCurrentLang } from './i18n.js'
+
+const L = (zh, en) => bi(getCurrentLang(), zh, en)
 const STORAGE_KEY = 'allinone_dsh_auth_v1'
 
 export function loadSavedAuth() {
@@ -100,7 +103,7 @@ export async function loginAccount(serverUrl, { username, password }) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `登录失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`登录失败 (HTTP ${res.status})`, `Sign in failed (HTTP ${res.status})`))
   }
   return {
     baseUrl: base,
@@ -132,7 +135,7 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `注册失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`注册失败 (HTTP ${res.status})`, `Registration failed (HTTP ${res.status})`))
   }
   return {
     baseUrl: base,
@@ -163,14 +166,14 @@ export async function sendEmailVerificationCode(serverUrl, { purpose, email, inv
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    const err = new Error(data.error || `发送验证码失败 (HTTP ${res.status})`)
+    const err = new Error(data.error || L(`发送验证码失败 (HTTP ${res.status})`, `Failed to send code (HTTP ${res.status})`))
     if (data.retryAfterSec) err.retryAfterSec = Number(data.retryAfterSec)
     throw err
   }
   return {
     cooldownSec: Number(data.cooldownSec) || 60,
     expiresInSec: Number(data.expiresInSec) || 600,
-    message: data.message || '验证码已发送，请查收邮件',
+    message: data.message || L('验证码已发送，请查收邮件', 'Verification code sent. Please check your inbox.'),
   }
 }
 
@@ -189,7 +192,7 @@ export async function bindAccountEmail(baseUrl, token, { email, code }) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `绑定邮箱失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`绑定邮箱失败 (HTTP ${res.status})`, `Failed to link email (HTTP ${res.status})`))
   }
   return data.user
 }
@@ -207,7 +210,7 @@ export async function resetAccountPassword(serverUrl, { email, code, newPassword
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `重置密码失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`重置密码失败 (HTTP ${res.status})`, `Password reset failed (HTTP ${res.status})`))
   }
   return { username: data.username || '' }
 }
@@ -219,7 +222,7 @@ export async function listAccountDevices(baseUrl, token) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `获取电脑列表失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`获取电脑列表失败 (HTTP ${res.status})`, `Failed to load computers (HTTP ${res.status})`))
   }
   return {
     devices: Array.isArray(data.devices) ? data.devices : [],
@@ -239,7 +242,7 @@ export async function renameAccountDevice(baseUrl, token, { deviceId, label }) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `重命名失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`重命名失败 (HTTP ${res.status})`, `Rename failed (HTTP ${res.status})`))
   }
   return Array.isArray(data.devices) ? data.devices : []
 }
@@ -256,7 +259,7 @@ export async function removeAccountDevice(baseUrl, token, { deviceId }) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `解绑失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`解绑失败 (HTTP ${res.status})`, `Unlink failed (HTTP ${res.status})`))
   }
   return Array.isArray(data.devices) ? data.devices : []
 }
@@ -268,7 +271,7 @@ export async function adminListInvites(baseUrl, token) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `获取邀请码失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`获取邀请码失败 (HTTP ${res.status})`, `Failed to load invite codes (HTTP ${res.status})`))
   }
   return {
     invites: Array.isArray(data.invites) ? data.invites : [],
@@ -289,7 +292,7 @@ export async function adminCreateInvites(baseUrl, token, { count = 1, note = '',
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `生成邀请码失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`生成邀请码失败 (HTTP ${res.status})`, `Failed to create invite codes (HTTP ${res.status})`))
   }
   return Array.isArray(data.invites) ? data.invites : []
 }
@@ -306,7 +309,7 @@ export async function adminRevokeInvite(baseUrl, token, { id }) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `作废邀请码失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`作废邀请码失败 (HTTP ${res.status})`, `Failed to revoke invite code (HTTP ${res.status})`))
   }
   return data.invite
 }
@@ -323,7 +326,7 @@ export async function loginToRelay(serverUrl, password) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `连接失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`连接失败 (HTTP ${res.status})`, `Connection failed (HTTP ${res.status})`))
   }
   return {
     baseUrl: base,
@@ -369,7 +372,7 @@ export async function pairWithRelay(serverUrl, { pairCode = '', pairToken = '' }
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `配对失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`配对失败 (HTTP ${res.status})`, `Pairing failed (HTTP ${res.status})`))
   }
   return {
     baseUrl: base,
@@ -432,7 +435,7 @@ export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
       ...(controller ? { signal: controller.signal } : {}),
     })
     if (res.status === 401) {
-      const err = new Error('登录已失效')
+      const err = new Error(L('登录已失效', 'Session expired'))
       err.status = 401
       throw err
     }
@@ -442,7 +445,7 @@ export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
     }
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok || !data.ticket) {
-      throw new Error(data.error || `获取连接票据失败 (HTTP ${res.status})`)
+      throw new Error(data.error || L(`获取连接票据失败 (HTTP ${res.status})`, `Failed to obtain WS ticket (HTTP ${res.status})`))
     }
     return data.ticket
   } finally {
@@ -462,13 +465,13 @@ export async function requestMediaToken(baseUrl, token, timeoutMs = 8000) {
     })
     if (res.status === 404) return { unsupported: true, mediaToken: '', expiresAt: 0 }
     if (res.status === 401) {
-      const err = new Error('登录已失效')
+      const err = new Error(L('登录已失效', 'Session expired'))
       err.status = 401
       throw err
     }
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok || !data.mediaToken) {
-      throw new Error(data.error || `获取媒体令牌失败 (HTTP ${res.status})`)
+      throw new Error(data.error || L(`获取媒体令牌失败 (HTTP ${res.status})`, `Failed to obtain media token (HTTP ${res.status})`))
     }
     return { unsupported: false, mediaToken: data.mediaToken, expiresAt: data.expiresAt || 0 }
   } finally {
@@ -484,7 +487,7 @@ export async function revokeDeviceSessions(baseUrl, token) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || `吊销会话失败 (HTTP ${res.status})`)
+    throw new Error(data.error || L(`吊销会话失败 (HTTP ${res.status})`, `Failed to revoke sessions (HTTP ${res.status})`))
   }
   return data
 }
@@ -551,7 +554,7 @@ export class MobileRelayClient {
     this.stopPing()
     for (const p of this.pending.values()) {
       clearTimeout(p.timer)
-      p.reject(new Error('连接已断开'))
+      p.reject(new Error(L('连接已断开', 'Connection closed')))
     }
     this.pending.clear()
     if (this.ws) {
@@ -634,7 +637,7 @@ export class MobileRelayClient {
         clearTimeout(p.timer)
         this.pending.delete(msg.id)
         if (msg.ok) p.resolve(msg.result)
-        else p.reject(new Error(msg.error?.message || 'RPC 执行失败'))
+        else p.reject(new Error(msg.error?.message || L('RPC 执行失败', 'RPC execution failed')))
         return
       }
 
@@ -706,7 +709,7 @@ export class MobileRelayClient {
   rpc(method, params = {}, timeoutMs = 45_000, options = {}) {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('尚未连接到中转服务器，正在重连...'))
+        reject(new Error(L('尚未连接到中转服务器，正在重连...', 'Not connected to relay server, reconnecting...')))
         return
       }
       const id = `c-${this.reqSeq++}-${Date.now()}`
@@ -716,7 +719,7 @@ export class MobileRelayClient {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return
         this.pending.delete(id)
-        reject(new Error('请求超时，请检查电脑端连接状态'))
+        reject(new Error(L('请求超时，请检查电脑端连接状态', 'Request timed out. Check your computer connection.')))
       }, timeoutMs)
       this.pending.set(id, { resolve, reject, timer })
       this.ws.send(JSON.stringify({
@@ -734,7 +737,7 @@ export class MobileRelayClient {
     const dataBase64 = await new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(String(reader.result || ''))
-      reader.onerror = () => reject(new Error('读取文件失败'))
+      reader.onerror = () => reject(new Error(L('读取文件失败', 'Failed to read file')))
       reader.readAsDataURL(file)
     })
 
@@ -752,7 +755,7 @@ export class MobileRelayClient {
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
-      throw new Error(data.error || '上传失败')
+      throw new Error(data.error || L('上传失败', 'Upload failed'))
     }
     return data.upload
   }

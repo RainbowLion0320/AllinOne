@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { Check, Loader2, Search, Sparkles, X } from 'lucide-react'
 import { VendorBadge, formatEffortLabel } from './VendorIcon.jsx'
+import { useI18n } from '../lib/i18n.jsx'
 
 export function ModelPickerSheet({
   open,
@@ -13,6 +14,7 @@ export function ModelPickerSheet({
   onClose,
   onApply,
 }) {
+  const { lang, bi, t } = useI18n()
   const appMeta = APP_META[app] || APP_META.dsh
   const models = catalog?.models || []
   const providers = catalog?.providers || []
@@ -104,7 +106,7 @@ export function ModelPickerSheet({
           <div className="flex items-center gap-2.5">
             <VendorBadge app={app} size="sm" />
             <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">
-              {appMeta.shortName} 模型
+              {bi(`${appMeta.shortName} 模型`, `${appMeta.shortName} Models`)}
             </h3>
           </div>
           <button
@@ -130,7 +132,7 @@ export function ModelPickerSheet({
                       : 'bg-slate-100 text-slate-600 dark:bg-[#262934] dark:text-slate-300'
                   }`}
                 >
-                  全部 ({models.length})
+                  {t('common.all')} ({models.length})
                 </button>
                 {providers.map((p) => {
                   const cnt = models.filter((m) => m.provider === p.id).length
@@ -160,7 +162,7 @@ export function ModelPickerSheet({
                   type="text"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="搜索模型名称或 ID..."
+                  placeholder={bi('搜索模型名称或 ID...', 'Search model name or ID...')}
                   className="w-full rounded-xl border border-slate-200/80 bg-slate-50 py-1.5 pr-3 pl-8 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#14161C] dark:text-slate-100"
                 />
               </div>
@@ -173,11 +175,11 @@ export function ModelPickerSheet({
           {loading && models.length === 0 ? (
             <div className="flex items-center justify-center gap-2 py-10 text-xs text-slate-400">
               <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-              <span>加载模型中...</span>
+              <span>{bi('加载模型中...', 'Loading models...')}</span>
             </div>
           ) : filteredModels.length === 0 ? (
             <div className="px-4 py-10 text-center text-xs leading-relaxed text-slate-400">
-              {models.length === 0 ? (catalog?.hint || '暂无可用模型') : '没有匹配的模型'}
+              {models.length === 0 ? (catalog?.hint || bi('暂无可用模型', 'No models available')) : bi('没有匹配的模型', 'No matching models')}
             </div>
           ) : (
             <div className="space-y-1">
@@ -190,7 +192,7 @@ export function ModelPickerSheet({
                   (!catalog?.defaultProvider || !m.provider || m.provider === catalog.defaultProvider)
                 const effortHint =
                   m.efforts?.length > 0
-                    ? `${formatEffortLabel(m.efforts[0])}~${formatEffortLabel(m.efforts[m.efforts.length - 1])}`
+                    ? `${formatEffortLabel(m.efforts[0], lang)}~${formatEffortLabel(m.efforts[m.efforts.length - 1], lang)}`
                     : ''
                 const hasSubMeta = Boolean(m.providerName || (m.name && m.name !== m.id) || effortHint)
                 return (
@@ -211,7 +213,7 @@ export function ModelPickerSheet({
                         </span>
                         {isDefault && (
                           <span className="shrink-0 rounded-md bg-[#4D6BFE]/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                            默认
+                            {t('common.default')}
                           </span>
                         )}
                       </div>
@@ -252,7 +254,7 @@ export function ModelPickerSheet({
             <div className="mb-3">
               <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
                 <Sparkles className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>推理强度</span>
+                <span>{bi('推理强度', 'Reasoning Effort')}</span>
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {activeEfforts.map((eff) => {
@@ -268,7 +270,7 @@ export function ModelPickerSheet({
                           : 'border border-slate-200 bg-white text-slate-600 hover:border-[#4D6BFE]/40 dark:border-slate-700 dark:bg-[#222530] dark:text-slate-300'
                       }`}
                     >
-                      {formatEffortLabel(eff)}
+                      {formatEffortLabel(eff, lang)}
                     </button>
                   )
                 })}
@@ -282,7 +284,7 @@ export function ModelPickerSheet({
             disabled={!pickedModel && models.length > 0}
             className="flex w-full items-center justify-center rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-50"
           >
-            确认
+            {t('common.confirm')}
           </button>
         </div>
       </div>
