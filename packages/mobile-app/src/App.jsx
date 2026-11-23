@@ -79,6 +79,8 @@ export function App() {
   const [inviteManagerOpen, setInviteManagerOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
+  const [newChatApp, setNewChatApp] = useState('')
+  const [sidebarFilterApp, setSidebarFilterApp] = useState('all')
   const [selectedDraftApp, setSelectedDraftApp] = useState('')
   const [selectedDraftCwd, setSelectedDraftCwd] = useState('')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
@@ -199,6 +201,23 @@ export function App() {
     }
   }, [])
 
+  const openNewChatModal = useCallback((cwdHint = '', appHint = '') => {
+    const cleanCwd = typeof cwdHint === 'string' ? cwdHint : ''
+    const cleanApp = typeof appHint === 'string' ? appHint : ''
+    const isWritableApp = (id) => Boolean(id && appsStatus.find((a) => a.app === id && a.writable))
+    const fallbackApp =
+      (isWritableApp(activeSessionRef.current?.app) ? activeSessionRef.current.app : '') ||
+      (isWritableApp(selectedDraftApp) ? selectedDraftApp : '') ||
+      ''
+    const resolvedApp =
+      cleanApp ||
+      (sidebarFilterApp !== 'all' ? sidebarFilterApp : '') ||
+      fallbackApp
+    setNewChatCwd(cleanCwd)
+    setNewChatApp(resolvedApp)
+    setNewChatOpen(true)
+  }, [sidebarFilterApp, selectedDraftApp, appsStatus])
+
   // Electron Desktop App integration: live local bridge status + menu shortcuts + keyboard shortcuts
   useEffect(() => {
     if (!desktopApi) return
@@ -212,7 +231,7 @@ export function App() {
     }
     if (typeof desktopApi.onMenuAction === 'function') {
       unsubMenu = desktopApi.onMenuAction((action) => {
-        if (action === 'new-chat') setNewChatOpen(true)
+        if (action === 'new-chat') openNewChatModal(activeSessionRef.current?.cwd || '')
         else if (action === 'devices') setDeviceSwitcherOpen(true)
         else if (action === 'share') setShareOpen(true)
         else if (action === 'invites') setInviteManagerOpen(true)
@@ -223,7 +242,7 @@ export function App() {
       try { unsubStatus?.() } catch {}
       try { unsubMenu?.() } catch {}
     }
-  }, [desktopApi])
+  }, [desktopApi, openNewChatModal])
 
   const hadDesktopAccountRef = useRef(false)
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
@@ -261,7 +280,7 @@ export function App() {
         const k = e.key.toLowerCase()
         if (k === 'n' && activeDevice) {
           e.preventDefault()
-          setNewChatOpen(true)
+          openNewChatModal(activeSessionRef.current?.cwd || selectedDraftCwd || '')
           return
         }
         if (k === 'k' && activeDevice) {
@@ -282,7 +301,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -321,6 +340,7 @@ export function App() {
     setApprovals([])
     setNewChatOpen(false)
     setNewChatCwd('')
+    setNewChatApp('')
     setModelPickerOpen(false)
     setLightboxState(null)
   }, [])
@@ -1334,7 +1354,7 @@ export function App() {
       const explicitCwd = String(selectedDraftCwd || '').trim()
       if (!explicitCwd) {
         showToast('请先选择目标项目目录')
-        setNewChatOpen(true)
+        openNewChatModal('', effectiveDefaultApp)
         return
       }
       try {
@@ -1524,10 +1544,9 @@ export function App() {
         sessions={sessions}
         activeSessionId={activeSession?.id}
         onSelectSession={openSession}
-        onNewChat={(cwdHint = '') => {
-          setNewChatCwd(typeof cwdHint === 'string' ? cwdHint : '')
-          setNewChatOpen(true)
-        }}
+        filterApp={sidebarFilterApp}
+        onFilterAppChange={setSidebarFilterApp}
+        onNewChat={(cwdHint = '', appHint = '') => openNewChatModal(cwdHint, appHint)}
         onRefresh={() => loadWorkspaceData(activeBridgeId)}
         refreshing={refreshing}
         connState={connState}
@@ -1599,10 +1618,7 @@ export function App() {
 
           <button
             type="button"
-            onClick={() => {
-              setNewChatCwd(activeSession?.cwd || selectedDraftCwd || '')
-              setNewChatOpen(true)
-            }}
+            onClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
             aria-label="新建对话"
             className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
@@ -1691,10 +1707,7 @@ export function App() {
           setSelectedDraftCwd(cwdPath)
           if (cwdPath) saveLastWorkspace(cacheScopeRef.current, cwdPath)
         }}
-        onOpenNewChatModal={() => {
-          setNewChatCwd(selectedDraftCwd || '')
-          setNewChatOpen(true)
-        }}
+        onOpenNewChatModal={() => openNewChatModal(selectedDraftCwd || '', effectiveDefaultApp)}
         approvals={approvals}
         imageContext={imageContext}
         onResolveApproval={handleResolveApproval}
@@ -1708,10 +1721,7 @@ export function App() {
         disabled={!bridgeOnline || connState !== 'connected'}
         needsWorkspace={!activeSession && !selectedDraftCwd}
         targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
-        onSwitchAppClick={() => {
-          setNewChatCwd(activeSession?.cwd || selectedDraftCwd || '')
-          setNewChatOpen(true)
-        }}
+        onSwitchAppClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
         onOpenModelPicker={() => {
@@ -1797,9 +1807,11 @@ export function App() {
       <NewChatModal
         open={newChatOpen}
         initialCwd={newChatCwd}
+        initialApp={newChatApp}
         onClose={() => {
           setNewChatOpen(false)
           setNewChatCwd('')
+          setNewChatApp('')
         }}
         workspaces={effectiveWorkspaces}
         appsStatus={appsStatus}

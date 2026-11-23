@@ -147,6 +147,8 @@ export function SidebarDrawer({
   activeSessionId,
   onSelectSession,
   onNewChat,
+  filterApp: controlledFilterApp,
+  onFilterAppChange,
   onRefresh,
   refreshing,
   connState,
@@ -165,7 +167,12 @@ export function SidebarDrawer({
   onOpenDeviceSwitcher,
   onOpenInviteManager,
 }) {
-  const [filterApp, setFilterApp] = useState('all')
+  const [uncontrolledFilterApp, setUncontrolledFilterApp] = useState('all')
+  const filterApp = controlledFilterApp ?? uncontrolledFilterApp
+  const setFilterApp = (next) => {
+    if (typeof onFilterAppChange === 'function') onFilterAppChange(next)
+    else setUncontrolledFilterApp(next)
+  }
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
   const [search, setSearch] = useState('')
   const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
@@ -339,7 +346,7 @@ export function SidebarDrawer({
             type="button"
             onClick={() => {
               onClose()
-              onNewChat()
+              onNewChat('', filterApp !== 'all' ? filterApp : '')
             }}
             className="flex w-full items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
           >
@@ -501,7 +508,7 @@ export function SidebarDrawer({
                           title={`在 ${group.label} 新建对话`}
                           onClick={() => {
                             onClose()
-                            onNewChat(group.cwd)
+                            onNewChat(group.cwd, filterApp !== 'all' ? filterApp : '')
                           }}
                           className="rounded-lg p-1 text-slate-400 hover:bg-slate-200/70 hover:text-[#4D6BFE] dark:hover:bg-slate-700/70"
                         >

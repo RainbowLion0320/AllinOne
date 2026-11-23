@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { APP_LIST, APP_META } from '@allinone/shared'
 import { ChevronRight, FolderOpen, Loader2, SlidersHorizontal, Sparkles, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel } from './VendorIcon.jsx'
@@ -7,6 +7,7 @@ import { ModelPickerSheet } from './ModelPickerSheet.jsx'
 export function NewChatModal({
   open,
   initialCwd = '',
+  initialApp = '',
   onClose,
   workspaces,
   appsStatus,
@@ -22,25 +23,40 @@ export function NewChatModal({
   const [provider, setProvider] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const prevOpenRef = useRef(false)
 
   const appCatalog = modelsCatalog?.[app] || null
   const appModels = appCatalog?.models || []
 
   useEffect(() => {
+    const justOpened = open && !prevOpenRef.current
+    prevOpenRef.current = open
     if (!open) return
-    if (initialCwd) {
-      setCwd(initialCwd)
-    } else if (!cwd && workspaces?.[0]?.path) {
+
+    if (justOpened) {
+      if (initialCwd) {
+        setCwd(initialCwd)
+      } else if (!cwd && workspaces?.[0]?.path) {
+        setCwd(workspaces[0].path)
+      }
+      if (initialApp && APP_LIST.includes(initialApp)) {
+        setApp(initialApp)
+      } else {
+        const curWritable = appsStatus.find((a) => a.app === app && a.writable)
+        if (!curWritable) {
+          const firstWritable = ['dsh', 'codex', 'claude', 'antigravity'].find((id) =>
+            appsStatus.find((a) => a.app === id && a.writable),
+          )
+          if (firstWritable) setApp(firstWritable)
+        }
+      }
+      return
+    }
+
+    if (!cwd && workspaces?.[0]?.path) {
       setCwd(workspaces[0].path)
     }
-    const curWritable = appsStatus.find((a) => a.app === app && a.writable)
-    if (!curWritable) {
-      const firstWritable = ['dsh', 'codex', 'claude', 'antigravity'].find((id) =>
-        appsStatus.find((a) => a.app === id && a.writable),
-      )
-      if (firstWritable) setApp(firstWritable)
-    }
-  }, [open, initialCwd, workspaces, appsStatus])
+  }, [open, initialApp, initialCwd, workspaces, appsStatus, app, cwd])
 
   // Sync default model/provider/effort whenever app switches or catalog arrives
   useEffect(() => {
