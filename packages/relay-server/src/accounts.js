@@ -127,6 +127,8 @@ export function createAccountStore({ filePath }) {
           role: u.role === 'admin' ? 'admin' : 'user',
           tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
           devices: Array.isArray(u.devices) ? u.devices : [],
+          sessions: Array.isArray(u.sessions) ? u.sessions : [],
+          revokedSids: u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {},
         }
         usersById.set(normalized.userId, normalized)
         userIdByLower.set(normalized.usernameLower, normalized.userId)
@@ -351,6 +353,8 @@ export function createAccountStore({ filePath }) {
       invitedBy: isBootstrapAdmin ? 'bootstrap' : matchedInvite?.createdBy || '',
       inviteId: matchedInvite?.id || '',
       devices: [],
+      sessions: [],
+      revokedSids: {},
     }
 
     usersById.set(userId, record)
@@ -428,6 +432,8 @@ export function createAccountStore({ filePath }) {
     record.passwordSalt = salt
     record.passwordHash = hash
     record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    record.sessions = []
+    record.revokedSids = {}
     save()
     return { ok: true, user: sanitizeUser(record) }
   }
@@ -444,6 +450,8 @@ export function createAccountStore({ filePath }) {
     record.passwordSalt = salt
     record.passwordHash = hash
     record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    record.sessions = []
+    record.revokedSids = {}
     save()
     return { ok: true, user: sanitizeUser(record) }
   }
@@ -556,10 +564,131 @@ export function createAccountStore({ filePath }) {
     return Number(record.tokenVersion || 0)
   }
 
+  const SESSION_TTL_MS = 31 * 24 * 60 * 60 * 1000
+  const MAX_USER_SESSIONS = 30
+
+  function pruneUserSessionData(record, now = Date.now()) {
+    if (!Array.isArray(record.sessions)) record.sessions = []
+    if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
+    record.sessions = record.sessions
+      .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !record.revokedSids[s.sid])
+      .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
+      .slice(0, MAX_USER_SESSIONS)
+    for (const [sid, ts] of Object.entries(record.revokedSids)) {
+      if (now - Number(ts || 0) > SESSION_TTL_MS) {
+        delete record.revokedSids[sid]
+      }
+    }
+  }
+
+  function recordUserSession(userId, { sid, deviceName = '', clientKind = 'web', ip = '' } = {}) {
+    const record = usersById.get(userId)
+    const cleanSid = String(sid || '').trim()
+    if (!record || !cleanSid) return null
+    const now = Date.now()
+    pruneUserSessionData(record, now)
+    const cleanName = String(deviceName || '').trim().slice(0, 64)
+    const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
+    const cleanIp = String(ip || '').trim().slice(0, 64)
+    let entry = record.sessions.find((s) => s.sid === cleanSid)
+    if (entry) {
+      if (cleanName) entry.deviceName = cleanName
+      entry.clientKind = cleanKind
+      if (cleanIp) entry.ip = cleanIp
+      entry.lastSeenAt = now
+    } else {
+      entry = {
+        sid: cleanSid,
+        deviceName: cleanName || 'Unknown Device',
+        clientKind: cleanKind,
+        ip: cleanIp,
+        createdAt: now,
+        lastSeenAt: now,
+      }
+      record.sessions.unshift(entry)
+    }
+    pruneUserSessionData(record, now)
+    save()
+    return { ...entry }
+  }
+
+  function touchUserSession(userId, sid, { deviceName = '', clientKind = '', ip = '' } = {}) {
+    const record = usersById.get(userId)
+    const cleanSid = String(sid || '').trim()
+    if (!record || !cleanSid) return false
+    if (record.revokedSids?.[cleanSid]) return false
+    const now = Date.now()
+    if (!Array.isArray(record.sessions)) record.sessions = []
+    let entry = record.sessions.find((s) => s.sid === cleanSid)
+    const cleanName = String(deviceName || '').trim().slice(0, 64)
+    const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' || clientKind === 'web' ? clientKind : ''
+    const cleanIp = String(ip || '').trim().slice(0, 64)
+    if (!entry) {
+      recordUserSession(userId, { sid: cleanSid, deviceName: cleanName, clientKind: cleanKind || 'web', ip: cleanIp })
+      return true
+    }
+    let changed = false
+    if (cleanName && entry.deviceName !== cleanName) {
+      entry.deviceName = cleanName
+      changed = true
+    }
+    if (cleanKind && entry.clientKind !== cleanKind) {
+      entry.clientKind = cleanKind
+      changed = true
+    }
+    if (cleanIp && entry.ip !== cleanIp) {
+      entry.ip = cleanIp
+      changed = true
+    }
+    const stale = now - (Number(entry.lastSeenAt) || 0) > 60_000
+    entry.lastSeenAt = now
+    if (changed || stale) save()
+    return true
+  }
+
+  function listUserSessions(userId) {
+    const record = usersById.get(userId)
+    if (!record) return []
+    const now = Date.now()
+    pruneUserSessionData(record, now)
+    return record.sessions.map((s) => ({
+      sid: s.sid,
+      deviceName: s.deviceName || '',
+      clientKind: s.clientKind || 'web',
+      ip: s.ip || '',
+      createdAt: Number(s.createdAt) || 0,
+      lastSeenAt: Number(s.lastSeenAt) || Number(s.createdAt) || 0,
+    }))
+  }
+
+  function isSessionRevoked(userId, sid) {
+    const record = usersById.get(userId)
+    const cleanSid = String(sid || '').trim()
+    if (!record || !cleanSid) return false
+    return Boolean(record.revokedSids?.[cleanSid])
+  }
+
+  function revokeUserSession(userId, sid) {
+    const record = usersById.get(userId)
+    const cleanSid = String(sid || '').trim()
+    if (!record || !cleanSid) return false
+    if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
+    const now = Date.now()
+    record.revokedSids[cleanSid] = now
+    if (Array.isArray(record.sessions)) {
+      record.sessions = record.sessions.filter((s) => s.sid !== cleanSid)
+    }
+    pruneUserSessionData(record, now)
+    save()
+    return true
+  }
+
   function revokeUserTokens(userId) {
     const record = usersById.get(userId)
     if (!record) return null
     record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    record.sessions = []
+    record.revokedSids = {}
     save()
     return { roomId: record.userId, tokenVersion: record.tokenVersion }
   }
@@ -590,6 +719,11 @@ export function createAccountStore({ filePath }) {
     removeUserDevice,
     getUserById,
     getTokenVersion,
+    recordUserSession,
+    touchUserSession,
+    listUserSessions,
+    isSessionRevoked,
+    revokeUserSession,
     revokeUserTokens,
     listUsers,
   }

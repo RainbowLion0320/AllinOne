@@ -64,6 +64,7 @@ export function SettingsModal({
   emailEnabled = false,
   connState = 'disconnected',
   bridgeOnline = false,
+  onlineClientCount = 0,
   darkMode = false,
   onToggleDark,
   cacheScope = '',
@@ -121,7 +122,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '0.3.8'
+    '0.3.9'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -274,6 +275,17 @@ export function SettingsModal({
                       }`}
                     />
                     <span className="truncate">{serverDisplay || bi('默认服务器', 'Default server')}</span>
+                    {onlineClientCount > 0 && (
+                      <span
+                        className={`shrink-0 ${
+                          onlineClientCount > 1
+                            ? 'font-medium text-amber-600 dark:text-amber-400'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        · {bi(`${onlineClientCount} 终端在线`, `${onlineClientCount} active`)}
+                      </span>
+                    )}
                   </div>
                 </div>
                 {onOpenDeviceSwitcher && (

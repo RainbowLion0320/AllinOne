@@ -82,6 +82,7 @@ export const RPC = Object.freeze({
  */
 export const EVENTS = Object.freeze({
   BRIDGE_STATUS: 'bridge.status',
+  CLIENTS_STATUS: 'clients.status',
   STREAM_START: 'stream.start',
   STREAM_DELTA: 'stream.delta',
   STREAM_THINKING: 'stream.thinking',

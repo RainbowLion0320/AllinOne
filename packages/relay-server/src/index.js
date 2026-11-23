@@ -9,7 +9,7 @@ import { createAuthManager } from './auth.js'
 import { createAccountStore, validateEmail, validatePassword } from './accounts.js'
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
-import { RelayHub } from './hub.js'
+import { RelayHub, parseClientDeviceInfo } from './hub.js'
 import { createRoomStore } from './rooms.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -215,6 +215,10 @@ export function createRelayServer(options = {}) {
       String(roomId || '').startsWith('usr_')
         ? accounts.getTokenVersion(roomId)
         : rooms.getTokenVersion(roomId),
+    isSessionRevoked: (roomId, sid) =>
+      String(roomId || '').startsWith('usr_')
+        ? accounts.isSessionRevoked(roomId, sid)
+        : false,
   })
 
   function getMergedAccountDevices(roomId, liveBridges = null) {
@@ -241,6 +245,111 @@ export function createRelayServer(options = {}) {
     // Online devices first, then most recently seen
     merged.sort((a, b) => Number(b.online) - Number(a.online) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
     return merged
+  }
+
+  function getMergedClientSessions(roomId, { currentSid = '', currentClientId = '' } = {}) {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const isAccount = rid.startsWith('usr_')
+    const liveClients = hub.getClientList(rid)
+    const persisted = isAccount ? accounts.listUserSessions(rid) : []
+    const liveBySid = new Map()
+    const legacyLive = []
+
+    for (const c of liveClients) {
+      if (c.sid) {
+        const arr = liveBySid.get(c.sid) || []
+        arr.push(c)
+        liveBySid.set(c.sid, arr)
+      } else {
+        legacyLive.push(c)
+      }
+    }
+
+    const sessions = []
+    const seenSids = new Set()
+
+    for (const p of persisted) {
+      seenSids.add(p.sid)
+      const conns = liveBySid.get(p.sid) || []
+      const newestConn = conns[0] || null
+      const isCurrent = Boolean(
+        (currentSid && p.sid === currentSid) ||
+        (currentClientId && conns.some((c) => c.clientId === currentClientId)),
+      )
+      sessions.push({
+        sid: p.sid,
+        clientId: newestConn?.clientId || '',
+        clientIds: conns.map((c) => c.clientId),
+        connectionCount: conns.length,
+        deviceName: newestConn?.deviceName || p.deviceName || 'Web Client',
+        clientKind: newestConn?.clientKind || p.clientKind || 'web',
+        ip: newestConn?.ip || p.ip || '',
+        online: conns.length > 0,
+        isCurrent,
+        legacy: false,
+        createdAt: p.createdAt || newestConn?.connectedAt || 0,
+        lastSeenAt: newestConn?.lastSeenAt || p.lastSeenAt || p.createdAt || 0,
+      })
+    }
+
+    // Live clients whose sid wasn't persisted yet (e.g., room/owner mode or restored token)
+    for (const [sid, conns] of liveBySid.entries()) {
+      if (seenSids.has(sid)) continue
+      const newestConn = conns[0]
+      const isCurrent = Boolean(
+        (currentSid && sid === currentSid) ||
+        (currentClientId && conns.some((c) => c.clientId === currentClientId)),
+      )
+      sessions.push({
+        sid,
+        clientId: newestConn.clientId,
+        clientIds: conns.map((c) => c.clientId),
+        connectionCount: conns.length,
+        deviceName: newestConn.deviceName || 'Web Client',
+        clientKind: newestConn.clientKind || 'web',
+        ip: newestConn.ip || '',
+        online: true,
+        isCurrent,
+        legacy: !isAccount,
+        createdAt: newestConn.connectedAt || 0,
+        lastSeenAt: newestConn.lastSeenAt || newestConn.connectedAt || 0,
+      })
+    }
+
+    // Legacy live connections issued before v0.3.9 (no `sid` in JWT)
+    for (const c of legacyLive) {
+      const isCurrent = Boolean(currentClientId && c.clientId === currentClientId)
+      sessions.push({
+        sid: '',
+        clientId: c.clientId,
+        clientIds: [c.clientId],
+        connectionCount: 1,
+        deviceName: c.deviceName || 'Web Client',
+        clientKind: c.clientKind || 'web',
+        ip: c.ip || '',
+        online: true,
+        isCurrent,
+        legacy: true,
+        createdAt: c.connectedAt || 0,
+        lastSeenAt: c.lastSeenAt || c.connectedAt || 0,
+      })
+    }
+
+    sessions.sort(
+      (a, b) =>
+        Number(b.isCurrent) - Number(a.isCurrent) ||
+        Number(b.online) - Number(a.online) ||
+        (b.lastSeenAt || 0) - (a.lastSeenAt || 0),
+    )
+
+    const onlineCount = liveClients.length
+    const onlineDeviceCount = sessions.filter((s) => s.online).length
+    return {
+      sessions,
+      onlineCount,
+      onlineDeviceCount,
+      totalCount: sessions.length,
+    }
   }
 
   const hub = new RelayHub({
@@ -662,12 +771,20 @@ export function createRelayServer(options = {}) {
         }
         auth.clearFailure(ip)
         const user = result.user
+        const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
+        const sid = auth.generateSessionId()
+        accounts.recordUserSession(user.userId, {
+          sid,
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip,
+        })
         const token = auth.signSessionToken(
           user.userId,
-          body.deviceName || 'mobile',
+          devInfo.deviceName,
           user.userId,
           user.tokenVersion,
-          { role: user.role, username: user.username },
+          { role: user.role, username: user.username, sid },
         )
         sendJson(res, 200, {
           ok: true,
@@ -798,12 +915,20 @@ export function createRelayServer(options = {}) {
         }
         auth.clearFailure(ip)
         const { user } = verified
+        const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
+        const sid = auth.generateSessionId()
+        accounts.recordUserSession(user.userId, {
+          sid,
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip,
+        })
         const token = auth.signSessionToken(
           user.userId,
-          body.deviceName || 'mobile',
+          devInfo.deviceName,
           user.userId,
           user.tokenVersion,
-          { role: user.role, username: user.username },
+          { role: user.role, username: user.username, sid },
         )
         const bridges = hub.getBridgeList(user.userId)
         sendJson(res, 200, {
@@ -982,12 +1107,21 @@ export function createRelayServer(options = {}) {
         }
         purgeRoomBridgeImgCache(payload.room)
         hub.disconnectRoomClients(payload.room, 4401, 'Password changed')
+        const ip = getClientIp(req)
+        const devInfo = parseClientDeviceInfo(body.deviceName || payload.dev || '', req.headers['user-agent'] || '', body.clientKind || '')
+        const newSid = auth.generateSessionId()
+        accounts.recordUserSession(changed.user.userId, {
+          sid: newSid,
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip,
+        })
         const freshToken = auth.signSessionToken(
           changed.user.userId,
-          payload.dev || 'mobile',
+          devInfo.deviceName,
           changed.user.userId,
           changed.user.tokenVersion,
-          { role: changed.user.role, username: changed.user.username },
+          { role: changed.user.role, username: changed.user.username, sid: newSid },
         )
         sendJson(res, 200, { ok: true, token: freshToken, user: changed.user })
       } catch {
@@ -1166,8 +1300,174 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
-      const { ticket, expiresAt } = auth.issueWsTicket(payload)
+      let body = {}
+      try {
+        body = await readJsonBody(req, 16 * 1024)
+      } catch {
+        body = {}
+      }
+      const devInfo = parseClientDeviceInfo(
+        body?.deviceName || payload.dev || '',
+        req.headers['user-agent'] || '',
+        body?.clientKind || '',
+      )
+      if (String(payload.room || '').startsWith('usr_') && payload.sid) {
+        accounts.touchUserSession(payload.room, payload.sid, {
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip: getClientIp(req),
+        })
+      }
+      const { ticket, expiresAt } = auth.issueWsTicket(payload, {
+        deviceName: devInfo.deviceName,
+        clientKind: devInfo.clientKind,
+      })
       sendJson(res, 200, { ok: true, ticket, expiresAt })
+      return
+    }
+
+    // List all active & logged-in controlling devices (phones, desktops, browsers) for security auditing
+    if (pathname === '/api/auth/sessions' && req.method === 'GET') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      const currentClientId = String(urlObj.searchParams.get('clientId') || '').trim()
+      const merged = getMergedClientSessions(payload.room, {
+        currentSid: payload.sid || '',
+        currentClientId,
+      })
+      sendJson(res, 200, {
+        ok: true,
+        roomId: payload.room,
+        currentSid: payload.sid || '',
+        ...merged,
+      })
+      return
+    }
+
+    // Kick / revoke a single logged-in client device (by `sid` or live `clientId`)
+    if (pathname === '/api/auth/sessions/revoke' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const targetSid = String(body.sid || '').trim()
+        const targetClientId = String(body.clientId || '').trim()
+        const currentClientId = String(body.currentClientId || '').trim()
+        if (!targetSid && !targetClientId) {
+          sendJson(res, 400, { ok: false, error: '缺少目标会话标识' })
+          return
+        }
+        if ((targetSid && payload.sid && targetSid === payload.sid) || (targetClientId && currentClientId && targetClientId === currentClientId)) {
+          sendJson(res, 400, { ok: false, error: '不能踢出当前本机设备，如需退出请使用退出登录' })
+          return
+        }
+        const isAccount = String(payload.room || '').startsWith('usr_')
+        let revokedPermanent = false
+        if (isAccount && targetSid) {
+          revokedPermanent = accounts.revokeUserSession(payload.room, targetSid)
+        }
+        const kickedConnections = hub.disconnectClient(
+          payload.room,
+          { clientId: targetClientId, sid: targetSid },
+          4401,
+          'Session revoked by user',
+        )
+        const merged = getMergedClientSessions(payload.room, {
+          currentSid: payload.sid || '',
+          currentClientId,
+        })
+        sendJson(res, 200, {
+          ok: true,
+          revokedPermanent,
+          kickedConnections,
+          legacy: !revokedPermanent,
+          ...merged,
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Nuclear security action: revoke EVERY other device/token (including offline & legacy JWTs) while keeping caller logged in with a fresh rotated JWT
+    if (pathname === '/api/auth/sessions/revoke-others' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const currentClientId = String(body.currentClientId || '').trim()
+        const targetRoom = String(payload.room || 'owner').trim() || 'owner'
+        const isAccount = targetRoom.startsWith('usr_')
+        const ip = getClientIp(req)
+        const devInfo = parseClientDeviceInfo(
+          body.deviceName || payload.dev || '',
+          req.headers['user-agent'] || '',
+          body.clientKind || '',
+        )
+        const revoked = isAccount
+          ? accounts.revokeUserTokens(targetRoom)
+          : rooms.revokeRoomTokens(targetRoom)
+        if (!revoked) {
+          sendJson(res, 404, { ok: false, error: '账号或房间不存在' })
+          return
+        }
+        purgeRoomBridgeImgCache(targetRoom)
+        const newSid = auth.generateSessionId()
+        let freshToken = ''
+        if (isAccount) {
+          const acctUser = accounts.getUserById(targetRoom)
+          accounts.recordUserSession(targetRoom, {
+            sid: newSid,
+            deviceName: devInfo.deviceName,
+            clientKind: devInfo.clientKind,
+            ip,
+          })
+          freshToken = auth.signSessionToken(
+            targetRoom,
+            devInfo.deviceName,
+            targetRoom,
+            revoked.tokenVersion,
+            { role: acctUser?.role || payload.role || 'user', username: acctUser?.username || payload.uname || '', sid: newSid },
+          )
+        } else {
+          freshToken = auth.signSessionToken(
+            targetRoom,
+            devInfo.deviceName,
+            targetRoom,
+            revoked.tokenVersion,
+            { role: payload.role || (targetRoom === 'owner' ? 'admin' : 'user'), sid: newSid },
+          )
+        }
+        const kickedConnections = hub.disconnectOtherRoomClients(
+          targetRoom,
+          { keepClientId: currentClientId, newSidForKept: newSid },
+          4401,
+          'Signed out from another device',
+        )
+        const merged = getMergedClientSessions(targetRoom, {
+          currentSid: newSid,
+          currentClientId,
+        })
+        sendJson(res, 200, {
+          ok: true,
+          token: freshToken,
+          sid: newSid,
+          tokenVersion: revoked.tokenVersion,
+          kickedConnections,
+          ...merged,
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
       return
     }
 
@@ -1194,6 +1494,7 @@ export function createRelayServer(options = {}) {
       const acctUser = isAccount ? accounts.getUserById(payload.room) : null
       const roomMeta = isAccount ? null : rooms.getRoomMeta(payload.room)
       const bridges = hub.getBridgeList(payload.room)
+      const clientSessions = getMergedClientSessions(payload.room, { currentSid: payload.sid || '' })
       sendJson(res, 200, {
         ok: true,
         user: payload,
@@ -1206,6 +1507,7 @@ export function createRelayServer(options = {}) {
         label: acctUser ? `@${acctUser.username}` : roomMeta?.label || '',
         ...(isAccount ? { devices: getMergedAccountDevices(payload.room, bridges) } : {}),
         bridges,
+        clientSessions,
       })
       return
     }
@@ -1478,8 +1780,18 @@ export function createRelayServer(options = {}) {
         return
       }
       const lastSeq = Number(urlObj.searchParams.get('lastSeq') || 0)
+      const clientIp = getClientIp(req)
+      const clientUa = String(req.headers['user-agent'] || '')
+      if (String(user?.room || '').startsWith('usr_') && user?.sid) {
+        const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
+        accounts.touchUserSession(user.room, user.sid, {
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip: clientIp,
+        })
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
-        hub.registerClient(ws, user, { lastSeq })
+        hub.registerClient(ws, user, { lastSeq, ip: clientIp, userAgent: clientUa })
       })
       return
     }

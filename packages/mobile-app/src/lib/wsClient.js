@@ -90,15 +90,46 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
   }
 }
 
+export function detectClientDeviceMeta() {
+  if (typeof window !== 'undefined' && window.allinoneDesktop?.isDesktop) {
+    const plat = String(window.allinoneDesktop.platform || '').toLowerCase()
+    const osName = plat === 'darwin' ? 'macOS' : plat === 'win32' ? 'Windows' : 'Linux'
+    return { deviceName: `${osName} Desktop`, clientKind: 'desktop' }
+  }
+  const ua = typeof navigator !== 'undefined' ? String(navigator.userAgent || '') : ''
+  if (typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()) {
+    const isIos = /iPhone|iPad|iPod/i.test(ua)
+    return { deviceName: isIos ? 'iOS App' : 'Android App', clientKind: 'mobile' }
+  }
+  const isIPhone = /iPhone/i.test(ua)
+  const isIPad = /iPad/i.test(ua)
+  const isAndroid = /Android/i.test(ua)
+  const isWindows = /Windows NT/i.test(ua)
+  const isMac = /Macintosh|Mac OS X/i.test(ua)
+  let browser = ''
+  if (/Edg\//i.test(ua)) browser = 'Edge'
+  else if (/Chrome\//i.test(ua) && !/Edg\//i.test(ua)) browser = 'Chrome'
+  else if (/Firefox\//i.test(ua)) browser = 'Firefox'
+  else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = 'Safari'
+  if (isIPhone) return { deviceName: browser ? `iPhone · ${browser}` : 'iPhone', clientKind: 'mobile' }
+  if (isIPad) return { deviceName: browser ? `iPad · ${browser}` : 'iPad', clientKind: 'mobile' }
+  if (isAndroid) return { deviceName: browser ? `Android · ${browser}` : 'Android', clientKind: 'mobile' }
+  if (isWindows) return { deviceName: browser ? `Windows · ${browser}` : 'Windows', clientKind: 'web' }
+  if (isMac) return { deviceName: browser ? `macOS · ${browser}` : 'macOS', clientKind: 'web' }
+  return { deviceName: browser || 'Web Client', clientKind: 'web' }
+}
+
 export async function loginAccount(serverUrl, { username, password }) {
   const base = normalizeBaseUrl(serverUrl)
+  const devMeta = detectClientDeviceMeta()
   const res = await fetch(`${base}/api/account/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       username: String(username || '').trim(),
       password: String(password ?? ''),
-      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+      deviceName: devMeta.deviceName,
+      clientKind: devMeta.clientKind,
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -122,6 +153,7 @@ export async function loginAccount(serverUrl, { username, password }) {
 export async function registerAccount(serverUrl, { username, password, inviteCode, email = '', emailCode = '' }) {
   const base = normalizeBaseUrl(serverUrl)
   const cleanEmail = String(email || '').trim()
+  const devMeta = detectClientDeviceMeta()
   const res = await fetch(`${base}/api/account/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,7 +162,8 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
       password: String(password ?? ''),
       inviteCode: String(inviteCode || '').trim(),
       ...(cleanEmail ? { email: cleanEmail, emailCode: String(emailCode || '').trim() } : {}),
-      deviceName: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 48) : 'mobile',
+      deviceName: devMeta.deviceName,
+      clientKind: devMeta.clientKind,
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -428,10 +461,18 @@ export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
   const base = normalizeBaseUrl(baseUrl)
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  const devMeta = detectClientDeviceMeta()
   try {
     const res = await fetch(`${base}/api/auth/ws-ticket`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        deviceName: devMeta.deviceName,
+        clientKind: devMeta.clientKind,
+      }),
       ...(controller ? { signal: controller.signal } : {}),
     })
     if (res.status === 401) {
@@ -492,6 +533,84 @@ export async function revokeDeviceSessions(baseUrl, token) {
   return data
 }
 
+export async function fetchAuthSessions(baseUrl, token, currentClientId = '') {
+  const base = normalizeBaseUrl(baseUrl)
+  const qs = currentClientId ? `?clientId=${encodeURIComponent(currentClientId)}` : ''
+  const res = await fetch(`${base}/api/auth/sessions${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (res.status === 404) {
+    return { supported: false, sessions: [], onlineCount: 0, onlineDeviceCount: 0, totalCount: 0 }
+  }
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`读取登录终端失败 (HTTP ${res.status})`, `Failed to load active sessions (HTTP ${res.status})`))
+  }
+  return {
+    supported: true,
+    sessions: Array.isArray(data.sessions) ? data.sessions : [],
+    onlineCount: Number(data.onlineCount) || 0,
+    onlineDeviceCount: Number(data.onlineDeviceCount) || 0,
+    totalCount: Number(data.totalCount) || 0,
+    currentSid: String(data.currentSid || ''),
+  }
+}
+
+export async function revokeAuthSession(baseUrl, token, { sid = '', clientId = '', currentClientId = '' } = {}) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/auth/sessions/revoke`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ sid, clientId, currentClientId }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`踢出设备失败 (HTTP ${res.status})`, `Failed to sign out device (HTTP ${res.status})`))
+  }
+  return {
+    sessions: Array.isArray(data.sessions) ? data.sessions : [],
+    onlineCount: Number(data.onlineCount) || 0,
+    onlineDeviceCount: Number(data.onlineDeviceCount) || 0,
+    totalCount: Number(data.totalCount) || 0,
+    revokedPermanent: Boolean(data.revokedPermanent),
+    kickedConnections: Number(data.kickedConnections) || 0,
+    legacy: Boolean(data.legacy),
+  }
+}
+
+export async function revokeOtherAuthSessions(baseUrl, token, currentClientId = '') {
+  const base = normalizeBaseUrl(baseUrl)
+  const devMeta = detectClientDeviceMeta()
+  const res = await fetch(`${base}/api/auth/sessions/revoke-others`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      currentClientId,
+      deviceName: devMeta.deviceName,
+      clientKind: devMeta.clientKind,
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`下线其他设备失败 (HTTP ${res.status})`, `Failed to sign out other devices (HTTP ${res.status})`))
+  }
+  return {
+    token: String(data.token || ''),
+    sid: String(data.sid || ''),
+    kickedConnections: Number(data.kickedConnections) || 0,
+    sessions: Array.isArray(data.sessions) ? data.sessions : [],
+    onlineCount: Number(data.onlineCount) || 0,
+    onlineDeviceCount: Number(data.onlineDeviceCount) || 0,
+    totalCount: Number(data.totalCount) || 0,
+  }
+}
+
 /**
  * Mobile WebSocket RPC + Stream client with automatic reconnect & catch-up replay.
  */
@@ -515,10 +634,17 @@ export class MobileRelayClient {
     this.connectionState = 'disconnected'
     this.bridges = []
     this.devices = null
+    this.clientId = ''
+    this.liveClients = []
+    this.onlineClientCount = 0
   }
 
   setTargetBridgeId(bridgeId) {
     this.targetBridgeId = String(bridgeId || '').trim()
+  }
+
+  updateToken(newToken) {
+    if (newToken) this.token = newToken
   }
 
   onEvent(fn) {
@@ -528,12 +654,26 @@ export class MobileRelayClient {
 
   onStatus(fn) {
     this.statusListeners.add(fn)
-    fn({ state: this.connectionState, bridges: this.bridges, devices: this.devices })
+    fn({
+      state: this.connectionState,
+      bridges: this.bridges,
+      devices: this.devices,
+      clientId: this.clientId,
+      liveClients: this.liveClients,
+      onlineClientCount: this.onlineClientCount,
+    })
     return () => this.statusListeners.delete(fn)
   }
 
   emitStatus() {
-    const snap = { state: this.connectionState, bridges: this.bridges, devices: this.devices }
+    const snap = {
+      state: this.connectionState,
+      bridges: this.bridges,
+      devices: this.devices,
+      clientId: this.clientId,
+      liveClients: this.liveClients,
+      onlineClientCount: this.onlineClientCount,
+    }
     for (const fn of this.statusListeners) {
       try { fn(snap) } catch {}
     }
@@ -625,8 +765,13 @@ export class MobileRelayClient {
 
       if (msg.type === 'hello') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
+        if (msg.clientId) this.clientId = String(msg.clientId)
         this.bridges = msg.bridges || []
         if (Array.isArray(msg.devices)) this.devices = msg.devices
+        if (Array.isArray(msg.clients)) {
+          this.liveClients = msg.clients
+          this.onlineClientCount = Number(msg.onlineClientCount) || msg.clients.length
+        }
         this.emitStatus()
         return
       }
@@ -647,6 +792,12 @@ export class MobileRelayClient {
           if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
           if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
           this.emitStatus()
+        } else if (msg.event === 'clients.status') {
+          if (Array.isArray(msg.payload?.clients)) {
+            this.liveClients = msg.payload.clients
+            this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
+            this.emitStatus()
+          }
         }
         for (const fn of this.eventListeners) {
           try { fn(msg.event, msg.payload, msg) } catch {}

@@ -28,6 +28,7 @@ export function createAuthManager({
   jwtSecret,
   registerInviteCode = '',
   getTokenVersion = null,
+  isSessionRevoked = null,
 }) {
   const signingKey = jwtSecret && jwtSecret.trim().length >= 16
     ? jwtSecret.trim()
@@ -146,21 +147,35 @@ export function createAuthManager({
     return tokenTv === currentTv
   }
 
+  function isSessionActive(payload) {
+    if (!isTokenVersionCurrent(payload)) return false
+    if (payload?.sid && typeof isSessionRevoked === 'function') {
+      if (isSessionRevoked(payload.room, payload.sid)) return false
+    }
+    return true
+  }
+
+  function generateSessionId() {
+    return `s_${randomBytes(8).toString('hex')}`
+  }
+
   function signSessionToken(
     subject = 'owner',
     deviceName = 'mobile',
     roomId = 'owner',
     tokenVersion = 0,
-    { role = '', username = '' } = {},
+    { role = '', username = '', sid = '' } = {},
   ) {
     const room = String(roomId || 'owner').trim() || 'owner'
     const tv = Number.isFinite(Number(tokenVersion)) ? Math.max(0, Math.floor(Number(tokenVersion))) : 0
     const now = Date.now()
     const effectiveRole = role || (room === 'owner' ? 'admin' : 'user')
+    const sessionId = String(sid || '').trim() || generateSessionId()
     return signRawPayload({
       sub: subject,
       room,
       dev: String(deviceName || 'mobile').slice(0, 64),
+      sid: sessionId,
       tv,
       role: effectiveRole,
       ...(username ? { uname: String(username).slice(0, 32) } : {}),
@@ -180,18 +195,20 @@ export function createAuthManager({
     if (!payload) return null
     // Reject media-only tokens or unknown scopes; allow legacy tokens without `scope`
     if (payload.scope && payload.scope !== 'session') return null
-    if (!isTokenVersionCurrent(payload)) return null
+    if (!isSessionActive(payload)) return null
     return payload
   }
 
   function signMediaToken(sessionPayload) {
     const room = String(sessionPayload?.room || 'owner').trim() || 'owner'
     const tv = Number.isFinite(Number(sessionPayload?.tv)) ? Number(sessionPayload.tv) : 0
+    const sid = String(sessionPayload?.sid || '').trim()
     const now = Date.now()
     const exp = now + MEDIA_TOKEN_TTL_MS
     const mediaToken = signRawPayload({
       sub: sessionPayload?.sub || room,
       room,
+      ...(sid ? { sid } : {}),
       tv,
       scope: 'media',
       iat: now,
@@ -205,20 +222,24 @@ export function createAuthManager({
     if (!payload) return null
     // Accept read-only `media` tokens AND session tokens (for backward compatibility)
     if (payload.scope && payload.scope !== 'media' && payload.scope !== 'session') return null
-    if (!isTokenVersionCurrent(payload)) return null
+    if (!isSessionActive(payload)) return null
     return payload
   }
 
-  function issueWsTicket(sessionPayload) {
+  function issueWsTicket(sessionPayload, { deviceName = '', clientKind = '' } = {}) {
     const now = Date.now()
     pruneWsTickets(now)
     const ticket = `tk_${randomBytes(24).toString('hex')}`
     const exp = now + WS_TICKET_TTL_MS
+    const cleanDev = String(deviceName || '').trim().slice(0, 64)
+    const cleanKind = String(clientKind || '').trim().slice(0, 16)
     wsTickets.set(ticket, {
       user: {
         sub: sessionPayload.sub,
         room: sessionPayload.room || 'owner',
-        dev: sessionPayload.dev || 'mobile',
+        dev: cleanDev || sessionPayload.dev || 'mobile',
+        ...(cleanKind ? { kind: cleanKind } : {}),
+        ...(sessionPayload.sid ? { sid: String(sessionPayload.sid) } : {}),
         tv: Number.isFinite(Number(sessionPayload.tv)) ? Number(sessionPayload.tv) : 0,
       },
       exp,
@@ -234,7 +255,7 @@ export function createAuthManager({
     // Strictly single-use: delete immediately on lookup
     wsTickets.delete(clean)
     if (Date.now() > entry.exp) return null
-    if (!isTokenVersionCurrent(entry.user)) return null
+    if (!isSessionActive(entry.user)) return null
     return entry.user
   }
 
@@ -260,6 +281,7 @@ export function createAuthManager({
     recordFailure,
     clearFailure,
     checkRegisterLimit,
+    generateSessionId,
     signSessionToken,
     verifySessionToken,
     isAdminPayload,

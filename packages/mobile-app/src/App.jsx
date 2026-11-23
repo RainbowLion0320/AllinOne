@@ -13,13 +13,16 @@ import {
   MobileRelayClient,
   bindAccountEmail,
   detectDefaultServerUrl,
+  fetchAuthSessions,
   listAccountDevices,
   pairWithRelay,
   probeDeviceStatus,
   removeAccountDevice,
   renameAccountDevice,
   requestMediaToken,
+  revokeAuthSession,
   revokeDeviceSessions,
+  revokeOtherAuthSessions,
   sendEmailVerificationCode,
 } from './lib/wsClient.js'
 import {
@@ -75,6 +78,14 @@ export function App() {
   const [connState, setConnState] = useState('disconnected')
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
+  const [clientSessions, setClientSessions] = useState({
+    supported: true,
+    sessions: [],
+    onlineCount: 0,
+    onlineDeviceCount: 0,
+    totalCount: 0,
+  })
+  const [liveOnlineClientCount, setLiveOnlineClientCount] = useState(0)
   const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
   const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '', unsupported: false })
 
@@ -979,16 +990,17 @@ export function App() {
     })
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, bridges: bList, devices: dList }) => {
+    const unsubStatus = client.onStatus(({ state, bridges: bList, devices: dList, onlineClientCount: occ }) => {
       if (clientRef.current !== client) return
       setConnState(state)
       setBridges(bList || [])
       if (Array.isArray(dList)) setAccountDevices(dList)
+      if (typeof occ === 'number') setLiveOnlineClientCount(occ)
     })
 
     const unsubEvents = client.onEvent((event, payload, rawMsg) => {
       if (clientRef.current !== client) return
-      if (event === EVENTS.BRIDGE_STATUS) return
+      if (event === EVENTS.BRIDGE_STATUS || event === EVENTS.CLIENTS_STATUS) return
 
       // Strictly isolate live events to the currently selected computer bridge
       const evBridgeId = String(rawMsg?.bridgeId || '').trim()
@@ -1197,8 +1209,83 @@ export function App() {
     }
   }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, resetTransientWorkspace, showToast])
 
+  const handleRefreshClientSessions = useCallback(async () => {
+    if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    try {
+      const res = await fetchAuthSessions(
+        activeDevice.baseUrl,
+        activeDevice.token,
+        clientRef.current?.clientId || '',
+      )
+      setClientSessions(res)
+      if (res.supported) {
+        setLiveOnlineClientCount(res.onlineCount)
+      }
+    } catch {}
+  }, [activeDevice?.baseUrl, activeDevice?.token])
+
+  // Auto-refresh detailed client session list whenever live client count changes while modal is open or on connect
+  useEffect(() => {
+    if (!activeDevice?.baseUrl || !activeDevice?.token || connState !== 'connected') return
+    void handleRefreshClientSessions()
+  }, [
+    activeDevice?.baseUrl,
+    activeDevice?.token,
+    connState,
+    liveOnlineClientCount,
+    deviceSwitcherOpen,
+    settingsOpen,
+    handleRefreshClientSessions,
+  ])
+
+  const handleRevokeClientSession = useCallback(
+    async ({ sid = '', clientId = '' } = {}) => {
+      if (!activeDevice?.baseUrl || !activeDevice?.token) return
+      try {
+        const res = await revokeAuthSession(activeDevice.baseUrl, activeDevice.token, {
+          sid,
+          clientId,
+          currentClientId: clientRef.current?.clientId || '',
+        })
+        setClientSessions({ supported: true, ...res })
+        setLiveOnlineClientCount(res.onlineCount)
+        const curLang = getCurrentLang()
+        showToast(
+          res.legacy
+            ? biLang(curLang, '已断开该设备连接（旧凭证请点「下线其他」彻底作废）', 'Disconnected device (use "Sign Out Others" to permanently revoke legacy token)')
+            : biLang(curLang, '已将该设备踢下线', 'Signed out device'),
+        )
+      } catch (err) {
+        showToast(String(err?.message || err))
+      }
+    },
+    [activeDevice?.baseUrl, activeDevice?.token, showToast],
+  )
+
+  const handleRevokeOtherClientSessions = useCallback(async () => {
+    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) return
+    try {
+      const res = await revokeOtherAuthSessions(
+        activeDevice.baseUrl,
+        activeDevice.token,
+        clientRef.current?.clientId || '',
+      )
+      if (res.token) {
+        clientRef.current?.updateToken(res.token)
+        setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { token: res.token }))
+      }
+      setClientSessions({ supported: true, ...res })
+      setLiveOnlineClientCount(res.onlineCount)
+      showToast(biLang(getCurrentLang(), '已下线其他全部登录设备，仅保留本机', 'Signed out all other devices'))
+    } catch (err) {
+      showToast(String(err?.message || err))
+    }
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast])
+
   const handleRefreshAccountDevices = useCallback(async () => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) return
+    if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    void handleRefreshClientSessions()
+    if (!isAccountMode) return
     try {
       const [devRes, meRes] = await Promise.all([
         listAccountDevices(activeDevice.baseUrl, activeDevice.token).catch(() => null),
@@ -1216,7 +1303,7 @@ export function App() {
         )
       }
     } catch {}
-  }, [activeDevice, isAccountMode])
+  }, [activeDevice, isAccountMode, handleRefreshClientSessions])
 
   useEffect(() => {
     if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) {
@@ -1785,6 +1872,8 @@ export function App() {
         activeConnState={connState}
         activeBridges={bridges}
         accountDevices={accountDevices}
+        clientSessions={clientSessions}
+        onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
         isAdmin={isAdmin}
         emailEnabled={serverEmailEnabled}
         desktopBridge={desktopBridge}
@@ -1818,6 +1907,9 @@ export function App() {
         onRenameAccountDevice={handleRenameAccountDevice}
         onRemoveAccountDevice={handleRemoveAccountDevice}
         onRefreshAccountDevices={handleRefreshAccountDevices}
+        onRefreshClientSessions={handleRefreshClientSessions}
+        onRevokeClientSession={handleRevokeClientSession}
+        onRevokeOtherClientSessions={handleRevokeOtherClientSessions}
         onSendBindEmailCode={handleSendBindEmailCode}
         onBindAccountEmail={handleBindAccountEmail}
         onOpenInviteManager={() => setInviteManagerOpen(true)}
@@ -1898,6 +1990,7 @@ export function App() {
         emailEnabled={serverEmailEnabled}
         connState={connState}
         bridgeOnline={bridgeOnline}
+        onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
         darkMode={darkMode}
         onToggleDark={() => setDarkMode((v) => !v)}
         cacheScope={cacheScope}

@@ -5,6 +5,84 @@ const EVENT_BUFFER_SIZE = 200
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
 
 /**
+ * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
+ * Handles both explicit labels from v0.3.9+ clients and raw legacy `Mozilla/5.0 ...` strings.
+ */
+export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind = '') {
+  const dev = String(rawDev || '').trim()
+  const ua = String(userAgent || '').trim()
+  const cleanKind = explicitKind === 'desktop' || explicitKind === 'mobile' || explicitKind === 'web'
+    ? explicitKind
+    : ''
+
+  // If caller already sent a clean explicit label (not raw Mozilla/5.0 UA or generic 'mobile')
+  const looksLikeRawUa = /^Mozilla\//i.test(dev) || /AppleWebKit|Gecko\//i.test(dev)
+  if (dev && !looksLikeRawUa && dev.toLowerCase() !== 'mobile') {
+    let kind = cleanKind
+    if (!kind) {
+      if (/desktop|桌面|electron/i.test(dev)) kind = 'desktop'
+      else if (/android|iphone|ipad|ios|phone|手机/i.test(dev)) kind = 'mobile'
+      else kind = 'web'
+    }
+    return { deviceName: dev.slice(0, 64), clientKind: kind }
+  }
+
+  const probe = `${ua} ${dev}`
+  const isElectron = /Electron\//i.test(probe)
+  const isAndroid = /Android/i.test(probe)
+  const isIPhone = /iPhone/i.test(probe)
+  const isIPad = /iPad/i.test(probe)
+  const isMac = /Macintosh|Mac OS X/i.test(probe)
+  const isWindows = /Windows NT/i.test(probe)
+  const isLinux = /Linux/i.test(probe) && !isAndroid
+
+  let osLabel = ''
+  if (isIPhone) osLabel = 'iPhone'
+  else if (isIPad) osLabel = 'iPad'
+  else if (isAndroid) osLabel = 'Android'
+  else if (isWindows) osLabel = 'Windows'
+  else if (isMac) osLabel = 'macOS'
+  else if (isLinux) osLabel = 'Linux'
+
+  if (isElectron || cleanKind === 'desktop') {
+    return {
+      deviceName: osLabel ? `${osLabel} Desktop` : 'Desktop App',
+      clientKind: 'desktop',
+    }
+  }
+
+  // Android WebView (Capacitor native APK) typically has `; wv)` in UA
+  if (isAndroid && (/; wv\)/i.test(probe) || cleanKind === 'mobile')) {
+    return { deviceName: 'Android App', clientKind: 'mobile' }
+  }
+
+  let browser = ''
+  if (/Edg\//i.test(probe)) browser = 'Edge'
+  else if (/Chrome\//i.test(probe) && !/Edg\//i.test(probe)) browser = 'Chrome'
+  else if (/Firefox\//i.test(probe)) browser = 'Firefox'
+  else if (/Safari\//i.test(probe) && !/Chrome\//i.test(probe)) browser = 'Safari'
+
+  if (isIPhone || isIPad || isAndroid) {
+    return {
+      deviceName: browser ? `${osLabel} · ${browser}` : osLabel,
+      clientKind: 'mobile',
+    }
+  }
+
+  if (osLabel) {
+    return {
+      deviceName: browser ? `${osLabel} · ${browser}` : osLabel,
+      clientKind: cleanKind || 'web',
+    }
+  }
+
+  return {
+    deviceName: dev && !looksLikeRawUa ? dev.slice(0, 64) : 'Web Client',
+    clientKind: cleanKind || 'web',
+  }
+}
+
+/**
  * Strictly room-isolated multi-tenant WebSocket hub connecting:
  *  - PC Bridges (each bound to a single `roomId`: `'owner'` or `'rm_<id>'`)
  *  - Mobile App WebSocket clients (each JWT-bound to a single `roomId`)
@@ -160,25 +238,86 @@ export class RelayHub {
     })
   }
 
-  registerClient(ws, user, { lastSeq = 0 } = {}) {
+  getClientList(roomId = 'owner') {
+    const rid = roomId || 'owner'
+    const out = []
+    for (const [clientId, c] of this.clients.entries()) {
+      if (c.roomId !== rid || c.ws.readyState !== 1) continue
+      out.push({
+        clientId,
+        sid: c.sid || '',
+        deviceName: c.deviceName || 'Web Client',
+        clientKind: c.clientKind || 'web',
+        ip: c.ip || '',
+        connectedAt: c.connectedAt,
+        lastSeenAt: c.lastSeenAt || c.connectedAt,
+        online: true,
+      })
+    }
+    return out.sort((a, b) => (b.connectedAt || 0) - (a.connectedAt || 0))
+  }
+
+  broadcastRoomClients(roomId) {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const clients = this.getClientList(rid)
+    const frame = JSON.stringify({
+      type: 'event',
+      ts: Date.now(),
+      bridgeId: '',
+      event: EVENTS.CLIENTS_STATUS,
+      payload: {
+        onlineCount: clients.length,
+        clients,
+      },
+    })
+    for (const client of this.clients.values()) {
+      if (client.roomId === rid && client.ws.readyState === 1) {
+        try {
+          client.ws.send(frame)
+        } catch {}
+      }
+    }
+  }
+
+  registerClient(ws, user, { lastSeq = 0, ip = '', userAgent = '' } = {}) {
     const clientId = randomUUID()
     const roomId = String(user?.room || 'owner').trim() || 'owner'
-    this.clients.set(clientId, { roomId, ws, user, connectedAt: Date.now() })
-    this.log.info(`[relay] Mobile client connected: ${clientId} (room=${roomId}, dev=${user?.dev || 'mobile'})`)
+    const parsed = parseClientDeviceInfo(user?.dev || '', userAgent, user?.kind || '')
+    const now = Date.now()
+    const entry = {
+      roomId,
+      ws,
+      user,
+      sid: String(user?.sid || '').trim(),
+      deviceName: parsed.deviceName,
+      clientKind: parsed.clientKind,
+      ip: String(ip || '').trim(),
+      connectedAt: now,
+      lastSeenAt: now,
+    }
+    this.clients.set(clientId, entry)
+    this.log.info(`[relay] Mobile client connected: ${clientId} (room=${roomId}, dev=${parsed.deviceName}, ip=${entry.ip || 'unknown'})`)
 
     const evState = this.getRoomEventState(roomId)
 
     const bridges = this.getBridgeList(roomId)
     const devices = this.resolveRoomDevices(roomId, bridges)
+    const clients = this.getClientList(roomId)
     this.sendRaw(ws, {
       type: 'hello',
       clientId,
+      sid: entry.sid,
       roomId,
       seq: evState.seq,
       bridges,
       ...(devices ? { devices } : {}),
+      clients,
+      onlineClientCount: clients.length,
       ts: Date.now(),
     })
+
+    // Notify sibling clients in this room immediately that another controlling client connected
+    this.broadcastRoomClients(roomId)
 
     if (Number.isFinite(lastSeq) && lastSeq > 0 && lastSeq < evState.seq) {
       for (const item of evState.buffer) {
@@ -189,6 +328,7 @@ export class RelayHub {
     }
 
     ws.on('message', (raw) => {
+      entry.lastSeenAt = Date.now()
       let msg
       try {
         msg = JSON.parse(String(raw))
@@ -199,8 +339,11 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
-      this.clients.delete(clientId)
+      const existed = this.clients.delete(clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
+      if (existed) {
+        this.broadcastRoomClients(roomId)
+      }
     })
   }
 
@@ -422,6 +565,74 @@ export class RelayHub {
       entry.ws.close(code, reason)
     } catch {}
     return true
+  }
+
+  disconnectClient(roomId, { clientId = '', sid = '' } = {}, code = 4401, reason = 'Session revoked') {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const targetCid = String(clientId || '').trim()
+    const targetSid = String(sid || '').trim()
+    if (!targetCid && !targetSid) return 0
+    let disconnected = 0
+    const droppedClientIds = new Set()
+    for (const [cid, client] of this.clients.entries()) {
+      if (client.roomId !== rid) continue
+      const matchCid = targetCid && cid === targetCid
+      const matchSid = targetSid && client.sid && client.sid === targetSid
+      if (!matchCid && !matchSid) continue
+      droppedClientIds.add(cid)
+      this.clients.delete(cid)
+      disconnected += 1
+      try {
+        client.ws.close(code, reason)
+      } catch {}
+    }
+    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
+      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
+        clearTimeout(pending.timer)
+        this.pendingRpc.delete(relayReqId)
+      }
+    }
+    if (disconnected > 0) {
+      this.log.info(`[relay] Kicked ${disconnected} client connection(s) in room=${rid}`)
+      this.broadcastRoomClients(rid)
+    }
+    return disconnected
+  }
+
+  disconnectOtherRoomClients(roomId, { keepClientId = '', keepSid = '', newSidForKept = '' } = {}, code = 4401, reason = 'Session revoked') {
+    const rid = String(roomId || 'owner').trim() || 'owner'
+    const keepCid = String(keepClientId || '').trim()
+    const keepSession = String(keepSid || '').trim()
+    let disconnected = 0
+    const droppedClientIds = new Set()
+    for (const [cid, client] of this.clients.entries()) {
+      if (client.roomId !== rid) continue
+      if (keepCid && cid === keepCid) {
+        if (newSidForKept) client.sid = String(newSidForKept)
+        continue
+      }
+      if (keepSession && client.sid && client.sid === keepSession) {
+        if (newSidForKept) client.sid = String(newSidForKept)
+        continue
+      }
+      droppedClientIds.add(cid)
+      this.clients.delete(cid)
+      disconnected += 1
+      try {
+        client.ws.close(code, reason)
+      } catch {}
+    }
+    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
+      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
+        clearTimeout(pending.timer)
+        this.pendingRpc.delete(relayReqId)
+      }
+    }
+    if (disconnected > 0) {
+      this.log.info(`[relay] Kicked ${disconnected} other client(s) in room=${rid}`)
+      this.broadcastRoomClients(rid)
+    }
+    return disconnected
   }
 
   disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {

@@ -1862,7 +1862,169 @@ async function main() {
       // Restore cache to default zh for clean test end
       saveLang('zh', langStorage)
     }
-    console.log('[smoke] 15/15 Bilingual i18n (zh/en detection, persistence & dictionary parity) OK')
+    console.log('[smoke] 15/16 Bilingual i18n (zh/en detection, persistence & dictionary parity) OK')
+
+    // 16. Active controlling devices monitor, live WS push, per-device kick & revoke-others token rotation
+    {
+      const sessRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        clientAccessToken: 'sess-owner-pass',
+        bridgeSecret: 'sess-bridge-sec',
+        roomsFile: join(tmpDir, 'sess-rooms.json'),
+        accountsFile: join(tmpDir, 'sess-accounts.json'),
+        uploadDir: join(tmpDir, 'sess-uploads'),
+      })
+      const { port: sPort } = await sessRelay.start()
+      const sBase = `http://127.0.0.1:${sPort}`
+      const openClientWs = (token, deviceName, clientKind) =>
+        new Promise((resolveWs, rejectWs) => {
+          fetch(`${sBase}/api/auth/ws-ticket`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ deviceName, clientKind }),
+          })
+            .then((r) => r.json())
+            .then((d) => {
+              if (!d.ok || !d.ticket) throw new Error('ws-ticket failed')
+              const ws = new WebSocket(`ws://127.0.0.1:${sPort}/ws/client?ticket=${encodeURIComponent(d.ticket)}`)
+              const events = []
+              let hello = null
+              let closedCode = null
+              ws.on('message', (raw) => {
+                const msg = JSON.parse(String(raw))
+                if (msg.type === 'hello') {
+                  hello = msg
+                  resolveWs({ ws, hello, events, getClosedCode: () => closedCode })
+                } else if (msg.type === 'event') {
+                  events.push(msg)
+                }
+              })
+              ws.on('close', (code) => {
+                closedCode = code
+              })
+              ws.on('error', rejectWs)
+            })
+            .catch(rejectWs)
+        })
+
+      const sockets = []
+      try {
+        // Register bootstrap account (Device A: Windows Desktop)
+        const regRes = await fetch(`${sBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'alice_sec',
+            password: 'Password123!',
+            inviteCode: 'sess-owner-pass',
+            deviceName: 'Windows Desktop',
+            clientKind: 'desktop',
+          }),
+        }).then((r) => r.json())
+        assert.equal(regRes.ok, true)
+        const tokA = regRes.token
+
+        // Login Device B (Android App) and Device C (suspicious browser)
+        const loginB = await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'alice_sec',
+            password: 'Password123!',
+            deviceName: 'Android App',
+            clientKind: 'mobile',
+          }),
+        }).then((r) => r.json())
+        assert.equal(loginB.ok, true)
+        const tokB = loginB.token
+
+        const loginC = await fetch(`${sBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'alice_sec',
+            password: 'Password123!',
+            deviceName: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128.0',
+          }),
+        }).then((r) => r.json())
+        assert.equal(loginC.ok, true)
+        const tokC = loginC.token
+
+        const cliA = await openClientWs(tokA, 'Windows Desktop', 'desktop')
+        sockets.push(cliA.ws)
+        assert.equal(cliA.hello.onlineClientCount, 1)
+
+        const cliB = await openClientWs(tokB, 'Android App', 'mobile')
+        sockets.push(cliB.ws)
+        const cliC = await openClientWs(tokC, 'macOS · Chrome', 'web')
+        sockets.push(cliC.ws)
+        await new Promise((r) => setTimeout(r, 120))
+
+        // Device A must have received live `clients.status` push reaching 3 online clients
+        const livePush = cliA.events.filter((e) => e.event === 'clients.status')
+        assert.ok(livePush.some((e) => e.payload?.onlineCount === 3), 'Device A must receive live 3-client push')
+
+        // GET /api/auth/sessions returns all 3 sessions with clean metadata & isCurrent flag
+        const sessList = await fetch(`${sBase}/api/auth/sessions?clientId=${encodeURIComponent(cliA.hello.clientId)}`, {
+          headers: { Authorization: `Bearer ${tokA}` },
+        }).then((r) => r.json())
+        assert.equal(sessList.ok, true)
+        assert.equal(sessList.onlineCount, 3)
+        assert.equal(sessList.totalCount, 3)
+        assert.equal(sessList.sessions.find((s) => s.isCurrent)?.deviceName, 'Windows Desktop')
+        const sessB = sessList.sessions.find((s) => s.deviceName === 'Android App')
+        assert.ok(sessB?.sid, 'Device B must have a revocable sid')
+
+        // Single-device kick: Device A kicks Device B -> B closes with 4401 & token permanently rejected, A & C remain alive
+        const kickB = await fetch(`${sBase}/api/auth/sessions/revoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokA}` },
+          body: JSON.stringify({ sid: sessB.sid, clientId: sessB.clientId, currentClientId: cliA.hello.clientId }),
+        }).then((r) => r.json())
+        assert.equal(kickB.ok, true)
+        assert.equal(kickB.revokedPermanent, true)
+        assert.equal(kickB.onlineCount, 2)
+        await new Promise((r) => setTimeout(r, 100))
+        assert.equal(cliB.getClosedCode(), 4401, 'Kicked Device B must close with 4401')
+
+        const bAfterKick = await fetch(`${sBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${tokB}` },
+        })
+        assert.equal(bAfterKick.status, 401, 'Revoked Device B token must be permanently rejected')
+
+        // Nuclear kick: Device A revokes all other devices -> C kicked with 4401, old tokA invalidated, freshToken works seamlessly!
+        const kickOthers = await fetch(`${sBase}/api/auth/sessions/revoke-others`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokA}` },
+          body: JSON.stringify({ currentClientId: cliA.hello.clientId, deviceName: 'Windows Desktop', clientKind: 'desktop' }),
+        }).then((r) => r.json())
+        assert.equal(kickOthers.ok, true)
+        assert.ok(kickOthers.token && kickOthers.token !== tokA, 'revoke-others must issue a rotated fresh token')
+        assert.equal(kickOthers.onlineCount, 1)
+        assert.equal(kickOthers.totalCount, 1)
+        await new Promise((r) => setTimeout(r, 100))
+        assert.equal(cliC.getClosedCode(), 4401, 'Device C must be kicked with 4401')
+
+        const cAfterNuke = await fetch(`${sBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${tokC}` },
+        })
+        assert.equal(cAfterNuke.status, 401, 'Device C token must be rejected after revoke-others')
+
+        const aFreshCheck = await fetch(`${sBase}/api/auth/sessions?clientId=${encodeURIComponent(cliA.hello.clientId)}`, {
+          headers: { Authorization: `Bearer ${kickOthers.token}` },
+        }).then((r) => r.json())
+        assert.equal(aFreshCheck.ok, true)
+        assert.equal(aFreshCheck.onlineCount, 1)
+        assert.equal(aFreshCheck.sessions[0]?.isCurrent, true)
+      } finally {
+        for (const ws of sockets) {
+          try { ws.close() } catch {}
+        }
+        await sessRelay.close()
+      }
+    }
+    console.log('[smoke] 16/16 Active controlling devices monitor, live WS push, per-device kick & revoke-others OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

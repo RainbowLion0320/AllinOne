@@ -244,6 +244,13 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
       changed = true
     }
   }
+  if (patch.token !== undefined) {
+    const val = String(patch.token || '').trim()
+    if (val && val !== cur.token) {
+      next.token = val
+      changed = true
+    }
+  }
   if (patch.label !== undefined) {
     const val = String(patch.label || '').trim().slice(0, 64)
     if (val && val !== cur.label) {

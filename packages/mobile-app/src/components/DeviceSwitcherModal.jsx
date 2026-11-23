@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import {
   Check,
   Copy,
+  Globe,
   KeyRound,
   Laptop,
   Loader2,
@@ -12,6 +13,8 @@ import {
   Plus,
   RefreshCw,
   ScanLine,
+  ShieldCheck,
+  Smartphone,
   Terminal,
   Ticket,
   Trash2,
@@ -77,6 +80,27 @@ function formatRelativeSeen(ts, lang) {
   return translate(lang, 'time.daysAgo', { n: Math.floor(diffSec / 86400) })
 }
 
+function formatClientDeviceLabel(name, kind, lang) {
+  const raw = String(name || '').trim()
+  if (lang === 'en') {
+    if (raw) return raw
+    if (kind === 'desktop') return 'Desktop App'
+    if (kind === 'mobile') return 'Mobile App'
+    return 'Web Client'
+  }
+  if (/^Windows Desktop$/i.test(raw)) return 'Windows 桌面端'
+  if (/^macOS Desktop$/i.test(raw)) return 'macOS 桌面端'
+  if (/^Linux Desktop$/i.test(raw)) return 'Linux 桌面端'
+  if (/^Desktop App$/i.test(raw)) return '桌面端'
+  if (/^Android App$/i.test(raw)) return 'Android 客户端'
+  if (/^iOS App$/i.test(raw)) return 'iOS 客户端'
+  if (/^Web Client$/i.test(raw)) return '网页浏览器'
+  if (raw) return raw
+  if (kind === 'desktop') return '桌面端'
+  if (kind === 'mobile') return '手机端'
+  return '网页浏览器'
+}
+
 export function DeviceSwitcherModal({
   open,
   onClose,
@@ -86,6 +110,8 @@ export function DeviceSwitcherModal({
   activeConnState = 'disconnected',
   activeBridges = [],
   accountDevices = [],
+  clientSessions = null,
+  onlineClientCount = 0,
   isAdmin = false,
   emailEnabled = false,
   desktopBridge = null,
@@ -99,6 +125,9 @@ export function DeviceSwitcherModal({
   onRenameAccountDevice,
   onRemoveAccountDevice,
   onRefreshAccountDevices,
+  onRefreshClientSessions = null,
+  onRevokeClientSession = null,
+  onRevokeOtherClientSessions = null,
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
   onOpenInviteManager,
@@ -110,6 +139,9 @@ export function DeviceSwitcherModal({
   const [editDraft, setEditDraft] = useState('')
   const [confirmDeleteId, setConfirmDeleteId] = useState(null)
   const [confirmLogoutAccount, setConfirmLogoutAccount] = useState(false)
+  const [confirmKickOthers, setConfirmKickOthers] = useState(false)
+  const [kickingKey, setKickingKey] = useState('')
+  const [kickingOthers, setKickingOthers] = useState(false)
   const [copiedCmd, setCopiedCmd] = useState('')
   const [showEmailPanel, setShowEmailPanel] = useState(false)
   const [emailDraft, setEmailDraft] = useState('')
@@ -129,9 +161,10 @@ export function DeviceSwitcherModal({
   const runProbeAll = useCallback(async (list) => {
     const targets = (list || []).filter((d) => d.id !== activeDeviceId)
     setProbingAll(true)
-    if (isAccountMode) {
-      await onRefreshAccountDevices?.().catch(() => {})
-    }
+    await Promise.all([
+      isAccountMode ? onRefreshAccountDevices?.().catch(() => {}) : Promise.resolve(),
+      onRefreshClientSessions?.().catch(() => {}),
+    ])
     if (targets.length === 0) {
       setProbingAll(false)
       return
@@ -164,13 +197,15 @@ export function DeviceSwitcherModal({
     } finally {
       setProbingAll(false)
     }
-  }, [activeDeviceId, isAccountMode, onRefreshAccountDevices, onSyncDeviceMeta])
+  }, [activeDeviceId, isAccountMode, onRefreshAccountDevices, onRefreshClientSessions, onSyncDeviceMeta])
 
   useEffect(() => {
     if (!open) {
       setEditingId(null)
       setConfirmDeleteId(null)
       setConfirmLogoutAccount(false)
+      setConfirmKickOthers(false)
+      setKickingKey('')
       setShowEmailPanel(false)
       setEmailDraft('')
       setEmailCodeDraft('')
@@ -266,6 +301,12 @@ export function DeviceSwitcherModal({
 
   const onlineAcctCount = accountDevices.filter((pc) => pc.online).length
   const acctServerBase = activeEntry?.baseUrl || ''
+  const sessionList = Array.isArray(clientSessions?.sessions) ? clientSessions.sessions : []
+  const effectiveOnlineClients = Math.max(
+    Number(onlineClientCount) || 0,
+    Number(clientSessions?.onlineCount) || 0,
+  )
+  const hasOtherSessions = sessionList.some((s) => !s.isCurrent) || effectiveOnlineClients > 1
 
   return (
     <div
@@ -398,9 +439,20 @@ export function DeviceSwitcherModal({
                       ) : emailEnabled ? (
                         <span>{bi('未绑定邮箱', 'No email linked')}</span>
                       ) : null}
-                      {accountDevices.length > 1 && (
+                      {accountDevices.length > 0 && (
                         <span className="shrink-0">
-                          {bi(`${onlineAcctCount}/${accountDevices.length} 在线`, `${onlineAcctCount}/${accountDevices.length} online`)}
+                          {bi(`${onlineAcctCount}/${accountDevices.length} 电脑在线`, `${onlineAcctCount}/${accountDevices.length} PCs`)}
+                        </span>
+                      )}
+                      {effectiveOnlineClients > 0 && (
+                        <span
+                          className={`shrink-0 ${
+                            effectiveOnlineClients > 1
+                              ? 'font-medium text-amber-600 dark:text-amber-400'
+                              : 'text-emerald-600 dark:text-emerald-400'
+                          }`}
+                        >
+                          {bi(`${effectiveOnlineClients} 终端在线`, `${effectiveOnlineClients} active`)}
                         </span>
                       )}
                     </div>
@@ -788,6 +840,156 @@ export function DeviceSwitcherModal({
                   )
                 })
               )}
+            </div>
+          )}
+
+          {/* Signed-in Controlling / Monitoring Clients Security Audit Section */}
+          {clientSessions?.supported !== false && (sessionList.length > 0 || effectiveOnlineClients > 0) && (
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between gap-2 px-1">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
+                  <ShieldCheck className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                  <span>{bi('已登录终端', 'Signed-in Devices')}</span>
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                      effectiveOnlineClients > 1
+                        ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                        : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                    }`}
+                  >
+                    {bi(`${effectiveOnlineClients} 在线`, `${effectiveOnlineClients} online`)}
+                  </span>
+                </div>
+                {hasOtherSessions && onRevokeOtherClientSessions && (
+                  <button
+                    type="button"
+                    disabled={kickingOthers}
+                    onClick={() => setConfirmKickOthers((v) => !v)}
+                    className="rounded-lg px-2 py-0.5 text-[11px] font-medium text-rose-500 hover:bg-rose-50 disabled:opacity-50 dark:hover:bg-rose-950/40"
+                  >
+                    {bi('下线其他', 'Sign Out Others')}
+                  </button>
+                )}
+              </div>
+
+              {confirmKickOthers && (
+                <div className="flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
+                  <span>{bi('下线除本机外的所有终端并作废旧凭证？', 'Sign out all other devices & revoke their tokens?')}</span>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmKickOthers(false)}
+                      className="rounded-lg bg-white px-2 py-1 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                    >
+                      {t('common.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={kickingOthers}
+                      onClick={async () => {
+                        setKickingOthers(true)
+                        try {
+                          await onRevokeOtherClientSessions?.()
+                          setConfirmKickOthers(false)
+                        } finally {
+                          setKickingOthers(false)
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
+                    >
+                      {kickingOthers && <Loader2 className="h-3 w-3 animate-spin" />}
+                      <span>{bi('确认下线', 'Confirm')}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#171920]">
+                {sessionList.map((s, idx) => {
+                  const rowKey = s.sid || s.clientId || `sess-${idx}`
+                  const isKicking = kickingKey === rowKey
+                  const IconComp =
+                    s.clientKind === 'desktop'
+                      ? Laptop
+                      : s.clientKind === 'mobile'
+                        ? Smartphone
+                        : Globe
+                  return (
+                    <div key={rowKey} className="flex items-center justify-between gap-2.5 px-3 py-2.5">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <div
+                          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${
+                            s.isCurrent
+                              ? 'bg-[#4D6BFE]/14 text-[#4D6BFE]'
+                              : s.online
+                                ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                                : 'bg-slate-100 text-slate-400 dark:bg-slate-800'
+                          }`}
+                        >
+                          <IconComp className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
+                              {formatClientDeviceLabel(s.deviceName, s.clientKind, lang)}
+                            </span>
+                            {s.isCurrent && (
+                              <span className="shrink-0 rounded-md bg-[#4D6BFE]/14 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE]">
+                                {bi('本机', 'This device')}
+                              </span>
+                            )}
+                            {s.connectionCount > 1 && (
+                              <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                                {bi(`${s.connectionCount} 窗口`, `${s.connectionCount} tabs`)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
+                            <span
+                              className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                                s.online ? 'bg-emerald-500' : 'bg-slate-400'
+                              }`}
+                            />
+                            <span>
+                              {s.online
+                                ? t('common.online')
+                                : s.lastSeenAt
+                                  ? `${t('common.offline')} · ${formatRelativeSeen(s.lastSeenAt, lang)}`
+                                  : t('common.offline')}
+                            </span>
+                            {s.ip && (
+                              <>
+                                <span>·</span>
+                                <span className="truncate font-mono text-[10px]">{s.ip}</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {!s.isCurrent && onRevokeClientSession && (
+                        <button
+                          type="button"
+                          disabled={isKicking}
+                          onClick={async () => {
+                            setKickingKey(rowKey)
+                            try {
+                              await onRevokeClientSession({ sid: s.sid || '', clientId: s.clientId || '' })
+                            } finally {
+                              setKickingKey('')
+                            }
+                          }}
+                          title={bi('踢出此设备', 'Sign out this device')}
+                          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-500 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50 dark:border-slate-700 dark:text-slate-400 dark:hover:border-rose-900/60 dark:hover:bg-rose-950/40 dark:hover:text-rose-300"
+                        >
+                          {isKicking ? <Loader2 className="h-3 w-3 animate-spin" /> : <LogOut className="h-3 w-3" />}
+                          <span>{bi('踢下线', 'Kick')}</span>
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           )}
 
