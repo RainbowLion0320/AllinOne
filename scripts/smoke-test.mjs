@@ -56,6 +56,7 @@ import {
 } from '../packages/mobile-app/src/lib/draftStore.js'
 import {
   DesktopUpdater,
+  buildWindowsUpdateScripts,
   compareSemver,
   pickReleaseAsset,
 } from '../packages/desktop-app/src/updater.js'
@@ -1665,6 +1666,20 @@ async function main() {
       ]
       assert.equal(pickReleaseAsset(sampleAssets, 'win32', 'x64')?.name, 'All.in.One.Setup.0.3.4.exe')
       assert.equal(pickReleaseAsset(sampleAssets, 'darwin', 'arm64')?.name, 'All.in.One-0.3.4-arm64.dmg')
+
+      // Verify Windows silent updater scripts use WScript (SW_HIDE=0) + PowerShell, never cmd/tasklist/find
+      const winScripts = buildWindowsUpdateScripts({
+        installerPath: 'C:\\Users\\张三\\AppData\\Local\\Temp\\All.in.One.Setup.0.3.7.exe',
+        exePath: 'C:\\Users\\张三\\AppData\\Local\\Programs\\all-in-one\\All in One.exe',
+        pid: 12345,
+        isPackaged: true,
+        logPath: 'C:\\Users\\张三\\AppData\\Local\\Temp\\last-update.log',
+        ps1Path: 'C:\\Users\\张三\\AppData\\Local\\Temp\\apply-update.ps1',
+      })
+      assert.ok(winScripts.vbsScript.includes('sh.Run cmd, 0, True'), 'VBScript wrapper must run PowerShell hidden (SW_HIDE=0)')
+      assert.ok(winScripts.psScript.includes('Get-Process -Id $oldPid'), 'PowerShell helper must wait via Get-Process')
+      assert.ok(winScripts.psScript.includes('ArgumentList "/S"'), 'PowerShell helper must invoke NSIS silent /S')
+      assert.equal(winScripts.psScript.includes('tasklist'), false, 'Must not use console tasklist/find')
 
       const fakePayload = Buffer.alloc(64 * 1024, 0x5a)
       const validSha = createHash('sha256').update(fakePayload).digest('hex')

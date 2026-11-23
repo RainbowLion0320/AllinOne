@@ -129,7 +129,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '0.3.6'
+    '0.3.7'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`

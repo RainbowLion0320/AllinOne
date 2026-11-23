@@ -133,6 +133,69 @@ function isWritableDir(dirPath) {
   }
 }
 
+export function buildWindowsUpdateScripts({
+  installerPath,
+  exePath,
+  pid = 0,
+  isPackaged = false,
+  logPath = '',
+  ps1Path = '',
+}) {
+  const safePid = Number(pid) || 0
+  const escPs = (s) => String(s || '').replace(/'/g, "''")
+  const escVbs = (s) => String(s || '').replace(/"/g, '""')
+  const resolvedInstaller = resolve(installerPath)
+  const resolvedExe = resolve(exePath)
+  const resolvedLog = logPath ? resolve(logPath) : ''
+
+  const psScript = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$oldPid = ${safePid}`,
+    `$installer = '${escPs(resolvedInstaller)}'`,
+    `$exePath = '${escPs(resolvedExe)}'`,
+    `$relaunch = ${isPackaged ? 1 : 0}`,
+    `$logPath = '${escPs(resolvedLog)}'`,
+    'function Write-UpdLog([string]$msg) {',
+    '  if (-not $logPath) { return }',
+    '  try { Add-Content -LiteralPath $logPath -Value ("[" + (Get-Date -Format "o") + "] " + $msg) -Encoding UTF8 } catch {}',
+    '}',
+    'Write-UpdLog ("Waiting for PID " + $oldPid)',
+    'for ($i = 0; $i -lt 60; $i++) {',
+    '  $mainAlive = if ($oldPid -gt 0) { Get-Process -Id $oldPid -ErrorAction SilentlyContinue } else { $null }',
+    '  $sameExe = if ($relaunch -eq 1 -and $exePath) {',
+    '    Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }',
+    '  } else { $null }',
+    '  if (-not $mainAlive -and -not $sameExe) { break }',
+    '  Start-Sleep -Milliseconds 500',
+    '}',
+    'Start-Sleep -Milliseconds 800',
+    'Write-UpdLog ("Running silent NSIS installer: " + $installer)',
+    '$proc = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru -WindowStyle Hidden',
+    '$exitCode = if ($null -ne $proc) { $proc.ExitCode } else { -1 }',
+    'Write-UpdLog ("Installer exited with code " + $exitCode)',
+    'if ($exitCode -ne 0) {',
+    '  Start-Process -FilePath $installer',
+    '} elseif ($relaunch -eq 1 -and $exePath -and (Test-Path -LiteralPath $exePath)) {',
+    '  Start-Sleep -Milliseconds 800',
+    '  Write-UpdLog ("Relaunching: " + $exePath)',
+    '  Start-Process -FilePath $exePath',
+    '}',
+    'if ($PSCommandPath) { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }',
+  ].join('\r\n')
+
+  const vbsScript = [
+    'Set sh = CreateObject("WScript.Shell")',
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    `cmd = "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & "${escVbs(ps1Path)}" & """"`,
+    'sh.Run cmd, 0, True',
+    'On Error Resume Next',
+    `fso.DeleteFile "${escVbs(ps1Path)}", True`,
+    'fso.DeleteFile WScript.ScriptFullName, True',
+  ].join('\r\n')
+
+  return { psScript, vbsScript }
+}
+
 export class DesktopUpdater extends EventEmitter {
   constructor({
     currentVersion = '0.0.0',
@@ -490,43 +553,52 @@ export class DesktopUpdater extends EventEmitter {
     this.setState({ status: 'installing', error: '' })
 
     if (this.platform === 'win32') {
-      const helperPath = join(this.downloadDir, `apply-update-${Date.now()}.cmd`)
-      const safeInstaller = resolve(installerPath).replace(/"/g, '')
-      const safeExe = resolve(exePath).replace(/"/g, '')
-      const safePid = Number(pid) || 0
-      const script = [
-        '@echo off',
-        'chcp 65001 >nul',
-        'set /a tries=0',
-        ':waitloop',
-        `tasklist /FI "PID eq ${safePid}" /NH /FO CSV 2>NUL | find """${safePid}""" >NUL`,
-        'if not errorlevel 1 (',
-        '  set /a tries+=1',
-        '  if %tries% LSS 30 (',
-        '    timeout /t 1 /nobreak >nul',
-        '    goto waitloop',
-        '  )',
-        ')',
-        'timeout /t 2 /nobreak >nul',
-        `"${safeInstaller}" /S`,
-        'if errorlevel 1 (',
-        `  start "" "${safeInstaller}"`,
-        '  del "%~f0" >nul 2>&1',
-        '  exit /b 0',
-        ')',
-        'timeout /t 1 /nobreak >nul',
-        ...(isPackaged
-          ? [`if exist "${safeExe}" start "" "${safeExe}"`]
-          : []),
-        'del "%~f0" >nul 2>&1',
-      ].join('\r\n')
-      writeFileSync(helperPath, script, 'utf8')
-      const child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', helperPath], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
+      mkdirSync(this.downloadDir, { recursive: true })
+      const stamp = Date.now()
+      const ps1Path = join(this.downloadDir, `apply-update-${stamp}.ps1`)
+      const vbsPath = join(this.downloadDir, `apply-update-${stamp}.vbs`)
+      const logPath = join(this.downloadDir, 'last-update.log')
+      const { psScript, vbsScript } = buildWindowsUpdateScripts({
+        installerPath,
+        exePath,
+        pid,
+        isPackaged,
+        logPath,
+        ps1Path,
       })
-      child.unref()
+
+      // UTF-8 BOM for PowerShell 5.1 Unicode paths; UTF-16LE BOM for VBScript Unicode paths
+      writeFileSync(ps1Path, `\uFEFF${psScript}`, 'utf8')
+      const wscriptExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe')
+
+      if (existsSync(wscriptExe)) {
+        writeFileSync(vbsPath, `\uFEFF${vbsScript}`, 'utf16le')
+        const child = spawn(wscriptExe, ['//B', '//Nologo', vbsPath], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+        child.unref()
+      } else {
+        const psExe = join(
+          process.env.SystemRoot || 'C:\\Windows',
+          'System32',
+          'WindowsPowerShell',
+          'v1.0',
+          'powershell.exe',
+        )
+        const child = spawn(
+          existsSync(psExe) ? psExe : 'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ps1Path],
+          {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true,
+          },
+        )
+        child.unref()
+      }
+
       if (typeof onQuit === 'function') await onQuit()
       return this.getState()
     }
