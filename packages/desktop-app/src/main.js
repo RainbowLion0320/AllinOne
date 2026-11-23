@@ -266,6 +266,7 @@ function refreshTrayMenu() {
     { label: '打开 All in One', click: () => showMainWindow() },
     { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
     { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
+    { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
     { type: 'separator' },
     {
       label: st.enabled ? '暂停本机远程桥接' : '开启本机远程桥接',
@@ -316,6 +317,8 @@ function buildAppMenu() {
             submenu: [
               { role: 'about', label: '关于 All in One' },
               { type: 'separator' },
+              { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
+              { type: 'separator' },
               { role: 'hide', label: '隐藏 All in One' },
               { role: 'hideOthers', label: '隐藏其他' },
               { role: 'unhide', label: '显示全部' },
@@ -337,6 +340,7 @@ function buildAppMenu() {
       submenu: [
         { label: '新建对话', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new-chat') },
         { label: '切换电脑', accelerator: 'CmdOrCtrl+K', click: () => sendMenuAction('devices') },
+        { label: '设置...', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
         { type: 'separator' },
         isMac ? { role: 'close', label: '关闭窗口' } : { role: 'quit', label: '退出' },
       ],

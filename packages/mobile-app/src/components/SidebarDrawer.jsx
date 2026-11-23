@@ -7,20 +7,15 @@ import {
   Clock,
   Folder,
   FolderOpen,
-  HardDrive,
   Monitor,
-  Moon,
   Plus,
   RefreshCw,
   Search,
-  Share2,
-  Sun,
-  Ticket,
-  Trash2,
+  Settings,
+  User,
   X,
 } from 'lucide-react'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
-import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
 
 const FILTER_TABS = [
   { id: 'all', label: '全部', color: '#4D6BFE' },
@@ -160,12 +155,8 @@ export function SidebarDrawer({
   username = '',
   isAdmin = false,
   isMacDesktop = false,
-  cacheScope = '',
-  darkMode,
-  onToggleDark,
-  onOpenShare,
+  onOpenSettings,
   onOpenDeviceSwitcher,
-  onOpenInviteManager,
 }) {
   const [uncontrolledFilterApp, setUncontrolledFilterApp] = useState('all')
   const filterApp = controlledFilterApp ?? uncontrolledFilterApp
@@ -175,26 +166,12 @@ export function SidebarDrawer({
   }
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
   const [search, setSearch] = useState('')
-  const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
-  const [cacheClearedHint, setCacheClearedHint] = useState(false)
   // Map of projectKey -> boolean (explicitly expanded or collapsed by user)
   const [expandedMap, setExpandedMap] = useState({})
 
   useEffect(() => {
     try { localStorage.setItem('allinone_group_mode', groupMode) } catch {}
   }, [groupMode])
-
-  useEffect(() => {
-    if (!open) return
-    getSessionCacheStats(cacheScope).then(setCacheStats).catch(() => {})
-  }, [open, sessions.length, cacheScope])
-
-  const handleClearCache = async () => {
-    await clearSessionCache(cacheScope)
-    setCacheStats({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
-    setCacheClearedHint(true)
-    setTimeout(() => setCacheClearedHint(false), 1800)
-  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -267,11 +244,6 @@ export function SidebarDrawer({
               <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
                 All in One
               </div>
-              {username && (
-                <div className="truncate text-[11px] text-slate-400">
-                  @{username}
-                </div>
-              )}
             </div>
           </div>
 
@@ -562,70 +534,37 @@ export function SidebarDrawer({
           )}
         </div>
 
-        {/* Footer controls */}
-        <div className="pb-safe border-t border-slate-200/80 px-4 pt-2.5 dark:border-slate-800">
-          {/* Show cache bar only when cached data exists */}
-          {(cacheStats.sessionCount > 0 || cacheClearedHint) && (
-            <div className="mb-2 flex items-center justify-between rounded-xl bg-slate-100/80 px-2.5 py-1.5 text-[11px] text-slate-500 dark:bg-[#232630] dark:text-slate-400">
-              <div className="flex min-w-0 items-center gap-1.5">
-                <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                <span className="truncate">
-                  {cacheClearedHint
-                    ? '已清空缓存'
-                    : `缓存 ${cacheStats.sessionCount} · ${formatBytesCompact(cacheStats.totalBytes)}`}
+        {/* Minimal single-row footer: User profile & Settings */}
+        <div className="pb-safe border-t border-slate-200/80 px-3 pt-2 pb-2 dark:border-slate-800">
+          <button
+            type="button"
+            onClick={() => {
+              onClose()
+              onOpenSettings?.()
+            }}
+            aria-label="打开设置"
+            className="flex w-full items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
+          >
+            <div className="flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
+              {username ? username.slice(0, 1).toUpperCase() : <User className="h-3.5 w-3.5" />}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
+                  {username ? `@${username}` : activeDeviceName || '设置'}
                 </span>
+                {isAdmin && (
+                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
+                    管理员
+                  </span>
+                )}
               </div>
-              {cacheStats.sessionCount > 0 && (
-                <button
-                  type="button"
-                  onClick={handleClearCache}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-200/80 hover:text-rose-500 dark:text-slate-300 dark:hover:bg-slate-700/70"
-                >
-                  <Trash2 className="h-3 w-3" />
-                  <span>清理</span>
-                </button>
-              )}
+              <div className="text-[10.5px] text-slate-400">
+                账号、主题、缓存与关于
+              </div>
             </div>
-          )}
-
-          <div className="flex items-center justify-between gap-1">
-            <button
-              type="button"
-              onClick={onToggleDark}
-              className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              {darkMode ? <Sun className="h-4 w-4 text-amber-400" /> : <Moon className="h-4 w-4" />}
-              <span>{darkMode ? '浅色' : '深色'}</span>
-            </button>
-
-            <div className="flex items-center gap-1">
-              {isAdmin && onOpenInviteManager && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose()
-                    onOpenInviteManager()
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-                >
-                  <Ticket className="h-3.5 w-3.5" />
-                  <span>邀请码</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => {
-                  onClose()
-                  onOpenShare?.()
-                }}
-                className="inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
-              >
-                <Share2 className="h-3.5 w-3.5" />
-                <span>分享</span>
-              </button>
-            </div>
-          </div>
+            <Settings className="h-4 w-4 shrink-0 text-slate-400" />
+          </button>
         </div>
       </aside>
     </>

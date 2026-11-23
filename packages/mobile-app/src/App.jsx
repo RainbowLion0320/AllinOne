@@ -59,6 +59,7 @@ import { ImageLightbox } from './components/ImageLightbox.jsx'
 import { ShareModal } from './components/ShareModal.jsx'
 import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
 import { InviteManagerModal } from './components/InviteManagerModal.jsx'
+import { SettingsModal } from './components/SettingsModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 
 export function App() {
@@ -85,6 +86,7 @@ export function App() {
   const [selectedDraftCwd, setSelectedDraftCwd] = useState('')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [lightboxState, setLightboxState] = useState(null)
 
   const [appsStatus, setAppsStatus] = useState([])
@@ -233,6 +235,7 @@ export function App() {
       unsubMenu = desktopApi.onMenuAction((action) => {
         if (action === 'new-chat') openNewChatModal(activeSessionRef.current?.cwd || '')
         else if (action === 'devices') setDeviceSwitcherOpen(true)
+        else if (action === 'settings') setSettingsOpen(true)
         else if (action === 'share') setShareOpen(true)
         else if (action === 'invites') setInviteManagerOpen(true)
         else if (action === 'toggle-dark') setDarkMode((v) => !v)
@@ -288,11 +291,17 @@ export function App() {
           setDeviceSwitcherOpen((v) => !v)
           return
         }
+        if (k === ',' && activeDevice) {
+          e.preventDefault()
+          setSettingsOpen((v) => !v)
+          return
+        }
       }
       if (e.key === 'Escape') {
         if (lightboxState) setLightboxState(null)
         else if (modelPickerOpen) setModelPickerOpen(false)
         else if (newChatOpen) setNewChatOpen(false)
+        else if (settingsOpen) setSettingsOpen(false)
         else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
         else if (inviteManagerOpen) setInviteManagerOpen(false)
         else if (shareOpen) setShareOpen(false)
@@ -301,7 +310,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, modelPickerOpen, newChatOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -1558,12 +1567,8 @@ export function App() {
         username={activeDevice?.username || ''}
         isAdmin={isAdmin}
         isMacDesktop={isMacDesktop}
-        cacheScope={cacheScope}
-        darkMode={darkMode}
-        onToggleDark={() => setDarkMode((v) => !v)}
-        onOpenShare={() => setShareOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
-        onOpenInviteManager={() => setInviteManagerOpen(true)}
       />
 
       {/* Right Main Column */}
@@ -1858,6 +1863,44 @@ export function App() {
         token={activeDevice?.token}
         isAdmin={isAdmin}
         onOpenInviteManager={() => setInviteManagerOpen(true)}
+      />
+      {/* Settings Modal (account, theme, desktop bridge, cache, version & about) */}
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        activeDevice={activeDevice}
+        activeDeviceName={activeDeviceName}
+        isAccountMode={isAccountMode}
+        isAdmin={isAdmin}
+        emailEnabled={serverEmailEnabled}
+        connState={connState}
+        bridgeOnline={bridgeOnline}
+        darkMode={darkMode}
+        onToggleDark={() => setDarkMode((v) => !v)}
+        cacheScope={cacheScope}
+        desktopApi={desktopApi}
+        desktopBridge={desktopBridge}
+        onToggleDesktopBridge={
+          desktopApi
+            ? () => {
+                desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+              }
+            : null
+        }
+        onToggleDesktopAutoLaunch={
+          desktopApi
+            ? () => {
+                desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+              }
+            : null
+        }
+        onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
+        onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
+        onOpenShare={() => setShareOpen(true)}
+        onOpenInviteManager={() => setInviteManagerOpen(true)}
+        onSendBindEmailCode={handleSendBindEmailCode}
+        onBindAccountEmail={handleBindAccountEmail}
+        onRemoveDevice={handleRemoveDevice}
       />
       {/* Full-Screen Zoomable Image Lightbox */}
       <ImageLightbox state={lightboxState} onClose={() => setLightboxState(null)} />
