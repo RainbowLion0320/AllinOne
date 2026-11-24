@@ -103,9 +103,11 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
  * and Relay NEVER forwards plaintext RPCs or bridge events.
  */
 export class RelayHub {
-  constructor({ log = console, getRoomDevices = null } = {}) {
+  constructor({ log = console, getRoomDevices = null, trafficGuard = null, isAdminRoom = null } = {}) {
     this.log = log
     this.getRoomDevices = typeof getRoomDevices === 'function' ? getRoomDevices : null
+    this.trafficGuard = trafficGuard || null
+    this.isAdminRoom = typeof isAdminRoom === 'function' ? isAdminRoom : () => false
     /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number }>} */
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
     /** @type {Map<string, { roomId: string, ws: import('ws').WebSocket, user: any, connectedAt: number }>} */
@@ -285,9 +287,45 @@ export class RelayHub {
   getRoomStats(roomId) {
     const rid = String(roomId || '').trim()
     const st = this.roomStats.get(rid)
-    return st
+    const base = st
       ? { ...st }
       : { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
+    if (this.trafficGuard) {
+      base.traffic = this.trafficGuard.getRoomUsage(rid)
+    }
+    return base
+  }
+
+  getTrafficSummary() {
+    if (!this.trafficGuard) {
+      return {
+        totalBytes10m: 0,
+        totalBytes24h: 0,
+        totalBytesLifetime: 0,
+        totalThrottledCount: 0,
+        limits: { burst10mBytes: 0, daily24hBytes: 0, uploadPerMin: 0, adminExempt: true },
+      }
+    }
+    return this.trafficGuard.getGlobalSummary()
+  }
+
+  checkRoomTraffic(roomId, bytes, { sourceLabel = '', ip = '' } = {}) {
+    if (!this.trafficGuard || !roomId) return { allowed: true, hardKick: false }
+    let isAdmin = false
+    try {
+      isAdmin = Boolean(this.isAdminRoom(roomId))
+    } catch {}
+    const res = this.trafficGuard.consumeBytes(roomId, bytes, { isAdmin })
+    if (!res.allowed) {
+      this.recordActivity({
+        type: 'traffic.throttled',
+        roomId,
+        label: sourceLabel || 'ws',
+        detail: `${res.code || 'TRAFFIC_QUOTA_EXCEEDED'} (${Math.round((Number(bytes) || 0) / 1024)}KB)`,
+        ip,
+      })
+    }
+    return res
   }
 
   recordActivity({ type, roomId = '', label = '', detail = '', ip = '' } = {}) {
@@ -508,13 +546,14 @@ export class RelayHub {
     ws.on('message', (raw) => {
       entry.isAlive = true
       entry.lastSeen = Date.now()
+      const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
       let msg
       try {
         msg = JSON.parse(String(raw))
       } catch {
         return
       }
-      this.handleBridgeMessage(roomId, bridgeId, msg, ws)
+      this.handleBridgeMessage(roomId, bridgeId, msg, ws, rawBytes)
     })
 
     ws.on('close', () => {
@@ -675,13 +714,14 @@ export class RelayHub {
     ws.on('message', (raw) => {
       entry.isAlive = true
       entry.lastSeenAt = Date.now()
+      const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
       let msg
       try {
         msg = JSON.parse(String(raw))
       } catch {
         return
       }
-      this.handleClientMessage(clientId, msg)
+      this.handleClientMessage(clientId, msg, rawBytes)
     })
 
     ws.on('close', () => {
@@ -711,7 +751,7 @@ export class RelayHub {
     })
   }
 
-  handleBridgeMessage(roomId, bridgeId, msg, ws = null) {
+  handleBridgeMessage(roomId, bridgeId, msg, ws = null, rawBytes = 0) {
     if (!msg || typeof msg !== 'object') return
     const key = this.bridgeKey(roomId, bridgeId)
     const activeBridge = this.bridges.get(key)
@@ -750,6 +790,25 @@ export class RelayHub {
       clearTimeout(pending.timer)
       this.pendingRpc.delete(msg.id)
       if (msg.e2ee) {
+        const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
+          sourceLabel: `bridge:${bridgeId}`,
+          ip: activeBridge.meta?.ip || '',
+        })
+        if (!trafficRes.allowed) {
+          this.sendToClient(pending.clientId, {
+            type: 'rpc.res',
+            id: pending.clientReqId,
+            ok: false,
+            error: {
+              code: trafficRes.code || 'TRAFFIC_QUOTA_EXCEEDED',
+              message: trafficRes.message || '当前账号传输流量已达上限，请稍后再试',
+            },
+          })
+          if (trafficRes.hardKick) {
+            try { activeBridge.ws.close(4009, 'Traffic quota exceeded') } catch {}
+          }
+          return
+        }
         this.sendToClient(pending.clientId, {
           type: 'rpc.res',
           id: pending.clientReqId,
@@ -780,11 +839,21 @@ export class RelayHub {
 
     if (msg.type === 'event') {
       if (!msg.e2ee) return
+      const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
+        sourceLabel: `bridge:${bridgeId}`,
+        ip: activeBridge.meta?.ip || '',
+      })
+      if (!trafficRes.allowed) {
+        if (trafficRes.hardKick) {
+          try { activeBridge.ws.close(4009, 'Traffic quota exceeded') } catch {}
+        }
+        return
+      }
       this.broadcastEvent(roomId, bridgeId, E2EE_EVENT_MARKER, null, msg.e2ee)
     }
   }
 
-  handleClientMessage(clientId, msg) {
+  handleClientMessage(clientId, msg, rawBytes = 0) {
     if (!msg || typeof msg !== 'object') return
     const client = this.clients.get(clientId)
     if (!client) return
@@ -793,6 +862,30 @@ export class RelayHub {
     if (msg.type === 'ping') {
       this.sendToClient(clientId, { type: 'pong', ts: Date.now() })
       return
+    }
+
+    if (rawBytes > 0) {
+      const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
+        sourceLabel: client.deviceName || 'client',
+        ip: client.ip || '',
+      })
+      if (!trafficRes.allowed) {
+        if (msg.type === 'rpc.req' && msg.id) {
+          this.sendToClient(clientId, {
+            type: 'rpc.res',
+            id: String(msg.id),
+            ok: false,
+            error: {
+              code: trafficRes.code || 'TRAFFIC_QUOTA_EXCEEDED',
+              message: trafficRes.message || '当前账号传输流量已达上限，请稍后再试',
+            },
+          })
+        }
+        if (trafficRes.hardKick) {
+          try { client.ws.close(4009, 'Traffic quota exceeded') } catch {}
+        }
+        return
+      }
     }
 
     // Zero-knowledge device-to-device E2EE key grant signaling (strictly same-room, blind courier)

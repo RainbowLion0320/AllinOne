@@ -533,9 +533,11 @@
       const hostName = srv.host?.hostname || 'relay'
       const up = fmtUptime(srv.node?.uptimeSec || 0)
       const rss = fmtBytes(srv.node?.rssBytes || 0)
+      const traffic24h = fmtBytes(sum.totalTraffic24hBytes || 0)
+      const throttled = Number(sum.totalThrottledCount || 0)
       subEl.textContent = bi(
-        `主机 ${hostName} · 运行 ${up} · 进程内存 ${rss}`,
-        `Host ${hostName} · Up ${up} · Node RSS ${rss}`,
+        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · 24h 流量 ${traffic24h}${throttled > 0 ? ` · 限流 ${throttled}` : ''}`,
+        `Host ${hostName} · Up ${up} · RSS ${rss} · 24h Traffic ${traffic24h}${throttled > 0 ? ` · Throttled ${throttled}` : ''}`,
       )
     }
 
@@ -937,7 +939,10 @@
 
             <div class="user-activity">
               <div>${esc(fmtRelative(u.lastActivityAt))}</div>
-              <div class="user-activity-sub">${esc(bi(`${u.stats?.rpcCount || 0} RPC`, `${u.stats?.rpcCount || 0} RPCs`))}</div>
+              <div class="user-activity-sub">${esc(bi(
+                `${u.stats?.rpcCount || 0} RPC · 24h ${fmtBytes(u.stats?.traffic?.bytes24h || 0)}${u.stats?.traffic?.throttledCount ? ` · 限流${u.stats.traffic.throttledCount}` : ''}`,
+                `${u.stats?.rpcCount || 0} RPCs · 24h ${fmtBytes(u.stats?.traffic?.bytes24h || 0)}${u.stats?.traffic?.throttledCount ? ` · Limited ${u.stats.traffic.throttledCount}` : ''}`,
+              ))}</div>
             </div>
 
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
@@ -1047,6 +1052,7 @@
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
             ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
             <span>${esc(bi('事件', 'Events'))}: ${esc(u.stats?.eventCount || 0)}</span>
+            <span>${esc(bi('24h 流量', '24h Traffic'))}: ${esc(fmtBytes(u.stats?.traffic?.bytes24h || 0))}${u.stats?.traffic?.limit24hBytes ? ` / ${esc(fmtBytes(u.stats.traffic.limit24hBytes))}` : ''} (${esc(bi('10m', '10m'))}: ${esc(fmtBytes(u.stats?.traffic?.bytes10m || 0))}${u.stats?.traffic?.throttledCount ? `, ${esc(bi(`限流 ${u.stats.traffic.throttledCount} 次`, `Throttled ${u.stats.traffic.throttledCount}x`))}` : ''})</span>
             ${u.stats?.lastRpcMethod ? `<span class="mono">${esc(bi('最近 RPC', 'Last RPC'))}: ${esc(u.stats.lastRpcMethod)} (${esc(fmtRelative(u.stats.lastRpcAt))})</span>` : ''}
           </div>
           ${!u.isCurrentAdmin ? `

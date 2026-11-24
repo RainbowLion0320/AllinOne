@@ -121,6 +121,9 @@ export function buildAdminOverview({
   const allBridges = hub.getAllBridges()
   const allClients = hub.getAllClients()
   const metrics = hub.getMetricsSummary()
+  const trafficSummary = typeof hub.getTrafficSummary === 'function'
+    ? hub.getTrafficSummary()
+    : { totalBytes10m: 0, totalBytes24h: 0, totalBytesLifetime: 0, totalThrottledCount: 0, limits: null }
 
   // Index username by roomId (`usr_*`) for enriching live connections & activity log
   const ownerNameByRoom = new Map()
@@ -368,6 +371,11 @@ export function buildAdminOverview({
       totalEvents: metrics.totalEvents,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
+      totalTraffic10mBytes: trafficSummary.totalBytes10m || 0,
+      totalTraffic24hBytes: trafficSummary.totalBytes24h || 0,
+      totalTrafficLifetimeBytes: trafficSummary.totalBytesLifetime || 0,
+      totalThrottledCount: trafficSummary.totalThrottledCount || 0,
+      trafficLimits: trafficSummary.limits || null,
     },
     distributions: {
       userStatus: userStatusDist,

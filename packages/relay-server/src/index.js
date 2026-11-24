@@ -9,6 +9,7 @@ import { createAccountStore, validateEmail, validatePassword } from './accounts.
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
+import { RelayTrafficGuard } from './traffic-guard.js'
 import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -369,8 +370,13 @@ export function createRelayServer(options = {}) {
     }
   }
 
+  const trafficGuard = new RelayTrafficGuard(options.trafficGuard || {})
+  const isAdminRoom = (rid) => accounts.getUserById(rid)?.role === 'admin'
+
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
+    trafficGuard,
+    isAdminRoom,
   })
 
   function isAllowedOrigin(rawOrigin, req) {
@@ -1866,6 +1872,26 @@ export function createRelayServer(options = {}) {
           return
         }
         const ownerRoom = payload.room
+        const tCheck = trafficGuard.consumeUploadPost(ownerRoom, buf.length, {
+          isAdmin: payload.role === 'admin' || isAdminRoom(ownerRoom),
+        })
+        if (!tCheck.allowed) {
+          hub.recordActivity({
+            type: 'traffic.throttled',
+            roomId: ownerRoom,
+            label: 'upload:post',
+            detail: `${tCheck.code} (${Math.round(buf.length / 1024)}KB)`,
+            ip: getClientIp(req),
+          })
+          res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
+          sendJson(res, 429, {
+            ok: false,
+            code: tCheck.code,
+            retryAfterSec: tCheck.retryAfterSec || 60,
+            error: tCheck.message,
+          })
+          return
+        }
         pruneUploadsForQuota(buf.length, ownerRoom)
         const id = randomUUID()
         const meta = {
@@ -1937,6 +1963,26 @@ export function createRelayServer(options = {}) {
         data = readFileSync(binPath)
       } catch {
         sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
+        return
+      }
+      const dlCheck = trafficGuard.consumeUploadGet(callerRoom, data.length, {
+        isAdmin: clientUser?.role === 'admin' || isAdminRoom(callerRoom),
+      })
+      if (!dlCheck.allowed) {
+        hub.recordActivity({
+          type: 'traffic.throttled',
+          roomId: callerRoom,
+          label: 'upload:get',
+          detail: `${dlCheck.code} (${Math.round(data.length / 1024)}KB)`,
+          ip: getClientIp(req),
+        })
+        res.setHeader('Retry-After', String(dlCheck.retryAfterSec || 300))
+        sendJson(res, 429, {
+          ok: false,
+          code: dlCheck.code,
+          retryAfterSec: dlCheck.retryAfterSec || 300,
+          error: dlCheck.message,
+        })
         return
       }
       // Ephemeral consume: when the PC bridge downloads a non-image attachment with ?consume=1, delete temp files immediately
@@ -2220,7 +2266,7 @@ export function createRelayServer(options = {}) {
       })
     })
 
-  return { server, wss, hub, accounts, mailer, start, close }
+  return { server, wss, hub, accounts, mailer, trafficGuard, start, close }
 }
 
 // Run directly when invoked as main script

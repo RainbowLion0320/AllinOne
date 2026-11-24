@@ -17,6 +17,7 @@ import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
 import { createRelayServer } from '../packages/relay-server/src/index.js'
+import { RelayTrafficGuard } from '../packages/relay-server/src/traffic-guard.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
 import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
@@ -5247,6 +5248,133 @@ async function main() {
       }
     }
     console.log('[smoke] 32/32 Deliverable document E2EE download (HTML/PDF/Word/Excel/PPT, 10MB cap, security guards & extractor) OK')
+
+    // 33. Per-room sliding-window traffic quota, upload rate limit (429), WS large-frame guard & admin metrics
+    {
+      let mockNow = 1_700_000_000_000
+      const tg = new RelayTrafficGuard({
+        burstLimitBytes: 1024 * 1024, // 1 MB / 10m
+        dailyLimitBytes: 3 * 1024 * 1024, // 3 MB / 24h
+        uploadMaxPerMinute: 2,
+        largeFrameThresholdBytes: 256 * 1024,
+        hardDisconnectMultiplier: 2,
+        adminExempt: true,
+        nowFn: () => mockNow,
+      })
+
+      // 33a. Upload per-minute rate limit triggers on 3rd attempt in 60s
+      assert.equal(tg.consumeUploadPost('usr_normal', 100 * 1024).allowed, true)
+      assert.equal(tg.consumeUploadPost('usr_normal', 100 * 1024).allowed, true)
+      const rateBlocked = tg.consumeUploadPost('usr_normal', 100 * 1024)
+      assert.equal(rateBlocked.allowed, false)
+      assert.equal(rateBlocked.code, 'UPLOAD_RATE_LIMIT')
+      assert.ok(rateBlocked.retryAfterSec >= 1)
+
+      // Advance 61s -> upload rate window clears, cumulative bytes still in 10m window
+      mockNow += 61_000
+      assert.equal(tg.consumeUploadPost('usr_normal', 600 * 1024).allowed, true) // total 800KB in 10m
+
+      // 33b. Large WS frame (>256KB) pushing over 1MB burst limit is blocked, while small text chat (<256KB) stays online
+      const bigWsBlocked = tg.consumeBytes('usr_normal', 300 * 1024)
+      assert.equal(bigWsBlocked.allowed, false)
+      assert.equal(bigWsBlocked.hardKick, false)
+      assert.equal(bigWsBlocked.code, 'TRAFFIC_QUOTA_EXCEEDED')
+
+      const smallChatOk = tg.consumeBytes('usr_normal', 4 * 1024)
+      assert.equal(smallChatOk.allowed, true)
+
+      // 33c. Persistent flood exceeding 2x burst limit triggers hardKick
+      const floodKick = tg.consumeBytes('usr_normal', 1500 * 1024)
+      assert.equal(floodKick.allowed, false)
+      assert.equal(floodKick.hardKick, true)
+
+      // 33d. Admin account is exempted from blocking while still metered
+      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
+      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
+      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
+      assert.equal(tg.getRoomUsage('usr_admin').bytes24h, 15 * 1024 * 1024)
+
+      // 33e. Live Relay HTTP /api/uploads 429 enforcement & admin overview traffic metrics
+      const quotaDir = join(tmpDir, 'quota-relay')
+      mkdirSync(quotaDir, { recursive: true })
+      const quotaRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-quota-secret-123456',
+        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
+        accountsFile: join(quotaDir, 'accounts.json'),
+        uploadDir: join(quotaDir, 'uploads'),
+        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
+        trafficGuard: {
+          burstLimitBytes: 512 * 1024,
+          dailyLimitBytes: 1024 * 1024,
+          uploadMaxPerMinute: 2,
+          adminExempt: true,
+        },
+      })
+      const qAddr = await quotaRelay.start()
+      const qBase = `http://127.0.0.1:${qAddr.port}`
+      try {
+        const qAdminReg = await (await fetch(`${qBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'q_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
+        })).json()
+        assert.equal(qAdminReg.ok, true)
+        const qInv = await (await fetch(`${qBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdminReg.token}` },
+          body: JSON.stringify({ count: 1 }),
+        })).json()
+        const qUserReg = await (await fetch(`${qBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'q_user',
+            password: SMOKE_ADMIN_PASS,
+            inviteCode: qInv.invites[0].code,
+          }),
+        })).json()
+        assert.equal(qUserReg.ok, true)
+
+        const tinyPayload = JSON.stringify({
+          encrypted: true,
+          dataBase64: Buffer.alloc(4096, 0x61).toString('base64'),
+        })
+        const u1 = await fetch(`${qBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
+          body: tinyPayload,
+        })
+        const u2 = await fetch(`${qBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
+          body: tinyPayload,
+        })
+        const u3 = await fetch(`${qBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
+          body: tinyPayload,
+        })
+        assert.equal(u1.status, 200)
+        assert.equal(u2.status, 200)
+        assert.equal(u3.status, 429, '3rd upload within 1 minute must return HTTP 429')
+        assert.ok(Number(u3.headers.get('retry-after')) >= 1)
+
+        const ovRes = await (await fetch(`${qBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${qAdminReg.token}` },
+        })).json()
+        assert.equal(ovRes.ok, true)
+        assert.ok(ovRes.summary.totalTraffic24hBytes >= 8192)
+        assert.ok(ovRes.summary.totalThrottledCount >= 1)
+        const trackedUser = ovRes.users.find((u) => u.username === 'q_user')
+        assert.ok(trackedUser?.stats?.traffic?.bytes24h >= 8192)
+        assert.ok(trackedUser?.stats?.traffic?.throttledCount >= 1)
+      } finally {
+        await quotaRelay.close()
+      }
+    }
+    console.log('[smoke] 33/33 Relay per-room traffic quota, upload 429 rate limit, WS flood guard & admin traffic metrics OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
