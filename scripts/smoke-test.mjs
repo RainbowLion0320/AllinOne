@@ -25,7 +25,11 @@ import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
 import { CodexAdapter, normalizeCodexTurns, probeCodexRolloutStatus, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
-import { ClaudeAdapter } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
+import {
+  ClaudeAdapter,
+  probeClaudeExternalStatus,
+  probeClaudeTranscriptTail,
+} from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
 import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
 import {
@@ -4492,7 +4496,191 @@ async function main() {
         assert.equal(verifyOrig.ok, true, 'Original password must remain intact after rejected TOCTOU change')
       }
     }
-    console.log('[smoke] 25/25 Full-Stack v0.5.1 Regression Suite (401 WS stop, protocol/E2EE parity, Desktop E2EE, LF/UTF-8 scripts, scope safety & password TOCTOU) OK')
+    console.log('[smoke] 25/26 Full-Stack v0.5.1 Regression Suite (401 WS stop, protocol/E2EE parity, Desktop E2EE, LF/UTF-8 scripts, scope safety & password TOCTOU) OK')
+
+    // 26. Claude Desktop (Cowork + Desktop Code) Discovery, Live External Running State, Watcher & Read-Only Guard
+    {
+      const claudeRoot26 = join(tmpDir, 'claude-desktop-26')
+      const claudeHome26 = join(tmpDir, 'claude-home-26')
+      const wsDir26 = join(tmpDir, 'ws-civ6')
+      mkdirSync(wsDir26, { recursive: true })
+      const acctDir = join(claudeRoot26, 'local-agent-mode-sessions', 'org-1', 'acct-1')
+      const sessUuid = '5931e05f-6a35-4063-8476-8b305db38304'
+      const cliSid = 'fe312cf1-0b14-48b9-a991-7198d20c17d4'
+      const sessDir = join(acctDir, '5931e05f')
+      const projDir = join(sessDir, '.claude', 'projects', 'session')
+      const pidDir = join(sessDir, '.claude', 'sessions')
+      mkdirSync(projDir, { recursive: true })
+      mkdirSync(pidDir, { recursive: true })
+
+      // Write Cowork metadata + spaces.json + native transcript + active audit.jsonl + live busy PID
+      writeFileSync(
+        join(acctDir, 'spaces.json'),
+        JSON.stringify({ spaces: [{ id: 'sp-1', name: 'Civ6Space', folders: [{ path: wsDir26 }] }] }),
+      )
+      writeFileSync(
+        join(acctDir, `local_${sessUuid}.json`),
+        JSON.stringify({
+          sessionId: `local_${sessUuid}`,
+          cliSessionId: cliSid,
+          title: 'Desktop Cowork Live Task',
+          initialMessage: 'Run scenario solver',
+          model: 'claude-opus-5-5',
+          isArchived: false,
+          userSelectedFolders: [wsDir26],
+          folderMountNames: { [wsDir26]: 'CivilizationVI' },
+          spaceId: 'sp-1',
+          createdAt: Date.now() - 60_000,
+          lastActivityAt: Date.now() - 5_000,
+        }),
+      )
+      // Archived session must be hidden
+      writeFileSync(
+        join(acctDir, 'local_archived-1111-2222-3333-444444444444.json'),
+        JSON.stringify({
+          sessionId: 'local_archived-1111-2222-3333-444444444444',
+          title: 'Archived Should Hide',
+          isArchived: true,
+        }),
+      )
+      const projJsonl = join(projDir, `${cliSid}.jsonl`)
+      writeFileSync(
+        projJsonl,
+        [
+          JSON.stringify({ type: 'user', uuid: 'u1', timestamp: new Date().toISOString(), message: { role: 'user', content: 'Run scenario solver' } }),
+          JSON.stringify({
+            type: 'assistant',
+            uuid: 'a1',
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'assistant',
+              model: 'claude-opus-5-5',
+              content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__workspace__bash', input: { command: 'python run.py' } }],
+            },
+          }),
+        ].join('\n') + '\n',
+      )
+      const auditJsonl = join(sessDir, 'audit.jsonl')
+      writeFileSync(
+        auditJsonl,
+        [
+          JSON.stringify({ type: 'user', uuid: 'u1', client_platform: 'desktop_app', timestamp: new Date().toISOString(), message: { role: 'user', content: 'Run scenario solver' } }),
+          JSON.stringify({ type: 'user', uuid: 'u1', timestamp: new Date().toISOString(), message: { role: 'user', content: 'Run scenario solver' } }),
+          JSON.stringify({ type: 'system', subtype: 'status', status: 'requesting', timestamp: new Date().toISOString() }),
+          JSON.stringify({ type: 'system', subtype: 'permission_request', uuid: 'perm-1', tool_name: 'mcp__cowork__request_cowork_directory', timestamp: new Date().toISOString() }),
+        ].join('\n') + '\n',
+      )
+      writeFileSync(
+        join(pidDir, '999999.json'),
+        JSON.stringify({ pid: 999999, sessionId: cliSid, status: 'busy', updatedAt: Date.now(), statusUpdatedAt: Date.now() }),
+      )
+
+      // Also verify Desktop Code session merges with ~/.claude/projects and stays writable
+      const cliProjDir = join(claudeHome26, 'projects', 'demo-proj')
+      mkdirSync(cliProjDir, { recursive: true })
+      const codeCliId = '11111111-2222-3333-4444-555555555555'
+      writeFileSync(
+        join(cliProjDir, `${codeCliId}.jsonl`),
+        [
+          JSON.stringify({ type: 'user', uuid: 'cu1', cwd: wsDir26, timestamp: new Date().toISOString(), message: { role: 'user', content: 'hello code tab' } }),
+          JSON.stringify({ type: 'assistant', uuid: 'ca1', timestamp: new Date().toISOString(), message: { role: 'assistant', model: 'claude-sonnet', stop_reason: 'end_turn', content: [{ type: 'text', text: 'hi from code' }] } }),
+        ].join('\n') + '\n',
+      )
+      const codeAcctDir = join(claudeRoot26, 'claude-code-sessions', 'org-1', 'acct-1')
+      mkdirSync(codeAcctDir, { recursive: true })
+      writeFileSync(
+        join(codeAcctDir, 'local_aaaa1111-2222-3333-4444-555555555555.json'),
+        JSON.stringify({
+          sessionId: 'local_aaaa1111-2222-3333-4444-555555555555',
+          cliSessionId: codeCliId,
+          title: 'Desktop Code Enriched Title',
+          cwd: wsDir26,
+          createdAt: Date.now() - 30_000,
+          lastActivityAt: Date.now() - 10_000,
+        }),
+      )
+
+      const tailProbe = probeClaudeTranscriptTail(auditJsonl)
+      assert.equal(tailProbe.running, true, 'audit.jsonl with status=requesting must probe as running')
+      assert.equal(tailProbe.waitingPermission, true, 'Unanswered permission_request must set waitingPermission=true')
+      assert.equal(tailProbe.permissionTool, 'mcp__cowork__request_cowork_directory')
+
+      const extEvents26 = []
+      let fakePidAlive = true
+      const claudeDesk = new ClaudeAdapter({
+        config: {
+          claudeHome: claudeHome26,
+          claudeDesktopRoots: [claudeRoot26],
+          claudeWatchPollMs: 120,
+          checkPidAlive: (pid) => pid === 999999 && fakePidAlive,
+        },
+        emitEvent: (ev, payload) => extEvents26.push({ ev, payload }),
+      })
+      try {
+        const listed = await claudeDesk.listSessions({ limit: 20 })
+        assert.equal(listed.length, 2, 'Must list 1 active Cowork + 1 deduplicated Desktop Code session (hiding archived)')
+        const coworkItem = listed.find((s) => s.nativeId === `local_${sessUuid}`)
+        assert.ok(coworkItem, 'Cowork session must be discovered')
+        assert.equal(coworkItem.title, 'Desktop Cowork Live Task')
+        assert.equal(coworkItem.workspace, 'CivilizationVI')
+        assert.equal(coworkItem.source, 'claude-desktop-cowork')
+        assert.equal(coworkItem.writable, false)
+        assert.equal(coworkItem.status, 'running')
+        assert.equal(coworkItem.syncState?.externalRunning, true)
+        assert.equal(coworkItem.syncState?.waitingPermission, true)
+
+        const codeItem = listed.find((s) => s.nativeId === codeCliId)
+        assert.ok(codeItem, 'Desktop Code session must merge with CLI transcript by cliSessionId')
+        assert.equal(codeItem.title, 'Desktop Code Enriched Title')
+        assert.equal(codeItem.source, 'claude-desktop-code')
+        assert.equal(codeItem.writable, true)
+        assert.equal(codeItem.status, 'idle')
+
+        const ws26 = await claudeDesk.listWorkspaces()
+        assert.ok(ws26.some((w) => w.path === wsDir26), 'Claude Desktop folders must appear in workspaces')
+
+        // Option 1: Cowork session must reject direct sendMessage cleanly with SESSION_READONLY
+        await assert.rejects(
+          () => claudeDesk.sendMessage(`local_${sessUuid}`, { text: 'should block' }),
+          (err) => err?.code === 'SESSION_READONLY',
+          'Cowork read-only mirror must reject sendMessage with SESSION_READONLY',
+        )
+
+        // Open Cowork session to register watcher, then append completion to audit.jsonl & mark PID idle -> must push SESSION_UPDATED(idle)
+        const opened = await claudeDesk.readSession(`local_${sessUuid}`, { limit: 20 })
+        assert.equal(opened.status, 'running')
+        assert.equal(opened.writable, false)
+        assert.equal(opened.messages.length, 2)
+
+        fakePidAlive = false
+        writeFileSync(
+          auditJsonl,
+          readFileSync(auditJsonl, 'utf8') +
+            JSON.stringify({ type: 'system', subtype: 'permission_response', uuid: 'perm-1', granted: true, timestamp: new Date().toISOString() }) + '\n' +
+            JSON.stringify({ type: 'assistant', uuid: 'a2', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'Achievement unlocked!' }] } }) + '\n' +
+            JSON.stringify({ type: 'result', subtype: 'success', timestamp: new Date().toISOString() }) + '\n',
+        )
+        const deadline26 = Date.now() + 3_000
+        while (
+          Date.now() < deadline26 &&
+          !extEvents26.some(
+            (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === `local_${sessUuid}` && e.payload?.session?.status === 'idle',
+          )
+        ) {
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        const doneEv26 = extEvents26.find(
+          (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === `local_${sessUuid}` && e.payload?.session?.status === 'idle',
+        )
+        assert.ok(doneEv26, 'Claude Desktop watcher must emit SESSION_UPDATED(idle) when Cowork turn completes')
+        assert.equal(doneEv26.payload.session.syncState?.externalRunning, false)
+        assert.equal(doneEv26.payload.session.syncState?.waitingPermission, undefined)
+      } finally {
+        await claudeDesk.dispose()
+      }
+      assert.equal(probeClaudeExternalStatus({ auditPath: auditJsonl }).running, false)
+    }
+    console.log('[smoke] 26/26 Claude Desktop (Cowork + Code) discovery, live external running/permission state, watcher & read-only guard OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

@@ -126,6 +126,14 @@ function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSu
         <span className="flex-1 truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
           {session.title}
         </span>
+        {session.source === 'claude-desktop-cowork' && (
+          <span
+            title={bi('Claude Desktop (Cowork) 实时同步视图', 'Claude Desktop (Cowork) live mirror')}
+            className="shrink-0 rounded border border-slate-200/80 bg-white/70 px-1 py-0.5 text-[9.5px] font-medium text-slate-500 dark:border-slate-700/80 dark:bg-slate-800/70 dark:text-slate-400"
+          >
+            Desktop
+          </span>
+        )}
         {hasPendingPrompt ? (
           <span
             title={bi('等待你的选择', 'Waiting for your input')}

@@ -108,11 +108,19 @@ export class MultiAppOrchestrator {
   }
 
   async listWorkspaces() {
-    const dshWs = await this.adapters[APPS.DSH].listWorkspaces().catch(() => [])
+    const [dshWs, claudeWs] = await Promise.all([
+      this.adapters[APPS.DSH].listWorkspaces().catch(() => []),
+      typeof this.adapters[APPS.CLAUDE]?.listWorkspaces === 'function'
+        ? this.adapters[APPS.CLAUDE].listWorkspaces().catch(() => [])
+        : Promise.resolve([]),
+    ])
     // Deduplicate by normalized path
     const map = new Map()
-    for (const w of dshWs) {
-      if (w.path) map.set(w.path.toLowerCase(), w)
+    for (const w of [...dshWs, ...claudeWs]) {
+      if (w?.path) {
+        const k = w.path.toLowerCase()
+        if (!map.has(k)) map.set(k, w)
+      }
     }
     if (this.config.cwd && existsSync(this.config.cwd)) {
       const k = this.config.cwd.toLowerCase()

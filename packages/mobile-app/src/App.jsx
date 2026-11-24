@@ -2598,7 +2598,35 @@ export function App() {
         onResolveApproval={handleResolveApproval}
       />
 
-      {/* Floating DeepSeek-style Composer */}
+      {/* Floating DeepSeek-style Composer (or sleek live-mirror footer for read-only Claude Desktop Cowork sessions) */}
+      {activeSession?.writable === false ? (
+        <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
+          <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-2.5 rounded-2xl border border-slate-200/90 bg-[#F4F6FA] px-3.5 py-2.5 lg:max-w-3xl dark:border-slate-700/80 dark:bg-[#21232B]">
+            <div className="flex min-w-0 items-center gap-2">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  activeSession?.syncState?.externalRunning
+                    ? 'bg-emerald-500 animate-pulse-dot'
+                    : 'bg-slate-400 dark:bg-slate-500'
+                }`}
+              />
+              <span className="truncate text-xs font-medium text-slate-600 dark:text-slate-300">
+                {activeSession?.syncState?.externalRunning
+                  ? bi('Claude Desktop 正在电脑端执行 · 实时只读同步中', 'Claude Desktop running on PC · Live read-only sync')
+                  : bi('Claude Desktop (Cowork) 只读同步视图', 'Claude Desktop (Cowork) read-only mirror')}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => openNewChatModal(activeSession?.cwd || '', activeSession?.app || 'claude')}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#4D6BFE] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
+            >
+              <SquarePen className="h-3.5 w-3.5" />
+              <span>{bi('同目录新建可写对话', 'New Writable Chat')}</span>
+            </button>
+          </div>
+        </div>
+      ) : (
       <Composer
         key={activeDevice?.id || 'none'}
         draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
@@ -2646,6 +2674,7 @@ export function App() {
         onInterrupt={handleInterrupt}
         onError={showToast}
       />
+      )}
       </>
       )}
       </div>

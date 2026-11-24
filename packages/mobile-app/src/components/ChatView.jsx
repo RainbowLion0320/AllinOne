@@ -928,11 +928,24 @@ export function ChatView({
               </div>
             )}
 
-            {/* External Desktop live-sync pulse (e.g. Antigravity Desktop currently generating) */}
+            {/* External Desktop live-sync pulse (Antigravity / Codex / Claude Desktop currently generating) */}
             {!streamingState?.active && session?.syncState?.externalRunning && (
-              <div className="flex items-center gap-2 py-1 text-xs text-slate-400 dark:text-slate-500">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
-                <span>{bi('桌面端正在运行此对话，进度自动实时同步中...', 'Running on Desktop, syncing live progress...')}</span>
+              <div className="space-y-1.5 py-1">
+                <div className="flex items-center gap-2 text-xs text-slate-400 dark:text-slate-500">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
+                  <span>{bi('桌面端正在运行此对话，进度自动实时同步中...', 'Running on Desktop, syncing live progress...')}</span>
+                </div>
+                {session?.syncState?.waitingPermission && (
+                  <div className="inline-flex items-center gap-1.5 rounded-xl border border-amber-200/80 bg-amber-50/90 px-2.5 py-1 text-[11.5px] text-amber-700 dark:border-amber-800/50 dark:bg-amber-950/35 dark:text-amber-300">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {bi(
+                        `桌面端正在等待权限确认${session.syncState.permissionTool ? `（${session.syncState.permissionTool}）` : ''}，请在电脑端确认`,
+                        `Waiting for permission approval on Desktop${session.syncState.permissionTool ? ` (${session.syncState.permissionTool})` : ''}`,
+                      )}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
