@@ -477,7 +477,7 @@ export class MultiAppOrchestrator {
   /**
    * Read a local image or deliverable document file on the PC so the remote client
    * can preview images/HTML or download office deliverables over E2EE WS RPC.
-   * - Image mode (default): image extensions only, <= 20MB.
+   * - Image mode (default): image extensions only, <= 15MB (stays safely below 32MB relay WS maxPayload after E2EE encoding).
    * - Document mode (`mode: 'document'`): deliverable extensions only (HTML/PDF/Word/Excel/PPT/CSV/MD/TXT/RTF/EPUB/ZIP),
    *   <= 10MB, max 2 concurrent reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
    */
@@ -513,7 +513,7 @@ export class MultiAppOrchestrator {
     }
     const isDocumentMode = String(mode || '').trim().toLowerCase() === 'document'
     const ALLOWED_MIMES = isDocumentMode ? DOCUMENT_MIMES : IMAGE_MIMES
-    const MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 20 * 1024 * 1024
+    const MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 15 * 1024 * 1024
     const MAX_CONCURRENT_DOC_READS = 2
 
     let p = String(rawPath || '').trim()

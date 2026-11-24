@@ -1,6 +1,7 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
+import { chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
+import { readFile as readFileAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
@@ -67,14 +68,20 @@ const MIME_TYPES = {
 }
 
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // 15MB per file
-const MAX_TOTAL_UPLOAD_BYTES = 256 * 1024 * 1024 // 256MB total temp upload quota
-const MAX_ROOM_UPLOAD_BYTES = 64 * 1024 * 1024 // 64MB per-room temp upload quota
+const MAX_TOTAL_UPLOAD_BYTES = Math.max(
+  32,
+  Number(process.env.RELAY_MAX_TOTAL_UPLOAD_MB || 256) || 256,
+) * 1024 * 1024 // default 256MB total temp upload quota (configurable via RELAY_MAX_TOTAL_UPLOAD_MB)
+const MAX_ROOM_UPLOAD_BYTES = Math.max(
+  16,
+  Number(process.env.RELAY_MAX_ROOM_UPLOAD_MB || 64) || 64,
+) * 1024 * 1024 // default 64MB per-room temp upload quota (configurable via RELAY_MAX_ROOM_UPLOAD_MB)
 const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
 const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 const SANDBOX_PREVIEW_CSP =
-  "sandbox allow-scripts allow-forms; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
+  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
 
 function maskEmailAddress(email) {
   const clean = String(email || '').trim()
@@ -405,30 +412,61 @@ export function createRelayServer(options = {}) {
     )
   }
 
-  // Periodic cleanup + quota enforcement for temporary encrypted uploads (prevents disk exhaustion DoS)
-  function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '') {
+  // In-memory index for temporary encrypted uploads (avoids sync readdirSync/readFileSync scans on every POST)
+  /** @type {Map<string, { id: string, binPath: string, metaPath: string, size: number, mtimeMs: number, roomId: string }>} */
+  const uploadIndex = new Map()
+  let uploadTotalBytesCache = 0
+  /** @type {Map<string, number>} */
+  const uploadRoomBytesCache = new Map()
+  const consumedUploadIds = new Set()
+
+  function removeUploadEntry(entry, { deleteDisk = true } = {}) {
+    if (!entry) return
+    const existing = uploadIndex.get(entry.id)
+    if (existing) {
+      uploadIndex.delete(entry.id)
+      uploadTotalBytesCache = Math.max(0, uploadTotalBytesCache - existing.size)
+      if (existing.roomId) {
+        const nextRoom = Math.max(0, (uploadRoomBytesCache.get(existing.roomId) || 0) - existing.size)
+        if (nextRoom <= 0) uploadRoomBytesCache.delete(existing.roomId)
+        else uploadRoomBytesCache.set(existing.roomId, nextRoom)
+      }
+    }
+    if (deleteDisk) {
+      void unlinkAsync(entry.binPath).catch(() => {})
+      void unlinkAsync(entry.metaPath).catch(() => {})
+    }
+  }
+
+  function trackUploadEntry(entry) {
+    if (!entry?.id) return
+    if (uploadIndex.has(entry.id)) {
+      removeUploadEntry(uploadIndex.get(entry.id), { deleteDisk: false })
+    }
+    uploadIndex.set(entry.id, entry)
+    uploadTotalBytesCache += entry.size
+    if (entry.roomId) {
+      uploadRoomBytesCache.set(entry.roomId, (uploadRoomBytesCache.get(entry.roomId) || 0) + entry.size)
+    }
+  }
+
+  // One-time startup scan to populate uploadIndex & prune orphaned/expired temp files
+  function initUploadIndex() {
     try {
       const now = Date.now()
       const cutoff = now - UPLOAD_TTL_MS
-      const entries = []
       const files = readdirSync(uploadDir)
       const binIds = new Set()
       for (const file of files) {
         if (file.endsWith('.bin')) binIds.add(file.slice(0, -4))
       }
+      const discovered = []
       for (const file of files) {
         if (file.endsWith('.json')) {
           const id = file.slice(0, -5)
           const metaPath = join(uploadDir, file)
           if (!binIds.has(id)) {
-            try { unlinkSync(metaPath) } catch {}
-          } else {
-            try {
-              const st = statSync(metaPath)
-              if (st.mtimeMs < cutoff) {
-                try { unlinkSync(metaPath) } catch {}
-              }
-            } catch {}
+            void unlinkAsync(metaPath).catch(() => {})
           }
           continue
         }
@@ -443,8 +481,8 @@ export function createRelayServer(options = {}) {
           continue
         }
         if (st.mtimeMs < cutoff) {
-          try { unlinkSync(binPath) } catch {}
-          try { unlinkSync(metaPath) } catch {}
+          void unlinkAsync(binPath).catch(() => {})
+          void unlinkAsync(metaPath).catch(() => {})
           continue
         }
         let roomId = ''
@@ -453,37 +491,46 @@ export function createRelayServer(options = {}) {
             roomId = String(JSON.parse(readFileSync(metaPath, 'utf8'))?.roomId || '')
           }
         } catch {}
-        entries.push({ id, binPath, metaPath, size: st.size, mtimeMs: st.mtimeMs, roomId })
+        discovered.push({ id, binPath, metaPath, size: st.size, mtimeMs: st.mtimeMs, roomId })
       }
-      entries.sort((a, b) => a.mtimeMs - b.mtimeMs)
-      let totalBytes = entries.reduce((sum, e) => sum + e.size, 0)
-      let roomBytes = targetRoomId
-        ? entries.filter((e) => e.roomId === targetRoomId).reduce((sum, e) => sum + e.size, 0)
-        : 0
-      const evicted = new Set()
-      if (targetRoomId && roomBytes + incomingBytes > MAX_ROOM_UPLOAD_BYTES) {
-        for (const e of entries) {
-          if (e.roomId !== targetRoomId) continue
-          if (roomBytes + incomingBytes <= MAX_ROOM_UPLOAD_BYTES) break
-          try { unlinkSync(e.binPath) } catch {}
-          try { unlinkSync(e.metaPath) } catch {}
-          evicted.add(e.id)
-          roomBytes -= e.size
-          totalBytes -= e.size
+      discovered.sort((a, b) => a.mtimeMs - b.mtimeMs)
+      for (const item of discovered) {
+        trackUploadEntry(item)
+      }
+      pruneUploadsForQuota(0, '')
+    } catch {}
+  }
+
+  // Fast O(k) in-memory quota & TTL eviction (zero sync filesystem scans on upload hot path)
+  function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '') {
+    try {
+      const now = Date.now()
+      const cutoff = now - UPLOAD_TTL_MS
+      // 1. Evict expired entries (Map preserves oldest-first insertion order)
+      for (const entry of [...uploadIndex.values()]) {
+        if (entry.mtimeMs < cutoff) {
+          removeUploadEntry(entry, { deleteDisk: true })
         }
       }
-      if (totalBytes + incomingBytes > MAX_TOTAL_UPLOAD_BYTES) {
-        for (const e of entries) {
-          if (evicted.has(e.id)) continue
-          if (totalBytes + incomingBytes <= MAX_TOTAL_UPLOAD_BYTES) break
-          try { unlinkSync(e.binPath) } catch {}
-          try { unlinkSync(e.metaPath) } catch {}
-          evicted.add(e.id)
-          totalBytes -= e.size
+      // 2. Enforce per-room disk quota
+      if (targetRoomId && (uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes > MAX_ROOM_UPLOAD_BYTES) {
+        for (const entry of [...uploadIndex.values()]) {
+          if (entry.roomId !== targetRoomId) continue
+          if ((uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes <= MAX_ROOM_UPLOAD_BYTES) break
+          removeUploadEntry(entry, { deleteDisk: true })
+        }
+      }
+      // 3. Enforce global disk quota
+      if (uploadTotalBytesCache + incomingBytes > MAX_TOTAL_UPLOAD_BYTES) {
+        for (const entry of [...uploadIndex.values()]) {
+          if (uploadTotalBytesCache + incomingBytes <= MAX_TOTAL_UPLOAD_BYTES) break
+          removeUploadEntry(entry, { deleteDisk: true })
         }
       }
     } catch {}
   }
+
+  initUploadIndex()
 
   const cleanupTimer = setInterval(() => {
     pruneUploadsForQuota(0, '')
@@ -840,7 +887,7 @@ export function createRelayServer(options = {}) {
           verifiedEmail = eCheck.email
         }
 
-        const result = accounts.registerUser({
+        const result = await accounts.registerUserAsync({
           username: body.username,
           password: body.password,
           inviteCode,
@@ -978,7 +1025,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: codeCheck.ok ? '邮箱验证码无效或已过期' : codeCheck.error })
           return
         }
-        const reset = accounts.resetPasswordByEmail(eCheck.email, pCheck.password)
+        const reset = await accounts.resetPasswordByEmailAsync(eCheck.email, pCheck.password)
         if (!reset.ok) {
           auth.recordFailure(ip)
           auth.recordAccountFailure(accountRateKey)
@@ -1040,7 +1087,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
-        const verified = accounts.authenticateUser(identifier, body.password, { recordLogin: false })
+        const verified = await accounts.authenticateUserAsync(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
           auth.recordAccountFailure(accountRateKey)
@@ -1126,7 +1173,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
-        const verified = accounts.authenticateUser(identifier, body.password, { recordLogin: false })
+        const verified = await accounts.authenticateUserAsync(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
           auth.recordAccountFailure(accountRateKey)
@@ -1905,13 +1952,21 @@ export function createRelayServer(options = {}) {
         }
         const binPath = join(uploadDir, `${id}.bin`)
         const metaPath = join(uploadDir, `${id}.json`)
-        writeFileSync(binPath, buf, { mode: 0o600 })
+        await writeFileAsync(binPath, buf, { mode: 0o600 })
         try {
-          writeFileSync(metaPath, JSON.stringify(meta), { mode: 0o600 })
+          await writeFileAsync(metaPath, JSON.stringify(meta), { mode: 0o600 })
         } catch (metaErr) {
-          try { unlinkSync(binPath) } catch {}
+          await unlinkAsync(binPath).catch(() => {})
           throw metaErr
         }
+        trackUploadEntry({
+          id,
+          binPath,
+          metaPath,
+          size: buf.length,
+          mtimeMs: meta.createdAt,
+          roomId: ownerRoom,
+        })
         sendJson(res, 200, {
           ok: true,
           upload: {
@@ -1942,30 +1997,38 @@ export function createRelayServer(options = {}) {
       const id = pathname.slice('/api/uploads/'.length).replace(/[^a-zA-Z0-9-]/g, '')
       const binPath = join(uploadDir, `${id}.bin`)
       const metaPath = join(uploadDir, `${id}.json`)
-      if (!id || !existsSync(binPath) || !existsSync(metaPath)) {
+      if (!id || consumedUploadIds.has(id)) {
         sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
         return
       }
-      let meta
-      try {
-        meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-      } catch {
-        sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
-        return
+      let indexed = uploadIndex.get(id)
+      let fileRoom = indexed?.roomId || ''
+      let fileSize = indexed?.size || 0
+      if (!indexed) {
+        try {
+          const [metaRaw, st] = await Promise.all([readFileAsync(metaPath, 'utf8'), statAsync(binPath)])
+          const meta = JSON.parse(metaRaw)
+          fileRoom = String(meta?.roomId || '')
+          fileSize = st.size
+        } catch {
+          sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
+          return
+        }
+      } else {
+        try {
+          const st = await statAsync(binPath)
+          fileSize = st.size
+        } catch {
+          removeUploadEntry(indexed, { deleteDisk: false })
+          sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
+          return
+        }
       }
-      const fileRoom = meta?.roomId
       if (!fileRoom || fileRoom !== callerRoom) {
         sendJson(res, 403, { ok: false, error: '无权访问其他账号的文件' })
         return
       }
-      let data
-      try {
-        data = readFileSync(binPath)
-      } catch {
-        sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
-        return
-      }
-      const dlCheck = trafficGuard.consumeUploadGet(callerRoom, data.length, {
+      const dlCheck = trafficGuard.consumeUploadGet(callerRoom, fileSize, {
         isAdmin: clientUser?.role === 'admin' || isAdminRoom(callerRoom),
       })
       if (!dlCheck.allowed) {
@@ -1973,7 +2036,7 @@ export function createRelayServer(options = {}) {
           type: 'traffic.throttled',
           roomId: callerRoom,
           label: 'upload:get',
-          detail: `${dlCheck.code} (${Math.round(data.length / 1024)}KB)`,
+          detail: `${dlCheck.code} (${Math.round(fileSize / 1024)}KB)`,
           ip: getClientIp(req),
         })
         res.setHeader('Retry-After', String(dlCheck.retryAfterSec || 300))
@@ -1985,20 +2048,40 @@ export function createRelayServer(options = {}) {
         })
         return
       }
-      // Ephemeral consume: when the PC bridge downloads a non-image attachment with ?consume=1, delete temp files immediately
-      if (bridgeRoom && urlObj.searchParams.get('consume') === '1') {
-        try { unlinkSync(binPath) } catch {}
-        try { unlinkSync(metaPath) } catch {}
+      const shouldConsume = Boolean(bridgeRoom && urlObj.searchParams.get('consume') === '1')
+      if (shouldConsume) {
+        consumedUploadIds.add(id)
+        if (consumedUploadIds.size > 1000) {
+          const oldestId = consumedUploadIds.values().next().value
+          if (oldestId) consumedUploadIds.delete(oldestId)
+        }
       }
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
-        'Content-Length': data.length,
+        'Content-Length': fileSize,
         'Content-Disposition': `attachment; filename*=UTF-8''encrypted.bin`,
         'Cache-Control': 'private, no-store',
         'X-Content-Type-Options': 'nosniff',
         'Content-Security-Policy': "default-src 'none'; sandbox",
       })
-      res.end(data)
+      const stream = createReadStream(binPath)
+      const cleanupConsumed = () => {
+        if (!shouldConsume) return
+        if (indexed) {
+          removeUploadEntry(indexed, { deleteDisk: true })
+        } else {
+          void unlinkAsync(binPath).catch(() => {})
+          void unlinkAsync(metaPath).catch(() => {})
+        }
+      }
+      stream.on('error', () => {
+        try { res.destroy() } catch {}
+      })
+      stream.on('end', cleanupConsumed)
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy()
+      })
+      stream.pipe(res)
       return
     }
 
@@ -2260,6 +2343,7 @@ export function createRelayServer(options = {}) {
   const close = () =>
     new Promise((resolveClose) => {
       clearInterval(cleanupTimer)
+      accounts.flush()
       hub.shutdown()
       wss.close(() => {
         server.close(() => resolveClose())

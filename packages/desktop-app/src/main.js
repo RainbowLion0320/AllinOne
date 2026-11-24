@@ -595,7 +595,7 @@ function registerStaticProtocol() {
       if (extname(target).toLowerCase() === '.html') {
         const isSandboxFrame = target.endsWith(`${sep}sandbox-preview.html`)
         headers['Content-Security-Policy'] = isSandboxFrame
-          ? "sandbox allow-scripts allow-forms; default-src 'self' app: 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'"
+          ? "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox; default-src 'self' app: 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'"
           : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https: http:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
       }
       return new Response(buf, {

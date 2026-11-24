@@ -1,5 +1,6 @@
 import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmod as chmodAsync, rename as renameAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { safeEqual } from './auth.js'
 
@@ -185,8 +186,12 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function save() {
-    const payload = JSON.stringify(
+  let saveTimer = null
+  let saveDirty = false
+  let asyncSaveInFlight = null
+
+  function serializeAccountsPayload() {
+    return JSON.stringify(
       {
         version: 1,
         users: [...usersById.values()],
@@ -195,6 +200,15 @@ export function createAccountStore({ filePath }) {
       null,
       2,
     )
+  }
+
+  function save() {
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+    }
+    saveDirty = false
+    const payload = serializeAccountsPayload()
     const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
     try {
       writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
@@ -204,6 +218,61 @@ export function createAccountStore({ filePath }) {
     } catch (err) {
       try { unlinkSync(tmpPath) } catch {}
       throw err
+    }
+  }
+
+  async function drainAsyncSave() {
+    if (asyncSaveInFlight) return asyncSaveInFlight
+    asyncSaveInFlight = (async () => {
+      while (saveDirty) {
+        saveDirty = false
+        const payload = serializeAccountsPayload()
+        const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+        try {
+          await writeFileAsync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+          try { await chmodAsync(tmpPath, 0o600) } catch {}
+          await renameAsync(tmpPath, filePath)
+          try { await chmodAsync(filePath, 0o600) } catch {}
+        } catch (err) {
+          try { await unlinkAsync(tmpPath) } catch {}
+          console.error(`[accounts] Async save failed: ${err?.message || err}`)
+          break
+        }
+      }
+    })().finally(() => {
+      asyncSaveInFlight = null
+      if (saveDirty) {
+        scheduleSave(1000)
+      }
+    })
+    return asyncSaveInFlight
+  }
+
+  /**
+   * Coalesce high-frequency non-critical metadata writes (e.g. lastSeenAt heartbeats)
+   * into a single serialized non-blocking disk write every few seconds.
+   */
+  function scheduleSave(delayMs = 5000) {
+    saveDirty = true
+    if (saveTimer) return
+    saveTimer = setTimeout(() => {
+      saveTimer = null
+      void drainAsyncSave()
+    }, delayMs)
+    saveTimer.unref?.()
+  }
+
+  function flush() {
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+    }
+    if (saveDirty) {
+      try {
+        save()
+      } catch (err) {
+        console.error(`[accounts] Flush save failed: ${err?.message || err}`)
+      }
     }
   }
 
@@ -421,6 +490,127 @@ export function createAccountStore({ filePath }) {
     }
   }
 
+  async function registerUserAsync({
+    username,
+    password,
+    inviteCode = '',
+    email = '',
+    emailVerified = false,
+    isBootstrapAdmin = false,
+  } = {}) {
+    const uCheck = validateUsername(username)
+    if (!uCheck.ok) return uCheck
+    const pCheck = validatePassword(password)
+    if (!pCheck.ok) return pCheck
+
+    if (userIdByLower.has(uCheck.usernameLower)) {
+      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+    }
+
+    let cleanEmail = ''
+    let cleanEmailLower = ''
+    if (String(email || '').trim()) {
+      const eCheck = validateEmail(email)
+      if (!eCheck.ok) return eCheck
+      if (userIdByEmailLower.has(eCheck.emailLower)) {
+        return { ok: false, error: '该邮箱已被其他账号绑定' }
+      }
+      cleanEmail = eCheck.email
+      cleanEmailLower = eCheck.emailLower
+    }
+
+    const normalizedInvite = isBootstrapAdmin ? '' : normalizeInviteCode(inviteCode)
+    if (!isBootstrapAdmin) {
+      if (!normalizedInvite) {
+        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
+      }
+      let preMatched = null
+      for (const inv of invitesById.values()) {
+        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
+          preMatched = inv
+          break
+        }
+      }
+      if (!preMatched) {
+        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
+      }
+    }
+
+    // Offload expensive scrypt hashing to libuv worker pool so event loop never stalls
+    const { salt, hash } = await hashPasswordAsync(pCheck.password)
+
+    // Re-verify uniqueness & single-use invite state synchronously after await (prevents TOCTOU races)
+    if (isBootstrapAdmin && usersById.size > 0) {
+      return { ok: false, error: '管理员账号已初始化，请使用邀请码注册' }
+    }
+    if (userIdByLower.has(uCheck.usernameLower)) {
+      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+    }
+    if (cleanEmailLower && userIdByEmailLower.has(cleanEmailLower)) {
+      return { ok: false, error: '该邮箱已被其他账号绑定' }
+    }
+
+    let matchedInvite = null
+    if (!isBootstrapAdmin) {
+      for (const inv of invitesById.values()) {
+        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
+          matchedInvite = inv
+          break
+        }
+      }
+      if (!matchedInvite) {
+        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
+      }
+    }
+
+    const now = Date.now()
+    const userId = `usr_${randomBytes(8).toString('hex')}`
+    const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
+
+    if (matchedInvite) {
+      matchedInvite.status = 'used'
+      matchedInvite.usedByUserId = userId
+      matchedInvite.usedByUsername = uCheck.username
+      matchedInvite.usedAt = now
+    }
+
+    const record = {
+      userId,
+      username: uCheck.username,
+      usernameLower: uCheck.usernameLower,
+      email: cleanEmail,
+      emailLower: cleanEmailLower,
+      emailVerified: Boolean(cleanEmail && emailVerified),
+      emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
+      loginEmail2fa: false,
+      knownLoginIps: [],
+      role,
+      passwordSalt: salt,
+      passwordHash: hash,
+      tokenVersion: 0,
+      createdAt: now,
+      lastLoginAt: now,
+      invitedBy: isBootstrapAdmin ? 'bootstrap' : matchedInvite?.createdBy || '',
+      inviteId: matchedInvite?.id || '',
+      devices: [],
+      sessions: [],
+      revokedSids: {},
+    }
+
+    usersById.set(userId, record)
+    userIdByLower.set(record.usernameLower, userId)
+    if (record.emailLower) {
+      userIdByEmailLower.set(record.emailLower, userId)
+    }
+    save()
+
+    return {
+      ok: true,
+      user: sanitizeUser(record),
+      devices: [],
+    }
+  }
+
   function resolveAccountKey(identifier) {
     const lower = String(identifier || '').trim().toLowerCase()
     if (!lower) return ''
@@ -435,7 +625,7 @@ export function createAccountStore({ filePath }) {
     const record = usersById.get(userId)
     if (!record) return null
     record.lastLoginAt = Date.now()
-    save()
+    scheduleSave()
     return sanitizeUser(record)
   }
 
@@ -454,7 +644,32 @@ export function createAccountStore({ filePath }) {
     }
     if (recordLogin) {
       record.lastLoginAt = Date.now()
-      save()
+      scheduleSave()
+    }
+    return {
+      user: sanitizeUser(record),
+      devices: record.devices.map(sanitizeDeviceRecord),
+    }
+  }
+
+  async function authenticateUserAsync(identifier, password, { recordLogin = true } = {}) {
+    const lower = String(identifier || '').trim().toLowerCase()
+    if (!lower || !password) return null
+    let userId = userIdByLower.get(lower)
+    if (!userId && lower.includes('@')) {
+      userId = userIdByEmailLower.get(lower)
+    }
+    if (!userId) return null
+    const record = usersById.get(userId)
+    if (!record) return null
+    const origSalt = record.passwordSalt
+    const origHash = record.passwordHash
+    const ok = await verifyPasswordHashAsync(password, origSalt, origHash)
+    if (!ok) return null
+    if (usersById.get(userId) !== record || record.passwordHash !== origHash) return null
+    if (recordLogin) {
+      record.lastLoginAt = Date.now()
+      scheduleSave()
     }
     return {
       user: sanitizeUser(record),
@@ -499,6 +714,32 @@ export function createAccountStore({ filePath }) {
       return { ok: false, error: '账号不存在' }
     }
     const { salt, hash } = hashPassword(pCheck.password)
+    record.passwordSalt = salt
+    record.passwordHash = hash
+    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    record.sessions = []
+    record.revokedSids = {}
+    save()
+    return { ok: true, user: sanitizeUser(record) }
+  }
+
+  async function resetPasswordByEmailAsync(email, newPassword) {
+    const eCheck = validateEmail(email)
+    if (!eCheck.ok) return eCheck
+    const pCheck = validatePassword(newPassword)
+    if (!pCheck.ok) return pCheck
+    const userId = userIdByEmailLower.get(eCheck.emailLower)
+    if (!userId) {
+      return { ok: false, error: '该邮箱未绑定任何账号' }
+    }
+    const record = usersById.get(userId)
+    if (!record) {
+      return { ok: false, error: '账号不存在' }
+    }
+    const { salt, hash } = await hashPasswordAsync(pCheck.password)
+    if (usersById.get(userId) !== record) {
+      return { ok: false, error: '账号状态已变更，请重试' }
+    }
     record.passwordSalt = salt
     record.passwordHash = hash
     record.tokenVersion = Number(record.tokenVersion || 0) + 1
@@ -636,7 +877,7 @@ export function createAccountStore({ filePath }) {
         // Throttle disk writes for heartbeat/reconnect bursts (update persisted lastSeenAt at most once/min)
         const shouldPersist = now - (dev.lastSeenAt || 0) > 60_000
         dev.lastSeenAt = now
-        if (shouldPersist) save()
+        if (shouldPersist) scheduleSave()
         return {
           roomId: record.userId,
           userId: record.userId,
@@ -790,7 +1031,7 @@ export function createAccountStore({ filePath }) {
     }
     const stale = now - (Number(entry.lastSeenAt) || 0) > 60_000
     entry.lastSeenAt = now
-    if (changed || stale) save()
+    if (changed || stale) scheduleSave()
     return true
   }
 
@@ -920,14 +1161,18 @@ export function createAccountStore({ filePath }) {
     isEmailTaken,
     getUserByEmail,
     registerUser,
+    registerUserAsync,
     resolveAccountKey,
     markUserLogin,
     authenticateUser,
+    authenticateUserAsync,
     setUserEmail,
     setLoginEmail2fa,
     checkAndRememberLoginContext,
     resetPasswordByEmail,
+    resetPasswordByEmailAsync,
     changePasswordAsync,
+    flush,
     bindDevice,
     verifyDeviceBridge,
     listUserDevices,

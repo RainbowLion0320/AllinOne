@@ -112,6 +112,8 @@ export class RelayHub {
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
     /** @type {Map<string, { roomId: string, ws: import('ws').WebSocket, user: any, connectedAt: number }>} */
     this.clients = new Map()
+    /** @type {Map<string, Set<string>>} Secondary index for O(1) per-room event fan-out */
+    this.roomClients = new Map()
     /** @type {Map<string, any>} */
     this.pendingRpc = new Map()
     /** @type {Map<string, { seq: number, buffer: any[] }>} */
@@ -206,9 +208,42 @@ export class RelayHub {
     return out.sort((a, b) => b.createdAt - a.createdAt)
   }
 
+  _indexRoomClient(roomId, clientId) {
+    let set = this.roomClients.get(roomId)
+    if (!set) {
+      set = new Set()
+      this.roomClients.set(roomId, set)
+    }
+    set.add(clientId)
+  }
+
+  _unindexRoomClient(roomId, clientId) {
+    const set = this.roomClients.get(roomId)
+    if (!set) return
+    set.delete(clientId)
+    if (set.size === 0) {
+      this.roomClients.delete(roomId)
+    }
+  }
+
+  _getRoomClientEntries(roomId) {
+    const set = this.roomClients.get(roomId)
+    if (!set || set.size === 0) return []
+    const out = []
+    for (const cid of set) {
+      const c = this.clients.get(cid)
+      if (c) out.push([cid, c])
+      else set.delete(cid)
+    }
+    if (set.size === 0) this.roomClients.delete(roomId)
+    return out
+  }
+
   pushRoomGrantEvent(roomId, event, payload, excludeClientId = '') {
     const rid = String(roomId || '').trim()
     if (!rid) return
+    const entries = this._getRoomClientEntries(rid)
+    if (entries.length === 0) return
     const frame = JSON.stringify({
       type: 'event',
       ts: Date.now(),
@@ -216,8 +251,8 @@ export class RelayHub {
       event,
       payload,
     })
-    for (const [cid, c] of this.clients.entries()) {
-      if (c.roomId !== rid || c.ws.readyState !== 1) continue
+    for (const [cid, c] of entries) {
+      if (c.ws.readyState !== 1) continue
       if (excludeClientId && cid === excludeClientId) continue
       try { c.ws.send(frame) } catch {}
     }
@@ -584,8 +619,8 @@ export class RelayHub {
     const rid = String(roomId || '').trim()
     if (!rid) return []
     const out = []
-    for (const [clientId, c] of this.clients.entries()) {
-      if (c.roomId !== rid || c.ws.readyState !== 1) continue
+    for (const [clientId, c] of this._getRoomClientEntries(rid)) {
+      if (c.ws.readyState !== 1) continue
       out.push({
         clientId,
         sid: c.sid || '',
@@ -603,6 +638,8 @@ export class RelayHub {
   broadcastRoomClients(roomId) {
     const rid = String(roomId || '').trim()
     if (!rid) return
+    const entries = this._getRoomClientEntries(rid)
+    if (entries.length === 0) return
     const clients = this.getClientList(rid)
     const frame = JSON.stringify({
       type: 'event',
@@ -614,8 +651,8 @@ export class RelayHub {
         clients,
       },
     })
-    for (const client of this.clients.values()) {
-      if (client.roomId === rid && client.ws.readyState === 1) {
+    for (const [, client] of entries) {
+      if (client.ws.readyState === 1) {
         try {
           client.ws.send(frame)
         } catch {}
@@ -636,10 +673,7 @@ export class RelayHub {
       try { ws.close(4401, 'Invalid account room') } catch {}
       return
     }
-    const roomClientEntries = []
-    for (const [cid, c] of this.clients.entries()) {
-      if (c.roomId === roomId) roomClientEntries.push([cid, c])
-    }
+    const roomClientEntries = this._getRoomClientEntries(roomId)
     if (roomClientEntries.length >= MAX_CLIENTS_PER_ROOM) {
       roomClientEntries.sort(
         (a, b) => (a[1].lastSeenAt || a[1].connectedAt || 0) - (b[1].lastSeenAt || b[1].connectedAt || 0),
@@ -662,6 +696,7 @@ export class RelayHub {
       isAlive: true,
     }
     this.clients.set(clientId, entry)
+    this._indexRoomClient(roomId, clientId)
     this.globalStats.totalClientConnects += 1
     const rStats = this.getOrCreateRoomStats(roomId)
     rStats.lastActivityAt = now
@@ -729,6 +764,7 @@ export class RelayHub {
       this.cancelClientGrants(clientId, 'disconnected')
       const hadQrNudge = Boolean(entry.lastQrNudgeAt)
       const existed = this.clients.delete(clientId)
+      this._unindexRoomClient(roomId, clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
       if (existed) {
         if (hadQrNudge) {
@@ -1206,8 +1242,8 @@ export class RelayHub {
         evState.buffer.shift()
       }
     }
-    for (const client of this.clients.values()) {
-      if (client.roomId === rid && client.ws.readyState === 1) {
+    for (const [, client] of this._getRoomClientEntries(rid)) {
+      if (client.ws.readyState === 1) {
         try {
           client.ws.send(frame)
         } catch {}
@@ -1279,6 +1315,7 @@ export class RelayHub {
     if (!targets.length) return 0
     for (const [cid, client] of targets) {
       this.clients.delete(cid)
+      this._unindexRoomClient(client.roomId, cid)
       try {
         client.ws.close(code, reason)
       } catch {}
@@ -1296,8 +1333,7 @@ export class RelayHub {
     const targetSid = String(sid || '').trim()
     if (!rid || (!targetCid && !targetSid)) return 0
     const targets = []
-    for (const [cid, client] of this.clients.entries()) {
-      if (client.roomId !== rid) continue
+    for (const [cid, client] of this._getRoomClientEntries(rid)) {
       const matchCid = targetCid && cid === targetCid
       const matchSid = targetSid && client.sid && client.sid === targetSid
       if (matchCid || matchSid) targets.push([cid, client])
@@ -1316,8 +1352,7 @@ export class RelayHub {
     const keepCid = String(keepClientId || '').trim()
     const keepSession = String(keepSid || '').trim()
     const targets = []
-    for (const [cid, client] of this.clients.entries()) {
-      if (client.roomId !== rid) continue
+    for (const [cid, client] of this._getRoomClientEntries(rid)) {
       if ((keepCid && cid === keepCid) || (keepSession && client.sid && client.sid === keepSession)) {
         if (newSidForKept) client.sid = String(newSidForKept)
         continue
@@ -1335,10 +1370,7 @@ export class RelayHub {
   disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {
     const rid = String(roomId || '').trim()
     if (!rid) return 0
-    const targets = []
-    for (const [cid, client] of this.clients.entries()) {
-      if (client.roomId === rid) targets.push([cid, client])
-    }
+    const targets = this._getRoomClientEntries(rid)
     const disconnected = this._dropClients(targets, code, reason)
     const evState = this.roomEvents.get(rid)
     if (evState) {
