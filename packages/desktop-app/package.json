@@ -27,6 +27,13 @@
     "copyright": "Copyright © 2026 All in One",
     "electronVersion": "35.7.5",
     "npmRebuild": false,
+    "compression": "maximum",
+    "electronLanguages": [
+      "en",
+      "en_GB",
+      "zh_CN",
+      "zh_TW"
+    ],
     "afterPack": "scripts/after-pack.cjs",
     "directories": {
       "output": "release",
@@ -69,6 +76,7 @@
     },
     "dmg": {
       "title": "All in One",
+      "format": "ULFO",
       "contents": [
         {
           "x": 140,
