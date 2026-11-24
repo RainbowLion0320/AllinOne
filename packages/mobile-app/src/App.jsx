@@ -2358,6 +2358,7 @@ export function App() {
         username={activeDevice?.username || ''}
         bridgeName={activeDeviceName}
         bridgeE2ee={activeBridge?.e2ee || null}
+        isBridgeLocked={e2eeLocked}
         activeKey={activeBridgeE2ee.shareableKey}
         activeKeyId={activeBridgeE2ee.shareableKeyId}
         isDesktopApp={Boolean(desktopApi)}

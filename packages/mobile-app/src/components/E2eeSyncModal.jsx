@@ -38,6 +38,7 @@ export function E2eeSyncModal({
   username = '',
   bridgeName = '',
   bridgeE2ee = null,
+  isBridgeLocked = false,
   activeKey = '',
   activeKeyId = '',
   isDesktopApp = false,
@@ -51,18 +52,20 @@ export function E2eeSyncModal({
   onRotateDesktopKey = null,
 }) {
   const { bi, t } = useI18n()
-  const isLocked = Boolean(bridgeE2ee?.enabled && !activeKey)
-  const canRequestGrant = Boolean(client && roomId)
+  const isLocked = Boolean(isBridgeLocked || (bridgeE2ee?.enabled && !activeKey))
+  // Strictly mutually exclusive: an unlocked device ONLY shows its own key QR;
+  // a locked / keyless device ONLY shows the remote phone-approval request QR.
+  const canShowMyKey = Boolean(activeKey && !isLocked)
+  const canRequestGrant = Boolean(client && roomId && !canShowMyKey)
 
   const resolveInitialTab = useCallback(() => {
-    if (initialTab === 'show' || initialTab === 'import' || initialTab === 'request') {
-      if (initialTab === 'request' && !canRequestGrant) return activeKey ? 'show' : 'import'
-      return initialTab
-    }
-    if (activeKey) return 'show'
+    if (initialTab === 'import') return 'import'
+    if (initialTab === 'show' && canShowMyKey) return 'show'
+    if (initialTab === 'request' && canRequestGrant) return 'request'
+    if (canShowMyKey) return 'show'
     if (isDesktopApp && canRequestGrant) return 'request'
     return 'import'
-  }, [initialTab, activeKey, isDesktopApp, canRequestGrant])
+  }, [initialTab, canShowMyKey, canRequestGrant, isDesktopApp])
 
   const [tab, setTab] = useState(resolveInitialTab)
   const [scannerOpen, setScannerOpen] = useState(false)
@@ -404,7 +407,7 @@ export function E2eeSyncModal({
     try {
       await onRotateDesktopKey()
       setConfirmRotate(false)
-      setInfo(bi('已生成全新 256-bit 密钥并重启本机桥接，旧手机需重新扫码同步。', 'Generated a new 256-bit key and restarted local bridge. Re-scan on other devices.'))
+      setInfo(bi('已重置本机密钥，其他设备需重新扫码。', 'Key rotated. Re-scan on other devices.'))
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
@@ -413,11 +416,11 @@ export function E2eeSyncModal({
   }
 
   const tabs = []
-  if (activeKey) {
+  if (canShowMyKey) {
     tabs.push({ id: 'show', icon: QrCode, label: bi('本机密钥', 'My Key') })
   }
   if (canRequestGrant) {
-    tabs.push({ id: 'request', icon: Smartphone, label: bi('手机授权', 'Approve via Phone') })
+    tabs.push({ id: 'request', icon: Smartphone, label: bi('请求手机授权', 'Approve via Phone') })
   }
   tabs.push({ id: 'import', icon: ScanLine, label: bi('扫码 / 导入', 'Scan / Import') })
 
@@ -501,7 +504,7 @@ export function E2eeSyncModal({
 
           {/* Body */}
           <div className="flex-1 space-y-3.5 overflow-y-auto px-4 py-3.5">
-            {tab === 'show' && activeKey ? (
+            {tab === 'show' && canShowMyKey ? (
               <>
                 <div className="flex flex-col items-center rounded-2xl border border-slate-200/80 bg-slate-50/70 p-4 text-center dark:border-slate-800 dark:bg-[#14171F]">
                   {qrDataUrl && (
