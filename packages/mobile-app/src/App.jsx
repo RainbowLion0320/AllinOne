@@ -1884,6 +1884,8 @@ export function App() {
         isAdmin={isAdmin}
         isMacDesktop={isMacDesktop}
         hasUpdate={updateState?.status === 'available' || updateState?.status === 'downloaded'}
+        e2eeLocked={e2eeLocked}
+        onQuickScan={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
       />

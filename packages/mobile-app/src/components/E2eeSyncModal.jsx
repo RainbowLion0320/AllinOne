@@ -84,6 +84,7 @@ export function E2eeSyncModal({
   grantStateRef.current = grantState
   const applyToDesktopRef = useRef(applyToDesktop)
   applyToDesktopRef.current = applyToDesktop
+  const didAutoOpenScannerRef = useRef(false)
 
   const cancelActiveGrant = useCallback(() => {
     const cur = grantStateRef.current
@@ -138,6 +139,7 @@ export function E2eeSyncModal({
 
   useEffect(() => {
     if (!open) {
+      didAutoOpenScannerRef.current = false
       cancelActiveGrant()
       setScannerOpen(false)
       setManualInput('')
@@ -150,7 +152,8 @@ export function E2eeSyncModal({
     }
     const nextTab = resolveInitialTab()
     setTab(nextTab)
-    if (autoOpenScanner && nextTab === 'import') {
+    if (autoOpenScanner && nextTab === 'import' && !didAutoOpenScannerRef.current) {
+      didAutoOpenScannerRef.current = true
       setScannerOpen(true)
     }
   }, [open, resolveInitialTab, autoOpenScanner, cancelActiveGrant])

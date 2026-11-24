@@ -10,6 +10,7 @@ import {
   Monitor,
   Plus,
   RefreshCw,
+  ScanLine,
   Search,
   Settings,
   User,
@@ -167,6 +168,8 @@ export function SidebarDrawer({
   isAdmin = false,
   isMacDesktop = false,
   hasUpdate = false,
+  e2eeLocked = false,
+  onQuickScan,
   onOpenSettings,
   onOpenDeviceSwitcher,
 }) {
@@ -548,39 +551,75 @@ export function SidebarDrawer({
           )}
         </div>
 
-        {/* Minimal single-row footer: User profile & Settings */}
+        {/* Minimal single-row footer: User profile, Quick Scan & Settings */}
         <div className="pb-safe border-t border-slate-200/80 px-3 pt-2 pb-2 dark:border-slate-800">
-          <button
-            type="button"
-            onClick={() => {
-              onClose()
-              onOpenSettings?.()
-            }}
-            aria-label={bi('打开设置', 'Open Settings')}
-            className="flex w-full items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
-          >
-            <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
-              {username ? username.slice(0, 1).toUpperCase() : <User className="h-3.5 w-3.5" />}
-              {hasUpdate && (
-                <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
-              )}
-            </div>
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
-                {username ? `@${username}` : activeDeviceName || t('common.settings')}
-              </span>
-              {hasUpdate ? (
-                <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
-                  {bi('有更新', 'Update')}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onOpenSettings?.()
+              }}
+              aria-label={bi('打开设置', 'Open Settings')}
+              className="flex min-w-0 flex-1 items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
+            >
+              <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
+                {username ? username.slice(0, 1).toUpperCase() : <User className="h-3.5 w-3.5" />}
+                {hasUpdate && (
+                  <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
+                )}
+              </div>
+              <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
+                  {username ? `@${username}` : activeDeviceName || t('common.settings')}
                 </span>
-              ) : isAdmin ? (
-                <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
-                  {t('common.admin')}
-                </span>
-              ) : null}
-            </div>
-            <Settings className="h-4 w-4 shrink-0 text-slate-400" />
-          </button>
+                {hasUpdate ? (
+                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
+                    {bi('有更新', 'Update')}
+                  </span>
+                ) : isAdmin ? (
+                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
+                    {t('common.admin')}
+                  </span>
+                ) : null}
+              </div>
+            </button>
+
+            {onQuickScan && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onQuickScan()
+                }}
+                title={bi('扫一扫（同步密钥 / 授权新设备）', 'Scan QR (Sync Key / Authorize Device)')}
+                aria-label={bi('扫一扫', 'Scan QR')}
+                className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition active:scale-95 ${
+                  e2eeLocked
+                    ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
+                    : 'text-slate-500 hover:bg-slate-200/70 hover:text-[#4D6BFE] dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-[#8CA3FF]'
+                }`}
+              >
+                <ScanLine className="h-4.5 w-4.5" />
+                {e2eeLocked && (
+                  <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
+                )}
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onOpenSettings?.()
+              }}
+              title={bi('设置', 'Settings')}
+              aria-label={bi('打开设置', 'Open Settings')}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-700 active:scale-95 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       </aside>
     </>
