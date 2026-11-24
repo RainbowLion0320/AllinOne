@@ -7,6 +7,8 @@ const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
 const E2EE_GRANT_TTL_MS = 120_000
 const E2EE_GRANT_MAX_PER_ROOM = 8
+const MAX_CLIENTS_PER_ROOM = 30
+const MAX_BRIDGES_PER_ROOM = 16
 
 /**
  * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
@@ -364,6 +366,16 @@ export class RelayHub {
     const bridgeId = String(meta.bridgeId || 'home-pc').trim() || 'home-pc'
     const key = this.bridgeKey(roomId, bridgeId)
     const existing = this.bridges.get(key)
+    if (!existing) {
+      let roomBridgeCount = 0
+      for (const b of this.bridges.values()) {
+        if (b.roomId === roomId && b.ws.readyState === 1) roomBridgeCount += 1
+      }
+      if (roomBridgeCount >= MAX_BRIDGES_PER_ROOM) {
+        try { ws.close(4029, 'Too many concurrent bridges in room') } catch {}
+        return
+      }
+    }
     if (existing && existing.ws !== ws) {
       try {
         existing.ws.close(4001, 'Replaced by newer bridge connection')
@@ -491,6 +503,21 @@ export class RelayHub {
     if (!roomId.startsWith('usr_')) {
       try { ws.close(4401, 'Invalid account room') } catch {}
       return
+    }
+    const roomClientEntries = []
+    for (const [cid, c] of this.clients.entries()) {
+      if (c.roomId === roomId) roomClientEntries.push([cid, c])
+    }
+    if (roomClientEntries.length >= MAX_CLIENTS_PER_ROOM) {
+      roomClientEntries.sort(
+        (a, b) => (a[1].lastSeenAt || a[1].connectedAt || 0) - (b[1].lastSeenAt || b[1].connectedAt || 0),
+      )
+      const toEvict = roomClientEntries.slice(0, roomClientEntries.length - MAX_CLIENTS_PER_ROOM + 1)
+      for (const [evictId, evictEntry] of toEvict) {
+        this.clients.delete(evictId)
+        this.cancelClientGrants(evictId, 'evicted')
+        try { evictEntry.ws.close(4029, 'Too many concurrent client connections') } catch {}
+      }
     }
     const parsed = parseClientDeviceInfo(user?.dev || '', userAgent, user?.kind || '')
     const now = Date.now()
