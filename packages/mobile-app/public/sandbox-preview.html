@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>All in One Sandbox Preview</title>
+</head>
+<body style="margin:0;background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,sans-serif;">
+  <script>
+    (function () {
+      var rendered = false;
+      function handleMessage(event) {
+        if (rendered) return;
+        if (event.source !== window.parent) return;
+        var data = event.data;
+        if (!data || data.type !== 'allinone-sandbox-html' || typeof data.html !== 'string') return;
+        rendered = true;
+        window.removeEventListener('message', handleMessage);
+        document.open();
+        document.write(data.html);
+        document.close();
+      }
+      window.addEventListener('message', handleMessage);
+      try {
+        window.parent.postMessage({ type: 'allinone-sandbox-ready' }, '*');
+      } catch (e) {}
+    })();
+  </script>
+</body>
+</html>

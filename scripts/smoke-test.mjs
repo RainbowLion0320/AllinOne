@@ -5234,6 +5234,14 @@ async function main() {
         const htmlItem = extracted.find((x) => x.filename === 'dashboard.html')
         assert.equal(htmlItem?.previewable, true)
         assert.equal(htmlItem?.badge, 'HTML')
+
+        // 32h. Sandboxed HTML preview host frame serves strict opaque-origin sandbox CSP while main index.html keeps strict script-src 'self'
+        const sandboxRes = await fetch(`${httpBase}/sandbox-preview.html`)
+        assert.equal(sandboxRes.status, 200)
+        const sandboxCsp = sandboxRes.headers.get('content-security-policy') || ''
+        assert.ok(sandboxCsp.includes('sandbox allow-scripts'), 'sandbox-preview.html must enforce HTTP sandbox CSP')
+        assert.equal(sandboxCsp.includes('allow-same-origin'), false, 'sandbox-preview.html must NEVER grant allow-same-origin')
+        assert.ok(sandboxCsp.includes("connect-src 'none'"), 'sandbox-preview.html must block outbound fetch/XHR')
       } finally {
         await docOrch.dispose()
       }

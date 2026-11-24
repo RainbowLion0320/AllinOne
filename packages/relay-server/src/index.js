@@ -1,7 +1,7 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
-import { extname, join, normalize, resolve, sep } from 'node:path'
+import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
@@ -72,6 +72,8 @@ const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
 const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+const SANDBOX_PREVIEW_CSP =
+  "sandbox allow-scripts allow-forms; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
 
 function maskEmailAddress(email) {
   const clean = String(email || '').trim()
@@ -2054,7 +2056,8 @@ export function createRelayServer(options = {}) {
               'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
             }
             if (ext === '.html') {
-              staticHeaders['Content-Security-Policy'] = APP_HTML_CSP
+              staticHeaders['Content-Security-Policy'] =
+                basename(target) === 'sandbox-preview.html' ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
             }
             res.writeHead(200, staticHeaders)
             res.end()
@@ -2068,7 +2071,8 @@ export function createRelayServer(options = {}) {
             'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
           }
           if (ext === '.html') {
-            staticHeaders['Content-Security-Policy'] = APP_HTML_CSP
+            staticHeaders['Content-Security-Policy'] =
+              basename(target) === 'sandbox-preview.html' ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
           }
           res.writeHead(200, staticHeaders)
           res.end(data)
