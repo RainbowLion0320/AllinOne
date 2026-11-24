@@ -908,7 +908,13 @@ export function App() {
     const prevKey = lastMetaAppsSigRef.current
     lastMetaAppsSigRef.current = key
     if (activeBridgeMetaApps) {
-      setAppsStatus(activeBridgeMetaApps)
+      setAppsStatus((prev) =>
+        activeBridgeMetaApps.map((nextApp) => {
+          if (nextApp.quota) return nextApp
+          const old = prev.find((p) => p.app === nextApp.app)
+          return old?.quota ? { ...nextApp, quota: old.quota } : nextApp
+        }),
+      )
     }
     // If readiness changed mid-session on the same bridge, quietly refresh model catalog too
     if (prevKey && prevKey.startsWith(`${activeBridgeId}::`)) {
@@ -1444,9 +1450,30 @@ export function App() {
           prev.map((s) => (s.id === sid ? { ...s, status: 'idle', updatedAt: Date.now() } : s)),
         )
         // Reconcile optimistic msg-u/msg-a IDs with authoritative disk transcript & syncState shortly after turn settles
+        const doneGen = deviceGenRef.current
         setTimeout(() => {
           if (activeSessionRef.current?.id === sid && !liveStreamMapRef.current[sid]?.active) {
             void syncActiveSessionQuietly(sid)
+          }
+          // Quietly refresh E2EE subscription quota (e.g. Codex / Claude) after a turn finishes
+          if (payload?.app === 'codex' || payload?.app === 'claude') {
+            const curClient = clientRef.current
+            const reqBridgeId = activeBridgeIdRef.current
+            if (curClient && curClient === client && reqBridgeId && deviceGenRef.current === doneGen) {
+              curClient
+                .rpc(RPC.APPS_STATUS, {}, 15_000, { bridgeId: reqBridgeId })
+                .then((res) => {
+                  if (
+                    deviceGenRef.current === doneGen &&
+                    activeBridgeIdRef.current === reqBridgeId &&
+                    clientRef.current === curClient &&
+                    Array.isArray(res?.apps)
+                  ) {
+                    setAppsStatus(res.apps)
+                  }
+                })
+                .catch(() => {})
+            }
           }
         }, 1200)
       }
@@ -2288,6 +2315,7 @@ export function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         sessions={sessions}
+        appsStatus={appsStatus}
         activeSessionId={activeSession?.id}
         pendingApprovalSessionIds={pendingApprovalSessionIds}
         onSelectSession={openSession}

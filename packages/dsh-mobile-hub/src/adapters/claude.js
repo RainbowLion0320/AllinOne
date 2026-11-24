@@ -926,6 +926,30 @@ function parseClaudeJsonlMessages(filePath) {
 }
 
 /**
+ * Normalize a Claude Code `rate_limit_event` payload (`rate_limit_info`) into a uniform
+ * E2EE quota descriptor when a numeric utilization percentage is provided.
+ */
+export function normalizeClaudeQuota(rateLimitInfo, now = Date.now()) {
+  if (!rateLimitInfo || typeof rateLimitInfo !== 'object') return null
+  const rawUtil = rateLimitInfo.utilization ?? rateLimitInfo.usedPercent ?? rateLimitInfo.used_percent
+  if (typeof rawUtil !== 'number' || !Number.isFinite(rawUtil)) return null
+  const pct = rawUtil >= 0 && rawUtil <= 1 ? rawUtil * 100 : rawUtil
+  const usedPercent = Math.max(0, Math.min(100, Math.round(pct)))
+  const resetsAt = toEpochMs(rateLimitInfo.resetsAt ?? rateLimitInfo.resets_at ?? 0)
+  if (resetsAt > 0 && now > resetsAt + 60_000) return null
+  const rawType = String(rateLimitInfo.rateLimitType || rateLimitInfo.rate_limit_type || '').toLowerCase()
+  const isWeekly = rawType.includes('seven_day') || rawType.includes('weekly') || rawType.includes('7d')
+  return {
+    remainingPercent: 100 - usedPercent,
+    usedPercent,
+    windowKind: isWeekly ? 'weekly' : 'session',
+    windowMinutes: isWeekly ? 10080 : 300,
+    resetsAt,
+    updatedAt: now,
+  }
+}
+
+/**
  * Claude Code / Claude Desktop (Cowork + Desktop Code) Sessions Adapter.
  * - Claude Code CLI & Desktop Code sessions: full read/write streaming via `claude -p --output-format stream-json --verbose [--resume <id>]` + external running-state sync.
  * - Claude Desktop Cowork (`local-agent-mode-sessions`) sessions: full history reading + real-time live progress/status sync (read-only mirror so Desktop's HMAC-signed audit logs & live processes are never conflicted).
@@ -948,6 +972,8 @@ export class ClaudeAdapter {
     this.pendingControlRequests = new Map() // approvalId -> { proc, requestId, toolName, toolInput, questions, sessionId }
     this.pendingCreated = new Map() // sessionId -> summary (before first turn persists jsonl)
     this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
+    this.weeklyQuota = null
+    this.shortQuota = null
     this.desktopEntriesById = new Map() // nativeId -> desktop entry descriptor
     this.watchedSessions = new Map() // nativeId -> watch state
     this.trackedListSessions = new Map() // nativeId -> tracked list state
@@ -1259,6 +1285,37 @@ export class ClaudeAdapter {
     }
   }
 
+  recordRateLimitInfo(info) {
+    const parsed = normalizeClaudeQuota(info)
+    if (!parsed) return
+    if (parsed.windowKind === 'weekly') {
+      this.weeklyQuota = parsed
+    } else {
+      this.shortQuota = parsed
+    }
+  }
+
+  getCachedQuota(now = Date.now()) {
+    const valid = (q) => q && (!q.resetsAt || now <= q.resetsAt + 60_000)
+    const weekly = valid(this.weeklyQuota) ? this.weeklyQuota : null
+    const shortWin = valid(this.shortQuota) ? this.shortQuota : null
+    if (!weekly && !shortWin) return null
+    if (weekly) {
+      return shortWin
+        ? {
+            ...weekly,
+            shortWindow: {
+              remainingPercent: shortWin.remainingPercent,
+              usedPercent: shortWin.usedPercent,
+              windowMinutes: shortWin.windowMinutes,
+              resetsAt: shortWin.resetsAt,
+            },
+          }
+        : weekly
+    }
+    return shortWin
+  }
+
   async getStatus() {
     this.claudeBin = findClaudeCommand(this.configuredBin)
     const projectsExists = existsSync(join(this.claudeHome, 'projects'))
@@ -1294,6 +1351,7 @@ export class ClaudeAdapter {
     })
 
     const desktopSuffix = desktopCount > 0 ? ` + ${desktopCount} 条 Claude Desktop 本地会话实时同步` : ''
+    const quota = this.getCachedQuota()
     return {
       app: APPS.CLAUDE,
       available: Boolean(cliAvailable) || projectsExists || desktopCount > 0,
@@ -1305,6 +1363,7 @@ export class ClaudeAdapter {
           ? `未检测到 claude CLI，已接入 ${desktopCount} 条 Claude Desktop 本地会话实时监控`
           : '未检测到 claude CLI，仅支持历史只读',
       activeCount: this.activeProcs.size,
+      ...(quota ? { quota } : {}),
     }
   }
 
@@ -1828,6 +1887,8 @@ export class ClaudeAdapter {
               })
             }
           }
+        } else if (obj.type === 'rate_limit_event' && obj.rate_limit_info) {
+          this.recordRateLimitInfo(obj.rate_limit_info)
         } else if (obj.type === 'control_request' && obj.request_id && obj.request) {
           this.handleControlRequest(proc, sessionId, compositeId, targetCwd, obj)
         } else if (obj.type === 'result') {

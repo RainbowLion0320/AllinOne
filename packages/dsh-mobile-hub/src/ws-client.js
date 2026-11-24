@@ -85,7 +85,14 @@ export class RelayBridgeLink {
   }
 
   setAppsMeta(apps) {
-    this.metaApps = apps
+    // Strip E2EE-only subscription quota details before sending plaintext bridge.meta to Relay Server
+    this.metaApps = Array.isArray(apps)
+      ? apps.map((item) => {
+          if (!item || typeof item !== 'object') return item
+          const { quota: _dropQuota, ...publicItem } = item
+          return publicItem
+        })
+      : []
     this.sendBridgeMeta().catch((err) => {
       this.log.warn?.(`mobile-hub: failed sending bridge.meta: ${String(err?.message || err)}`)
     })

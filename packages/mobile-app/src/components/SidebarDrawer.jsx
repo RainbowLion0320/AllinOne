@@ -155,10 +155,66 @@ function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSu
   )
 }
 
+function formatResetShort(ts, lang) {
+  if (!ts || !Number.isFinite(ts)) return ''
+  try {
+    const d = new Date(ts)
+    if (Number.isNaN(d.getTime())) return ''
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    const hh = String(d.getHours()).padStart(2, '0')
+    const mi = String(d.getMinutes()).padStart(2, '0')
+    return lang === 'en' ? `Resets ${mm}/${dd} ${hh}:${mi}` : `${mm}/${dd} ${hh}:${mi} 重置`
+  } catch {
+    return ''
+  }
+}
+
+function getQuotaTone(remainingPercent) {
+  if (remainingPercent >= 40) {
+    return {
+      text: 'text-emerald-600 dark:text-emerald-400',
+      bar: 'bg-emerald-500 dark:bg-emerald-400',
+    }
+  }
+  if (remainingPercent >= 15) {
+    return {
+      text: 'text-amber-600 dark:text-amber-400',
+      bar: 'bg-amber-500 dark:bg-amber-400',
+    }
+  }
+  return {
+    text: 'text-rose-600 dark:text-rose-400',
+    bar: 'bg-rose-500 dark:bg-rose-400',
+  }
+}
+
+function formatQuotaTooltip(label, quota, lang) {
+  if (!quota || typeof quota.remainingPercent !== 'number') return label
+  const planSuffix = quota.planType ? ` (${String(quota.planType).toUpperCase()})` : ''
+  const windowLabel =
+    quota.windowKind === 'weekly'
+      ? lang === 'en' ? 'Weekly left' : '周额度剩余'
+      : lang === 'en' ? 'Quota left' : '额度剩余'
+  const parts = [`${label}${planSuffix}`, `${windowLabel} ${quota.remainingPercent}%`]
+  if (quota.shortWindow && typeof quota.shortWindow.remainingPercent === 'number') {
+    const hrs = Math.max(1, Math.round((quota.shortWindow.windowMinutes || 300) / 60))
+    parts.push(
+      lang === 'en'
+        ? `${hrs}h left ${quota.shortWindow.remainingPercent}%`
+        : `${hrs}h剩余 ${quota.shortWindow.remainingPercent}%`,
+    )
+  }
+  const resetStr = formatResetShort(quota.resetsAt, lang)
+  if (resetStr) parts.push(resetStr)
+  return parts.join(' · ')
+}
+
 export function SidebarDrawer({
   open,
   onClose,
   sessions,
+  appsStatus = [],
   activeSessionId,
   pendingApprovalSessionIds = null,
   onSelectSession,
@@ -364,23 +420,31 @@ export function SidebarDrawer({
           </div>
         </div>
 
-        {/* Vendor Icon Filter Bar (5-column grid, zero clipping) */}
+        {/* Vendor Icon & Subscription Quota Filter Bar (5-column grid, zero clipping) */}
         <div className="px-4 pb-2">
           <div className="grid grid-cols-5 gap-1.5">
             {filterTabs.map((tab) => {
               const active = filterApp === tab.id
-              const count =
-                tab.id === 'all'
-                  ? sessions.length
-                  : sessions.filter((s) => s.app === tab.id).length
+              const appInfo = tab.id !== 'all' ? appsStatus.find((a) => a?.app === tab.id) : null
+              const quota =
+                appInfo?.quota &&
+                typeof appInfo.quota.remainingPercent === 'number' &&
+                Number.isFinite(appInfo.quota.remainingPercent)
+                  ? appInfo.quota
+                  : null
+              const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
+              const tone = pct !== null ? getQuotaTone(pct) : null
+              const tooltip = formatQuotaTooltip(tab.label, quota, lang)
               return (
                 <button
                   key={tab.id}
                   type="button"
-                  title={`${tab.label} (${count})`}
-                  aria-label={bi(`筛选 ${tab.label}`, `Filter ${tab.label}`)}
+                  title={tooltip}
+                  aria-label={tooltip}
                   onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                  className={`relative flex h-10 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                  className={`relative flex h-12 flex-col items-center justify-center overflow-hidden rounded-xl border transition active:scale-95 ${
+                    quota ? 'gap-1 pt-0.5 pb-1.5' : ''
+                  } ${
                     active
                       ? 'border-transparent shadow-xs'
                       : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
@@ -397,17 +461,24 @@ export function SidebarDrawer({
                 >
                   <VendorIcon
                     app={tab.id}
-                    size={tab.id === 'all' ? 17 : 19}
+                    size={tab.id === 'all' ? 17 : quota ? 15 : 19}
                     mono={tab.id === 'all'}
                   />
-                  {count > 0 && (
-                    <span
-                      className={`absolute top-1 right-1.5 text-[9px] leading-none font-semibold ${
-                        active ? 'opacity-90' : 'text-slate-400 dark:text-slate-500'
-                      }`}
-                    >
-                      {count > 99 ? '99' : count}
-                    </span>
+                  {pct !== null && tone && (
+                    <>
+                      <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
+                        {pct}%
+                      </span>
+                      <span
+                        aria-hidden="true"
+                        className="pointer-events-none absolute inset-x-1.5 bottom-1 h-[2.5px] overflow-hidden rounded-full bg-slate-200/80 dark:bg-white/10"
+                      >
+                        <span
+                          className={`block h-full rounded-full transition-[width] duration-300 ${tone.bar}`}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </span>
+                    </>
                   )}
                 </button>
               )

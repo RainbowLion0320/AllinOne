@@ -550,7 +550,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.2' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.3' },
         capabilities: null,
       })
         .then((res) => {
@@ -688,6 +688,70 @@ class CodexRpcClient {
   }
 }
 
+const CODEX_QUOTA_CACHE_TTL_MS = 45_000
+
+/**
+ * Normalize Codex subscription rate-limit snapshot (from official `account/rateLimits/read` RPC
+ * or rollout `rate_limits` payload) into a uniform E2EE quota descriptor.
+ * Picks the weekly window (`windowDurationMins >= 1440`, e.g. 10080 = 7d) as the primary metric
+ * and preserves any shorter rolling window (e.g. 5h = 300m on Plus/Team) in `shortWindow`.
+ */
+export function normalizeCodexQuota(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object') return null
+  const rl = raw.rateLimits || raw.rate_limits || raw.rateLimitsByLimitId?.codex || raw
+  if (!rl || typeof rl !== 'object') return null
+
+  const parseWindow = (w) => {
+    if (!w || typeof w !== 'object') return null
+    const rawUsed = w.usedPercent ?? w.used_percent
+    if (typeof rawUsed !== 'number' || !Number.isFinite(rawUsed)) return null
+    const usedPercent = Math.max(0, Math.min(100, Math.round(rawUsed)))
+    const windowMinutes = Number(w.windowDurationMins ?? w.window_minutes ?? 0) || 0
+    const resetsAt = toEpochMs(w.resetsAt ?? w.resets_at ?? 0)
+    return {
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      windowMinutes,
+      resetsAt,
+    }
+  }
+
+  const windows = [parseWindow(rl.primary), parseWindow(rl.secondary)].filter(Boolean)
+  if (windows.length === 0) return null
+
+  // Prefer the 7-day / weekly window (>= 24h) as primary display metric
+  const weekly = windows.find((w) => w.windowMinutes >= 1440) || null
+  const shorter = windows.find((w) => w !== weekly && w.windowMinutes > 0 && w.windowMinutes < 1440) || null
+  const chosen = weekly || windows[0]
+  if (!chosen) return null
+
+  // Ignore clearly expired cached windows (only when no newer live snapshot)
+  if (chosen.resetsAt > 0 && now > chosen.resetsAt + 60_000) {
+    return null
+  }
+
+  const planType = String(rl.planType || rl.plan_type || '').trim().toLowerCase()
+  return {
+    remainingPercent: chosen.remainingPercent,
+    usedPercent: chosen.usedPercent,
+    windowKind: chosen.windowMinutes >= 1440 ? 'weekly' : 'session',
+    windowMinutes: chosen.windowMinutes,
+    resetsAt: chosen.resetsAt,
+    ...(planType ? { planType } : {}),
+    ...(shorter
+      ? {
+          shortWindow: {
+            remainingPercent: shorter.remainingPercent,
+            usedPercent: shorter.usedPercent,
+            windowMinutes: shorter.windowMinutes,
+            resetsAt: shorter.resetsAt,
+          },
+        }
+      : {}),
+    updatedAt: now,
+  }
+}
+
 /**
  * Official Codex Adapter using:
  *  - Persistent read-only `codex app-server --stdio` for 3ms thread listing, pagination & model discovery
@@ -707,6 +771,15 @@ export class CodexAdapter {
       codexBin: this.codexBin,
       log: this.log,
       label: 'reader',
+      onNotification: (method, params) => {
+        if (method === 'account/rateLimits/updated' && params) {
+          const parsed = normalizeCodexQuota(params)
+          if (parsed) {
+            this.quotaCache = parsed
+            this.quotaCacheAt = Date.now()
+          }
+        }
+      },
     })
     this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled }
     this.releasingWriters = new Map() // threadId -> Promise<void> (in-flight writer release before next thread/resume)
@@ -715,6 +788,8 @@ export class CodexAdapter {
     this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
     this.modelsCache = null
     this.modelsCacheAt = 0
+    this.quotaCache = null
+    this.quotaCacheAt = 0
     this.watchedSessions = new Map() // threadId -> live open-chat external watch snapshot
     this.trackedListSessions = new Map() // threadId -> recent sidebar thread external status snapshot
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || CODEX_WATCH_POLL_INTERVAL_MS)
@@ -1145,6 +1220,7 @@ export class CodexAdapter {
         }
         return
       }
+      this.quotaCacheAt = 0
       this.emitEvent(EVENTS.STREAM_DONE, {
         sessionId: compositeId,
         app: APPS.CODEX,
@@ -1159,6 +1235,24 @@ export class CodexAdapter {
     }
   }
 
+  async readQuota({ force = false } = {}) {
+    const now = Date.now()
+    if (!force && this.quotaCacheAt > 0 && now - this.quotaCacheAt < CODEX_QUOTA_CACHE_TTL_MS) {
+      if (!this.quotaCache?.resetsAt || now <= this.quotaCache.resetsAt + 60_000) {
+        return this.quotaCache
+      }
+    }
+    try {
+      const res = await this.rpc('account/rateLimits/read', {}, 5_000)
+      const parsed = normalizeCodexQuota(res, now)
+      this.quotaCache = parsed
+      this.quotaCacheAt = now
+      return parsed
+    } catch {
+      return this.quotaCache
+    }
+  }
+
   async getStatus() {
     try {
       // Re-resolve binary if previously missing (e.g. user installed Codex after starting bridge)
@@ -1168,6 +1262,7 @@ export class CodexAdapter {
         this.reader.codexBin = resolved
       }
       await this.reader.ensureStarted()
+      const quota = await this.readQuota().catch(() => null)
       return {
         app: APPS.CODEX,
         available: true,
@@ -1175,6 +1270,7 @@ export class CodexAdapter {
         mode: 'app-server-rpc',
         detail: `已连接官方 codex app-server（${basename(this.codexBin)}，每轮自动释放写入锁，可与电脑端无缝切换）`,
         activeCount: this.activeTurns.size,
+        ...(quota ? { quota } : {}),
       }
     } catch (err) {
       return {

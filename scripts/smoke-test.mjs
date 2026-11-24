@@ -24,9 +24,16 @@ import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
-import { CodexAdapter, normalizeCodexTurns, probeCodexRolloutStatus, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
+import {
+  CodexAdapter,
+  normalizeCodexQuota,
+  normalizeCodexTurns,
+  probeCodexRolloutStatus,
+  readCodexRolloutTail,
+} from '../packages/dsh-mobile-hub/src/adapters/codex.js'
 import {
   ClaudeAdapter,
+  normalizeClaudeQuota,
   probeClaudeExternalStatus,
   probeClaudeTranscriptTail,
 } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
@@ -4680,7 +4687,56 @@ async function main() {
       }
       assert.equal(probeClaudeExternalStatus({ auditPath: auditJsonl }).running, false)
     }
-    console.log('[smoke] 26/26 Claude Desktop (Cowork + Code) discovery, live external running/permission state, watcher & read-only guard OK')
+    console.log('[smoke] 26/27 Claude Desktop (Cowork + Code) discovery, live external running/permission state, watcher & read-only guard OK')
+
+    // 27. Subscription Weekly Quota Normalization (Codex Pro/Plus + Claude rate_limit_event) & Zero-Knowledge Relay Stripping
+    {
+      const futureResetSec = Math.floor(Date.now() / 1000) + 3 * 86400
+      const proQuota = normalizeCodexQuota({
+        rateLimits: {
+          planType: 'pro',
+          primary: { usedPercent: 18, windowDurationMins: 10080, resetsAt: futureResetSec },
+          secondary: null,
+        },
+      })
+      assert.equal(proQuota.remainingPercent, 82, 'Codex Pro weekly remaining percent must be 100 - 18 = 82')
+      assert.equal(proQuota.windowKind, 'weekly')
+      assert.equal(proQuota.planType, 'pro')
+
+      // Plus/Team plan: primary is 5h (300m), secondary is 7d (10080m) -> weekly must be primary display, 5h in shortWindow
+      const plusQuota = normalizeCodexQuota({
+        rateLimits: {
+          planType: 'plus',
+          primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: futureResetSec },
+          secondary: { usedPercent: 64, windowDurationMins: 10080, resetsAt: futureResetSec },
+        },
+      })
+      assert.equal(plusQuota.remainingPercent, 36, 'Codex Plus must select 7-day weekly secondary window as main display')
+      assert.equal(plusQuota.windowKind, 'weekly')
+      assert.equal(plusQuota.shortWindow?.remainingPercent, 90, 'Codex Plus 5h window must be preserved in shortWindow')
+      assert.equal(normalizeCodexQuota({ rateLimits: { primary: null, secondary: null } }), null, 'Missing quota must normalize to null')
+
+      // Claude rate_limit_event (fraction 0..1)
+      const claudeWeekly = normalizeClaudeQuota({ rateLimitType: 'seven_day', utilization: 0.27, resetsAt: futureResetSec })
+      assert.equal(claudeWeekly.remainingPercent, 73)
+      assert.equal(claudeWeekly.windowKind, 'weekly')
+      assert.equal(normalizeClaudeQuota({ rateLimitType: 'seven_day', status: 'allowed' }), null, 'Missing numeric utilization must return null')
+
+      // Zero-knowledge check: RelayBridgeLink.setAppsMeta must strip `quota` before sending plaintext bridge.meta
+      const zkLink = new RelayBridgeLink({
+        relayUrl: wsBridgeUrl,
+        bridgeId: 'zk-quota-pc',
+        roomId: 'usr_zk_test',
+        secret: 'sec',
+        e2eeKey: generateE2eeKey(),
+        onRpc: async () => ({}),
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+      })
+      zkLink.sendBridgeMeta = async () => {}
+      zkLink.setAppsMeta([{ app: 'codex', available: true, writable: true, quota: proQuota }])
+      assert.equal(zkLink.metaApps[0].quota, undefined, 'Plaintext bridge.meta.apps sent to Relay must NEVER include subscription quota')
+    }
+    console.log('[smoke] 27/27 Subscription weekly quota normalization (Codex Pro/Plus + Claude) & zero-knowledge Relay stripping OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
