@@ -2044,17 +2044,16 @@ export function App() {
               <Lock className="h-6 w-6" />
             </div>
             <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              {bi('需要同步端到端加密密钥', 'Sync End-to-End Encryption Key')}
+              {bi('同步加密密钥', 'Sync Encryption Key')}
             </h2>
             <p className="mt-1.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
               {bi(
-                `「${activeDeviceName}」已启用零知识端到端加密（AES-256-GCM），中转服务器不存储任何密钥。请扫描电脑端二维码同步密钥以解锁会话。`,
-                `${activeDeviceName} uses zero-knowledge AES-256-GCM encryption. Scan the QR code on your computer to sync the key and unlock.`,
+                `同步「${activeDeviceName}」的密钥后即可查看会话`,
+                `Sync the key for ${activeDeviceName} to unlock chats`,
               )}
             </p>
             {activeBridgeE2ee.keyId && (
               <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1 font-mono text-[11px] font-semibold text-slate-600 ring-1 ring-slate-200/80 dark:bg-[#14171F] dark:text-slate-300 dark:ring-slate-700/80">
-                <span>{bi('密钥指纹', 'Fingerprint')}:</span>
                 <span className="text-[#4D6BFE]">{formatE2eeFingerprint(activeBridgeE2ee.keyId)}</span>
               </div>
             )}
@@ -2067,7 +2066,7 @@ export function App() {
                     className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
                   >
                     <Smartphone className="h-4 w-4" />
-                    <span>{bi('用已授权手机一键同步', 'Approve from Authorized Phone')}</span>
+                    <span>{bi('用已授权手机同步', 'Approve from Phone')}</span>
                   </button>
                   <button
                     type="button"
@@ -2075,7 +2074,7 @@ export function App() {
                     className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
                   >
                     <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('扫码或粘贴恢复密钥', 'Scan QR or Paste Recovery Key')}</span>
+                    <span>{bi('扫码或粘贴密钥', 'Scan or Paste Key')}</span>
                   </button>
                 </>
               ) : (
@@ -2086,7 +2085,7 @@ export function App() {
                     className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
                   >
                     <ScanLine className="h-4 w-4" />
-                    <span>{bi('扫一扫电脑端二维码', 'Scan Computer QR Code')}</span>
+                    <span>{bi('扫一扫二维码', 'Scan QR Code')}</span>
                   </button>
                   <button
                     type="button"
@@ -2094,7 +2093,7 @@ export function App() {
                     className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
                   >
                     <Smartphone className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('向已授权手机/设备请求同步', 'Request Approval from Another Device')}</span>
+                    <span>{bi('向已授权设备请求同步', 'Approve from Another Device')}</span>
                   </button>
                   <button
                     type="button"
@@ -2102,14 +2101,11 @@ export function App() {
                     className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200/80 bg-transparent py-2 text-[11.5px] font-medium text-slate-500 transition hover:bg-slate-100/70 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-800/50"
                   >
                     <KeyRound className="h-3.5 w-3.5" />
-                    <span>{bi('手动粘贴恢复密钥', 'Paste Recovery Key')}</span>
+                    <span>{bi('粘贴恢复密钥', 'Paste Recovery Key')}</span>
                   </button>
                 </>
               )}
             </div>
-            <p className="mt-3.5 text-[11px] text-slate-400">
-              {bi('无需触碰原电脑 · 随身手机打开 All in One 即可零知识安全授权', 'No need to touch your original PC — approve securely from any unlocked device')}
-            </p>
           </div>
         </div>
       ) : (

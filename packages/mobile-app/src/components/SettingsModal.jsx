@@ -434,7 +434,7 @@ export function SettingsModal({
                             : 'text-slate-400'
                       }`}
                     />
-                    <span className="truncate">{bi('端到端加密 (E2EE)', 'End-to-End Encryption')}</span>
+                    <span className="truncate">{bi('端到端加密', 'End-to-End Encryption')}</span>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
                     {e2eeStatus?.locked ? (

@@ -511,11 +511,8 @@ export function DeviceSwitcherModal({
                 <div className="mt-2.5 rounded-xl border border-slate-200/80 bg-white/95 p-3 dark:border-slate-700/80 dark:bg-[#151821]">
                   {emailEnabled ? (
                     <form onSubmit={handleCommitBindEmail} className="space-y-2">
-                      <div className="flex items-center justify-between text-[11.5px]">
-                        <span className="font-semibold text-slate-700 dark:text-slate-200">
-                          {activeEntry.email ? bi('更换绑定邮箱', 'Change Email') : bi('绑定邮箱', 'Link Email')}
-                        </span>
-                        <span className="text-[10.5px] text-slate-400">{bi('用于邮箱登录与找回密码', 'For login & password reset')}</span>
+                      <div className="text-[11.5px] font-semibold text-slate-700 dark:text-slate-200">
+                        {activeEntry.email ? bi('更换绑定邮箱', 'Change Email') : bi('绑定邮箱', 'Link Email')}
                       </div>
                       <input
                         type="email"

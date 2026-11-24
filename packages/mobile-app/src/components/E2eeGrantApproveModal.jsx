@@ -199,15 +199,18 @@ export function E2eeGrantApproveModal({
                 <Smartphone className="h-5 w-5" />
               )}
             </div>
-            <div>
+            <div className="flex flex-wrap items-center gap-1.5">
               <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">
                 {step === 'done'
-                  ? bi('已安全授权并同步密钥', 'Authorized & Synced')
-                  : bi('新设备请求同步加密密钥', 'New Device Requests E2EE Key')}
+                  ? bi('已授权同步', 'Authorized')
+                  : bi('授权新设备', 'Authorize New Device')}
               </h3>
-              <p className="text-[11.5px] text-slate-500 dark:text-slate-400">
-                {bi('零知识端到端移交 · 服务器不可见', 'Zero-knowledge ECDH handoff')}
-              </p>
+              {qrVerified && step !== 'done' && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/12 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-600 dark:text-emerald-400">
+                  <ShieldCheck className="h-3 w-3" />
+                  <span>{bi('扫码已验证', 'QR Verified')}</span>
+                </span>
+              )}
             </div>
           </div>
           <button
@@ -223,26 +226,26 @@ export function E2eeGrantApproveModal({
         {/* Requester summary card */}
         <div className="mt-4 space-y-1.5 rounded-2xl border border-slate-200/80 bg-slate-50/80 px-3.5 py-3 text-xs dark:border-slate-800 dark:bg-[#14171F]">
           <div className="flex items-center justify-between gap-2">
-            <span className="text-slate-500 dark:text-slate-400">{bi('请求设备', 'Device')}</span>
+            <span className="text-slate-500 dark:text-slate-400">{bi('设备', 'Device')}</span>
             <span className="font-semibold text-slate-900 dark:text-white">
               {grant.deviceName || bi('未知设备', 'Unknown Device')}
             </span>
           </div>
           {grant.ip && (
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500 dark:text-slate-400">{bi('来源 IP', 'IP Address')}</span>
+              <span className="text-slate-500 dark:text-slate-400">{bi('来源 IP', 'IP')}</span>
               <span className="font-mono text-[11.5px] text-slate-700 dark:text-slate-300">{grant.ip}</span>
             </div>
           )}
           <div className="flex items-center justify-between gap-2">
-            <span className="text-slate-500 dark:text-slate-400">{bi('同步范围', 'Scope')}</span>
+            <span className="text-slate-500 dark:text-slate-400">{bi('同步密钥', 'Keys')}</span>
             <span className="font-medium text-slate-800 dark:text-slate-200">
-              {bi(`账号下 ${keyEntries.length} 把端到端密钥`, `${keyEntries.length} E2EE key(s) in keyring`)}
+              {bi(`${keyEntries.length} 把`, `${keyEntries.length}`)}
             </span>
           </div>
           {grant.wantedKeyId && (
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500 dark:text-slate-400">{bi('目标指纹', 'Requested Key')}</span>
+              <span className="text-slate-500 dark:text-slate-400">{bi('目标指纹', 'Fingerprint')}</span>
               <span className={`font-mono text-[11px] font-semibold ${hasWantedKey ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-500'}`}>
                 {formatE2eeFingerprint(grant.wantedKeyId)}
               </span>
@@ -255,21 +258,8 @@ export function E2eeGrantApproveModal({
             <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
             <span>
               {bi(
-                '提示：本设备暂未包含对方请求的指纹，但仍可将本设备已有的密钥同步给对方。',
-                'Note: this device does not hold that specific fingerprint, but can still sync its existing keys.',
-              )}
-            </span>
-          </div>
-        )}
-
-        {/* QR verified badge OR 6-digit SAS code box */}
-        {qrVerified && step !== 'done' && (
-          <div className="mt-3 flex items-center gap-2 rounded-2xl border border-emerald-200/80 bg-emerald-50/80 px-3.5 py-2.5 text-xs text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-950/35 dark:text-emerald-300">
-            <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-500" />
-            <span>
-              {bi(
-                '已通过二维码验证对方设备公钥指纹，防中间人校验通过，可直接一键授权。',
-                'Device public key verified via QR code. Safe to approve in one tap.',
+                '本设备暂未存有该目标指纹，仅同步已有密钥。',
+                'This device lacks that fingerprint; only existing keys will be synced.',
               )}
             </span>
           </div>
@@ -278,13 +268,10 @@ export function E2eeGrantApproveModal({
         {step === 'sas' && sasCode && (
           <div className="mt-3.5 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-4 py-3.5 text-center dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
             <div className="text-[11.5px] font-medium text-slate-600 dark:text-slate-300">
-              {bi('请核对新设备屏幕上的 6 位安全码是否完全一致', 'Confirm this 6-digit code matches the new device')}
+              {bi('核对新设备上的 6 位安全码', 'Match 6-digit code on new device')}
             </div>
             <div className="mt-1.5 font-mono text-3xl font-extrabold tracking-[0.22em] text-[#2842C9] dark:text-white">
               {sasCode.replace('-', ' · ')}
-            </div>
-            <div className="mt-1 text-[10.5px] text-slate-500 dark:text-slate-400">
-              {bi('若数字不一致或非本人操作，请立即点拒绝', 'Reject immediately if codes differ or you did not initiate this')}
             </div>
           </div>
         )}
@@ -298,7 +285,7 @@ export function E2eeGrantApproveModal({
         {/* Actions */}
         {step === 'done' ? (
           <div className="mt-4 rounded-2xl bg-emerald-50 py-2.5 text-center text-xs font-semibold text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
-            {bi('✓ 加密密钥已安全移交，新设备已解锁', '✓ Encrypted keyring delivered')}
+            {bi('已授权同步', 'Authorized')}
           </div>
         ) : qrVerified ? (
           <div className="mt-4 grid grid-cols-2 gap-2">
@@ -317,7 +304,7 @@ export function E2eeGrantApproveModal({
               className="flex items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-xs font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-60"
             >
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-              <span>{bi('确认授权并同步', 'Approve & Sync')}</span>
+              <span>{bi('确认授权', 'Approve')}</span>
             </button>
           </div>
         ) : step === 'prompt' ? (
@@ -328,7 +315,7 @@ export function E2eeGrantApproveModal({
               onClick={handleReject}
               className="rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
             >
-              {bi('不是本人 · 拒绝', 'Not Me · Reject')}
+              {bi('拒绝', 'Decline')}
             </button>
             <button
               type="button"
@@ -337,7 +324,7 @@ export function E2eeGrantApproveModal({
               className="flex items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-xs font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-60"
             >
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-              <span>{bi('验证并授权', 'Verify & Approve')}</span>
+              <span>{bi('验证授权', 'Verify')}</span>
             </button>
           </div>
         ) : (
@@ -348,7 +335,7 @@ export function E2eeGrantApproveModal({
               onClick={handleReject}
               className="rounded-2xl border border-rose-200 py-2.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-500/30 dark:text-rose-400 dark:hover:bg-rose-950/30"
             >
-              {bi('不符 · 拒绝', 'Mismatch · Reject')}
+              {bi('不符 · 拒绝', 'Mismatch')}
             </button>
             <button
               type="button"
@@ -357,7 +344,7 @@ export function E2eeGrantApproveModal({
               className="flex items-center justify-center gap-1.5 rounded-2xl bg-emerald-600 py-2.5 text-xs font-semibold text-white shadow-sm shadow-emerald-600/25 transition active:scale-[0.98] disabled:opacity-60"
             >
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-              <span>{bi('安全码一致，同步', 'Codes Match · Sync')}</span>
+              <span>{bi('确认一致', 'Confirm Match')}</span>
             </button>
           </div>
         )}

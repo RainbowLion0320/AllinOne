@@ -663,7 +663,7 @@ export function LoginScreen({
                       type="email"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
-                      placeholder={bi('用于邮箱登录与找回密码（可留空）', 'For email login & password reset (optional)')}
+                      placeholder={bi('输入邮箱地址', 'Email address')}
                       autoComplete="email"
                       autoCapitalize="none"
                       autoCorrect="off"

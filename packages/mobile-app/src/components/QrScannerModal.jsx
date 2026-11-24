@@ -365,7 +365,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
               <div className="absolute inset-x-4 top-1/2 h-0.5 -translate-y-1/2 animate-pulse rounded-full bg-gradient-to-r from-transparent via-[#4D6BFE] to-transparent shadow-[0_0_12px_#4D6BFE]" />
             </div>
             <p className="mt-6 rounded-full bg-black/45 px-4 py-1.5 text-xs text-white/85 backdrop-blur-sm">
-              {bi('将二维码放入框内即可自动识别连接', 'Align QR code inside frame to connect automatically')}
+              {bi('对准二维码自动识别', 'Align QR code inside frame')}
             </p>
           </div>
         )}
@@ -375,7 +375,6 @@ export function QrScannerModal({ open, onClose, onDetected }) {
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <Loader2 className="h-8 w-8 animate-spin text-[#4D6BFE]" />
             <div className="text-sm font-medium text-white/90">{bi('正在启动摄像头...', 'Starting camera...')}</div>
-            <div className="text-xs text-white/50">{bi('如弹出权限请求请点击「允许」', 'Tap "Allow" if prompted for camera access')}</div>
           </div>
         )}
 

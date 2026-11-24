@@ -447,7 +447,7 @@ export function E2eeSyncModal({
               </div>
               <div>
                 <h2 className="text-[14.5px] font-bold text-slate-900 dark:text-white">
-                  {bi('端到端加密 (E2EE)', 'End-to-End Encryption')}
+                  {bi('端到端加密', 'End-to-End Encryption')}
                 </h2>
                 <p className="text-[11px] text-slate-400">
                   {bridgeName || (username ? `@${username}` : 'AES-256-GCM')}
@@ -515,14 +515,8 @@ export function E2eeSyncModal({
                   )}
                   <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-emerald-500/12 px-2.5 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                     <ShieldCheck className="h-3.5 w-3.5" />
-                    <span>AES-256-GCM · {activeFp}</span>
+                    <span>{activeFp}</span>
                   </div>
-                  <p className="mt-2 text-[11.5px] leading-relaxed text-slate-500 dark:text-slate-400">
-                    {bi(
-                      '用新手机扫描上方二维码，或点下方按钮用本设备去扫新电脑屏幕上的「授权二维码」一键零知识同步。',
-                      'Scan this QR from a new phone, or tap below to scan a new computer’s request QR and authorize it in one tap.',
-                    )}
-                  </p>
                 </div>
 
                 {/* Reverse-QR scanner shortcut for Phone B -> Computer C */}
@@ -540,14 +534,9 @@ export function E2eeSyncModal({
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
                         <ScanLine className="h-4 w-4" />
                       </div>
-                      <div className="min-w-0">
-                        <div className="text-xs font-bold text-[#2842C9] dark:text-white">
-                          {bi('扫一扫授权新电脑 / 新设备', 'Scan to Authorize New Computer')}
-                        </div>
-                        <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">
-                          {bi('ECDH 端到端加密移交密钥，无需碰原电脑', 'Zero-knowledge ECDH handoff without touching original PC')}
-                        </div>
-                      </div>
+                      <span className="truncate text-xs font-bold text-[#2842C9] dark:text-white">
+                        {bi('扫一扫授权新设备', 'Scan to Authorize New Device')}
+                      </span>
                     </div>
                     <QrCode className="h-4 w-4 shrink-0 text-[#4D6BFE]" />
                   </button>
@@ -558,7 +547,7 @@ export function E2eeSyncModal({
                   <div className="mb-1.5 flex items-center justify-between text-[11.5px]">
                     <span className="inline-flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200">
                       <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                      <span>{bi('恢复密钥（手动同步备用）', 'Recovery Key')}</span>
+                      <span>{bi('恢复密钥', 'Recovery Key')}</span>
                     </span>
                     <div className="flex items-center gap-1">
                       <button
@@ -591,20 +580,15 @@ export function E2eeSyncModal({
                   <div className="rounded-2xl border border-slate-200/80 bg-white p-3 dark:border-slate-800 dark:bg-[#22252E]">
                     {!confirmRotate ? (
                       <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">
-                            {bi('轮换 / 重置本机密钥', 'Rotate Local Key')}
-                          </div>
-                          <div className="text-[11px] text-slate-400">
-                            {bi('设备遗失时可立即作废旧密钥，不影响本机历史对话', 'Revokes old devices immediately without losing local chats')}
-                          </div>
+                        <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                          {bi('重置本机密钥', 'Rotate Local Key')}
                         </div>
                         <button
                           type="button"
                           onClick={() => setConfirmRotate(true)}
                           className="shrink-0 rounded-xl border border-slate-200 px-2.5 py-1.5 text-[11.5px] font-semibold text-slate-700 hover:border-amber-400 hover:text-amber-600 dark:border-slate-700 dark:text-slate-200"
                         >
-                          {bi('轮换密钥', 'Rotate')}
+                          {bi('重置', 'Rotate')}
                         </button>
                       </div>
                     ) : (
@@ -613,8 +597,8 @@ export function E2eeSyncModal({
                           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                           <span>
                             {bi(
-                              '确认生成全新随机密钥？所有已同步的手机端需重新扫描新二维码才能继续访问本电脑。',
-                              'Generate a brand-new random key? All synced phones will need to scan the new QR code.',
+                              '重置后，已同步的手机需重新扫码才能访问本电脑。',
+                              'Synced devices will need to scan the new QR code after rotating.',
                             )}
                           </span>
                         </div>
@@ -633,7 +617,7 @@ export function E2eeSyncModal({
                             className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
                           >
                             {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-                            <span>{bi('确认轮换', 'Confirm Rotate')}</span>
+                            <span>{bi('确认重置', 'Confirm')}</span>
                           </button>
                         </div>
                       </div>
@@ -647,25 +631,17 @@ export function E2eeSyncModal({
                   <div className="flex flex-col items-center rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] p-5 text-center dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
                     <div className="inline-flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-1 text-[11px] font-semibold text-[#2842C9] shadow-xs dark:bg-[#14171F] dark:text-[#8DA2FF]">
                       <ShieldCheck className="h-3.5 w-3.5" />
-                      <span>
-                        {bi(
-                          `正在与「${grantState.approverDeviceName}」校验安全码`,
-                          `Verifying with ${grantState.approverDeviceName}`,
-                        )}
-                      </span>
+                      <span>{grantState.approverDeviceName}</span>
                     </div>
                     <div className="mt-4 font-mono text-4xl font-extrabold tracking-[0.22em] text-[#2842C9] dark:text-white">
                       {grantState.sasCode.replace('-', ' · ')}
                     </div>
-                    <p className="mt-3 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-                      {bi(
-                        '请确认你手机上的 6 位安全码与此完全一致，然后在手机上点击「安全码一致，同步」即可自动解锁！',
-                        'Verify this 6-digit code matches your phone, then tap "Codes Match · Sync" on your phone to unlock automatically.',
-                      )}
+                    <p className="mt-3 text-xs text-slate-600 dark:text-slate-300">
+                      {bi('核对手机上的 6 位数字一致后，在手机点击确认', 'Confirm this code matches your phone, then approve')}
                     </p>
                     {grantState.approverIp && (
                       <div className="mt-2 font-mono text-[11px] text-slate-400">
-                        IP: {grantState.approverIp} · {grantCountdownSec}s
+                        {grantState.approverIp} · {grantCountdownSec}s
                       </div>
                     )}
                   </div>
@@ -675,18 +651,15 @@ export function E2eeSyncModal({
                     <div className="mt-2 text-sm font-bold text-slate-800 dark:text-white">
                       {grantState.phase === 'rejected'
                         ? bi(`已被「${grantState.approverDeviceName}」拒绝`, `Declined by ${grantState.approverDeviceName}`)
-                        : bi('本次授权请求已过期', 'Authorization request expired')}
+                        : bi('授权请求已过期', 'Request expired')}
                     </div>
-                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                      {bi('可点击下方按钮重新生成一次性授权二维码。', 'Generate a fresh one-time authorization QR below.')}
-                    </p>
                     <button
                       type="button"
                       onClick={() => void startGrantSession()}
                       className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-[#4D6BFE] px-4 py-2 text-xs font-semibold text-white shadow-sm shadow-[#4D6BFE]/25"
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
-                      <span>{bi('重新发起授权请求', 'Request Again')}</span>
+                      <span>{bi('重新生成', 'Try Again')}</span>
                     </button>
                   </div>
                 ) : (
@@ -704,36 +677,23 @@ export function E2eeSyncModal({
                         <Loader2 className="h-6 w-6 animate-spin text-[#4D6BFE]" />
                       </div>
                     )}
-                    <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-[#4D6BFE]/12 px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE]">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      <span>
-                        {bi(
-                          `等待已解锁设备批准 (${grantCountdownSec || 120}s)`,
-                          `Waiting for authorized device (${grantCountdownSec || 120}s)`,
-                        )}
-                      </span>
-                    </div>
-                    <p className="mt-2.5 text-[11.5px] leading-relaxed text-slate-600 dark:text-slate-300">
-                      {bi(
-                        '打开你随身已解锁的手机 All in One：直接点屏幕弹出的授权通知（核对 6 位安全码），或用手机「扫一扫」扫上方二维码即可 1 秒解锁，全程无需碰原电脑。',
-                        'On your unlocked phone: approve the instant popup (verify 6-digit code) or scan this QR code to transfer your E2EE keys via zero-knowledge ECDH.',
-                      )}
-                    </p>
-                    <div className="mt-2 flex items-center gap-2 text-[11px] text-slate-400">
-                      <span>
-                        {onlineOtherClientCount > 0
-                          ? bi(`已推送至 ${onlineOtherClientCount} 台同账号在线设备`, `Pushed to ${onlineOtherClientCount} online device(s)`)
-                          : bi('手机打开 All in One 后将自动收到授权弹窗', 'Open All in One on your phone to receive the popup')}
-                      </span>
+                    <div className="mt-3 flex items-center gap-2">
+                      <div className="inline-flex items-center gap-1.5 rounded-full bg-[#4D6BFE]/12 px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE]">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        <span>{bi(`等待授权 (${grantCountdownSec || 120}s)`, `Waiting (${grantCountdownSec || 120}s)`)}</span>
+                      </div>
                       <button
                         type="button"
                         onClick={() => void startGrantSession()}
-                        className="inline-flex items-center gap-1 rounded-lg px-1.5 py-0.5 font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                        className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
                       >
                         <RefreshCw className="h-3 w-3" />
                         <span>{bi('刷新', 'Refresh')}</span>
                       </button>
                     </div>
+                    <p className="mt-2 text-[11.5px] text-slate-500 dark:text-slate-400">
+                      {bi('用已授权手机扫码，或直接确认手机弹窗', 'Scan with your phone, or approve the popup on it')}
+                    </p>
                   </div>
                 )}
 
@@ -745,36 +705,19 @@ export function E2eeSyncModal({
                       onChange={(e) => setApplyToDesktop(e.target.checked)}
                       className="h-3.5 w-3.5 rounded accent-[#4D6BFE]"
                     />
-                    <span>
-                      {bi(
-                        '授权后同时同步本机电脑桥接密钥（多台电脑共用同一把密钥）',
-                        'Also sync this computer’s local bridge key (share one key across PCs)',
-                      )}
-                    </span>
+                    <span>{bi('同步至本机桌面桥接', 'Also apply to local bridge')}</span>
                   </label>
                 )}
               </>
             ) : (
               <>
-                {isLocked && (
-                  <div className="flex items-start gap-2.5 rounded-2xl border border-amber-300/60 bg-amber-50/90 px-3.5 py-3 text-xs text-amber-800 dark:border-amber-500/35 dark:bg-amber-950/35 dark:text-amber-200">
-                    <Lock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-                    <div className="space-y-1">
-                      <div className="font-semibold">
-                        {bi(`需要同步「${bridgeName || '目标电脑'}」的端到端密钥`, `Sync E2EE key for ${bridgeName || 'this computer'}`)}
-                      </div>
-                      {expectedFp && (
-                        <div className="font-mono text-[11px] opacity-85">
-                          {bi('目标指纹：', 'Expected fingerprint: ')}{expectedFp}
-                        </div>
-                      )}
-                      <div className="text-[11px] opacity-85">
-                        {bi(
-                          '可扫描电脑端二维码，或切到上方「手机授权」直接用随身已解锁的手机批准本设备。',
-                          'Scan your PC’s QR code, or switch to "Approve via Phone" to unlock from your phone.',
-                        )}
-                      </div>
-                    </div>
+                {isLocked && expectedFp && (
+                  <div className="flex items-center justify-between gap-2 rounded-2xl border border-amber-300/60 bg-amber-50/90 px-3.5 py-2.5 text-xs text-amber-800 dark:border-amber-500/35 dark:bg-amber-950/35 dark:text-amber-200">
+                    <span className="inline-flex items-center gap-1.5 font-medium">
+                      <Lock className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                      <span>{bridgeName || bi('目标电脑', 'Target PC')}</span>
+                    </span>
+                    <span className="font-mono text-[11px] font-semibold">{expectedFp}</span>
                   </div>
                 )}
 
@@ -791,14 +734,9 @@ export function E2eeSyncModal({
                     <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
                       <ScanLine className="h-4.5 w-4.5" />
                     </div>
-                    <div className="min-w-0">
-                      <div className="text-[13px] font-bold text-[#2842C9] dark:text-white">
-                        {bi('扫一扫电脑端密钥二维码', 'Scan E2EE Key QR Code')}
-                      </div>
-                      <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">
-                        {bi('100% 本地扫码，密钥不经过服务器', '100% local scan — key never touches server')}
-                      </div>
-                    </div>
+                    <span className="truncate text-[13px] font-bold text-[#2842C9] dark:text-white">
+                      {bi('扫一扫二维码', 'Scan QR Code')}
+                    </span>
                   </div>
                   <QrCode className="h-4.5 w-4.5 shrink-0 text-[#4D6BFE]" />
                 </button>
@@ -806,13 +744,13 @@ export function E2eeSyncModal({
                 <form onSubmit={handleManualSubmit} className="space-y-2.5 rounded-2xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-[#14171F]">
                   <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
                     <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('或手动粘贴恢复密钥', 'Or paste recovery key')}</span>
+                    <span>{bi('恢复密钥', 'Recovery Key')}</span>
                   </label>
                   <input
                     type="text"
                     value={manualInput}
                     onChange={(e) => setManualInput(e.target.value)}
-                    placeholder={bi('粘贴 43 位恢复密钥或 allinone-e2ee://...', 'Paste 43-char key or allinone-e2ee://...')}
+                    placeholder={bi('粘贴恢复密钥', 'Paste recovery key')}
                     autoCapitalize="none"
                     autoCorrect="off"
                     spellCheck={false}
@@ -827,12 +765,7 @@ export function E2eeSyncModal({
                         onChange={(e) => setApplyToDesktop(e.target.checked)}
                         className="h-3.5 w-3.5 rounded accent-[#4D6BFE]"
                       />
-                      <span>
-                        {bi(
-                          '同时应用到本机电脑桥接（多台电脑共用一把密钥）',
-                          'Also apply to this computer bridge (share one key across PCs)',
-                        )}
-                      </span>
+                      <span>{bi('同步至本机桌面桥接', 'Also apply to local bridge')}</span>
                     </label>
                   )}
 
