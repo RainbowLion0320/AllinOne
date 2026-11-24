@@ -267,7 +267,7 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
 
   if (msg.role === 'user') {
     return (
-      <div className={`${rowClass}flex max-w-full flex-col items-end`}>
+      <div data-msg-id={msg.id} className={`${rowClass}flex max-w-full flex-col items-end`}>
         {msg.text && (
           <div className="max-w-[85%] min-w-0 rounded-[22px] rounded-tr-md bg-[#EEF2FF] px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-slate-900 dark:bg-[#2A3454] dark:text-white">
             {msg.text}
@@ -283,7 +283,7 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
   }
 
   return (
-    <div className={`${rowClass}flex max-w-full items-start gap-2.5`}>
+    <div data-msg-id={msg.id} className={`${rowClass}flex max-w-full items-start gap-2.5`}>
       <VendorBadge app={appId} size="md" className="mt-0.5 shadow-2xs" />
       <div className="min-w-0 flex-1">
         {msg.thinking && <ThinkingBlock text={msg.thinking} streaming={false} />}
@@ -342,6 +342,7 @@ export function ChatView({
   const pendingInitialScrollRef = useRef(false)
   const pinnedToBottomRef = useRef(false)
   const pinUntilRef = useRef(0)
+  const isNearBottomRef = useRef(true)
   const userInteractedRef = useRef(false)
   const rafIdsRef = useRef({ r1: 0, r2: 0 })
 
@@ -356,6 +357,48 @@ export function ChatView({
   const meta = APP_META[session?.app || 'dsh'] || APP_META.dsh
   const displayMessages = useMemo(() => mergeAssistantRuns(messages), [messages])
 
+  const captureVisibleAnchor = (forSeq = null) => {
+    const el = scrollRef.current
+    if (!el) return null
+    const containerRect = el.getBoundingClientRect()
+    let msgId = ''
+    let relTop = 0
+    if (contentRef.current) {
+      const nodes = contentRef.current.querySelectorAll('[data-msg-id]')
+      for (const node of nodes) {
+        const rect = node.getBoundingClientRect()
+        if (rect.bottom >= containerRect.top) {
+          msgId = node.getAttribute('data-msg-id') || ''
+          relTop = rect.top - containerRect.top
+          break
+        }
+      }
+      if (!msgId && nodes.length > 0) {
+        const first = nodes[0]
+        msgId = first.getAttribute('data-msg-id') || ''
+        relTop = first.getBoundingClientRect().top - containerRect.top
+      }
+    }
+    const snap = {
+      forSeq,
+      msgId,
+      relTop,
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+    }
+    anchorBeforePrependRef.current = snap
+    return snap
+  }
+
+  // Capture the exact live visible message element right before React commits a prepend
+  if (
+    prependSeq !== lastAppliedPrependSeqRef.current &&
+    anchorBeforePrependRef.current?.forSeq !== prependSeq &&
+    scrollRef.current
+  ) {
+    captureVisibleAnchor(prependSeq)
+  }
+
   const scrollToBottomImmediate = () => {
     const el = scrollRef.current
     if (!el) return
@@ -367,6 +410,7 @@ export function ChatView({
         el.scrollTop = el.scrollHeight
       }
     }
+    isNearBottomRef.current = true
     setShowScrollBottom(false)
   }
 
@@ -376,13 +420,7 @@ export function ChatView({
     const now = Date.now()
     if (now - loadCooldownRef.current < 320) return
     loadCooldownRef.current = now
-    const el = scrollRef.current
-    if (el) {
-      anchorBeforePrependRef.current = {
-        scrollHeight: el.scrollHeight,
-        scrollTop: el.scrollTop,
-      }
-    }
+    captureVisibleAnchor(null)
     onLoadOlder()
   }
 
@@ -448,12 +486,22 @@ export function ChatView({
       pendingInitialScrollRef.current = true
       pinnedToBottomRef.current = true
       pinUntilRef.current = Date.now() + 1400
+      isNearBottomRef.current = true
       setInitialScrollReady(false)
       setShowScrollBottom(false)
     }
 
-    if (pendingInitialScrollRef.current) {
-      if (!loadingSession && (count > 0 || streamingState?.active)) {
+    if (loadingSession) {
+      // Reset initial scroll readiness cleanly whenever loading starts so observer never fires before bottom-snap settles
+      cancelPendingRafs()
+      pendingInitialScrollRef.current = true
+      pinnedToBottomRef.current = true
+      pinUntilRef.current = Date.now() + 1400
+      isNearBottomRef.current = true
+      setInitialScrollReady(false)
+      setShowScrollBottom(false)
+    } else if (pendingInitialScrollRef.current) {
+      if (count > 0 || streamingState?.active) {
         pendingInitialScrollRef.current = false
         pinnedToBottomRef.current = true
         pinUntilRef.current = Date.now() + 1000
@@ -469,19 +517,36 @@ export function ChatView({
             setInitialScrollReady(true)
           })
         })
-      } else if (!loadingSession && count === 0) {
-        setInitialScrollReady(true)
       }
     } else if (prependSeq !== lastAppliedPrependSeqRef.current) {
-      // Older messages were prepended -> restore exact visual viewport position (zero jump!)
+      // Older messages were prepended -> restore exact visual viewport position via [data-msg-id] anchor (zero jump!)
       lastAppliedPrependSeqRef.current = prependSeq
       pinnedToBottomRef.current = false
       const snap = anchorBeforePrependRef.current
       anchorBeforePrependRef.current = null
       if (snap) {
-        const delta = el.scrollHeight - snap.scrollHeight
-        if (delta > 0) {
-          el.scrollTop = snap.scrollTop + delta
+        let restored = false
+        if (snap.msgId && contentRef.current) {
+          const escapedId =
+            typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+              ? CSS.escape(snap.msgId)
+              : String(snap.msgId).replace(/["\\]/g, '\\$&')
+          const anchorEl = contentRef.current.querySelector(`[data-msg-id="${escapedId}"]`)
+          if (anchorEl) {
+            const containerRect = el.getBoundingClientRect()
+            const nextRelTop = anchorEl.getBoundingClientRect().top - containerRect.top
+            const shift = nextRelTop - snap.relTop
+            if (Number.isFinite(shift) && Math.abs(shift) > 0.5) {
+              el.scrollTop = Math.max(0, el.scrollTop + shift)
+            }
+            restored = true
+          }
+        }
+        if (!restored) {
+          const delta = el.scrollHeight - snap.scrollHeight
+          if (delta > 0) {
+            el.scrollTop = snap.scrollTop + delta
+          }
         }
       }
     } else if (
@@ -495,8 +560,9 @@ export function ChatView({
         requestAnimationFrame(() => {
           if (!userInteractedRef.current && pinnedToBottomRef.current) scrollToBottomImmediate()
         })
-      } else if (distFromBottom < 320 || prevMsgCountRef.current === 0) {
+      } else if (isNearBottomRef.current || distFromBottom < 320 || prevMsgCountRef.current === 0) {
         el.scrollTo({ top: el.scrollHeight, behavior: prevMsgCountRef.current === 0 ? 'auto' : 'smooth' })
+        isNearBottomRef.current = true
         setShowScrollBottom(false)
       }
     }
@@ -524,12 +590,13 @@ export function ChatView({
   }, [approvals?.length])
 
   // Follow live streaming output only if user hasn't scrolled up reading history
+  // Uses pre-growth `isNearBottomRef` tracked in handleScroll so tall >=260px chunks never break auto-scroll
   useEffect(() => {
     const el = scrollRef.current
     if (!el || !streamingState?.active) return
-    const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
-    if (distFromBottom < 260) {
+    if (isNearBottomRef.current || (pinnedToBottomRef.current && !userInteractedRef.current)) {
       el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+      isNearBottomRef.current = true
     }
   }, [streamingState?.active, streamingState?.text, streamingState?.thinking, streamingState?.tools?.length])
 
@@ -537,10 +604,14 @@ export function ChatView({
     const el = scrollRef.current
     if (!el) return
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
+    isNearBottomRef.current = distFromBottom < 260
     const shouldShowJump = distFromBottom > 360 && !loadingSession && displayMessages.length > 0
     setShowScrollBottom((prev) => (prev === shouldShowJump ? prev : shouldShowJump))
     if (distFromBottom > 80 && initialScrollReady) {
       pinnedToBottomRef.current = false
+    }
+    if (loadingOlder) {
+      captureVisibleAnchor(null)
     }
     if (
       !pendingInitialScrollRef.current &&
@@ -820,7 +891,7 @@ export function ChatView({
                 msg={msg}
                 appId={session?.app || 'dsh'}
                 imageContext={imageContext}
-                virtualize={idx < displayMessages.length - 8}
+                virtualize={idx >= 15 && idx < displayMessages.length - 8}
               />
             ))}
 
@@ -891,6 +962,7 @@ export function ChatView({
           aria-label={bi('回到底部最新消息', 'Scroll to latest')}
           onClick={() => {
             userInteractedRef.current = false
+            isNearBottomRef.current = true
             scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
           }}
           className="absolute right-4 bottom-3 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-slate-200/90 bg-white/95 text-slate-600 shadow-lg backdrop-blur-md transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/90 dark:bg-[#232630]/95 dark:text-slate-200"

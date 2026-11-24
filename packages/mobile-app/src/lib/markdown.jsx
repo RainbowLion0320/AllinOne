@@ -220,8 +220,8 @@ function CodeBlock({ language, code }) {
 }
 
 function ImageChip({ target, label, imageContext }) {
-  const isRemoteHttp = /^https?:\/\//i.test(target)
-  const useE2ee = Boolean(imageContext?.e2eeActive && !isRemoteHttp)
+  const isDirectSrc = /^(?:https?:\/\/|data:|blob:)/i.test(target)
+  const useE2ee = Boolean(imageContext?.e2eeActive && !isDirectSrc)
   const src = useE2ee ? '' : resolveImageSrc(target, imageContext || {})
   const displayLabel = label || getImageLabel(target)
   return (
@@ -244,7 +244,9 @@ function ImageChip({ target, label, imageContext }) {
 
 function RichBlockquote({ children }) {
   const { lang } = useI18n()
-  const childArr = React.Children.toArray(children)
+  const childArr = React.Children.toArray(children).filter(
+    (child) => !(typeof child === 'string' && child.trim() === ''),
+  )
   const firstText = extractPlainText(childArr[0]).trim()
   const alertMatch = firstText.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/s)
 

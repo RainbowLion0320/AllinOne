@@ -85,11 +85,13 @@ export function E2eeSyncModal({
   const grantPrivateKeyRef = useRef(null)
   const grantStateRef = useRef(null)
   grantStateRef.current = grantState
+  const grantSessionGenRef = useRef(0)
   const applyToDesktopRef = useRef(applyToDesktop)
   applyToDesktopRef.current = applyToDesktop
   const didAutoOpenScannerRef = useRef(false)
 
   const cancelActiveGrant = useCallback(() => {
+    grantSessionGenRef.current += 1
     const cur = grantStateRef.current
     if (cur?.reqId) {
       try {
@@ -104,20 +106,25 @@ export function E2eeSyncModal({
   const startGrantSession = useCallback(async () => {
     if (!client || !roomId) return
     cancelActiveGrant()
+    const gen = ++grantSessionGenRef.current
     setError('')
     setInfo('')
     try {
       const pair = await generateGrantKeyPair()
+      if (grantSessionGenRef.current !== gen) return
       const reqId = generateGrantReqId()
       const uri = encodeE2eeGrantQrUri({ reqId, roomId, pubKeyFp: pair.publicKeyFp })
       const qrDataUrl = renderQrDataUrl(uri, { pixelSize: 224, darkColor: '#0F172A', lightColor: '#FFFFFF' })
+      if (grantSessionGenRef.current !== gen) return
       const sent = client.sendGrantRequest({
         reqId,
         pubKey: pair.publicKeyRaw,
         wantedKeyId: bridgeE2ee?.keyId || '',
       })
       if (!sent) {
-        setError(bi('尚未连接到中转服务器，请稍候重试', 'Not connected to relay server yet.'))
+        if (grantSessionGenRef.current === gen) {
+          setError(bi('尚未连接到中转服务器，请稍候重试', 'Not connected to relay server yet.'))
+        }
         return
       }
       grantPrivateKeyRef.current = pair.privateKey
@@ -136,7 +143,9 @@ export function E2eeSyncModal({
       })
       setGrantCountdownSec(120)
     } catch (err) {
-      setError(String(err?.message || err))
+      if (grantSessionGenRef.current === gen) {
+        setError(String(err?.message || err))
+      }
     }
   }, [client, roomId, bridgeE2ee?.keyId, cancelActiveGrant, bi])
 
@@ -218,6 +227,22 @@ export function E2eeSyncModal({
               : prev,
           )
         } catch {}
+        return
+      }
+
+      if (event === 'e2ee.grant.cancel' && payload.reopen) {
+        setGrantState((prev) =>
+          prev && prev.reqId === cur.reqId
+            ? {
+                ...prev,
+                phase: 'waiting',
+                sasCode: '',
+                approverPubKey: '',
+                approverDeviceName: '',
+                approverIp: '',
+              }
+            : prev,
+        )
         return
       }
 

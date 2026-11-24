@@ -46,9 +46,10 @@ export function apply(ctx, config = {}) {
     log.info('mobile-hub: registered 6 DSH cross-app master dispatch tools (allinone_*)')
   }
 
+  let startPromise = null
   if (enableLocalIpc) {
     const dshAdapter = orchestrator.adapters[APPS.DSH]
-    const startPromise = startDshLocalIpcServer({
+    startPromise = startDshLocalIpcServer({
       dshAdapter,
       dshHome: config.dshHome || '',
       log,
@@ -78,20 +79,17 @@ export function apply(ctx, config = {}) {
         log.warn?.(`mobile-hub: failed to start DSH local IPC server: ${String(err)}`)
         return null
       })
-
-    ctx.effect(() => async () => {
-      ipcDisposed = true
-      const srv = ipcServer || (await startPromise.catch(() => null))
-      ipcServer = null
-      if (srv) {
-        await srv.close().catch(() => {})
-      }
-    })
   }
 
   log.info('mobile-hub: serving DeepSeek Harness via authenticated local IPC for All in One Desktop App.')
 
   ctx.effect(() => async () => {
+    ipcDisposed = true
+    const srv = ipcServer || (startPromise ? await startPromise.catch(() => null) : null)
+    ipcServer = null
+    if (srv) {
+      await srv.close().catch(() => {})
+    }
     await orchestrator.dispose()
   })
 }

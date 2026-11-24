@@ -5,9 +5,9 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { accessSync, constants, existsSync, readdirSync, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 
 let pathEnriched = false
 
@@ -177,13 +177,72 @@ export function findExecutable(names = [], extraCandidates = []) {
   return null
 }
 
+function escapeCmdMeta(str) {
+  return str.replace(/([()%!^"<>&|])/g, '^$1')
+}
+
+function escapeWinCmdArg(arg) {
+  let s = String(arg ?? '')
+  s = s.replace(/(\\*)"/g, '$1$1\\"')
+  s = s.replace(/(\\*)$/, '$1$1')
+  s = `"${s}"`
+  // Double-escape cmd.exe metacharacters: cmd.exe parses once for /c and again when expanding %* inside .cmd/.bat
+  return escapeCmdMeta(escapeCmdMeta(s))
+}
+
+function resolveNpmCmdShim(cmdPath) {
+  try {
+    if (!cmdPath || !existsSync(cmdPath)) return null
+    const st = statSync(cmdPath)
+    if (!st.isFile() || st.size > 16_384) return null
+    const content = readFileSync(cmdPath, 'utf8')
+    const m = content.match(/"%(?:~)?dp0%\\([^"\r\n]+\.(?:js|cjs|mjs))"\s+%\*/i)
+    if (!m) return null
+    const dir = dirname(cmdPath)
+    const entryScript = join(dir, m[1])
+    if (!existsSync(entryScript)) return null
+    const localNode = join(dir, 'node.exe')
+    let nodeBin = existsSync(localNode) ? localNode : ''
+    if (!nodeBin && !process.versions.electron && process.execPath && /node(?:\.exe)?$/i.test(process.execPath)) {
+      nodeBin = process.execPath
+    }
+    if (!nodeBin) {
+      nodeBin = findExecutable(['node.exe', 'node']) || ''
+    }
+    if (!nodeBin) return null
+    return { nodeBin, entryScript }
+  } catch {
+    return null
+  }
+}
+
 /**
- * Spawn an executable safely across platforms (wrapping `.cmd`/`.bat` on Windows via `cmd.exe`).
+ * Safely spawn a Windows `.cmd`/`.bat` shim with spaces in paths and arbitrary JSON/metacharacter args.
+ * Resolves standard npm JS shims directly to `node.exe` when possible, and otherwise invokes
+ * `cmd.exe /d /s /c` with `windowsVerbatimArguments: true` and properly quoted/escaped arguments.
+ */
+export function spawnCmdShim(bin, args = [], options = {}) {
+  const argList = Array.isArray(args) ? args : []
+  const shim = resolveNpmCmdShim(bin)
+  if (shim) {
+    return spawn(shim.nodeBin, [shim.entryScript, ...argList], options)
+  }
+  const cleanBin = `"${String(bin || '').replace(/"/g, '')}"`
+  const escapedArgs = argList.map(escapeWinCmdArg)
+  const commandLine = `"${[cleanBin, ...escapedArgs].join(' ')}"`
+  return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], {
+    ...options,
+    windowsVerbatimArguments: true,
+  })
+}
+
+/**
+ * Spawn an executable safely across platforms (wrapping `.cmd`/`.bat` on Windows via `spawnCmdShim`).
  */
 export function spawnCrossPlatform(bin, args = [], options = {}) {
   ensureRichPath()
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
-    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', bin, ...args], options)
+    return spawnCmdShim(bin, args, options)
   }
   return spawn(bin, args, options)
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
@@ -34,6 +34,7 @@ export class MultiAppOrchestrator {
     this.pendingApprovals = new Map()
     /** @type {Map<string, any>} */
     this.dispatches = new Map()
+    this._lastInboundPruneAt = 0
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -62,7 +63,7 @@ export class MultiAppOrchestrator {
     if (!wsUrl) return ''
     try {
       const u = new URL(wsUrl)
-      u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:'
+      u.protocol = (u.protocol === 'wss:' || u.protocol === 'https:') ? 'https:' : 'http:'
       u.pathname = u.pathname.replace(/\/ws\/bridge\/?$/, '')
       u.search = ''
       return u.toString().replace(/\/$/, '')
@@ -199,12 +200,31 @@ export class MultiAppOrchestrator {
    *  - Strictly validates `att.url` matches `/api/uploads/<uuid>` and ALWAYS fetches from `this.relayHttpBase`
    *    with `redirect: 'error'` so `X-Bridge-Secret` can NEVER be leaked to third-party hosts (SSRF defense).
    */
+  pruneInboundDir(maxAgeMs = 24 * 60 * 60 * 1000) {
+    const now = Date.now()
+    if (now - this._lastInboundPruneAt < 10 * 60_000) return
+    this._lastInboundPruneAt = now
+    try {
+      if (!existsSync(this.inboundDir)) return
+      for (const name of readdirSync(this.inboundDir)) {
+        const fp = join(this.inboundDir, name)
+        try {
+          const st = statSync(fp)
+          if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
+            unlinkSync(fp)
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
   async materializeAttachments(attachments = []) {
     if (!Array.isArray(attachments) || attachments.length === 0) return []
     const RELAY_UPLOAD_PATH_RE = /^\/api\/uploads\/[a-f0-9-]{8,64}$/i
     const MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
     mkdirSync(this.inboundDir, { recursive: true })
     try { chmodSync(this.inboundDir, 0o700) } catch {}
+    this.pruneInboundDir()
     const out = []
 
     for (const att of attachments.slice(0, 12)) {
@@ -225,7 +245,7 @@ export class MultiAppOrchestrator {
         const fullUrl = `${this.relayHttpBase}${rawUrl}${isImage ? '' : '?consume=1'}`
         const headers = { 'X-Bridge-Secret': this.bridgeSecret }
         if (this.roomId) headers['X-Room-Id'] = this.roomId
-        const res = await fetch(fullUrl, { headers, redirect: 'error' })
+        const res = await fetch(fullUrl, { headers, redirect: 'error', signal: AbortSignal.timeout(30_000) })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const declaredLen = Number(res.headers.get('content-length') || 0)
         if (declaredLen > MAX_DOWNLOAD_BYTES) {
@@ -243,7 +263,7 @@ export class MultiAppOrchestrator {
         })
         const rawBase = basename(String(att.filename || 'upload.bin'))
         const safe = rawBase
-          .replace(/[^a-zA-Z0-9._-\u4e00-\u9fa5]/g, '_')
+          .replace(/[^a-zA-Z0-9._\u4e00-\u9fa5-]/g, '_')
           .replace(/^\.+/, '')
           .slice(0, 100) || 'upload.bin'
         const localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safe}`)
@@ -289,15 +309,24 @@ export class MultiAppOrchestrator {
   }
 
   async listApprovals() {
-    // Merge any pending approvals currently held inside a live DSH IPC process (e.g. after reconnect)
+    // Reconcile pending approvals currently held inside a live DSH IPC process (e.g. after reconnect or desktop resolution)
     const dshAdapter = this.adapters[APPS.DSH]
     if (typeof dshAdapter?.listPendingApprovals === 'function') {
       try {
         const remote = await dshAdapter.listPendingApprovals()
         if (Array.isArray(remote)) {
+          const authoritativeIds = new Set()
           for (const req of remote) {
-            if (req?.id && !this.pendingApprovals.has(req.id)) {
-              this.pendingApprovals.set(req.id, req)
+            if (req?.id) {
+              authoritativeIds.add(req.id)
+              if (!this.pendingApprovals.has(req.id)) {
+                this.pendingApprovals.set(req.id, req)
+              }
+            }
+          }
+          for (const [id, req] of this.pendingApprovals.entries()) {
+            if (req?.app === APPS.DSH && !authoritativeIds.has(id)) {
+              this.pendingApprovals.delete(id)
             }
           }
         }
@@ -313,7 +342,12 @@ export class MultiAppOrchestrator {
     const adapter = this.getAdapter(req.app)
     if (typeof adapter.resolveApproval === 'function') {
       const payload = answers && typeof answers === 'object' ? { decision, answers } : decision
-      return adapter.resolveApproval(id, payload)
+      try {
+        return await adapter.resolveApproval(id, payload)
+      } catch (err) {
+        this.pendingApprovals.set(id, req)
+        throw err
+      }
     }
     return { resolved: true, id, decision }
   }
@@ -370,6 +404,18 @@ export class MultiAppOrchestrator {
       completedAt: null,
     }
     this.dispatches.set(taskId, task)
+    const MAX_DISPATCHES = 200
+    if (this.dispatches.size > MAX_DISPATCHES) {
+      for (const [k, v] of this.dispatches.entries()) {
+        if (this.dispatches.size <= MAX_DISPATCHES) break
+        if (v.status !== 'running') this.dispatches.delete(k)
+      }
+      while (this.dispatches.size > MAX_DISPATCHES) {
+        const oldest = this.dispatches.keys().next().value
+        if (!oldest) break
+        this.dispatches.delete(oldest)
+      }
+    }
     this.onEvent(EVENTS.DISPATCH_UPDATED, { task })
 
     const runPromise = this.sendMessage({
@@ -442,24 +488,35 @@ export class MultiAppOrchestrator {
     if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
       p = p.slice(1, -1).trim()
     }
-    // Strip query/hash fragments if any
-    p = p.replace(/[?#].*$/, '')
 
-    // Convert file:/// URI to native filesystem path
+    // Convert file:/// URI to native filesystem path (strip query/hash only for file:// URIs or nonexistent paths)
     if (/^file:\/\//i.test(p)) {
+      p = p.replace(/[?#].*$/, '')
       p = p.replace(/^file:\/\/(?:localhost)?/i, '')
       try { p = decodeURIComponent(p) } catch {}
       if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) {
         p = p.slice(1)
       }
-    } else if (/%[0-9A-Fa-f]{2}/.test(p)) {
-      // Only decode percent-encoded paths if the raw path does not exist directly
-      if (!existsSync(p)) {
-        try { p = decodeURIComponent(p) } catch {}
+    } else {
+      if (p.startsWith('~/') || p.startsWith('~\\')) {
+        p = join(homedir(), p.slice(2))
+      }
+      if (/[?#]/.test(p) && !existsSync(p)) {
+        const baseDir = String(cwd || '').trim() || this.config.cwd || process.cwd()
+        const checkPath = isAbsolute(p) ? p : resolve(baseDir, p)
+        if (!existsSync(checkPath)) {
+          p = p.replace(/[?#].*$/, '')
+        }
+      }
+      if (/%[0-9A-Fa-f]{2}/.test(p)) {
+        // Only decode percent-encoded paths if the raw path does not exist directly
+        if (!existsSync(p)) {
+          try { p = decodeURIComponent(p) } catch {}
+        }
       }
     }
 
-    // Expand leading ~/
+    // Expand leading ~/ (in case file:// or decoded path had it)
     if (p.startsWith('~/') || p.startsWith('~\\')) {
       p = join(homedir(), p.slice(2))
     }
@@ -539,6 +596,10 @@ export class MultiAppOrchestrator {
         void this.sendMessage(params).catch((err) => {
           const msg = String(err?.message || err)
           this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)
+          // Never duplicate adapter-emitted STREAM_ERROR or kill an active stream UI spinner on SESSION_BUSY
+          if (err?._streamErrorEmitted || err?.code === 'SESSION_BUSY' || /正在运行中/.test(msg)) {
+            return
+          }
           // Guarantee mobile UI always exits the loading spinner even if an adapter threw early
           this.onEvent(EVENTS.STREAM_ERROR, {
             sessionId: targetId,

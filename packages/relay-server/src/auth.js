@@ -4,6 +4,7 @@ const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 const MEDIA_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes (read-only encrypted upload download scope)
 const WS_TICKET_TTL_MS = 30 * 1000 // 30 seconds (strictly single-use)
 const MAX_WS_TICKETS = 2000
+const MAX_WS_TICKETS_PER_ROOM = 20
 const MAX_RATE_LIMIT_ENTRIES = 5000
 
 /** Constant-time string comparison. */
@@ -62,14 +63,9 @@ export function createAuthManager({
     }
   }
 
-  function pruneWsTickets(now) {
+  function pruneExpiredWsTickets(now) {
     for (const [k, v] of wsTickets.entries()) {
       if (now > v.exp) wsTickets.delete(k)
-    }
-    while (wsTickets.size >= MAX_WS_TICKETS) {
-      const oldest = wsTickets.keys().next().value
-      if (!oldest) break
-      wsTickets.delete(oldest)
     }
   }
 
@@ -284,7 +280,23 @@ export function createAuthManager({
 
   function issueWsTicket(sessionPayload, { deviceName = '', clientKind = '' } = {}) {
     const now = Date.now()
-    pruneWsTickets(now)
+    pruneExpiredWsTickets(now)
+    const room = String(sessionPayload?.room || '').trim()
+    if (room) {
+      const roomKeys = []
+      for (const [k, v] of wsTickets.entries()) {
+        if (v.user?.room === room) roomKeys.push(k)
+      }
+      while (roomKeys.length >= MAX_WS_TICKETS_PER_ROOM) {
+        const oldestRoomTicket = roomKeys.shift()
+        if (oldestRoomTicket) wsTickets.delete(oldestRoomTicket)
+      }
+    }
+    while (wsTickets.size >= MAX_WS_TICKETS) {
+      const oldest = wsTickets.keys().next().value
+      if (!oldest) break
+      wsTickets.delete(oldest)
+    }
     const ticket = `tk_${randomBytes(24).toString('hex')}`
     const exp = now + WS_TICKET_TTL_MS
     const cleanDev = String(deviceName || '').trim().slice(0, 64)

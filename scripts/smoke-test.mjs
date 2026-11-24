@@ -31,9 +31,10 @@ import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
 } from '../packages/dsh-mobile-hub/src/helpers/interactive-schema.js'
-import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
+import { EVENTS, RPC, parseCompositeId, toEpochMs } from '../packages/shared/src/protocol.js'
 import {
   E2EE_METHOD_MARKER,
+  base64UrlToBytes,
   bytesToBase64,
   computeE2eeKeyId,
   computeGrantPubKeyFp,
@@ -65,6 +66,7 @@ import {
   saveDeviceState,
   selectDevice,
   upsertDevice,
+  upsertDeviceE2eeKey,
 } from '../packages/mobile-app/src/lib/deviceStore.js'
 import {
   clearSessionCache,
@@ -93,6 +95,7 @@ import {
 } from '../packages/desktop-app/src/updater.js'
 import {
   loadConfigDecrypted,
+  loadConfigWithStatus,
   saveConfigSecure,
 } from '../packages/desktop-app/src/bridge-manager.js'
 import {
@@ -4246,7 +4249,105 @@ async function main() {
         await cdxWatch.dispose()
       }
     }
-    console.log('[smoke] 23/23 Codex external running-state detection (zero-OOM rollout tail probe + giant file + live watcher) OK')
+    console.log('[smoke] 23/24 Codex external running-state detection (zero-OOM rollout tail probe + giant file + live watcher) OK')
+
+    // 24. Full-Stack v0.5.0 Regression Suite (Relay crash/injection defense, strict E2EE/Base64URL, Desktop Keychain & Intel Mac guard, Mobile 16-key LRU & Codex cache safety)
+    {
+      // 24.1 Relay HTTP malformed Host must return 400 without crashing relay, and /api/admin/invites returns 401 on missing token
+      const badHostStatus = await new Promise((resolveStatus, rejectStatus) => {
+        const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+          sock.write('GET /api/health HTTP/1.1\r\nHost: bad:port\r\nConnection: close\r\n\r\n')
+        })
+        let resp = ''
+        sock.on('data', (c) => { resp += c.toString('utf8') })
+        sock.on('end', () => resolveStatus(resp.split('\r\n')[0] || ''))
+        sock.on('error', rejectStatus)
+      })
+      assert.match(badHostStatus, /400/, 'Malformed Host header must return HTTP 400 without crashing relay')
+      const aliveAfterBadHost = await (await fetch(`${httpBase}/api/health`)).json()
+      assert.equal(aliveAfterBadHost.ok, true, 'Relay must stay alive after malformed Host header')
+      const noAuthInv = await fetch(`${httpBase}/api/admin/invites`)
+      assert.equal(noAuthInv.status, 401, '/api/admin/invites must return 401 without token')
+
+      // 24.2 Strict shared E2EE Base64URL, protocol helpers, and extended QR v11+
+      const sampleKey = generateE2eeKey()
+      assert.equal(base64UrlToBytes(`${sampleKey}=GARBAGE`), null, 'Trailing garbage after = must be rejected')
+      assert.equal(base64UrlToBytes(`${sampleKey}==`), null, 'Extra = padding must be rejected')
+      assert.equal(base64UrlToBytes('===='), null, 'Padding-only string must be rejected')
+      assert.equal(toEpochMs(new Date('invalid')), 0, 'Invalid Date must return 0, not NaN')
+      assert.deepEqual(parseCompositeId({ app: 'codex', sessionId: 'thr-1' }), { app: 'codex', sessionId: 'thr-1' })
+      const longQrSvg = renderSharedQrSvg(`https://example.com/${'a'.repeat(240)}`)
+      assert.ok(longQrSvg.startsWith('<svg'), 'QR encoder must support >213 byte payloads (Version 11+)')
+
+      // 24.3 Desktop safeStorage decrypt-error protection & Intel Mac ARM64 bricking guard
+      const cfgPath = join(tmpDir, 'keychain-locked-cfg.json')
+      const workingStore = {
+        isAvailable: () => true,
+        encrypt: (s) => Buffer.from(`enc:${s}`).toString('base64'),
+        decrypt: (b) => {
+          const s = Buffer.from(b, 'base64').toString('utf8')
+          if (!s.startsWith('enc:')) throw new Error('locked')
+          return s.slice(4)
+        },
+      }
+      saveConfigSecure(cfgPath, { roomId: 'usr_demo', bridgeSecret: 'sec123', e2eeKey: sampleKey }, workingStore)
+      const lockedStore = {
+        isAvailable: () => true,
+        encrypt: () => { throw new Error('Keychain locked') },
+        decrypt: () => { throw new Error('Keychain locked') },
+      }
+      const lockedRes = loadConfigWithStatus(cfgPath, lockedStore)
+      assert.equal(lockedRes.status, 'decrypt-error', 'Locked keychain must return decrypt-error instead of missing')
+      assert.equal(
+        pickReleaseAsset([{ name: 'All.in.One-0.5.0-arm64.dmg', browser_download_url: 'https://x/a.dmg' }], 'darwin', 'x64'),
+        null,
+        'Intel Mac x64 must NEVER fall back to arm64 DMG',
+      )
+
+      // 24.4 Mobile 16-key LRU keyring retention, blob preview stripping & Codex cache >120 safety
+      let { state: ringState, device: ringDev } = upsertDevice(loadDeviceState(), {
+        baseUrl: 'https://example.com/dsh',
+        token: 'tok-ring',
+        roomId: 'usr_ring',
+        username: 'ringuser',
+      })
+      const ringDevId = ringDev.id
+      const addedKids = []
+      for (let i = 0; i < 18; i += 1) {
+        const k = generateE2eeKey()
+        const kid = await computeE2eeKeyId(k)
+        addedKids.push(kid)
+        ringState = upsertDeviceE2eeKey(ringState, ringDevId, kid, k)
+      }
+      const ringTarget = ringState.devices.find((d) => d.id === ringDevId)
+      const finalKeys = Object.keys(ringTarget?.e2eeKeys || {})
+      assert.equal(finalKeys.length, 16, 'Keyring must stay capped at 16 entries')
+      assert.ok(finalKeys.includes(addedKids[17]), 'Newest key #18 must be retained in LRU keyring')
+      assert.ok(finalKeys.includes(addedKids[16]), 'Newest key #17 must be retained in LRU keyring')
+      assert.equal(finalKeys.includes(addedKids[0]), false, 'Oldest key #1 must be evicted')
+
+      const draftKey24 = makeDraftKey('dev24::pc24', 'codex:t24', 'codex')
+      saveDraft(draftKey24, {
+        text: 'hello',
+        attachments: [null, { id: 'a1', filename: 'p.png', mimeType: 'image/png', url: '/api/uploads/a1', localPreviewUrl: 'blob:https://x/123' }],
+      })
+      const loadedDraft24 = loadDraft(draftKey24)
+      assert.equal(loadedDraft24.attachments.length, 1, 'Invalid null attachments must be filtered')
+      assert.equal(loadedDraft24.attachments[0].localPreviewUrl, undefined, 'blob: localPreviewUrl must never be persisted')
+
+      const manyCodexMsgs = Array.from({ length: 130 }, (_, idx) => ({ id: `cdx-m-${idx}`, role: idx % 2 ? 'assistant' : 'user', text: `msg ${idx}`, ts: Date.now() + idx }))
+      await saveCachedSession('codex:t-over-120', {
+        meta: { app: 'codex', id: 'codex:t-over-120' },
+        messages: manyCodexMsgs,
+        hasMore: false,
+        nextCursor: null,
+      }, 'scope24')
+      const cachedCodex24 = await loadCachedSession('codex:t-over-120', 'scope24')
+      assert.equal(cachedCodex24.messages.length, 120)
+      assert.equal(cachedCodex24.nextCursor, null, 'Codex >120 cache must NEVER fabricate a numeric cursor')
+      assert.equal(cachedCodex24.hasMore, false)
+    }
+    console.log('[smoke] 24/24 Full-Stack v0.5.0 Regression Suite (Relay crash defense, strict E2EE, Keychain/Intel Mac guard, 16-key LRU & Codex cache) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

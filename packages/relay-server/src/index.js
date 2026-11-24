@@ -179,14 +179,61 @@ function sendJson(res, status, data) {
   res.end(body)
 }
 
+const SAFE_SCRIPT_URL_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
+const SAFE_PREFIX_RE = /^\/[A-Za-z0-9._\-\/]*$/
+
+function getTrustedForwardedProto(req) {
+  if (!isTrustedProxyAddr(req.socket?.remoteAddress)) return ''
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
+  return proto === 'https' || proto === 'http' ? proto : ''
+}
+
+function validateSafeScriptUrl(rawUrl) {
+  const trimmed = String(rawUrl || '').trim().replace(/\/+$/, '')
+  if (!trimmed || trimmed.length > 256) return ''
+  if (!SAFE_SCRIPT_URL_RE.test(trimmed)) return ''
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return ''
+    const cleanPath = parsed.pathname.replace(/\/+$/, '')
+    const candidate = `${parsed.origin}${cleanPath}`
+    return SAFE_SCRIPT_URL_RE.test(candidate) ? candidate : ''
+  } catch {
+    return ''
+  }
+}
+
+function resolveSafePublicScriptUrl(req, publicRelayUrl) {
+  if (publicRelayUrl) {
+    return validateSafeScriptUrl(publicRelayUrl)
+  }
+  const trusted = isTrustedProxyAddr(req.socket?.remoteAddress)
+  const proto = (trusted && getTrustedForwardedProto(req)) || (req.socket?.encrypted ? 'https' : 'http')
+  const rawHost = String(req.headers.host || '').trim()
+  if (!rawHost) return ''
+  let prefix = ''
+  if (trusted) {
+    const rawPrefix = String(req.headers['x-forwarded-prefix'] || '').split(',')[0].trim()
+    if (rawPrefix) {
+      const normalized = rawPrefix.startsWith('/') ? rawPrefix : `/${rawPrefix}`
+      const stripped = normalized.replace(/\/+$/, '')
+      if (stripped && !stripped.includes('..') && SAFE_PREFIX_RE.test(stripped)) {
+        prefix = stripped
+      }
+    }
+  }
+  return validateSafeScriptUrl(`${proto}://${rawHost}${prefix}`)
+}
+
 function setSecurityHeaders(req, res) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'no-referrer')
   // Allow self camera so built-in QR scanner continues to work cleanly in PWA/WebView
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()')
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
-  if (forwardedProto === 'https') {
+  const forwardedProto = getTrustedForwardedProto(req)
+  if (forwardedProto === 'https' || req.socket?.encrypted) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
   }
 }
@@ -372,7 +419,27 @@ export function createRelayServer(options = {}) {
       const now = Date.now()
       const cutoff = now - UPLOAD_TTL_MS
       const entries = []
-      for (const file of readdirSync(uploadDir)) {
+      const files = readdirSync(uploadDir)
+      const binIds = new Set()
+      for (const file of files) {
+        if (file.endsWith('.bin')) binIds.add(file.slice(0, -4))
+      }
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          const id = file.slice(0, -5)
+          const metaPath = join(uploadDir, file)
+          if (!binIds.has(id)) {
+            try { unlinkSync(metaPath) } catch {}
+          } else {
+            try {
+              const st = statSync(metaPath)
+              if (st.mtimeMs < cutoff) {
+                try { unlinkSync(metaPath) } catch {}
+              }
+            } catch {}
+          }
+          continue
+        }
         if (!file.endsWith('.bin')) continue
         const id = file.slice(0, -4)
         const binPath = join(uploadDir, file)
@@ -492,21 +559,28 @@ export function createRelayServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    setSecurityHeaders(req, res)
-    setCors(req, res)
-    if (req.method === 'OPTIONS') {
-      if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
-        res.writeHead(403)
+    try {
+      setSecurityHeaders(req, res)
+      setCors(req, res)
+      if (req.method === 'OPTIONS') {
+        if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
+          res.writeHead(403)
+          res.end()
+          return
+        }
+        res.writeHead(204)
         res.end()
         return
       }
-      res.writeHead(204)
-      res.end()
-      return
-    }
 
-    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
-    const pathname = urlObj.pathname
+      let urlObj
+      try {
+        urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'Bad Request' })
+        return
+      }
+      const pathname = urlObj.pathname
 
     // Health check (privacy-safe: unauthenticated callers only see `{ ok: true }`)
     if (pathname === '/api/health' && req.method === 'GET') {
@@ -820,7 +894,8 @@ export function createRelayServer(options = {}) {
           return
         }
         const matchedUser = accounts.getUserByEmail(eCheck.email)
-        if (!auth.checkAccountRateLimit(eCheck.email)) {
+        const accountRateKey = accounts.resolveAccountKey(eCheck.email)
+        if (!auth.checkAccountRateLimit(accountRateKey)) {
           sendJson(res, 429, { ok: false, error: '该账号验证尝试过于频繁，请 15 分钟后再试' })
           return
         }
@@ -833,20 +908,20 @@ export function createRelayServer(options = {}) {
         })
         if (!codeCheck.ok || !matchedUser) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(eCheck.email)
+          auth.recordAccountFailure(accountRateKey)
           sendJson(res, 400, { ok: false, error: codeCheck.ok ? '邮箱验证码无效或已过期' : codeCheck.error })
           return
         }
         const reset = accounts.resetPasswordByEmail(eCheck.email, pCheck.password)
         if (!reset.ok) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(eCheck.email)
+          auth.recordAccountFailure(accountRateKey)
           sendJson(res, 400, { ok: false, error: reset.error })
           return
         }
         emailCodes.consumeCode({ purpose: 'reset', email: eCheck.email })
         auth.clearFailure(ip)
-        auth.clearAccountFailure(eCheck.email)
+        auth.clearAccountFailure(accountRateKey)
         hub.disconnectRoomClients(reset.user.userId, 4401, 'Password reset')
         sendJson(res, 200, {
           ok: true,
@@ -894,18 +969,19 @@ export function createRelayServer(options = {}) {
       try {
         const body = await readJsonBody(req)
         const identifier = String(body.username || '').trim()
-        if (!auth.checkAccountRateLimit(identifier)) {
+        const accountRateKey = accounts.resolveAccountKey(identifier)
+        if (!auth.checkAccountRateLimit(accountRateKey)) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
-        const verified = accounts.authenticateUser(identifier, body.password)
+        const verified = accounts.authenticateUser(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(identifier)
+          auth.recordAccountFailure(accountRateKey)
           sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
-        const { user } = verified
+        let { user } = verified
         const emailCode = String(body.emailCode || '').trim()
 
         // Optional Email 2FA: require verified 6-digit OTP when enabled on account & SMTP is active
@@ -961,7 +1037,7 @@ export function createRelayServer(options = {}) {
           })
           if (!check2fa.ok) {
             auth.recordFailure(ip)
-            auth.recordAccountFailure(identifier)
+            auth.recordAccountFailure(accountRateKey)
             sendJson(res, 401, {
               ok: false,
               requires2fa: true,
@@ -974,7 +1050,8 @@ export function createRelayServer(options = {}) {
         }
 
         auth.clearFailure(ip)
-        auth.clearAccountFailure(identifier)
+        auth.clearAccountFailure(accountRateKey)
+        user = accounts.markUserLogin(user.userId) || user
         const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
         const { isNewContext } = accounts.checkAndRememberLoginContext(user.userId, {
           deviceName: devInfo.deviceName,
@@ -1029,7 +1106,7 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // PC Bridge account login -> verifies username+password once, issues a per-PC `deviceSecret` (PC never stores password!)
+    // PC Bridge account login -> verifies username+password (+ optional Email 2FA) once, issues a per-PC `deviceSecret`
     if (pathname === '/api/account/device-login' && req.method === 'POST') {
       const ip = getClientIp(req)
       if (!auth.checkRateLimit(ip)) {
@@ -1039,27 +1116,132 @@ export function createRelayServer(options = {}) {
       try {
         const body = await readJsonBody(req)
         const identifier = String(body.username || '').trim()
-        if (!auth.checkAccountRateLimit(identifier)) {
+        const accountRateKey = accounts.resolveAccountKey(identifier)
+        if (!auth.checkAccountRateLimit(accountRateKey)) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
-        const verified = accounts.authenticateUser(identifier, body.password)
+        const verified = accounts.authenticateUser(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(identifier)
+          auth.recordAccountFailure(accountRateKey)
           sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
+        const { user } = verified
+        const emailCode = String(body.emailCode || '').trim()
+
+        // Enforce the same Email 2FA verification when enabled on account & SMTP is configured
+        if (user.loginEmail2fa && mailer.isConfigured() && user.email && user.emailVerified) {
+          if (!emailCode) {
+            const issued = emailCodes.issueCode({
+              purpose: 'login_2fa',
+              email: user.email,
+              ip,
+              userId: user.userId,
+            })
+            if (!issued.ok) {
+              if (issued.retryAfterSec) {
+                sendJson(res, 200, {
+                  ok: false,
+                  requires2fa: true,
+                  maskedEmail: maskEmailAddress(user.email),
+                  cooldownSec: issued.retryAfterSec,
+                  message: `验证码已发送至 ${maskEmailAddress(user.email)}，请直接输入或 ${issued.retryAfterSec} 秒后重发`,
+                })
+                return
+              }
+              sendJson(res, 429, { ok: false, error: issued.error })
+              return
+            }
+            try {
+              await mailer.sendVerificationCode({
+                to: user.email,
+                code: issued.code,
+                purpose: 'login_2fa',
+                username: user.username,
+              })
+            } catch (mailErr) {
+              issued.rollback?.()
+              sendJson(res, 502, { ok: false, error: `发送登录验证码失败：${String(mailErr?.message || mailErr)}` })
+              return
+            }
+            sendJson(res, 200, {
+              ok: false,
+              requires2fa: true,
+              maskedEmail: maskEmailAddress(user.email),
+              cooldownSec: issued.cooldownSec,
+              message: `已向 ${maskEmailAddress(user.email)} 发送 6 位登录验证码`,
+            })
+            return
+          }
+          const check2fa = emailCodes.verifyCode({
+            purpose: 'login_2fa',
+            email: user.email,
+            code: emailCode,
+            userId: user.userId,
+            consume: false,
+          })
+          if (!check2fa.ok) {
+            auth.recordFailure(ip)
+            auth.recordAccountFailure(accountRateKey)
+            sendJson(res, 401, {
+              ok: false,
+              requires2fa: true,
+              maskedEmail: maskEmailAddress(user.email),
+              error: check2fa.error,
+            })
+            return
+          }
+          emailCodes.consumeCode({ purpose: 'login_2fa', email: user.email })
+        }
+
         auth.clearFailure(ip)
-        auth.clearAccountFailure(identifier)
-        const bound = accounts.bindDevice({
-          userId: verified.user.userId,
-          label: body.label || body.hostname || 'My PC',
-          hostname: body.hostname || body.label || 'My-PC',
-          platform: body.platform || 'unknown',
-          bridgeId: body.bridgeId || '',
+        auth.clearAccountFailure(accountRateKey)
+        let bound
+        try {
+          bound = accounts.bindDevice({
+            userId: user.userId,
+            label: body.label || body.hostname || 'My PC',
+            hostname: body.hostname || body.label || 'My-PC',
+            platform: body.platform || 'unknown',
+            bridgeId: body.bridgeId || '',
+          })
+        } catch (bindErr) {
+          sendJson(res, 400, { ok: false, error: String(bindErr?.message || '绑定电脑失败') })
+          return
+        }
+        if (!bound) {
+          sendJson(res, 404, { ok: false, error: '账号不存在' })
+          return
+        }
+        accounts.markUserLogin(user.userId)
+        const deviceLabel = bound.label || bound.hostname || 'My PC'
+        const { isNewContext } = accounts.checkAndRememberLoginContext(user.userId, {
+          deviceName: deviceLabel,
+          ip,
         })
-        hub.broadcastRoomDevices(verified.user.userId)
+        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified) {
+          mailer
+            .sendLoginAlert({
+              to: user.email,
+              username: user.username,
+              deviceName: deviceLabel,
+              ip,
+              at: Date.now(),
+            })
+            .catch((err) => {
+              console.warn(`[relay] Failed to send device-login alert email for @${user.username}: ${String(err?.message || err)}`)
+            })
+        }
+        hub.recordActivity({
+          type: 'user.login',
+          roomId: user.userId,
+          label: `@${user.username}`,
+          detail: `PC bind: ${deviceLabel}`,
+          ip,
+        })
+        hub.broadcastRoomDevices(user.userId)
         sendJson(res, 200, { ok: true, ...bound })
       } catch {
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
@@ -1117,6 +1299,10 @@ export function createRelayServer(options = {}) {
           platform: body.platform || 'unknown',
           bridgeId: body.bridgeId || '',
         })
+        if (!bound) {
+          sendJson(res, 404, { ok: false, error: '账号不存在' })
+          return
+        }
         hub.broadcastRoomDevices(payload.room)
         sendJson(res, 200, {
           ok: true,
@@ -1182,23 +1368,41 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Change account password (revokes all other sessions and returns a fresh JWT for caller)
+    // Change account password (rate-limited, non-blocking scrypt, kicks OTHER clients while keeping caller connected)
     if (pathname === '/api/account/password' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+        return
+      }
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
+      if (!auth.checkAccountRateLimit(payload.room)) {
+        sendJson(res, 429, { ok: false, error: '该账号尝试次数过多，请 15 分钟后再试' })
+        return
+      }
       try {
         const body = await readJsonBody(req)
-        const changed = accounts.changePassword(payload.room, body.currentPassword, body.newPassword)
+        const changed = await accounts.changePasswordAsync(payload.room, body.currentPassword, body.newPassword)
         if (!changed.ok) {
+          if (changed.error === '当前密码不正确') {
+            auth.recordFailure(ip)
+            auth.recordAccountFailure(payload.room)
+          }
           sendJson(res, 400, { ok: false, error: changed.error })
           return
         }
-        hub.disconnectRoomClients(payload.room, 4401, 'Password changed')
-        const ip = getClientIp(req)
-        const devInfo = parseClientDeviceInfo(body.deviceName || payload.dev || '', req.headers['user-agent'] || '', body.clientKind || '')
+        auth.clearFailure(ip)
+        auth.clearAccountFailure(payload.room)
+        const currentClientId = String(body.currentClientId || '').trim()
+        const devInfo = parseClientDeviceInfo(
+          body.deviceName || payload.dev || '',
+          req.headers['user-agent'] || '',
+          body.clientKind || '',
+        )
         const newSid = auth.generateSessionId()
         accounts.recordUserSession(changed.user.userId, {
           sid: newSid,
@@ -1206,6 +1410,12 @@ export function createRelayServer(options = {}) {
           clientKind: devInfo.clientKind,
           ip,
         })
+        hub.disconnectOtherRoomClients(
+          payload.room,
+          { keepClientId: currentClientId, keepSid: payload.sid || '', newSidForKept: newSid },
+          4401,
+          'Password changed',
+        )
         const freshToken = auth.signSessionToken(
           changed.user.userId,
           devInfo.deviceName,
@@ -1222,11 +1432,8 @@ export function createRelayServer(options = {}) {
 
     // Admin: List all single-use invite codes + registered user summary
     if (pathname === '/api/admin/invites' && req.method === 'GET') {
-      const payload = auth.verifySessionToken(extractBearer(req))
-      if (!auth.isAdminPayload(payload)) {
-        sendJson(res, 403, { ok: false, error: '仅管理员可管理邀请码' })
-        return
-      }
+      const payload = requireAdmin(req, res)
+      if (!payload) return
       const invites = accounts.listInvites()
       const stats = {
         total: invites.length,
@@ -1240,11 +1447,8 @@ export function createRelayServer(options = {}) {
 
     // Admin: Generate N single-use registration invite codes (each usable by strictly 1 user)
     if (pathname === '/api/admin/invites' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
-      if (!auth.isAdminPayload(payload)) {
-        sendJson(res, 403, { ok: false, error: '仅管理员可生成邀请码' })
-        return
-      }
+      const payload = requireAdmin(req, res)
+      if (!payload) return
       try {
         const body = await readJsonBody(req)
         const created = accounts.createInvites({
@@ -1269,11 +1473,8 @@ export function createRelayServer(options = {}) {
 
     // Admin: Revoke an unused invite code
     if (pathname === '/api/admin/invites/revoke' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
-      if (!auth.isAdminPayload(payload)) {
-        sendJson(res, 403, { ok: false, error: '仅管理员可作废邀请码' })
-        return
-      }
+      const payload = requireAdmin(req, res)
+      if (!payload) return
       try {
         const body = await readJsonBody(req)
         const resRevoke = accounts.revokeInvite(body.id || body.code)
@@ -1306,6 +1507,7 @@ export function createRelayServer(options = {}) {
       const serverHealth = collectServerHealth({
         uploadDir,
         mailer,
+        registerInviteGated: true,
         startedAt,
         version: RELAY_VERSION,
       })
@@ -1485,6 +1687,21 @@ export function createRelayServer(options = {}) {
       return
     }
 
+    // Sign out current session (permanently revokes caller's `sid` without kicking other devices)
+    if (pathname === '/api/auth/logout' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload) {
+        sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      const revokedPermanent = payload.sid ? accounts.revokeUserSession(payload.room, payload.sid) : false
+      const kickedConnections = payload.sid
+        ? hub.disconnectClient(payload.room, { sid: payload.sid }, 4401, 'Signed out')
+        : 0
+      sendJson(res, 200, { ok: true, revokedPermanent, kickedConnections })
+      return
+    }
+
     // Kick / revoke a single logged-in client device (by `sid` or live `clientId`)
     if (pathname === '/api/auth/sessions/revoke' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
@@ -1500,6 +1717,15 @@ export function createRelayServer(options = {}) {
         if (!targetSid && !targetClientId) {
           sendJson(res, 400, { ok: false, error: '缺少目标会话标识' })
           return
+        }
+        if (targetSid) {
+          const validFormat = /^s_[0-9a-f]{16}$/.test(targetSid)
+          const liveMatch = hub.getClientList(payload.room).some((c) => c.sid === targetSid)
+          const knownSid = accounts.hasUserSession(payload.room, targetSid) || liveMatch
+          if (targetSid.length > 64 || (!validFormat && !knownSid)) {
+            sendJson(res, 400, { ok: false, error: '无效的会话标识' })
+            return
+          }
         }
         if ((targetSid && payload.sid && targetSid === payload.sid) || (targetClientId && currentClientId && targetClientId === currentClientId)) {
           sendJson(res, 400, { ok: false, error: '不能踢出当前本机设备，如需退出请使用退出登录' })
@@ -1567,7 +1793,7 @@ export function createRelayServer(options = {}) {
         )
         const kickedConnections = hub.disconnectOtherRoomClients(
           targetRoom,
-          { keepClientId: currentClientId, newSidForKept: newSid },
+          { keepClientId: currentClientId, keepSid: payload.sid || '', newSidForKept: newSid },
           4401,
           'Signed out from another device',
         )
@@ -1691,8 +1917,15 @@ export function createRelayServer(options = {}) {
           size: buf.length,
           createdAt: Date.now(),
         }
-        writeFileSync(join(uploadDir, `${id}.bin`), buf, { mode: 0o600 })
-        writeFileSync(join(uploadDir, `${id}.json`), JSON.stringify(meta), { mode: 0o600 })
+        const binPath = join(uploadDir, `${id}.bin`)
+        const metaPath = join(uploadDir, `${id}.json`)
+        writeFileSync(binPath, buf, { mode: 0o600 })
+        try {
+          writeFileSync(metaPath, JSON.stringify(meta), { mode: 0o600 })
+        } catch (metaErr) {
+          try { unlinkSync(binPath) } catch {}
+          throw metaErr
+        }
         sendJson(res, 200, {
           ok: true,
           upload: {
@@ -1727,13 +1960,25 @@ export function createRelayServer(options = {}) {
         sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
         return
       }
-      const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-      const fileRoom = meta.roomId
+      let meta
+      try {
+        meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+      } catch {
+        sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
+        return
+      }
+      const fileRoom = meta?.roomId
       if (!fileRoom || fileRoom !== callerRoom) {
         sendJson(res, 403, { ok: false, error: '无权访问其他账号的文件' })
         return
       }
-      const data = readFileSync(binPath)
+      let data
+      try {
+        data = readFileSync(binPath)
+      } catch {
+        sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
+        return
+      }
       // Ephemeral consume: when the PC bridge downloads a non-image attachment with ?consume=1, delete temp files immediately
       if (bridgeRoom && urlObj.searchParams.get('consume') === '1') {
         try { unlinkSync(binPath) } catch {}
@@ -1762,31 +2007,35 @@ export function createRelayServer(options = {}) {
       }
       const mapped = adminFiles[pathname]
       const adminTarget = mapped ? join(ADMIN_DASHBOARD_DIR, mapped) : ''
-      if (adminTarget && existsSync(adminTarget) && statSync(adminTarget).isFile()) {
-        const ext = extname(adminTarget).toLowerCase()
-        let buf = readFileSync(adminTarget)
-        if (ext === '.html' && pathname === '/admin') {
-          // Keep asset & back-to-app links subpath-safe when accessed without trailing slash (e.g. /subpath/admin)
-          const html = buf
-            .toString('utf8')
-            .replaceAll('href="./styles.css"', 'href="admin/styles.css"')
-            .replaceAll('src="./app.js"', 'src="admin/app.js"')
-            .replaceAll('href="../"', 'href="./"')
-          buf = Buffer.from(html, 'utf8')
-        }
-        const headers = {
-          'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-          'Content-Length': buf.length,
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-        }
-        if (ext === '.html') {
-          headers['Content-Security-Policy'] =
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-        }
-        res.writeHead(200, headers)
-        if (req.method === 'HEAD') res.end()
-        else res.end(buf)
-        return
+      if (adminTarget) {
+        try {
+          if (statSync(adminTarget).isFile()) {
+            const ext = extname(adminTarget).toLowerCase()
+            let buf = readFileSync(adminTarget)
+            if (ext === '.html' && pathname === '/admin') {
+              // Keep asset & back-to-app links subpath-safe when accessed without trailing slash (e.g. /subpath/admin)
+              const html = buf
+                .toString('utf8')
+                .replaceAll('href="./styles.css"', 'href="admin/styles.css"')
+                .replaceAll('src="./app.js"', 'src="admin/app.js"')
+                .replaceAll('href="../"', 'href="./"')
+              buf = Buffer.from(html, 'utf8')
+            }
+            const headers = {
+              'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+              'Content-Length': buf.length,
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+            }
+            if (ext === '.html') {
+              headers['Content-Security-Policy'] =
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+            }
+            res.writeHead(200, headers)
+            if (req.method === 'HEAD') res.end()
+            else res.end(buf)
+            return
+          }
+        } catch {}
       }
       sendJson(res, 404, { ok: false, error: 'Not Found' })
       return
@@ -1798,70 +2047,109 @@ export function createRelayServer(options = {}) {
       const candidate = resolve(staticDir, normalize(rel))
       let target = null
       const withinStaticDir = candidate === staticDir || candidate.startsWith(`${staticDir}${sep}`)
-      if (withinStaticDir && existsSync(candidate) && statSync(candidate).isFile()) {
-        target = candidate
-      } else if (!pathname.startsWith('/api/') && !pathname.startsWith('/ws/') && !pathname.startsWith('/downloads/') && !pathname.startsWith('/admin')) {
+      if (withinStaticDir) {
+        try {
+          if (statSync(candidate).isFile()) target = candidate
+        } catch {}
+      }
+      if (!target && !pathname.startsWith('/api/') && !pathname.startsWith('/ws/') && !pathname.startsWith('/downloads/') && !pathname.startsWith('/admin')) {
         const indexHtml = join(staticDir, 'index.html')
-        if (existsSync(indexHtml)) target = indexHtml
+        try {
+          if (statSync(indexHtml).isFile()) target = indexHtml
+        } catch {}
       }
       if (target) {
-        const ext = extname(target).toLowerCase()
-        const isMutable =
-          ext === '.html' ||
-          ext === '.ps1' ||
-          ext === '.sh' ||
-          ext === '.mjs' ||
-          target.endsWith('sw.js') ||
-          target.endsWith('registerSW.js') ||
-          target.endsWith('manifest.webmanifest')
+        try {
+          const ext = extname(target).toLowerCase()
+          const isMutable =
+            ext === '.html' ||
+            ext === '.ps1' ||
+            ext === '.sh' ||
+            ext === '.mjs' ||
+            target.endsWith('sw.js') ||
+            target.endsWith('registerSW.js') ||
+            target.endsWith('manifest.webmanifest')
 
-        // Dynamically inject this server's public URL into setup.ps1 / setup.sh so the public repo stays 100% generic
-        if (ext === '.ps1' || ext === '.sh') {
-          const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim()
-          const inferredOrigin = req.headers.host ? `${proto}://${req.headers.host}` : ''
-          const effectiveUrl = publicRelayUrl || inferredOrigin
-          let scriptBody = readFileSync(target, 'utf8')
-          if (effectiveUrl) {
-            scriptBody = scriptBody.replaceAll('https://your-relay.example.com', effectiveUrl)
+          // Dynamically inject this server's strictly validated public URL into setup.ps1 / setup.sh
+          if (ext === '.ps1' || ext === '.sh') {
+            const effectiveUrl = resolveSafePublicScriptUrl(req, publicRelayUrl)
+            let scriptBody = readFileSync(target, 'utf8')
+            if (effectiveUrl) {
+              scriptBody = scriptBody.replaceAll('https://your-relay.example.com', effectiveUrl)
+            }
+            const buf = Buffer.from(scriptBody, 'utf8')
+            res.writeHead(200, {
+              'Content-Type': MIME_TYPES[ext] || 'text/plain; charset=utf-8',
+              'Content-Length': buf.length,
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+            })
+            if (req.method === 'HEAD') res.end()
+            else res.end(buf)
+            return
           }
-          const buf = Buffer.from(scriptBody, 'utf8')
-          res.writeHead(200, {
-            'Content-Type': MIME_TYPES[ext] || 'text/plain; charset=utf-8',
-            'Content-Length': buf.length,
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-          })
-          if (req.method === 'HEAD') res.end()
-          else res.end(buf)
+
+          if (req.method === 'HEAD') {
+            const st = statSync(target)
+            const staticHeaders = {
+              'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+              'Content-Length': st.size,
+              'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
+            }
+            if (ext === '.html') {
+              staticHeaders['Content-Security-Policy'] = APP_HTML_CSP
+            }
+            res.writeHead(200, staticHeaders)
+            res.end()
+            return
+          }
+
+          const data = readFileSync(target)
+          const staticHeaders = {
+            'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+            'Content-Length': data.length,
+            'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
+          }
+          if (ext === '.html') {
+            staticHeaders['Content-Security-Policy'] = APP_HTML_CSP
+          }
+          res.writeHead(200, staticHeaders)
+          res.end(data)
+          return
+        } catch {
+          sendJson(res, 404, { ok: false, error: 'Not Found' })
           return
         }
-
-        const st = statSync(target)
-        const staticHeaders = {
-          'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-          'Content-Length': st.size,
-          'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
-        }
-        if (ext === '.html') {
-          staticHeaders['Content-Security-Policy'] = APP_HTML_CSP
-        }
-        res.writeHead(200, staticHeaders)
-        if (req.method === 'HEAD') {
-          res.end()
-        } else {
-          res.end(readFileSync(target))
-        }
-        return
       }
     }
 
     sendJson(res, 404, { ok: false, error: 'Not Found' })
+    } catch (err) {
+      console.error('[relay] Unhandled HTTP request error:', err?.stack || err)
+      if (!res.headersSent) {
+        try {
+          sendJson(res, 500, { ok: false, error: 'Internal Server Error' })
+        } catch {}
+      } else {
+        try { res.end() } catch {}
+      }
+    }
   })
 
   // WebSocket server handling both /ws/bridge and /ws/client (32MB supports high-res PC screenshots)
   const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 })
+  wss.on('error', (err) => {
+    console.warn('[relay] WebSocketServer error:', err?.message || err)
+  })
 
   server.on('upgrade', (req, socket, head) => {
-    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+    let urlObj
+    try {
+      urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+    } catch {
+      try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n') } catch {}
+      try { socket.destroy() } catch {}
+      return
+    }
     const pathname = urlObj.pathname
 
     if (pathname === '/ws/bridge') {
@@ -1926,11 +2214,15 @@ export function createRelayServer(options = {}) {
       const clientIp = getClientIp(req)
       const clientUa = String(req.headers['user-agent'] || '')
       const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
-      accounts.touchUserSession(user.room, user.sid, {
-        deviceName: devInfo.deviceName,
-        clientKind: devInfo.clientKind,
-        ip: clientIp,
-      })
+      try {
+        accounts.touchUserSession(user.room, user.sid, {
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          ip: clientIp,
+        })
+      } catch (err) {
+        console.warn('[relay] Failed to persist touchUserSession on WS upgrade:', err?.message || err)
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         hub.registerClient(ws, user, { lastSeq, ip: clientIp, userAgent: clientUa })
       })

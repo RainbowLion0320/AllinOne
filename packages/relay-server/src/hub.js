@@ -5,8 +5,13 @@ const EVENT_BUFFER_SIZE = 200
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
 const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
+const ROOM_EVENTS_MAX = 2000
+const MAX_CACHED_EVENT_BYTES = 512 * 1024
+const MAX_PENDING_RPC_PER_ROOM = 200
 const E2EE_GRANT_TTL_MS = 120_000
 const E2EE_GRANT_MAX_PER_ROOM = 8
+const E2EE_GRANT_SWEEP_MS = 15_000
+const WS_HEARTBEAT_INTERVAL_MS = 30_000
 const MAX_CLIENTS_PER_ROOM = 30
 const MAX_BRIDGES_PER_ROOM = 16
 
@@ -126,13 +131,44 @@ export class RelayHub {
      * @type {Map<string, any>}
      */
     this.e2eeGrants = new Map()
+
+    // Periodic sweep so expired E2EE grant requests actively emit E2EE_GRANT_CANCEL (reason: 'expired')
+    this._grantSweepTimer = setInterval(() => {
+      if (this.e2eeGrants.size > 0) this.pruneExpiredGrants()
+    }, E2EE_GRANT_SWEEP_MS)
+    this._grantSweepTimer.unref()
+
+    // Server-side WS ping/pong liveness heartbeat (reaps half-open/dead TCP sockets)
+    this._heartbeatTimer = setInterval(() => {
+      for (const entry of this.bridges.values()) {
+        if (entry.ws.readyState !== 1) continue
+        if (entry.isAlive === false) {
+          this.log.warn?.(`[relay] Bridge heartbeat timeout: room=${entry.roomId} id=${entry.bridgeId}`)
+          try { entry.ws.terminate() } catch {}
+          continue
+        }
+        entry.isAlive = false
+        try { entry.ws.ping() } catch {}
+      }
+      for (const [cid, entry] of this.clients.entries()) {
+        if (entry.ws.readyState !== 1) continue
+        if (entry.isAlive === false) {
+          this.log.warn?.(`[relay] Client heartbeat timeout: room=${entry.roomId} client=${cid}`)
+          try { entry.ws.terminate() } catch {}
+          continue
+        }
+        entry.isAlive = false
+        try { entry.ws.ping() } catch {}
+      }
+    }, WS_HEARTBEAT_INTERVAL_MS)
+    this._heartbeatTimer.unref()
   }
 
   pruneExpiredGrants(now = Date.now()) {
     for (const [reqId, g] of this.e2eeGrants.entries()) {
       if (now >= g.expiresAt || !this.clients.has(g.requesterClientId)) {
         this.e2eeGrants.delete(reqId)
-        this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'expired' }, g.requesterClientId)
+        this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'expired' })
       }
     }
   }
@@ -186,9 +222,48 @@ export class RelayHub {
 
   cancelClientGrants(clientId, reason = 'disconnected') {
     for (const [reqId, g] of this.e2eeGrants.entries()) {
-      if (g.requesterClientId !== clientId) continue
-      this.e2eeGrants.delete(reqId)
-      this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason }, clientId)
+      if (g.requesterClientId === clientId) {
+        this.e2eeGrants.delete(reqId)
+        this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason }, clientId)
+      } else if (g.offeredByClientId === clientId) {
+        g.offeredByClientId = ''
+        g.approverPubKey = ''
+        this.sendToClient(g.requesterClientId, {
+          type: 'event',
+          ts: Date.now(),
+          bridgeId: '',
+          event: EVENTS.E2EE_GRANT_CANCEL,
+          payload: { reqId, reason: 'approver_disconnected', reopen: true },
+        })
+      }
+    }
+  }
+
+  failPendingRpcsForBridgeWs(bridgeWs, bridgeKey = '') {
+    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
+      const match = pending.bridgeWs
+        ? pending.bridgeWs === bridgeWs
+        : Boolean(bridgeKey && pending.bridgeKey === bridgeKey)
+      if (match) {
+        clearTimeout(pending.timer)
+        this.pendingRpc.delete(relayReqId)
+        this.sendToClient(pending.clientId, {
+          type: 'rpc.res',
+          id: pending.clientReqId,
+          ok: false,
+          error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
+        })
+      }
+    }
+  }
+
+  clearPendingRpcsForClient(clientId) {
+    if (!clientId) return
+    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
+      if (pending.clientId === clientId) {
+        clearTimeout(pending.timer)
+        this.pendingRpc.delete(relayReqId)
+      }
     }
   }
 
@@ -305,10 +380,19 @@ export class RelayHub {
   getRoomEventState(roomId) {
     const rid = String(roomId || '').trim()
     let st = this.roomEvents.get(rid)
-    if (!st) {
-      st = { seq: 0, buffer: [] }
+    if (st) {
+      // Refresh LRU position
+      this.roomEvents.delete(rid)
       this.roomEvents.set(rid, st)
+      return st
     }
+    while (this.roomEvents.size >= ROOM_EVENTS_MAX) {
+      const oldestKey = this.roomEvents.keys().next().value
+      if (!oldestKey) break
+      this.roomEvents.delete(oldestKey)
+    }
+    st = { seq: 0, buffer: [] }
+    this.roomEvents.set(rid, st)
     return st
   }
 
@@ -358,6 +442,12 @@ export class RelayHub {
   }
 
   registerBridge(ws, meta = {}) {
+    ws.on('error', (err) => {
+      this.log.warn?.(
+        `[relay] Bridge WS error (room=${String(meta?.roomId || '').trim()}, id=${String(meta?.bridgeId || '').trim()}): ${err?.message || err}`,
+      )
+      try { ws.terminate() } catch {}
+    })
     const roomId = String(meta.roomId || '').trim()
     if (!roomId.startsWith('usr_')) {
       try { ws.close(4401, 'Invalid account room') } catch {}
@@ -377,13 +467,14 @@ export class RelayHub {
       }
     }
     if (existing && existing.ws !== ws) {
+      this.failPendingRpcsForBridgeWs(existing.ws, key)
       try {
         existing.ws.close(4001, 'Replaced by newer bridge connection')
       } catch {}
     }
 
     const now = Date.now()
-    const entry = { roomId, bridgeId, ws, meta, connectedAt: now, lastSeen: now }
+    const entry = { roomId, bridgeId, ws, meta, connectedAt: now, lastSeen: now, isAlive: true }
     this.bridges.set(key, entry)
     this.globalStats.totalBridgeConnects += 1
     const rStats = this.getOrCreateRoomStats(roomId)
@@ -408,7 +499,13 @@ export class RelayHub {
       ...(devices ? { devices } : {}),
     })
 
+    ws.on('pong', () => {
+      entry.isAlive = true
+      entry.lastSeen = Date.now()
+    })
+
     ws.on('message', (raw) => {
+      entry.isAlive = true
       entry.lastSeen = Date.now()
       let msg
       try {
@@ -416,10 +513,11 @@ export class RelayHub {
       } catch {
         return
       }
-      this.handleBridgeMessage(roomId, bridgeId, msg)
+      this.handleBridgeMessage(roomId, bridgeId, msg, ws)
     })
 
     ws.on('close', () => {
+      this.failPendingRpcsForBridgeWs(ws, key)
       if (this.bridges.get(key)?.ws === ws) {
         this.bridges.delete(key)
         this.recordActivity({
@@ -430,18 +528,6 @@ export class RelayHub {
           ip: entry.meta?.ip || '',
         })
         this.log.info(`[relay] Bridge disconnected: room=${roomId} id=${bridgeId}`)
-        for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-          if (pending.bridgeKey === key) {
-            clearTimeout(pending.timer)
-            this.pendingRpc.delete(relayReqId)
-            this.sendToClient(pending.clientId, {
-              type: 'rpc.res',
-              id: pending.clientReqId,
-              ok: false,
-              error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
-            })
-          }
-        }
         const bridges = this.getBridgeList(roomId)
         const devices = this.resolveRoomDevices(roomId, bridges)
         this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
@@ -499,6 +585,12 @@ export class RelayHub {
 
   registerClient(ws, user, { lastSeq = 0, ip = '', userAgent = '' } = {}) {
     const clientId = randomUUID()
+    ws.on('error', (err) => {
+      this.log.warn?.(
+        `[relay] Client WS error (room=${String(user?.room || '').trim()}, client=${clientId}): ${err?.message || err}`,
+      )
+      try { ws.terminate() } catch {}
+    })
     const roomId = String(user?.room || '').trim()
     if (!roomId.startsWith('usr_')) {
       try { ws.close(4401, 'Invalid account room') } catch {}
@@ -515,6 +607,7 @@ export class RelayHub {
       const toEvict = roomClientEntries.slice(0, roomClientEntries.length - MAX_CLIENTS_PER_ROOM + 1)
       for (const [evictId, evictEntry] of toEvict) {
         this.clients.delete(evictId)
+        this.clearPendingRpcsForClient(evictId)
         this.cancelClientGrants(evictId, 'evicted')
         try { evictEntry.ws.close(4029, 'Too many concurrent client connections') } catch {}
       }
@@ -531,6 +624,7 @@ export class RelayHub {
       ip: String(ip || '').trim(),
       connectedAt: now,
       lastSeenAt: now,
+      isAlive: true,
     }
     this.clients.set(clientId, entry)
     this.globalStats.totalClientConnects += 1
@@ -570,13 +664,20 @@ export class RelayHub {
 
     if (Number.isFinite(lastSeq) && lastSeq > 0 && lastSeq < evState.seq) {
       for (const item of evState.buffer) {
-        if (item.seq > lastSeq) {
-          this.sendRaw(ws, { type: 'event', ...item })
-        }
+        if (item.seq <= lastSeq) continue
+        // Skip superseded status snapshots since `hello` already delivered fresh bridges/devices/clients
+        if (item.event === EVENTS.BRIDGE_STATUS || item.event === EVENTS.CLIENTS_STATUS) continue
+        this.sendRaw(ws, { type: 'event', ...item })
       }
     }
 
+    ws.on('pong', () => {
+      entry.isAlive = true
+      entry.lastSeenAt = Date.now()
+    })
+
     ws.on('message', (raw) => {
+      entry.isAlive = true
       entry.lastSeenAt = Date.now()
       let msg
       try {
@@ -588,6 +689,7 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
+      this.clearPendingRpcsForClient(clientId)
       this.cancelClientGrants(clientId, 'disconnected')
       const existed = this.clients.delete(clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
@@ -604,43 +706,42 @@ export class RelayHub {
     })
   }
 
-  handleBridgeMessage(roomId, bridgeId, msg) {
+  handleBridgeMessage(roomId, bridgeId, msg, ws = null) {
     if (!msg || typeof msg !== 'object') return
     const key = this.bridgeKey(roomId, bridgeId)
+    const activeBridge = this.bridges.get(key)
+    if (!activeBridge || (ws && activeBridge.ws !== ws)) return
 
     if (msg.type === 'ping') {
-      const bridge = this.bridges.get(key)
-      if (bridge) this.sendRaw(bridge.ws, { type: 'pong', ts: Date.now() })
+      this.sendRaw(activeBridge.ws, { type: 'pong', ts: Date.now() })
       return
     }
 
     if (msg.type === 'bridge.meta') {
-      const bridge = this.bridges.get(key)
-      if (bridge) {
-        const nextMeta = { ...bridge.meta, ...(msg.meta || {}) }
-        if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
-          this.log.warn?.(`[relay] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
-          try {
-            bridge.ws.close(4008, 'E2EE required — upgrade bridge/desktop app to v0.4.4+')
-          } catch {}
-          return
-        }
-        bridge.meta = nextMeta
-        const bridges = this.getBridgeList(roomId)
-        const devices = this.resolveRoomDevices(roomId, bridges)
-        this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
-          bridgeId,
-          online: true,
-          bridges,
-          ...(devices ? { devices } : {}),
-        })
+      const nextMeta = { ...activeBridge.meta, ...(msg.meta || {}) }
+      if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
+        this.log.warn?.(`[relay] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
+        try {
+          activeBridge.ws.close(4008, 'E2EE required — upgrade bridge/desktop app to v0.4.4+')
+        } catch {}
+        return
       }
+      activeBridge.meta = nextMeta
+      const bridges = this.getBridgeList(roomId)
+      const devices = this.resolveRoomDevices(roomId, bridges)
+      this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
+        bridgeId,
+        online: true,
+        bridges,
+        ...(devices ? { devices } : {}),
+      })
       return
     }
 
     if (msg.type === 'rpc.res') {
       const pending = this.pendingRpc.get(msg.id)
       if (!pending || pending.roomId !== roomId) return
+      if (ws && pending.bridgeWs && pending.bridgeWs !== ws) return
       clearTimeout(pending.timer)
       this.pendingRpc.delete(msg.id)
       if (msg.e2ee) {
@@ -745,6 +846,10 @@ export class RelayHub {
       this.pruneExpiredGrants(now)
       const grant = this.e2eeGrants.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      if (grant.offeredByClientId && !this.clients.has(grant.offeredByClientId)) {
+        grant.offeredByClientId = ''
+        grant.approverPubKey = ''
+      }
       if (grant.offeredByClientId && grant.offeredByClientId !== clientId) return
       grant.offeredByClientId = clientId
       grant.approverPubKey = approverPubKey
@@ -784,9 +889,15 @@ export class RelayHub {
       this.pruneExpiredGrants(now)
       const grant = this.e2eeGrants.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      if (grant.offeredByClientId && !this.clients.has(grant.offeredByClientId)) {
+        grant.offeredByClientId = ''
+        grant.approverPubKey = ''
+      }
       if (grant.offeredByClientId && (grant.offeredByClientId !== clientId || grant.approverPubKey !== appPub)) {
         return
       }
+      const requester = this.clients.get(grant.requesterClientId)
+      if (!requester || requester.ws?.readyState !== 1) return
       // Strictly single-use: burn request immediately before delivery
       this.e2eeGrants.delete(reqId)
       this.sendToClient(grant.requesterClientId, {
@@ -808,12 +919,14 @@ export class RelayHub {
 
     if (msg.type === 'e2ee.grant.reject') {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const now = Date.now()
+      this.pruneExpiredGrants(now)
       const grant = this.e2eeGrants.get(reqId)
-      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId) return
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
       this.e2eeGrants.delete(reqId)
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
-        ts: Date.now(),
+        ts: now,
         bridgeId: '',
         event: EVENTS.E2EE_GRANT_REJECT,
         payload: {
@@ -867,6 +980,23 @@ export class RelayHub {
         return
       }
 
+      let roomPendingCount = 0
+      for (const p of this.pendingRpc.values()) {
+        if (p.roomId === roomId) roomPendingCount += 1
+      }
+      if (roomPendingCount >= MAX_PENDING_RPC_PER_ROOM) {
+        this.sendToClient(clientId, {
+          type: 'rpc.res',
+          id: clientReqId,
+          ok: false,
+          error: {
+            code: 'TOO_MANY_PENDING_RPCS',
+            message: '当前并发请求过多，请稍后重试',
+          },
+        })
+        return
+      }
+
       const relayReqId = randomUUID()
       const timeoutMs = Number.isFinite(msg.timeoutMs)
         ? Math.min(Math.max(5_000, msg.timeoutMs), 600_000)
@@ -889,6 +1019,7 @@ export class RelayHub {
         timer,
         roomId,
         bridgeKey: this.bridgeKey(roomId, bridge.bridgeId),
+        bridgeWs: bridge.ws,
       })
 
       const rpcNow = Date.now()
@@ -899,12 +1030,22 @@ export class RelayHub {
       rStats.lastRpcAt = rpcNow
       rStats.lastActivityAt = rpcNow
 
-      this.sendRaw(bridge.ws, {
+      const sent = this.sendRaw(bridge.ws, {
         type: 'rpc.req',
         id: relayReqId,
         method: '__e2ee__',
         e2ee: msg.e2ee,
       })
+      if (!sent) {
+        clearTimeout(timer)
+        this.pendingRpc.delete(relayReqId)
+        this.sendToClient(clientId, {
+          type: 'rpc.res',
+          id: clientReqId,
+          ok: false,
+          error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
+        })
+      }
     }
   }
 
@@ -933,11 +1074,13 @@ export class RelayHub {
           event,
           payload,
         }
-    evState.buffer.push(envelope)
-    if (evState.buffer.length > EVENT_BUFFER_SIZE) {
-      evState.buffer.shift()
-    }
     const frame = JSON.stringify({ type: 'event', ...envelope })
+    if (Buffer.byteLength(frame, 'utf8') <= MAX_CACHED_EVENT_BYTES) {
+      evState.buffer.push(envelope)
+      if (evState.buffer.length > EVENT_BUFFER_SIZE) {
+        evState.buffer.shift()
+      }
+    }
     for (const client of this.clients.values()) {
       if (client.roomId === rid && client.ws.readyState === 1) {
         try {
@@ -949,15 +1092,18 @@ export class RelayHub {
 
   sendToClient(clientId, payload) {
     const client = this.clients.get(clientId)
-    if (!client) return
-    this.sendRaw(client.ws, payload)
+    if (!client) return false
+    return this.sendRaw(client.ws, payload)
   }
 
   sendRaw(ws, payload) {
-    if (ws.readyState !== 1) return
+    if (!ws || ws.readyState !== 1) return false
     try {
       ws.send(JSON.stringify(payload))
-    } catch {}
+      return true
+    } catch {
+      return false
+    }
   }
 
   broadcastRoomDevices(roomId) {
@@ -980,9 +1126,27 @@ export class RelayHub {
     const key = this.bridgeKey(rid, bid)
     const entry = this.bridges.get(key)
     if (!entry) return false
+    this.bridges.delete(key)
+    this.failPendingRpcsForBridgeWs(entry.ws, key)
+    this.recordActivity({
+      type: 'bridge.offline',
+      roomId: rid,
+      label: entry.meta?.label || entry.meta?.hostname || bid,
+      detail: entry.meta?.platform || '',
+      ip: entry.meta?.ip || '',
+    })
+    this.log.info(`[relay] Bridge disconnected: room=${rid} id=${bid}`)
     try {
       entry.ws.close(code, reason)
     } catch {}
+    const bridges = this.getBridgeList(rid)
+    const devices = this.resolveRoomDevices(rid, bridges)
+    this.broadcastEvent(rid, bid, EVENTS.BRIDGE_STATUS, {
+      bridgeId: bid,
+      online: false,
+      bridges,
+      ...(devices ? { devices } : {}),
+    })
     return true
   }
 
@@ -1004,6 +1168,9 @@ export class RelayHub {
       try {
         client.ws.close(code, reason)
       } catch {}
+    }
+    for (const cid of droppedClientIds) {
+      this.cancelClientGrants(cid, 'revoked')
     }
     for (const [relayReqId, pending] of this.pendingRpc.entries()) {
       if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
@@ -1042,6 +1209,9 @@ export class RelayHub {
         client.ws.close(code, reason)
       } catch {}
     }
+    for (const cid of droppedClientIds) {
+      this.cancelClientGrants(cid, 'revoked')
+    }
     for (const [relayReqId, pending] of this.pendingRpc.entries()) {
       if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
         clearTimeout(pending.timer)
@@ -1069,13 +1239,19 @@ export class RelayHub {
         client.ws.close(code, reason)
       } catch {}
     }
+    for (const cid of droppedClientIds) {
+      this.cancelClientGrants(cid, 'revoked')
+    }
     for (const [relayReqId, pending] of this.pendingRpc.entries()) {
       if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
         clearTimeout(pending.timer)
         this.pendingRpc.delete(relayReqId)
       }
     }
-    this.roomEvents.delete(rid)
+    const evState = this.roomEvents.get(rid)
+    if (evState) {
+      evState.buffer = []
+    }
     if (disconnected > 0) {
       this.log.info(`[relay] Revoked and disconnected ${disconnected} client(s) in room=${rid}`)
     }
@@ -1083,6 +1259,14 @@ export class RelayHub {
   }
 
   shutdown() {
+    if (this._grantSweepTimer) {
+      clearInterval(this._grantSweepTimer)
+      this._grantSweepTimer = null
+    }
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer)
+      this._heartbeatTimer = null
+    }
     for (const pending of this.pendingRpc.values()) {
       clearTimeout(pending.timer)
     }

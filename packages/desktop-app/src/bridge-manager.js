@@ -18,7 +18,9 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import os from 'node:os'
@@ -70,62 +72,124 @@ function computeDesktopE2eeKeyId(rawKey) {
     .slice(0, 16)
 }
 
-export function saveConfigSecure(filePath, data, secretStore = null) {
-  const payload = { ...data }
-  if (secretStore && payload.bridgeSecret) {
-    try {
-      const enc = secretStore.encrypt(String(payload.bridgeSecret))
-      if (enc) {
-        payload.bridgeSecretEnc = enc
-        delete payload.bridgeSecret
-      }
-    } catch {}
+const KEYCHAIN_DECRYPT_ERROR =
+  '无法解密本机桥接配置与端到端密钥，请先解锁系统钥匙串后重试 (Unable to decrypt local bridge config; please unlock OS Keychain and retry)'
+
+function isSecretStoreAvailable(secretStore) {
+  if (!secretStore || typeof secretStore.encrypt !== 'function' || typeof secretStore.decrypt !== 'function') {
+    return false
   }
-  if (secretStore && payload.e2eeKey) {
+  if (typeof secretStore.isAvailable === 'function') {
     try {
-      const enc = secretStore.encrypt(String(payload.e2eeKey))
-      if (enc) {
-        payload.e2eeKeyEnc = enc
-        delete payload.e2eeKey
-      }
-    } catch {}
+      return Boolean(secretStore.isAvailable())
+    } catch {
+      return false
+    }
   }
-  writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8')
-  try { chmodSync(filePath, 0o600) } catch {}
+  return true
 }
 
-export function loadConfigDecrypted(filePath, secretStore = null) {
+export function saveConfigSecure(filePath, data, secretStore = null) {
+  const payload = { ...data }
+  const storeAvail = isSecretStoreAvailable(secretStore)
+  if (payload.bridgeSecret) {
+    let encrypted = false
+    if (storeAvail) {
+      try {
+        const enc = secretStore.encrypt(String(payload.bridgeSecret))
+        if (enc) {
+          payload.bridgeSecretEnc = enc
+          delete payload.bridgeSecret
+          encrypted = true
+        }
+      } catch {}
+    }
+    if (!encrypted) {
+      delete payload.bridgeSecretEnc
+    }
+  }
+  if (payload.e2eeKey) {
+    let encrypted = false
+    if (storeAvail) {
+      try {
+        const enc = secretStore.encrypt(String(payload.e2eeKey))
+        if (enc) {
+          payload.e2eeKeyEnc = enc
+          delete payload.e2eeKey
+          encrypted = true
+        }
+      } catch {}
+    }
+    if (!encrypted) {
+      delete payload.e2eeKeyEnc
+    }
+  }
+  mkdirSync(dirname(filePath), { recursive: true })
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${randomBytes(4).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(tmpPath, 0o600) } catch {}
+    renameSync(tmpPath, filePath)
+    try { chmodSync(filePath, 0o600) } catch {}
+  } catch (err) {
+    try { unlinkSync(tmpPath) } catch {}
+    throw err
+  }
+}
+
+export function loadConfigWithStatus(filePath, secretStore = null) {
   const raw = readJsonSafe(filePath)
-  if (!raw) return null
+  if (!raw || typeof raw !== 'object') {
+    return { status: 'missing', config: null }
+  }
   const out = { ...raw }
+  const storeAvail = isSecretStoreAvailable(secretStore)
   let shouldMigrate = false
-  if (out.bridgeSecretEnc && !out.bridgeSecret && secretStore) {
+
+  if (out.bridgeSecretEnc && !out.bridgeSecret) {
+    if (!storeAvail) {
+      return { status: 'decrypt-error', config: null }
+    }
     try {
       const dec = secretStore.decrypt(out.bridgeSecretEnc)
-      if (!dec) return null
+      if (!dec) return { status: 'decrypt-error', config: null }
       out.bridgeSecret = dec
     } catch {
-      return null
+      return { status: 'decrypt-error', config: null }
     }
-  } else if (out.bridgeSecret && !out.bridgeSecretEnc && secretStore) {
+  } else if (out.bridgeSecret && storeAvail) {
     shouldMigrate = true
   }
-  if (out.e2eeKeyEnc && !out.e2eeKey && secretStore) {
+
+  if (out.e2eeKeyEnc && !out.e2eeKey) {
+    if (!storeAvail) {
+      return { status: 'decrypt-error', config: null }
+    }
     try {
       const dec = secretStore.decrypt(out.e2eeKeyEnc)
-      if (dec) out.e2eeKey = normalizeDesktopE2eeKey(dec)
-    } catch {}
-  } else if (out.e2eeKey && !out.e2eeKeyEnc && secretStore) {
+      const norm = dec ? normalizeDesktopE2eeKey(dec) : ''
+      if (!norm) return { status: 'decrypt-error', config: null }
+      out.e2eeKey = norm
+    } catch {
+      return { status: 'decrypt-error', config: null }
+    }
+  } else if (out.e2eeKey) {
     out.e2eeKey = normalizeDesktopE2eeKey(out.e2eeKey)
-    if (out.e2eeKey) shouldMigrate = true
+    if (out.e2eeKey && storeAvail) shouldMigrate = true
   }
+
   // Auto-encrypt any plaintext credentials on disk into OS keychain / DPAPI storage
-  if (shouldMigrate) {
+  if (shouldMigrate && storeAvail) {
     try {
       saveConfigSecure(filePath, out, secretStore)
     } catch {}
   }
-  return out
+  return { status: 'ok', config: out }
+}
+
+export function loadConfigDecrypted(filePath, secretStore = null) {
+  const res = loadConfigWithStatus(filePath, secretStore)
+  return res.status === 'ok' ? res.config : null
 }
 
 function resolveBridgeScriptPath(isPackaged) {
@@ -154,9 +218,11 @@ export class DesktopBridgeManager extends EventEmitter {
     this.logPath = join(this.stateDir, 'desktop-bridge.log')
 
     this.proc = null
+    this.killPromise = null
     this.restartTimer = null
     this.restartAttempts = 0
     this.disposed = false
+    this.authRevoked = false
 
     this.enabled = true
     this.state = 'idle' // 'idle' | 'binding' | 'starting' | 'connected' | 'paused' | 'error'
@@ -166,6 +232,7 @@ export class DesktopBridgeManager extends EventEmitter {
     this.appsSummary = ''
     this.autofixText = ''
     this.syncSeq = 0
+    this.spawnSeq = 0
   }
 
   ensureStateDir() {
@@ -272,6 +339,8 @@ export class DesktopBridgeManager extends EventEmitter {
     const sameRunning =
       this.proc &&
       !this.proc.killed &&
+      this.proc.exitCode === null &&
+      !this.authRevoked &&
       this.deviceMeta?.roomId === roomId &&
       normalizeBaseUrl(this.deviceMeta?.serverUrl) === baseUrl &&
       this.enabled
@@ -289,13 +358,23 @@ export class DesktopBridgeManager extends EventEmitter {
     }
 
     const mySeq = ++this.syncSeq
+    this.authRevoked = false
     this.state = 'binding'
     this.error = ''
     this.emitStatus()
 
     try {
       this.ensureStateDir()
-      let cfg = loadConfigDecrypted(this.configPath, this.secretStore)
+      const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+      if (cfgRes.status === 'decrypt-error') {
+        if (mySeq !== this.syncSeq) return this.getStatus()
+        this.state = 'error'
+        this.error = KEYCHAIN_DECRYPT_ERROR
+        this.appendLog(`syncAccount blocked: ${this.error}`)
+        this.emitStatus()
+        return this.getStatus()
+      }
+      const cfg = cfgRes.config
       let readyCfg = null
 
       if (
@@ -308,21 +387,32 @@ export class DesktopBridgeManager extends EventEmitter {
         const check = await this.verifyExistingConfig(cfg)
         if (mySeq !== this.syncSeq) return this.getStatus()
         if (check.valid || check.networkError) {
+          const hadAutoStartDisabled = Boolean(cfg.autoStartDisabled)
           readyCfg = {
             ...cfg,
             label: check.data?.label || cfg.label || os.hostname() || 'My-PC',
             username: check.data?.username || cfg.username || username,
           }
+          delete readyCfg.autoStartDisabled
+          let needsSave = hadAutoStartDisabled
           if (!normalizeDesktopE2eeKey(readyCfg.e2eeKey)) {
             readyCfg.e2eeKey = generateDesktopE2eeKey()
+            needsSave = true
+          }
+          if (needsSave) {
             saveConfigSecure(this.configPath, readyCfg, this.secretStore)
           }
         }
       }
 
       if (!readyCfg) {
-        this.appendLog(`Auto-registering this PC into account @${username || roomId} on ${baseUrl}...`)
-        const bound = await this.registerDeviceWithJwt({ baseUrl, token })
+        const sameRoomRebind = Boolean(cfg && cfg.mode === 'account' && cfg.roomId === roomId)
+        const existingBridgeId = sameRoomRebind ? String(cfg.bridgeId || '').trim() : ''
+        const preservedE2eeKey = sameRoomRebind ? normalizeDesktopE2eeKey(cfg.e2eeKey) : ''
+        this.appendLog(
+          `Auto-registering this PC into account @${username || roomId} on ${baseUrl}${existingBridgeId ? ` (rebind bridgeId=${existingBridgeId})` : ''}...`,
+        )
+        const bound = await this.registerDeviceWithJwt({ baseUrl, token, existingBridgeId })
         if (mySeq !== this.syncSeq) return this.getStatus()
         readyCfg = {
           mode: 'account',
@@ -333,7 +423,7 @@ export class DesktopBridgeManager extends EventEmitter {
           deviceId: bound.deviceId,
           bridgeId: bound.bridgeId,
           bridgeSecret: bound.deviceSecret,
-          e2eeKey: generateDesktopE2eeKey(),
+          e2eeKey: preservedE2eeKey || generateDesktopE2eeKey(),
           label: bound.label || os.hostname() || 'My-PC',
           createdAt: Date.now(),
         }
@@ -368,8 +458,23 @@ export class DesktopBridgeManager extends EventEmitter {
    */
   async startFromSavedConfigIfPresent() {
     if (this.disposed || !this.enabled || this.proc) return this.getStatus()
-    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
-    if (!cfg || cfg.mode !== 'account' || !cfg.roomId?.startsWith('usr_') || !cfg.bridgeSecret || !cfg.serverUrl) {
+    const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+    if (cfgRes.status === 'decrypt-error') {
+      this.state = 'error'
+      this.error = KEYCHAIN_DECRYPT_ERROR
+      this.appendLog(`startFromSavedConfigIfPresent blocked: ${this.error}`)
+      this.emitStatus()
+      return this.getStatus()
+    }
+    const cfg = cfgRes.config
+    if (
+      !cfg ||
+      cfg.autoStartDisabled ||
+      cfg.mode !== 'account' ||
+      !cfg.roomId?.startsWith('usr_') ||
+      !cfg.bridgeSecret ||
+      !cfg.serverUrl
+    ) {
       return this.getStatus()
     }
     if (!normalizeDesktopE2eeKey(cfg.e2eeKey)) {
@@ -394,14 +499,80 @@ export class DesktopBridgeManager extends EventEmitter {
     return this.getStatus()
   }
 
+  /**
+   * Called on OS sleep/resume or screen-unlock to promptly recover the embedded bridge.
+   */
+  async handleSystemResume() {
+    if (this.disposed || !this.enabled) return this.getStatus()
+    this.restartAttempts = 0
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer)
+      this.restartTimer = null
+    }
+    if (this.authRevoked || this.state === 'binding') {
+      return this.getStatus()
+    }
+    const childAlive = Boolean(this.proc && !this.proc.killed && this.proc.exitCode === null)
+    if (childAlive && this.state === 'connected') {
+      return this.getStatus()
+    }
+
+    const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+    if (cfgRes.status === 'decrypt-error') {
+      this.state = 'error'
+      this.error = KEYCHAIN_DECRYPT_ERROR
+      this.appendLog(`handleSystemResume blocked: ${this.error}`)
+      this.emitStatus()
+      return this.getStatus()
+    }
+    const cfg = cfgRes.config
+    if (
+      cfg &&
+      !cfg.autoStartDisabled &&
+      cfg.mode === 'account' &&
+      cfg.roomId?.startsWith('usr_') &&
+      cfg.bridgeSecret &&
+      cfg.serverUrl
+    ) {
+      this.appendLog('System resumed/unlocked; restarting embedded bridge...')
+      if (!normalizeDesktopE2eeKey(cfg.e2eeKey)) {
+        cfg.e2eeKey = generateDesktopE2eeKey()
+        saveConfigSecure(this.configPath, cfg, this.secretStore)
+      }
+      this.deviceMeta = {
+        label: cfg.label || os.hostname() || 'My-PC',
+        bridgeId: cfg.bridgeId || cfg.label || os.hostname() || 'My-PC',
+        roomId: cfg.roomId,
+        username: cfg.username || this.activeAccount?.username || '',
+        serverUrl: normalizeBaseUrl(cfg.serverUrl),
+        e2eeKeyId: computeDesktopE2eeKeyId(cfg.e2eeKey),
+      }
+      try {
+        await this.spawnBridgeProcess(cfg)
+      } catch (err) {
+        this.state = 'error'
+        this.error = String(err?.message || err)
+        this.emitStatus()
+      }
+      return this.getStatus()
+    }
+
+    if (this.activeAccount) {
+      return this.syncAccount(this.activeAccount)
+    }
+    return this.getStatus()
+  }
+
   async spawnBridgeProcess(cfg) {
+    const mySpawnSeq = ++this.spawnSeq
     await this.killChild()
-    if (this.disposed || !this.enabled) return
+    if (this.disposed || !this.enabled || mySpawnSeq !== this.spawnSeq) return
 
     const scriptPath = resolveBridgeScriptPath(this.isPackaged)
     const serverUrl = normalizeBaseUrl(cfg.serverUrl)
     const label = cfg.label || os.hostname() || 'My-PC'
 
+    this.authRevoked = false
     this.state = 'starting'
     this.error = ''
     this.emitStatus()
@@ -433,16 +604,23 @@ export class DesktopBridgeManager extends EventEmitter {
     )
 
     this.proc = child
+    let childAuthRevoked = false
 
     const handleLine = (raw) => {
       const line = String(raw || '').trim()
       if (!line) return
       this.appendLog(line)
-      if (line.includes('已加密连接到中转服务器')) {
+      if (this.proc !== child) return
+      if (line.includes('已加密连接到中转服务器') || line.includes('网络已恢复，重新连接成功')) {
         this.restartAttempts = 0
         this.state = 'connected'
         this.error = ''
         this.emitStatus()
+      } else if (line.includes('连接暂时中断')) {
+        if (!childAuthRevoked && this.state !== 'error') {
+          this.state = 'starting'
+          this.emitStatus()
+        }
       } else if (line.includes('本机 AI')) {
         const idx = line.indexOf(':')
         if (idx !== -1) {
@@ -458,7 +636,15 @@ export class DesktopBridgeManager extends EventEmitter {
           this.autofixText = ''
           this.emitStatus()
         }
-      } else if (line.includes('已被解绑') || line.includes('凭证无效')) {
+      } else if (
+        line.includes('已被解绑') ||
+        line.includes('凭证无效') ||
+        line.includes('凭证已失效') ||
+        line.includes('凭证失效') ||
+        line.includes('已在手机端解绑')
+      ) {
+        childAuthRevoked = true
+        this.authRevoked = true
         this.error = '本机绑定凭证已失效，请重新登录'
         this.state = 'error'
         this.emitStatus()
@@ -474,6 +660,12 @@ export class DesktopBridgeManager extends EventEmitter {
         outBuf = outBuf.slice(nl + 1)
       }
     })
+    child.stdout?.on('end', () => {
+      if (outBuf.trim()) {
+        handleLine(outBuf)
+        outBuf = ''
+      }
+    })
 
     let errBuf = ''
     child.stderr?.on('data', (chunk) => {
@@ -482,6 +674,12 @@ export class DesktopBridgeManager extends EventEmitter {
       while ((nl = errBuf.indexOf('\n')) !== -1) {
         handleLine(`[stderr] ${errBuf.slice(0, nl)}`)
         errBuf = errBuf.slice(nl + 1)
+      }
+    })
+    child.stderr?.on('end', () => {
+      if (errBuf.trim()) {
+        handleLine(`[stderr] ${errBuf}`)
+        errBuf = ''
       }
     })
 
@@ -495,6 +693,14 @@ export class DesktopBridgeManager extends EventEmitter {
     })
 
     child.on('exit', (code, signal) => {
+      if (outBuf.trim()) {
+        handleLine(outBuf)
+        outBuf = ''
+      }
+      if (errBuf.trim()) {
+        handleLine(`[stderr] ${errBuf}`)
+        errBuf = ''
+      }
       if (this.proc !== child) return
       this.proc = null
       this.autofixText = ''
@@ -502,6 +708,20 @@ export class DesktopBridgeManager extends EventEmitter {
 
       if (this.disposed || !this.enabled) {
         this.state = this.enabled ? 'idle' : 'paused'
+        this.emitStatus()
+        return
+      }
+
+      if (code === 41) {
+        childAuthRevoked = true
+      }
+      if (childAuthRevoked) {
+        this.authRevoked = true
+        this.state = 'error'
+        if (!this.error) {
+          this.error = '本机绑定凭证已失效，请重新登录'
+        }
+        this.appendLog('Bridge device credentials revoked/unbound; disabling auto-restart until re-login')
         this.emitStatus()
         return
       }
@@ -514,8 +734,17 @@ export class DesktopBridgeManager extends EventEmitter {
 
       clearTimeout(this.restartTimer)
       this.restartTimer = setTimeout(() => {
-        if (this.disposed || !this.enabled) return
-        const latestCfg = loadConfigDecrypted(this.configPath, this.secretStore) || cfg
+        if (this.disposed || !this.enabled || this.authRevoked || mySpawnSeq !== this.spawnSeq) return
+        const latestRes = loadConfigWithStatus(this.configPath, this.secretStore)
+        if (latestRes.status === 'decrypt-error') {
+          this.state = 'error'
+          this.error = KEYCHAIN_DECRYPT_ERROR
+          this.appendLog(`Auto-restart blocked: ${this.error}`)
+          this.emitStatus()
+          return
+        }
+        const latestCfg = latestRes.config || cfg
+        if (latestCfg?.autoStartDisabled) return
         void this.spawnBridgeProcess(latestCfg)
       }, delayMs)
     })
@@ -524,34 +753,71 @@ export class DesktopBridgeManager extends EventEmitter {
   async killChild() {
     clearTimeout(this.restartTimer)
     this.restartTimer = null
-    const child = this.proc
-    if (!child) return
-    this.proc = null
-    await new Promise((resolveDone) => {
-      let settled = false
-      const done = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(killTimer)
-        resolveDone()
+    while (this.killPromise || this.proc) {
+      if (this.killPromise) {
+        await this.killPromise
+        continue
       }
-      child.once('exit', done)
-      const killTimer = setTimeout(() => {
-        try { child.kill('SIGKILL') } catch {}
-        setTimeout(done, 150)
-      }, 2500)
-      try {
-        child.kill('SIGTERM')
-      } catch {
-        done()
-      }
-    })
+      const child = this.proc
+      if (!child) break
+      this.proc = null
+      const p = new Promise((resolveDone) => {
+        let settled = false
+        let forceTimer = null
+        const done = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(killTimer)
+          if (forceTimer) clearTimeout(forceTimer)
+          resolveDone()
+        }
+        if (child.exitCode !== null || child.signalCode !== null) {
+          done()
+          return
+        }
+        child.once('exit', done)
+        const killTimer = setTimeout(() => {
+          try { child.kill('SIGKILL') } catch {}
+          forceTimer = setTimeout(done, 150)
+        }, 2500)
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          done()
+        }
+      }).finally(() => {
+        if (this.killPromise === p) {
+          this.killPromise = null
+        }
+      })
+      this.killPromise = p
+      await p
+    }
   }
 
-  async stop({ nextState = 'idle' } = {}) {
+  async stop({ nextState = 'idle', clearAccount = nextState === 'idle' } = {}) {
     this.syncSeq += 1
+    const mySpawnSeq = ++this.spawnSeq
     this.appendLog(`Stopping embedded bridge (nextState=${nextState})`)
+    if (clearAccount) {
+      this.activeAccount = null
+      this.deviceMeta = null
+      this.appsSummary = ''
+      this.autofixText = ''
+      this.authRevoked = false
+      try {
+        const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+        if (cfgRes.status === 'ok' && cfgRes.config) {
+          saveConfigSecure(
+            this.configPath,
+            { ...cfgRes.config, autoStartDisabled: true },
+            this.secretStore,
+          )
+        }
+      } catch {}
+    }
     await this.killChild()
+    if (mySpawnSeq !== this.spawnSeq) return this.getStatus()
     this.state = nextState
     this.error = ''
     this.emitStatus()
@@ -571,7 +837,14 @@ export class DesktopBridgeManager extends EventEmitter {
   }
 
   getE2eeInfo(expectedRoomId = '') {
-    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
+    const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+    if (cfgRes.status === 'decrypt-error') {
+      this.state = 'error'
+      this.error = KEYCHAIN_DECRYPT_ERROR
+      this.emitStatus()
+      return { enabled: false, key: '', keyId: '', roomId: '', error: KEYCHAIN_DECRYPT_ERROR }
+    }
+    const cfg = cfgRes.config
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
       return { enabled: false, key: '', keyId: '', roomId: '' }
     }
@@ -579,14 +852,24 @@ export class DesktopBridgeManager extends EventEmitter {
       return { enabled: false, key: '', keyId: '', roomId: cfg.roomId }
     }
     let key = normalizeDesktopE2eeKey(cfg.e2eeKey)
+    let generatedNew = false
     if (!key) {
       key = generateDesktopE2eeKey()
       cfg.e2eeKey = key
       saveConfigSecure(this.configPath, cfg, this.secretStore)
+      generatedNew = true
     }
     const keyId = computeDesktopE2eeKeyId(key)
     if (this.deviceMeta && this.deviceMeta.roomId === cfg.roomId) {
       this.deviceMeta.e2eeKeyId = keyId
+    }
+    if (generatedNew && this.proc && !this.proc.killed && this.enabled && !this.disposed) {
+      this.appendLog(`Generated new local E2EE key (fingerprint=${keyId}); restarting embedded bridge...`)
+      void this.spawnBridgeProcess(cfg).catch((err) => {
+        this.state = 'error'
+        this.error = String(err?.message || err)
+        this.emitStatus()
+      })
     }
     return {
       enabled: true,
@@ -598,32 +881,54 @@ export class DesktopBridgeManager extends EventEmitter {
   }
 
   async setE2eeKey(expectedRoomId = '', rawKey = '') {
+    this.syncSeq += 1
     const normalized = normalizeDesktopE2eeKey(rawKey)
     if (!normalized) {
       throw new Error('无效的端到端密钥格式（应为 43 位 Base64URL 密钥）')
     }
-    const cfg = loadConfigDecrypted(this.configPath, this.secretStore)
+    const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
+    if (cfgRes.status === 'decrypt-error') {
+      this.state = 'error'
+      this.error = KEYCHAIN_DECRYPT_ERROR
+      this.emitStatus()
+      throw new Error(KEYCHAIN_DECRYPT_ERROR)
+    }
+    const cfg = cfgRes.config
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
       throw new Error('本机尚未绑定账号，请先登录')
     }
     if (expectedRoomId && cfg.roomId !== expectedRoomId) {
       throw new Error('当前登录账号与本机桥接账号不一致')
     }
-    cfg.e2eeKey = normalized
-    saveConfigSecure(this.configPath, cfg, this.secretStore)
+    const prevCfg = { ...cfg }
+    const prevDeviceMeta = this.deviceMeta ? { ...this.deviceMeta } : null
+    const nextCfg = { ...cfg, e2eeKey: normalized }
+    saveConfigSecure(this.configPath, nextCfg, this.secretStore)
     const keyId = computeDesktopE2eeKeyId(normalized)
     this.deviceMeta = {
       ...(this.deviceMeta || {}),
-      label: cfg.label || os.hostname() || 'My-PC',
-      bridgeId: cfg.bridgeId || cfg.label || os.hostname() || 'My-PC',
-      roomId: cfg.roomId,
-      username: cfg.username || '',
-      serverUrl: normalizeBaseUrl(cfg.serverUrl),
+      label: nextCfg.label || os.hostname() || 'My-PC',
+      bridgeId: nextCfg.bridgeId || nextCfg.label || os.hostname() || 'My-PC',
+      roomId: nextCfg.roomId,
+      username: nextCfg.username || '',
+      serverUrl: normalizeBaseUrl(nextCfg.serverUrl),
       e2eeKeyId: keyId,
     }
     this.appendLog(`Updated local E2EE key (fingerprint=${keyId}); restarting embedded bridge...`)
     if (this.enabled && !this.disposed) {
-      await this.spawnBridgeProcess(cfg)
+      try {
+        await this.spawnBridgeProcess(nextCfg)
+      } catch (err) {
+        try {
+          saveConfigSecure(this.configPath, prevCfg, this.secretStore)
+        } catch {}
+        this.deviceMeta = prevDeviceMeta
+        this.state = 'error'
+        this.error = String(err?.message || err)
+        this.appendLog(`setE2eeKey failed to restart bridge; rolled back config: ${this.error}`)
+        this.emitStatus()
+        throw err
+      }
     } else {
       this.emitStatus()
     }
@@ -631,18 +936,20 @@ export class DesktopBridgeManager extends EventEmitter {
       ok: true,
       key: normalized,
       keyId,
-      roomId: cfg.roomId,
-      bridgeId: cfg.bridgeId || '',
+      roomId: nextCfg.roomId,
+      bridgeId: nextCfg.bridgeId || '',
     }
   }
 
   async rotateE2eeKey(expectedRoomId = '') {
+    this.syncSeq += 1
     return this.setE2eeKey(expectedRoomId, generateDesktopE2eeKey())
   }
 
   async dispose() {
     this.disposed = true
     this.syncSeq += 1
+    this.spawnSeq += 1
     await this.killChild()
   }
 }

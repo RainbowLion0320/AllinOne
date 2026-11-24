@@ -32,16 +32,38 @@ export function ChatImageCard({
   const [status, setStatus] = useState('loading') // 'loading' | 'loaded' | 'error'
   const [retryNonce, setRetryNonce] = useState(0)
   const [e2eeSrc, setE2eeSrc] = useState('')
+  const [previewFailed, setPreviewFailed] = useState(false)
   const imgRef = useRef(null)
 
-  const needsE2ee = needsE2eeMediaLoad(item, imageContext)
+  useEffect(() => {
+    setPreviewFailed(false)
+  }, [item?.localPreviewUrl, item?.url, item?.path])
+
+  const effectiveItem =
+    previewFailed && item && typeof item === 'object'
+      ? { ...item, localPreviewUrl: '' }
+      : item
+
+  const needsE2ee = needsE2eeMediaLoad(effectiveItem, imageContext)
   const directSrc = needsE2ee
     ? ''
-    : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item, imageContext)
+    : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem, imageContext)
   const baseSrc = needsE2ee ? e2eeSrc : directSrc
   const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
+
+  const rawTarget = typeof effectiveItem === 'string'
+    ? effectiveItem.trim()
+    : String(effectiveItem?.url || effectiveItem?.path || '').trim()
+  const isUploadUrl =
+    rawTarget.startsWith('/api/uploads/') ||
+    /^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(rawTarget) ||
+    /^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(rawTarget)
+  const waitingForMediaToken = Boolean(isUploadUrl && imageContext?.baseUrl && !imageContext?.mediaToken)
+  const e2eeKeysSig = imageContext?.e2eeKeys
+    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
+    : ''
 
   const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
   const rawHint = item?.path || item?.raw || ''
@@ -51,9 +73,13 @@ export function ChatImageCard({
       setE2eeSrc('')
       return
     }
+    if (waitingForMediaToken && typeof effectiveItem === 'object' && effectiveItem?.e2ee?.iv) {
+      setStatus('loading')
+      return
+    }
     let cancelled = false
     setStatus('loading')
-    loadE2eeImageUrl(item, imageContext, { forceRefresh: retryNonce > 0 })
+    loadE2eeImageUrl(effectiveItem, imageContext, { forceRefresh: retryNonce > 0 })
       .then((blobUrl) => {
         if (cancelled) return
         if (!blobUrl) {
@@ -73,21 +99,30 @@ export function ChatImageCard({
     }
   }, [
     needsE2ee,
-    item?.path,
-    item?.url,
-    item?.raw,
-    item?.e2ee?.iv,
-    item?.e2ee?.kid,
+    previewFailed,
+    waitingForMediaToken,
+    effectiveItem?.path,
+    effectiveItem?.url,
+    effectiveItem?.raw,
+    effectiveItem?.e2ee?.iv,
+    effectiveItem?.e2ee?.kid,
+    imageContext?.baseUrl,
+    imageContext?.roomId,
     imageContext?.bridgeId,
     imageContext?.cwd,
+    imageContext?.mediaToken,
+    imageContext?.e2eeKey,
     imageContext?.e2eeKeyId,
     imageContext?.e2eeActive,
+    e2eeKeysSig,
     retryNonce,
   ])
 
   useEffect(() => {
     if (!src) {
-      if (!needsE2ee) setStatus('error')
+      if (!needsE2ee) {
+        setStatus(waitingForMediaToken ? 'loading' : 'error')
+      }
       return
     }
     const el = imgRef.current
@@ -96,9 +131,9 @@ export function ChatImageCard({
     } else {
       setStatus('loading')
     }
-  }, [src, needsE2ee])
+  }, [src, needsE2ee, waitingForMediaToken])
 
-  if (!needsE2ee && !directSrc) return null
+  if (!needsE2ee && !directSrc && !waitingForMediaToken) return null
 
   return (
     <div
@@ -150,7 +185,14 @@ export function ChatImageCard({
               loading="eager"
               decoding="async"
               onLoad={() => setStatus('loaded')}
-              onError={() => setStatus('error')}
+              onError={() => {
+                if (!previewFailed && typeof item === 'object' && item?.localPreviewUrl) {
+                  setPreviewFailed(true)
+                  setStatus('loading')
+                  return
+                }
+                setStatus('error')
+              }}
               className={`max-h-[340px] w-full object-contain transition duration-200 ${
                 status === 'loaded' ? 'opacity-100 group-hover:scale-[1.01]' : 'opacity-0'
               }`}
@@ -224,38 +266,89 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
   const [index, setIndex] = useState(0)
   const [zoom, setZoom] = useState(1)
   const [resolvedMap, setResolvedMap] = useState({})
+  const [errorMap, setErrorMap] = useState({})
+  const [failedSrcMap, setFailedSrcMap] = useState({})
+  const [retryNonce, setRetryNonce] = useState(0)
 
   useEffect(() => {
     if (state) {
       setIndex(state.index || 0)
       setZoom(1)
       setResolvedMap({})
+      setErrorMap({})
+      setFailedSrcMap({})
+      setRetryNonce(0)
+    } else {
+      setResolvedMap({})
+      setErrorMap({})
+      setFailedSrcMap({})
+      setRetryNonce(0)
     }
   }, [state])
 
   const current = state?.images?.[index] || state?.images?.[0] || null
+  const currentInitialSrc = failedSrcMap[index] ? '' : (current?.src || '')
+  const effectiveCurrentItem =
+    failedSrcMap[index] && current?.item && typeof current.item === 'object'
+      ? { ...current.item, localPreviewUrl: '' }
+      : current?.item
   const currentNeedsE2ee = Boolean(
     current &&
-      !current.src &&
-      current.item &&
+      !currentInitialSrc &&
+      effectiveCurrentItem &&
       imageContext &&
-      needsE2eeMediaLoad(current.item, imageContext),
+      needsE2eeMediaLoad(effectiveCurrentItem, imageContext),
   )
+  const e2eeKeysSig = imageContext?.e2eeKeys
+    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
+    : ''
 
   useEffect(() => {
-    if (!currentNeedsE2ee || !current?.item || resolvedMap[index]) return
+    if (!state || !currentNeedsE2ee || !effectiveCurrentItem || resolvedMap[index] || errorMap[index]) return
+    const targetUrl = typeof effectiveCurrentItem === 'string'
+      ? effectiveCurrentItem.trim()
+      : String(effectiveCurrentItem?.url || effectiveCurrentItem?.path || '').trim()
+    const isUploadUrl =
+      targetUrl.startsWith('/api/uploads/') ||
+      /^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(targetUrl) ||
+      /^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(targetUrl)
+    if (isUploadUrl && typeof effectiveCurrentItem === 'object' && effectiveCurrentItem?.e2ee?.iv && imageContext?.baseUrl && !imageContext?.mediaToken) {
+      return
+    }
     let cancelled = false
-    loadE2eeImageUrl(current.item, imageContext)
+    loadE2eeImageUrl(effectiveCurrentItem, imageContext, { forceRefresh: retryNonce > 0 })
       .then((blobUrl) => {
-        if (!cancelled && blobUrl) {
+        if (cancelled) return
+        if (blobUrl) {
           setResolvedMap((prev) => ({ ...prev, [index]: blobUrl }))
+        } else {
+          setErrorMap((prev) => ({ ...prev, [index]: bi('无法加载图片', 'Failed to load image') }))
         }
       })
-      .catch(() => {})
+      .catch((err) => {
+        if (!cancelled) {
+          setErrorMap((prev) => ({
+            ...prev,
+            [index]: String(err?.message || err || bi('端到端解密图片失败', 'Failed to decrypt image')),
+          }))
+        }
+      })
     return () => {
       cancelled = true
     }
-  }, [currentNeedsE2ee, current?.item, imageContext, index, resolvedMap])
+  }, [
+    state,
+    currentNeedsE2ee,
+    effectiveCurrentItem,
+    imageContext,
+    imageContext?.mediaToken,
+    e2eeKeysSig,
+    index,
+    resolvedMap,
+    errorMap,
+    retryNonce,
+    bi,
+  ])
 
   useEffect(() => {
     if (!state) return
@@ -276,8 +369,31 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
   if (!state || !Array.isArray(state.images) || state.images.length === 0 || !current) return null
 
   const total = state.images.length
-  const activeSrc = resolvedMap[index] || current.src || ''
+  const activeSrc = resolvedMap[index] || currentInitialSrc || ''
+  const currentError = errorMap[index] || ''
   const downloadHref = buildDownloadUrl(activeSrc)
+
+  const handleRetry = (e) => {
+    e?.stopPropagation?.()
+    setErrorMap((prev) => {
+      const next = { ...prev }
+      delete next[index]
+      return next
+    })
+    setResolvedMap((prev) => {
+      const next = { ...prev }
+      delete next[index]
+      return next
+    })
+    if (current?.src && !String(current.src).startsWith('blob:')) {
+      setFailedSrcMap((prev) => {
+        const next = { ...prev }
+        delete next[index]
+        return next
+      })
+    }
+    setRetryNonce((n) => n + 1)
+  }
 
   const cycleZoom = () => {
     setZoom((z) => (z === 1 ? 2 : z === 2 ? 3 : 1))
@@ -353,6 +469,25 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
               e.stopPropagation()
               cycleZoom()
             }}
+            onError={() => {
+              if (!failedSrcMap[index] && current.src && current.item && imageContext) {
+                const withoutPreview = typeof current.item === 'object' ? { ...current.item, localPreviewUrl: '' } : current.item
+                if (needsE2eeMediaLoad(withoutPreview, imageContext)) {
+                  setFailedSrcMap((prev) => ({ ...prev, [index]: true }))
+                  return
+                }
+              }
+              setResolvedMap((prev) => {
+                const next = { ...prev }
+                delete next[index]
+                return next
+              })
+              setFailedSrcMap((prev) => ({ ...prev, [index]: true }))
+              setErrorMap((prev) => ({
+                ...prev,
+                [index]: bi('图片加载失败', 'Failed to load image'),
+              }))
+            }}
             style={{
               width: zoom === 1 ? 'auto' : `${zoom * 100}%`,
               maxWidth: zoom === 1 ? '100%' : 'none',
@@ -360,6 +495,22 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
             }}
             className="cursor-zoom-in rounded-lg object-contain shadow-2xl transition-all duration-150 select-none"
           />
+        ) : currentError || !currentNeedsE2ee ? (
+          <div
+            className="flex max-w-xs flex-col items-center gap-3 rounded-2xl bg-white/8 px-5 py-4 text-center text-xs text-white/85"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <ImageOff className="h-7 w-7 text-amber-400" />
+            <div className="break-words">{currentError || bi('图片加载失败', 'Failed to load image')}</div>
+            <button
+              type="button"
+              onClick={handleRetry}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[#4D6BFE] px-3.5 py-1.5 text-xs font-semibold text-white active:scale-95"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>{bi('重试加载', 'Retry')}</span>
+            </button>
+          </div>
         ) : (
           <div className="flex flex-col items-center gap-2 text-xs text-white/70">
             <Loader2 className="h-6 w-6 animate-spin text-[#4D6BFE]" />

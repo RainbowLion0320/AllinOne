@@ -221,7 +221,11 @@ function generateIcons() {
 
 function buildCorePackages() {
   const skipBuild = process.env.ALLINONE_SKIP_CORE_BUILD === '1'
-  if (skipBuild && existsSync(join(MOBILE_DIST, 'index.html'))) {
+  if (
+    skipBuild &&
+    existsSync(join(MOBILE_DIST, 'index.html')) &&
+    existsSync(join(MOBILE_PUBLIC, 'downloads', 'allinone-bridge.mjs'))
+  ) {
     return
   }
   const relayUrl = resolveDefaultRelayUrl()

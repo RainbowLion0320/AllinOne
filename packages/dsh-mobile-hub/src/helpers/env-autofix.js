@@ -18,7 +18,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
-import { ensureRichPath, findExecutable, isExecutableFile } from './bin-finder.js'
+import { ensureRichPath, findExecutable, isExecutableFile, spawnCmdShim } from './bin-finder.js'
 
 const FAILURE_COOLDOWN_MS = 6 * 60 * 60 * 1000 // 6 hours after failed attempt
 const INSTALL_TIMEOUT_MS = 180_000 // 3 minutes per official installer
@@ -381,19 +381,23 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
 
     try {
       const isWinCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(step.cmd)
-      const spawnCmd = isWinCmd ? (process.env.ComSpec || 'cmd.exe') : step.cmd
-      const spawnArgs = isWinCmd ? ['/d', '/s', '/c', step.cmd, ...step.args] : step.args
-      const execCmd =
-        process.platform !== 'win32' && step.cmd === '/bin/bash' && !isExecutableFile('/bin/bash')
-          ? 'bash'
-          : spawnCmd
-
-      proc = spawn(execCmd, spawnArgs, {
+      const spawnOpts = {
         cwd: os.homedir(),
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-      })
+      }
+      if (isWinCmd) {
+        proc = spawnCmdShim(step.cmd, step.args, spawnOpts)
+      } else {
+        const execCmd =
+          process.platform !== 'win32' && step.cmd === '/bin/bash' && !isExecutableFile('/bin/bash')
+            ? 'bash'
+            : step.cmd
+        proc = spawn(execCmd, step.args, spawnOpts)
+      }
+      proc.stdout?.setEncoding('utf8')
+      proc.stderr?.setEncoding('utf8')
       proc.stdout?.on('data', appendOut)
       proc.stderr?.on('data', appendOut)
       proc.on('error', (err) => finish(false, -1, String(err?.message || err)))

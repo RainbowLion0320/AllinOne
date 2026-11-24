@@ -56,6 +56,18 @@ export function resolveImageSrc(item, { baseUrl = '', mediaToken = '' } = {}) {
     return `${cleanBase}${target}${sep}mt=${encodeURIComponent(mediaToken)}`
   }
 
+  // Subpath-mounted relay upload path such as `/dsh/api/uploads/<id>`
+  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(target)) {
+    if (!cleanBase || !mediaToken) return ''
+    try {
+      const origin = new URL(cleanBase).origin
+      const sep = target.includes('?') ? '&' : '?'
+      return `${origin}${target}${sep}mt=${encodeURIComponent(mediaToken)}`
+    } catch {
+      return ''
+    }
+  }
+
   // External or direct HTTP(S) URL
   if (/^https?:\/\//i.test(target)) {
     if (

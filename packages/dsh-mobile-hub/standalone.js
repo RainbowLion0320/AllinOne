@@ -4,12 +4,13 @@
  * until mounted as a Cordis plugin inside DeepSeek Harness Desktop.
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import os from 'node:os'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
+import { normalizeE2eeKey } from './src/helpers/e2ee.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
@@ -32,16 +33,27 @@ function loadDotEnv(filePath) {
 loadDotEnv(resolve(__dirname, '../../.env'))
 loadDotEnv(resolve(__dirname, '../relay-server/.env'))
 
+function normalizeRelayWsUrl(rawUrl) {
+  const input = String(rawUrl || 'ws://127.0.0.1:8787/ws/bridge').trim()
+  const u = new URL(input)
+  if (u.protocol === 'https:') u.protocol = 'wss:'
+  else if (u.protocol === 'http:') u.protocol = 'ws:'
+  const cleanPath = u.pathname.replace(/\/+$/, '')
+  u.pathname = cleanPath.endsWith('/ws/bridge') ? cleanPath : `${cleanPath}/ws/bridge`
+  return u.toString()
+}
+
 export function startStandaloneBridge(options = {}) {
-  const relayUrl = options.relayUrl || process.env.RELAY_URL || 'ws://127.0.0.1:8787/ws/bridge'
+  const relayUrl = normalizeRelayWsUrl(options.relayUrl || process.env.RELAY_URL || 'ws://127.0.0.1:8787/ws/bridge')
   const secret = String(options.secret || process.env.ALLINONE_BRIDGE_SECRET || '').trim()
   const roomId = String(options.roomId || process.env.ALLINONE_ROOM_ID || '').trim()
   const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
   const bridgeId = options.bridgeId || process.env.BRIDGE_ID || defaultBridgeId
   const mode = options.mode || 'standalone'
-  const e2eeKey = String(options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? '').trim()
+  const rawE2eeKey = String(options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? '').trim()
+  const e2eeKey = normalizeE2eeKey(rawE2eeKey)
   if (!roomId.startsWith('usr_') || !secret || !e2eeKey) {
-    throw new Error('startStandaloneBridge requires account roomId (usr_*), device secret, and 256-bit e2eeKey')
+    throw new Error('startStandaloneBridge requires account roomId (usr_*), device secret, and valid 256-bit e2eeKey')
   }
   const cwd = options.cwd || process.env.DEFAULT_CWD || resolve(__dirname, '../..')
   const log = options.log || console
@@ -61,31 +73,42 @@ export function startStandaloneBridge(options = {}) {
     onEvent: (event, payload) => link?.pushEvent(event, payload),
   })
 
-  link = new RelayBridgeLink({
-    relayUrl,
-    secret,
-    roomId,
-    bridgeId,
-    mode,
-    e2eeKey,
-    log,
-    onRpc: (method, params) => orchestrator.handleRpc(method, params),
-    onState: (state, detail) => {
-      options.onState?.(state, detail)
-      if (!options.quiet) {
-        log.log?.(`[bridge] state=${state} ${detail ? `(${detail})` : ''}`)
-      }
-    },
-  })
+  try {
+    link = new RelayBridgeLink({
+      relayUrl,
+      secret,
+      roomId,
+      bridgeId,
+      mode,
+      e2eeKey,
+      log,
+      onRpc: (method, params) => orchestrator.handleRpc(method, params),
+      onState: (state, detail) => {
+        options.onState?.(state, detail)
+        if (!options.quiet) {
+          log.log?.(`[bridge] state=${state} ${detail ? `(${detail})` : ''}`)
+        }
+      },
+    })
+  } catch (err) {
+    void orchestrator.dispose().catch(() => {})
+    throw err
+  }
 
   link.start()
-  const appsReadyPromise = orchestrator.getAppsStatus().then((apps) => {
-    link.setAppsMeta(apps)
-    if (!options.quiet) {
-      log.log?.('[bridge] App readiness:', apps.map((a) => `${a.app}:${a.available ? (a.writable ? 'RW' : 'RO') : 'OFF'}`).join(' | '))
-    }
-    return apps
-  })
+  const appsReadyPromise = orchestrator
+    .getAppsStatus()
+    .then((apps) => {
+      link.setAppsMeta(apps)
+      if (!options.quiet) {
+        log.log?.('[bridge] App readiness:', apps.map((a) => `${a.app}:${a.available ? (a.writable ? 'RW' : 'RO') : 'OFF'}`).join(' | '))
+      }
+      return apps
+    })
+    .catch((err) => {
+      log.warn?.(`[bridge] App readiness probe failed: ${String(err?.message || err)}`)
+      return []
+    })
 
   const stop = async () => {
     link.stop()
@@ -95,10 +118,39 @@ export function startStandaloneBridge(options = {}) {
   return { orchestrator, link, appsReadyPromise, stop }
 }
 
-const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
-if (isMain) {
+function isExecutedDirectly() {
+  if (!process.argv[1]) return false
+  try {
+    const argvPath = realpathSync(resolve(process.argv[1]))
+    const selfPath = realpathSync(fileURLToPath(import.meta.url))
+    return process.platform === 'win32'
+      ? argvPath.toLowerCase() === selfPath.toLowerCase()
+      : argvPath === selfPath
+  } catch {
+    const argvPath = resolve(process.argv[1])
+    const selfPath = resolve(fileURLToPath(import.meta.url))
+    return process.platform === 'win32'
+      ? argvPath.toLowerCase() === selfPath.toLowerCase()
+      : argvPath === selfPath
+  }
+}
+
+if (isExecutedDirectly()) {
   const bridge = startStandaloneBridge()
-  const shutdown = () => bridge.stop().then(() => process.exit(0))
+  let shuttingDown = false
+  const shutdown = () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    const forceTimer = setTimeout(() => process.exit(0), 5_000)
+    forceTimer.unref?.()
+    bridge
+      .stop()
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(forceTimer)
+        process.exit(0)
+      })
+  }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }

@@ -4,7 +4,124 @@ import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X 
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { resolveImageSrc } from '../lib/imageUrls.js'
+import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
+
+function revokeAttachmentPreview(att) {
+  const url = att?.localPreviewUrl
+  if (typeof url === 'string' && url.startsWith('blob:')) {
+    try { URL.revokeObjectURL(url) } catch {}
+  }
+}
+
+function ComposerAttachmentChip({ att, imageContext, onRemove }) {
+  const isImg = String(att?.mimeType || '').startsWith('image/')
+  const [previewFailed, setPreviewFailed] = useState(false)
+  const [decryptedSrc, setDecryptedSrc] = useState('')
+  const [loadError, setLoadError] = useState(false)
+
+  useEffect(() => {
+    setPreviewFailed(false)
+    setDecryptedSrc('')
+    setLoadError(false)
+  }, [att?.id, att?.url, att?.localPreviewUrl])
+
+  const effectiveAtt = previewFailed ? { ...att, localPreviewUrl: '' } : att
+  const needsE2ee = isImg && needsE2eeMediaLoad(effectiveAtt, imageContext)
+  const directSrc =
+    isImg && !needsE2ee
+      ? effectiveAtt.localPreviewUrl || resolveImageSrc({ url: effectiveAtt.url }, imageContext)
+      : ''
+  const e2eeKeysSig = imageContext?.e2eeKeys
+    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
+    : ''
+
+  useEffect(() => {
+    if (!needsE2ee) {
+      setDecryptedSrc('')
+      return
+    }
+    const targetUrl = String(effectiveAtt?.url || '').trim()
+    const isUploadUrl =
+      targetUrl.startsWith('/api/uploads/') ||
+      /^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(targetUrl) ||
+      /^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(targetUrl)
+    if (isUploadUrl && effectiveAtt?.e2ee?.iv && imageContext?.baseUrl && !imageContext?.mediaToken) {
+      return
+    }
+    let cancelled = false
+    setLoadError(false)
+    loadE2eeImageUrl(effectiveAtt, imageContext)
+      .then((blobUrl) => {
+        if (cancelled) return
+        if (blobUrl) setDecryptedSrc(blobUrl)
+        else setLoadError(true)
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    needsE2ee,
+    effectiveAtt?.url,
+    effectiveAtt?.e2ee?.iv,
+    effectiveAtt?.e2ee?.kid,
+    imageContext?.baseUrl,
+    imageContext?.roomId,
+    imageContext?.bridgeId,
+    imageContext?.mediaToken,
+    imageContext?.e2eeKey,
+    imageContext?.e2eeKeyId,
+    e2eeKeysSig,
+  ])
+
+  const thumbSrc = needsE2ee ? decryptedSrc : directSrc
+
+  if (isImg && !loadError && (thumbSrc || needsE2ee)) {
+    return (
+      <div className="relative flex h-14 w-14 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 shadow-2xs dark:border-slate-700 dark:bg-[#232630]">
+        {thumbSrc ? (
+          <img
+            src={thumbSrc}
+            alt={att.filename}
+            onError={() => {
+              if (!previewFailed && att.localPreviewUrl) {
+                setPreviewFailed(true)
+              } else {
+                setLoadError(true)
+              }
+            }}
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
+        )}
+        <button
+          type="button"
+          onClick={onRemove}
+          className="absolute top-0.5 right-0.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-black/65 text-white hover:bg-rose-500"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#232630] dark:text-slate-200">
+      <span className="max-w-[140px] truncate">{att.filename}</span>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="text-slate-400 hover:text-rose-500"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </span>
+  )
+}
 
 export function Composer({
   draftKey = '',
@@ -26,11 +143,14 @@ export function Composer({
   const [text, setText] = useState(() => loadDraft(draftKey).text)
   const [attachments, setAttachments] = useState(() => loadDraft(draftKey).attachments)
   const [uploading, setUploading] = useState(false)
+  const [sending, setSending] = useState(false)
   const fileRef = useRef(null)
   const textareaRef = useRef(null)
   const draftKeyRef = useRef(draftKey)
   const textRef = useRef(text)
   const attachmentsRef = useRef(attachments)
+  const sendingRef = useRef(false)
+  const mountedRef = useRef(true)
   textRef.current = text
   attachmentsRef.current = attachments
 
@@ -42,13 +162,31 @@ export function Composer({
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`
   }
 
+  // Revoke any unsent blob preview URLs on unmount (sent attachments are already cleared from ref)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      for (const att of attachmentsRef.current) {
+        revokeAttachmentPreview(att)
+      }
+    }
+  }, [])
+
   // Save outgoing conversation's draft and restore incoming conversation's draft whenever draftKey changes
   useEffect(() => {
     const prevKey = draftKeyRef.current
     if (prevKey === draftKey) return
-    saveDraft(prevKey, { text: textRef.current, attachments: attachmentsRef.current })
+    if (!sendingRef.current) {
+      saveDraft(prevKey, { text: textRef.current, attachments: attachmentsRef.current })
+      for (const att of attachmentsRef.current) {
+        revokeAttachmentPreview(att)
+      }
+    }
     draftKeyRef.current = draftKey
     const nextDraft = loadDraft(draftKey)
+    textRef.current = nextDraft.text
+    attachmentsRef.current = nextDraft.attachments
     setText(nextDraft.text)
     setAttachments(nextDraft.attachments)
   }, [draftKey])
@@ -59,6 +197,7 @@ export function Composer({
   }, [draftKey, text])
 
   const updateText = (nextText) => {
+    textRef.current = nextText
     setText(nextText)
     saveDraft(draftKeyRef.current, { text: nextText, attachments: attachmentsRef.current })
   }
@@ -66,8 +205,17 @@ export function Composer({
   const updateAttachments = (updater) => {
     setAttachments((prev) => {
       const next = typeof updater === 'function' ? updater(prev) : updater
+      attachmentsRef.current = next
       saveDraft(draftKeyRef.current, { text: textRef.current, attachments: next })
       return next
+    })
+  }
+
+  const handleRemoveAttachment = (attId) => {
+    updateAttachments((prev) => {
+      const removed = prev.find((x) => x.id === attId)
+      if (removed) revokeAttachmentPreview(removed)
+      return prev.filter((x) => x.id !== attId)
     })
   }
 
@@ -79,10 +227,21 @@ export function Composer({
     setUploading(true)
     try {
       const uploaded = await onUploadFile(file)
+      if (!uploaded || typeof uploaded !== 'object') return
+      if (!mountedRef.current) {
+        revokeAttachmentPreview(uploaded)
+        const existing = loadDraft(targetKey)
+        saveDraft(targetKey, {
+          text: existing.text,
+          attachments: [...existing.attachments, uploaded],
+        })
+        return
+      }
       if (draftKeyRef.current === targetKey) {
         updateAttachments((prev) => [...prev, uploaded])
       } else {
-        // User switched conversations mid-upload: keep attachment scoped to the original conversation's draft
+        // User switched conversations mid-upload: revoke ephemeral blob URL and persist scoped metadata
+        revokeAttachmentPreview(uploaded)
         const existing = loadDraft(targetKey)
         saveDraft(targetKey, {
           text: existing.text,
@@ -92,30 +251,72 @@ export function Composer({
     } catch (err) {
       alert(bi(`上传失败：${err.message || err}`, `Upload failed: ${err.message || err}`))
     } finally {
-      setUploading(false)
+      if (mountedRef.current) {
+        setUploading(false)
+      }
     }
   }
 
-  const handleSubmit = () => {
-    const trimmed = text.trim()
-    if (!trimmed && attachments.length === 0) return
-    if (disabled || streaming || needsWorkspace) return
+  const handleSubmit = async () => {
+    const rawText = textRef.current
+    const trimmed = rawText.trim()
+    const curAttachments = attachmentsRef.current
+    if (!trimmed && curAttachments.length === 0) return
+    if (disabled || streaming || uploading || sendingRef.current || needsWorkspace) return
     const curKey = draftKeyRef.current
-    onSend({ text: trimmed, attachments })
-    clearDraft(curKey)
-    setText('')
-    setAttachments([])
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    sendingRef.current = true
+    setSending(true)
+    try {
+      const result = await onSend({ text: trimmed, attachments: curAttachments })
+      if (result === false) {
+        if (mountedRef.current && textRef.current === '' && attachmentsRef.current.length === 0) {
+          textRef.current = rawText
+          attachmentsRef.current = curAttachments
+          setText(rawText)
+          setAttachments(curAttachments)
+          saveDraft(draftKeyRef.current, { text: rawText, attachments: curAttachments })
+        }
+        return
+      }
+      clearDraft(curKey)
+      if (mountedRef.current && (draftKeyRef.current === curKey || curKey.includes('::__new__::'))) {
+        textRef.current = ''
+        attachmentsRef.current = []
+        setText('')
+        setAttachments([])
+        if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      }
+    } catch {
+      if (mountedRef.current && textRef.current === '' && attachmentsRef.current.length === 0) {
+        textRef.current = rawText
+        attachmentsRef.current = curAttachments
+        setText(rawText)
+        setAttachments(curAttachments)
+        saveDraft(draftKeyRef.current, { text: rawText, attachments: curAttachments })
+      }
+    } finally {
+      sendingRef.current = false
+      if (mountedRef.current) {
+        setSending(false)
+      }
+    }
   }
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
-      handleSubmit()
+      if (!uploading && !sendingRef.current) {
+        void handleSubmit()
+      }
     }
   }
 
-  const canSend = (text.trim().length > 0 || attachments.length > 0) && !disabled && !uploading && !needsWorkspace
+  const canSend =
+    (text.trim().length > 0 || attachments.length > 0) &&
+    !disabled &&
+    !uploading &&
+    !sending &&
+    !needsWorkspace
   const placeholderText = needsWorkspace
     ? bi('请先在上方选择目标项目目录...', 'Select a project directory above first...')
     : targetWorkspaceName
@@ -125,42 +326,17 @@ export function Composer({
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
       <div className="mx-auto w-full max-w-2xl lg:max-w-3xl">
-        {/* Pending attachment chips (with image thumbnails!) */}
+        {/* Pending attachment chips (with E2EE-capable image thumbnails!) */}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 px-1">
-            {attachments.map((att) => {
-              const isImg = String(att.mimeType || '').startsWith('image/')
-              const thumbSrc = isImg ? (att.localPreviewUrl || resolveImageSrc({ url: att.url }, imageContext)) : ''
-              return isImg && thumbSrc ? (
-                <div
-                  key={att.id}
-                  className="relative h-14 w-14 overflow-hidden rounded-xl border border-slate-200 bg-slate-100 shadow-2xs dark:border-slate-700 dark:bg-[#232630]"
-                >
-                  <img src={thumbSrc} alt={att.filename} className="h-full w-full object-cover" />
-                  <button
-                    type="button"
-                    onClick={() => updateAttachments((prev) => prev.filter((x) => x.id !== att.id))}
-                    className="absolute top-0.5 right-0.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-black/65 text-white hover:bg-rose-500"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </div>
-              ) : (
-                <span
-                  key={att.id}
-                  className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#232630] dark:text-slate-200"
-                >
-                  <span className="max-w-[140px] truncate">{att.filename}</span>
-                  <button
-                    type="button"
-                    onClick={() => updateAttachments((prev) => prev.filter((x) => x.id !== att.id))}
-                    className="text-slate-400 hover:text-rose-500"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </span>
-              )
-            })}
+            {attachments.map((att, idx) => (
+              <ComposerAttachmentChip
+                key={att?.id || att?.url || `att-${idx}`}
+                att={att}
+                imageContext={imageContext}
+                onRemove={() => handleRemoveAttachment(att?.id)}
+              />
+            ))}
           </div>
         )}
 

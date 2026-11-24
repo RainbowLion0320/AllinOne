@@ -104,91 +104,113 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
   }
 
   const server = http.createServer(async (req, res) => {
-    // Anti-DNS-rebinding & anti-browser CSRF: reject any cross-origin/browser Origin header
-    if (req.headers.origin) {
-      sendJson(res, 403, { ok: false, error: 'Browser origins are not allowed on local DSH IPC' })
-      return
-    }
-    if (!isAuthorized(req)) {
-      sendJson(res, 401, { ok: false, error: 'Unauthorized' })
-      return
-    }
-
-    const urlObj = new URL(req.url || '/', 'http://127.0.0.1')
-    const pathname = urlObj.pathname
-
-    if (req.method === 'GET' && pathname === '/health') {
-      sendJson(res, 200, {
-        ok: true,
-        pid: process.pid,
-        writable: Boolean(dshAdapter.isLive?.()),
-        activeCount: Number(dshAdapter.activeTurns?.size || 0),
-      })
-      return
-    }
-
-    if (req.method === 'GET' && pathname === '/events') {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-store',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      })
-      res.write(': connected\n\n')
-      sseClients.add(res)
-      const cleanup = () => {
-        sseClients.delete(res)
+    try {
+      // Anti-DNS-rebinding & anti-browser CSRF: reject any cross-origin/browser Origin header
+      if (req.headers.origin) {
+        sendJson(res, 403, { ok: false, error: 'Browser origins are not allowed on local DSH IPC' })
+        return
       }
-      req.on('close', cleanup)
-      res.on('close', cleanup)
-      res.on('error', cleanup)
-      return
-    }
+      if (!isAuthorized(req)) {
+        sendJson(res, 401, { ok: false, error: 'Unauthorized' })
+        return
+      }
 
-    if (req.method === 'POST' && pathname === '/rpc') {
+      let urlObj
       try {
-        const body = await readJsonBody(req)
-        const method = String(body?.method || '').trim()
-        const params = body?.params ?? {}
-        if (!ALLOWED_METHODS.has(method)) {
-          sendJson(res, 400, { ok: false, error: `Unsupported DSH IPC method: ${method}` })
-          return
-        }
-        let result
-        if (method === 'listModels') {
-          result = await dshAdapter.listModels()
-        } else if (method === 'listWorkspaces') {
-          result = await dshAdapter.listWorkspaces()
-        } else if (method === 'listSessions') {
-          result = await dshAdapter.listSessions(params)
-        } else if (method === 'readSession') {
-          result = await dshAdapter.readSession(params.sessionId, params.options || {})
-        } else if (method === 'createSession') {
-          result = await dshAdapter.createSession(params)
-        } else if (method === 'sendMessage') {
-          result = await dshAdapter.sendMessage(params.sessionId, params.payload || {})
-        } else if (method === 'interrupt') {
-          result = await dshAdapter.interrupt(params.sessionId)
-        } else if (method === 'listApprovals') {
-          result = typeof dshAdapter.listPendingApprovals === 'function'
-            ? await dshAdapter.listPendingApprovals()
-            : []
-        } else if (method === 'resolveApproval') {
-          const payload = params.answers && typeof params.answers === 'object'
-            ? { decision: params.decision, answers: params.answers }
-            : params.decision
-          result = typeof dshAdapter.resolveApproval === 'function'
-            ? await dshAdapter.resolveApproval(params.id, payload)
-            : { resolved: false, reason: 'resolveApproval not supported' }
-        }
-        sendJson(res, 200, { ok: true, result })
-      } catch (err) {
-        sendJson(res, 500, { ok: false, error: String(err?.message || err) })
+        urlObj = new URL(req.url || '/', 'http://127.0.0.1')
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'Invalid request URL' })
+        return
       }
-      return
-    }
+      const pathname = urlObj.pathname
 
-    sendJson(res, 404, { ok: false, error: 'Not Found' })
+      if (req.method === 'GET' && pathname === '/health') {
+        sendJson(res, 200, {
+          ok: true,
+          pid: process.pid,
+          writable: Boolean(dshAdapter.isLive?.()),
+          activeCount: Number(dshAdapter.activeTurns?.size || 0),
+        })
+        return
+      }
+
+      if (req.method === 'GET' && pathname === '/events') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        })
+        res.write(': connected\n\n')
+        sseClients.add(res)
+        const cleanup = () => {
+          sseClients.delete(res)
+        }
+        req.on('close', cleanup)
+        res.on('close', cleanup)
+        res.on('error', cleanup)
+        return
+      }
+
+      if (req.method === 'POST' && pathname === '/rpc') {
+        try {
+          const body = await readJsonBody(req)
+          const method = String(body?.method || '').trim()
+          const params = body?.params ?? {}
+          if (!ALLOWED_METHODS.has(method)) {
+            sendJson(res, 400, { ok: false, error: `Unsupported DSH IPC method: ${method}` })
+            return
+          }
+          let result
+          if (method === 'listModels') {
+            result = await dshAdapter.listModels()
+          } else if (method === 'listWorkspaces') {
+            result = await dshAdapter.listWorkspaces()
+          } else if (method === 'listSessions') {
+            result = await dshAdapter.listSessions(params)
+          } else if (method === 'readSession') {
+            result = await dshAdapter.readSession(params.sessionId, params.options || {})
+          } else if (method === 'createSession') {
+            result = await dshAdapter.createSession(params)
+          } else if (method === 'sendMessage') {
+            result = await dshAdapter.sendMessage(params.sessionId, params.payload || {})
+          } else if (method === 'interrupt') {
+            result = await dshAdapter.interrupt(params.sessionId)
+          } else if (method === 'listApprovals') {
+            result = typeof dshAdapter.listPendingApprovals === 'function'
+              ? await dshAdapter.listPendingApprovals()
+              : []
+          } else if (method === 'resolveApproval') {
+            const payload = params.answers && typeof params.answers === 'object'
+              ? { decision: params.decision, answers: params.answers }
+              : params.decision
+            result = typeof dshAdapter.resolveApproval === 'function'
+              ? await dshAdapter.resolveApproval(params.id, payload)
+              : { resolved: false, reason: 'resolveApproval not supported' }
+          }
+          if (!res.headersSent) {
+            sendJson(res, 200, { ok: true, result })
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            const statusCode = err instanceof SyntaxError ? 400 : 500
+            sendJson(res, statusCode, { ok: false, error: String(err?.message || err) })
+          }
+        }
+        return
+      }
+
+      sendJson(res, 404, { ok: false, error: 'Not Found' })
+    } catch (err) {
+      log.warn?.(`mobile-hub: DSH local IPC handler error: ${String(err?.message || err)}`)
+      if (!res.headersSent) {
+        try {
+          sendJson(res, 500, { ok: false, error: String(err?.message || err) })
+        } catch {}
+      } else {
+        try { res.end() } catch {}
+      }
+    }
   })
 
   // Keep long-running agentic RPCs alive (up to 35 minutes)
@@ -278,6 +300,8 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
   return { port, token, ipcFile, emitEvent, close }
 }
 
+const IPC_TRANSPORT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTFOUND'])
+
 /**
  * Local IPC client used by standalone / Desktop App `DshAdapter` (`ctx === null`)
  * to seamlessly control a running DeepSeek Harness instance on the same machine.
@@ -291,6 +315,8 @@ export class DshLocalIpcClient {
     this.sseReq = null
     this.sseEndpointKey = ''
     this.sseReadyPromise = null
+    this.sseReconnectTimer = null
+    this.sseReconnectAttempt = 0
     this.disposed = false
   }
 
@@ -360,8 +386,33 @@ export class DshLocalIpcClient {
     }
   }
 
+  clearSseReconnectTimer() {
+    if (this.sseReconnectTimer) {
+      clearTimeout(this.sseReconnectTimer)
+      this.sseReconnectTimer = null
+    }
+  }
+
+  scheduleSseReconnect() {
+    if (this.disposed || this.sseReconnectTimer) return
+    const delayMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(this.sseReconnectAttempt, 5)))
+    this.sseReconnectAttempt += 1
+    this.sseReconnectTimer = setTimeout(() => {
+      this.sseReconnectTimer = null
+      if (this.disposed) return
+      const freshDesc = this.readDescriptor()
+      if (freshDesc) {
+        void this.ensureSse(freshDesc)
+      } else {
+        this.scheduleSseReconnect()
+      }
+    }, delayMs)
+    this.sseReconnectTimer.unref?.()
+  }
+
   ensureSse(desc) {
     if (this.disposed || !desc) return Promise.resolve(false)
+    this.clearSseReconnectTimer()
     const key = `${desc.port}:${desc.token}`
     if (this.sseReq && this.sseEndpointKey === key) {
       return this.sseReadyPromise || Promise.resolve(true)
@@ -373,10 +424,34 @@ export class DshLocalIpcClient {
     this.sseReadyPromise = new Promise((r) => {
       resolveReady = r
     })
-    const readyTimeout = setTimeout(() => resolveReady(false), 1200)
+
+    let req = null
+    const handleDrop = () => {
+      if (this.sseReq !== req) return
+      this.sseReq = null
+      this.sseEndpointKey = ''
+      this.sseReadyPromise = null
+      if (!this.disposed) {
+        this.scheduleSseReconnect()
+      }
+    }
+
+    const readyTimeout = setTimeout(() => {
+      resolveReady(false)
+      if (this.sseReq === req) {
+        const staleReq = req
+        this.sseReq = null
+        this.sseEndpointKey = ''
+        this.sseReadyPromise = null
+        try { staleReq?.destroy() } catch {}
+        if (!this.disposed) {
+          this.scheduleSseReconnect()
+        }
+      }
+    }, 1200)
     readyTimeout.unref?.()
 
-    const req = http.request(
+    req = http.request(
       {
         hostname: '127.0.0.1',
         port: desc.port,
@@ -392,9 +467,10 @@ export class DshLocalIpcClient {
         if (res.statusCode !== 200) {
           res.resume()
           resolveReady(false)
-          if (this.sseReq === req) this.closeSse()
+          handleDrop()
           return
         }
+        this.sseReconnectAttempt = 0
         resolveReady(true)
         let buf = ''
         res.setEncoding('utf8')
@@ -417,30 +493,16 @@ export class DshLocalIpcClient {
             } catch {}
           }
         })
-        res.on('end', () => {
-          if (this.sseReq === req) {
-            this.sseReq = null
-            this.sseEndpointKey = ''
-            this.sseReadyPromise = null
-          }
-        })
-        res.on('error', () => {
-          if (this.sseReq === req) {
-            this.sseReq = null
-            this.sseEndpointKey = ''
-            this.sseReadyPromise = null
-          }
-        })
+        res.on('end', handleDrop)
+        res.on('close', handleDrop)
+        res.on('error', handleDrop)
       },
     )
+    req.setTimeout(0)
     req.on('error', () => {
       clearTimeout(readyTimeout)
       resolveReady(false)
-      if (this.sseReq === req) {
-        this.sseReq = null
-        this.sseEndpointKey = ''
-        this.sseReadyPromise = null
-      }
+      handleDrop()
     })
     req.end()
     this.sseReq = req
@@ -448,11 +510,13 @@ export class DshLocalIpcClient {
   }
 
   closeSse() {
-    if (this.sseReq) {
-      try { this.sseReq.destroy() } catch {}
-      this.sseReq = null
-      this.sseEndpointKey = ''
-      this.sseReadyPromise = null
+    this.clearSseReconnectTimer()
+    const req = this.sseReq
+    this.sseReq = null
+    this.sseEndpointKey = ''
+    this.sseReadyPromise = null
+    if (req) {
+      try { req.destroy() } catch {}
     }
   }
 
@@ -464,37 +528,86 @@ export class DshLocalIpcClient {
     if (waitForEvents) {
       await this.ensureSse(endpoint)
     }
-    const controller = new AbortController()
-    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null
+
+    const bodyBuf = Buffer.from(JSON.stringify({ method, params }), 'utf8')
     try {
-      const res = await fetch(`http://127.0.0.1:${endpoint.port}/rpc`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${endpoint.token}`,
-        },
-        body: JSON.stringify({ method, params }),
-        signal: controller.signal,
+      return await new Promise((resolveCall, rejectCall) => {
+        let settled = false
+        let timer = null
+        let req = null
+        const finishResolve = (val) => {
+          if (settled) return
+          settled = true
+          if (timer) clearTimeout(timer)
+          resolveCall(val)
+        }
+        const finishReject = (err) => {
+          if (settled) return
+          settled = true
+          if (timer) clearTimeout(timer)
+          rejectCall(err)
+        }
+
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            const err = new Error(`DSH IPC call ${method} timed out (${timeoutMs}ms)`)
+            err.code = 'ETIMEDOUT'
+            try { req?.destroy(err) } catch {}
+            finishReject(err)
+          }, timeoutMs)
+          timer.unref?.()
+        }
+
+        req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: endpoint.port,
+            path: '/rpc',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': bodyBuf.length,
+              Authorization: `Bearer ${endpoint.token}`,
+            },
+          },
+          (res) => {
+            res.setEncoding('utf8')
+            let raw = ''
+            res.on('data', (chunk) => { raw += chunk })
+            res.on('end', () => {
+              let data = {}
+              try {
+                data = raw ? JSON.parse(raw) : {}
+              } catch {}
+              if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300 || !data?.ok) {
+                finishReject(
+                  new Error(data?.error || `DSH IPC call ${method} failed (HTTP ${res.statusCode || 0})`),
+                )
+                return
+              }
+              finishResolve(data.result)
+            })
+            res.on('error', finishReject)
+          },
+        )
+        // Disable Node's default socket idle timeout so long-running agentic turns (>5 min) obey ONLY caller timeoutMs
+        req.setTimeout(0)
+        req.on('error', finishReject)
+        req.end(bodyBuf)
       })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || `DSH IPC call ${method} failed (HTTP ${res.status})`)
-      }
-      return data.result
     } catch (err) {
-      // Invalidate cached endpoint on transport error so subsequent status probes reflect reality
-      if (err?.name === 'TypeError' || err?.code === 'ECONNREFUSED') {
+      // Only invalidate cached endpoint & SSE on genuine connection errors (never on RPC/application errors or timeouts)
+      if (IPC_TRANSPORT_ERROR_CODES.has(err?.code)) {
         this.cachedEndpoint = null
         this.closeSse()
       }
       throw err
-    } finally {
-      if (timer) clearTimeout(timer)
     }
   }
 
   dispose() {
     this.disposed = true
+    this.clearSseReconnectTimer()
     this.closeSse()
     this.cachedEndpoint = null
   }

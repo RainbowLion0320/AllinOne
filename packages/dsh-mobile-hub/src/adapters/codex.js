@@ -295,57 +295,69 @@ export function probeCodexRolloutStatus(
   try {
     fd = openSync(cleanPath, 'r')
     const actualSize = fstatSync(fd).size
-    const readLen = Math.min(actualSize, tailBytes)
-    const startOffset = actualSize - readLen
-    const buf = Buffer.alloc(readLen)
-    readSync(fd, buf, 0, readLen, startOffset)
-    const lines = buf.toString('utf8').split(/\r?\n/)
-    if (startOffset > 0 && lines.length > 0) lines.shift()
+    const maxWindowBytes = Math.max(tailBytes, 512 * 1024)
+    let windowBytes = tailBytes
 
-    let sawActiveLine = false
-    let lastEvent = ''
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i]
-      if (!line || line[0] !== '{') continue
-      let obj
-      try {
-        obj = JSON.parse(line)
-      } catch {
-        continue
-      }
-      const topType = String(obj.type || '')
-      const pType = String(obj.payload?.type || '')
+    while (true) {
+      const readLen = Math.min(actualSize, windowBytes)
+      const startOffset = actualSize - readLen
+      const buf = Buffer.alloc(readLen)
+      const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
+      const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
+      if (startOffset > 0 && lines.length > 0) lines.shift()
 
-      if (topType === 'event_msg') {
-        if (CODEX_TERMINAL_EVENT_TYPES.has(pType)) {
-          return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent: pType }
-        }
-        if (CODEX_METADATA_EVENT_TYPES.has(pType)) {
+      let sawActiveLine = false
+      let lastEvent = ''
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]
+        if (!line || line[0] !== '{') continue
+        let obj
+        try {
+          obj = JSON.parse(line)
+        } catch {
           continue
         }
-        sawActiveLine = true
-        lastEvent = pType || 'event_msg'
-        break
+        const topType = String(obj.type || '')
+        const pType = String(obj.payload?.type || '')
+
+        if (topType === 'event_msg') {
+          if (CODEX_TERMINAL_EVENT_TYPES.has(pType)) {
+            return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent: pType }
+          }
+          if (CODEX_METADATA_EVENT_TYPES.has(pType)) {
+            continue
+          }
+          sawActiveLine = true
+          lastEvent = pType || 'event_msg'
+          break
+        }
+
+        if (topType === 'session_meta') {
+          continue
+        }
+
+        if (topType === 'response_item' || topType === 'token_usage_record' || topType === 'turn_context') {
+          sawActiveLine = true
+          lastEvent = pType || topType
+          break
+        }
       }
 
-      if (topType === 'session_meta') {
-        continue
+      if (sawActiveLine) {
+        return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent }
       }
 
-      if (topType === 'response_item' || topType === 'token_usage_record' || topType === 'turn_context') {
-        sawActiveLine = true
-        lastEvent = pType || topType
-        break
+      // If we hit a truncated >tailBytes line with no parsed event yet, expand window up to 512KB before treating as giant_item
+      if (startOffset > 0) {
+        if (windowBytes < maxWindowBytes) {
+          windowBytes = Math.min(maxWindowBytes, windowBytes * 2)
+          continue
+        }
+        return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent: 'giant_item' }
       }
+
+      return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent }
     }
-
-    // If a recently modified giant rollout (>tailBytes) ended mid-huge-line (e.g. >64KB screenshot tool output)
-    // with no terminal event after it, treat it as actively running.
-    if (!sawActiveLine && startOffset > 0) {
-      return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent: 'giant_item' }
-    }
-
-    return { exists: true, running: sawActiveLine, size: actualSize, mtimeMs, lastEvent }
   } catch {
     return { exists: true, running: false, size, mtimeMs, lastEvent: '' }
   } finally {
@@ -373,8 +385,8 @@ export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limi
     const readLen = Math.min(totalSize, maxBytes)
     const startOffset = totalSize - readLen
     const buf = Buffer.alloc(readLen)
-    readSync(fd, buf, 0, readLen, startOffset)
-    const rawText = buf.toString('utf8')
+    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
+    const rawText = buf.subarray(0, bytesRead).toString('utf8')
     const lines = rawText.split(/\r?\n/)
     // Drop first partial line if we started mid-file
     if (startOffset > 0 && lines.length > 0) lines.shift()
@@ -514,12 +526,15 @@ class CodexRpcClient {
 
       this.proc = proc
       this.stdoutBuf = ''
+      proc.stdout.setEncoding('utf8')
+      proc.stderr?.setEncoding('utf8')
 
       // Prevent uncaught EPIPE if the child exits while a JSON-RPC line is being written
       proc.stdin?.on('error', () => {})
 
       proc.stdout.on('data', (chunk) => {
-        this.stdoutBuf += chunk.toString('utf8')
+        if (this.proc !== proc) return
+        this.stdoutBuf += chunk
         let idx
         while ((idx = this.stdoutBuf.indexOf('\n')) !== -1) {
           const line = this.stdoutBuf.slice(0, idx).trim()
@@ -533,13 +548,15 @@ class CodexRpcClient {
       })
 
       proc.stderr.on('data', (chunk) => {
-        const text = chunk.toString('utf8')
+        if (this.proc !== proc) return
+        const text = String(chunk)
         this.stderrTail = `${this.stderrTail}${text}`.slice(-1200)
         const line = text.trim()
         if (line) this.log.debug?.(`[codex-${this.label}] ${line}`)
       })
 
       proc.on('error', (err) => {
+        if (this.proc !== proc) return
         if (!this.closing) {
           this.log.error?.(`mobile-hub: codex(${this.label}) failed: ${String(err)}`)
         }
@@ -548,6 +565,7 @@ class CodexRpcClient {
       })
 
       proc.on('exit', (code, signal) => {
+        if (this.proc !== proc) return
         if (!this.closing) {
           this.log.warn?.(`mobile-hub: codex(${this.label}) exited (code=${code}, signal=${signal})`)
         }
@@ -564,15 +582,19 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.9' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.0' },
         capabilities: null,
       })
         .then((res) => {
+          if (this.proc !== proc) return
           this.sendRaw({ jsonrpc: '2.0', method: 'initialized', params: {} })
           resolveReady(res)
         })
         .catch((err) => {
-          this.cleanup(err)
+          try { proc.kill() } catch {}
+          if (this.proc === proc) {
+            this.cleanup(err)
+          }
           rejectReady(err)
         })
     })
@@ -683,11 +705,18 @@ class CodexRpcClient {
 
   killImmediate() {
     this.closing = true
-    if (this.proc) {
-      try { this.proc.kill() } catch {}
-      this.proc = null
-      this.readyPromise = null
+    const proc = this.proc
+    this.proc = null
+    this.readyPromise = null
+    if (proc) {
+      try { proc.kill() } catch {}
     }
+    const err = new Error(`codex(${this.label}) disposed`)
+    for (const pending of this.pendingRpc.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(err)
+    }
+    this.pendingRpc.clear()
   }
 }
 
@@ -711,7 +740,8 @@ export class CodexAdapter {
       log: this.log,
       label: 'reader',
     })
-    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted }
+    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled }
+    this.releasingWriters = new Map() // threadId -> Promise<void> (in-flight writer release before next thread/resume)
     this.pendingNewWriters = new Map() // threadId -> { writer, summary, timer }
     this.pendingServerRequests = new Map() // approvalId -> { writer, rpcId, method, threadId }
     this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
@@ -724,6 +754,7 @@ export class CodexAdapter {
     this.watchTimer = null
     this.watchPollInFlight = false
     this.lastListDiscoveryAt = 0
+    this.lastClientListAt = 0
   }
 
   refreshBinary() {
@@ -751,14 +782,10 @@ export class CodexAdapter {
       onExit: (err, exitedClient) => {
         const targetWriter = exitedClient || writer
         // Fail any active turn bound to this writer if it crashed unexpectedly
+        // (STREAM_ERROR is emitted once in sendMessage's catch block to avoid duplicate error events)
         for (const [tid, active] of this.activeTurns.entries()) {
-          if (active.writer === targetWriter && !targetWriter.closing) {
-            this.activeTurns.delete(tid)
-            this.emitEvent(EVENTS.STREAM_ERROR, {
-              sessionId: makeCompositeId(APPS.CODEX, tid),
-              app: APPS.CODEX,
-              message: String(err?.message || err),
-            })
+          if (active.writer === targetWriter && !targetWriter.closing && !active.settled) {
+            active.settled = true
             active.reject(err)
           }
         }
@@ -1136,11 +1163,19 @@ export class CodexAdapter {
       const finalText = active?.textBuffer || ''
       const aborted = turn.status === 'interrupted' || Boolean(active?.aborted)
       if (turn.error && !aborted) {
+        const errMsg = turn.error.message || JSON.stringify(turn.error)
+        const err = new Error(errMsg)
+        err._streamErrorEmitted = true
         this.emitEvent(EVENTS.STREAM_ERROR, {
           sessionId: compositeId,
           app: APPS.CODEX,
-          message: turn.error.message || JSON.stringify(turn.error),
+          message: errMsg,
         })
+        if (active && !active.settled) {
+          active.settled = true
+          active.reject(err)
+        }
+        return
       }
       this.emitEvent(EVENTS.STREAM_DONE, {
         sessionId: compositeId,
@@ -1149,8 +1184,8 @@ export class CodexAdapter {
         finalText,
         aborted,
       })
-      if (active) {
-        this.activeTurns.delete(threadId)
+      if (active && !active.settled) {
+        active.settled = true
         active.resolve({ sessionId: compositeId, nativeId: threadId, finalText, aborted })
       }
     }
@@ -1213,16 +1248,20 @@ export class CodexAdapter {
     this.ensureWatcherRunning()
   }
 
-  rememberTrackedListSession(threadId, snapshot = {}) {
+  rememberTrackedListSession(threadId, snapshot = {}, { fromDiscovery = false } = {}) {
     const cleanPath = String(snapshot.path || '').replace(/^\\\\\?\\/, '').trim()
     if (!threadId || !cleanPath) return
+    const now = Date.now()
+    if (!fromDiscovery) {
+      this.lastClientListAt = now
+    }
     const existing = this.trackedListSessions.get(threadId)
     const probe = snapshot.probe || probeCodexRolloutStatus(cleanPath, { maxIdleMs: this.externalMaxIdleMs })
     this.trackedListSessions.delete(threadId)
     this.trackedListSessions.set(threadId, {
       threadId,
       path: cleanPath,
-      lastSeenAt: Date.now(),
+      lastSeenAt: fromDiscovery ? (existing?.lastSeenAt || this.lastClientListAt || now) : now,
       size: probe.size,
       mtimeMs: probe.mtimeMs,
       externalRunning: Boolean(snapshot.externalRunning ?? probe.running),
@@ -1320,6 +1359,10 @@ export class CodexAdapter {
       }
 
       // 2. Poll top recent sidebar Codex sessions so running dots flip live when Desktop starts/finishes any task
+      const listExpired = this.lastClientListAt > 0 && now - this.lastClientListAt > CODEX_TRACKED_LIST_TTL_MS
+      if (listExpired) {
+        this.trackedListSessions.clear()
+      }
       for (const [tid, entry] of [...this.trackedListSessions.entries()]) {
         if (now - entry.lastSeenAt > CODEX_TRACKED_LIST_TTL_MS) {
           this.trackedListSessions.delete(tid)
@@ -1347,6 +1390,7 @@ export class CodexAdapter {
 
       // 3. Periodically discover newly started / resumed Desktop Codex threads via existing reader daemon
       if (
+        !listExpired &&
         this.trackedListSessions.size > 0 &&
         this.reader.proc &&
         !this.reader.proc.killed &&
@@ -1365,12 +1409,16 @@ export class CodexAdapter {
             const prev = this.trackedListSessions.get(raw.id)
             const summary = normalizeThreadSummary(raw)
             const prevRunning = Boolean(prev?.externalRunning)
-            this.rememberTrackedListSession(raw.id, {
-              ...summary,
-              path: raw.path,
-              probe,
-              externalRunning: probe.running,
-            })
+            this.rememberTrackedListSession(
+              raw.id,
+              {
+                ...summary,
+                path: raw.path,
+                probe,
+                externalRunning: probe.running,
+              },
+              { fromDiscovery: true },
+            )
             if ((!prev && probe.running) || (prev && prevRunning !== probe.running)) {
               const entry = this.trackedListSessions.get(raw.id)
               if (entry && !emittedIds.has(raw.id)) {
@@ -1438,6 +1486,7 @@ export class CodexAdapter {
       items.push(item)
     }
     this.lastListDiscoveryAt = now
+    this.lastClientListAt = now
     const seen = new Set(items.map((x) => x.nativeId))
     for (const [tid, entry] of this.pendingNewWriters.entries()) {
       if (!seen.has(tid) && entry.summary) {
@@ -1567,7 +1616,7 @@ export class CodexAdapter {
         const all = mergeAndCompactMessages(normalizeCodexTurns(fullRes?.thread?.turns || []))
         const start = Math.max(0, all.length - targetBubbles)
         messages = all.slice(start)
-        hasMore = start > 0
+        hasMore = false
         nextCursor = null
       } catch {}
     }
@@ -1660,7 +1709,12 @@ export class CodexAdapter {
           const entry = this.pendingNewWriters.get(t.id)
           if (entry && entry.writer === writer) {
             this.pendingNewWriters.delete(t.id)
-            void this.releaseWriter(writer, t.id)
+            const rel = this.releaseWriter(writer, t.id).finally(() => {
+              if (this.releasingWriters.get(t.id) === rel) {
+                this.releasingWriters.delete(t.id)
+              }
+            })
+            this.releasingWriters.set(t.id, rel)
           }
         }, 3 * 60_000)
         timer.unref?.()
@@ -1680,24 +1734,79 @@ export class CodexAdapter {
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
     if (this.activeTurns.has(threadId)) {
       const err = new Error('该 Codex 对话正在运行中，请等待完成或先中断当前任务。')
-      this.emitEvent(EVENTS.STREAM_ERROR, { sessionId: compositeId, app: APPS.CODEX, message: err.message })
+      err.code = 'SESSION_BUSY'
       throw err
     }
 
-    // Reuse pending new-thread writer if Turn 1; otherwise spawn a fresh per-turn writer
-    const pendingNew = this.pendingNewWriters.get(threadId)
-    let writer = null
-    let alreadyLoaded = false
-    if (pendingNew) {
-      clearTimeout(pendingNew.timer)
-      this.pendingNewWriters.delete(threadId)
-      writer = pendingNew.writer
-      alreadyLoaded = true
-    } else {
-      writer = this.createWriter(threadId)
+    const input = []
+    const trimmedText = String(text || '').trim()
+    if (trimmedText.length > 0) {
+      input.push({ type: 'text', text: String(text), text_elements: [] })
+    }
+    for (const att of attachments) {
+      if (att.localPath && String(att.mimeType || '').startsWith('image/')) {
+        input.push({ type: 'localImage', path: att.localPath })
+      } else if (att.localPath) {
+        input.push({ type: 'text', text: `[附件文件: ${att.localPath}]`, text_elements: [] })
+      }
+    }
+    if (input.length === 0) {
+      throw new Error('消息内容不能为空')
     }
 
+    let resolveTurn
+    let rejectTurn
+    const turnDone = new Promise((res, rej) => {
+      resolveTurn = res
+      rejectTurn = rej
+    })
+    // Prevent unhandled rejection if writer exits during `turn/start` before `await turnDone`
+    turnDone.catch(() => {})
+
+    // Synchronously reserve activeTurns BEFORE any await to eliminate TOCTOU races
+    const turnState = {
+      writer: null,
+      turnId: null,
+      textBuffer: '',
+      aborted: false,
+      settled: false,
+      resolve: resolveTurn,
+      reject: rejectTurn,
+    }
+    this.activeTurns.set(threadId, turnState)
+
+    let writer = null
+    let alreadyLoaded = false
+    let streamStarted = false
+
     try {
+      // Wait for any previous writer on this threadId to finish releasing its lock before calling thread/resume
+      const inflightRelease = this.releasingWriters.get(threadId)
+      if (inflightRelease) {
+        await inflightRelease.catch(() => {})
+      }
+
+      if (turnState.aborted) {
+        return { sessionId: compositeId, nativeId: threadId, finalText: '', aborted: true }
+      }
+
+      // Reuse pending new-thread writer if Turn 1 and still alive; otherwise spawn a fresh per-turn writer
+      const pendingNew = this.pendingNewWriters.get(threadId)
+      if (pendingNew) {
+        clearTimeout(pendingNew.timer)
+        this.pendingNewWriters.delete(threadId)
+        if (pendingNew.writer?.proc && !pendingNew.writer.proc.killed) {
+          writer = pendingNew.writer
+          alreadyLoaded = true
+        } else {
+          pendingNew.writer?.killImmediate?.()
+          writer = this.createWriter(threadId)
+        }
+      } else {
+        writer = this.createWriter(threadId)
+      }
+      turnState.writer = writer
+
       if (!alreadyLoaded) {
         try {
           await writer.rpc('thread/resume', {
@@ -1718,46 +1827,16 @@ export class CodexAdapter {
         }
       }
 
-      const input = []
-      const trimmedText = String(text || '').trim()
-      if (trimmedText.length > 0) {
-        input.push({ type: 'text', text: String(text), text_elements: [] })
-      }
-      for (const att of attachments) {
-        if (att.localPath && String(att.mimeType || '').startsWith('image/')) {
-          input.push({ type: 'localImage', path: att.localPath })
-        } else if (att.localPath) {
-          input.push({ type: 'text', text: `[附件文件: ${att.localPath}]`, text_elements: [] })
-        }
-      }
-      if (input.length === 0) {
-        throw new Error('消息内容不能为空')
+      if (turnState.aborted) {
+        return { sessionId: compositeId, nativeId: threadId, finalText: '', aborted: true }
       }
 
+      streamStarted = true
       this.emitEvent(EVENTS.STREAM_START, {
         sessionId: compositeId,
         app: APPS.CODEX,
         nativeId: threadId,
       })
-
-      let resolveTurn
-      let rejectTurn
-      const turnDone = new Promise((res, rej) => {
-        resolveTurn = res
-        rejectTurn = rej
-      })
-      // Prevent unhandled rejection if writer exits during `turn/start` before `await turnDone`
-      turnDone.catch(() => {})
-
-      const turnState = {
-        writer,
-        turnId: null,
-        textBuffer: '',
-        aborted: false,
-        resolve: resolveTurn,
-        reject: rejectTurn,
-      }
-      this.activeTurns.set(threadId, turnState)
 
       const pref = this.sessionPrefs.get(threadId)
       const effectiveModel = model || pref?.model || undefined
@@ -1776,31 +1855,96 @@ export class CodexAdapter {
       })
       turnState.turnId = startRes?.turn?.id || null
 
+      // If interrupt() was called while turn/start was in flight, immediately send turn/interrupt now that turnId is known
+      if (turnState.aborted && turnState.turnId) {
+        await writer.rpc('turn/interrupt', { threadId, turnId: turnState.turnId }, 5_000).catch(() => {})
+      }
+
       return await turnDone
     } catch (err) {
-      this.activeTurns.delete(threadId)
-      this.emitEvent(EVENTS.STREAM_ERROR, {
-        sessionId: compositeId,
-        app: APPS.CODEX,
-        message: String(err?.message || err),
-      })
+      if (!err?._streamErrorEmitted) {
+        if (err && typeof err === 'object') err._streamErrorEmitted = true
+        this.emitEvent(EVENTS.STREAM_ERROR, {
+          sessionId: compositeId,
+          app: APPS.CODEX,
+          message: String(err?.message || err),
+        })
+      }
       throw err
     } finally {
-      // ALWAYS release the writer process once the turn completes or errors so Codex Desktop
-      // on PC can immediately take over without "已在另一个应用中打开"!
-      this.activeTurns.delete(threadId)
-      for (const [aprId, entry] of this.pendingServerRequests.entries()) {
-        if (entry.writer === writer) {
-          this.pendingServerRequests.delete(aprId)
-          this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+      if (streamStarted && turnState.aborted && !turnState.settled) {
+        turnState.settled = true
+        this.emitEvent(EVENTS.STREAM_DONE, {
+          sessionId: compositeId,
+          app: APPS.CODEX,
+          nativeId: threadId,
+          finalText: turnState.textBuffer || '',
+          aborted: true,
+        })
+      }
+      if (writer) {
+        for (const [aprId, entry] of this.pendingServerRequests.entries()) {
+          if (entry.writer === writer) {
+            this.pendingServerRequests.delete(aprId)
+            this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+          }
         }
       }
-      await this.releaseWriter(writer, threadId)
+      // Register releasingWriters BEFORE clearing activeTurns so fast follow-up turns wait on the release lock
+      let releasePromise = null
+      if (writer) {
+        releasePromise = this.releaseWriter(writer, threadId).finally(() => {
+          if (this.releasingWriters.get(threadId) === releasePromise) {
+            this.releasingWriters.delete(threadId)
+          }
+        })
+        this.releasingWriters.set(threadId, releasePromise)
+      }
+      if (this.activeTurns.get(threadId) === turnState) {
+        this.activeTurns.delete(threadId)
+      }
+      if (releasePromise) {
+        await releasePromise.catch(() => {})
+      }
+      // Refresh local watcher/list snapshots post-release so our own turn's writes don't trigger a false externalUpdate echo
+      const now = Date.now()
+      const watched = this.watchedSessions.get(threadId)
+      if (watched?.path) {
+        const cur = probeCodexRolloutStatus(watched.path, { now, maxIdleMs: this.externalMaxIdleMs })
+        watched.size = cur.size
+        watched.mtimeMs = cur.mtimeMs
+        watched.externalRunning = false
+        watched.lastSeenAt = now
+      }
+      const tracked = this.trackedListSessions.get(threadId)
+      if (tracked?.path) {
+        const cur = probeCodexRolloutStatus(tracked.path, { now, maxIdleMs: this.externalMaxIdleMs })
+        tracked.size = cur.size
+        tracked.mtimeMs = cur.mtimeMs
+        tracked.externalRunning = false
+      }
     }
   }
 
   async interrupt(threadId) {
     threadId = assertSafeSessionId(threadId, 'Codex threadId')
+    for (const [aprId, entry] of this.pendingServerRequests.entries()) {
+      if (entry.threadId === threadId) {
+        this.pendingServerRequests.delete(aprId)
+        try {
+          if (entry.method === 'item/tool/requestUserInput') {
+            entry.writer?.sendRaw({ jsonrpc: '2.0', id: entry.rpcId, result: { answers: {} } })
+          } else if (entry.method === 'item/permissions/requestApproval') {
+            entry.writer?.sendRaw({ jsonrpc: '2.0', id: entry.rpcId, result: { permissions: {}, scope: 'turn' } })
+          } else if (entry.method === 'mcpServer/elicitation/request') {
+            entry.writer?.sendRaw({ jsonrpc: '2.0', id: entry.rpcId, result: { action: 'cancel' } })
+          } else {
+            entry.writer?.sendRaw({ jsonrpc: '2.0', id: entry.rpcId, result: { decision: 'cancel' } })
+          }
+        } catch {}
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+      }
+    }
     const active = this.activeTurns.get(threadId)
     if (!active) return { interrupted: false, sessionId: threadId }
     active.aborted = true
@@ -1817,15 +1961,23 @@ export class CodexAdapter {
     }
     this.watchedSessions.clear()
     this.trackedListSessions.clear()
+    for (const [aprId] of this.pendingServerRequests.entries()) {
+      this.pendingServerRequests.delete(aprId)
+    }
     for (const [tid, entry] of this.pendingNewWriters.entries()) {
       clearTimeout(entry.timer)
       entry.writer.killImmediate()
       this.pendingNewWriters.delete(tid)
     }
-    for (const active of this.activeTurns.values()) {
+    for (const [tid, active] of this.activeTurns.entries()) {
+      if (!active.settled) {
+        active.settled = true
+        active.reject?.(new Error('Codex adapter disposed'))
+      }
       active.writer?.killImmediate()
+      this.activeTurns.delete(tid)
     }
-    this.activeTurns.clear()
+    this.releasingWriters.clear()
     this.reader.killImmediate()
   }
 }

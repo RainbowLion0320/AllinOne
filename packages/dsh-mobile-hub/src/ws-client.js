@@ -2,7 +2,10 @@ import os from 'node:os'
 import WebSocket from 'ws'
 import {
   E2EE_EVENT_MARKER,
+  E2EE_IV_BYTES,
   E2EE_VERSION,
+  base64UrlToBytes,
+  bytesToBase64Url,
   computeE2eeKeyId,
   decryptJson,
   encryptJson,
@@ -49,6 +52,9 @@ export class RelayBridgeLink {
       this.e2eeKeyId = kid
       return kid
     })
+    this.e2eeReady.catch((err) => {
+      this.log.error?.(`mobile-hub: failed computing E2EE keyId: ${String(err?.message || err)}`)
+    })
     this.seenReqIvs = new Map()
     this._eventQueue = Promise.resolve()
     this.log = log
@@ -80,14 +86,20 @@ export class RelayBridgeLink {
 
   setAppsMeta(apps) {
     this.metaApps = apps
-    void this.sendBridgeMeta()
+    this.sendBridgeMeta().catch((err) => {
+      this.log.warn?.(`mobile-hub: failed sending bridge.meta: ${String(err?.message || err)}`)
+    })
   }
 
   start() {
     this.stopped = false
-    void this.e2eeReady.finally(() => {
-      if (!this.stopped) this.connect()
-    })
+    this.e2eeReady
+      .then(() => {
+        if (!this.stopped) this.connect()
+      })
+      .catch((err) => {
+        this.emitState('error', String(err?.message || err))
+      })
     return () => this.stop()
   }
 
@@ -138,6 +150,12 @@ export class RelayBridgeLink {
 
   connect() {
     if (this.stopped) return
+    if (this.ws) {
+      const prevWs = this.ws
+      this.ws = null
+      this.clearHeartbeat()
+      try { prevWs.terminate() } catch {}
+    }
     this.emitState('connecting', this.relayUrl)
 
     let ws
@@ -161,17 +179,27 @@ export class RelayBridgeLink {
     this.ws = ws
 
     ws.on('open', async () => {
-      this.attempt = 0
-      this.lastPongAt = Date.now()
-      this.log.info?.(
-        `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}" (E2EE AES-256-GCM)`,
-      )
-      this.emitState('connected', this.relayUrl)
-      await this.sendBridgeMeta()
-      this.startHeartbeat()
+      if (this.ws !== ws || this.stopped) {
+        try { ws.close() } catch {}
+        return
+      }
+      try {
+        this.attempt = 0
+        this.lastPongAt = Date.now()
+        this.log.info?.(
+          `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}" (E2EE AES-256-GCM)`,
+        )
+        this.emitState('connected', this.relayUrl)
+        await this.sendBridgeMeta()
+        if (this.ws !== ws || this.stopped) return
+        this.startHeartbeat()
+      } catch (err) {
+        this.log.warn?.(`mobile-hub: relay open handler error: ${String(err?.message || err)}`)
+      }
     })
 
     ws.on('message', async (raw) => {
+      if (this.ws !== ws || this.stopped) return
       let msg
       try {
         msg = JSON.parse(String(raw))
@@ -185,14 +213,19 @@ export class RelayBridgeLink {
       }
 
       if (msg.type === 'rpc.req') {
-        await this.handleEncryptedRpc(msg.id, msg)
+        try {
+          await this.handleEncryptedRpc(msg.id, msg)
+        } catch (err) {
+          this.log.warn?.(`mobile-hub: unhandled rpc.req(${msg.id}) error: ${String(err?.message || err)}`)
+        }
       }
     })
 
     ws.on('close', (code, reasonBuf) => {
+      if (this.ws !== ws) return
       const reason = reasonBuf ? reasonBuf.toString('utf8') : ''
       this.clearHeartbeat()
-      if (this.ws === ws) this.ws = null
+      this.ws = null
       if (this.stopped) return
       if (code === 4401) {
         const detail = reason || 'Device unbound or credential revoked'
@@ -207,6 +240,7 @@ export class RelayBridgeLink {
     })
 
     ws.on('error', (err) => {
+      if (this.ws !== ws) return
       this.log.warn?.(`mobile-hub: relay socket error: ${String(err?.message || err)}`)
       this.emitState('error', String(err?.message || err))
     })
@@ -263,7 +297,21 @@ export class RelayBridgeLink {
     }
 
     const now = Date.now()
-    const ivKey = String(msg.e2ee.iv || '')
+    const ivBytes = base64UrlToBytes(msg.e2ee.iv)
+    const ivKey = ivBytes && ivBytes.byteLength === E2EE_IV_BYTES ? bytesToBase64Url(ivBytes) : ''
+    if (!ivKey) {
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_DECRYPT_FAILED',
+          keyId: this.e2eeKeyId,
+          message: '端到端密文 IV 无效',
+        },
+      })
+      return
+    }
     this.pruneSeenIvs(now)
     const prevSeen = this.seenReqIvs.get(ivKey)
     if (prevSeen && now - prevSeen <= REPLAY_WINDOW_MS) {
@@ -278,7 +326,7 @@ export class RelayBridgeLink {
       })
       return
     }
-    if (typeof decrypted?.ts === 'number' && Math.abs(now - decrypted.ts) > REPLAY_WINDOW_MS) {
+    if (!Number.isFinite(decrypted?.ts) || Math.abs(now - decrypted.ts) > REPLAY_WINDOW_MS) {
       this.send({
         type: 'rpc.res',
         id,
@@ -313,6 +361,15 @@ export class RelayBridgeLink {
       this.send({ type: 'rpc.res', id, ok: true, e2ee: enc })
     } catch (err) {
       this.log.warn?.(`mobile-hub: failed encrypting rpc.res: ${String(err?.message || err)}`)
+      this.send({
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: {
+          code: 'E2EE_ENCRYPT_FAILED',
+          message: '端到端响应加密失败',
+        },
+      })
     }
   }
 

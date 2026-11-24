@@ -151,16 +151,53 @@ function scanClaudeSessionSummary(filePath, fallbackProjectName) {
   }
 }
 
+const CLAUDE_MAX_FULL_PARSE_BYTES = 32 * 1024 * 1024
+const CLAUDE_TAIL_FALLBACK_BYTES = 4 * 1024 * 1024
+
+function readClaudeFileForParse(filePath) {
+  const st = statSync(filePath)
+  if (st.size <= CLAUDE_MAX_FULL_PARSE_BYTES) {
+    return { headLines: [], bodyLines: readFileSync(filePath, 'utf8').split(/\r?\n/) }
+  }
+  const fd = openSync(filePath, 'r')
+  try {
+    const headLen = Math.min(st.size, 32 * 1024)
+    const headBuf = Buffer.alloc(headLen)
+    const headRead = readSync(fd, headBuf, 0, headLen, 0)
+    const headLines = headBuf.subarray(0, headRead).toString('utf8').split(/\r?\n/)
+    if (headLines.length > 1) headLines.pop()
+
+    const tailLen = Math.min(st.size, CLAUDE_TAIL_FALLBACK_BYTES)
+    const tailOffset = Math.max(0, st.size - tailLen)
+    const tailBuf = Buffer.alloc(tailLen)
+    const tailRead = readSync(fd, tailBuf, 0, tailLen, tailOffset)
+    const bodyLines = tailBuf.subarray(0, tailRead).toString('utf8').split(/\r?\n/)
+    if (tailOffset > 0 && bodyLines.length > 0) bodyLines.shift()
+    return { headLines, bodyLines }
+  } finally {
+    closeSync(fd)
+  }
+}
+
 function parseClaudeJsonlMessages(filePath) {
   return claudeParseCache.getOrParse(filePath, () => {
-    const raw = readFileSync(filePath, 'utf8')
+    const { headLines, bodyLines } = readClaudeFileForParse(filePath)
     const messages = []
     const toolIndex = new Map()
     let cwd = ''
     let title = ''
     let model = ''
 
-    for (const line of raw.split(/\r?\n/)) {
+    for (const line of headLines) {
+      if (!line.trim()) continue
+      let obj
+      try { obj = JSON.parse(line) } catch { continue }
+      if (!cwd && typeof obj.cwd === 'string') cwd = obj.cwd
+      if (obj.type === 'ai-title' && obj.aiTitle) title = obj.aiTitle
+      if (!model && obj.type === 'assistant' && obj.message?.model) model = obj.message.model
+    }
+
+    for (const line of bodyLines) {
       if (!line.trim()) continue
       let obj
       try {
@@ -334,17 +371,31 @@ export class ClaudeAdapter {
     this.claudeBin = findClaudeCommand(this.configuredBin)
     const projectsExists = existsSync(join(this.claudeHome, 'projects'))
     const cliAvailable = await new Promise((resolvePromise) => {
+      let settled = false
+      const done = (val) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolvePromise(val)
+      }
+      let proc = null
+      const timer = setTimeout(() => {
+        try { proc?.kill() } catch {}
+        done(false)
+      }, 6_000)
+      timer.unref?.()
       try {
-        const proc = spawnClaude(this.claudeBin, ['--version'], {
+        proc = spawnClaude(this.claudeBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
         let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
-        proc.on('close', (code) => resolvePromise(code === 0 ? out.trim() : false))
-        proc.on('error', () => resolvePromise(false))
+        proc.stdout.setEncoding('utf8')
+        proc.stdout.on('data', (d) => { out += d })
+        proc.on('close', (code) => done(code === 0 ? out.trim() : false))
+        proc.on('error', () => done(false))
       } catch {
-        resolvePromise(false)
+        done(false)
       }
     })
 
@@ -489,7 +540,9 @@ export class ClaudeAdapter {
   async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     if (this.activeProcs.has(sessionId)) {
-      throw new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
+      const err = new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
+      err.code = 'SESSION_BUSY'
+      throw err
     }
 
     const existingFile = this.findSessionFile(sessionId)
@@ -567,6 +620,8 @@ export class ClaudeAdapter {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       })
+      proc.stdout.setEncoding('utf8')
+      proc.stderr?.setEncoding('utf8')
 
       const state = { proc, aborted: false }
       this.activeProcs.set(sessionId, state)
@@ -574,8 +629,11 @@ export class ClaudeAdapter {
       let stdoutBuf = ''
       let stderrBuf = ''
       let finalText = ''
-      let emittedLength = 0
-      let emittedThinkingLen = 0
+      let seenResult = false
+      const emittedTextByMsg = new Map()
+      const emittedThinkByMsg = new Map()
+      let lastTextMsgId = null
+      let lastThinkMsgId = null
       const seenToolIds = new Set()
       let resultError = ''
 
@@ -588,6 +646,7 @@ export class ClaudeAdapter {
         }
 
         if (obj.type === 'assistant') {
+          const msgId = String(obj.message?.id || '__default__')
           const blocks = Array.isArray(obj.message?.content) ? obj.message.content : []
           let fullText = ''
           let fullThink = ''
@@ -605,18 +664,26 @@ export class ClaudeAdapter {
               fullText += b.text
             }
           }
-          if (fullThink.length > emittedThinkingLen) {
+          const prevThinkLen = emittedThinkByMsg.get(msgId) || 0
+          if (fullThink.length > prevThinkLen) {
+            const rawThinkDelta = fullThink.slice(prevThinkLen)
+            const thinkPrefix = lastThinkMsgId && lastThinkMsgId !== msgId && prevThinkLen === 0 ? '\n\n' : ''
+            emittedThinkByMsg.set(msgId, fullThink.length)
+            lastThinkMsgId = msgId
             this.emitEvent(EVENTS.STREAM_THINKING, {
               sessionId: compositeId,
               app: APPS.CLAUDE,
-              delta: fullThink.slice(emittedThinkingLen),
+              delta: `${thinkPrefix}${rawThinkDelta}`,
             })
-            emittedThinkingLen = fullThink.length
           }
-          if (fullText.length > emittedLength) {
-            const delta = fullText.slice(emittedLength)
-            emittedLength = fullText.length
-            finalText = fullText
+          const prevTextLen = emittedTextByMsg.get(msgId) || 0
+          if (fullText.length > prevTextLen) {
+            const rawDelta = fullText.slice(prevTextLen)
+            const textPrefix = lastTextMsgId && lastTextMsgId !== msgId && prevTextLen === 0 ? '\n\n' : ''
+            const delta = `${textPrefix}${rawDelta}`
+            emittedTextByMsg.set(msgId, fullText.length)
+            lastTextMsgId = msgId
+            finalText += delta
             this.emitEvent(EVENTS.STREAM_DELTA, {
               sessionId: compositeId,
               app: APPS.CLAUDE,
@@ -638,18 +705,42 @@ export class ClaudeAdapter {
         } else if (obj.type === 'control_request' && obj.request_id && obj.request) {
           this.handleControlRequest(proc, sessionId, compositeId, targetCwd, obj)
         } else if (obj.type === 'result') {
+          seenResult = true
           if (obj.is_error) {
             resultError = String(obj.result || obj.error || 'Claude 执行返回错误')
           } else if (typeof obj.result === 'string' && obj.result.length > 0) {
-            if (obj.result.length > emittedLength) {
+            if (!lastTextMsgId) {
+              finalText = obj.result
               this.emitEvent(EVENTS.STREAM_DELTA, {
                 sessionId: compositeId,
                 app: APPS.CLAUDE,
-                delta: obj.result.slice(emittedLength),
+                delta: obj.result,
               })
-              emittedLength = obj.result.length
+            } else if (!finalText.endsWith(obj.result)) {
+              const lastEmittedLen = emittedTextByMsg.get(lastTextMsgId) || 0
+              if (
+                lastEmittedLen > 0 &&
+                obj.result.length > lastEmittedLen &&
+                finalText.endsWith(obj.result.slice(0, lastEmittedLen))
+              ) {
+                const suffix = obj.result.slice(lastEmittedLen)
+                emittedTextByMsg.set(lastTextMsgId, obj.result.length)
+                finalText += suffix
+                this.emitEvent(EVENTS.STREAM_DELTA, {
+                  sessionId: compositeId,
+                  app: APPS.CLAUDE,
+                  delta: suffix,
+                })
+              } else {
+                const delta = `${finalText ? '\n\n' : ''}${obj.result}`
+                finalText += delta
+                this.emitEvent(EVENTS.STREAM_DELTA, {
+                  sessionId: compositeId,
+                  app: APPS.CLAUDE,
+                  delta,
+                })
+              }
             }
-            finalText = obj.result
           }
           // Close stdin cleanly once the turn finishes so the bidirectional stream-json process exits
           try { proc.stdin.end() } catch {}
@@ -659,7 +750,7 @@ export class ClaudeAdapter {
       proc.stdin?.on('error', () => {})
 
       proc.stdout.on('data', (chunk) => {
-        stdoutBuf += chunk.toString('utf8')
+        stdoutBuf += chunk
         let idx
         while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
           const line = stdoutBuf.slice(0, idx).trim()
@@ -669,12 +760,15 @@ export class ClaudeAdapter {
       })
 
       proc.stderr.on('data', (chunk) => {
-        stderrBuf += chunk.toString('utf8')
+        stderrBuf = (stderrBuf + chunk).slice(-4096)
       })
 
       proc.on('error', (err) => {
-        this.activeProcs.delete(sessionId)
+        if (this.activeProcs.get(sessionId) === state) {
+          this.activeProcs.delete(sessionId)
+        }
         this.clearPendingControlRequests(proc)
+        if (err && typeof err === 'object') err._streamErrorEmitted = true
         this.emitEvent(EVENTS.STREAM_ERROR, {
           sessionId: compositeId,
           app: APPS.CLAUDE,
@@ -685,29 +779,44 @@ export class ClaudeAdapter {
 
       proc.on('close', (code) => {
         if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
-        this.activeProcs.delete(sessionId)
-        this.pendingCreated.delete(sessionId)
+        if (this.activeProcs.get(sessionId) === state) {
+          this.activeProcs.delete(sessionId)
+        }
         this.clearPendingControlRequests(proc)
 
         if (resultError && !state.aborted) {
+          if (this.findSessionFile(sessionId)) {
+            this.pendingCreated.delete(sessionId)
+          }
+          const err = new Error(resultError)
+          err._streamErrorEmitted = true
           this.emitEvent(EVENTS.STREAM_ERROR, {
             sessionId: compositeId,
             app: APPS.CLAUDE,
             message: resultError,
           })
-          rejectPromise(new Error(resultError))
+          rejectPromise(err)
           return
         }
 
-        if (code !== 0 && !state.aborted && !finalText) {
+        if (code !== 0 && !state.aborted && !seenResult) {
+          if (this.findSessionFile(sessionId)) {
+            this.pendingCreated.delete(sessionId)
+          }
           const errMsg = stderrBuf.trim() || `claude 进程退出（code=${code}）`
+          const err = new Error(errMsg)
+          err._streamErrorEmitted = true
           this.emitEvent(EVENTS.STREAM_ERROR, {
             sessionId: compositeId,
             app: APPS.CLAUDE,
             message: errMsg,
           })
-          rejectPromise(new Error(errMsg))
+          rejectPromise(err)
           return
+        }
+
+        if (!state.aborted || this.findSessionFile(sessionId)) {
+          this.pendingCreated.delete(sessionId)
         }
 
         this.emitEvent(EVENTS.STREAM_DONE, {
@@ -937,12 +1046,30 @@ export class ClaudeAdapter {
     if (!active) return { interrupted: false, sessionId }
     active.aborted = true
     this.clearPendingControlRequests(active.proc)
+    const proc = active.proc
     try {
-      active.proc.stdin?.end()
+      proc.stdin?.end()
     } catch {}
     try {
-      active.proc.kill('SIGTERM')
+      proc.kill('SIGTERM')
     } catch {}
+    if (proc.exitCode === null && proc.signalCode === null) {
+      const killTimer = setTimeout(() => {
+        if (proc.exitCode !== null || proc.signalCode !== null) return
+        if (process.platform === 'win32' && proc.pid) {
+          try {
+            const tk = spawnCrossPlatform('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+              stdio: 'ignore',
+              windowsHide: true,
+            })
+            tk.on('error', () => {})
+          } catch {}
+        }
+        try { proc.kill('SIGKILL') } catch {}
+      }, 2_000)
+      killTimer.unref?.()
+      proc.once('close', () => clearTimeout(killTimer))
+    }
     return { interrupted: true, sessionId }
   }
 

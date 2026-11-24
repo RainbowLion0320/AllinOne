@@ -112,10 +112,17 @@ export function makeCompositeId(app, sessionId) {
 
 /**
  * Parse a composite session id `<app>:<nativeId>` or `{ app, sessionId }`.
- * @param {string} compositeId
+ * @param {string|{ app?: string, sessionId?: string }} compositeId
  * @returns {{ app: string, sessionId: string }}
  */
 export function parseCompositeId(compositeId) {
+  if (compositeId && typeof compositeId === 'object') {
+    const app = compositeId.app != null && String(compositeId.app) !== ''
+      ? String(compositeId.app)
+      : APPS.DSH
+    const sessionId = String(compositeId.sessionId ?? '')
+    return { app, sessionId }
+  }
   const raw = String(compositeId ?? '')
   const idx = raw.indexOf(':')
   if (idx === -1) return { app: APPS.DSH, sessionId: raw }
@@ -128,16 +135,26 @@ export function parseCompositeId(compositeId) {
  * @returns {number}
  */
 export function toEpochMs(value) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value <= 0) return 0
     // Unix seconds vs milliseconds heuristic
     return value > 1e12 ? value : value * 1000
   }
-  if (typeof value === 'string' && value.trim().length > 0) {
-    const num = Number(value)
-    if (Number.isFinite(num)) return num > 1e12 ? num : num * 1000
-    const parsed = Date.parse(value)
-    if (Number.isFinite(parsed)) return parsed
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return 0
+    // Treat plain positive numeric strings (excluding 4-digit year strings like "2026") as Unix s/ms
+    if (/^\d+(?:\.\d+)?$/.test(trimmed) && !/^\d{4}$/.test(trimmed)) {
+      const num = Number(trimmed)
+      if (!Number.isFinite(num) || num <= 0) return 0
+      return num > 1e12 ? num : num * 1000
+    }
+    const parsed = Date.parse(trimmed)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
   }
-  if (value instanceof Date) return value.getTime()
+  if (value instanceof Date) {
+    const t = value.getTime()
+    return Number.isFinite(t) ? t : 0
+  }
   return 0
 }

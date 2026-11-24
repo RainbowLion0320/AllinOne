@@ -19,7 +19,39 @@ function encodeRfc2047(text) {
   const clean = sanitizeHeaderValue(text)
   if (!clean) return ''
   if (/^[\x20-\x7E]+$/.test(clean) && !clean.includes('=?')) return clean
-  return `=?UTF-8?B?${Buffer.from(clean, 'utf8').toString('base64')}?=`
+  // RFC 2047: each encoded-word <= 75 chars; 45 UTF-8 bytes -> 60 base64 chars -> 72 total chars
+  const MAX_CHUNK_BYTES = 45
+  const words = []
+  let chunk = ''
+  let chunkBytes = 0
+  for (const ch of clean) {
+    const chBytes = Buffer.byteLength(ch, 'utf8')
+    if (chunkBytes + chBytes > MAX_CHUNK_BYTES && chunk) {
+      words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`)
+      chunk = ch
+      chunkBytes = chBytes
+    } else {
+      chunk += ch
+      chunkBytes += chBytes
+    }
+  }
+  if (chunk) {
+    words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`)
+  }
+  return words.join('\r\n ')
+}
+
+function formatDisplayName(display) {
+  const clean = sanitizeHeaderValue(display)
+  if (!clean) return ''
+  if (!/^[\x20-\x7E]+$/.test(clean) || clean.includes('=?')) {
+    return encodeRfc2047(clean)
+  }
+  // Quote RFC 5322 specials in ASCII display-name
+  if (/[()<>\[\]:;@\\,".]/.test(clean)) {
+    return `"${clean.replace(/([\\"])/g, '\\$1')}"`
+  }
+  return clean
 }
 
 function formatFromHeader(rawFrom, fallbackAddr) {
@@ -29,7 +61,8 @@ function formatFromHeader(rawFrom, fallbackAddr) {
   if (angle) {
     const display = angle[1].trim().replace(/^["']|["']$/g, '')
     const addr = angle[2].trim()
-    return display ? `${encodeRfc2047(display)} <${addr}>` : `<${addr}>`
+    const formatted = formatDisplayName(display)
+    return formatted ? `${formatted} <${addr}>` : `<${addr}>`
   }
   return `<${clean}>`
 }
@@ -170,11 +203,13 @@ export async function sendViaSmtp({
     sock.on('error', (err) => {
       failPending(err instanceof Error ? err : new Error(String(err)))
     })
-    sock.on('close', () => {
-      if (pendingReject) {
+    const handleDisconnect = () => {
+      if (!closedError) {
         failPending(new Error('邮件服务器意外断开连接'))
       }
-    })
+    }
+    sock.on('end', handleDisconnect)
+    sock.on('close', handleDisconnect)
   }
 
   const readReply = () => {
@@ -261,7 +296,10 @@ export async function sendViaSmtp({
     const ehloHost = envelopeFrom.split('@')[1] || 'localhost'
     let ehlo = await sendCmd(`EHLO ${ehloHost}`, [250])
 
-    if (!secure && starttls && ehlo.lines.some((l) => /STARTTLS/i.test(l))) {
+    if (!secure && starttls) {
+      if (!ehlo.lines.some((l) => /^250[- ]STARTTLS(?:\s|$)/i.test(l))) {
+        throw new Error('SMTP 服务器未提供 STARTTLS，已拒绝降级为明文传输')
+      }
       await sendCmd('STARTTLS', [220])
       buffer = ''
       pendingLines = []
@@ -271,7 +309,7 @@ export async function sendViaSmtp({
     }
 
     if (user || pass) {
-      const authLine = ehlo.lines.find((l) => /AUTH[\s=]/i.test(l)) || ''
+      const authLine = ehlo.lines.find((l) => /^250[- ]AUTH[\s=]/i.test(l)) || ''
       const supportsPlain = /\bPLAIN\b/i.test(authLine)
       const supportsLogin = /\bLOGIN\b/i.test(authLine) || !supportsPlain
 

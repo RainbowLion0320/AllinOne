@@ -1,12 +1,24 @@
 import { RPC } from '@allinone/shared'
 import { base64ToBytes, decryptBytes } from '@allinone/shared/e2ee'
 import { resolveImageSrc } from './imageUrls.js'
+import { bi, getCurrentLang } from './i18n.js'
+
+const L = (zh, en) => bi(getCurrentLang(), zh, en)
 
 const MAX_BLOB_CACHE = 48
 /** @type {Map<string, { url: string, ts: number }>} */
 const blobUrlCache = new Map()
 /** @type {Map<string, Promise<string>>} */
 const inflightLoads = new Map()
+let cacheEpoch = 0
+
+function isRelayUploadTarget(target) {
+  if (!target) return false
+  if (target.startsWith('/api/uploads/')) return true
+  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(target)) return true
+  if (/^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(target)) return true
+  return false
+}
 
 function cacheBlobUrl(cacheKey, url) {
   const existing = blobUrlCache.get(cacheKey)
@@ -27,6 +39,7 @@ function cacheBlobUrl(cacheKey, url) {
 }
 
 export function clearE2eeMediaCache() {
+  cacheEpoch += 1
   for (const entry of blobUrlCache.values()) {
     if (entry?.url) {
       try { URL.revokeObjectURL(entry.url) } catch {}
@@ -44,14 +57,15 @@ export function needsE2eeMediaLoad(item, imageContext = {}) {
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
   if (!target || target.startsWith('data:') || target.startsWith('blob:')) return false
 
-  // Encrypted relay upload (/api/uploads/<id> with item.e2ee)
-  if (typeof item === 'object' && item.e2ee?.iv && target.startsWith('/api/uploads/')) {
+  const isUpload = isRelayUploadTarget(target)
+
+  // Encrypted relay upload (/api/uploads/<id> or subpath /.../api/uploads/<id> with item.e2ee)
+  if (typeof item === 'object' && item.e2ee?.iv && isUpload) {
     return true
   }
 
   // Local PC file path -> always load over E2EE-encrypted RPC.FILE_READ
   const isHttp = /^https?:\/\//i.test(target)
-  const isUpload = target.startsWith('/api/uploads/')
   if (!isHttp && !isUpload) {
     return true
   }
@@ -93,18 +107,22 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
     if (pending) return pending
   }
 
+  const epoch = cacheEpoch
   const job = (async () => {
     // Case 1: Encrypted relay-hosted upload
-    if (typeof item === 'object' && item.e2ee?.iv && target.startsWith('/api/uploads/')) {
+    if (typeof item === 'object' && item.e2ee?.iv && isRelayUploadTarget(target)) {
       const fetchUrl = resolveImageSrc({ url: target }, imageContext)
-      if (!fetchUrl) throw new Error('无法构造附件下载地址')
+      if (!fetchUrl) throw new Error(L('无法构造附件下载地址', 'Failed to construct attachment download URL'))
+      const normKid = String(item.e2ee.kid || '').trim().toLowerCase()
       const key =
-        (item.e2ee.kid && imageContext?.e2eeKeys?.[item.e2ee.kid]) ||
+        (normKid && (imageContext?.e2eeKeys?.[normKid] || imageContext?.e2eeKeys?.[item.e2ee.kid])) ||
         imageContext?.e2eeKey ||
         ''
-      if (!key) throw new Error('缺少端到端解密密钥')
+      if (!key) throw new Error(L('缺少端到端解密密钥', 'Missing end-to-end decryption key'))
       const res = await fetch(fetchUrl)
-      if (!res.ok) throw new Error(`下载加密附件失败 (HTTP ${res.status})`)
+      if (!res.ok) {
+        throw new Error(L(`下载加密附件失败 (HTTP ${res.status})`, `Failed to download encrypted attachment (HTTP ${res.status})`))
+      }
       const cipherBytes = new Uint8Array(await res.arrayBuffer())
       const plainBytes = await decryptBytes(key, cipherBytes, {
         iv: item.e2ee.iv,
@@ -114,13 +132,17 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
       })
       const blob = new Blob([plainBytes], { type: item.mimeType || 'image/png' })
       const url = URL.createObjectURL(blob)
+      if (epoch !== cacheEpoch) {
+        try { URL.revokeObjectURL(url) } catch {}
+        throw new Error(L('加密媒体缓存已重置，请重试', 'Encrypted media cache was reset; please retry'))
+      }
       cacheBlobUrl(cacheKey, url)
       return url
     }
 
     // Case 2: Local PC image file fetched through E2EE-encrypted WS RPC.FILE_READ
     const client = imageContext?.client
-    if (!client) throw new Error('未连接到电脑端')
+    if (!client) throw new Error(L('未连接到电脑端', 'Not connected to computer'))
     const result = await client.rpc(
       RPC.FILE_READ,
       { path: target, cwd },
@@ -128,11 +150,15 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
       bridgeId ? { bridgeId } : {},
     )
     if (!result?.dataBase64 || !String(result.mimeType || '').startsWith('image/')) {
-      throw new Error('仅支持预览图片文件')
+      throw new Error(L('仅支持预览图片文件', 'Only image files can be previewed'))
     }
     const bytes = base64ToBytes(result.dataBase64)
     const blob = new Blob([bytes], { type: result.mimeType })
     const url = URL.createObjectURL(blob)
+    if (epoch !== cacheEpoch) {
+      try { URL.revokeObjectURL(url) } catch {}
+      throw new Error(L('加密媒体缓存已重置，请重试', 'Encrypted media cache was reset; please retry'))
+    }
     cacheBlobUrl(cacheKey, url)
     return url
   })()

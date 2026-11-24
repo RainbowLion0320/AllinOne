@@ -14,11 +14,13 @@ import {
   app,
   ipcMain,
   nativeImage,
+  powerMonitor,
   protocol,
   safeStorage,
+  screen,
   shell,
 } from 'electron'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
@@ -79,6 +81,9 @@ const DEFAULT_SERVER_URL = String(
 let mainWindow = null
 let tray = null
 let isQuitting = false
+let isDisposed = false
+let disposePromise = null
+let quitAfterDisposeScheduled = false
 
 function normalizeLang(input) {
   const raw = String(input || '').trim().toLowerCase()
@@ -142,12 +147,19 @@ function setAutoLaunchEnabled(enabled) {
 }
 
 const desktopSecretStore = {
+  isAvailable() {
+    try {
+      return Boolean(safeStorage?.isEncryptionAvailable?.())
+    } catch {
+      return false
+    }
+  },
   encrypt(plaintext) {
-    if (!safeStorage?.isEncryptionAvailable?.()) return ''
+    if (!this.isAvailable()) return ''
     return safeStorage.encryptString(String(plaintext)).toString('base64')
   },
   decrypt(base64Cipher) {
-    if (!safeStorage?.isEncryptionAvailable?.() || !base64Cipher) return ''
+    if (!this.isAvailable() || !base64Cipher) return ''
     return safeStorage.decryptString(Buffer.from(String(base64Cipher), 'base64'))
   },
 }
@@ -157,6 +169,19 @@ const bridgeManager = new DesktopBridgeManager({
   getAutoLaunch: getAutoLaunchEnabled,
   secretStore: desktopSecretStore,
 })
+
+function disposeBridgeOnce() {
+  if (isDisposed) return Promise.resolve()
+  if (!disposePromise) {
+    disposePromise = Promise.resolve()
+      .then(() => bridgeManager.dispose())
+      .catch(() => {})
+      .finally(() => {
+        isDisposed = true
+      })
+  }
+  return disposePromise
+}
 
 const devUpdateApiUrl = !app.isPackaged
   ? String(process.env.ALLINONE_UPDATE_API_URL || '').trim()
@@ -169,17 +194,40 @@ const updater = new DesktopUpdater({
   ...(devUpdateApiUrl ? { apiUrl: devUpdateApiUrl, allowLocalhost: true } : {}),
 })
 
+function isBoundsVisibleOnAnyDisplay(bounds) {
+  try {
+    const displays = screen.getAllDisplays()
+    if (!Array.isArray(displays) || displays.length === 0) return true
+    const minVisible = 40
+    return displays.some((d) => {
+      const wa = d?.workArea
+      if (!wa) return false
+      const overlapX = Math.min(bounds.x + bounds.width, wa.x + wa.width) - Math.max(bounds.x, wa.x)
+      const overlapY = Math.min(bounds.y + bounds.height, wa.y + wa.height) - Math.max(bounds.y, wa.y)
+      return overlapX >= minVisible && overlapY >= minVisible
+    })
+  } catch {
+    return true
+  }
+}
+
 function loadWindowBounds() {
   try {
     const p = join(app.getPath('userData'), 'window-bounds.json')
     if (existsSync(p)) {
       const b = JSON.parse(readFileSync(p, 'utf8'))
       if (Number.isFinite(b.width) && Number.isFinite(b.height)) {
-        return {
-          width: Math.max(760, Math.min(2400, Math.round(b.width))),
-          height: Math.max(560, Math.min(1600, Math.round(b.height))),
-          ...(Number.isFinite(b.x) && Number.isFinite(b.y) ? { x: Math.round(b.x), y: Math.round(b.y) } : {}),
+        const width = Math.max(760, Math.min(2400, Math.round(b.width)))
+        const height = Math.max(560, Math.min(1600, Math.round(b.height)))
+        const result = { width, height }
+        if (Number.isFinite(b.x) && Number.isFinite(b.y)) {
+          const candidate = { x: Math.round(b.x), y: Math.round(b.y), width, height }
+          if (isBoundsVisibleOnAnyDisplay(candidate)) {
+            result.x = candidate.x
+            result.y = candidate.y
+          }
         }
+        return result
       }
     }
   } catch {}
@@ -197,22 +245,37 @@ function saveWindowBounds(win) {
 
 function showMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) {
-    createMainWindow()
+    createMainWindow({ showOnReady: true })
+    if (process.platform === 'darwin') {
+      try { app.focus({ steal: true }) } catch {}
+    }
     return
   }
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
   mainWindow.focus()
-}
-
-function sendMenuAction(action) {
-  showMainWindow()
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('desktop:menu-action', action)
+  if (process.platform === 'darwin') {
+    try { app.focus({ steal: true }) } catch {}
   }
 }
 
-function createMainWindow() {
+function sendMenuAction(action) {
+  const wasMissing = !mainWindow || mainWindow.isDestroyed()
+  showMainWindow()
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const targetWin = mainWindow
+  if (wasMissing || targetWin.webContents.isLoading()) {
+    targetWin.webContents.once('did-finish-load', () => {
+      if (!targetWin.isDestroyed()) {
+        targetWin.webContents.send('desktop:menu-action', action)
+      }
+    })
+  } else {
+    targetWin.webContents.send('desktop:menu-action', action)
+  }
+}
+
+function createMainWindow({ showOnReady = true } = {}) {
   const bounds = loadWindowBounds()
   const iconPath = join(BUILD_DIR, 'icon.png')
 
@@ -245,7 +308,11 @@ function createMainWindow() {
   mainWindow = win
 
   win.once('ready-to-show', () => {
+    if (!showOnReady) return
     win.show()
+    if (process.platform === 'darwin') {
+      try { app.focus({ steal: true }) } catch {}
+    }
   })
 
   // Keep local PC bridge alive when closing window (hide to tray instead of quitting)
@@ -271,8 +338,22 @@ function createMainWindow() {
     return { action: 'deny' }
   })
 
+  const devUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
+  let devOrigin = ''
+  if (devUrl) {
+    try {
+      devOrigin = new URL(devUrl).origin
+    } catch {}
+  }
+
   win.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith('app://allinone/')) {
+    let allowed = url.startsWith('app://allinone/')
+    if (!allowed && devOrigin) {
+      try {
+        if (new URL(url).origin === devOrigin) allowed = true
+      } catch {}
+    }
+    if (!allowed) {
       event.preventDefault()
       try {
         const u = new URL(url)
@@ -283,7 +364,6 @@ function createMainWindow() {
     }
   })
 
-  const devUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
   if (devUrl) {
     void win.loadURL(devUrl)
   } else {
@@ -343,7 +423,8 @@ function refreshTrayMenu() {
           : bi('检查更新...', 'Check for Updates...'),
       click: () => {
         sendMenuAction('settings')
-        if (updater.getState().status !== 'downloading') {
+        const curStatus = updater.getState().status
+        if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
           void updater.checkForUpdates()
         }
       },
@@ -382,7 +463,6 @@ function refreshTrayMenu() {
     {
       label: bi('退出 All in One', 'Quit All in One'),
       click: () => {
-        isQuitting = true
         app.quit()
       },
     },
@@ -403,7 +483,10 @@ function buildAppMenu() {
                 label: bi('检查更新...', 'Check for Updates...'),
                 click: () => {
                   sendMenuAction('settings')
-                  void updater.checkForUpdates()
+                  const curStatus = updater.getState().status
+                  if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
+                    void updater.checkForUpdates()
+                  }
                 },
               },
               { type: 'separator' },
@@ -417,7 +500,6 @@ function buildAppMenu() {
                 label: bi('退出 All in One', 'Quit All in One'),
                 accelerator: 'CmdOrCtrl+Q',
                 click: () => {
-                  isQuitting = true
                   app.quit()
                 },
               },
@@ -435,7 +517,10 @@ function buildAppMenu() {
           label: bi('检查更新...', 'Check for Updates...'),
           click: () => {
             sendMenuAction('settings')
-            void updater.checkForUpdates()
+            const curStatus = updater.getState().status
+            if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
+              void updater.checkForUpdates()
+            }
           },
         },
         { type: 'separator' },
@@ -484,6 +569,9 @@ function registerStaticProtocol() {
   protocol.handle('app', (request) => {
     try {
       const url = new URL(request.url)
+      if (url.hostname !== 'allinone') {
+        return new Response('Not Found', { status: 404 })
+      }
       let reqPath = decodeURIComponent(url.pathname || '/')
       if (!reqPath || reqPath === '/') reqPath = '/index.html'
       const normalized = normalize(reqPath).replace(/^(\.\.[/\\])+/, '').replace(/^[/\\]+/, '')
@@ -491,8 +579,21 @@ function registerStaticProtocol() {
       if (!target.startsWith(RENDERER_DIR + sep) && target !== RENDERER_DIR) {
         return new Response('Forbidden', { status: 403 })
       }
-      if (!existsSync(target)) {
-        target = join(RENDERER_DIR, 'index.html')
+      let isFile = false
+      try {
+        isFile = existsSync(target) && statSync(target).isFile()
+      } catch {
+        isFile = false
+      }
+      if (!isFile) {
+        if (extname(reqPath) === '') {
+          target = join(RENDERER_DIR, 'index.html')
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return new Response('Not Found', { status: 404 })
+          }
+        } else {
+          return new Response('Not Found', { status: 404 })
+        }
       }
       const buf = readFileSync(target)
       const mime = MIME_TYPES[extname(target).toLowerCase()] || 'application/octet-stream'
@@ -588,7 +689,7 @@ function registerIpc() {
       openExternalPath: (p) => shell.openPath(p),
       onQuit: async () => {
         isQuitting = true
-        try { await bridgeManager.dispose() } catch {}
+        await disposeBridgeOnce()
         app.quit()
       },
     })
@@ -633,8 +734,21 @@ if (!gotLock) {
       }
     })
 
+    const onSystemResume = () => {
+      if (isQuitting) return
+      void bridgeManager.handleSystemResume()
+    }
+    powerMonitor.on('resume', onSystemResume)
+    powerMonitor.on('unlock-screen', onSystemResume)
+
     refreshTrayMenu()
-    createMainWindow()
+    let openedAsHidden = false
+    if (process.platform === 'darwin') {
+      try {
+        openedAsHidden = Boolean(app.getLoginItemSettings()?.wasOpenedAsHidden)
+      } catch {}
+    }
+    createMainWindow({ showOnReady: !openedAsHidden })
 
     // Immediately resume background bridge if this PC already has an account binding
     void bridgeManager.startFromSavedConfigIfPresent()
@@ -652,13 +766,15 @@ if (!gotLock) {
     showMainWindow()
   })
 
-  app.on('before-quit', async (e) => {
-    if (isQuitting) return
+  app.on('before-quit', (e) => {
     isQuitting = true
+    if (isDisposed) return
     e.preventDefault()
-    try {
-      await bridgeManager.dispose()
-    } catch {}
-    app.quit()
+    if (!quitAfterDisposeScheduled) {
+      quitAfterDisposeScheduled = true
+      void disposeBridgeOnce().finally(() => {
+        app.quit()
+      })
+    }
   })
 }

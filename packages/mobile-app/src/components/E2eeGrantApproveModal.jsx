@@ -43,11 +43,24 @@ export function E2eeGrantApproveModal({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const pairRef = useRef(null)
+  const closeTimerRef = useRef(null)
+  const stepRef = useRef(step)
+  stepRef.current = step
+  const rejectedOrDoneRef = useRef(false)
 
   const grantReqId = grant?.reqId || ''
   const qrVerified = Boolean(grant?.qrVerified)
 
+  const clearCloseTimer = () => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current)
+      closeTimerRef.current = null
+    }
+  }
+
   useEffect(() => {
+    clearCloseTimer()
+    rejectedOrDoneRef.current = false
     if (!open || !grantReqId) {
       setStep('prompt')
       setSasCode('')
@@ -61,7 +74,16 @@ export function E2eeGrantApproveModal({
     setBusy(false)
     setError('')
     pairRef.current = null
-  }, [open, grantReqId])
+    return () => {
+      clearCloseTimer()
+      if (stepRef.current === 'sas' && !rejectedOrDoneRef.current) {
+        rejectedOrDoneRef.current = true
+        try {
+          client?.sendGrantReject?.({ reqId: grantReqId })
+        } catch {}
+      }
+    }
+  }, [open, grantReqId, client])
 
   if (!open || !grant) return null
 
@@ -72,9 +94,22 @@ export function E2eeGrantApproveModal({
   const isDesktopRequester = grant.clientKind === 'desktop' || /desktop|桌面|mac|win/i.test(grant.deviceName || '')
 
   const handleReject = () => {
+    clearCloseTimer()
+    rejectedOrDoneRef.current = true
     try {
       client?.sendGrantReject?.({ reqId: grant.reqId })
     } catch {}
+    onClose?.()
+  }
+
+  const handleDismiss = () => {
+    clearCloseTimer()
+    if (stepRef.current === 'sas' && !rejectedOrDoneRef.current && grant?.reqId) {
+      rejectedOrDoneRef.current = true
+      try {
+        client?.sendGrantReject?.({ reqId: grant.reqId })
+      } catch {}
+    }
     onClose?.()
   }
 
@@ -158,9 +193,12 @@ export function E2eeGrantApproveModal({
       if (!sent) {
         throw new Error(bi('发送授权密文失败，请检查网络连接', 'Failed to deliver encrypted keyring.'))
       }
+      rejectedOrDoneRef.current = true
       setStep('done')
       onDone?.(grant)
-      setTimeout(() => {
+      clearCloseTimer()
+      closeTimerRef.current = setTimeout(() => {
+        closeTimerRef.current = null
         onClose?.()
       }, 900)
     } catch (err) {
@@ -174,7 +212,7 @@ export function E2eeGrantApproveModal({
   return (
     <div
       className="fixed inset-0 z-[60] flex items-end justify-center bg-black/55 backdrop-blur-[2px] sm:items-center sm:p-4"
-      onClick={onClose}
+      onClick={handleDismiss}
     >
       <div
         className="pb-safe w-full max-w-sm rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
@@ -215,7 +253,7 @@ export function E2eeGrantApproveModal({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleDismiss}
             aria-label={bi('关闭', 'Close')}
             className="rounded-xl p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
           >

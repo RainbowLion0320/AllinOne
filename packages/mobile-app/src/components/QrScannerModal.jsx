@@ -99,6 +99,8 @@ export function QrScannerModal({ open, onClose, onDetected }) {
   const timerRef = useRef(null)
   const busyRef = useRef(false)
   const detectedRef = useRef(false)
+  const onDetectedRef = useRef(onDetected)
+  onDetectedRef.current = onDetected
   const captureInputRef = useRef(null)
   const albumInputRef = useRef(null)
 
@@ -134,8 +136,8 @@ export function QrScannerModal({ open, onClose, onDetected }) {
     detectedRef.current = true
     try { navigator.vibrate?.(60) } catch {}
     stopCamera()
-    onDetected?.(clean)
-  }, [onDetected, stopCamera])
+    onDetectedRef.current?.(clean)
+  }, [stopCamera])
 
   useEffect(() => {
     if (!open) {

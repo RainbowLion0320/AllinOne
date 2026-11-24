@@ -31,8 +31,14 @@ export function isE2eeCryptoAvailable() {
   return Boolean(globalThis.crypto?.subtle && globalThis.crypto?.getRandomValues)
 }
 
+function toUint8Array(x) {
+  return ArrayBuffer.isView(x)
+    ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength)
+    : new Uint8Array(x)
+}
+
 export function bytesToBase64(bytes) {
-  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  const u8 = toUint8Array(bytes)
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString('base64')
   }
@@ -49,7 +55,7 @@ export function base64ToBytes(b64) {
   if (!clean) return new Uint8Array(0)
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     const buf = Buffer.from(clean, 'base64')
-    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+    return Uint8Array.from(buf)
   }
   const binary = atob(clean)
   const out = new Uint8Array(binary.length)
@@ -64,12 +70,19 @@ export function bytesToBase64Url(bytes) {
 }
 
 export function base64UrlToBytes(str) {
-  const clean = String(str || '').trim().replace(/\s+/g, '')
-  if (!clean || !/^[A-Za-z0-9+/_=-]+$/.test(clean)) return null
+  if (typeof str !== 'string') return null
+  const clean = str.trim()
+  if (!clean || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) return null
+  const hasPadding = clean.includes('=')
+  if (hasPadding) {
+    if (clean.length % 4 !== 0) return null
+  } else if (clean.length % 4 === 1) {
+    return null
+  }
   const std = clean.replace(/-/g, '+').replace(/_/g, '/')
-  const padLen = (4 - (std.length % 4)) % 4
+  const padded = hasPadding ? std : `${std}${'='.repeat((4 - (std.length % 4)) % 4)}`
   try {
-    return base64ToBytes(`${std}${'='.repeat(padLen)}`)
+    return base64ToBytes(padded)
   } catch {
     return null
   }
@@ -162,7 +175,7 @@ export async function encryptBytes(rawKeyStr, plainBytes, { kind = 'upload', roo
   const { cryptoKey, keyId } = await importCachedKey(rawKeyStr)
   const iv = new Uint8Array(E2EE_IV_BYTES)
   globalThis.crypto.getRandomValues(iv)
-  const input = plainBytes instanceof Uint8Array ? plainBytes : new Uint8Array(plainBytes)
+  const input = toUint8Array(plainBytes)
   const aad = buildAad({ kind, roomId, keyId })
   const cipherBuf = await globalThis.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
@@ -185,13 +198,18 @@ export async function decryptBytes(rawKeyStr, cipherBytes, { iv, kid = '', kind 
     err.expectedKeyId = String(kid)
     throw err
   }
+  if (typeof iv !== 'string' || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(iv)) {
+    const err = new Error('端到端密文 IV 无效')
+    err.code = 'E2EE_DECRYPT_FAILED'
+    throw err
+  }
   const ivBytes = base64UrlToBytes(iv)
   if (!ivBytes || ivBytes.byteLength !== E2EE_IV_BYTES) {
     const err = new Error('端到端密文 IV 无效')
     err.code = 'E2EE_DECRYPT_FAILED'
     throw err
   }
-  const input = cipherBytes instanceof Uint8Array ? cipherBytes : new Uint8Array(cipherBytes)
+  const input = toUint8Array(cipherBytes)
   const aad = buildAad({ kind, roomId, keyId })
   try {
     const plainBuf = await globalThis.crypto.subtle.decrypt(

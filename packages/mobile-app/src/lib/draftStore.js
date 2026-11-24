@@ -26,6 +26,21 @@ function readRawStorage() {
   }
 }
 
+function sanitizeDraftAttachments(rawList) {
+  if (!Array.isArray(rawList)) return []
+  const out = []
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    if ('localPreviewUrl' in item) {
+      const { localPreviewUrl: _drop, ...rest } = item
+      out.push(rest)
+    } else {
+      out.push({ ...item })
+    }
+  }
+  return out
+}
+
 function hydrateOnce() {
   if (hydrated) return
   hydrated = true
@@ -34,7 +49,7 @@ function hydrateOnce() {
   for (const [key, entry] of Object.entries(raw)) {
     if (!key || !entry || typeof entry !== 'object') continue
     const text = typeof entry.text === 'string' ? entry.text : ''
-    const attachments = Array.isArray(entry.attachments) ? entry.attachments : []
+    const attachments = sanitizeDraftAttachments(entry.attachments)
     if (!text && attachments.length === 0) continue
     memoryDrafts.set(key, {
       text: text.slice(0, MAX_TEXT_CHARS),
@@ -83,7 +98,7 @@ export function loadDraft(draftKey) {
   if (!hit) return { text: '', attachments: [] }
   return {
     text: hit.text || '',
-    attachments: Array.isArray(hit.attachments) ? [...hit.attachments] : [],
+    attachments: sanitizeDraftAttachments(hit.attachments),
   }
 }
 
@@ -91,7 +106,7 @@ export function saveDraft(draftKey, { text = '', attachments = [] } = {}) {
   hydrateOnce()
   if (!draftKey) return
   const safeText = typeof text === 'string' ? text.slice(0, MAX_TEXT_CHARS) : ''
-  const safeAttachments = Array.isArray(attachments) ? attachments : []
+  const safeAttachments = sanitizeDraftAttachments(attachments)
   if (!safeText && safeAttachments.length === 0) {
     if (memoryDrafts.delete(draftKey)) {
       persistDrafts()

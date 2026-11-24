@@ -10,7 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import readline from 'node:readline'
@@ -31,7 +31,25 @@ const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
 const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
-const BRIDGE_VERSION = '0.4.9'
+const BRIDGE_VERSION = '0.5.0'
+
+function normalizeServerUrl(raw) {
+  const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
+  try {
+    const u = new URL(trimmed)
+    if (u.protocol === 'wss:') u.protocol = 'https:'
+    else if (u.protocol === 'ws:') u.protocol = 'http:'
+    u.pathname = u.pathname.replace(/\/ws\/bridge\/?$/i, '').replace(/\/+$/, '')
+    u.search = ''
+    u.hash = ''
+    return u.toString().replace(/\/+$/, '')
+  } catch {
+    return trimmed
+      .replace(/[?#].*$/, '')
+      .replace(/\/ws\/bridge\/?$/i, '')
+      .replace(/\/+$/, '')
+  }
+}
 
 function parseArgs(argv) {
   const opts = {
@@ -42,6 +60,7 @@ function parseArgs(argv) {
     username: process.env.ALLINONE_USERNAME || '',
     password: process.env.ALLINONE_PASSWORD || '',
     e2eeKey: process.env.ALLINONE_E2EE_KEY || '',
+    e2eeKeyFromCli: false,
     logout: false,
     reset: false,
     noBrowser: false,
@@ -61,20 +80,27 @@ function parseArgs(argv) {
     else if (a.startsWith('--password=')) opts.password = a.slice('--password='.length)
     else if (a === '--state-dir') opts.stateDir = argv[++i] || opts.stateDir
     else if (a.startsWith('--state-dir=')) opts.stateDir = a.slice('--state-dir='.length)
-    else if (a === '--e2ee-key') opts.e2eeKey = argv[++i] || opts.e2eeKey
-    else if (a.startsWith('--e2ee-key=')) opts.e2eeKey = a.slice('--e2ee-key='.length)
-    else if (a === '--logout' || a === '--login') opts.logout = true
+    else if (a === '--e2ee-key') {
+      opts.e2eeKey = argv[++i] ?? ''
+      opts.e2eeKeyFromCli = true
+    } else if (a.startsWith('--e2ee-key=')) {
+      opts.e2eeKey = a.slice('--e2ee-key='.length)
+      opts.e2eeKeyFromCli = true
+    } else if (a === '--logout' || a === '--login') opts.logout = true
     else if (a === '--reset') opts.reset = true
     else if (a === '--no-browser') opts.noBrowser = true
     else if (a === '--help' || a === '-h') opts.help = true
   }
-  opts.server = String(opts.server || DEFAULT_SERVER_URL).trim().replace(/\/+$/, '')
+  opts.server = normalizeServerUrl(opts.server || DEFAULT_SERVER_URL)
   return opts
 }
 
 function toBridgeWsUrl(httpBase) {
-  const u = new URL(`${httpBase}/ws/bridge`)
-  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
+  const u = new URL(httpBase)
+  u.protocol = (u.protocol === 'https:' || u.protocol === 'wss:') ? 'wss:' : 'ws:'
+  u.pathname = `${u.pathname.replace(/\/ws\/bridge\/?$/i, '').replace(/\/+$/, '')}/ws/bridge`
+  u.search = ''
+  u.hash = ''
   return u.toString()
 }
 
@@ -112,11 +138,20 @@ function saveConfig(configPath, cfg) {
   if (toPersist.e2eeKeyEnc && process.env.ALLINONE_E2EE_KEY) {
     delete toPersist.e2eeKey
   }
-  writeFileSync(configPath, JSON.stringify(toPersist, null, 2), 'utf8')
+  const payload = JSON.stringify(toPersist, null, 2)
+  const tmpPath = `${configPath}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+  try { chmodSync(tmpPath, 0o600) } catch {}
+  try {
+    renameSync(tmpPath, configPath)
+  } catch {
+    writeFileSync(configPath, payload, { encoding: 'utf8', mode: 0o600 })
+    try { unlinkSync(tmpPath) } catch {}
+  }
   try { chmodSync(configPath, 0o600) } catch {}
 }
 
-async function loginDeviceWithAccount(serverUrl, { username, password, label }) {
+async function loginDeviceWithAccount(serverUrl, { username, password, label, emailCode = '' }) {
   const res = await fetch(`${serverUrl}/api/account/device-login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -126,9 +161,13 @@ async function loginDeviceWithAccount(serverUrl, { username, password, label }) 
       label: String(label || os.hostname() || 'My PC').trim(),
       hostname: os.hostname() || 'My-PC',
       platform: process.platform,
+      ...(emailCode ? { emailCode: String(emailCode).trim() } : {}),
     }),
   })
   const data = await res.json().catch(() => ({}))
+  if (res.ok && data?.requires2fa) {
+    return data
+  }
   if (!res.ok || !data.ok) {
     throw new Error(data.error || `账号登录失败 (HTTP ${res.status})`)
   }
@@ -153,10 +192,22 @@ async function fetchDeviceAccountStatus(serverUrl, roomId, bridgeSecret) {
 
 function promptText(question) {
   return new Promise((resolve) => {
+    let settled = false
+    const done = (val) => {
+      if (settled) return
+      settled = true
+      resolve(String(val || '').trim())
+    }
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    rl.once('close', () => done(''))
+    rl.once('SIGINT', () => {
+      try { rl.close() } catch {}
+      process.stdout.write('\n')
+      process.exit(130)
+    })
     rl.question(question, (ans) => {
-      rl.close()
-      resolve(String(ans || '').trim())
+      try { rl.close() } catch {}
+      done(ans)
     })
   })
 }
@@ -173,22 +224,40 @@ function promptPassword(question) {
     stdin.setRawMode(true)
     stdin.resume()
     let value = ''
+    let settled = false
+
+    const cleanup = () => {
+      try { stdin.setRawMode(wasRaw) } catch {}
+      stdin.removeListener('data', onData)
+      stdin.removeListener('end', onEof)
+      stdin.removeListener('close', onEof)
+      stdin.pause()
+    }
+
+    const finish = (val) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      process.stdout.write('\n')
+      resolve(val)
+    }
+
+    const onEof = () => finish(value)
 
     const onData = (buf) => {
       const str = buf.toString('utf8')
       for (const ch of str) {
         if (ch === '\u0003') {
           // Ctrl+C
-          stdin.setRawMode(wasRaw)
-          stdin.removeListener('data', onData)
+          cleanup()
           process.stdout.write('\n')
           process.exit(130)
+        } else if (ch === '\u0004') {
+          // Ctrl+D / EOF
+          finish(value)
+          return
         } else if (ch === '\r' || ch === '\n') {
-          stdin.setRawMode(wasRaw)
-          stdin.removeListener('data', onData)
-          stdin.pause()
-          process.stdout.write('\n')
-          resolve(value)
+          finish(value)
           return
         } else if (ch === '\u007f' || ch === '\b') {
           if (value.length > 0) {
@@ -203,6 +272,8 @@ function promptPassword(question) {
     }
 
     stdin.on('data', onData)
+    stdin.once('end', onEof)
+    stdin.once('close', onEof)
   })
 }
 
@@ -231,7 +302,16 @@ async function interactiveAccountLogin(serverUrl, label) {
     }
     try {
       console.log('  正在验证账号并绑定本机...')
-      const bound = await loginDeviceWithAccount(serverUrl, { username, password, label })
+      let bound = await loginDeviceWithAccount(serverUrl, { username, password, label })
+      if (bound?.requires2fa) {
+        console.log(`  [2FA] ${bound.message || `已向 ${bound.maskedEmail || '绑定邮箱'} 发送 6 位登录验证码`}`)
+        const otp = await promptText('  邮箱验证码: ')
+        if (!otp) {
+          console.log('  [!] 验证码不能为空，请重试。\n')
+          continue
+        }
+        bound = await loginDeviceWithAccount(serverUrl, { username, password, label, emailCode: otp })
+      }
       console.log(`  ✓ 绑定成功！欢迎 @${bound.username}（设备标识: ${bound.bridgeId}）`)
       return bound
     } catch (err) {
@@ -309,20 +389,33 @@ function buildE2eeKeyHtml({ username, roomId, label, e2eeKey, e2eeFingerprint })
 
 function openFileInBrowser(filePath) {
   try {
+    let child = null
     if (process.platform === 'win32') {
-      const child = spawn('cmd.exe', ['/c', 'start', '', filePath], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      })
-      child.unref()
+      // Pass path through environment variable to avoid any cmd.exe / shell metacharacter injection
+      child = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-WindowStyle',
+          'Hidden',
+          '-Command',
+          'Start-Process -FilePath $env:ALLINONE_OPEN_FILE',
+        ],
+        {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          env: { ...process.env, ALLINONE_OPEN_FILE: String(filePath || '') },
+        },
+      )
     } else if (process.platform === 'darwin') {
-      const child = spawn('open', [filePath], { detached: true, stdio: 'ignore' })
-      child.unref()
+      child = spawn('open', [filePath], { detached: true, stdio: 'ignore' })
     } else {
-      const child = spawn('xdg-open', [filePath], { detached: true, stdio: 'ignore' })
-      child.unref()
+      child = spawn('xdg-open', [filePath], { detached: true, stdio: 'ignore' })
     }
+    child?.on('error', () => {})
+    child?.unref()
   } catch {}
 }
 
@@ -355,11 +448,12 @@ async function main() {
   const configPath = join(opts.stateDir, 'config.json')
 
   let cfg = (opts.reset || opts.logout) ? null : readConfig(configPath)
-  if (cfg && (cfg.serverUrl !== opts.server || !String(cfg.roomId || '').startsWith('usr_'))) {
+  if (cfg && (normalizeServerUrl(cfg.serverUrl) !== opts.server || !String(cfg.roomId || '').startsWith('usr_'))) {
     cfg = null
   }
 
   let accountDevices = []
+  let authRevoked = false
 
   const bindAndSaveAccount = async (bound) => {
     cfg = {
@@ -390,7 +484,8 @@ async function main() {
     try {
       const st = await fetchDeviceAccountStatus(opts.server, cfg.roomId, cfg.bridgeSecret)
       if (!st) {
-        console.log('[allinone] ⚠ 本机绑定凭证已失效或已在手机端解绑，需要重新登录账号。')
+        console.error('[allinone] ⚠ 本机绑定凭证已失效或已在手机端解绑，需要重新登录账号。')
+        authRevoked = true
         cfg = null
       } else {
         accountDevices = st.devices || []
@@ -412,6 +507,9 @@ async function main() {
     if (process.stdin.isTTY) {
       const bound = await interactiveAccountLogin(opts.server, opts.label)
       await bindAndSaveAccount(bound)
+    } else if (authRevoked) {
+      console.error('[allinone] ✖ 本机绑定凭证已被吊销 (HTTP 401)，退出码 41。')
+      process.exit(41)
     } else {
       throw new Error(
         '尚未登录账号绑定本机。请在交互式终端运行以输入用户名和密码，或通过 --username <用户名> --password <密码> 绑定。',
@@ -421,16 +519,33 @@ async function main() {
 
   const e2eeHtmlPath = join(opts.stateDir, 'e2ee-key.html')
 
-  let activeE2eeKey = normalizeE2eeKey(opts.e2eeKey || cfg.e2eeKey || '')
-  if (activeE2eeKey) {
-    if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !process.env.ALLINONE_E2EE_KEY) {
+  let activeE2eeKey = ''
+  let isNewE2eeKey = false
+  const explicitKeyInput = String(opts.e2eeKey || '').trim()
+  if (opts.e2eeKeyFromCli || explicitKeyInput) {
+    const parsedExplicitKey = normalizeE2eeKey(explicitKeyInput)
+    if (!parsedExplicitKey) {
+      throw new Error('无效的端到端加密密钥（--e2ee-key 应为 256-bit Base64URL 密钥），请检查输入是否有误。')
+    }
+    activeE2eeKey = parsedExplicitKey
+    if (opts.e2eeKeyFromCli) {
+      cfg.e2eeKey = activeE2eeKey
+      delete cfg.e2eeKeyEnc
+      saveConfig(configPath, cfg)
+      isNewE2eeKey = true
+    } else if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !process.env.ALLINONE_E2EE_KEY) {
       cfg.e2eeKey = activeE2eeKey
       saveConfig(configPath, cfg)
     }
   } else {
-    activeE2eeKey = generateE2eeKey()
-    cfg.e2eeKey = activeE2eeKey
-    saveConfig(configPath, cfg)
+    activeE2eeKey = normalizeE2eeKey(cfg.e2eeKey || '')
+    if (!activeE2eeKey) {
+      isNewE2eeKey = true
+      activeE2eeKey = generateE2eeKey()
+      cfg.e2eeKey = activeE2eeKey
+      delete cfg.e2eeKeyEnc
+      saveConfig(configPath, cfg)
+    }
   }
   const e2eeKeyId = await computeE2eeKeyId(activeE2eeKey)
   const e2eeFingerprint = formatE2eeFingerprint(e2eeKeyId)
@@ -450,11 +565,50 @@ async function main() {
     }
   }
 
+  // Always persist offline E2EE QR HTML on newly generated keys or non-TTY / headless mode
+  if (isNewE2eeKey || !process.stdin.isTTY || !existsSync(e2eeHtmlPath)) {
+    try {
+      writeE2eeKeyPage(false)
+    } catch {}
+  }
+
+  // Ensure DeepSeek Harness local IPC plugin is installed BEFORE initial getAppsStatus()
+  const dshLog = {
+    info: (msg) => console.log(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
+    warn: (msg) => console.warn(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
+  }
+  try {
+    ensureDshLocalIpcPlugin({ log: dshLog })
+  } catch {}
+
   let detectedApps = []
 
   let connectedOnce = false
   const wsBridgeUrl = toBridgeWsUrl(opts.server)
   let link = null
+  let rl = null
+  let dshIpcWatchTimer = null
+  let exiting = false
+  let bridge = null
+
+  async function shutdown(exitCode = 0) {
+    if (exiting) return
+    exiting = true
+    const forceTimer = setTimeout(() => process.exit(exitCode), 5_000)
+    forceTimer.unref?.()
+    if (dshIpcWatchTimer) {
+      clearInterval(dshIpcWatchTimer)
+      dshIpcWatchTimer = null
+    }
+    console.log('\n[allinone] 正在断开桥接并安全退出...')
+    try { rl?.close() } catch {}
+    try {
+      await bridge?.stop()
+    } catch {}
+    clearTimeout(forceTimer)
+    process.exit(exitCode)
+  }
+
   const quietLog = {
     info: () => {},
     log: () => {},
@@ -493,6 +647,7 @@ async function main() {
         }
       } else if (state === 'unauthorized') {
         console.error(`[allinone] ✖ 本机已被解绑或凭证失效 (${detail})，请加 --logout 重新登录账号绑定。`)
+        void shutdown(41)
       } else if (state === 'disconnected') {
         console.log(`[allinone] ⚠ 连接暂时中断 (${detail})，正在自动重连...`)
       } else if (state === 'error' && detail) {
@@ -502,12 +657,15 @@ async function main() {
   })
   link.start()
 
-  const appsReadyPromise = orchestrator.getAppsStatus().then((apps) => {
-    link.setAppsMeta(apps)
-    return apps
-  })
+  const appsReadyPromise = orchestrator
+    .getAppsStatus()
+    .then((apps) => {
+      link.setAppsMeta(apps)
+      return apps
+    })
+    .catch(() => [])
 
-  const bridge = {
+  bridge = {
     appsReadyPromise,
     stop: async () => {
       link.stop()
@@ -520,6 +678,7 @@ async function main() {
     bridge.appsReadyPromise,
     new Promise((r) => setTimeout(() => r([]), 3500)),
   ])
+  const bannerPrintedApps = detectedApps.length > 0
 
   printAccountBanner({
     serverUrl: opts.server,
@@ -532,23 +691,11 @@ async function main() {
     e2eeFingerprint,
   })
 
-  // Silently detect & auto-complete any half-installed AI CLIs in the background
-  // (e.g. Antigravity.app installed without `agy`, ~/.claude/projects without `claude`,
-  //  or DeepSeek Harness desktop profile without the authenticated local IPC plugin)
-  // and hot-refresh adapter readiness + models with zero user prompts.
-  const dshLog = {
-    info: (msg) => console.log(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
-    warn: (msg) => console.warn(msg.startsWith('[allinone]') ? msg : `[allinone] ${msg}`),
-  }
-  try {
-    ensureDshLocalIpcPlugin({ log: dshLog })
-  } catch {}
-
   let lastDshWritable = null
-  const dshIpcWatchTimer = setInterval(async () => {
+  dshIpcWatchTimer = setInterval(async () => {
     try {
       const dshStatus = await orchestrator.adapters.dsh?.getStatus?.()
-      if (!dshStatus || !dshStatus.available) return
+      if (!dshStatus) return
       const nowWritable = Boolean(dshStatus.writable)
       if (lastDshWritable !== null && nowWritable !== lastDshWritable) {
         const freshApps = await orchestrator.getAppsStatus()
@@ -567,6 +714,13 @@ async function main() {
   void bridge.appsReadyPromise
     .catch(() => [])
     .then((apps) => {
+      if (!bannerPrintedApps && Array.isArray(apps) && apps.length > 0) {
+        detectedApps = apps
+        const appSummary = apps
+          .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
+          .join(' | ')
+        console.log(`  本机 AI    : ${appSummary}`)
+      }
       const dshApp = Array.isArray(apps) ? apps.find((a) => a.app === 'dsh') : null
       if (dshApp) lastDshWritable = Boolean(dshApp.writable)
       return autoCompleteHalfInstalledClis({
@@ -597,9 +751,11 @@ async function main() {
     .catch(() => {})
 
   // Interactive terminal controls
-  let rl = null
   if (process.stdin.isTTY) {
     rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    rl.on('SIGINT', () => {
+      void shutdown(0)
+    })
     rl.on('line', async (line) => {
       const cmd = line.trim().toLowerCase()
       if (cmd === 'k' || cmd === 'key' || cmd === 'e2ee') {
@@ -631,23 +787,13 @@ async function main() {
         return
       }
       if (cmd === 'q' || cmd === 'exit') {
-        await shutdown()
+        await shutdown(0)
       }
     })
   }
 
-  let exiting = false
-  async function shutdown() {
-    if (exiting) return
-    exiting = true
-    console.log('\n[allinone] 正在断开桥接并安全退出...')
-    try { rl?.close() } catch {}
-    await bridge.stop()
-    process.exit(0)
-  }
-
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', () => void shutdown(0))
+  process.on('SIGTERM', () => void shutdown(0))
   process.on('uncaughtException', (err) => {
     console.error('[allinone] ⚠ 捕获到未处理异常（桥接保持在线）:', err?.stack || String(err))
   })

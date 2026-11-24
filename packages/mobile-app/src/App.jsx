@@ -84,6 +84,7 @@ export function App() {
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [connState, setConnState] = useState('disconnected')
+  const [connError, setConnError] = useState('')
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
   const [clientSessions, setClientSessions] = useState({
@@ -154,9 +155,13 @@ export function App() {
       const matched = onlineBridges.find((b) => b.bridgeId === preferredId)
       if (matched) {
         chosen = matched
-      } else if (activeSession || sessions.length > 0) {
-        // Never silently reroute mid-conversation to a different online computer
-        return null
+      } else {
+        const knownOfflineDevice =
+          isAccountMode && accountDevices.some((d) => d.bridgeId === preferredId)
+        if (knownOfflineDevice || activeSession || sessions.length > 0) {
+          // Never silently reroute away from an explicitly selected offline computer or mid-conversation
+          return null
+        }
       }
     }
     if (!chosen) chosen = onlineBridges[0] || null
@@ -195,18 +200,66 @@ export function App() {
   historyMetaRef.current = historyMeta
   const openRequestSeqRef = useRef(0)
   const deviceGenRef = useRef(0)
+  const workspaceLoadSeqRef = useRef(0)
+  const olderReqSeqRef = useRef(0)
   const loadingOlderLockRef = useRef(false)
   const streamingRef = useRef(streamingBySession)
   streamingRef.current = streamingBySession
+  const liveStreamMapRef = useRef({})
+  const sentPreviewUrlsRef = useRef(new Set())
   const activeBridgeIdRef = useRef(activeBridgeId)
   activeBridgeIdRef.current = activeBridgeId
   const cacheScopeRef = useRef(cacheScope)
   cacheScopeRef.current = cacheScope
-  const quietSyncInFlightRef = useRef(false)
+  const quietSyncSeqRef = useRef(0)
+  const activeQuietSyncSeqRef = useRef(0)
   const quietSyncPendingRef = useRef('')
   const lastFocusSyncAtRef = useRef(0)
   const autoOpenedScopeRef = useRef('')
   const toastTimerRef = useRef(null)
+
+  const revokeAllSentPreviewUrls = useCallback(() => {
+    for (const url of sentPreviewUrlsRef.current) {
+      try { URL.revokeObjectURL(url) } catch {}
+    }
+    sentPreviewUrlsRef.current.clear()
+  }, [])
+
+  const pruneUnusedSentPreviewUrls = useCallback((currentMessages = []) => {
+    if (sentPreviewUrlsRef.current.size === 0) return
+    const inUse = new Set()
+    for (const m of currentMessages || []) {
+      if (!Array.isArray(m?.images)) continue
+      for (const img of m.images) {
+        if (img?.localPreviewUrl) inUse.add(img.localPreviewUrl)
+      }
+    }
+    for (const url of [...sentPreviewUrlsRef.current]) {
+      if (!inUse.has(url)) {
+        sentPreviewUrlsRef.current.delete(url)
+        try { URL.revokeObjectURL(url) } catch {}
+      }
+    }
+  }, [])
+
+  const clearLiveStreamEntry = useCallback((sid) => {
+    if (!sid) return
+    delete liveStreamMapRef.current[sid]
+    setStreamingBySession((prev) => {
+      if (!(sid in prev)) return prev
+      const next = { ...prev }
+      delete next[sid]
+      return next
+    })
+  }, [])
+
+  const isStaleStreamForIdle = useCallback((sid) => {
+    if (!sid) return false
+    const entry = liveStreamMapRef.current[sid] || streamingRef.current[sid]
+    if (!entry?.active) return false
+    const lastActivity = Number(entry.lastDeltaAt || entry.startedAt || 0)
+    return Date.now() - lastActivity >= 3_000
+  }, [])
 
   const showToast = useCallback((text) => {
     if (!text) return
@@ -221,8 +274,9 @@ export function App() {
   useEffect(() => {
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+      revokeAllSentPreviewUrls()
     }
-  }, [])
+  }, [revokeAllSentPreviewUrls])
 
   const openNewChatModal = useCallback((cwdHint = '', appHint = '') => {
     const cleanCwd = typeof cwdHint === 'string' ? cwdHint : ''
@@ -247,7 +301,13 @@ export function App() {
       client
         .rpc(RPC.APPS_STATUS, {}, 12_000, targetBridge ? { bridgeId: targetBridge } : {})
         .then((res) => {
-          if (deviceGenRef.current === gen && Array.isArray(res?.apps) && res.apps.length > 0) {
+          if (
+            deviceGenRef.current === gen &&
+            clientRef.current === client &&
+            (!targetBridge || activeBridgeIdRef.current === targetBridge) &&
+            Array.isArray(res?.apps) &&
+            res.apps.length > 0
+          ) {
             setAppsStatus(res.apps)
           }
         })
@@ -395,13 +455,23 @@ export function App() {
   const resetTransientWorkspace = useCallback(() => {
     deviceGenRef.current += 1
     openRequestSeqRef.current += 1
+    workspaceLoadSeqRef.current += 1
+    olderReqSeqRef.current += 1
+    quietSyncSeqRef.current += 1
+    activeQuietSyncSeqRef.current = 0
+    quietSyncPendingRef.current = ''
     loadingOlderLockRef.current = false
+    liveStreamMapRef.current = {}
+    activeSessionRef.current = null
+    messagesRef.current = []
+    historyMetaRef.current = { hasMore: false, nextCursor: null, totalCount: null }
     setActiveSession(null)
     setMessages([])
     setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
     setOlderError('')
     setLoadingSession(false)
     setLoadingOlder(false)
+    setLoadingModels(false)
     setAppsStatus([])
     setModelsCatalog({})
     setSessionModelPrefs({})
@@ -418,8 +488,9 @@ export function App() {
     setNewChatApp('')
     setModelPickerOpen(false)
     setLightboxState(null)
+    revokeAllSentPreviewUrls()
     clearE2eeMediaCache()
-  }, [])
+  }, [revokeAllSentPreviewUrls])
 
   const handleDeviceAuthenticated = useCallback((payload) => {
     setPairError('')
@@ -527,7 +598,13 @@ export function App() {
 
   // Mint and auto-refresh a short-lived 15-min read-only media token so the 30-day master JWT never appears in image URLs
   useEffect(() => {
-    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || connState === 'unauthorized') {
+    if (
+      !activeDevice?.id ||
+      !activeDevice?.baseUrl ||
+      !activeDevice?.token ||
+      connState === 'unauthorized' ||
+      connState === 'error'
+    ) {
       setMediaAuth({ deviceId: '', mediaToken: '' })
       return
     }
@@ -627,36 +704,161 @@ export function App() {
     activeBridgeE2ee.keyId,
   ])
 
+  const syncActiveSessionQuietly = useCallback(async (sessionId = '') => {
+    const client = clientRef.current
+    const targetId = sessionId || activeSessionRef.current?.id || ''
+    if (!client || !targetId) return
+    if (liveStreamMapRef.current[targetId]?.active || loadingOlderLockRef.current) return
+    if (activeQuietSyncSeqRef.current !== 0) {
+      quietSyncPendingRef.current = targetId
+      return
+    }
+
+    const seq = ++quietSyncSeqRef.current
+    activeQuietSyncSeqRef.current = seq
+    const gen = deviceGenRef.current
+    const scope = cacheScopeRef.current
+    const targetBridge = activeBridgeIdRef.current
+    try {
+      const res = await client.rpc(
+        RPC.SESSION_READ,
+        { id: targetId, limit: 14 },
+        30_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
+      if (
+        quietSyncSeqRef.current !== seq ||
+        deviceGenRef.current !== gen ||
+        activeSessionRef.current?.id !== targetId ||
+        liveStreamMapRef.current[targetId]?.active
+      ) {
+        return
+      }
+      if (res?.session) {
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
+        const currentSnapshot = {
+          messages: messagesRef.current,
+          hasMore: historyMetaRef.current.hasMore,
+          nextCursor: historyMetaRef.current.nextCursor,
+          totalCount: historyMetaRef.current.totalCount,
+        }
+        const reconciled = reconcileCachedWithFreshPage(currentSnapshot, {
+          messages: freshMsgs,
+          hasMore,
+          nextCursor,
+          totalCount,
+        })
+        const nextHistoryMeta = {
+          hasMore: reconciled.hasMore,
+          nextCursor: reconciled.nextCursor,
+          totalCount: reconciled.totalCount,
+        }
+        activeSessionRef.current = res.session
+        messagesRef.current = reconciled.messages
+        historyMetaRef.current = nextHistoryMeta
+        setActiveSession(res.session)
+        setMessages(reconciled.messages)
+        setHistoryMeta(nextHistoryMeta)
+        pruneUnusedSentPreviewUrls(reconciled.messages)
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetId
+              ? {
+                  ...s,
+                  status: res.session.status || s.status,
+                  title: res.session.title || s.title,
+                  syncState: res.session.syncState ?? null,
+                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
+                }
+              : s,
+          ),
+        )
+        void saveCachedSession(
+          targetId,
+          {
+            meta: metaOnly,
+            messages: reconciled.messages,
+            hasMore: reconciled.hasMore,
+            nextCursor: reconciled.nextCursor,
+            totalCount: reconciled.totalCount,
+          },
+          scope,
+        )
+      }
+    } catch {
+      // Quiet background sync errors should never disrupt active reading
+    } finally {
+      if (activeQuietSyncSeqRef.current === seq) {
+        activeQuietSyncSeqRef.current = 0
+        const pendingId = quietSyncPendingRef.current
+        quietSyncPendingRef.current = ''
+        if (
+          pendingId &&
+          quietSyncSeqRef.current === seq &&
+          deviceGenRef.current === gen &&
+          activeSessionRef.current?.id === pendingId &&
+          !liveStreamMapRef.current[pendingId]?.active
+        ) {
+          void syncActiveSessionQuietly(pendingId)
+        }
+      }
+    }
+  }, [pruneUnusedSentPreviewUrls])
+
   const loadWorkspaceData = useCallback(async (bridgeOverride = '') => {
     const client = clientRef.current
     if (!client || e2eeLockedRef.current) return
     const targetBridge = String(bridgeOverride || activeBridgeIdRef.current || '').trim()
     if (targetBridge) client.setTargetBridgeId(targetBridge)
     const gen = deviceGenRef.current
+    const loadSeq = ++workspaceLoadSeqRef.current
     setRefreshing(true)
     try {
       const rpcOpts = targetBridge ? { bridgeId: targetBridge } : {}
       const [statusRes, sessRes, wsRes, aprRes, modelsRes] = await Promise.all([
-        client.rpc(RPC.APPS_STATUS, {}, 45_000, rpcOpts).catch(() => ({ apps: [] })),
-        client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }, 45_000, rpcOpts).catch(() => ({ sessions: [] })),
-        client.rpc(RPC.WORKSPACES_LIST, {}, 45_000, rpcOpts).catch(() => ({ workspaces: [] })),
-        client.rpc(RPC.APPROVAL_LIST, {}, 45_000, rpcOpts).catch(() => ({ approvals: [] })),
-        client.rpc(RPC.MODELS_LIST, {}, 45_000, rpcOpts).catch(() => ({ catalog: {} })),
+        client.rpc(RPC.APPS_STATUS, {}, 45_000, rpcOpts).catch(() => null),
+        client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }, 45_000, rpcOpts).catch(() => null),
+        client.rpc(RPC.WORKSPACES_LIST, {}, 45_000, rpcOpts).catch(() => null),
+        client.rpc(RPC.APPROVAL_LIST, {}, 45_000, rpcOpts).catch(() => null),
+        client.rpc(RPC.MODELS_LIST, {}, 45_000, rpcOpts).catch(() => null),
       ])
-      if (deviceGenRef.current !== gen || clientRef.current !== client) return
-      setAppsStatus(statusRes.apps || [])
-      setSessions(sessRes.sessions || [])
-      setWorkspaces(wsRes.workspaces || [])
-      setApprovals(aprRes.approvals || [])
+      if (
+        deviceGenRef.current !== gen ||
+        workspaceLoadSeqRef.current !== loadSeq ||
+        clientRef.current !== client ||
+        (targetBridge && activeBridgeIdRef.current && activeBridgeIdRef.current !== targetBridge)
+      ) {
+        return
+      }
+      if (statusRes && Array.isArray(statusRes.apps)) {
+        setAppsStatus(statusRes.apps)
+      }
+      if (sessRes && Array.isArray(sessRes.sessions)) {
+        setSessions(sessRes.sessions)
+        for (const s of sessRes.sessions) {
+          if (s?.id && s.status === 'idle' && isStaleStreamForIdle(s.id)) {
+            clearLiveStreamEntry(s.id)
+            if (activeSessionRef.current?.id === s.id) {
+              void syncActiveSessionQuietly(s.id)
+            }
+          }
+        }
+      }
+      if (wsRes && Array.isArray(wsRes.workspaces)) {
+        setWorkspaces(wsRes.workspaces)
+      }
+      if (aprRes && Array.isArray(aprRes.approvals)) {
+        setApprovals(aprRes.approvals)
+      }
       if (modelsRes?.catalog && Object.keys(modelsRes.catalog).length > 0) {
         setModelsCatalog(modelsRes.catalog)
       }
     } finally {
-      if (deviceGenRef.current === gen) {
+      if (deviceGenRef.current === gen && workspaceLoadSeqRef.current === loadSeq) {
         setRefreshing(false)
       }
     }
-  }, [])
+  }, [clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
 
   // Trigger workspace load whenever connected target device/bridge is ready or E2EE unlocks
   useEffect(() => {
@@ -694,9 +896,18 @@ export function App() {
     if (prevKey && prevKey.startsWith(`${activeBridgeId}::`)) {
       const client = clientRef.current
       if (client) {
+        const gen = deviceGenRef.current
+        const reqBridgeId = activeBridgeId
         client
-          .rpc(RPC.MODELS_LIST, {}, 45_000, { bridgeId: activeBridgeId })
+          .rpc(RPC.MODELS_LIST, {}, 45_000, { bridgeId: reqBridgeId })
           .then((res) => {
+            if (
+              deviceGenRef.current !== gen ||
+              activeBridgeIdRef.current !== reqBridgeId ||
+              clientRef.current !== client
+            ) {
+              return
+            }
             if (res?.catalog && Object.keys(res.catalog).length > 0) {
               setModelsCatalog(res.catalog)
             }
@@ -712,23 +923,29 @@ export function App() {
     const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId.id
     const isDifferentSession = activeSessionRef.current?.id !== id
     const reqSeq = ++openRequestSeqRef.current
+    const openStartedAt = Date.now()
     const gen = deviceGenRef.current
     const scope = cacheScopeRef.current
     const targetBridge = activeBridgeIdRef.current
+    olderReqSeqRef.current += 1
     loadingOlderLockRef.current = false
     setLoadingOlder(false)
     setOlderError('')
     setSessionOpenSeq((n) => n + 1)
 
     if (typeof sessionOrId === 'object') {
+      activeSessionRef.current = sessionOrId
       setActiveSession(sessionOrId)
       if (sessionOrId.cwd) saveLastWorkspace(scope, sessionOrId.cwd)
     }
     saveLastSessionId(scope, id)
     if (isDifferentSession) {
       // Clear previous session's messages immediately so ChatView never measures stale scrollHeight
+      messagesRef.current = []
+      historyMetaRef.current = { hasMore: false, nextCursor: null, totalCount: null }
       setMessages([])
       setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
+      pruneUnusedSentPreviewUrls([])
     }
 
     // 1. Show phone-cached history immediately (0ms perceived latency), strictly scoped to current PC
@@ -736,16 +953,22 @@ export function App() {
     if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
     if (cached && cached.messages?.length > 0) {
       if (cached.meta && typeof sessionOrId === 'string') {
+        activeSessionRef.current = cached.meta
         setActiveSession(cached.meta)
       }
-      setMessages(cached.messages)
-      setHistoryMeta({
+      const nextMeta = {
         hasMore: Boolean(cached.hasMore),
         nextCursor: cached.nextCursor ?? null,
         totalCount: cached.totalCount ?? null,
-      })
+      }
+      messagesRef.current = cached.messages
+      historyMetaRef.current = nextMeta
+      setMessages(cached.messages)
+      setHistoryMeta(nextMeta)
       setLoadingSession(false)
     } else {
+      messagesRef.current = []
+      historyMetaRef.current = { hasMore: false, nextCursor: null, totalCount: null }
       setMessages([])
       setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
       setLoadingSession(true)
@@ -761,6 +984,9 @@ export function App() {
       )
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
       if (res?.session) {
+        if (res.session.status === 'idle' && isStaleStreamForIdle(id)) {
+          clearLiveStreamEntry(id)
+        }
         const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
         const reconciled = reconcileCachedWithFreshPage(cached, {
           messages: freshMsgs,
@@ -768,18 +994,40 @@ export function App() {
           nextCursor,
           totalCount,
         })
-        setActiveSession(res.session)
-        setMessages(reconciled.messages)
-        setHistoryMeta({
+        // Preserve any optimistic msg-u-*/msg-a-* sent while SESSION_READ was in flight
+        const recentTail = reconciled.messages.slice(-4)
+        const pendingLocal = (messagesRef.current || []).filter((m) => {
+          if (!m || !/^msg-[ua]-/.test(String(m.id || ''))) return false
+          if (Number(m.ts || 0) < openStartedAt - 1_000) return false
+          const trimmed = String(m.text || '').trim()
+          const alreadyPersisted = recentTail.some(
+            (fm) =>
+              fm &&
+              fm.role === m.role &&
+              String(fm.text || '').trim() === trimmed &&
+              (!fm.ts || Number(fm.ts) >= openStartedAt - 5_000),
+          )
+          return !alreadyPersisted
+        })
+        const finalMessages =
+          pendingLocal.length > 0 ? [...reconciled.messages, ...pendingLocal] : reconciled.messages
+        const nextMeta = {
           hasMore: reconciled.hasMore,
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
-        })
+        }
+        activeSessionRef.current = res.session
+        messagesRef.current = finalMessages
+        historyMetaRef.current = nextMeta
+        setActiveSession(res.session)
+        setMessages(finalMessages)
+        setHistoryMeta(nextMeta)
+        pruneUnusedSentPreviewUrls(finalMessages)
         void saveCachedSession(
           id,
           {
             meta: metaOnly,
-            messages: reconciled.messages,
+            messages: finalMessages,
             hasMore: reconciled.hasMore,
             nextCursor: reconciled.nextCursor,
             totalCount: reconciled.totalCount,
@@ -790,9 +1038,11 @@ export function App() {
     } catch (err) {
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
       if (!cached || !cached.messages?.length) {
+        const errEntry = { active: false, error: String(err?.message || err) }
+        liveStreamMapRef.current[id] = errEntry
         setStreamingBySession((prev) => ({
           ...prev,
-          [id]: { active: false, error: String(err?.message || err) },
+          [id]: errEntry,
         }))
       }
     } finally {
@@ -800,7 +1050,7 @@ export function App() {
         setLoadingSession(false)
       }
     }
-  }, [])
+  }, [clearLiveStreamEntry, isStaleStreamForIdle, pruneUnusedSentPreviewUrls])
 
   // Auto-resume the last active conversation (or most recent conversation) once per connected PC,
   // so opening the app lands straight inside a real project conversation instead of an unscoped blank screen.
@@ -831,97 +1081,6 @@ export function App() {
     }
   }, [cacheScope, effectiveWorkspaces, selectedDraftCwd])
 
-  const syncActiveSessionQuietly = useCallback(async (sessionId = '') => {
-    const client = clientRef.current
-    const targetId = sessionId || activeSessionRef.current?.id || ''
-    if (!client || !targetId) return
-    if (streamingRef.current[targetId]?.active || loadingOlderLockRef.current) return
-    if (quietSyncInFlightRef.current) {
-      quietSyncPendingRef.current = targetId
-      return
-    }
-
-    quietSyncInFlightRef.current = true
-    const gen = deviceGenRef.current
-    const scope = cacheScopeRef.current
-    const targetBridge = activeBridgeIdRef.current
-    try {
-      const res = await client.rpc(
-        RPC.SESSION_READ,
-        { id: targetId, limit: 14 },
-        30_000,
-        targetBridge ? { bridgeId: targetBridge } : {},
-      )
-      if (
-        deviceGenRef.current !== gen ||
-        activeSessionRef.current?.id !== targetId ||
-        streamingRef.current[targetId]?.active
-      ) {
-        return
-      }
-      if (res?.session) {
-        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
-        const currentSnapshot = {
-          messages: messagesRef.current,
-          hasMore: historyMetaRef.current.hasMore,
-          nextCursor: historyMetaRef.current.nextCursor,
-          totalCount: historyMetaRef.current.totalCount,
-        }
-        const reconciled = reconcileCachedWithFreshPage(currentSnapshot, {
-          messages: freshMsgs,
-          hasMore,
-          nextCursor,
-          totalCount,
-        })
-        setActiveSession(res.session)
-        setMessages(reconciled.messages)
-        setHistoryMeta({
-          hasMore: reconciled.hasMore,
-          nextCursor: reconciled.nextCursor,
-          totalCount: reconciled.totalCount,
-        })
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.id === targetId
-              ? {
-                  ...s,
-                  status: res.session.status || s.status,
-                  title: res.session.title || s.title,
-                  ...(res.session.syncState ? { syncState: res.session.syncState } : {}),
-                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
-                }
-              : s,
-          ),
-        )
-        void saveCachedSession(
-          targetId,
-          {
-            meta: metaOnly,
-            messages: reconciled.messages,
-            hasMore: reconciled.hasMore,
-            nextCursor: reconciled.nextCursor,
-            totalCount: reconciled.totalCount,
-          },
-          scope,
-        )
-      }
-    } catch {
-      // Quiet background sync errors should never disrupt active reading
-    } finally {
-      quietSyncInFlightRef.current = false
-      const pendingId = quietSyncPendingRef.current
-      quietSyncPendingRef.current = ''
-      if (
-        pendingId &&
-        deviceGenRef.current === gen &&
-        activeSessionRef.current?.id === pendingId &&
-        !streamingRef.current[pendingId]?.active
-      ) {
-        void syncActiveSessionQuietly(pendingId)
-      }
-    }
-  }, [])
-
   // Auto-sync the open session whenever user switches back to All in One (Desktop focus or mobile resume)
   useEffect(() => {
     const triggerFocusSync = () => {
@@ -931,7 +1090,7 @@ export function App() {
       if (now - lastFocusSyncAtRef.current < 1_500) return
       lastFocusSyncAtRef.current = now
       const curId = activeSessionRef.current?.id
-      if (curId && !streamingRef.current[curId]?.active) {
+      if (curId && !liveStreamMapRef.current[curId]?.active) {
         void syncActiveSessionQuietly(curId)
       }
     }
@@ -950,6 +1109,7 @@ export function App() {
     if (!client || !sess?.id || !hMeta.hasMore || !hMeta.nextCursor) return
     if (loadingOlderLockRef.current) return
 
+    const reqSeq = ++olderReqSeqRef.current
     loadingOlderLockRef.current = true
     setLoadingOlder(true)
     setOlderError('')
@@ -966,21 +1126,30 @@ export function App() {
         45_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
-      if (activeSessionRef.current?.id !== targetId || deviceGenRef.current !== gen) return
+      if (
+        olderReqSeqRef.current !== reqSeq ||
+        activeSessionRef.current?.id !== targetId ||
+        deviceGenRef.current !== gen
+      ) {
+        return
+      }
       if (res?.session) {
         const olderMsgs = Array.isArray(res.session.messages) ? res.session.messages : []
         const merged = mergeSessionMessages(olderMsgs, messagesRef.current)
         const nextHasMore = Boolean(res.session.hasMore) && Boolean(res.session.nextCursor) && res.session.nextCursor !== cursor
         const nextCur = nextHasMore ? res.session.nextCursor : null
         const nextTotal = res.session.totalCount ?? hMeta.totalCount ?? null
-
-        setMessages(merged)
-        setPrependSeq((n) => n + 1)
-        setHistoryMeta({
+        const nextMeta = {
           hasMore: nextHasMore,
           nextCursor: nextCur,
           totalCount: nextTotal,
-        })
+        }
+
+        messagesRef.current = merged
+        historyMetaRef.current = nextMeta
+        setMessages(merged)
+        setPrependSeq((n) => n + 1)
+        setHistoryMeta(nextMeta)
 
         const { messages: _drop, ...metaOnly } = res.session
         void saveCachedSession(
@@ -996,13 +1165,15 @@ export function App() {
         )
       }
     } catch (err) {
-      if (deviceGenRef.current === gen) {
+      if (olderReqSeqRef.current === reqSeq && deviceGenRef.current === gen) {
         setOlderError(String(err?.message || err || biLang(getCurrentLang(), '加载更早历史失败', 'Failed to load earlier history')))
       }
     } finally {
-      loadingOlderLockRef.current = false
-      if (deviceGenRef.current === gen) {
-        setLoadingOlder(false)
+      if (olderReqSeqRef.current === reqSeq) {
+        loadingOlderLockRef.current = false
+        if (deviceGenRef.current === gen) {
+          setLoadingOlder(false)
+        }
       }
     }
   }, [])
@@ -1011,19 +1182,42 @@ export function App() {
   useEffect(() => {
     if (!activeDevice?.token || !activeDevice?.baseUrl) {
       setConnState('disconnected')
+      setConnError('')
       setBridges([])
       setAccountDevices([])
+      setClientSessions({
+        supported: true,
+        sessions: [],
+        onlineCount: 0,
+        onlineDeviceCount: 0,
+        totalCount: 0,
+      })
+      setLiveOnlineClientCount(0)
       return
     }
 
+    let cancelled = false
+    const probedDeviceId = activeDevice.id
+    setConnError('')
     setBridges([])
+    setAccountDevices([])
+    setClientSessions({
+      supported: true,
+      sessions: [],
+      onlineCount: 0,
+      onlineDeviceCount: 0,
+      totalCount: 0,
+    })
+    setLiveOnlineClientCount(0)
+
     // Refresh persisted account profile (role/username/devices) cleanly on mount/switch
     probeDeviceStatus(activeDevice, 5000)
       .then((res) => {
+        if (cancelled) return
         if (Array.isArray(res.devices)) setAccountDevices(res.devices)
         if (res.username || res.role) {
           setDeviceState((prev) =>
-            updateDeviceMeta(prev, activeDevice.id, {
+            updateDeviceMeta(prev, probedDeviceId, {
               ...(res.username ? { username: res.username } : {}),
               ...(res.role ? { role: res.role } : {}),
             }),
@@ -1042,9 +1236,10 @@ export function App() {
     setPendingGrantPopup(null)
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, bridges: bList, devices: dList, onlineClientCount: occ }) => {
+    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ }) => {
       if (clientRef.current !== client) return
       setConnState(state)
+      setConnError(error || '')
       setBridges(bList || [])
       if (Array.isArray(dList)) setAccountDevices(dList)
       if (typeof occ === 'number') setLiveOnlineClientCount(occ)
@@ -1075,10 +1270,10 @@ export function App() {
         return
       }
 
-      // Strictly isolate live events to the currently selected computer bridge
+      // Strictly isolate live events to the currently selected computer bridge (never leak when active bridge is offline)
       const evBridgeId = String(rawMsg?.bridgeId || '').trim()
       const curBridgeId = activeBridgeIdRef.current
-      if (evBridgeId && curBridgeId && evBridgeId !== curBridgeId) {
+      if (evBridgeId && (!curBridgeId || evBridgeId !== curBridgeId)) {
         return
       }
 
@@ -1094,6 +1289,11 @@ export function App() {
 
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
         const updated = payload.session
+        let clearedStaleStream = false
+        if (updated.status === 'idle' && isStaleStreamForIdle(updated.id)) {
+          clearLiveStreamEntry(updated.id)
+          clearedStaleStream = true
+        }
         setSessions((prev) => {
           const prevItem = prev.find((s) => s.id === updated.id)
           const merged = prevItem ? { ...prevItem, ...updated } : updated
@@ -1103,7 +1303,10 @@ export function App() {
         })
         if (activeSessionRef.current?.id === updated.id) {
           setActiveSession((prev) => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev))
-          if ((payload.historyChanged || payload.statusChanged) && !streamingRef.current[updated.id]?.active) {
+          if (
+            (payload.historyChanged || payload.statusChanged || clearedStaleStream) &&
+            !liveStreamMapRef.current[updated.id]?.active
+          ) {
             void syncActiveSessionQuietly(updated.id)
           }
         }
@@ -1114,49 +1317,109 @@ export function App() {
       if (!sid) return
 
       if (event === EVENTS.STREAM_START) {
-        setStreamingBySession((prev) => ({
-          ...prev,
-          [sid]: { active: true, text: '', thinking: '', tools: [], error: '' },
-        }))
+        const now = Date.now()
+        const entry = {
+          active: true,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: '',
+          startedAt: now,
+          lastDeltaAt: now,
+        }
+        liveStreamMapRef.current[sid] = entry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: entry }))
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'running' } : s)))
       } else if (event === EVENTS.STREAM_DELTA) {
-        setStreamingBySession((prev) => {
-          const cur = prev[sid] || { active: true, text: '', thinking: '', tools: [], error: '' }
-          return { ...prev, [sid]: { ...cur, active: true, text: cur.text + (payload.delta || '') } }
-        })
+        const now = Date.now()
+        const cur = liveStreamMapRef.current[sid] || {
+          active: true,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: '',
+          startedAt: now,
+          lastDeltaAt: now,
+        }
+        const nextEntry = {
+          ...cur,
+          active: true,
+          text: cur.text + (payload.delta || ''),
+          lastDeltaAt: now,
+        }
+        liveStreamMapRef.current[sid] = nextEntry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_THINKING) {
-        setStreamingBySession((prev) => {
-          const cur = prev[sid] || { active: true, text: '', thinking: '', tools: [], error: '' }
-          return { ...prev, [sid]: { ...cur, active: true, thinking: cur.thinking + (payload.delta || '') } }
-        })
+        const now = Date.now()
+        const cur = liveStreamMapRef.current[sid] || {
+          active: true,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: '',
+          startedAt: now,
+          lastDeltaAt: now,
+        }
+        const nextEntry = {
+          ...cur,
+          active: true,
+          thinking: cur.thinking + (payload.delta || ''),
+          lastDeltaAt: now,
+        }
+        liveStreamMapRef.current[sid] = nextEntry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_TOOL_START && payload.tool) {
-        setStreamingBySession((prev) => {
-          const cur = prev[sid] || { active: true, text: '', thinking: '', tools: [], error: '' }
-          const exists = cur.tools.some((t) => t.id === payload.tool.id)
-          const tools = exists
-            ? cur.tools
-            : [...cur.tools, { ...payload.tool, status: 'running', output: '' }]
-          return { ...prev, [sid]: { ...cur, active: true, tools } }
-        })
+        const now = Date.now()
+        const cur = liveStreamMapRef.current[sid] || {
+          active: true,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: '',
+          startedAt: now,
+          lastDeltaAt: now,
+        }
+        const exists = cur.tools.some((t) => t.id === payload.tool.id)
+        const tools = exists
+          ? cur.tools
+          : [...cur.tools, { ...payload.tool, status: 'running', output: '' }]
+        const nextEntry = { ...cur, active: true, tools, lastDeltaAt: now }
+        liveStreamMapRef.current[sid] = nextEntry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_TOOL_END && payload.toolId) {
-        setStreamingBySession((prev) => {
-          const cur = prev[sid] || { active: true, text: '', thinking: '', tools: [], error: '' }
-          const tools = cur.tools.map((t) =>
-            t.id === payload.toolId
-              ? { ...t, status: payload.status || 'completed', output: payload.output || '' }
-              : t,
-          )
-          return { ...prev, [sid]: { ...cur, tools } }
-        })
+        const now = Date.now()
+        const cur = liveStreamMapRef.current[sid] || {
+          active: true,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: '',
+          startedAt: now,
+          lastDeltaAt: now,
+        }
+        const tools = cur.tools.map((t) =>
+          t.id === payload.toolId
+            ? { ...t, status: payload.status || 'completed', output: payload.output || '' }
+            : t,
+        )
+        const nextEntry = { ...cur, tools, lastDeltaAt: now }
+        liveStreamMapRef.current[sid] = nextEntry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_ERROR) {
-        setStreamingBySession((prev) => {
-          const cur = prev[sid] || { active: false, text: '', thinking: '', tools: [] }
-          return { ...prev, [sid]: { ...cur, active: false, error: payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error') } }
-        })
+        const cur = liveStreamMapRef.current[sid] || { active: false, text: '', thinking: '', tools: [] }
+        const nextEntry = {
+          ...cur,
+          active: false,
+          error: payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error'),
+        }
+        liveStreamMapRef.current[sid] = nextEntry
+        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
       } else if (event === EVENTS.STREAM_DONE) {
-        const cur = streamingRef.current[sid]
+        const cur = liveStreamMapRef.current[sid] || streamingRef.current[sid]
+        delete liveStreamMapRef.current[sid]
         setStreamingBySession((prev) => {
+          if (!(sid in prev)) return prev
           const next = { ...prev }
           delete next[sid]
           return next
@@ -1173,13 +1436,18 @@ export function App() {
             tools: cur?.tools?.length ? cur.tools : undefined,
             ts: Date.now(),
           }
-          const nextList = [...messagesRef.current, committed]
-          setMessages(nextList)
+          const cacheList = [...messagesRef.current, committed]
+          messagesRef.current = cacheList
+          setMessages((prev) => {
+            const next = prev.some((m) => m.id === committed.id) ? prev : [...prev, committed]
+            messagesRef.current = next
+            return next
+          })
           void saveCachedSession(
             sid,
             {
               meta: activeSessionRef.current,
-              messages: nextList,
+              messages: cacheList,
               hasMore: historyMetaRef.current.hasMore,
               nextCursor: historyMetaRef.current.nextCursor,
               totalCount: historyMetaRef.current.totalCount,
@@ -1192,7 +1460,7 @@ export function App() {
         )
         // Reconcile optimistic msg-u/msg-a IDs with authoritative disk transcript & syncState shortly after turn settles
         setTimeout(() => {
-          if (activeSessionRef.current?.id === sid && !streamingRef.current[sid]?.active) {
+          if (activeSessionRef.current?.id === sid && !liveStreamMapRef.current[sid]?.active) {
             void syncActiveSessionQuietly(sid)
           }
         }, 1200)
@@ -1202,6 +1470,7 @@ export function App() {
     client.connect()
 
     return () => {
+      cancelled = true
       unsubStatus()
       unsubEvents()
       client.disconnect()
@@ -1209,7 +1478,7 @@ export function App() {
         clientRef.current = null
       }
     }
-  }, [activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl])
+  }, [activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
 
   const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
     const cleanBridgeId = String(bridgeId || '').trim()
@@ -1286,12 +1555,14 @@ export function App() {
 
   const handleRefreshClientSessions = useCallback(async () => {
     if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    const gen = deviceGenRef.current
     try {
       const res = await fetchAuthSessions(
         activeDevice.baseUrl,
         activeDevice.token,
         clientRef.current?.clientId || '',
       )
+      if (deviceGenRef.current !== gen) return
       setClientSessions(res)
       if (res.supported) {
         setLiveOnlineClientCount(res.onlineCount)
@@ -1354,6 +1625,8 @@ export function App() {
 
   const handleRefreshAccountDevices = useCallback(async () => {
     if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    const gen = deviceGenRef.current
+    const targetDeviceId = activeDevice.id
     void handleRefreshClientSessions()
     if (!isAccountMode) return
     try {
@@ -1361,11 +1634,12 @@ export function App() {
         listAccountDevices(activeDevice.baseUrl, activeDevice.token).catch(() => null),
         probeDeviceStatus(activeDevice, 5000).catch(() => null),
       ])
+      if (deviceGenRef.current !== gen) return
       if (devRes) setAccountDevices(devRes.devices)
       if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
         setServerEmailEnabled(Boolean(meRes.emailEnabled))
         setDeviceState((prev) =>
-          updateDeviceMeta(prev, activeDevice.id, {
+          updateDeviceMeta(prev, targetDeviceId, {
             ...(meRes.username ? { username: meRes.username } : {}),
             ...(meRes.role ? { role: meRes.role } : {}),
             email: meRes.email || '',
@@ -1495,13 +1769,17 @@ export function App() {
 
       const nextKeys = { ...(activeDevice.e2eeKeys || {}) }
       for (const item of validEntries) {
+        delete nextKeys[item.keyId]
         nextKeys[item.keyId] = item.key
       }
 
+      let desktopKeyEntry = null
       if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId && preferred?.key) {
         const res = await desktopApi.setE2eeKey(activeDevice.roomId, preferred.key)
         if (res?.key && res?.keyId) {
+          delete nextKeys[res.keyId]
           nextKeys[res.keyId] = res.key
+          desktopKeyEntry = { keyId: res.keyId, key: res.key }
         }
         const st = await desktopApi.getBridgeStatus?.().catch(() => null)
         if (st) setDesktopBridge(st)
@@ -1510,8 +1788,14 @@ export function App() {
       clientRef.current?.setE2eeKeys(nextKeys)
       setDeviceState((prev) => {
         let next = prev
-        for (const [kid, kVal] of Object.entries(nextKeys)) {
-          next = upsertDeviceE2eeKey(next, activeDevice.id, kid, kVal)
+        for (const item of validEntries) {
+          next = upsertDeviceE2eeKey(next, activeDevice.id, item.keyId, item.key)
+        }
+        if (desktopKeyEntry) {
+          next = upsertDeviceE2eeKey(next, activeDevice.id, desktopKeyEntry.keyId, desktopKeyEntry.key)
+        }
+        if (preferred?.keyId && preferred?.key) {
+          next = upsertDeviceE2eeKey(next, activeDevice.id, preferred.keyId, preferred.key)
         }
         return next
       })
@@ -1629,6 +1913,13 @@ export function App() {
     )
     if (deviceGenRef.current !== gen) return res.session
     const created = res.session
+    openRequestSeqRef.current += 1
+    olderReqSeqRef.current += 1
+    loadingOlderLockRef.current = false
+    setLoadingSession(false)
+    setLoadingOlder(false)
+    setOlderError('')
+    setSessionOpenSeq((n) => n + 1)
     if (model || provider || reasoningEffort) {
       setSessionModelPrefs((prev) => ({
         ...prev,
@@ -1639,6 +1930,11 @@ export function App() {
         },
       }))
     }
+    const emptyMeta = { hasMore: false, nextCursor: null, totalCount: 0 }
+    activeSessionRef.current = created
+    messagesRef.current = []
+    historyMetaRef.current = emptyMeta
+    pruneUnusedSentPreviewUrls([])
     setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)])
     setActiveSession(created)
     saveLastSessionId(cacheScopeRef.current, created.id)
@@ -1647,7 +1943,7 @@ export function App() {
       setSelectedDraftCwd(created.cwd)
     }
     setMessages([])
-    setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: 0 })
+    setHistoryMeta(emptyMeta)
     return created
   }
 
@@ -1679,19 +1975,20 @@ export function App() {
 
   const handleSend = async ({ text, attachments = [] }) => {
     const client = clientRef.current
-    if (!client) return
+    if (!client) return false
     const gen = deviceGenRef.current
     const scope = cacheScopeRef.current
     const targetBridge = activeBridgeIdRef.current
 
     let target = activeSession
+    const createdJustNow = !target
     if (!target) {
       // Strictly require an explicitly chosen project directory before creating a new conversation
       const explicitCwd = String(selectedDraftCwd || '').trim()
       if (!explicitCwd) {
         showToast(bi('请先选择目标项目目录', 'Please select a target project directory first'))
         openNewChatModal('', effectiveDefaultApp)
-        return
+        return false
       }
       try {
         const initPref = resolveModelPrefFor({ app: effectiveDefaultApp })
@@ -1703,10 +2000,10 @@ export function App() {
           provider: initPref.provider || undefined,
           reasoningEffort: initPref.reasoningEffort || undefined,
         })
-        if (deviceGenRef.current !== gen) return
+        if (deviceGenRef.current !== gen || !target) return false
       } catch (err) {
         alert(String(err?.message || err))
-        return
+        return false
       }
     }
 
@@ -1722,14 +2019,22 @@ export function App() {
     }
 
     // Optimistic user bubble (render uploaded image attachments as real previews!)
-    const imgAtts = attachments.filter((a) => String(a.mimeType || '').startsWith('image/'))
-    const nonImgAtts = attachments.filter((a) => !String(a.mimeType || '').startsWith('image/'))
+    const validAtts = Array.isArray(attachments)
+      ? attachments.filter((a) => a && typeof a === 'object')
+      : []
+    const imgAtts = validAtts.filter((a) => String(a.mimeType || '').startsWith('image/'))
+    const nonImgAtts = validAtts.filter((a) => !String(a.mimeType || '').startsWith('image/'))
+    for (const a of imgAtts) {
+      if (typeof a.localPreviewUrl === 'string' && a.localPreviewUrl.startsWith('blob:')) {
+        sentPreviewUrlsRef.current.add(a.localPreviewUrl)
+      }
+    }
     const displayUserText =
       nonImgAtts.length > 0
         ? `${finalText}${finalText ? '\n' : ''}[${bi('附件', 'Attachment')}: ${nonImgAtts.map((a) => a.filename).join(', ')}]`
         : finalText
     const userMsg = {
-      id: `msg-u-${Date.now()}`,
+      id: `msg-u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       role: 'user',
       text: displayUserText,
       ...(imgAtts.length > 0
@@ -1745,24 +2050,45 @@ export function App() {
         : {}),
       ts: Date.now(),
     }
-    const wireAttachments = attachments.map(({ localPreviewUrl: _drop, ...rest }) => rest)
-    const nextWithUser = [...messagesRef.current, userMsg]
-    setMessages(nextWithUser)
+    const wireAttachments = validAtts.map(({ localPreviewUrl: _drop, ...rest }) => rest)
+    const baseMessages = createdJustNow ? [] : messagesRef.current
+    const baseHistoryMeta = createdJustNow
+      ? { hasMore: false, nextCursor: null, totalCount: 0 }
+      : historyMetaRef.current
+    const nextWithUser = [...baseMessages, userMsg]
+    messagesRef.current = nextWithUser
+    setMessages((prev) => {
+      const base = createdJustNow ? [] : prev
+      const next = base.some((m) => m.id === userMsg.id) ? base : [...base, userMsg]
+      messagesRef.current = next
+      return next
+    })
     void saveCachedSession(
       target.id,
       {
         meta: target,
         messages: nextWithUser,
-        hasMore: historyMetaRef.current.hasMore,
-        nextCursor: historyMetaRef.current.nextCursor,
-        totalCount: historyMetaRef.current.totalCount,
+        hasMore: baseHistoryMeta.hasMore,
+        nextCursor: baseHistoryMeta.nextCursor,
+        totalCount: baseHistoryMeta.totalCount,
       },
       scope,
     )
 
+    const startNow = Date.now()
+    const initStream = {
+      active: true,
+      text: '',
+      thinking: '',
+      tools: [],
+      error: '',
+      startedAt: startNow,
+      lastDeltaAt: startNow,
+    }
+    liveStreamMapRef.current[target.id] = initStream
     setStreamingBySession((prev) => ({
       ...prev,
-      [target.id]: { active: true, text: '', thinking: '', tools: [], error: '' },
+      [target.id]: initStream,
     }))
 
     try {
@@ -1781,47 +2107,121 @@ export function App() {
         45_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
+      return true
     } catch (err) {
-      if (deviceGenRef.current !== gen) return
+      if (deviceGenRef.current !== gen) return true
+      const streamUntouched = liveStreamMapRef.current[target.id] === initStream
+      const errEntry = {
+        active: false,
+        text: '',
+        thinking: '',
+        tools: [],
+        error: String(err?.message || err),
+      }
+      liveStreamMapRef.current[target.id] = errEntry
       setStreamingBySession((prev) => ({
         ...prev,
-        [target.id]: { active: false, text: '', thinking: '', tools: [], error: String(err?.message || err) },
+        [target.id]: errEntry,
       }))
+      if (streamUntouched) {
+        // Return preview URL ownership back to Composer and roll back unsent optimistic bubble
+        for (const a of imgAtts) {
+          if (a?.localPreviewUrl) sentPreviewUrlsRef.current.delete(a.localPreviewUrl)
+        }
+        const rolledBack = messagesRef.current.filter((m) => m?.id !== userMsg.id)
+        messagesRef.current = rolledBack
+        setMessages((prev) => {
+          const next = prev.filter((m) => m?.id !== userMsg.id)
+          messagesRef.current = next
+          return next
+        })
+        void saveCachedSession(
+          target.id,
+          {
+            meta: target,
+            messages: rolledBack,
+            hasMore: baseHistoryMeta.hasMore,
+            nextCursor: baseHistoryMeta.nextCursor,
+            totalCount: baseHistoryMeta.totalCount,
+          },
+          scope,
+        )
+        return false
+      }
+      return true
     }
   }
 
   const handleInterrupt = async () => {
     const client = clientRef.current
-    if (!client || !activeSession) return
+    const sess = activeSessionRef.current
+    if (!client || !sess?.id) return
+    const sid = sess.id
+    const gen = deviceGenRef.current
     const targetBridge = activeBridgeIdRef.current
     try {
-      await client.rpc(
+      const res = await client.rpc(
         RPC.SESSION_INTERRUPT,
-        { id: activeSession.id },
+        { id: sid },
         45_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
-    } catch {}
+      if (deviceGenRef.current !== gen) return
+      if (res?.interrupted === false) {
+        clearLiveStreamEntry(sid)
+        setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
+        void syncActiveSessionQuietly(sid)
+      }
+    } catch {
+      if (deviceGenRef.current !== gen) return
+      clearLiveStreamEntry(sid)
+      setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
+      void syncActiveSessionQuietly(sid)
+    }
   }
 
   const handleResolveApproval = async (id, decisionOrPayload) => {
     const client = clientRef.current
     if (!client) return
+    const gen = deviceGenRef.current
     const targetBridge = activeBridgeIdRef.current
+    const rpcOpts = targetBridge ? { bridgeId: targetBridge } : {}
     const payload =
       decisionOrPayload && typeof decisionOrPayload === 'object'
         ? { id, decision: decisionOrPayload.decision || 'submit', answers: decisionOrPayload.answers }
         : { id, decision: decisionOrPayload }
     try {
-      await client.rpc(
-        RPC.APPROVAL_RESOLVE,
-        payload,
-        45_000,
-        targetBridge ? { bridgeId: targetBridge } : {},
-      )
+      const res = await client.rpc(RPC.APPROVAL_RESOLVE, payload, 45_000, rpcOpts)
+      if (deviceGenRef.current !== gen) return
+      if (res && res.resolved === false) {
+        const reason = String(res.reason || '')
+        const isAlreadyHandled = /not\s*found|already|不存在|已处理|已过期|expired/i.test(reason)
+        if (isAlreadyHandled) {
+          setApprovals((prev) => prev.filter((a) => a.id !== id))
+        }
+        showToast(reason || biLang(getCurrentLang(), '审批未能提交，请重试', 'Could not resolve prompt'))
+        return
+      }
       setApprovals((prev) => prev.filter((a) => a.id !== id))
     } catch (err) {
+      if (deviceGenRef.current !== gen) return
       alert(String(err?.message || err))
+      // Background re-sync so stale/already-handled prompts are removed from UI
+      client
+        .rpc(RPC.APPROVAL_LIST, {}, 20_000, rpcOpts)
+        .then((listRes) => {
+          if (
+            deviceGenRef.current !== gen ||
+            clientRef.current !== client ||
+            (targetBridge && activeBridgeIdRef.current !== targetBridge)
+          ) {
+            return
+          }
+          if (listRes && Array.isArray(listRes.approvals)) {
+            setApprovals(listRes.approvals)
+          }
+        })
+        .catch(() => {})
     }
   }
 
@@ -1862,6 +2262,7 @@ export function App() {
   const currentWorkspaceLabel = activeSession?.workspace || selectedDraftWorkspaceObj?.name || ''
   const headerSubtitle = (() => {
     if (connState === 'unauthorized') return `${activeDeviceName} · ${t('common.expired')}`
+    if (connState === 'error') return `${activeDeviceName} · ${bi('连接已断开', 'Disconnected')}`
     if (connState !== 'connected') return `${activeDeviceName} · ${t('common.connecting')}`
     if (!bridgeOnline) return `${activeDeviceName} · ${t('common.offline')}`
     if (hasMultipleTargets) {
@@ -1945,7 +2346,7 @@ export function App() {
               >
                 <span
                   className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                    connState === 'unauthorized'
+                    connState === 'unauthorized' || connState === 'error'
                       ? 'bg-rose-500'
                       : connState === 'connected' && bridgeOnline
                         ? 'bg-emerald-500'
@@ -2023,6 +2424,21 @@ export function App() {
         </div>
       )}
 
+      {/* Connection limit / fatal WS error banner (e.g., close code 4029) */}
+      {connState === 'error' && (
+        <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
+          <WifiOff className="h-3.5 w-3.5 shrink-0" />
+          <span>{connError || bi('连接已断开，请重试', 'Connection closed. Please reconnect.')}</span>
+          <button
+            type="button"
+            onClick={() => clientRef.current?.connect()}
+            className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
+          >
+            {bi('重新连接', 'Reconnect')}
+          </button>
+        </div>
+      )}
+
       {/* Offline warning bar if relay connected but target PC bridge offline */}
       {connState === 'connected' && !bridgeOnline && (
         <div className="flex flex-wrap items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
@@ -2049,6 +2465,7 @@ export function App() {
       {otherSessionApprovals.length > 0 && connState === 'connected' && bridgeOnline && !e2eeLocked && (() => {
         const first = otherSessionApprovals[0]
         const targetSess = sessions.find((s) => s.id === first.sessionId)
+        const jumpTarget = targetSess || first.sessionId
         return (
           <div className="flex items-center justify-center gap-2 bg-[#EEF2FF] px-3 py-1.5 text-xs text-[#2842C9] dark:bg-[#1F2742] dark:text-[#B4C4FF]">
             <span className="h-2 w-2 shrink-0 rounded-full bg-[#4D6BFE] animate-pulse" />
@@ -2058,10 +2475,10 @@ export function App() {
                 `${targetSess?.title || first.title} is waiting for your input`,
               )}
             </span>
-            {targetSess && (
+            {jumpTarget && (
               <button
                 type="button"
-                onClick={() => openSession(targetSess)}
+                onClick={() => openSession(jumpTarget)}
                 className="shrink-0 rounded-lg bg-[#4D6BFE] px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
               >
                 {bi('去查看', 'View')}
@@ -2186,6 +2603,7 @@ export function App() {
 
       {/* Floating DeepSeek-style Composer */}
       <Composer
+        key={activeDevice?.id || 'none'}
         draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
         activeApp={activeApp}
         streaming={Boolean(currentStream?.active)}
@@ -2199,16 +2617,30 @@ export function App() {
           setModelPickerOpen(true)
           const curModels = modelsCatalog?.[activeApp]?.models || []
           if (curModels.length === 0 && clientRef.current && connState === 'connected' && activeBridgeId) {
+            const client = clientRef.current
+            const gen = deviceGenRef.current
+            const reqBridgeId = activeBridgeId
             setLoadingModels(true)
-            clientRef.current
-              .rpc(RPC.MODELS_LIST, { app: activeApp }, 25_000, { bridgeId: activeBridgeId })
+            client
+              .rpc(RPC.MODELS_LIST, { app: activeApp }, 25_000, { bridgeId: reqBridgeId })
               .then((res) => {
+                if (
+                  deviceGenRef.current !== gen ||
+                  activeBridgeIdRef.current !== reqBridgeId ||
+                  clientRef.current !== client
+                ) {
+                  return
+                }
                 if (res?.catalog) {
                   setModelsCatalog((prev) => ({ ...prev, ...res.catalog }))
                 }
               })
               .catch(() => {})
-              .finally(() => setLoadingModels(false))
+              .finally(() => {
+                if (deviceGenRef.current === gen && activeBridgeIdRef.current === reqBridgeId) {
+                  setLoadingModels(false)
+                }
+              })
           }
         }}
         imageContext={imageContext}
@@ -2284,6 +2716,7 @@ export function App() {
       {/* New Chat Bottom Sheet */}
       <NewChatModal
         open={newChatOpen}
+        scopeKey={cacheScope}
         initialCwd={newChatCwd}
         initialApp={newChatApp}
         onClose={() => {

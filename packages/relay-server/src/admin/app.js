@@ -27,6 +27,7 @@
     activeTab: 'overview', // 'overview' | 'connections' | 'invites' | 'activity'
     data: null,
     loading: false,
+    pendingRefresh: false,
     autoRefreshSec: 0, // Default 0 = manual only (zero idle load)
     refreshTimer: null,
     userFilter: 'all', // 'all' | 'online' | 'active' | 'bridge_only' | 'client_only' | 'offline' | 'admin'
@@ -393,8 +394,31 @@
     return data
   }
 
+  function resetTwofaField() {
+    const twofaWrap = document.getElementById('twofa-field')
+    const twofaInput = document.getElementById('inp-twofa')
+    const twofaHint = document.getElementById('twofa-hint')
+    if (twofaWrap) twofaWrap.classList.add('hidden')
+    if (twofaInput) twofaInput.value = ''
+    if (twofaHint) twofaHint.textContent = ''
+  }
+
+  function handleAuthError(err) {
+    if (err && (err.status === 401 || err.status === 403)) {
+      clearAdminToken()
+      showLoginView(
+        err.status === 403
+          ? bi('当前账号没有管理员权限，请使用管理员账号登录。', 'This account does not have admin privileges.')
+          : bi('登录已失效，请重新登录监控后台。', 'Session expired. Please sign in again.'),
+      )
+      return true
+    }
+    return false
+  }
+
   function showLoginView(errorMsg = '') {
     stopAutoRefresh()
+    resetTwofaField()
     document.getElementById('dashboard-view').classList.add('hidden')
     document.getElementById('login-view').classList.remove('hidden')
     const errEl = document.getElementById('login-error')
@@ -411,9 +435,14 @@
     document.getElementById('dashboard-view').classList.remove('hidden')
   }
 
-  async function loadOverview({ silent = false } = {}) {
-    if (!state.token || state.loading) return
+  async function loadOverview({ silent = false, force = false } = {}) {
+    if (!state.token) return
+    if (state.loading) {
+      if (force) state.pendingRefresh = true
+      return
+    }
     state.loading = true
+    state.pendingRefresh = false
     const icon = document.getElementById('refresh-icon')
     if (icon) icon.classList.add('spin')
     const errEl = document.getElementById('global-error')
@@ -425,15 +454,7 @@
       showDashboardView()
       renderAll()
     } catch (err) {
-      if (err.status === 401 || err.status === 403) {
-        clearAdminToken()
-        showLoginView(
-          err.status === 403
-            ? bi('当前账号没有管理员权限，请使用管理员账号登录。', 'This account does not have admin privileges.')
-            : bi('登录已失效，请重新登录监控后台。', 'Session expired. Please sign in again.'),
-        )
-        return
-      }
+      if (handleAuthError(err)) return
       if (errEl) {
         errEl.textContent = String(err.message || err)
         errEl.classList.remove('hidden')
@@ -441,6 +462,10 @@
     } finally {
       state.loading = false
       if (icon) icon.classList.remove('spin')
+      if (state.pendingRefresh && state.token) {
+        state.pendingRefresh = false
+        void loadOverview({ silent: true, force: false })
+      }
     }
   }
 
@@ -543,6 +568,7 @@
       plat.win32 ? `Win ${plat.win32}` : '',
       plat.darwin ? `Mac ${plat.darwin}` : '',
       plat.linux ? `Linux ${plat.linux}` : '',
+      plat.other ? `${bi('其他', 'Other')} ${plat.other}` : '',
     ].filter(Boolean).join(' · ') || bi('暂无在线电脑', 'No online PCs')
 
     const kindSummary = [
@@ -717,6 +743,7 @@
           <span class="mini-chip">Win: ${esc(dist.bridgePlatforms?.win32 || 0)}</span>
           <span class="mini-chip">macOS: ${esc(dist.bridgePlatforms?.darwin || 0)}</span>
           <span class="mini-chip">Linux: ${esc(dist.bridgePlatforms?.linux || 0)}</span>
+          ${dist.bridgePlatforms?.other ? `<span class="mini-chip">${esc(bi('其他', 'Other'))}: ${esc(dist.bridgePlatforms.other)}</span>` : ''}
           <span class="mini-chip">${esc(bi('邀请注册门控', 'Room Invite'))}: ${esc(feat.registerInviteGated ? bi('开', 'On') : bi('关', 'Off'))}</span>
         </div>
       </div>
@@ -726,9 +753,6 @@
     const hostMemPct = Math.min(100, Math.max(0, Number(host.memUsagePct) || 0))
     const heapPct = node.heapTotalBytes > 0
       ? Math.min(100, Math.round((node.heapUsedBytes / node.heapTotalBytes) * 100))
-      : 0
-    const imgCachePct = storage.imgCacheMaxBytes > 0
-      ? Math.min(100, Math.round(((storage.imgCacheBytes || 0) / storage.imgCacheMaxBytes) * 100))
       : 0
     const load1 = Array.isArray(host.loadAvg) ? host.loadAvg[0] : 0
     const loadPct = host.cpuCount > 0 ? Math.min(100, Math.round((load1 / host.cpuCount) * 100)) : 0
@@ -771,16 +795,6 @@
             </div>
             <div class="bar-track">
               <div class="bar-fill" style="width:${isWinHost ? 0 : loadPct}%;background:${loadPct > 85 ? '#f43f5e' : '#38bdf8'}"></div>
-            </div>
-          </div>
-
-          <div class="bar-row">
-            <div class="bar-label-row">
-              <span class="bar-name">${esc(bi('图片内存缓存', 'Image LRU Cache'))}</span>
-              <span class="bar-val">${esc(storage.imgCacheItems || 0)} ${esc(bi('项', 'items'))} · ${esc(fmtBytes(storage.imgCacheBytes))}</span>
-            </div>
-            <div class="bar-track">
-              <div class="bar-fill" style="width:${imgCachePct}%;background:#7c5cff"></div>
             </div>
           </div>
         </div>
@@ -1294,6 +1308,14 @@
   // ---- Event Wiring ----
 
   function bindEvents() {
+    // Reset 2FA challenge field whenever username changes
+    const usernameInput = document.getElementById('inp-username')
+    if (usernameInput) {
+      usernameInput.addEventListener('input', () => {
+        resetTwofaField()
+      })
+    }
+
     // Login form submit
     document.getElementById('login-form').addEventListener('submit', async (e) => {
       e.preventDefault()
@@ -1361,7 +1383,7 @@
 
     // Manual refresh
     document.getElementById('btn-refresh').addEventListener('click', () => {
-      void loadOverview()
+      void loadOverview({ force: true })
     })
 
     // Auto refresh selector
@@ -1391,11 +1413,19 @@
     document.getElementById('btn-lang').addEventListener('click', toggleLang)
     document.getElementById('login-lang-btn').addEventListener('click', toggleLang)
 
-    // Logout
+    // Logout (revoke current session sid server-side so bearer JWT cannot be reused)
     document.getElementById('btn-logout').addEventListener('click', () => {
+      const tok = state.token
       clearAdminToken()
       showLoginView()
       showToast(bi('已退出监控后台', 'Signed out of monitor'))
+      if (tok) {
+        fetch(`${RELAY_BASE_PATH}/api/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tok}` },
+          keepalive: true,
+        }).catch(() => {})
+      }
     })
 
     // Search & Sort & Expand All
@@ -1448,8 +1478,9 @@
         adminEl.checked = false
         state.inviteFilter = 'active'
         showToast(bi(`已生成 ${res.invites.length} 个邀请码`, `Generated ${res.invites.length} invite(s)`))
-        await loadOverview()
+        await loadOverview({ force: true })
       } catch (err) {
+        if (handleAuthError(err)) return
         showToast(String(err.message || err))
       } finally {
         btn.disabled = false
@@ -1512,8 +1543,9 @@
             body: { roomId, bridgeId },
           })
           showToast(bi(`已断开电脑桥接 ${bridgeId}`, `Disconnected bridge ${bridgeId}`))
-          await loadOverview()
+          await loadOverview({ force: true })
         } catch (err) {
+          if (handleAuthError(err)) return
           showToast(String(err.message || err))
         }
         return
@@ -1535,8 +1567,9 @@
             body: { userId, sid, clientId },
           })
           showToast(bi('已踢出该终端会话', 'Terminal session revoked'))
-          await loadOverview()
+          await loadOverview({ force: true })
         } catch (err) {
+          if (handleAuthError(err)) return
           showToast(String(err.message || err))
         }
         return
@@ -1556,8 +1589,9 @@
             body: { userId },
           })
           showToast(bi(`已强制下线该用户全部终端（踢出 ${res.disconnectedClients || 0} 条在线连接）`, `Signed out all sessions (${res.disconnectedClients || 0} live)`))
-          await loadOverview()
+          await loadOverview({ force: true })
         } catch (err) {
+          if (handleAuthError(err)) return
           showToast(String(err.message || err))
         }
         return
@@ -1577,8 +1611,9 @@
             body: { id },
           })
           showToast(bi('已作废邀请码', 'Invite code revoked'))
-          await loadOverview()
+          await loadOverview({ force: true })
         } catch (err) {
+          if (handleAuthError(err)) return
           showToast(String(err.message || err))
         }
       }
@@ -1591,7 +1626,7 @@
       if (tag === 'input' || tag === 'textarea' || tag === 'select') return
       if (e.key === 'r' || e.key === 'R') {
         e.preventDefault()
-        void loadOverview()
+        void loadOverview({ force: true })
       }
     })
   }

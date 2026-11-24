@@ -597,6 +597,7 @@ export class MobileRelayClient {
     this.eventListeners = new Set()
     this.statusListeners = new Set()
     this.connectionState = 'disconnected'
+    this.connectionError = ''
     this.bridges = []
     this.devices = null
     this.clientId = ''
@@ -604,6 +605,22 @@ export class MobileRelayClient {
     this.onlineClientCount = 0
     this.pendingGrants = []
     this._grantListResolvers = new Map()
+  }
+
+  _rejectPendingRpcs(message = L('连接已断开', 'Connection closed')) {
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer)
+      p.reject(new Error(message))
+    }
+    this.pending.clear()
+  }
+
+  _settleGrantListResolvers() {
+    for (const resolver of this._grantListResolvers.values()) {
+      clearTimeout(resolver.timer)
+      try { resolver.resolve(this.pendingGrants || []) } catch {}
+    }
+    this._grantListResolvers.clear()
   }
 
   setTargetBridgeId(bridgeId) {
@@ -646,6 +663,7 @@ export class MobileRelayClient {
     this.statusListeners.add(fn)
     fn({
       state: this.connectionState,
+      error: this.connectionError,
       bridges: this.bridges,
       devices: this.devices,
       clientId: this.clientId,
@@ -658,6 +676,7 @@ export class MobileRelayClient {
   emitStatus() {
     const snap = {
       state: this.connectionState,
+      error: this.connectionError,
       bridges: this.bridges,
       devices: this.devices,
       clientId: this.clientId,
@@ -671,6 +690,7 @@ export class MobileRelayClient {
 
   connect() {
     this.closed = false
+    this.connectionError = ''
     this.openSocket()
   }
 
@@ -682,16 +702,15 @@ export class MobileRelayClient {
       this.reconnectTimer = null
     }
     this.stopPing()
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer)
-      p.reject(new Error(L('连接已断开', 'Connection closed')))
-    }
-    this.pending.clear()
+    this._rejectPendingRpcs(L('连接已断开', 'Connection closed'))
+    this._settleGrantListResolvers()
     if (this.ws) {
-      try { this.ws.close(1000) } catch {}
+      const oldWs = this.ws
       this.ws = null
+      try { oldWs.close(1000) } catch {}
     }
     this.connectionState = 'disconnected'
+    this.connectionError = ''
     this.emitStatus()
   }
 
@@ -708,7 +727,20 @@ export class MobileRelayClient {
   async openSocket() {
     if (this.closed) return
     const gen = ++this.connectGen
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.stopPing()
+    if (this.ws) {
+      const prevWs = this.ws
+      this.ws = null
+      try { prevWs.close(1000) } catch {}
+    }
+    this._rejectPendingRpcs(L('连接正在重建', 'Connection reconnecting'))
+    this._settleGrantListResolvers()
     this.connectionState = 'connecting'
+    this.connectionError = ''
     this.emitStatus()
 
     // Exchange 30-day master JWT (in Authorization header) for a 30s single-use WS ticket
@@ -729,6 +761,12 @@ export class MobileRelayClient {
     }
     if (this.closed || gen !== this.connectGen) return
 
+    if (this.ws) {
+      const prevWs = this.ws
+      this.ws = null
+      try { prevWs.close(1000) } catch {}
+    }
+
     const url = toWsUrl(this.baseUrl, '/ws/client', {
       ticket,
       lastSeq: this.lastSeq > 0 ? this.lastSeq : undefined,
@@ -738,18 +776,18 @@ export class MobileRelayClient {
     this.ws = ws
 
     ws.onopen = () => {
-      if (this.closed || gen !== this.connectGen) {
+      if (this.closed || gen !== this.connectGen || this.ws !== ws) {
         try { ws.close(1000) } catch {}
         return
       }
       this.attempt = 0
       this.openedOnce = true
-      this.connectionState = 'connected'
-      this.emitStatus()
       this.startPing()
+      // Wait for the server's `hello` frame (with fresh bridges/devices) before emitting 'connected'
     }
 
     ws.onmessage = (ev) => {
+      if (this.closed || gen !== this.connectGen || this.ws !== ws) return
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
 
@@ -762,6 +800,8 @@ export class MobileRelayClient {
           this.liveClients = msg.clients
           this.onlineClientCount = Number(msg.onlineClientCount) || msg.clients.length
         }
+        this.connectionState = 'connected'
+        this.connectionError = ''
         if (Array.isArray(msg.pendingGrants)) {
           this.pendingGrants = msg.pendingGrants
           for (const g of msg.pendingGrants) {
@@ -792,7 +832,11 @@ export class MobileRelayClient {
         clearTimeout(p.timer)
         this.pending.delete(msg.id)
         if (msg.e2ee) {
-          const decryptKey = p.e2eeKey || (msg.e2ee.kid ? this.e2eeKeys[msg.e2ee.kid] : '')
+          const resKid = String(msg.e2ee.kid || '').trim().toLowerCase()
+          const decryptKey =
+            (resKid && (this.e2eeKeys[resKid] || this.e2eeKeys[msg.e2ee.kid])) ||
+            p.e2eeKey ||
+            ''
           if (!decryptKey) {
             const err = new Error(L('缺少端到端解密密钥，请先扫码同步密钥', 'Missing E2EE key. Scan the QR code on your computer to sync.'))
             err.code = 'E2EE_KEY_REQUIRED'
@@ -833,8 +877,8 @@ export class MobileRelayClient {
       }
 
       if (msg.type === 'event') {
-        if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
         if (!msg.e2ee) {
+          if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
           // Only relay-originated control metadata events are unencrypted; drop any plaintext bridge events
           if (msg.event === 'bridge.status') {
             if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
@@ -874,15 +918,20 @@ export class MobileRelayClient {
           }
           return
         }
-        const key = msg.e2ee.kid ? this.e2eeKeys[msg.e2ee.kid] : ''
+        const evKid = String(msg.e2ee.kid || '').trim().toLowerCase()
+        const key = evKid ? (this.e2eeKeys[evKid] || this.e2eeKeys[msg.e2ee.kid] || '') : ''
+        // Do NOT advance lastSeq when the decryption key is currently missing so catch-up replay can recover
         if (!key) return
+        if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
         // Decrypt & dispatch encrypted bridge events strictly in FIFO order
         const roomIdSnap = this.roomId
         const envSnap = msg.e2ee
         const rawMsg = msg
         this._inboundEventQueue = this._inboundEventQueue
           .then(async () => {
+            if (this.closed || gen !== this.connectGen || this.ws !== ws) return
             const inner = await decryptJson(key, envSnap, { kind: 'event', roomId: roomIdSnap })
+            if (this.closed || gen !== this.connectGen || this.ws !== ws) return
             if (!inner?.event) return
             for (const fn of this.eventListeners) {
               try { fn(inner.event, inner.payload, rawMsg) } catch {}
@@ -893,11 +942,27 @@ export class MobileRelayClient {
     }
 
     ws.onclose = (ev) => {
-      this.stopPing()
-      if (this.ws === ws) this.ws = null
+      if (this.ws === ws) {
+        this.ws = null
+        this.stopPing()
+      }
       if (this.closed || gen !== this.connectGen) return
+      this.stopPing()
+      this._rejectPendingRpcs(L('连接已断开，正在重连...', 'Connection closed'))
+      this._settleGrantListResolvers()
+
       if (ev.code === 4401) {
         this.connectionState = 'unauthorized'
+        this.connectionError = ''
+        this.emitStatus()
+        return
+      }
+      if (ev.code === 4029) {
+        this.connectionState = 'error'
+        this.connectionError = L(
+          '同时打开的连接数已达上限，当前标签页已断开，请关闭多余标签页后重新连接。',
+          'Too many concurrent tabs or sessions open. This connection was closed. Close extra tabs and reconnect.',
+        )
         this.emitStatus()
         return
       }

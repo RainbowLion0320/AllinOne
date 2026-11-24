@@ -1,5 +1,5 @@
 /**
- * Zero-dependency, 100% offline ISO/IEC 18004 QR Code SVG encoder (Versions 1–10, EC Level M).
+ * Zero-dependency, 100% offline ISO/IEC 18004 QR Code SVG encoder (Versions 1–16, EC Level M).
  * Isomorphic (Node.js + Browser via TextEncoder). Keeps sensitive keys/URLs strictly local.
  */
 
@@ -69,6 +69,12 @@ const VERSION_SPECS_M = [
   { version: 8, ecPerBlock: 22, blocks: [[2, 38], [2, 39]], align: [6, 24, 42] },
   { version: 9, ecPerBlock: 22, blocks: [[3, 36], [2, 37]], align: [6, 26, 46] },
   { version: 10, ecPerBlock: 26, blocks: [[4, 43], [1, 44]], align: [6, 28, 50] },
+  { version: 11, ecPerBlock: 30, blocks: [[1, 50], [4, 51]], align: [6, 30, 54] },
+  { version: 12, ecPerBlock: 22, blocks: [[6, 36], [2, 37]], align: [6, 32, 58] },
+  { version: 13, ecPerBlock: 22, blocks: [[8, 37], [1, 38]], align: [6, 34, 62] },
+  { version: 14, ecPerBlock: 24, blocks: [[4, 40], [5, 41]], align: [6, 26, 46, 66] },
+  { version: 15, ecPerBlock: 24, blocks: [[5, 41], [5, 42]], align: [6, 26, 48, 70] },
+  { version: 16, ecPerBlock: 28, blocks: [[7, 45], [3, 46]], align: [6, 26, 50, 74] },
 ]
 
 function totalDataBytes(spec) {
@@ -207,6 +213,36 @@ function evaluatePenalty(grid, size) {
       }
     }
   }
+  // Rule 3: 1:1:3:1:1 finder-like pattern preceded or followed by 4 light modules (+40 each)
+  for (let r = 0; r < size; r += 1) {
+    const row = grid[r]
+    for (let c = 0; c <= size - 11; c += 1) {
+      if (
+        (row[c] === 1 && row[c + 1] === 0 && row[c + 2] === 1 && row[c + 3] === 1 &&
+          row[c + 4] === 1 && row[c + 5] === 0 && row[c + 6] === 1 &&
+          row[c + 7] === 0 && row[c + 8] === 0 && row[c + 9] === 0 && row[c + 10] === 0) ||
+        (row[c] === 0 && row[c + 1] === 0 && row[c + 2] === 0 && row[c + 3] === 0 &&
+          row[c + 4] === 1 && row[c + 5] === 0 && row[c + 6] === 1 &&
+          row[c + 7] === 1 && row[c + 8] === 1 && row[c + 9] === 0 && row[c + 10] === 1)
+      ) {
+        penalty += 40
+      }
+    }
+  }
+  for (let c = 0; c < size; c += 1) {
+    for (let r = 0; r <= size - 11; r += 1) {
+      if (
+        (grid[r][c] === 1 && grid[r + 1][c] === 0 && grid[r + 2][c] === 1 && grid[r + 3][c] === 1 &&
+          grid[r + 4][c] === 1 && grid[r + 5][c] === 0 && grid[r + 6][c] === 1 &&
+          grid[r + 7][c] === 0 && grid[r + 8][c] === 0 && grid[r + 9][c] === 0 && grid[r + 10][c] === 0) ||
+        (grid[r][c] === 0 && grid[r + 1][c] === 0 && grid[r + 2][c] === 0 && grid[r + 3][c] === 0 &&
+          grid[r + 4][c] === 1 && grid[r + 5][c] === 0 && grid[r + 6][c] === 1 &&
+          grid[r + 7][c] === 1 && grid[r + 8][c] === 1 && grid[r + 9][c] === 0 && grid[r + 10][c] === 1)
+      ) {
+        penalty += 40
+      }
+    }
+  }
   let dark = 0
   for (let r = 0; r < size; r += 1) {
     for (let c = 0; c < size; c += 1) {
@@ -220,14 +256,16 @@ function evaluatePenalty(grid, size) {
 }
 
 export function encodeQrMatrix(text) {
-  const bytes = textEncoder.encode(String(text || ''))
+  const bytes = textEncoder.encode(String(text ?? ''))
   const spec = VERSION_SPECS_M.find((s) => {
     const capBytes = totalDataBytes(s)
     const headerBits = 4 + (s.version <= 9 ? 8 : 16)
     return headerBits + bytes.length * 8 <= capBytes * 8
   })
   if (!spec) {
-    throw new Error(`QR payload too long (${bytes.length} bytes, max 213)`)
+    const maxSpec = VERSION_SPECS_M[VERSION_SPECS_M.length - 1]
+    const maxBytes = Math.floor((totalDataBytes(maxSpec) * 8 - (4 + (maxSpec.version <= 9 ? 8 : 16))) / 8)
+    throw new Error(`QR payload too long (${bytes.length} bytes, max ${maxBytes})`)
   }
 
   const size = 17 + 4 * spec.version
@@ -372,18 +410,34 @@ export function encodeQrMatrix(text) {
   return { size, version: spec.version, mask: bestMask, grid: bestGrid }
 }
 
+const SAFE_SVG_COLOR_RE =
+  /^(?:#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})|[a-zA-Z]{3,20}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))$/
+
+function sanitizeSvgColor(val, fallback) {
+  const s = String(val ?? '').trim()
+  return SAFE_SVG_COLOR_RE.test(s) ? s : fallback
+}
+
 export function renderQrSvg(text, { pixelSize = 240, quietZone = 4, darkColor = '#0F172A', lightColor = '#FFFFFF' } = {}) {
+  const safePixelSize = Number.isFinite(Number(pixelSize))
+    ? Math.max(16, Math.min(4096, Math.round(Number(pixelSize))))
+    : 240
+  const safeQuietZone = Number.isFinite(Number(quietZone))
+    ? Math.max(0, Math.min(32, Math.floor(Number(quietZone))))
+    : 4
+  const safeDark = sanitizeSvgColor(darkColor, '#0F172A')
+  const safeLight = sanitizeSvgColor(lightColor, '#FFFFFF')
   const { size, grid } = encodeQrMatrix(text)
-  const total = size + quietZone * 2
+  const total = size + safeQuietZone * 2
   const parts = []
   for (let r = 0; r < size; r += 1) {
     for (let c = 0; c < size; c += 1) {
       if (grid[r][c]) {
-        parts.push(`M${c + quietZone},${r + quietZone}h1v1h-1z`)
+        parts.push(`M${c + safeQuietZone},${r + safeQuietZone}h1v1h-1z`)
       }
     }
   }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" width="${pixelSize}" height="${pixelSize}" shape-rendering="crispEdges"><rect width="${total}" height="${total}" fill="${lightColor}"/><path d="${parts.join('')}" fill="${darkColor}"/></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" width="${safePixelSize}" height="${safePixelSize}" shape-rendering="crispEdges"><rect width="${total}" height="${total}" fill="${safeLight}"/><path d="${parts.join('')}" fill="${safeDark}"/></svg>`
 }
 
 export function renderQrDataUrl(text, opts = {}) {

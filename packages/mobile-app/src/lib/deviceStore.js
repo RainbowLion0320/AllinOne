@@ -45,15 +45,18 @@ export function formatServerHost(baseUrl) {
 
 function sanitizeE2eeKeysMap(rawMap) {
   if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) return {}
-  const out = {}
-  let count = 0
+  const deduped = new Map()
   for (const [kid, val] of Object.entries(rawMap)) {
-    if (count >= 16) break
     const cleanKid = String(kid || '').trim().toLowerCase()
     const cleanVal = String(val || '').trim()
     if (!/^[0-9a-f]{16}$/.test(cleanKid) || !/^[A-Za-z0-9_-]{42,44}$/.test(cleanVal)) continue
-    out[cleanKid] = cleanVal
-    count += 1
+    deduped.delete(cleanKid)
+    deduped.set(cleanKid, cleanVal)
+  }
+  const recent = [...deduped.entries()].slice(-16)
+  const out = {}
+  for (const [k, v] of recent) {
+    out[k] = v
   }
   return out
 }
@@ -170,10 +173,14 @@ export function upsertDevice(state, payload) {
       lastHostname: incoming.lastHostname || existing.lastHostname,
       lastPlatform: incoming.lastPlatform || existing.lastPlatform,
       selectedBridgeId: existing.selectedBridgeId || incoming.selectedBridgeId,
-      e2eeKeys: {
-        ...sanitizeE2eeKeysMap(existing.e2eeKeys),
-        ...sanitizeE2eeKeysMap(incoming.e2eeKeys),
-      },
+      e2eeKeys: (() => {
+        const mergedKeys = { ...sanitizeE2eeKeysMap(existing.e2eeKeys) }
+        for (const [k, v] of Object.entries(sanitizeE2eeKeysMap(incoming.e2eeKeys))) {
+          delete mergedKeys[k]
+          mergedKeys[k] = v
+        }
+        return sanitizeE2eeKeysMap(mergedKeys)
+      })(),
       lastUsedAt: now,
     }
     const nextDevices = baseState.devices.slice()
@@ -327,10 +334,11 @@ export function upsertDeviceE2eeKey(state, deviceId, keyId, key) {
   if (!state || !Array.isArray(state.devices) || !deviceId || !keyId || !key) return state
   const target = state.devices.find((d) => d.id === deviceId)
   if (!target) return state
-  const merged = {
-    ...(target.e2eeKeys || {}),
-    [String(keyId).trim().toLowerCase()]: String(key).trim(),
-  }
+  const cleanKid = String(keyId).trim().toLowerCase()
+  const cleanKey = String(key).trim()
+  const merged = { ...(target.e2eeKeys || {}) }
+  delete merged[cleanKid]
+  merged[cleanKid] = cleanKey
   return updateDeviceMeta(state, deviceId, { e2eeKeys: merged })
 }
 

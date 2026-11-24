@@ -58,6 +58,55 @@ export function makeScopedCacheKey(sessionId, scope = '') {
   return sc ? `${sc}::${sid}` : sid
 }
 
+function stripEphemeralPreviewUrls(messages) {
+  if (!Array.isArray(messages)) return []
+  let anyChanged = false
+  const mapped = messages.map((msg) => {
+    if (!msg || typeof msg !== 'object') return msg
+    let msgChanged = false
+    let nextImages = msg.images
+    if (Array.isArray(msg.images)) {
+      let imgsChanged = false
+      const cleanedImgs = msg.images.map((img) => {
+        if (img && typeof img === 'object' && 'localPreviewUrl' in img) {
+          imgsChanged = true
+          const { localPreviewUrl: _drop, ...rest } = img
+          return rest
+        }
+        return img
+      })
+      if (imgsChanged) {
+        msgChanged = true
+        nextImages = cleanedImgs
+      }
+    }
+    let nextAttachments = msg.attachments
+    if (Array.isArray(msg.attachments)) {
+      let attsChanged = false
+      const cleanedAtts = msg.attachments.map((att) => {
+        if (att && typeof att === 'object' && 'localPreviewUrl' in att) {
+          attsChanged = true
+          const { localPreviewUrl: _drop, ...rest } = att
+          return rest
+        }
+        return att
+      })
+      if (attsChanged) {
+        msgChanged = true
+        nextAttachments = cleanedAtts
+      }
+    }
+    if (!msgChanged) return msg
+    anyChanged = true
+    return {
+      ...msg,
+      ...(nextImages !== msg.images ? { images: nextImages } : {}),
+      ...(nextAttachments !== msg.attachments ? { attachments: nextAttachments } : {}),
+    }
+  })
+  return anyChanged ? mapped : messages
+}
+
 export async function loadCachedSession(sessionId, scope = '') {
   if (!sessionId) return null
   const cacheKey = makeScopedCacheKey(sessionId, scope)
@@ -82,6 +131,12 @@ export async function loadCachedSession(sessionId, scope = '') {
   if (record.cachedAt && Date.now() - record.cachedAt > MAX_CACHE_AGE_MS) {
     void deleteCachedSession(sessionId, scope)
     return null
+  }
+  if (Array.isArray(record.messages)) {
+    const cleaned = stripEphemeralPreviewUrls(record.messages)
+    if (cleaned !== record.messages) {
+      return { ...record, messages: cleaned }
+    }
   }
   return record
 }
@@ -109,7 +164,7 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
   const cleanScope = String(scope || '').trim()
   const cacheKey = makeScopedCacheKey(sessionId, cleanScope)
 
-  let messages = Array.isArray(payload.messages) ? payload.messages : []
+  let messages = stripEphemeralPreviewUrls(Array.isArray(payload.messages) ? payload.messages : [])
   let hasMore = Boolean(payload.hasMore)
   let nextCursor = payload.nextCursor ?? null
   const totalCount = payload.totalCount ?? null
@@ -117,10 +172,13 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
   // Enforce per-session persisted cap without ever corrupting opaque cursors (e.g. Codex)
   if (messages.length > MAX_MESSAGES_PER_SESSION) {
     const dropCount = messages.length - MAX_MESSAGES_PER_SESSION
+    const isCodexSession =
+      payload.meta?.app === 'codex' || String(sessionId).startsWith('codex:')
     const isNumericCursor =
-      nextCursor === null ||
-      nextCursor === undefined ||
-      (typeof nextCursor === 'string' && /^\d+$/.test(nextCursor))
+      !isCodexSession &&
+      (nextCursor === null ||
+        nextCursor === undefined ||
+        (typeof nextCursor === 'string' && /^\d+$/.test(nextCursor)))
 
     if (isNumericCursor) {
       const baseStart = nextCursor ? Number(nextCursor) : 0
@@ -128,14 +186,12 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
       nextCursor = String(baseStart + dropCount)
       hasMore = true
     } else {
-      // For opaque cursors (Codex), if an existing <=120 snapshot is already stored, keep its valid cursor
-      // and only refresh the newest tail without growing persisted size beyond 120.
-      const existing = await loadCachedSession(sessionId, cleanScope)
-      if (existing && existing.messages?.length >= MAX_MESSAGES_PER_SESSION) {
-        return
-      }
-      // First time exceeding 120: persist capped latest slice cleanly (user can still scroll live in RAM)
+      // For Codex / opaque-cursor sessions exceeding MAX_MESSAGES_PER_SESSION:
+      // retain the latest 120 messages cleanly and clear cursor/hasMore so we neither
+      // fabricate invalid numeric cursors nor freeze cache updates or skip history gaps.
       messages = messages.slice(-MAX_MESSAGES_PER_SESSION)
+      hasMore = false
+      nextCursor = null
     }
   }
 

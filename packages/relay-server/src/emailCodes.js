@@ -31,7 +31,7 @@ export function createEmailCodeStore(options = {}) {
 
   /** key `${purpose}:${emailLower}` -> { salt, hash, userId, issuedAt, expiresAt, attempts } */
   const codes = new Map()
-  /** emailLower -> timestamps[] */
+  /** key `${purpose}:${emailLower}` -> timestamps[] */
   const emailSendLog = new Map()
   /** ip -> timestamps[] */
   const ipSendLog = new Map()
@@ -92,7 +92,7 @@ export function createEmailCodeStore(options = {}) {
       }
     }
 
-    const recentEmail = getRecentTimestamps(emailSendLog, emailLower, now)
+    const recentEmail = getRecentTimestamps(emailSendLog, key, now)
     if (recentEmail.length >= maxEmailPerHour) {
       return {
         ok: false,
@@ -120,27 +120,31 @@ export function createEmailCodeStore(options = {}) {
     }
 
     codes.set(key, entry)
-    emailSendLog.set(emailLower, [...recentEmail, now])
+    emailSendLog.set(key, [...recentEmail, now])
     ipSendLog.set(cleanIp, [...recentIp, now])
 
+    const removeOneTimestamp = (map, mapKey, ts) => {
+      const cur = map.get(mapKey)
+      if (!cur) return
+      const idx = cur.lastIndexOf(ts)
+      if (idx === -1) return
+      const next = cur.slice()
+      next.splice(idx, 1)
+      if (next.length === 0) map.delete(mapKey)
+      else map.set(mapKey, next)
+    }
+
     // Roll back cooldown & quota entry if the upstream SMTP send itself fails
+    let rolledBack = false
     const rollback = () => {
+      if (rolledBack) return
+      rolledBack = true
       if (codes.get(key) === entry) {
         if (prev && prev.expiresAt > Date.now()) codes.set(key, prev)
         else codes.delete(key)
       }
-      const curEmail = emailSendLog.get(emailLower)
-      if (curEmail) {
-        const next = curEmail.filter((t) => t !== now)
-        if (next.length === 0) emailSendLog.delete(emailLower)
-        else emailSendLog.set(emailLower, next)
-      }
-      const curIp = ipSendLog.get(cleanIp)
-      if (curIp) {
-        const next = curIp.filter((t) => t !== now)
-        if (next.length === 0) ipSendLog.delete(cleanIp)
-        else ipSendLog.set(cleanIp, next)
-      }
+      removeOneTimestamp(emailSendLog, key, now)
+      removeOneTimestamp(ipSendLog, cleanIp, now)
     }
 
     return {

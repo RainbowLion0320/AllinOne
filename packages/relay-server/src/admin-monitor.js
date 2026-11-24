@@ -36,11 +36,8 @@ function normalizePlatformBucket(platform) {
  */
 export function collectServerHealth({
   uploadDir,
-  bridgeImgCacheItems = 0,
-  bridgeImgCacheBytes = 0,
-  bridgeImgCacheMaxBytes = 48 * 1024 * 1024,
   mailer = null,
-  registerInviteGated = false,
+  registerInviteGated = true,
   startedAt = Date.now(),
   version = '0.3.9',
 } = {}) {
@@ -98,9 +95,6 @@ export function collectServerHealth({
     storage: {
       uploadFileCount,
       uploadTotalBytes,
-      imgCacheItems: bridgeImgCacheItems,
-      imgCacheBytes: bridgeImgCacheBytes,
-      imgCacheMaxBytes: bridgeImgCacheMaxBytes,
     },
     features: {
       emailEnabled: Boolean(mailer?.isConfigured?.()),

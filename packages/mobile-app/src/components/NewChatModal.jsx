@@ -7,6 +7,7 @@ import { useI18n } from '../lib/i18n.jsx'
 
 export function NewChatModal({
   open,
+  scopeKey = '',
   initialCwd = '',
   initialApp = '',
   onClose,
@@ -26,25 +27,49 @@ export function NewChatModal({
   const [reasoningEffort, setReasoningEffort] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   const prevOpenRef = useRef(false)
+  const prevScopeKeyRef = useRef(scopeKey)
+  const userClearedCwdRef = useRef(false)
+  const cwdRef = useRef(cwd)
+  cwdRef.current = cwd
+  const appRef = useRef(app)
+  appRef.current = app
 
   const appCatalog = modelsCatalog?.[app] || null
   const appModels = appCatalog?.models || []
 
   useEffect(() => {
+    if (prevScopeKeyRef.current !== scopeKey) {
+      prevScopeKeyRef.current = scopeKey
+      userClearedCwdRef.current = false
+      setCwd('')
+      setPickerOpen(false)
+    }
+  }, [scopeKey])
+
+  useEffect(() => {
     const justOpened = open && !prevOpenRef.current
     prevOpenRef.current = open
-    if (!open) return
+    if (!open) {
+      userClearedCwdRef.current = false
+      setCwd('')
+      setPickerOpen(false)
+      return
+    }
 
     if (justOpened) {
+      userClearedCwdRef.current = false
+      setPickerOpen(false)
       if (initialCwd) {
         setCwd(initialCwd)
-      } else if (!cwd && workspaces?.[0]?.path) {
+      } else if (workspaces?.[0]?.path) {
         setCwd(workspaces[0].path)
+      } else {
+        setCwd('')
       }
       if (initialApp && APP_LIST.includes(initialApp)) {
         setApp(initialApp)
       } else {
-        const curWritable = appsStatus.find((a) => a.app === app && a.writable)
+        const curWritable = appsStatus.find((a) => a.app === appRef.current && a.writable)
         if (!curWritable) {
           const firstWritable = ['dsh', 'codex', 'claude', 'antigravity'].find((id) =>
             appsStatus.find((a) => a.app === id && a.writable),
@@ -55,10 +80,10 @@ export function NewChatModal({
       return
     }
 
-    if (!cwd && workspaces?.[0]?.path) {
+    if (!userClearedCwdRef.current && !cwdRef.current && workspaces?.[0]?.path) {
       setCwd(workspaces[0].path)
     }
-  }, [open, initialApp, initialCwd, workspaces, appsStatus, app, cwd])
+  }, [open, initialApp, initialCwd, workspaces, appsStatus])
 
   // Sync default model/provider/effort whenever app switches or catalog arrives
   useEffect(() => {
@@ -259,7 +284,11 @@ export function NewChatModal({
               <input
                 type="text"
                 value={cwd}
-                onChange={(e) => setCwd(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value
+                  userClearedCwdRef.current = val === ''
+                  setCwd(val)
+                }}
                 placeholder={bi('默认目录', 'Default directory')}
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#16171A] dark:text-slate-100"
               />
@@ -269,7 +298,10 @@ export function NewChatModal({
                     <button
                       key={w.id || w.path}
                       type="button"
-                      onClick={() => setCwd(w.path)}
+                      onClick={() => {
+                        userClearedCwdRef.current = false
+                        setCwd(w.path)
+                      }}
                       className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300"
                     >
                       {w.title || w.name || w.path}

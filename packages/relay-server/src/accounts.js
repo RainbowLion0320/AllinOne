@@ -1,5 +1,5 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { safeEqual } from './auth.js'
 
@@ -8,6 +8,8 @@ const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;:"']{2,}$/
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
+const MAX_DEVICES_PER_USER = 20
+const MAX_REVOKED_SIDS = 64
 
 function sha256Hex(val) {
   return createHash('sha256').update(String(val ?? ''), 'utf8').digest('hex')
@@ -23,6 +25,33 @@ function verifyPasswordHash(password, salt, expectedHashHex) {
   if (!password || !salt || !expectedHashHex) return false
   try {
     const derivedBuf = scryptSync(String(password), String(salt), SCRYPT_KEYLEN, SCRYPT_OPTS)
+    const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
+    if (derivedBuf.length !== expectedBuf.length) return false
+    return timingSafeEqual(derivedBuf, expectedBuf)
+  } catch {
+    return false
+  }
+}
+
+function scryptAsync(password, salt) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    scrypt(String(password), String(salt), SCRYPT_KEYLEN, SCRYPT_OPTS, (err, derivedKey) => {
+      if (err) rejectPromise(err)
+      else resolvePromise(derivedKey)
+    })
+  })
+}
+
+async function hashPasswordAsync(password, saltHex) {
+  const salt = saltHex || randomBytes(16).toString('hex')
+  const derived = (await scryptAsync(password, salt)).toString('hex')
+  return { salt, hash: derived }
+}
+
+async function verifyPasswordHashAsync(password, salt, expectedHashHex) {
+  if (!password || !salt || !expectedHashHex) return false
+  try {
+    const derivedBuf = await scryptAsync(password, salt)
     const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
     if (derivedBuf.length !== expectedBuf.length) return false
     return timingSafeEqual(derivedBuf, expectedBuf)
@@ -111,38 +140,47 @@ export function createAccountStore({ filePath }) {
 
   function load() {
     if (!existsSync(filePath)) return
+    let parsed
     try {
-      const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
-      for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
-        if (!u?.userId || !u?.username) continue
-        const rawEmail = String(u.email || '').trim()
-        const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
-        const normalized = {
-          ...u,
-          usernameLower: String(u.usernameLower || u.username).toLowerCase(),
-          email: rawEmail,
-          emailLower,
-          emailVerified: Boolean(rawEmail && u.emailVerified),
-          emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
-          loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
-          knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
-          role: u.role === 'admin' ? 'admin' : 'user',
-          tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
-          devices: Array.isArray(u.devices) ? u.devices : [],
-          sessions: Array.isArray(u.sessions) ? u.sessions : [],
-          revokedSids: u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {},
-        }
-        usersById.set(normalized.userId, normalized)
-        userIdByLower.set(normalized.usernameLower, normalized.userId)
-        if (normalized.emailLower) {
-          userIdByEmailLower.set(normalized.emailLower, normalized.userId)
-        }
+      parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+    } catch (err) {
+      console.error(`[relay] CRITICAL: Failed to read/parse accounts file (${filePath}):`, err?.message || err)
+      throw err
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      const err = new Error(`Invalid accounts file format: ${filePath}`)
+      console.error(`[relay] CRITICAL: ${err.message}`)
+      throw err
+    }
+    for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
+      if (!u?.userId || !u?.username) continue
+      const rawEmail = String(u.email || '').trim()
+      const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
+      const normalized = {
+        ...u,
+        usernameLower: String(u.usernameLower || u.username).toLowerCase(),
+        email: rawEmail,
+        emailLower,
+        emailVerified: Boolean(rawEmail && u.emailVerified),
+        emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
+        loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
+        knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
+        role: u.role === 'admin' ? 'admin' : 'user',
+        tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
+        devices: Array.isArray(u.devices) ? u.devices : [],
+        sessions: Array.isArray(u.sessions) ? u.sessions : [],
+        revokedSids: u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {},
       }
-      for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
-        if (!inv?.id || !inv?.code) continue
-        invitesById.set(inv.id, inv)
+      usersById.set(normalized.userId, normalized)
+      userIdByLower.set(normalized.usernameLower, normalized.userId)
+      if (normalized.emailLower) {
+        userIdByEmailLower.set(normalized.emailLower, normalized.userId)
       }
-    } catch {}
+    }
+    for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
+      if (!inv?.id || !inv?.code) continue
+      invitesById.set(inv.id, inv)
+    }
   }
 
   function save() {
@@ -155,11 +193,16 @@ export function createAccountStore({ filePath }) {
       null,
       2,
     )
-    const tmpPath = `${filePath}.tmp.${process.pid}`
-    writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
-    try { chmodSync(tmpPath, 0o600) } catch {}
-    renameSync(tmpPath, filePath)
-    try { chmodSync(filePath, 0o600) } catch {}
+    const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+    try {
+      writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+      try { chmodSync(tmpPath, 0o600) } catch {}
+      renameSync(tmpPath, filePath)
+      try { chmodSync(filePath, 0o600) } catch {}
+    } catch (err) {
+      try { unlinkSync(tmpPath) } catch {}
+      throw err
+    }
   }
 
   load()
@@ -376,7 +419,25 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function authenticateUser(identifier, password) {
+  function resolveAccountKey(identifier) {
+    const lower = String(identifier || '').trim().toLowerCase()
+    if (!lower) return ''
+    let userId = userIdByLower.get(lower)
+    if (!userId && lower.includes('@')) {
+      userId = userIdByEmailLower.get(lower)
+    }
+    return userId || lower
+  }
+
+  function markUserLogin(userId) {
+    const record = usersById.get(userId)
+    if (!record) return null
+    record.lastLoginAt = Date.now()
+    save()
+    return sanitizeUser(record)
+  }
+
+  function authenticateUser(identifier, password, { recordLogin = true } = {}) {
     const lower = String(identifier || '').trim().toLowerCase()
     if (!lower || !password) return null
     let userId = userIdByLower.get(lower)
@@ -389,8 +450,10 @@ export function createAccountStore({ filePath }) {
     if (!verifyPasswordHash(password, record.passwordSalt, record.passwordHash)) {
       return null
     }
-    record.lastLoginAt = Date.now()
-    save()
+    if (recordLogin) {
+      record.lastLoginAt = Date.now()
+      save()
+    }
     return {
       user: sanitizeUser(record),
       devices: record.devices.map(sanitizeDeviceRecord),
@@ -461,17 +524,72 @@ export function createAccountStore({ filePath }) {
     return { ok: true, user: sanitizeUser(record) }
   }
 
+  async function changePasswordAsync(userId, currentPassword, newPassword) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    const valid = await verifyPasswordHashAsync(currentPassword, record.passwordSalt, record.passwordHash)
+    if (!valid) {
+      return { ok: false, error: '当前密码不正确' }
+    }
+    const pCheck = validatePassword(newPassword)
+    if (!pCheck.ok) return pCheck
+    const { salt, hash } = await hashPasswordAsync(pCheck.password)
+    if (usersById.get(userId) !== record) return { ok: false, error: '用户不存在' }
+    record.passwordSalt = salt
+    record.passwordHash = hash
+    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    record.sessions = []
+    record.revokedSids = {}
+    save()
+    return { ok: true, user: sanitizeUser(record) }
+  }
+
   function bindDevice({ userId, label = '', hostname = '', platform = 'unknown', bridgeId = '' } = {}) {
     const record = usersById.get(userId)
     if (!record) return null
+    if (!Array.isArray(record.devices)) record.devices = []
     const now = Date.now()
-    const deviceId = `dev_${randomBytes(6).toString('hex')}`
-    const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
     const cleanHost = String(hostname || label || 'My-PC').trim().slice(0, 64) || 'My-PC'
     const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
+    const cleanPlatform = String(platform || 'unknown').trim().slice(0, 32) || 'unknown'
+    const explicitBridgeSlug = String(bridgeId || '').trim() ? sanitizeBridgeSlug(bridgeId) : ''
+
+    // Allow rebinding an existing explicit bridgeId in-place even when at MAX_DEVICES_PER_USER
+    const existingDevice = explicitBridgeSlug
+      ? record.devices.find((d) => d.bridgeId === explicitBridgeSlug)
+      : null
+    if (existingDevice) {
+      const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
+      existingDevice.label = cleanLabel
+      existingDevice.hostname = cleanHost
+      existingDevice.platform = cleanPlatform
+      existingDevice.secretHash = sha256Hex(`${userId}:${existingDevice.deviceId}:${deviceSecret}`)
+      existingDevice.lastSeenAt = now
+      save()
+      return {
+        userId: record.userId,
+        username: record.username,
+        roomId: record.userId,
+        deviceId: existingDevice.deviceId,
+        bridgeId: existingDevice.bridgeId,
+        label: existingDevice.label,
+        hostname: existingDevice.hostname,
+        platform: existingDevice.platform,
+        deviceSecret,
+      }
+    }
+
+    if (record.devices.length >= MAX_DEVICES_PER_USER) {
+      const err = new Error(`每个账号最多绑定 ${MAX_DEVICES_PER_USER} 台电脑，请先解绑旧设备后再试`)
+      err.code = 'MAX_DEVICES_EXCEEDED'
+      throw err
+    }
+
+    const deviceId = `dev_${randomBytes(6).toString('hex')}`
+    const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
     const baseSlug = sanitizeBridgeSlug(bridgeId || cleanHost || cleanLabel)
 
-    const existingBridgeIds = new Set((record.devices || []).map((d) => d.bridgeId))
+    const existingBridgeIds = new Set(record.devices.map((d) => d.bridgeId))
     let finalBridgeId = baseSlug
     if (existingBridgeIds.has(finalBridgeId)) {
       finalBridgeId = `${baseSlug.slice(0, 24)}-${deviceId.slice(4, 10)}`
@@ -482,7 +600,7 @@ export function createAccountStore({ filePath }) {
       bridgeId: finalBridgeId,
       label: cleanLabel,
       hostname: cleanHost,
-      platform: String(platform || 'unknown').trim().slice(0, 32) || 'unknown',
+      platform: cleanPlatform,
       secretHash: sha256Hex(`${userId}:${deviceId}:${deviceSecret}`),
       createdAt: now,
       lastSeenAt: now,
@@ -575,15 +693,36 @@ export function createAccountStore({ filePath }) {
   function pruneUserSessionData(record, now = Date.now()) {
     if (!Array.isArray(record.sessions)) record.sessions = []
     if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
-    record.sessions = record.sessions
+    const active = record.sessions
       .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !record.revokedSids[s.sid])
       .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
-      .slice(0, MAX_USER_SESSIONS)
+    if (active.length > MAX_USER_SESSIONS) {
+      for (const evicted of active.slice(MAX_USER_SESSIONS)) {
+        if (evicted?.sid) record.revokedSids[evicted.sid] = now
+      }
+    }
+    record.sessions = active.slice(0, MAX_USER_SESSIONS)
     for (const [sid, ts] of Object.entries(record.revokedSids)) {
       if (now - Number(ts || 0) > SESSION_TTL_MS) {
         delete record.revokedSids[sid]
       }
     }
+    const revokedEntries = Object.entries(record.revokedSids)
+    if (revokedEntries.length > MAX_REVOKED_SIDS) {
+      revokedEntries.sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      const kept = {}
+      for (const [sid, ts] of revokedEntries.slice(0, MAX_REVOKED_SIDS)) {
+        kept[sid] = ts
+      }
+      record.revokedSids = kept
+    }
+  }
+
+  function hasUserSession(userId, sid) {
+    const record = usersById.get(userId)
+    const cleanSid = String(sid || '').trim()
+    if (!record || !cleanSid || !Array.isArray(record.sessions)) return false
+    return record.sessions.some((s) => s?.sid === cleanSid)
   }
 
   function recordUserSession(userId, { sid, deviceName = '', clientKind = 'web', ip = '' } = {}) {
@@ -777,12 +916,15 @@ export function createAccountStore({ filePath }) {
     isEmailTaken,
     getUserByEmail,
     registerUser,
+    resolveAccountKey,
+    markUserLogin,
     authenticateUser,
     setUserEmail,
     setLoginEmail2fa,
     checkAndRememberLoginContext,
     resetPasswordByEmail,
     changePassword,
+    changePasswordAsync,
     bindDevice,
     verifyDeviceBridge,
     listUserDevices,
@@ -793,6 +935,7 @@ export function createAccountStore({ filePath }) {
     recordUserSession,
     touchUserSession,
     listUserSessions,
+    hasUserSession,
     isSessionRevoked,
     revokeUserSession,
     revokeUserTokens,

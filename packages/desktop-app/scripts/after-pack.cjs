@@ -71,9 +71,14 @@ exports.default = async function afterPack(context) {
     )
   }
 
-  // 2. Ad-hoc deep re-sign macOS bundle when no Developer ID signing cert is configured
+  // 2. Ad-hoc deep re-sign macOS bundle when no Developer ID signing cert is configured (or identity: null)
   if (platform !== 'darwin') return
-  if (process.env.CSC_LINK || process.env.CSC_NAME) return
+  if (
+    context?.packager?.platformSpecificBuildOptions?.identity !== null &&
+    (process.env.CSC_LINK || process.env.CSC_NAME)
+  ) {
+    return
+  }
 
   const appPath = join(context.appOutDir, `${appName}.app`)
   console.log(`[afterPack] Ad-hoc deep signing macOS bundle: ${appPath}`)

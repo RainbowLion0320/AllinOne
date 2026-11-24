@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
@@ -69,7 +69,8 @@ async function isAntigravityDesktopRunning(force = false) {
           windowsHide: true,
         })
         let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
+        proc.stdout.setEncoding('utf8')
+        proc.stdout.on('data', (d) => { out += d })
         proc.on('close', () => done(/Antigravity\.exe/i.test(out)))
         proc.on('error', () => done(false))
       } else {
@@ -81,7 +82,8 @@ async function isAntigravityDesktopRunning(force = false) {
           windowsHide: true,
         })
         let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
+        proc.stdout.setEncoding('utf8')
+        proc.stdout.on('data', (d) => { out += d })
         proc.on('close', (code) => done(code === 0 && out.trim().length > 0))
         proc.on('error', () => done(false))
       }
@@ -93,11 +95,57 @@ async function isAntigravityDesktopRunning(force = false) {
   return running
 }
 
+function computeAgyExternalRunning({ selfActive, desktopRunning, status, notFullyIdle, mtimeMs = 0, now = Date.now() }) {
+  if (selfActive || !desktopRunning) return false
+  if (status === 'CASCADE_RUN_STATUS_RUNNING') return true
+  const recentlyModified = mtimeMs > 0 && now - mtimeMs < 90_000
+  return Boolean(notFullyIdle && recentlyModified)
+}
+
+function runPythonSqliteJson(pyCode, args, fallbackValue, timeoutMs = 3_000) {
+  const pyBin = findExecutable(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) ||
+    (process.platform === 'win32' ? 'python' : 'python3')
+  return new Promise((resolvePromise) => {
+    let settled = false
+    const done = (val) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise(val)
+    }
+    let proc = null
+    const timer = setTimeout(() => {
+      try { proc?.kill() } catch {}
+      done(fallbackValue)
+    }, timeoutMs)
+    timer.unref?.()
+    try {
+      proc = spawnCrossPlatform(pyBin, ['-c', pyCode, ...args], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      })
+      let out = ''
+      proc.stdout.setEncoding('utf8')
+      proc.stdout.on('data', (d) => { out += d })
+      proc.on('close', () => {
+        try {
+          done(JSON.parse(out))
+        } catch {
+          done(fallbackValue)
+        }
+      })
+      proc.on('error', () => done(fallbackValue))
+    } catch {
+      done(fallbackValue)
+    }
+  })
+}
+
 async function queryAgyConversationState(dbPath, conversationId) {
   if (!conversationId || !existsSync(dbPath)) return null
   try {
     const sqlite = await import('node:sqlite')
-    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
     try {
       const row = db
         .prepare('SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1')
@@ -116,38 +164,54 @@ async function queryAgyConversationState(dbPath, conversationId) {
   }
 
   const pyCode = [
-    'import sqlite3, json, sys',
+    'import pathlib, sqlite3, json, sys',
     'db_path, cid = sys.argv[1], sys.argv[2]',
-    'con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)',
+    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
     'con.row_factory = sqlite3.Row',
     'row = con.execute("SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (cid,)).fetchone()',
     'print(json.dumps(dict(row) if row else None))',
   ].join('\n')
-  const pyBin = findExecutable(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) ||
-    (process.platform === 'win32' ? 'python' : 'python3')
 
-  return new Promise((resolvePromise) => {
-    const proc = spawnCrossPlatform(pyBin, ['-c', pyCode, dbPath, conversationId], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
-    let out = ''
-    proc.stdout.on('data', (d) => { out += d.toString('utf8') })
-    proc.on('close', () => {
-      try {
-        const row = JSON.parse(out)
-        if (!row) return resolvePromise(null)
-        resolvePromise({
-          status: String(row.status || ''),
-          notFullyIdle: Boolean(row.not_fully_idle),
-          stepCount: Number(row.step_count || 0),
-        })
-      } catch {
-        resolvePromise(null)
-      }
-    })
-    proc.on('error', () => resolvePromise(null))
-  })
+  const row = await runPythonSqliteJson(pyCode, [dbPath, conversationId], null)
+  if (!row) return null
+  return {
+    status: String(row.status || ''),
+    notFullyIdle: Boolean(row.not_fully_idle),
+    stepCount: Number(row.step_count || 0),
+  }
+}
+
+async function queryAgySummaryById(dbPath, conversationId) {
+  if (!conversationId || !existsSync(dbPath)) return null
+  try {
+    const sqlite = await import('node:sqlite')
+    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
+    try {
+      const row = db
+        .prepare(
+          `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
+           FROM conversation_summaries
+           WHERE conversation_id = ? LIMIT 1`,
+        )
+        .get(conversationId)
+      return row || null
+    } finally {
+      db.close()
+    }
+  } catch {
+    // Fallback to Python sqlite3 read-only query
+  }
+
+  const pyCode = [
+    'import pathlib, sqlite3, json, sys',
+    'db_path, cid = sys.argv[1], sys.argv[2]',
+    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
+    'con.row_factory = sqlite3.Row',
+    'row = con.execute("SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (cid,)).fetchone()',
+    'print(json.dumps(dict(row) if row else None, ensure_ascii=False))',
+  ].join('\n')
+
+  return runPythonSqliteJson(pyCode, [dbPath, conversationId], null)
 }
 
 function getAgyHome() {
@@ -216,7 +280,7 @@ async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
 
   try {
     const sqlite = await import('node:sqlite')
-    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
     try {
       let sql = `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
                  FROM conversation_summaries
@@ -239,9 +303,9 @@ async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
   }
 
   const pyCode = [
-    'import sqlite3, json, sys',
+    'import pathlib, sqlite3, json, sys',
     'db_path, limit, search = sys.argv[1], int(sys.argv[2]), sys.argv[3]',
-    'con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)',
+    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
     'con.row_factory = sqlite3.Row',
     'cur = con.cursor()',
     'sql = "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle FROM conversation_summaries WHERE nesting_depth = 0 AND (parent_conversation_id IS NULL OR parent_conversation_id = \'\')"',
@@ -253,25 +317,8 @@ async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
     'print(json.dumps(rows, ensure_ascii=False))',
   ].join('\n')
 
-  const pyBin = findExecutable(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) ||
-    (process.platform === 'win32' ? 'python' : 'python3')
-
-  return new Promise((resolvePromise) => {
-    const proc = spawnCrossPlatform(pyBin, ['-c', pyCode, dbPath, String(limit), search || ''], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
-    let out = ''
-    proc.stdout.on('data', (d) => { out += d.toString('utf8') })
-    proc.on('close', () => {
-      try {
-        resolvePromise(JSON.parse(out))
-      } catch {
-        resolvePromise([])
-      }
-    })
-    proc.on('error', () => resolvePromise([]))
-  })
+  const rows = await runPythonSqliteJson(pyCode, [dbPath, String(limit), search || ''], [])
+  return Array.isArray(rows) ? rows : []
 }
 
 /**
@@ -388,12 +435,31 @@ export function parseAgyTranscriptContent(raw) {
   }
 }
 
+const AGY_MAX_FULL_TRANSCRIPT_BYTES = 32 * 1024 * 1024
+const AGY_TAIL_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+
 function parseDesktopTranscript(conversationId, agyHome = getAgyHome()) {
   const transcriptPath = getTranscriptPathSafe(agyHome, conversationId)
   if (!existsSync(transcriptPath)) {
     return { messages: [], divergence: null, latestStepIndex: -1, branchEpoch: 0 }
   }
   return transcriptCache.getOrParse(transcriptPath, () => {
+    const st = statSync(transcriptPath)
+    if (st.size > AGY_MAX_FULL_TRANSCRIPT_BYTES) {
+      const fd = openSync(transcriptPath, 'r')
+      try {
+        const readLen = Math.min(st.size, AGY_TAIL_TRANSCRIPT_BYTES)
+        const startOffset = Math.max(0, st.size - readLen)
+        const buf = Buffer.alloc(readLen)
+        const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
+        const rawTail = buf.subarray(0, bytesRead).toString('utf8')
+        const firstNl = startOffset > 0 ? rawTail.indexOf('\n') : -1
+        const safeTail = firstNl !== -1 ? rawTail.slice(firstNl + 1) : rawTail
+        return parseAgyTranscriptContent(safeTail)
+      } finally {
+        closeSync(fd)
+      }
+    }
     const raw = readFileSync(transcriptPath, 'utf8')
     return parseAgyTranscriptContent(raw)
   })
@@ -477,10 +543,12 @@ class AgyAcpClient {
       windowsHide: true,
     })
     this.proc = proc
+    proc.stdout.setEncoding('utf8')
+    proc.stderr?.setEncoding('utf8')
     proc.stdin?.on('error', () => {})
 
     proc.stdout.on('data', (chunk) => {
-      this.stdoutBuf += chunk.toString('utf8')
+      this.stdoutBuf += chunk
       let idx
       while ((idx = this.stdoutBuf.indexOf('\n')) !== -1) {
         const line = this.stdoutBuf.slice(0, idx).trim()
@@ -491,7 +559,7 @@ class AgyAcpClient {
     })
 
     proc.stderr.on('data', (chunk) => {
-      this.stderrBuf += chunk.toString('utf8')
+      this.stderrBuf = (this.stderrBuf + chunk).slice(-4096)
     })
 
     proc.on('error', (err) => {
@@ -649,6 +717,7 @@ class AgyAcpClient {
       try { this.proc.kill() } catch {}
       this.proc = null
     }
+    this.failAll(new Error('agy acp disposed'))
   }
 }
 
@@ -673,6 +742,7 @@ export class AntigravityAdapter {
     this.pendingServerRequests = new Map() // approvalId -> { client, rpcId, method, sessionId, params }
     this.activeTurns = new Map() // conversationId -> { client, aborted }
     this.warmSessions = new Map() // conversationId -> warm entry keeping background tasks alive
+    this.startingWarmSessions = new Map() // conversationId -> Promise<entry> deduplicating concurrent acquireWarmSession
     this.pendingCreated = new Map() // conversationId -> summary (before first turn hits conversation_summaries.db)
     this.sessionPrefs = new Map() // conversationId -> { model, reasoningEffort }
     this.bridgeWrittenSessions = new Map() // conversationId -> { writtenAt, stepCount }
@@ -680,6 +750,7 @@ export class AntigravityAdapter {
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || WATCH_POLL_INTERVAL_MS)
     this.watchTimer = null
     this.watchPollInFlight = false
+    this.reapingInFlight = false
     this.cliVersionCache = null
     this.modelsCache = null
     this.modelsCacheAt = 0
@@ -800,7 +871,8 @@ export class AntigravityAdapter {
           windowsHide: true,
         })
         let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
+        proc.stdout.setEncoding('utf8')
+        proc.stdout.on('data', (d) => { out += d })
         proc.on('close', () => done(out))
         proc.on('error', () => done(''))
       } catch {
@@ -880,7 +952,8 @@ export class AntigravityAdapter {
           windowsHide: true,
         })
         let out = ''
-        proc.stdout.on('data', (d) => { out += d.toString('utf8') })
+        proc.stdout.setEncoding('utf8')
+        proc.stdout.on('data', (d) => { out += d })
         proc.on('close', (code) => done(code === 0 ? out.trim() : ''))
         proc.on('error', () => done(''))
       } catch {
@@ -909,15 +982,35 @@ export class AntigravityAdapter {
 
   async listSessions({ limit = 80, search = '' } = {}) {
     const results = []
-    const cliReady = Boolean(await this.checkCliVersion())
-    const seen = new Set()
-
     const dbPath = join(this.agyHome, 'conversation_summaries.db')
-    const rows = await queryAgySummariesDb(dbPath, limit, search)
+    const [cliVer, rows, desktopRunning] = await Promise.all([
+      this.checkCliVersion(),
+      queryAgySummariesDb(dbPath, limit, search),
+      isAntigravityDesktopRunning(),
+    ])
+    const cliReady = Boolean(cliVer)
+    const seen = new Set()
+    const now = Date.now()
+
     for (const r of rows) {
       seen.add(r.conversation_id)
       const cwd = parseWorkspaceUri(r.workspace_uris)
       const pref = this.sessionPrefs.get(r.conversation_id)
+      const warmEntry = this.warmSessions.get(r.conversation_id)
+      const selfActive = this.activeTurns.has(r.conversation_id) || Boolean(warmEntry?.wakeup)
+      let mtimeMs = toEpochMs(r.last_modified_time)
+      if (!selfActive && desktopRunning && Boolean(r.not_fully_idle)) {
+        const fp = getTranscriptFingerprint(this.agyHome, r.conversation_id)
+        if (fp.mtimeMs > mtimeMs) mtimeMs = fp.mtimeMs
+      }
+      const externalRunning = computeAgyExternalRunning({
+        selfActive,
+        desktopRunning,
+        status: String(r.status || ''),
+        notFullyIdle: Boolean(r.not_fully_idle),
+        mtimeMs,
+        now,
+      })
       results.push({
         id: makeCompositeId(APPS.ANTIGRAVITY, r.conversation_id),
         app: APPS.ANTIGRAVITY,
@@ -928,7 +1021,8 @@ export class AntigravityAdapter {
         workspace: cwd ? basename(cwd) : 'Antigravity',
         model: pref?.model || '',
         reasoningEffort: pref?.reasoningEffort || '',
-        status: this.activeTurns.has(r.conversation_id) || r.not_fully_idle ? 'running' : 'idle',
+        status: selfActive || externalRunning ? 'running' : 'idle',
+        syncState: { externalRunning },
         writable: cliReady,
         readOnlyDesktop: false,
         createdAt: toEpochMs(r.last_modified_time),
@@ -950,6 +1044,7 @@ export class AntigravityAdapter {
       results.push({
         ...pending,
         status: this.activeTurns.has(pending.nativeId) ? 'running' : 'idle',
+        syncState: { externalRunning: false },
       })
     }
 
@@ -963,11 +1058,10 @@ export class AntigravityAdapter {
     const pageSize = Math.max(10, Math.min(Number(limit) || 25, 200))
 
     const dbPath = join(this.agyHome, 'conversation_summaries.db')
-    const [allRecent, desktopRunning] = await Promise.all([
-      queryAgySummariesDb(dbPath, 200, ''),
+    const [meta, desktopRunning] = await Promise.all([
+      queryAgySummaryById(dbPath, conversationId),
       isAntigravityDesktopRunning(),
     ])
-    const meta = allRecent.find((r) => r.conversation_id === conversationId)
     const pending = this.pendingCreated.get(conversationId)
     const parsed = parseDesktopTranscript(conversationId, this.agyHome)
     const messages = parsed.messages
@@ -977,13 +1071,13 @@ export class AntigravityAdapter {
 
     const warmEntry = this.warmSessions.get(conversationId)
     const selfActive = this.activeTurns.has(conversationId) || Boolean(warmEntry?.wakeup)
-    const recentlyModified = fp.mtimeMs > 0 && Date.now() - fp.mtimeMs < 90_000
-    const dbRunning = meta?.status === 'CASCADE_RUN_STATUS_RUNNING'
-    const externalRunning = Boolean(
-      !selfActive &&
-      desktopRunning &&
-      (dbRunning || (Boolean(meta?.not_fully_idle) && recentlyModified)),
-    )
+    const externalRunning = computeAgyExternalRunning({
+      selfActive,
+      desktopRunning,
+      status: String(meta?.status || ''),
+      notFullyIdle: Boolean(meta?.not_fully_idle),
+      mtimeMs: fp.mtimeMs,
+    })
     const bridgeWritten = this.bridgeWrittenSessions.get(conversationId) || null
     const bridgeWrittenWithDesktopOpen = Boolean(bridgeWritten && desktopRunning)
     const diverged = Boolean(parsed.divergence)
@@ -1008,6 +1102,7 @@ export class AntigravityAdapter {
       status: String(meta?.status || ''),
       notFullyIdle: Boolean(meta?.not_fully_idle),
       stepCount: Number(meta?.step_count || 0),
+      externalRunning,
     })
 
     const total = messages.length
@@ -1057,6 +1152,7 @@ export class AntigravityAdapter {
       status: snapshot.status ?? existing?.status ?? '',
       notFullyIdle: snapshot.notFullyIdle ?? existing?.notFullyIdle ?? false,
       stepCount: snapshot.stepCount ?? existing?.stepCount ?? 0,
+      externalRunning: snapshot.externalRunning ?? existing?.externalRunning ?? false,
       title: snapshot.title || existing?.title || conversationId,
       cwd: snapshot.cwd || existing?.cwd || '',
       cliReady: snapshot.cliReady ?? existing?.cliReady ?? true,
@@ -1104,6 +1200,7 @@ export class AntigravityAdapter {
     try {
       const now = Date.now()
       const dbPath = join(this.agyHome, 'conversation_summaries.db')
+      const desktopRunning = await isAntigravityDesktopRunning()
       for (const [sid, w] of [...this.watchedSessions.entries()]) {
         if (now - w.lastSeenAt > WATCH_TTL_MS) {
           this.watchedSessions.delete(sid)
@@ -1114,6 +1211,7 @@ export class AntigravityAdapter {
           const curFp = getTranscriptFingerprint(this.agyHome, sid)
           w.mtimeMs = curFp.mtimeMs
           w.size = curFp.size
+          w.externalRunning = false
           continue
         }
 
@@ -1122,12 +1220,21 @@ export class AntigravityAdapter {
         const nextStatus = String(dbState?.status || '')
         const nextNotIdle = Boolean(dbState?.notFullyIdle)
         const nextStepCount = Number(dbState?.stepCount || 0)
+        const externalRunning = computeAgyExternalRunning({
+          selfActive: false,
+          desktopRunning,
+          status: nextStatus,
+          notFullyIdle: nextNotIdle,
+          mtimeMs: curFp.mtimeMs,
+          now,
+        })
 
         const fileChanged = curFp.size !== w.size || curFp.mtimeMs !== w.mtimeMs
         const statusChanged =
           nextStatus !== w.status ||
           nextNotIdle !== w.notFullyIdle ||
-          nextStepCount !== w.stepCount
+          nextStepCount !== w.stepCount ||
+          externalRunning !== Boolean(w.externalRunning)
 
         if (!fileChanged && !statusChanged) continue
 
@@ -1136,9 +1243,9 @@ export class AntigravityAdapter {
         w.status = nextStatus
         w.notFullyIdle = nextNotIdle
         w.stepCount = nextStepCount
+        w.externalRunning = externalRunning
 
         const pref = this.sessionPrefs.get(sid)
-        const isRunning = nextStatus === 'CASCADE_RUN_STATUS_RUNNING'
         this.emitEvent(EVENTS.SESSION_UPDATED, {
           historyChanged: fileChanged,
           statusChanged,
@@ -1152,7 +1259,8 @@ export class AntigravityAdapter {
             workspace: w.cwd ? basename(w.cwd) : 'Antigravity',
             model: pref?.model || '',
             reasoningEffort: pref?.reasoningEffort || '',
-            status: isRunning ? 'running' : 'idle',
+            status: externalRunning ? 'running' : 'idle',
+            syncState: { externalRunning },
             writable: w.cliReady,
             readOnlyDesktop: false,
             updatedAt: curFp.mtimeMs || now,
@@ -1190,15 +1298,14 @@ export class AntigravityAdapter {
     })
 
     let sessionId = ''
-    const entry = this.registerWarmSession('', targetCwd, client)
+    const entry = this.registerWarmSession('', targetCwd, client, { starting: true, addToMap: false })
     try {
       await client.start()
       const res = await client.rpc('session/new', { cwd: targetCwd, mcpServers: [] }, 25_000)
       sessionId = res?.sessionId || ''
       if (!sessionId) throw new Error('Antigravity ACP 未返回有效 sessionId')
 
-      // Re-key warm entry under the authoritative sessionId
-      this.warmSessions.delete('')
+      // Key warm entry under the authoritative sessionId while still marked starting during model setup
       entry.sessionId = sessionId
       entry.lastActivityAt = Date.now()
       this.warmSessions.set(sessionId, entry)
@@ -1212,9 +1319,14 @@ export class AntigravityAdapter {
           })
         }
       }
+      entry.starting = false
+      entry.lastActivityAt = Date.now()
       this.ensureReaperRunning()
     } catch (err) {
-      this.warmSessions.delete(sessionId || '')
+      entry.starting = false
+      if (sessionId && this.warmSessions.get(sessionId) === entry) {
+        this.warmSessions.delete(sessionId)
+      }
       await client.close(sessionId).catch(() => {})
       throw err
     }
@@ -1240,12 +1352,13 @@ export class AntigravityAdapter {
     return summary
   }
 
-  registerWarmSession(sessionId, cwd, client) {
+  registerWarmSession(sessionId, cwd, client, { starting = false, addToMap = true } = {}) {
     const fp = getTranscriptFingerprint(this.agyHome, sessionId)
     const entry = {
       sessionId,
       cwd,
       client,
+      starting: Boolean(starting),
       fgTurn: null,
       wakeup: null,
       lastActivityAt: Date.now(),
@@ -1270,11 +1383,11 @@ export class AntigravityAdapter {
         })
         entry.wakeup = null
       }
-      if (this.warmSessions.get(entry.sessionId) === entry) {
+      if (entry.sessionId && this.warmSessions.get(entry.sessionId) === entry) {
         this.warmSessions.delete(entry.sessionId)
       }
     }
-    if (sessionId) this.warmSessions.set(sessionId, entry)
+    if (addToMap && sessionId) this.warmSessions.set(sessionId, entry)
     return entry
   }
 
@@ -1286,9 +1399,26 @@ export class AntigravityAdapter {
     this.reaperTimer.unref?.()
   }
 
-  async closeWarmSession(sessionId) {
+  hasPendingServerRequest(sessionId) {
+    for (const item of this.pendingServerRequests.values()) {
+      if (item.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  isWarmEntrySafeToClose(sid, expectedEntry = null) {
+    const cur = this.warmSessions.get(sid)
+    if (!cur) return false
+    if (expectedEntry && cur !== expectedEntry) return false
+    if (cur.starting || cur.fgTurn || cur.wakeup || this.activeTurns.has(sid)) return false
+    if (this.startingWarmSessions.has(sid) || this.hasPendingServerRequest(sid)) return false
+    return true
+  }
+
+  async closeWarmSession(sessionId, expectedEntry = null) {
     const entry = this.warmSessions.get(sessionId)
     if (!entry) return
+    if (expectedEntry && entry !== expectedEntry) return
     this.warmSessions.delete(sessionId)
     if (entry.wakeup?.settleTimer) {
       clearTimeout(entry.wakeup.settleTimer)
@@ -1298,6 +1428,7 @@ export class AntigravityAdapter {
   }
 
   async reapIdleSessions() {
+    if (this.reapingInFlight) return
     if (this.warmSessions.size === 0) {
       if (this.reaperTimer) {
         clearInterval(this.reaperTimer)
@@ -1306,39 +1437,47 @@ export class AntigravityAdapter {
       return
     }
 
-    const dbPath = join(this.agyHome, 'conversation_summaries.db')
-    const now = Date.now()
-    const idleCandidates = []
+    this.reapingInFlight = true
+    try {
+      const dbPath = join(this.agyHome, 'conversation_summaries.db')
+      const now = Date.now()
+      const idleCandidates = []
 
-    for (const [sid, entry] of this.warmSessions.entries()) {
-      if (!entry.client.isAlive()) {
-        this.warmSessions.delete(sid)
-        continue
-      }
-      if (entry.fgTurn || entry.wakeup || this.activeTurns.has(sid)) continue
-
-      const idleMs = now - entry.lastActivityAt
-      if (idleMs < 20_000) continue // Grace window for SQLite summary write flush
-
-      const dbState = await queryAgyConversationState(dbPath, sid)
-      const busyInDb = Boolean(dbState?.notFullyIdle || dbState?.status === 'CASCADE_RUN_STATUS_RUNNING')
-      if (busyInDb) {
-        // NEVER kill active background tasks / subagents / timers unless exceeding 2h safety cap
-        if (idleMs >= WARM_BUSY_HARD_CAP_MS) {
-          this.log.warn?.(`mobile-hub: closing agy warm session ${sid} after 2h safety cap`)
-          await this.closeWarmSession(sid)
+      for (const [sid, entry] of [...this.warmSessions.entries()]) {
+        if (entry.starting) continue
+        if (!entry.client.isAlive()) {
+          if (this.warmSessions.get(sid) === entry) this.warmSessions.delete(sid)
+          continue
         }
-        continue
-      }
-      idleCandidates.push({ sid, idleMs })
-    }
+        if (entry.fgTurn || entry.wakeup || this.activeTurns.has(sid) || this.hasPendingServerRequest(sid)) continue
 
-    idleCandidates.sort((a, b) => b.idleMs - a.idleMs)
-    const ttlMs = idleCandidates.length > MAX_IDLE_WARM_SESSIONS ? WARM_IDLE_EXCESS_CLOSE_MS : WARM_IDLE_CLOSE_MS
-    for (const { sid, idleMs } of idleCandidates) {
-      if (idleMs >= ttlMs) {
-        await this.closeWarmSession(sid)
+        const idleMs = now - entry.lastActivityAt
+        if (idleMs < 20_000) continue // Grace window for SQLite summary write flush
+
+        const dbState = await queryAgyConversationState(dbPath, sid)
+        // Re-verify after async DB query before making any close decision
+        if (!this.isWarmEntrySafeToClose(sid, entry)) continue
+        const busyInDb = Boolean(dbState?.notFullyIdle || dbState?.status === 'CASCADE_RUN_STATUS_RUNNING')
+        if (busyInDb) {
+          // NEVER kill active background tasks / subagents / timers unless exceeding 2h safety cap
+          if (idleMs >= WARM_BUSY_HARD_CAP_MS && this.isWarmEntrySafeToClose(sid, entry)) {
+            this.log.warn?.(`mobile-hub: closing agy warm session ${sid} after 2h safety cap`)
+            await this.closeWarmSession(sid, entry)
+          }
+          continue
+        }
+        idleCandidates.push({ sid, entry, idleMs })
       }
+
+      idleCandidates.sort((a, b) => b.idleMs - a.idleMs)
+      const ttlMs = idleCandidates.length > MAX_IDLE_WARM_SESSIONS ? WARM_IDLE_EXCESS_CLOSE_MS : WARM_IDLE_CLOSE_MS
+      for (const { sid, entry, idleMs } of idleCandidates) {
+        if (idleMs >= ttlMs && this.isWarmEntrySafeToClose(sid, entry)) {
+          await this.closeWarmSession(sid, entry)
+        }
+      }
+    } finally {
+      this.reapingInFlight = false
     }
   }
 
@@ -1368,15 +1507,29 @@ export class AntigravityAdapter {
     if (!wk) return
     if (wk.settleTimer) clearTimeout(wk.settleTimer)
     wk.settleTimer = setTimeout(async () => {
-      if (entry.wakeup !== wk || entry.fgTurn) return
-      const dbPath = join(this.agyHome, 'conversation_summaries.db')
-      const dbState = await queryAgyConversationState(dbPath, entry.sessionId)
-      const stillRunning = dbState?.status === 'CASCADE_RUN_STATUS_RUNNING'
-      const silentMs = Date.now() - entry.lastActivityAt
-      if (!stillRunning || silentMs >= 12_000) {
-        this.finalizeWakeupTurn(entry)
-      } else {
-        this.scheduleWakeupSettle(entry)
+      try {
+        if (entry.wakeup !== wk || entry.fgTurn) return
+        if (this.hasPendingServerRequest(entry.sessionId)) {
+          this.scheduleWakeupSettle(entry)
+          return
+        }
+        const dbPath = join(this.agyHome, 'conversation_summaries.db')
+        const dbState = await queryAgyConversationState(dbPath, entry.sessionId)
+        // Re-check state after async await before finalizing
+        if (entry.wakeup !== wk || entry.fgTurn) return
+        if (this.hasPendingServerRequest(entry.sessionId)) {
+          this.scheduleWakeupSettle(entry)
+          return
+        }
+        const stillRunning = dbState?.status === 'CASCADE_RUN_STATUS_RUNNING'
+        const silentMs = Date.now() - entry.lastActivityAt
+        if (!stillRunning || silentMs >= 12_000) {
+          this.finalizeWakeupTurn(entry)
+        } else {
+          this.scheduleWakeupSettle(entry)
+        }
+      } catch (err) {
+        this.log.warn?.(`mobile-hub: agy wakeup settle error (${entry.sessionId}): ${String(err?.message || err)}`)
       }
     }, 2_500)
     wk.settleTimer.unref?.()
@@ -1511,20 +1664,35 @@ export class AntigravityAdapter {
   }
 
   async acquireWarmSession(sessionId, targetCwd) {
+    const inflight = this.startingWarmSessions.get(sessionId)
+    if (inflight) {
+      return inflight
+    }
+    const promise = this._acquireWarmSessionInternal(sessionId, targetCwd).finally(() => {
+      if (this.startingWarmSessions.get(sessionId) === promise) {
+        this.startingWarmSessions.delete(sessionId)
+      }
+    })
+    this.startingWarmSessions.set(sessionId, promise)
+    return promise
+  }
+
+  async _acquireWarmSessionInternal(sessionId, targetCwd) {
     const dbPath = join(this.agyHome, 'conversation_summaries.db')
     const existing = this.warmSessions.get(sessionId)
-    if (existing && existing.client.isAlive()) {
+    if (existing && !existing.starting && existing.client.isAlive()) {
       const dbState = await queryAgyConversationState(dbPath, sessionId)
       const curFp = getTranscriptFingerprint(this.agyHome, sessionId)
       const busyInDb = Boolean(dbState?.notFullyIdle || dbState?.status === 'CASCADE_RUN_STATUS_RUNNING')
+      const curStepCount = Number(dbState?.stepCount || 0)
 
-      // Exact disk change check: if Antigravity Desktop wrote even a single step since our ACP
-      // worker's last write (size, mtime, or step_count changed), close the stale ACP process
+      // Exact disk change check (including 0 -> >0 transitions on Turn 1): if Antigravity Desktop
+      // wrote even a single step since our ACP worker's last write, close the stale ACP process
       // and resume fresh from disk so mobile NEVER runs on stale context!
       const fileChanged =
-        (existing.lastTranscriptSize > 0 && curFp.size !== existing.lastTranscriptSize) ||
-        (existing.lastTranscriptMtimeMs > 0 && curFp.mtimeMs !== existing.lastTranscriptMtimeMs) ||
-        (existing.lastStepCount > 0 && dbState?.stepCount > 0 && dbState.stepCount !== existing.lastStepCount)
+        curFp.size !== existing.lastTranscriptSize ||
+        curFp.mtimeMs !== existing.lastTranscriptMtimeMs ||
+        (curStepCount > 0 && curStepCount !== existing.lastStepCount)
 
       const desktopModified = !existing.wakeup && !existing.sawBackgroundTask && fileChanged
 
@@ -1532,8 +1700,8 @@ export class AntigravityAdapter {
         existing.lastActivityAt = Date.now()
         return existing
       }
-      await this.closeWarmSession(sessionId)
-    } else if (existing) {
+      await this.closeWarmSession(sessionId, existing)
+    } else if (existing && !existing.starting) {
       this.warmSessions.delete(sessionId)
     }
 
@@ -1543,7 +1711,7 @@ export class AntigravityAdapter {
       autoApprove: this.autoApprove,
       log: this.log,
     })
-    const entry = this.registerWarmSession(sessionId, targetCwd, client)
+    const entry = this.registerWarmSession(sessionId, targetCwd, client, { starting: true, addToMap: false })
     try {
       await client.start()
       await client.rpc('session/resume', { sessionId, cwd: targetCwd, mcpServers: [] }, 30_000)
@@ -1555,9 +1723,12 @@ export class AntigravityAdapter {
       entry.lastTranscriptSize = fp.size
       entry.lastStepCount = Number(dbState?.stepCount || 0)
       entry.lastActivityAt = Date.now()
+      entry.starting = false
+      this.warmSessions.set(sessionId, entry)
       this.ensureReaperRunning()
       return entry
     } catch (err) {
+      entry.starting = false
       if (this.warmSessions.get(sessionId) === entry) {
         this.warmSessions.delete(sessionId)
       }
@@ -1570,19 +1741,27 @@ export class AntigravityAdapter {
     sessionId = assertSafeSessionId(sessionId, 'Antigravity conversationId')
     const compositeId = makeCompositeId(APPS.ANTIGRAVITY, sessionId)
 
+    if (this.activeTurns.has(sessionId)) {
+      const err = new Error('该 Antigravity 对话正在运行中，请等待完成或先点击停止。')
+      err.code = 'SESSION_BUSY'
+      throw err
+    }
+
+    // Synchronously reserve activeTurns BEFORE any await to eliminate TOCTOU races
+    const turnState = { client: null, aborted: false }
+    this.activeTurns.set(sessionId, turnState)
+
     let entry = null
+    let fgTurn = null
     let failedHard = false
     try {
       const cliVer = await this.checkCliVersion()
       if (!cliVer) {
         throw new Error(
-        process.platform === 'win32'
-          ? '本机未检测到 Antigravity CLI（请运行 irm https://antigravity.google/cli/install.ps1 | iex 安装）'
-          : '本机未检测到 Antigravity CLI（请运行 curl -fsSL https://antigravity.google/cli/install.sh | bash 安装）',
-      )
-      }
-      if (this.activeTurns.has(sessionId)) {
-        throw new Error('该 Antigravity 对话正在运行中，请等待完成或先点击停止。')
+          process.platform === 'win32'
+            ? '本机未检测到 Antigravity CLI（请运行 irm https://antigravity.google/cli/install.ps1 | iex 安装）'
+            : '本机未检测到 Antigravity CLI（请运行 curl -fsSL https://antigravity.google/cli/install.sh | bash 安装）',
+        )
       }
 
       // Guard against concurrent split-brain writes when Antigravity Desktop is actively executing this exact turn!
@@ -1609,15 +1788,14 @@ export class AntigravityAdapter {
         }
       }
 
-      // Resolve real workspace directory from Desktop summary DB or pending map
+      // Resolve real workspace directory from Desktop summary DB (single-row lookup, no 200-row cutoff) or pending map
       let targetCwd = String(cwd || '').trim()
       if (!targetCwd) {
         const pending = this.pendingCreated.get(sessionId)
         targetCwd = pending?.cwd || ''
       }
       if (!targetCwd) {
-        const allRecent = await queryAgySummariesDb(join(this.agyHome, 'conversation_summaries.db'), 200, '')
-        const meta = allRecent.find((r) => r.conversation_id === sessionId)
+        const meta = await queryAgySummaryById(dbPath, sessionId)
         targetCwd = parseWorkspaceUri(meta?.workspace_uris) || ''
       }
       if (!targetCwd || !existsSync(targetCwd)) targetCwd = this.defaultCwd
@@ -1653,6 +1831,10 @@ export class AntigravityAdapter {
         throw new Error('消息内容不能为空')
       }
 
+      if (turnState.aborted) {
+        return { sessionId: compositeId, nativeId: sessionId, finalText: '', aborted: true, usage: null }
+      }
+
       const pref = this.sessionPrefs.get(sessionId)
       const effectiveModel = model || pref?.model || ''
       const effectiveEffort = reasoningEffort !== undefined ? reasoningEffort : pref?.reasoningEffort || ''
@@ -1661,21 +1843,22 @@ export class AntigravityAdapter {
       }
 
       entry = await this.acquireWarmSession(sessionId, targetCwd)
+      turnState.client = entry.client
+      if (turnState.aborted) {
+        return { sessionId: compositeId, nativeId: sessionId, finalText: '', aborted: true, usage: null }
+      }
       // If a spontaneous wakeup was still finalizing, close its bubble cleanly before starting user's new turn
       if (entry.wakeup) {
         this.finalizeWakeupTurn(entry)
       }
 
-      const fgTurn = {
+      fgTurn = {
         finalText: '',
         seenToolStarts: new Set(),
         seenToolEnds: new Set(),
         aborted: false,
       }
       entry.fgTurn = fgTurn
-
-      const turnState = { client: entry.client, aborted: false }
-      this.activeTurns.set(sessionId, turnState)
 
       this.emitEvent(EVENTS.STREAM_START, {
         sessionId: compositeId,
@@ -1693,12 +1876,19 @@ export class AntigravityAdapter {
       }
 
       // Sliding 15-min inactivity timeout (resets on every session/update chunk!)
-      const promptRes = await entry.client.rpc(
-        'session/prompt',
-        { sessionId, prompt: promptBlocks },
-        15 * 60_000,
-        { sliding: true },
-      )
+      let promptRes
+      try {
+        promptRes = await entry.client.rpc(
+          'session/prompt',
+          { sessionId, prompt: promptBlocks },
+          15 * 60_000,
+          { sliding: true },
+        )
+      } catch (promptErr) {
+        entry.client.notify('session/cancel', { sessionId })
+        failedHard = true
+        throw promptErr
+      }
 
       const aborted = turnState.aborted || promptRes?.stopReason === 'cancelled'
       const cleanFinal = fgTurn.finalText.trim()
@@ -1720,17 +1910,24 @@ export class AntigravityAdapter {
         usage: promptRes?.usage || null,
       }
     } catch (err) {
-      failedHard = !entry?.client?.isAlive()
-      this.emitEvent(EVENTS.STREAM_ERROR, {
-        sessionId: compositeId,
-        app: APPS.ANTIGRAVITY,
-        message: String(err?.message || err),
-      })
+      failedHard = failedHard || !entry?.client?.isAlive()
+      if (!err?._streamErrorEmitted) {
+        if (err && typeof err === 'object') err._streamErrorEmitted = true
+        this.emitEvent(EVENTS.STREAM_ERROR, {
+          sessionId: compositeId,
+          app: APPS.ANTIGRAVITY,
+          message: String(err?.message || err),
+        })
+      }
       throw err
     } finally {
-      this.activeTurns.delete(sessionId)
+      if (this.activeTurns.get(sessionId) === turnState) {
+        this.activeTurns.delete(sessionId)
+      }
       if (entry) {
-        entry.fgTurn = null
+        if (fgTurn && entry.fgTurn === fgTurn) {
+          entry.fgTurn = null
+        }
         entry.lastActivityAt = Date.now()
         const dbPath = join(this.agyHome, 'conversation_summaries.db')
         const snapNow = async () => {
@@ -1751,7 +1948,7 @@ export class AntigravityAdapter {
         settleSnap.unref?.()
 
         if (failedHard) {
-          await this.closeWarmSession(sessionId)
+          await this.closeWarmSession(sessionId, entry)
         } else {
           // Keep warm ACP worker alive so background tasks / subagents / timers NEVER get canceled on turn end!
           this.ensureReaperRunning()

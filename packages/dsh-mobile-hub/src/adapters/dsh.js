@@ -541,10 +541,12 @@ export class DshAdapter {
         try {
           const list = await this.ipcClient.call('listApprovals', {}, { timeoutMs: 5_000 })
           return Array.isArray(list) ? list : []
-        } catch {}
+        } catch {
+          return null
+        }
       }
     }
-    return []
+    return null
   }
 
   async resolveApproval(approvalId, decisionOrPayload) {
@@ -761,7 +763,10 @@ export class DshAdapter {
         const preview = (lastTurn?.response || lastTurn?.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 120)
         const modelInfo = rows.modelSelection?.val?.lastUsed
         const model = modelInfo ? `${modelInfo.model || ''}`.trim() : ''
-        const isRunning = this.activeTurns.has(sessionId) || Boolean(rows.approvalState?.val?.turnOpen)
+        const isLocalActive = this.activeTurns.has(sessionId)
+        const desktopTurnOpen = Boolean(rows.approvalState?.val?.turnOpen)
+        const externalRunning = Boolean(!isLocalActive && desktopTurnOpen)
+        const isRunning = isLocalActive || externalRunning
 
         byId.set(sessionId, {
           id: makeCompositeId(APPS.DSH, sessionId),
@@ -774,6 +779,7 @@ export class DshAdapter {
           model,
           turnCount: rows.sessionStats?.val?.turns ?? turns.length,
           status: isRunning ? 'running' : 'idle',
+          syncState: { externalRunning },
           pinned: pinnedSet.has(sessionId),
           archived,
           writable: this.isLive(),
@@ -927,6 +933,10 @@ export class DshAdapter {
     const startIdx = Math.max(0, endIdx - pageSize)
     const pageMessages = normalized.slice(startIdx, endIdx)
 
+    const isLocalActive = this.activeTurns.has(sessionId)
+    const desktopTurnOpen = Boolean(cacheRec?.record?.rows?.approvalState?.val?.turnOpen)
+    const externalRunning = Boolean(!isLocalActive && desktopTurnOpen)
+
     return {
       id: makeCompositeId(APPS.DSH, sessionId),
       app: APPS.DSH,
@@ -937,7 +947,8 @@ export class DshAdapter {
       provider,
       reasoningEffort,
       writable: this.isLive(),
-      status: this.activeTurns.has(sessionId) ? 'running' : 'idle',
+      status: isLocalActive || externalRunning ? 'running' : 'idle',
+      syncState: { externalRunning },
       messages: pageMessages,
       hasMore: startIdx > 0,
       nextCursor: startIdx > 0 ? String(startIdx) : null,
@@ -1043,115 +1054,145 @@ export class DshAdapter {
 
   async sendMessage(sessionId, { text, cwd, title, attachments = [], model, provider, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
+    if (this.activeTurns.has(sessionId)) {
+      const err = new Error('该 DeepSeek Harness 对话正在运行中，请等待完成或先点击停止。')
+      err.code = 'SESSION_BUSY'
+      throw err
+    }
+
+    const turnState = { agent: null, startedAt: Date.now(), aborted: false }
+    this.activeTurns.set(sessionId, turnState)
+    let lockedId = sessionId
+
     if (!this.isLive()) {
-      const ipc = await this.ipcClient?.checkHealth({ force: true })
-      if (ipc) {
-        return this.ipcClient.call(
-          'sendMessage',
-          {
-            sessionId,
-            payload: { text, cwd, title, attachments, model, provider, reasoningEffort },
-          },
-          { timeoutMs: 30 * 60 * 1000, waitForEvents: true },
-        )
+      try {
+        const ipc = await this.ipcClient?.checkHealth({ force: true })
+        if (ipc) {
+          return await this.ipcClient.call(
+            'sendMessage',
+            {
+              sessionId,
+              payload: { text, cwd, title, attachments, model, provider, reasoningEffort },
+            },
+            { timeoutMs: 30 * 60 * 1000, waitForEvents: true },
+          )
+        }
+        throw new Error(this.getIpcUnavailableMessage())
+      } finally {
+        if (this.activeTurns.get(lockedId) === turnState) {
+          this.activeTurns.delete(lockedId)
+        }
       }
-      throw new Error(this.getIpcUnavailableMessage())
-    }
-    const compositeId = makeCompositeId(APPS.DSH, sessionId)
-    const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, cwd, title)
-    const realCompositeId = makeCompositeId(APPS.DSH, resolvedId)
-    if (model || reasoningEffort) {
-      await this.applyModelSelection(agent, resolvedId, { provider, model, reasoningEffort })
     }
 
-    let prompt = String(text || '').trim()
-    if (attachments.length > 0) {
-      const lines = attachments.map((a) => `- 附件：${a.localPath || a.filename} (${a.mimeType || 'file'})`)
-      prompt = `${prompt}\n\n[手机端上传的附件，可用文件/图片工具直接读取]\n${lines.join('\n')}`
-    }
+    let realCompositeId = makeCompositeId(APPS.DSH, sessionId)
+    let pollTimer = null
+    try {
+      const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, cwd, title)
+      if (resolvedId && resolvedId !== lockedId) {
+        if (this.activeTurns.has(resolvedId)) {
+          const err = new Error('该 DeepSeek Harness 对话正在运行中，请等待完成或先点击停止。')
+          err.code = 'SESSION_BUSY'
+          throw err
+        }
+        if (this.activeTurns.get(lockedId) === turnState) {
+          this.activeTurns.delete(lockedId)
+        }
+        lockedId = resolvedId
+        this.activeTurns.set(lockedId, turnState)
+      }
+      turnState.agent = agent
+      realCompositeId = makeCompositeId(APPS.DSH, lockedId)
 
-    const fromSeq = agent.session?.seq ?? 0
-    let cursorSeq = fromSeq
-    const emittedTextMap = new Map()
-    const emittedThinkMap = new Map()
-    const seenToolStarts = new Set()
-    const seenToolEnds = new Set()
+      if (model || reasoningEffort) {
+        await this.applyModelSelection(agent, lockedId, { provider, model, reasoningEffort })
+      }
 
-    const turnState = { agent, startedAt: Date.now(), aborted: false }
-    this.activeTurns.set(resolvedId, turnState)
-    this.emitEvent(EVENTS.STREAM_START, {
-      sessionId: realCompositeId,
-      app: APPS.DSH,
-      nativeId: resolvedId,
-    })
+      let prompt = String(text || '').trim()
+      if (attachments.length > 0) {
+        const lines = attachments.map((a) => `- 附件：${a.localPath || a.filename} (${a.mimeType || 'file'})`)
+        prompt = `${prompt}\n\n[手机端上传的附件，可用文件/图片工具直接读取]\n${lines.join('\n')}`
+      }
 
-    const flushNewEvents = () => {
-      if (typeof agent.session?.ownEvents !== 'function') return
-      const events = agent.session.ownEvents()
-      for (const ev of events) {
-        if (!ev || ev.seq <= cursorSeq) continue
-        if (ev.type === 'assistant/message') {
-          const msgId = ev.data?.message?.id || `a-${ev.seq}`
-          const blocks = ev.data?.message?.content ?? []
-          let fullThink = ''
-          let fullText = ''
-          for (const b of blocks) {
-            if (b?.type === 'thinking' || b?.type === 'reasoning') {
-              fullThink += b.thinking ?? b.reasoning ?? b.text ?? ''
-            } else if (b?.type === 'text' && typeof b.text === 'string') {
-              fullText += b.text
-            } else if ((b?.type === 'tool_use' || b?.type === 'tool_call') && b.id && !seenToolStarts.has(b.id)) {
-              seenToolStarts.add(b.id)
-              this.emitEvent(EVENTS.STREAM_TOOL_START, {
+      const fromSeq = agent.session?.seq ?? 0
+      let cursorSeq = fromSeq
+      const emittedTextMap = new Map()
+      const emittedThinkMap = new Map()
+      const seenToolStarts = new Set()
+      const seenToolEnds = new Set()
+
+      this.emitEvent(EVENTS.STREAM_START, {
+        sessionId: realCompositeId,
+        app: APPS.DSH,
+        nativeId: lockedId,
+      })
+
+      const flushNewEvents = () => {
+        if (typeof agent.session?.ownEvents !== 'function') return
+        const events = agent.session.ownEvents()
+        for (const ev of events) {
+          if (!ev || ev.seq <= cursorSeq) continue
+          if (ev.type === 'assistant/message') {
+            const msgId = ev.data?.message?.id || `a-${ev.seq}`
+            const blocks = ev.data?.message?.content ?? []
+            let fullThink = ''
+            let fullText = ''
+            for (const b of blocks) {
+              if (b?.type === 'thinking' || b?.type === 'reasoning') {
+                fullThink += b.thinking ?? b.reasoning ?? b.text ?? ''
+              } else if (b?.type === 'text' && typeof b.text === 'string') {
+                fullText += b.text
+              } else if ((b?.type === 'tool_use' || b?.type === 'tool_call') && b.id && !seenToolStarts.has(b.id)) {
+                seenToolStarts.add(b.id)
+                this.emitEvent(EVENTS.STREAM_TOOL_START, {
+                  sessionId: realCompositeId,
+                  app: APPS.DSH,
+                  tool: { id: b.id, name: b.name || 'tool', input: b.input ?? b.arguments ?? {} },
+                })
+              }
+            }
+            const prevThink = emittedThinkMap.get(msgId) || ''
+            if (fullThink.length > prevThink.length) {
+              emittedThinkMap.set(msgId, fullThink)
+              this.emitEvent(EVENTS.STREAM_THINKING, {
                 sessionId: realCompositeId,
                 app: APPS.DSH,
-                tool: { id: b.id, name: b.name || 'tool', input: b.input ?? b.arguments ?? {} },
+                delta: fullThink.slice(prevThink.length),
+              })
+            }
+            const prevText = emittedTextMap.get(msgId) || ''
+            if (fullText.length > prevText.length) {
+              emittedTextMap.set(msgId, fullText)
+              this.emitEvent(EVENTS.STREAM_DELTA, {
+                sessionId: realCompositeId,
+                app: APPS.DSH,
+                delta: fullText.slice(prevText.length),
+              })
+            }
+          } else if (ev.type === 'tool/result' || ev.type === 'tool_result') {
+            const callId = ev.data?.toolCallId || ev.data?.id || ev.data?.callId
+            if (callId && !seenToolEnds.has(callId)) {
+              seenToolEnds.add(callId)
+              const rawOut = ev.data?.content ?? ev.data?.output ?? ev.data?.result ?? ''
+              const output = typeof rawOut === 'string'
+                ? rawOut
+                : Array.isArray(rawOut)
+                  ? rawOut.map((b) => (typeof b === 'string' ? b : b?.text ?? JSON.stringify(b))).join('\n')
+                  : JSON.stringify(rawOut)
+              this.emitEvent(EVENTS.STREAM_TOOL_END, {
+                sessionId: realCompositeId,
+                app: APPS.DSH,
+                toolId: callId,
+                status: ev.data?.isError ? 'error' : 'completed',
+                output: output.slice(0, 3000),
               })
             }
           }
-          const prevThink = emittedThinkMap.get(msgId) || ''
-          if (fullThink.length > prevThink.length) {
-            emittedThinkMap.set(msgId, fullThink)
-            this.emitEvent(EVENTS.STREAM_THINKING, {
-              sessionId: realCompositeId,
-              app: APPS.DSH,
-              delta: fullThink.slice(prevThink.length),
-            })
-          }
-          const prevText = emittedTextMap.get(msgId) || ''
-          if (fullText.length > prevText.length) {
-            emittedTextMap.set(msgId, fullText)
-            this.emitEvent(EVENTS.STREAM_DELTA, {
-              sessionId: realCompositeId,
-              app: APPS.DSH,
-              delta: fullText.slice(prevText.length),
-            })
-          }
-        } else if (ev.type === 'tool/result' || ev.type === 'tool_result') {
-          const callId = ev.data?.toolCallId || ev.data?.id || ev.data?.callId
-          if (callId && !seenToolEnds.has(callId)) {
-            seenToolEnds.add(callId)
-            const rawOut = ev.data?.content ?? ev.data?.output ?? ev.data?.result ?? ''
-            const output = typeof rawOut === 'string'
-              ? rawOut
-              : Array.isArray(rawOut)
-                ? rawOut.map((b) => (typeof b === 'string' ? b : b?.text ?? JSON.stringify(b))).join('\n')
-                : JSON.stringify(rawOut)
-            this.emitEvent(EVENTS.STREAM_TOOL_END, {
-              sessionId: realCompositeId,
-              app: APPS.DSH,
-              toolId: callId,
-              status: ev.data?.isError ? 'error' : 'completed',
-              output: output.slice(0, 3000),
-            })
-          }
+          cursorSeq = Math.max(cursorSeq, ev.seq)
         }
-        cursorSeq = Math.max(cursorSeq, ev.seq)
       }
-    }
 
-    const pollTimer = setInterval(flushNewEvents, 250)
-    try {
+      pollTimer = setInterval(flushNewEvents, 250)
       agent.followup(buildDshUserMessage(prompt))
       await agent.whenIdle()
       flushNewEvents()
@@ -1178,27 +1219,32 @@ export class DshAdapter {
       this.emitEvent(EVENTS.STREAM_DONE, {
         sessionId: realCompositeId,
         app: APPS.DSH,
-        nativeId: resolvedId,
+        nativeId: lockedId,
         finalText,
         aborted: turnState.aborted,
       })
 
       return {
         sessionId: realCompositeId,
-        nativeId: resolvedId,
+        nativeId: lockedId,
         finalText,
         aborted: turnState.aborted,
       }
     } catch (err) {
-      this.emitEvent(EVENTS.STREAM_ERROR, {
-        sessionId: compositeId,
-        app: APPS.DSH,
-        message: String(err?.message || err),
-      })
+      if (err?.code !== 'SESSION_BUSY' && !err?._streamErrorEmitted) {
+        if (err && typeof err === 'object') err._streamErrorEmitted = true
+        this.emitEvent(EVENTS.STREAM_ERROR, {
+          sessionId: realCompositeId,
+          app: APPS.DSH,
+          message: String(err?.message || err),
+        })
+      }
       throw err
     } finally {
-      clearInterval(pollTimer)
-      this.activeTurns.delete(resolvedId)
+      if (pollTimer) clearInterval(pollTimer)
+      if (this.activeTurns.get(lockedId) === turnState) {
+        this.activeTurns.delete(lockedId)
+      }
     }
   }
 
