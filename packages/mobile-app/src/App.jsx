@@ -9,10 +9,11 @@ import {
   Menu,
   ScanLine,
   ShieldCheck,
+  Smartphone,
   SquarePen,
   WifiOff,
 } from 'lucide-react'
-import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
+import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
 import {
   MobileRelayClient,
@@ -70,6 +71,7 @@ import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
 import { InviteManagerModal } from './components/InviteManagerModal.jsx'
 import { SettingsModal } from './components/SettingsModal.jsx'
 import { E2eeSyncModal } from './components/E2eeSyncModal.jsx'
+import { E2eeGrantApproveModal } from './components/E2eeGrantApproveModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 import { useI18n } from './lib/i18n.jsx'
 import { bi as biLang, getCurrentLang } from './lib/i18n.js'
@@ -93,6 +95,7 @@ export function App() {
   })
   const [liveOnlineClientCount, setLiveOnlineClientCount] = useState(0)
   const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
+  const [pendingGrantPopup, setPendingGrantPopup] = useState(null)
   const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '' })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -588,6 +591,8 @@ export function App() {
   const e2eeLocked = activeBridgeE2ee.locked
   const e2eeLockedRef = useRef(e2eeLocked)
   e2eeLockedRef.current = e2eeLocked
+  const activeE2eeKeysRef = useRef(activeDevice?.e2eeKeys || {})
+  activeE2eeKeysRef.current = activeDevice?.e2eeKeys || {}
 
   useEffect(() => {
     clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
@@ -1028,6 +1033,7 @@ export function App() {
       bridgeId: activeDevice.selectedBridgeId || '',
       e2eeKeys: activeDevice.e2eeKeys || {},
     })
+    setPendingGrantPopup(null)
     clientRef.current = client
 
     const unsubStatus = client.onStatus(({ state, bridges: bList, devices: dList, onlineClientCount: occ }) => {
@@ -1041,6 +1047,27 @@ export function App() {
     const unsubEvents = client.onEvent((event, payload, rawMsg) => {
       if (clientRef.current !== client) return
       if (event === EVENTS.BRIDGE_STATUS || event === EVENTS.CLIENTS_STATUS) return
+
+      // Zero-knowledge device-to-device E2EE key-grant signaling (room-wide, independent of selected bridge)
+      if (event === EVENTS.E2EE_GRANT_REQUEST && payload?.reqId && payload?.pubKey) {
+        if (payload.requesterClientId && payload.requesterClientId === client.clientId) return
+        const myKeys = activeE2eeKeysRef.current || {}
+        if (Object.keys(myKeys).length > 0) {
+          setPendingGrantPopup((prev) => (prev?.qrVerified ? prev : payload))
+        }
+        return
+      }
+      if (event === EVENTS.E2EE_GRANT_CANCEL && payload?.reqId) {
+        setPendingGrantPopup((prev) => (prev && prev.reqId === payload.reqId ? null : prev))
+        return
+      }
+      if (
+        event === EVENTS.E2EE_GRANT_OFFER ||
+        event === EVENTS.E2EE_GRANT_DELIVER ||
+        event === EVENTS.E2EE_GRANT_REJECT
+      ) {
+        return
+      }
 
       // Strictly isolate live events to the currently selected computer bridge
       const evBridgeId = String(rawMsg?.bridgeId || '').trim()
@@ -1449,6 +1476,83 @@ export function App() {
     [activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, desktopApi, showToast],
   )
 
+  const handleImportE2eeKeyring = useCallback(
+    async (entries = [], preferredKeyId = '', { applyToDesktopBridge = false, approverName = '' } = {}) => {
+      if (!activeDevice?.id || !Array.isArray(entries) || entries.length === 0) return
+      const validEntries = entries.filter((e) => e?.keyId && e?.key)
+      if (validEntries.length === 0) return
+
+      const preferred =
+        validEntries.find((e) => e.keyId === preferredKeyId) || validEntries[0]
+
+      const nextKeys = { ...(activeDevice.e2eeKeys || {}) }
+      for (const item of validEntries) {
+        nextKeys[item.keyId] = item.key
+      }
+
+      if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId && preferred?.key) {
+        const res = await desktopApi.setE2eeKey(activeDevice.roomId, preferred.key)
+        if (res?.key && res?.keyId) {
+          nextKeys[res.keyId] = res.key
+        }
+        const st = await desktopApi.getBridgeStatus?.().catch(() => null)
+        if (st) setDesktopBridge(st)
+      }
+
+      clientRef.current?.setE2eeKeys(nextKeys)
+      setDeviceState((prev) => {
+        let next = prev
+        for (const [kid, kVal] of Object.entries(nextKeys)) {
+          next = upsertDeviceE2eeKey(next, activeDevice.id, kid, kVal)
+        }
+        return next
+      })
+      showToast(
+        approverName
+          ? biLang(
+              getCurrentLang(),
+              `已通过「${approverName}」安全同步 ${validEntries.length} 把端到端密钥`,
+              `Synced ${validEntries.length} E2EE key(s) via ${approverName}`,
+            )
+          : biLang(
+              getCurrentLang(),
+              `已安全同步 ${validEntries.length} 把端到端密钥`,
+              `Synced ${validEntries.length} E2EE key(s)`,
+            ),
+      )
+    },
+    [activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, desktopApi, showToast],
+  )
+
+  const handleScanGrantQr = useCallback(
+    async (grantQr) => {
+      if (!grantQr?.reqId || !grantQr?.pubKeyFp || !clientRef.current) return false
+      const list = await clientRef.current.listGrantRequests(5000)
+      const match = (Array.isArray(list) ? list : []).find((g) => g.reqId === grantQr.reqId)
+      if (!match || !match.pubKey) return false
+      if (activeDevice?.roomId && match.roomId && match.roomId !== activeDevice.roomId) {
+        throw new Error(biLang(getCurrentLang(), '该授权请求属于其他账号', 'Grant request belongs to a different account'))
+      }
+      const computedFp = await computeGrantPubKeyFp(match.pubKey)
+      if (computedFp !== String(grantQr.pubKeyFp).toLowerCase()) {
+        throw new Error(
+          biLang(
+            getCurrentLang(),
+            '安全校验失败：二维码公钥指纹不匹配，可能存在中间人攻击，已拒绝授权！',
+            'Security verification failed: QR public key fingerprint mismatch!',
+          ),
+        )
+      }
+      setPendingGrantPopup({
+        ...match,
+        qrVerified: true,
+        qrPubKeyFp: grantQr.pubKeyFp,
+      })
+      return true
+    },
+    [activeDevice?.roomId],
+  )
+
   const handleRotateDesktopE2eeKey = useCallback(async () => {
     if (!desktopApi?.rotateE2eeKey || !activeDevice?.id || !activeDevice?.roomId) return
     const res = await desktopApi.rotateE2eeKey(activeDevice.roomId)
@@ -1839,7 +1943,7 @@ export function App() {
                   onClick={() =>
                     setE2eeModal({
                       open: true,
-                      tab: e2eeLocked ? 'import' : 'show',
+                      tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'show',
                       autoOpenScanner: false,
                     })
                   }
@@ -1953,25 +2057,56 @@ export function App() {
               </div>
             )}
             <div className="mt-5 space-y-2">
-              <button
-                type="button"
-                onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
-                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
-              >
-                <ScanLine className="h-4 w-4" />
-                <span>{bi('扫一扫电脑端二维码', 'Scan Computer QR Code')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: false })}
-                className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
-              >
-                <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                <span>{bi('手动粘贴恢复密钥', 'Paste Recovery Key')}</span>
-              </button>
+              {desktopApi ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setE2eeModal({ open: true, tab: 'request', autoOpenScanner: false })}
+                    className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+                  >
+                    <Smartphone className="h-4 w-4" />
+                    <span>{bi('用已授权手机一键同步', 'Approve from Authorized Phone')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: false })}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
+                  >
+                    <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>{bi('扫码或粘贴恢复密钥', 'Scan QR or Paste Recovery Key')}</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
+                    className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+                  >
+                    <ScanLine className="h-4 w-4" />
+                    <span>{bi('扫一扫电脑端二维码', 'Scan Computer QR Code')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setE2eeModal({ open: true, tab: 'request', autoOpenScanner: false })}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200 dark:hover:bg-[#2B2F3D]"
+                  >
+                    <Smartphone className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>{bi('向已授权手机/设备请求同步', 'Request Approval from Another Device')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: false })}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-2xl border border-slate-200/80 bg-transparent py-2 text-[11.5px] font-medium text-slate-500 transition hover:bg-slate-100/70 dark:border-slate-800 dark:text-slate-400 dark:hover:bg-slate-800/50"
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    <span>{bi('手动粘贴恢复密钥', 'Paste Recovery Key')}</span>
+                  </button>
+                </>
+              )}
             </div>
             <p className="mt-3.5 text-[11px] text-slate-400">
-              {bi('路径：电脑端「设置 → 端到端加密」或 CLI 终端按 K 键', 'On PC: Settings → End-to-End Encryption, or press K in CLI')}
+              {bi('无需触碰原电脑 · 随身手机打开 All in One 即可零知识安全授权', 'No need to touch your original PC — approve securely from any unlocked device')}
             </p>
           </div>
         </div>
@@ -2211,7 +2346,7 @@ export function App() {
         onOpenE2eeSync={() =>
           setE2eeModal({
             open: true,
-            tab: e2eeLocked ? 'import' : 'auto',
+            tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'auto',
             autoOpenScanner: false,
           })
         }
@@ -2228,10 +2363,32 @@ export function App() {
         activeKey={activeBridgeE2ee.shareableKey}
         activeKeyId={activeBridgeE2ee.shareableKeyId}
         isDesktopApp={Boolean(desktopApi)}
+        client={clientRef.current}
+        onlineOtherClientCount={Math.max(0, liveOnlineClientCount - 1)}
         initialTab={e2eeModal.tab}
         autoOpenScanner={e2eeModal.autoOpenScanner}
         onImportKey={handleImportE2eeKey}
+        onImportKeyring={handleImportE2eeKeyring}
+        onScanGrantQr={handleScanGrantQr}
         onRotateDesktopKey={desktopApi ? handleRotateDesktopE2eeKey : null}
+      />
+      {/* Zero-Knowledge Device-to-Device Key Grant Approval Popup (Phone B -> Computer C) */}
+      <E2eeGrantApproveModal
+        open={Boolean(pendingGrantPopup)}
+        grant={pendingGrantPopup}
+        e2eeKeys={activeDevice?.e2eeKeys || {}}
+        preferredKeyId={activeBridgeE2ee.shareableKeyId || ''}
+        client={clientRef.current}
+        onDone={(g) => {
+          showToast(
+            biLang(
+              getCurrentLang(),
+              `已安全授权「${g?.deviceName || '新设备'}」同步端到端密钥`,
+              `Authorized ${g?.deviceName || 'new device'} via zero-knowledge E2EE handoff`,
+            ),
+          )
+        }}
+        onClose={() => setPendingGrantPopup(null)}
       />
       {/* Full-Screen Zoomable Image Lightbox */}
       <ImageLightbox state={lightboxState} imageContext={imageContext} onClose={() => setLightboxState(null)} />

@@ -602,6 +602,8 @@ export class MobileRelayClient {
     this.clientId = ''
     this.liveClients = []
     this.onlineClientCount = 0
+    this.pendingGrants = []
+    this._grantListResolvers = new Map()
   }
 
   setTargetBridgeId(bridgeId) {
@@ -760,7 +762,27 @@ export class MobileRelayClient {
           this.liveClients = msg.clients
           this.onlineClientCount = Number(msg.onlineClientCount) || msg.clients.length
         }
+        if (Array.isArray(msg.pendingGrants)) {
+          this.pendingGrants = msg.pendingGrants
+          for (const g of msg.pendingGrants) {
+            for (const fn of this.eventListeners) {
+              try { fn('e2ee.grant.request', g, msg) } catch {}
+            }
+          }
+        }
         this.emitStatus()
+        return
+      }
+
+      if (msg.type === 'e2ee.grant.list.res') {
+        const resolver = this._grantListResolvers.get(String(msg.id || ''))
+        if (resolver) {
+          this._grantListResolvers.delete(String(msg.id || ''))
+          clearTimeout(resolver.timer)
+          const grants = Array.isArray(msg.grants) ? msg.grants : []
+          this.pendingGrants = grants
+          resolver.resolve(grants)
+        }
         return
       }
 
@@ -826,6 +848,25 @@ export class MobileRelayClient {
               this.liveClients = msg.payload.clients
               this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
               this.emitStatus()
+            }
+            for (const fn of this.eventListeners) {
+              try { fn(msg.event, msg.payload, msg) } catch {}
+            }
+          } else if (
+            msg.event === 'e2ee.grant.request' ||
+            msg.event === 'e2ee.grant.offer' ||
+            msg.event === 'e2ee.grant.deliver' ||
+            msg.event === 'e2ee.grant.reject' ||
+            msg.event === 'e2ee.grant.cancel'
+          ) {
+            // Relay-routed ephemeral ECDH public-key / ciphertext-envelope signaling (never plaintext E2EE keys)
+            if (msg.event === 'e2ee.grant.request' && msg.payload?.reqId) {
+              this.pendingGrants = [
+                msg.payload,
+                ...this.pendingGrants.filter((g) => g.reqId !== msg.payload.reqId),
+              ]
+            } else if (msg.event === 'e2ee.grant.cancel' && msg.payload?.reqId) {
+              this.pendingGrants = this.pendingGrants.filter((g) => g.reqId !== msg.payload.reqId)
             }
             for (const fn of this.eventListeners) {
               try { fn(msg.event, msg.payload, msg) } catch {}
@@ -970,6 +1011,57 @@ export class MobileRelayClient {
           reject(err)
         })
     })
+  }
+
+  sendGrantRequest({ reqId, pubKey, wantedKeyId = '' }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({
+      type: 'e2ee.grant.req',
+      reqId,
+      pubKey,
+      ...(wantedKeyId ? { wantedKeyId } : {}),
+    }))
+    return true
+  }
+
+  listGrantRequests(timeoutMs = 5000) {
+    return new Promise((resolve) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        resolve(this.pendingGrants || [])
+        return
+      }
+      const id = `gl-${this.reqSeq++}`
+      const timer = setTimeout(() => {
+        this._grantListResolvers.delete(id)
+        resolve(this.pendingGrants || [])
+      }, timeoutMs)
+      this._grantListResolvers.set(id, { resolve, timer })
+      this.ws.send(JSON.stringify({ type: 'e2ee.grant.list', id }))
+    })
+  }
+
+  sendGrantOffer({ reqId, approverPubKey }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId, approverPubKey }))
+    return true
+  }
+
+  sendGrantDeliver({ reqId, envelope }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId, envelope }))
+    return true
+  }
+
+  sendGrantReject({ reqId }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ type: 'e2ee.grant.reject', reqId }))
+    return true
+  }
+
+  sendGrantCancel({ reqId }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ type: 'e2ee.grant.cancel', reqId }))
+    return true
   }
 
   async uploadFile(file) {

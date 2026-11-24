@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Check,
@@ -12,12 +12,19 @@ import {
   RefreshCw,
   ScanLine,
   ShieldCheck,
+  Smartphone,
   X,
 } from 'lucide-react'
 import {
   computeE2eeKeyId,
+  decryptGrantPayload,
+  deriveGrantSas,
+  encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
   formatE2eeFingerprint,
+  generateGrantKeyPair,
+  generateGrantReqId,
+  parseE2eeGrantQrInput,
   parseE2eeQrInput,
 } from '@allinone/shared/e2ee'
 import { renderQrDataUrl } from '@allinone/shared/qr-svg'
@@ -34,21 +41,30 @@ export function E2eeSyncModal({
   activeKey = '',
   activeKeyId = '',
   isDesktopApp = false,
-  initialTab = 'auto', // 'auto' | 'show' | 'import'
+  client = null,
+  onlineOtherClientCount = 0,
+  initialTab = 'auto', // 'auto' | 'show' | 'request' | 'import'
   autoOpenScanner = false,
   onImportKey = null,
+  onImportKeyring = null,
+  onScanGrantQr = null,
   onRotateDesktopKey = null,
 }) {
   const { bi, t } = useI18n()
   const isLocked = Boolean(bridgeE2ee?.enabled && !activeKey)
-  const resolvedDefaultTab =
-    initialTab === 'show' || initialTab === 'import'
-      ? initialTab
-      : activeKey
-        ? 'show'
-        : 'import'
+  const canRequestGrant = Boolean(client && roomId)
 
-  const [tab, setTab] = useState(resolvedDefaultTab)
+  const resolveInitialTab = useCallback(() => {
+    if (initialTab === 'show' || initialTab === 'import' || initialTab === 'request') {
+      if (initialTab === 'request' && !canRequestGrant) return activeKey ? 'show' : 'import'
+      return initialTab
+    }
+    if (activeKey) return 'show'
+    if (isDesktopApp && canRequestGrant) return 'request'
+    return 'import'
+  }, [initialTab, activeKey, isDesktopApp, canRequestGrant])
+
+  const [tab, setTab] = useState(resolveInitialTab)
   const [scannerOpen, setScannerOpen] = useState(false)
   const [manualInput, setManualInput] = useState('')
   const [applyToDesktop, setApplyToDesktop] = useState(true)
@@ -59,8 +75,70 @@ export function E2eeSyncModal({
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
 
+  // Reverse-Auth / Device-to-Device Grant state (Computer C waiting for Phone B)
+  const [grantState, setGrantState] = useState(null)
+  // { reqId, pubKeyRaw, pubKeyFp, qrDataUrl, expiresAt, phase: 'waiting'|'sas'|'rejected'|'expired', sasCode, approverDeviceName, approverIp, approverPubKey }
+  const [grantCountdownSec, setGrantCountdownSec] = useState(0)
+  const grantPrivateKeyRef = useRef(null)
+  const grantStateRef = useRef(null)
+  grantStateRef.current = grantState
+  const applyToDesktopRef = useRef(applyToDesktop)
+  applyToDesktopRef.current = applyToDesktop
+
+  const cancelActiveGrant = useCallback(() => {
+    const cur = grantStateRef.current
+    if (cur?.reqId) {
+      try {
+        client?.sendGrantCancel?.({ reqId: cur.reqId })
+      } catch {}
+    }
+    grantPrivateKeyRef.current = null
+    setGrantState(null)
+    setGrantCountdownSec(0)
+  }, [client])
+
+  const startGrantSession = useCallback(async () => {
+    if (!client || !roomId) return
+    cancelActiveGrant()
+    setError('')
+    setInfo('')
+    try {
+      const pair = await generateGrantKeyPair()
+      const reqId = generateGrantReqId()
+      const uri = encodeE2eeGrantQrUri({ reqId, roomId, pubKeyFp: pair.publicKeyFp })
+      const qrDataUrl = renderQrDataUrl(uri, { pixelSize: 224, darkColor: '#0F172A', lightColor: '#FFFFFF' })
+      const sent = client.sendGrantRequest({
+        reqId,
+        pubKey: pair.publicKeyRaw,
+        wantedKeyId: bridgeE2ee?.keyId || '',
+      })
+      if (!sent) {
+        setError(bi('尚未连接到中转服务器，请稍候重试', 'Not connected to relay server yet.'))
+        return
+      }
+      grantPrivateKeyRef.current = pair.privateKey
+      const expiresAt = Date.now() + 120_000
+      setGrantState({
+        reqId,
+        pubKeyRaw: pair.publicKeyRaw,
+        pubKeyFp: pair.publicKeyFp,
+        qrDataUrl,
+        expiresAt,
+        phase: 'waiting',
+        sasCode: '',
+        approverDeviceName: '',
+        approverIp: '',
+        approverPubKey: '',
+      })
+      setGrantCountdownSec(120)
+    } catch (err) {
+      setError(String(err?.message || err))
+    }
+  }, [client, roomId, bridgeE2ee?.keyId, cancelActiveGrant, bi])
+
   useEffect(() => {
     if (!open) {
+      cancelActiveGrant()
       setScannerOpen(false)
       setManualInput('')
       setShowPlainKey(false)
@@ -70,17 +148,145 @@ export function E2eeSyncModal({
       setInfo('')
       return
     }
-    const nextTab =
-      initialTab === 'show' || initialTab === 'import'
-        ? initialTab
-        : activeKey
-          ? 'show'
-          : 'import'
+    const nextTab = resolveInitialTab()
     setTab(nextTab)
     if (autoOpenScanner && nextTab === 'import') {
       setScannerOpen(true)
     }
-  }, [open, initialTab, activeKey, autoOpenScanner])
+  }, [open, resolveInitialTab, autoOpenScanner, cancelActiveGrant])
+
+  // Auto-start Reverse-Auth grant session whenever entering the `request` tab
+  useEffect(() => {
+    if (!open || tab !== 'request' || !canRequestGrant) {
+      if (grantStateRef.current) cancelActiveGrant()
+      return
+    }
+    if (!grantStateRef.current) {
+      void startGrantSession()
+    }
+    return () => {
+      cancelActiveGrant()
+    }
+  }, [open, tab, canRequestGrant, startGrantSession, cancelActiveGrant])
+
+  // Live countdown for pending grant session
+  useEffect(() => {
+    if (!open || !grantState || (grantState.phase !== 'waiting' && grantState.phase !== 'sas')) return
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((grantState.expiresAt - Date.now()) / 1000))
+      setGrantCountdownSec(left)
+      if (left <= 0) {
+        setGrantState((prev) => (prev && prev.reqId === grantState.reqId ? { ...prev, phase: 'expired' } : prev))
+      }
+    }
+    tick()
+    const timer = setInterval(tick, 1000)
+    return () => clearInterval(timer)
+  }, [open, grantState])
+
+  // Listen for approver `offer`, `deliver`, `reject` events on this client
+  useEffect(() => {
+    if (!open || !client || tab !== 'request') return
+    const unsub = client.onEvent(async (event, payload) => {
+      const cur = grantStateRef.current
+      if (!cur || !payload || payload.reqId !== cur.reqId) return
+
+      if (event === 'e2ee.grant.offer' && payload.approverPubKey) {
+        try {
+          const sas = await deriveGrantSas({
+            requesterPubKey: cur.pubKeyRaw,
+            approverPubKey: payload.approverPubKey,
+            reqId: cur.reqId,
+            roomId,
+          })
+          setGrantState((prev) =>
+            prev && prev.reqId === cur.reqId
+              ? {
+                  ...prev,
+                  phase: 'sas',
+                  sasCode: sas,
+                  approverPubKey: payload.approverPubKey,
+                  approverDeviceName: payload.approverDeviceName || bi('已授权设备', 'Authorized Device'),
+                  approverIp: payload.approverIp || '',
+                }
+              : prev,
+          )
+        } catch {}
+        return
+      }
+
+      if (event === 'e2ee.grant.reject') {
+        grantPrivateKeyRef.current = null
+        setGrantState((prev) =>
+          prev && prev.reqId === cur.reqId
+            ? {
+                ...prev,
+                phase: 'rejected',
+                approverDeviceName: payload.approverDeviceName || bi('已授权设备', 'Authorized Device'),
+              }
+            : prev,
+        )
+        return
+      }
+
+      if (event === 'e2ee.grant.deliver' && payload.envelope) {
+        const privKey = grantPrivateKeyRef.current
+        if (!privKey) return
+        setBusy(true)
+        setError('')
+        try {
+          const decrypted = await decryptGrantPayload({
+            requesterPrivateKey: privKey,
+            requesterPubKeyRaw: cur.pubKeyRaw,
+            envelope: payload.envelope,
+            roomId,
+            expectedApproverPubKey: cur.approverPubKey || '',
+          })
+          const rawKeys = Array.isArray(decrypted?.keys) ? decrypted.keys : []
+          const verifiedKeys = []
+          for (const entry of rawKeys) {
+            if (!entry?.key) continue
+            try {
+              const cid = await computeE2eeKeyId(entry.key)
+              if (!entry.keyId || entry.keyId === cid) {
+                verifiedKeys.push({ keyId: cid, key: entry.key })
+              }
+            } catch {}
+          }
+          if (verifiedKeys.length === 0) {
+            throw new Error(bi('授权包中未包含有效密钥', 'No valid keys in authorization payload'))
+          }
+          grantPrivateKeyRef.current = null
+          setGrantState(null)
+          const preferredKeyId =
+            (bridgeE2ee?.keyId && verifiedKeys.some((k) => k.keyId === bridgeE2ee.keyId) ? bridgeE2ee.keyId : '') ||
+            (decrypted?.preferredKeyId && verifiedKeys.some((k) => k.keyId === decrypted.preferredKeyId)
+              ? decrypted.preferredKeyId
+              : verifiedKeys[0].keyId)
+
+          const shouldApplyDesktop = Boolean(isDesktopApp && applyToDesktopRef.current)
+          if (onImportKeyring) {
+            await onImportKeyring(verifiedKeys, preferredKeyId, {
+              applyToDesktopBridge: shouldApplyDesktop,
+              approverName: payload.approverDeviceName || '',
+            })
+          } else if (onImportKey) {
+            for (const item of verifiedKeys) {
+              await onImportKey(item.key, item.keyId, {
+                applyToDesktopBridge: shouldApplyDesktop && item.keyId === preferredKeyId,
+              })
+            }
+          }
+          onClose?.()
+        } catch (err) {
+          setError(String(err?.message || err))
+        } finally {
+          setBusy(false)
+        }
+      }
+    })
+    return () => unsub?.()
+  }, [open, client, tab, roomId, bridgeE2ee?.keyId, isDesktopApp, onImportKeyring, onImportKey, onClose, bi])
 
   const qrDataUrl = useMemo(() => {
     if (!activeKey) return ''
@@ -109,6 +315,41 @@ export function E2eeSyncModal({
   const processImportedText = async (rawText) => {
     setError('')
     setInfo('')
+
+    // Dual-purpose QR detection: if user scanned a Reverse-Auth Grant QR (`allinone-e2ee-grant://v1?...`)
+    const grantQr = parseE2eeGrantQrInput(rawText)
+    if (grantQr) {
+      if (!activeKey) {
+        setError(
+          bi(
+            '这是新设备的「请求授权二维码」，请用已解锁的手机（持有密钥的设备）扫描它来完成授权。',
+            'This is a new-device authorization request QR. Scan it from a device that already holds your E2EE key.',
+          ),
+        )
+        return
+      }
+      if (grantQr.roomId && roomId && grantQr.roomId !== roomId) {
+        setError(bi('该授权二维码属于其他账号，无法授权', 'This authorization QR belongs to a different account.'))
+        return
+      }
+      if (onScanGrantQr) {
+        setBusy(true)
+        try {
+          const ok = await onScanGrantQr(grantQr)
+          if (ok) {
+            onClose?.()
+          } else {
+            setError(bi('未找到对应的待授权请求（可能已过期或对方已关闭页面），请让对方刷新二维码后重试。', 'Pending request not found or expired. Ask the other device to refresh the QR code.'))
+          }
+        } catch (err) {
+          setError(String(err?.message || err))
+        } finally {
+          setBusy(false)
+        }
+      }
+      return
+    }
+
     const parsed = parseE2eeQrInput(rawText)
     if (!parsed?.key) {
       setError(bi('未识别到有效的端到端密钥，请扫描电脑端二维码或粘贴 43 位恢复密钥', 'Invalid E2EE key or QR code.'))
@@ -128,7 +369,6 @@ export function E2eeSyncModal({
         bridgeE2ee?.keyId &&
         importedKeyId !== bridgeE2ee.keyId
       ) {
-        // Still save to key ring if user has multiple PCs, but warn clearly that it didn't match the currently selected PC!
         await onImportKey?.(parsed.key, importedKeyId, { applyToDesktopBridge: false })
         setError(
           bi(
@@ -168,6 +408,15 @@ export function E2eeSyncModal({
       setBusy(false)
     }
   }
+
+  const tabs = []
+  if (activeKey) {
+    tabs.push({ id: 'show', icon: QrCode, label: bi('本机密钥', 'My Key') })
+  }
+  if (canRequestGrant) {
+    tabs.push({ id: 'request', icon: Smartphone, label: bi('手机授权', 'Approve via Phone') })
+  }
+  tabs.push({ id: 'import', icon: ScanLine, label: bi('扫码 / 导入', 'Scan / Import') })
 
   return (
     <>
@@ -213,39 +462,36 @@ export function E2eeSyncModal({
           </div>
 
           {/* Tabs */}
-          {activeKey && (
+          {tabs.length > 1 && (
             <div className="px-4 pt-3">
-              <div className="grid grid-cols-2 gap-1 rounded-2xl bg-slate-100 p-1 dark:bg-[#14161C]">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setTab('show')
-                    setError('')
-                  }}
-                  className={`flex items-center justify-center gap-1.5 rounded-xl py-1.5 text-xs font-semibold transition ${
-                    tab === 'show'
-                      ? 'bg-white text-[#4D6BFE] shadow-xs dark:bg-[#262A36] dark:text-white'
-                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'
-                  }`}
-                >
-                  <QrCode className="h-3.5 w-3.5" />
-                  <span>{bi('同步二维码', 'Sync QR')}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setTab('import')
-                    setError('')
-                  }}
-                  className={`flex items-center justify-center gap-1.5 rounded-xl py-1.5 text-xs font-semibold transition ${
-                    tab === 'import'
-                      ? 'bg-white text-[#4D6BFE] shadow-xs dark:bg-[#262A36] dark:text-white'
-                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'
-                  }`}
-                >
-                  <ScanLine className="h-3.5 w-3.5" />
-                  <span>{bi('扫码 / 导入', 'Scan / Import')}</span>
-                </button>
+              <div
+                className={`grid gap-1 rounded-2xl bg-slate-100 p-1 dark:bg-[#14161C] ${
+                  tabs.length === 3 ? 'grid-cols-3' : 'grid-cols-2'
+                }`}
+              >
+                {tabs.map((item) => {
+                  const Icon = item.icon
+                  const active = tab === item.id
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => {
+                        setTab(item.id)
+                        setError('')
+                        setInfo('')
+                      }}
+                      className={`flex items-center justify-center gap-1 rounded-xl py-1.5 text-[11.5px] font-semibold transition ${
+                        active
+                          ? 'bg-white text-[#4D6BFE] shadow-xs dark:bg-[#262A36] dark:text-white'
+                          : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'
+                      }`}
+                    >
+                      <Icon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{item.label}</span>
+                    </button>
+                  )
+                })}
               </div>
             </div>
           )}
@@ -270,11 +516,39 @@ export function E2eeSyncModal({
                   </div>
                   <p className="mt-2 text-[11.5px] leading-relaxed text-slate-500 dark:text-slate-400">
                     {bi(
-                      '用新手机打开 All in One 扫描上方二维码即可同步密钥。密钥仅保存在你的本地设备，中转服务器无法查看任何对话、代码与图片。',
-                      'Scan this QR code from another signed-in device to sync your 256-bit key. Keys never leave your devices; the relay server only forwards opaque ciphertext.',
+                      '用新手机扫描上方二维码，或点下方按钮用本设备去扫新电脑屏幕上的「授权二维码」一键零知识同步。',
+                      'Scan this QR from a new phone, or tap below to scan a new computer’s request QR and authorize it in one tap.',
                     )}
                   </p>
                 </div>
+
+                {/* Reverse-QR scanner shortcut for Phone B -> Computer C */}
+                {onScanGrantQr && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setError('')
+                      setScannerOpen(true)
+                    }}
+                    className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-2.5 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
+                  >
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
+                        <ScanLine className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-[#2842C9] dark:text-white">
+                          {bi('扫一扫授权新电脑 / 新设备', 'Scan to Authorize New Computer')}
+                        </div>
+                        <div className="truncate text-[11px] text-slate-500 dark:text-slate-300">
+                          {bi('ECDH 端到端加密移交密钥，无需碰原电脑', 'Zero-knowledge ECDH handoff without touching original PC')}
+                        </div>
+                      </div>
+                    </div>
+                    <QrCode className="h-4 w-4 shrink-0 text-[#4D6BFE]" />
+                  </button>
+                )}
 
                 {/* Recovery key box */}
                 <div className="rounded-2xl border border-slate-200/80 bg-white p-3 dark:border-slate-800 dark:bg-[#22252E]">
@@ -364,6 +638,119 @@ export function E2eeSyncModal({
                   </div>
                 )}
               </>
+            ) : tab === 'request' && canRequestGrant ? (
+              <>
+                {grantState?.phase === 'sas' ? (
+                  <div className="flex flex-col items-center rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] p-5 text-center dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
+                    <div className="inline-flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-1 text-[11px] font-semibold text-[#2842C9] shadow-xs dark:bg-[#14171F] dark:text-[#8DA2FF]">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      <span>
+                        {bi(
+                          `正在与「${grantState.approverDeviceName}」校验安全码`,
+                          `Verifying with ${grantState.approverDeviceName}`,
+                        )}
+                      </span>
+                    </div>
+                    <div className="mt-4 font-mono text-4xl font-extrabold tracking-[0.22em] text-[#2842C9] dark:text-white">
+                      {grantState.sasCode.replace('-', ' · ')}
+                    </div>
+                    <p className="mt-3 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                      {bi(
+                        '请确认你手机上的 6 位安全码与此完全一致，然后在手机上点击「安全码一致，同步」即可自动解锁！',
+                        'Verify this 6-digit code matches your phone, then tap "Codes Match · Sync" on your phone to unlock automatically.',
+                      )}
+                    </p>
+                    {grantState.approverIp && (
+                      <div className="mt-2 font-mono text-[11px] text-slate-400">
+                        IP: {grantState.approverIp} · {grantCountdownSec}s
+                      </div>
+                    )}
+                  </div>
+                ) : grantState?.phase === 'rejected' || grantState?.phase === 'expired' ? (
+                  <div className="flex flex-col items-center rounded-2xl border border-slate-200/80 bg-slate-50/70 p-5 text-center dark:border-slate-800 dark:bg-[#14171F]">
+                    <AlertTriangle className="h-8 w-8 text-amber-500" />
+                    <div className="mt-2 text-sm font-bold text-slate-800 dark:text-white">
+                      {grantState.phase === 'rejected'
+                        ? bi(`已被「${grantState.approverDeviceName}」拒绝`, `Declined by ${grantState.approverDeviceName}`)
+                        : bi('本次授权请求已过期', 'Authorization request expired')}
+                    </div>
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                      {bi('可点击下方按钮重新生成一次性授权二维码。', 'Generate a fresh one-time authorization QR below.')}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void startGrantSession()}
+                      className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-[#4D6BFE] px-4 py-2 text-xs font-semibold text-white shadow-sm shadow-[#4D6BFE]/25"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>{bi('重新发起授权请求', 'Request Again')}</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center rounded-2xl border border-slate-200/80 bg-slate-50/70 p-4 text-center dark:border-slate-800 dark:bg-[#14171F]">
+                    {grantState?.qrDataUrl ? (
+                      <div className="rounded-2xl bg-white p-3 shadow-sm ring-1 ring-slate-200/70">
+                        <img
+                          src={grantState.qrDataUrl}
+                          alt="E2EE Reverse Auth QR"
+                          className="h-44 w-44 select-none"
+                        />
+                      </div>
+                    ) : (
+                      <div className="flex h-44 w-44 items-center justify-center rounded-2xl bg-white/60 dark:bg-[#1B1D23]">
+                        <Loader2 className="h-6 w-6 animate-spin text-[#4D6BFE]" />
+                      </div>
+                    )}
+                    <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-[#4D6BFE]/12 px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE]">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      <span>
+                        {bi(
+                          `等待已解锁设备批准 (${grantCountdownSec || 120}s)`,
+                          `Waiting for authorized device (${grantCountdownSec || 120}s)`,
+                        )}
+                      </span>
+                    </div>
+                    <p className="mt-2.5 text-[11.5px] leading-relaxed text-slate-600 dark:text-slate-300">
+                      {bi(
+                        '打开你随身已解锁的手机 All in One：直接点屏幕弹出的授权通知（核对 6 位安全码），或用手机「扫一扫」扫上方二维码即可 1 秒解锁，全程无需碰原电脑。',
+                        'On your unlocked phone: approve the instant popup (verify 6-digit code) or scan this QR code to transfer your E2EE keys via zero-knowledge ECDH.',
+                      )}
+                    </p>
+                    <div className="mt-2 flex items-center gap-2 text-[11px] text-slate-400">
+                      <span>
+                        {onlineOtherClientCount > 0
+                          ? bi(`已推送至 ${onlineOtherClientCount} 台同账号在线设备`, `Pushed to ${onlineOtherClientCount} online device(s)`)
+                          : bi('手机打开 All in One 后将自动收到授权弹窗', 'Open All in One on your phone to receive the popup')}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void startGrantSession()}
+                        className="inline-flex items-center gap-1 rounded-lg px-1.5 py-0.5 font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                        <span>{bi('刷新', 'Refresh')}</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {isDesktopApp && (
+                  <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200/80 bg-white px-3.5 py-2.5 text-[11.5px] text-slate-600 dark:border-slate-800 dark:bg-[#22252E] dark:text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={applyToDesktop}
+                      onChange={(e) => setApplyToDesktop(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded accent-[#4D6BFE]"
+                    />
+                    <span>
+                      {bi(
+                        '授权后同时同步本机电脑桥接密钥（多台电脑共用同一把密钥）',
+                        'Also sync this computer’s local bridge key (share one key across PCs)',
+                      )}
+                    </span>
+                  </label>
+                )}
+              </>
             ) : (
               <>
                 {isLocked && (
@@ -380,8 +767,8 @@ export function E2eeSyncModal({
                       )}
                       <div className="text-[11px] opacity-85">
                         {bi(
-                          '请在电脑端「设置 → 端到端加密」（或 CLI 按 K 键）打开同步二维码，用本设备扫描即可解锁。',
-                          'Open Settings → End-to-End Encryption on your computer (or press K in CLI) and scan its QR code.',
+                          '可扫描电脑端二维码，或切到上方「手机授权」直接用随身已解锁的手机批准本设备。',
+                          'Scan your PC’s QR code, or switch to "Approve via Phone" to unlock from your phone.',
                         )}
                       </div>
                     </div>

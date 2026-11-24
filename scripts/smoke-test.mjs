@@ -30,13 +30,21 @@ import {
   E2EE_METHOD_MARKER,
   bytesToBase64,
   computeE2eeKeyId,
+  computeGrantPubKeyFp,
   decryptBytes,
+  decryptGrantPayload,
   decryptJson,
+  deriveGrantSas,
+  encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
   encryptBytes,
+  encryptGrantPayload,
   encryptJson,
   formatE2eeFingerprint,
   generateE2eeKey,
+  generateGrantKeyPair,
+  generateGrantReqId,
+  parseE2eeGrantQrInput,
   parseE2eeQrInput,
 } from '../packages/shared/src/e2ee.js'
 import { renderQrSvg as renderSharedQrSvg } from '../packages/shared/src/qr-svg.js'
@@ -3278,7 +3286,289 @@ async function main() {
         await e2eeBridge.stop()
       }
     }
-    console.log('[smoke] 20/20 Zero-Knowledge E2EE (AES-256-GCM, QR sync, replay defense, blind relay & encrypted uploads) OK')
+    console.log('[smoke] 20/21 Zero-Knowledge E2EE (AES-256-GCM, QR sync, replay defense, blind relay & encrypted uploads) OK')
+
+    // 21. Zero-Knowledge Device-to-Device Key Grant (Phone B -> Computer C via ECDH P-256 + HKDF + AES-256-GCM + 6-digit SAS + Reverse QR)
+    {
+      // 21.1 Cryptographic & MITM unit tests
+      const roomKeyA = generateE2eeKey()
+      const roomKeyAId = await computeE2eeKeyId(roomKeyA)
+      const pairC = await generateGrantKeyPair()
+      const pairB = await generateGrantKeyPair()
+      const pairEvil = await generateGrantKeyPair()
+      const reqId1 = generateGrantReqId()
+      const testRoomId = 'usr_grant_crypto_unit'
+
+      assert.equal(pairC.publicKeyFp.length, 16)
+      assert.equal(await computeGrantPubKeyFp(pairC.publicKeyRaw), pairC.publicKeyFp)
+      const grantUri = encodeE2eeGrantQrUri({ reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp })
+      const parsedGrantQr = parseE2eeGrantQrInput(grantUri)
+      assert.deepEqual(parsedGrantQr, { reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp })
+
+      const sasFromC = await deriveGrantSas({
+        requesterPubKey: pairC.publicKeyRaw,
+        approverPubKey: pairB.publicKeyRaw,
+        reqId: reqId1,
+        roomId: testRoomId,
+      })
+      const sasFromB = await deriveGrantSas({
+        requesterPubKey: pairC.publicKeyRaw,
+        approverPubKey: pairB.publicKeyRaw,
+        reqId: reqId1,
+        roomId: testRoomId,
+      })
+      assert.match(sasFromC, /^\d{3}-\d{3}$/)
+      assert.equal(sasFromC, sasFromB, 'Both devices must independently derive the exact same 6-digit SAS')
+
+      const sasMitm = await deriveGrantSas({
+        requesterPubKey: pairEvil.publicKeyRaw,
+        approverPubKey: pairB.publicKeyRaw,
+        reqId: reqId1,
+        roomId: testRoomId,
+      })
+      assert.notEqual(sasMitm, sasFromC, 'Substituted MITM public key must alter SAS')
+
+      const env1 = await encryptGrantPayload({
+        approverPrivateKey: pairB.privateKey,
+        approverPubKeyRaw: pairB.publicKeyRaw,
+        requesterPubKeyRaw: pairC.publicKeyRaw,
+        reqId: reqId1,
+        roomId: testRoomId,
+        payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
+      })
+      assert.equal(JSON.stringify(env1).includes(roomKeyA), false, 'Grant envelope must NEVER contain plaintext E2EE key')
+      const dec1 = await decryptGrantPayload({
+        requesterPrivateKey: pairC.privateKey,
+        requesterPubKeyRaw: pairC.publicKeyRaw,
+        envelope: env1,
+        roomId: testRoomId,
+        expectedApproverPubKey: pairB.publicKeyRaw,
+      })
+      assert.equal(dec1.keys[0].key, roomKeyA)
+      assert.equal(dec1.preferredKeyId, roomKeyAId)
+
+      // Mismatched approverPubKey, wrong roomId, and tampered ciphertext must all fail
+      await assert.rejects(
+        () => decryptGrantPayload({
+          requesterPrivateKey: pairC.privateKey,
+          requesterPubKeyRaw: pairC.publicKeyRaw,
+          envelope: env1,
+          roomId: testRoomId,
+          expectedApproverPubKey: pairEvil.publicKeyRaw,
+        }),
+        /E2EE_GRANT_PUBKEY_MISMATCH|安全码/,
+      )
+      await assert.rejects(
+        () => decryptGrantPayload({
+          requesterPrivateKey: pairC.privateKey,
+          requesterPubKeyRaw: pairC.publicKeyRaw,
+          envelope: env1,
+          roomId: 'usr_wrong_room',
+        }),
+        /解密授权密钥包失败/,
+      )
+      await assert.rejects(
+        () => decryptGrantPayload({
+          requesterPrivateKey: pairC.privateKey,
+          requesterPubKeyRaw: pairC.publicKeyRaw,
+          envelope: { ...env1, ct: `${env1.ct.slice(0, -2)}AA` },
+          roomId: testRoomId,
+        }),
+        /解密授权密钥包失败/,
+      )
+
+      // 21.2 Full Live Relay Signaling E2E: SAS Push Flow, Reverse-QR Lookup Flow, Cross-Room Isolation, Single-Use Burn & Disconnect Auto-Cancel
+      const grantRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'grant-smoke-jwt-secret-0123456789',
+        adminBootstrapToken: 'grant-bootstrap-99',
+        accountsFile: join(tmpDir, 'grant-accounts.json'),
+        uploadDir: join(tmpDir, 'grant-uploads'),
+      })
+      const grantSockets = []
+      const openGrantWs = async (gBase, token, devName, kind = 'web') => {
+        const tRes = await (await fetch(`${gBase}/api/auth/ws-ticket`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ dev: devName, kind }),
+        })).json()
+        assert.equal(tRes.ok, true)
+        const wsUrl = `${gBase.replace(/^http/, 'ws')}/ws/client?ticket=${encodeURIComponent(tRes.ticket)}`
+        const inbox = []
+        const waiters = []
+        const ws = new WebSocket(wsUrl)
+        grantSockets.push(ws)
+        ws.on('message', (raw) => {
+          const msg = JSON.parse(String(raw))
+          inbox.push(msg)
+          for (let i = waiters.length - 1; i >= 0; i -= 1) {
+            if (waiters[i].pred(msg)) {
+              const w = waiters.splice(i, 1)[0]
+              clearTimeout(w.timer)
+              w.resolve(msg)
+            }
+          }
+        })
+        const waitFor = (pred, timeoutMs = 4000) => {
+          const existing = inbox.find(pred)
+          if (existing) return Promise.resolve(existing)
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Timed out waiting for WS message')), timeoutMs)
+            waiters.push({ pred, resolve, timer })
+          })
+        }
+        const hello = await waitFor((m) => m.type === 'hello')
+        return { ws, hello, inbox, waitFor }
+      }
+
+      try {
+        const { port: gPort } = await grantRelay.start()
+        const gBase = `http://127.0.0.1:${gPort}`
+
+        // Bootstrap Alice (owns PC A, Phone B, Computer C) + register separate user Mallory (Account D attacker)
+        const aliceReg = await (await fetch(`${gBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'grant_alice', password: 'AliceGrantPassword1!', inviteCode: 'grant-bootstrap-99' }),
+        })).json()
+        assert.equal(aliceReg.ok, true)
+        const invRes = await (await fetch(`${gBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${aliceReg.token}` },
+          body: JSON.stringify({ count: 1, note: 'mallory' }),
+        })).json()
+        const malloryReg = await (await fetch(`${gBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'grant_mallory', password: 'MalloryGrantPassword1!', inviteCode: invRes.invites[0].code }),
+        })).json()
+        assert.equal(malloryReg.ok, true)
+
+        // Computer C connects & initiates a grant request BEFORE Phone B opens the app!
+        const compC = await openGrantWs(gBase, aliceReg.token, 'Windows Desktop', 'desktop')
+        const cPair1 = await generateGrantKeyPair()
+        const liveReqId1 = generateGrantReqId()
+        compC.ws.send(JSON.stringify({
+          type: 'e2ee.grant.req',
+          reqId: liveReqId1,
+          pubKey: cPair1.publicKeyRaw,
+          wantedKeyId: roomKeyAId,
+        }))
+        await new Promise((r) => setTimeout(r, 60))
+
+        // Mallory (different account!) connects -> MUST see 0 pending grants & forged deliver/reject MUST be ignored!
+        const malloryWs = await openGrantWs(gBase, malloryReg.token, 'Attacker Browser', 'web')
+        assert.equal(malloryWs.hello.pendingGrants.length, 0, 'Other account must NEVER see Alice pending grants')
+        malloryWs.ws.send(JSON.stringify({ type: 'e2ee.grant.list', id: 'm-list-1' }))
+        const mList = await malloryWs.waitFor((m) => m.type === 'e2ee.grant.list.res' && m.id === 'm-list-1')
+        assert.equal(mList.grants.length, 0)
+        // Mallory tries to reject/hijack Alice's reqId -> must be silently dropped!
+        malloryWs.ws.send(JSON.stringify({ type: 'e2ee.grant.reject', reqId: liveReqId1 }))
+        malloryWs.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId: liveReqId1, approverPubKey: pairEvil.publicKeyRaw }))
+        await new Promise((r) => setTimeout(r, 60))
+        assert.equal(compC.inbox.some((m) => m.event === EVENTS.E2EE_GRANT_REJECT || m.event === EVENTS.E2EE_GRANT_OFFER), false, 'Cross-account grant injection must be strictly blocked')
+
+        // Phone B opens AFTER Computer C created the request -> hello.pendingGrants delivers it immediately!
+        const phoneB = await openGrantWs(gBase, aliceReg.token, 'Android App', 'mobile')
+        assert.equal(phoneB.hello.pendingGrants.length, 1, 'Phone B must receive pending grant in hello frame')
+        assert.equal(phoneB.hello.pendingGrants[0].reqId, liveReqId1)
+        assert.equal(phoneB.hello.pendingGrants[0].pubKey, cPair1.publicKeyRaw)
+
+        // Path A: 2-party SAS Remote Push flow
+        const bPair1 = await generateGrantKeyPair()
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId: liveReqId1, approverPubKey: bPair1.publicKeyRaw }))
+        const offerEv = await compC.waitFor((m) => m.event === EVENTS.E2EE_GRANT_OFFER && m.payload?.reqId === liveReqId1)
+        assert.equal(offerEv.payload.approverPubKey, bPair1.publicKeyRaw)
+        const liveSasC = await deriveGrantSas({
+          requesterPubKey: cPair1.publicKeyRaw,
+          approverPubKey: offerEv.payload.approverPubKey,
+          reqId: liveReqId1,
+          roomId: aliceReg.roomId,
+        })
+        const liveSasB = await deriveGrantSas({
+          requesterPubKey: cPair1.publicKeyRaw,
+          approverPubKey: bPair1.publicKeyRaw,
+          reqId: liveReqId1,
+          roomId: aliceReg.roomId,
+        })
+        assert.equal(liveSasC, liveSasB)
+
+        // Phone B encrypts PC A's key & delivers; Computer C decrypts!
+        const liveEnv1 = await encryptGrantPayload({
+          approverPrivateKey: bPair1.privateKey,
+          approverPubKeyRaw: bPair1.publicKeyRaw,
+          requesterPubKeyRaw: cPair1.publicKeyRaw,
+          reqId: liveReqId1,
+          roomId: aliceReg.roomId,
+          payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
+        })
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId: liveReqId1, envelope: liveEnv1 }))
+        const deliverEv = await compC.waitFor((m) => m.event === EVENTS.E2EE_GRANT_DELIVER && m.payload?.reqId === liveReqId1)
+        const unlocked1 = await decryptGrantPayload({
+          requesterPrivateKey: cPair1.privateKey,
+          requesterPubKeyRaw: cPair1.publicKeyRaw,
+          envelope: deliverEv.payload.envelope,
+          roomId: aliceReg.roomId,
+          expectedApproverPubKey: offerEv.payload.approverPubKey,
+        })
+        assert.equal(unlocked1.keys[0].key, roomKeyA)
+
+        // Single-use burn: replaying deliver on liveReqId1 must be dropped!
+        const beforeReplayCount = compC.inbox.filter((m) => m.event === EVENTS.E2EE_GRANT_DELIVER).length
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId: liveReqId1, envelope: liveEnv1 }))
+        await new Promise((r) => setTimeout(r, 60))
+        assert.equal(compC.inbox.filter((m) => m.event === EVENTS.E2EE_GRANT_DELIVER).length, beforeReplayCount, 'Burned reqId must ignore replay')
+
+        // Path B: Reverse-QR out-of-band 1-tap delivery (no offer step needed) + Disconnect auto-cancel
+        const cPair2 = await generateGrantKeyPair()
+        const liveReqId2 = generateGrantReqId()
+        const qrUri2 = encodeE2eeGrantQrUri({ reqId: liveReqId2, roomId: aliceReg.roomId, pubKeyFp: cPair2.publicKeyFp })
+        const parsedQr2 = parseE2eeGrantQrInput(qrUri2)
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId2, pubKey: cPair2.publicKeyRaw }))
+        await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REQUEST && m.payload?.reqId === liveReqId2)
+
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.list', id: 'b-list-2' }))
+        const bList2 = await phoneB.waitFor((m) => m.type === 'e2ee.grant.list.res' && m.id === 'b-list-2')
+        const found2 = bList2.grants.find((g) => g.reqId === parsedQr2.reqId)
+        assert.ok(found2)
+        assert.equal(await computeGrantPubKeyFp(found2.pubKey), parsedQr2.pubKeyFp, 'Out-of-band QR fingerprint must match')
+
+        const bPair2 = await generateGrantKeyPair()
+        const liveEnv2 = await encryptGrantPayload({
+          approverPrivateKey: bPair2.privateKey,
+          approverPubKeyRaw: bPair2.publicKeyRaw,
+          requesterPubKeyRaw: found2.pubKey,
+          reqId: liveReqId2,
+          roomId: aliceReg.roomId,
+          payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
+        })
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId: liveReqId2, envelope: liveEnv2 }))
+        const deliverEv2 = await compC.waitFor((m) => m.event === EVENTS.E2EE_GRANT_DELIVER && m.payload?.reqId === liveReqId2)
+        const unlocked2 = await decryptGrantPayload({
+          requesterPrivateKey: cPair2.privateKey,
+          requesterPubKeyRaw: cPair2.publicKeyRaw,
+          envelope: deliverEv2.payload.envelope,
+          roomId: aliceReg.roomId,
+        })
+        assert.equal(unlocked2.keys[0].key, roomKeyA)
+
+        // Disconnect auto-cancel: Computer C opens a 3rd grant & closes WS -> Phone B receives E2EE_GRANT_CANCEL!
+        const cPair3 = await generateGrantKeyPair()
+        const liveReqId3 = generateGrantReqId()
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId3, pubKey: cPair3.publicKeyRaw }))
+        await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REQUEST && m.payload?.reqId === liveReqId3)
+        compC.ws.close()
+        const cancelEv3 = await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_CANCEL && m.payload?.reqId === liveReqId3)
+        assert.equal(cancelEv3.payload.reason, 'disconnected')
+      } finally {
+        for (const ws of grantSockets) {
+          try { ws.close() } catch {}
+        }
+        await grantRelay.close()
+      }
+    }
+    console.log('[smoke] 21/21 Zero-Knowledge Device-to-Device Key Grant (ECDH P-256, 6-digit SAS, Reverse-QR, MITM defense & cross-room isolation) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

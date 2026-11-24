@@ -5,6 +5,8 @@ const EVENT_BUFFER_SIZE = 200
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
 const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
+const E2EE_GRANT_TTL_MS = 120_000
+const E2EE_GRANT_MAX_PER_ROOM = 8
 
 /**
  * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
@@ -116,6 +118,76 @@ export class RelayHub {
     /** @type {Array<{ id: number, ts: number, type: string, roomId: string, label: string, detail: string, ip: string }>} */
     this.activityLog = []
     this._activitySeq = 0
+    /**
+     * Ephemeral, strictly room-scoped zero-knowledge E2EE device key-grant requests.
+     * Stores ONLY ephemeral P-256 public keys & metadata for up to 120s (never plaintext secrets).
+     * @type {Map<string, any>}
+     */
+    this.e2eeGrants = new Map()
+  }
+
+  pruneExpiredGrants(now = Date.now()) {
+    for (const [reqId, g] of this.e2eeGrants.entries()) {
+      if (now >= g.expiresAt || !this.clients.has(g.requesterClientId)) {
+        this.e2eeGrants.delete(reqId)
+        this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'expired' }, g.requesterClientId)
+      }
+    }
+  }
+
+  sanitizeGrantPublic(g) {
+    return {
+      reqId: g.reqId,
+      roomId: g.roomId,
+      requesterClientId: g.requesterClientId,
+      deviceName: g.deviceName,
+      clientKind: g.clientKind,
+      ip: g.ip,
+      pubKey: g.pubKey,
+      wantedKeyId: g.wantedKeyId || '',
+      createdAt: g.createdAt,
+      expiresAt: g.expiresAt,
+    }
+  }
+
+  getPendingGrantsForClient(roomId, excludeClientId = '') {
+    const rid = String(roomId || '').trim()
+    if (!rid) return []
+    const now = Date.now()
+    this.pruneExpiredGrants(now)
+    const out = []
+    for (const g of this.e2eeGrants.values()) {
+      if (g.roomId !== rid) continue
+      if (excludeClientId && g.requesterClientId === excludeClientId) continue
+      if (g.expiresAt <= now) continue
+      out.push(this.sanitizeGrantPublic(g))
+    }
+    return out.sort((a, b) => b.createdAt - a.createdAt)
+  }
+
+  pushRoomGrantEvent(roomId, event, payload, excludeClientId = '') {
+    const rid = String(roomId || '').trim()
+    if (!rid) return
+    const frame = JSON.stringify({
+      type: 'event',
+      ts: Date.now(),
+      bridgeId: '',
+      event,
+      payload,
+    })
+    for (const [cid, c] of this.clients.entries()) {
+      if (c.roomId !== rid || c.ws.readyState !== 1) continue
+      if (excludeClientId && cid === excludeClientId) continue
+      try { c.ws.send(frame) } catch {}
+    }
+  }
+
+  cancelClientGrants(clientId, reason = 'disconnected') {
+    for (const [reqId, g] of this.e2eeGrants.entries()) {
+      if (g.requesterClientId !== clientId) continue
+      this.e2eeGrants.delete(reqId)
+      this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason }, clientId)
+    }
   }
 
   getOrCreateRoomStats(roomId) {
@@ -451,6 +523,7 @@ export class RelayHub {
     const bridges = this.getBridgeList(roomId)
     const devices = this.resolveRoomDevices(roomId, bridges)
     const clients = this.getClientList(roomId)
+    const pendingGrants = this.getPendingGrantsForClient(roomId, clientId)
     this.sendRaw(ws, {
       type: 'hello',
       clientId,
@@ -461,6 +534,7 @@ export class RelayHub {
       ...(devices ? { devices } : {}),
       clients,
       onlineClientCount: clients.length,
+      pendingGrants,
       ts: Date.now(),
     })
 
@@ -487,6 +561,7 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
+      this.cancelClientGrants(clientId, 'disconnected')
       const existed = this.clients.delete(clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
       if (existed) {
@@ -584,6 +659,151 @@ export class RelayHub {
 
     if (msg.type === 'ping') {
       this.sendToClient(clientId, { type: 'pong', ts: Date.now() })
+      return
+    }
+
+    // Zero-knowledge device-to-device E2EE key grant signaling (strictly same-room, blind courier)
+    if (msg.type === 'e2ee.grant.req') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const pubKey = String(msg.pubKey || '').trim()
+      const wantedKeyId = String(msg.wantedKeyId || '').trim().toLowerCase()
+      if (!/^[0-9a-f]{16,32}$/.test(reqId) || !/^[A-Za-z0-9_-]{80,100}$/.test(pubKey)) return
+      if (wantedKeyId && !/^[0-9a-f]{16}$/.test(wantedKeyId)) return
+      const now = Date.now()
+      this.pruneExpiredGrants(now)
+      if (this.e2eeGrants.has(reqId)) return
+      // Enforce per-room cap (evict oldest pending request in this room if needed)
+      const roomGrants = [...this.e2eeGrants.values()]
+        .filter((g) => g.roomId === roomId)
+        .sort((a, b) => a.createdAt - b.createdAt)
+      while (roomGrants.length >= E2EE_GRANT_MAX_PER_ROOM) {
+        const oldest = roomGrants.shift()
+        if (!oldest) break
+        this.e2eeGrants.delete(oldest.reqId)
+        this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId: oldest.reqId, reason: 'replaced' })
+      }
+      const grant = {
+        reqId,
+        roomId,
+        requesterClientId: clientId,
+        deviceName: client.deviceName || 'Web Client',
+        clientKind: client.clientKind || 'web',
+        ip: client.ip || '',
+        pubKey,
+        wantedKeyId,
+        createdAt: now,
+        expiresAt: now + E2EE_GRANT_TTL_MS,
+        offeredByClientId: '',
+        approverPubKey: '',
+      }
+      this.e2eeGrants.set(reqId, grant)
+      this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_REQUEST, this.sanitizeGrantPublic(grant), clientId)
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.list') {
+      this.sendToClient(clientId, {
+        type: 'e2ee.grant.list.res',
+        id: String(msg.id || ''),
+        grants: this.getPendingGrantsForClient(roomId, clientId),
+      })
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.offer') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const approverPubKey = String(msg.approverPubKey || '').trim()
+      if (!/^[0-9a-f]{16,32}$/.test(reqId) || !/^[A-Za-z0-9_-]{80,100}$/.test(approverPubKey)) return
+      const now = Date.now()
+      this.pruneExpiredGrants(now)
+      const grant = this.e2eeGrants.get(reqId)
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      if (grant.offeredByClientId && grant.offeredByClientId !== clientId) return
+      grant.offeredByClientId = clientId
+      grant.approverPubKey = approverPubKey
+      this.sendToClient(grant.requesterClientId, {
+        type: 'event',
+        ts: now,
+        bridgeId: '',
+        event: EVENTS.E2EE_GRANT_OFFER,
+        payload: {
+          reqId,
+          approverClientId: clientId,
+          approverDeviceName: client.deviceName || 'Authorized Device',
+          approverClientKind: client.clientKind || 'mobile',
+          approverIp: client.ip || '',
+          approverPubKey,
+        },
+      })
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.deliver') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const env = msg.envelope
+      if (!/^[0-9a-f]{16,32}$/.test(reqId) || !env || typeof env !== 'object') return
+      if (env.v !== 1 || String(env.reqId || '').trim().toLowerCase() !== reqId) return
+      const appPub = String(env.approverPubKey || '').trim()
+      const iv = String(env.iv || '').trim()
+      const ct = String(env.ct || '').trim()
+      if (
+        !/^[A-Za-z0-9_-]{80,100}$/.test(appPub) ||
+        !/^[A-Za-z0-9_-]{14,24}$/.test(iv) ||
+        !/^[A-Za-z0-9_-]{24,16384}$/.test(ct)
+      ) {
+        return
+      }
+      const now = Date.now()
+      this.pruneExpiredGrants(now)
+      const grant = this.e2eeGrants.get(reqId)
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      if (grant.offeredByClientId && (grant.offeredByClientId !== clientId || grant.approverPubKey !== appPub)) {
+        return
+      }
+      // Strictly single-use: burn request immediately before delivery
+      this.e2eeGrants.delete(reqId)
+      this.sendToClient(grant.requesterClientId, {
+        type: 'event',
+        ts: now,
+        bridgeId: '',
+        event: EVENTS.E2EE_GRANT_DELIVER,
+        payload: {
+          reqId,
+          approverDeviceName: client.deviceName || 'Authorized Device',
+          approverClientKind: client.clientKind || 'mobile',
+          approverIp: client.ip || '',
+          envelope: { v: 1, reqId, approverPubKey: appPub, iv, ct },
+        },
+      })
+      this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'delivered' }, grant.requesterClientId)
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.reject') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const grant = this.e2eeGrants.get(reqId)
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId) return
+      this.e2eeGrants.delete(reqId)
+      this.sendToClient(grant.requesterClientId, {
+        type: 'event',
+        ts: Date.now(),
+        bridgeId: '',
+        event: EVENTS.E2EE_GRANT_REJECT,
+        payload: {
+          reqId,
+          approverDeviceName: client.deviceName || 'Authorized Device',
+        },
+      })
+      this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'rejected' }, grant.requesterClientId)
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.cancel') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const grant = this.e2eeGrants.get(reqId)
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId) return
+      this.e2eeGrants.delete(reqId)
+      this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'cancelled' }, clientId)
       return
     }
 
