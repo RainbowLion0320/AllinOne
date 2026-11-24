@@ -9,15 +9,13 @@ ENV PUBLIC_RELAY_URL=${PUBLIC_RELAY_URL}
 ENV VITE_RELAY_URL=${VITE_RELAY_URL}
 ENV VITE_APK_URL=${VITE_APK_URL}
 
-COPY package.json ./
+COPY package.json package-lock.json ./
 COPY packages/shared/package.json ./packages/shared/
-COPY packages/relay-server/package.json ./packages/relay-server/
 COPY packages/dsh-mobile-hub/package.json ./packages/dsh-mobile-hub/
 COPY packages/mobile-app/package.json ./packages/mobile-app/
 
-RUN npm install --include-workspace-root=false \
+RUN npm ci --include-workspace-root=false \
     --workspace=@allinone/shared \
-    --workspace=@allinone/relay-server \
     --workspace=dsh-mobile-hub \
     --workspace=@allinone/mobile-app
 
@@ -26,9 +24,11 @@ COPY packages/shared ./packages/shared
 COPY packages/dsh-mobile-hub ./packages/dsh-mobile-hub
 COPY packages/mobile-app ./packages/mobile-app
 
-# Build single-file PC bridge into packages/mobile-app/public/downloads/allinone-bridge.mjs,
-# then bundle Mobile PWA (which copies downloads/allinone-bridge.mjs into dist/)
-RUN npm run build:bridge && npm --workspace=@allinone/mobile-app run build
+# Normalize setup.sh line endings (defense-in-depth), build single-file PC bridge into
+# packages/mobile-app/public/downloads/allinone-bridge.mjs, then bundle Mobile PWA
+RUN sed -i 's/\r$//' packages/mobile-app/public/setup.sh \
+    && npm run build:bridge \
+    && npm --workspace=@allinone/mobile-app run build
 
 # Stage 2: Slim production Relay Server + Static PWA
 FROM node:22-alpine AS runtime
@@ -37,11 +37,11 @@ ENV NODE_ENV=production
 ENV PORT=8787
 ENV HOST=0.0.0.0
 
-COPY package.json ./
+COPY package.json package-lock.json ./
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/relay-server/package.json ./packages/relay-server/
 
-RUN npm install --omit=dev --include-workspace-root=false \
+RUN npm ci --omit=dev --include-workspace-root=false \
     --workspace=@allinone/shared \
     --workspace=@allinone/relay-server
 

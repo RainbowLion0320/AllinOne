@@ -18,9 +18,9 @@ npm run test:smoke
 
 ## Workspace Overview
 
-- `packages/shared` — RPC methods, event constants, composite IDs, and path/ID validation helpers
+- `packages/shared` — Shared RPC/event protocol, path/ID validation, AES-256-GCM E2EE, and offline QR SVG generator (`protocol.js`, `e2ee.js`, `qr-svg.js`)
 - `packages/relay-server` — HTTP/WS relay gateway, account/invite store, room isolation, and admin CLI
-- `packages/dsh-mobile-hub` — Local bridge orchestrator, agent adapters (`codex`, `claude`, `antigravity`, `dsh`), and portable CLI
+- `packages/dsh-mobile-hub` — Local bridge orchestrator, agent adapters (`codex`, `claude`, `antigravity`, `dsh`), auto-installed `allinone-dsh-ipc` local IPC plugin, and portable CLI
 - `packages/mobile-app` — React + Tailwind + Vite PWA frontend (also bundled into the Electron desktop app)
 - `packages/desktop-app` — Electron desktop wrapper with embedded bridge manager, system tray, and DMG/NSIS packaging
 

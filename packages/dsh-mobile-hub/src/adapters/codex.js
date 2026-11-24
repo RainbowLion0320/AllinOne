@@ -1,11 +1,10 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, isExecutableFile, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getCodexCandidates, isExecutableFile, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -40,38 +39,7 @@ function findRunningCodexBinary() {
 }
 
 function findCodexBinary(configuredBin) {
-  const home = homedir()
-  const candidates = [
-    configuredBin,
-    process.env.CODEX_BIN,
-    join(home, '.codex', '.sandbox-bin', 'codex.exe'),
-    join(home, '.codex', '.sandbox-bin', 'codex'),
-  ]
-  if (process.platform === 'darwin') {
-    candidates.push(
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
-      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
-      '/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex',
-      '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      '/Applications/Codex.app/Contents/Resources/codex',
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
-      '/Applications/Codex.app/Contents/Resources/bin/codex',
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'bin', 'codex'),
-    )
-  } else if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || join(home, 'AppData', 'Roaming')
-    const localApp = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
-    candidates.push(
-      join(appData, 'npm', 'codex.cmd'),
-      join(appData, 'npm', 'codex.exe'),
-      join(localApp, 'Programs', 'ChatGPT', 'resources', 'codex-cli', 'codex.exe'),
-      join(localApp, 'Programs', 'Codex', 'resources', 'codex.exe'),
-    )
-  }
+  const candidates = getCodexCandidates(undefined, process.platform, process.env, configuredBin)
   return (
     findExecutable(process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex'], candidates) ||
     findRunningCodexBinary() ||
@@ -582,7 +550,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.0' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.1' },
         capabilities: null,
       })
         .then((res) => {

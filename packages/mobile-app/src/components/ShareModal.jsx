@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import {
   Check,
   Copy,
@@ -17,16 +17,7 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
-
-const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
-const RELEASES_URL = String(import.meta.env.VITE_RELEASES_URL || '').trim() || DEFAULT_RELEASES_URL
-const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
-
-function resolveApkUrl(base) {
-  if (!CONFIGURED_APK_URL) return ''
-  if (/^https?:\/\//i.test(CONFIGURED_APK_URL)) return CONFIGURED_APK_URL
-  return `${base}/${CONFIGURED_APK_URL.replace(/^\/+/, '')}`
-}
+import { RELEASES_URL, copyTextToClipboard, resolveApkUrl } from '../lib/clientHelpers.js'
 
 export function ShareModal({
   open,
@@ -42,6 +33,18 @@ export function ShareModal({
   const [generatedInvite, setGeneratedInvite] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState('')
+
+  useEffect(() => {
+    if (!open) {
+      setGeneratedInvite(null)
+      setGenError('')
+    }
+  }, [open])
+
+  useEffect(() => {
+    setGeneratedInvite(null)
+    setGenError('')
+  }, [serverUrl, token])
 
   if (!open) return null
 
@@ -101,18 +104,7 @@ export function ShareModal({
   ).join('\n')
 
   const copyText = async (key, text) => {
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      try { document.execCommand('copy') } catch {}
-      document.body.removeChild(ta)
-    }
+    await copyTextToClipboard(text)
     setCopiedKey(key)
     setTimeout(() => setCopiedKey((cur) => (cur === key ? '' : cur)), 1800)
   }

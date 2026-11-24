@@ -32,17 +32,6 @@ export function formatPlatformLabel(platform) {
   return ''
 }
 
-export function formatServerHost(baseUrl) {
-  const clean = normalizeDeviceBaseUrl(baseUrl)
-  if (!clean) return ''
-  try {
-    const u = new URL(clean)
-    return u.host + (u.pathname && u.pathname !== '/' ? u.pathname.replace(/\/+$/, '') : '')
-  } catch {
-    return clean.replace(/^https?:\/\//i, '')
-  }
-}
-
 function sanitizeE2eeKeysMap(rawMap) {
   if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) return {}
   const deduped = new Map()
@@ -168,6 +157,10 @@ export function upsertDevice(state, payload) {
       authMode: incoming.authMode,
       username: incoming.username || existing.username || '',
       email: incoming.email !== undefined && incoming.email !== '' ? incoming.email : existing.email || '',
+      loginEmail2fa:
+        payload?.loginEmail2fa !== undefined
+          ? Boolean(payload.loginEmail2fa)
+          : Boolean(existing.loginEmail2fa),
       role: incoming.role || existing.role || '',
       label: incoming.label || existing.label,
       lastHostname: incoming.lastHostname || existing.lastHostname,

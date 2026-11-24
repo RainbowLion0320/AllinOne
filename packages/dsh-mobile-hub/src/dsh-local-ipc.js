@@ -463,6 +463,12 @@ export class DshLocalIpcClient {
         },
       },
       (res) => {
+        if (this.disposed || this.sseReq !== req) {
+          clearTimeout(readyTimeout)
+          resolveReady(false)
+          res.destroy()
+          return
+        }
         clearTimeout(readyTimeout)
         if (res.statusCode !== 200) {
           res.resume()
@@ -475,6 +481,7 @@ export class DshLocalIpcClient {
         let buf = ''
         res.setEncoding('utf8')
         res.on('data', (chunk) => {
+          if (this.disposed || this.sseReq !== req) return
           buf += chunk
           let sep
           while ((sep = buf.indexOf('\n\n')) !== -1) {

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Check,
   Copy,
@@ -28,6 +28,7 @@ import {
 import { probeDeviceStatus } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { translate } from '../lib/i18n.js'
+import { copyTextToClipboard } from '../lib/clientHelpers.js'
 
 function StatusPill({ status, onlineCount = 0 }) {
   const { bi, t } = useI18n()
@@ -108,7 +109,6 @@ export function DeviceSwitcherModal({
   activeDeviceId = null,
   activeBridgeId = '',
   activeConnState = 'disconnected',
-  activeBridges = [],
   accountDevices = [],
   clientSessions = null,
   onlineClientCount = 0,
@@ -119,7 +119,6 @@ export function DeviceSwitcherModal({
   onToggleDesktopAutoLaunch = null,
   onSelectDevice,
   onAddDevice,
-  onRenameDevice,
   onRemoveDevice,
   onSyncDeviceMeta,
   onRenameAccountDevice,
@@ -143,6 +142,7 @@ export function DeviceSwitcherModal({
   const [kickingKey, setKickingKey] = useState('')
   const [kickingOthers, setKickingOthers] = useState(false)
   const [copiedCmd, setCopiedCmd] = useState('')
+  const copiedCmdTimerRef = useRef(null)
   const [showEmailPanel, setShowEmailPanel] = useState(false)
   const [emailDraft, setEmailDraft] = useState('')
   const [emailCodeDraft, setEmailCodeDraft] = useState('')
@@ -152,17 +152,17 @@ export function DeviceSwitcherModal({
   const [emailError, setEmailError] = useState('')
   const [emailInfo, setEmailInfo] = useState('')
 
+  const devicesRef = useRef(devices)
+  devicesRef.current = devices
+
   const activeEntry = devices.find((d) => d.id === activeDeviceId) || null
-  const isAccountMode = Boolean(
-    activeEntry && (activeEntry.authMode === 'account' || String(activeEntry.roomId || '').startsWith('usr_')),
-  )
-  const otherEntries = isAccountMode ? devices.filter((d) => d.id !== activeDeviceId) : devices
+  const otherEntries = devices.filter((d) => d.id !== activeDeviceId)
 
   const runProbeAll = useCallback(async (list) => {
     const targets = (list || []).filter((d) => d.id !== activeDeviceId)
     setProbingAll(true)
     await Promise.all([
-      isAccountMode ? onRefreshAccountDevices?.().catch(() => {}) : Promise.resolve(),
+      onRefreshAccountDevices?.().catch(() => {}),
       onRefreshClientSessions?.().catch(() => {}),
     ])
     if (targets.length === 0) {
@@ -197,7 +197,13 @@ export function DeviceSwitcherModal({
     } finally {
       setProbingAll(false)
     }
-  }, [activeDeviceId, isAccountMode, onRefreshAccountDevices, onRefreshClientSessions, onSyncDeviceMeta])
+  }, [activeDeviceId, onRefreshAccountDevices, onRefreshClientSessions, onSyncDeviceMeta])
+
+  useEffect(() => {
+    return () => {
+      if (copiedCmdTimerRef.current) clearTimeout(copiedCmdTimerRef.current)
+    }
+  }, [])
 
   useEffect(() => {
     if (!open) {
@@ -213,7 +219,7 @@ export function DeviceSwitcherModal({
       setEmailInfo('')
       return
     }
-    void runProbeAll(devices)
+    void runProbeAll(devicesRef.current)
   }, [open, devices.length, runProbeAll])
 
   useEffect(() => {
@@ -276,9 +282,13 @@ export function DeviceSwitcherModal({
   }
 
   const copyBindCmd = async (kind, cmd) => {
-    try { await navigator.clipboard.writeText(cmd) } catch {}
+    await copyTextToClipboard(cmd)
     setCopiedCmd(kind)
-    setTimeout(() => setCopiedCmd(''), 1800)
+    if (copiedCmdTimerRef.current) clearTimeout(copiedCmdTimerRef.current)
+    copiedCmdTimerRef.current = setTimeout(() => {
+      copiedCmdTimerRef.current = null
+      setCopiedCmd((cur) => (cur === kind ? '' : cur))
+    }, 1800)
   }
 
   const startRename = (id, currentName) => {
@@ -287,16 +297,12 @@ export function DeviceSwitcherModal({
     setEditDraft(currentName || '')
   }
 
-  const commitRename = async (id, isAcctPc = false) => {
+  const commitRename = async (id) => {
     const clean = editDraft.trim()
     setEditingId(null)
     setEditDraft('')
     if (!clean) return
-    if (isAcctPc) {
-      await onRenameAccountDevice?.(id, clean)
-    } else {
-      onRenameDevice?.(id, clean)
-    }
+    await onRenameAccountDevice?.(id, clean)
   }
 
   const onlineAcctCount = accountDevices.filter((pc) => pc.online).length
@@ -326,7 +332,7 @@ export function DeviceSwitcherModal({
             <h2 className="text-[15.5px] font-bold text-slate-900 dark:text-white">
               {bi('我的电脑', 'My Computers')}
               <span className="ml-1.5 text-xs font-medium text-slate-400">
-                ({isAccountMode ? accountDevices.length : devices.length})
+                ({accountDevices.length})
               </span>
             </h2>
           </div>
@@ -420,7 +426,7 @@ export function DeviceSwitcherModal({
           )}
 
           {/* Active Account Header Card */}
-          {isAccountMode && activeEntry && (
+          {activeEntry && (
             <div className="rounded-2xl border border-[#4D6BFE]/25 bg-gradient-to-br from-[#F4F7FF] to-white p-3 dark:border-[#4D6BFE]/35 dark:from-[#1E2438] dark:to-[#181B24]">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2.5">
@@ -653,7 +659,7 @@ export function DeviceSwitcherModal({
           )}
 
           {/* Account-bound Computers List */}
-          {isAccountMode && (
+          {activeEntry && (
             <div className="space-y-2">
               {accountDevices.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-700/80 dark:bg-[#151820]">
@@ -779,7 +785,7 @@ export function DeviceSwitcherModal({
                         <form
                           onSubmit={(e) => {
                             e.preventDefault()
-                            void commitRename(pc.deviceId, true)
+                            void commitRename(pc.deviceId)
                           }}
                           className="mt-2.5 flex items-center gap-1.5"
                         >
@@ -993,67 +999,38 @@ export function DeviceSwitcherModal({
           {/* Other saved accounts */}
           {otherEntries.length > 0 && (
             <div className="space-y-2">
-              {isAccountMode && (
-                <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
-                  {bi('其他账号', 'Other Accounts')}
-                </div>
-              )}
+              <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
+                {bi('其他账号', 'Other Accounts')}
+              </div>
               {otherEntries.map((device) => {
-                const isActive = device.id === activeDeviceId
                 const probe = probes[device.id]
-                const bridges = isActive ? activeBridges : probe?.bridges || []
+                const bridges = probe?.bridges || []
                 const onlineBridges = bridges.filter((b) => b.online)
                 const primaryBridge =
-                  (isActive
-                    ? onlineBridges.find((b) => b.bridgeId === activeBridgeId)
-                    : onlineBridges.find((b) => b.bridgeId === device.selectedBridgeId)) ||
+                  onlineBridges.find((b) => b.bridgeId === device.selectedBridgeId) ||
                   onlineBridges[0] ||
                   null
 
-                let status = 'offline'
-                if (isActive) {
-                  if (activeConnState === 'unauthorized') status = 'expired'
-                  else if (activeConnState === 'connecting') status = 'connecting'
-                  else if (activeConnState === 'connected') status = onlineBridges.length > 0 ? 'online' : 'offline'
-                  else status = 'unreachable'
-                } else if (probe) {
-                  status = probe.status
-                } else {
-                  status = 'probing'
-                }
-
+                const status = probe ? probe.status : 'probing'
                 const displayName = getDeviceDisplayName(device, primaryBridge, 1, lang)
                 const platformLabel = formatPlatformLabel(primaryBridge?.platform || device.lastPlatform)
-                const isEditing = editingId === device.id
                 const isConfirmingDelete = confirmDeleteId === device.id
 
                 return (
                   <div
                     key={device.id}
-                    className={`rounded-2xl border p-3 transition ${
-                      isActive
-                        ? 'border-[#4D6BFE]/60 bg-[#F4F7FF] shadow-xs dark:border-[#4D6BFE]/50 dark:bg-[#20273B]'
-                        : 'border-slate-200/80 bg-white hover:border-slate-300 dark:border-slate-800 dark:bg-[#171920] dark:hover:border-slate-700'
-                    }`}
+                    className="rounded-2xl border border-slate-200/80 bg-white p-3 transition hover:border-slate-300 dark:border-slate-800 dark:bg-[#171920] dark:hover:border-slate-700"
                   >
                     <div className="flex items-start gap-2.5">
                       <button
                         type="button"
-                        disabled={isEditing}
                         onClick={() => {
-                          if (isEditing) return
                           onSelectDevice?.(device.id, primaryBridge?.bridgeId || device.selectedBridgeId || '')
                           onClose()
                         }}
                         className="flex min-w-0 flex-1 items-start gap-2.5 text-left"
                       >
-                        <div
-                          className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
-                            isActive
-                              ? 'bg-[#4D6BFE] text-white'
-                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300'
-                          }`}
-                        >
+                        <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
                           <User className="h-4.5 w-4.5" />
                         </div>
 
@@ -1073,7 +1050,7 @@ export function DeviceSwitcherModal({
                         </div>
                       </button>
 
-                      {!isEditing && !isConfirmingDelete && (
+                      {!isConfirmingDelete && (
                         <div className="flex shrink-0 items-center gap-0.5">
                           <button
                             type="button"
@@ -1164,7 +1141,7 @@ export function DeviceSwitcherModal({
               className="col-span-3 flex items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
             >
               <Plus className="h-4 w-4" />
-              <span>{isAccountMode ? bi('添加账号', 'Add Account') : bi('登录账号', 'Sign In')}</span>
+              <span>{bi('添加账号', 'Add Account')}</span>
             </button>
 
             <button

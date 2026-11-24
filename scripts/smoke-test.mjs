@@ -27,6 +27,11 @@ import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-m
 import { CodexAdapter, normalizeCodexTurns, probeCodexRolloutStatus, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
 import { ClaudeAdapter } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
+import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
+import {
+  parseCompositeId as hubParseCompositeId,
+  toEpochMs as hubToEpochMs,
+} from '../packages/dsh-mobile-hub/src/protocol.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -94,6 +99,7 @@ import {
   pickReleaseAsset,
 } from '../packages/desktop-app/src/updater.js'
 import {
+  DesktopBridgeManager,
   loadConfigDecrypted,
   loadConfigWithStatus,
   saveConfigSecure,
@@ -205,7 +211,6 @@ async function main() {
   let bridge = null
   let friendBridgeA = null
   let ownerBridge2 = null
-  let portableChild = null
   let acctPortableChild = null
   let acctBridge2 = null
 
@@ -4347,7 +4352,147 @@ async function main() {
       assert.equal(cachedCodex24.nextCursor, null, 'Codex >120 cache must NEVER fabricate a numeric cursor')
       assert.equal(cachedCodex24.hasMore, false)
     }
-    console.log('[smoke] 24/24 Full-Stack v0.5.0 Regression Suite (Relay crash defense, strict E2EE, Keychain/Intel Mac guard, 16-key LRU & Codex cache) OK')
+    console.log('[smoke] 24/25 Full-Stack v0.5.0 Regression Suite (Relay crash defense, strict E2EE, Keychain/Intel Mac guard, 16-key LRU & Codex cache) OK')
+
+    // 25. Full-Stack v0.5.1 Regression Suite (401 WS stop, protocol/E2EE parity, Desktop E2EE & autoStartDisabled, setup scripts LF/UTF-8, loginEmail2fa, sessionCache scope & password TOCTOU)
+    {
+      // 25.1 RelayBridgeLink must stop cleanly on HTTP 401 upgrade rejection (no infinite reconnect loop)
+      const unauthStates = []
+      const badBridge = new RelayBridgeLink({
+        relayUrl: wsBridgeUrl,
+        bridgeId: 'revoked-pc',
+        roomId: 'usr_nonexistent_room',
+        secret: 'invalid-secret-xyz',
+        e2eeKey: generateE2eeKey(),
+        onRpc: async () => ({}),
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+        onState: (st, detail) => unauthStates.push({ st, detail }),
+      })
+      badBridge.start()
+      const unauthDeadline = Date.now() + 5_000
+      while (Date.now() < unauthDeadline && !unauthStates.some((x) => x.st === 'unauthorized')) {
+        await new Promise((r) => setTimeout(r, 30))
+      }
+      assert.ok(unauthStates.some((x) => x.st === 'unauthorized'), 'Bridge hitting HTTP 401 on /ws/bridge must emit unauthorized')
+      assert.equal(badBridge.reconnectTimer, null, 'Unauthorized bridge must NOT schedule reconnect')
+      badBridge.stop()
+
+      // 25.2 Shared E2EE whitespace rejection + dsh-mobile-hub protocol.js parity
+      assert.equal(base64UrlToBytes('abcd efgh'), null, 'Shared base64UrlToBytes must reject embedded whitespace')
+      assert.equal(hubToEpochMs(new Date('invalid')), 0, 'dsh-mobile-hub toEpochMs(Invalid Date) must return 0')
+      assert.equal(hubToEpochMs(-123), 0, 'dsh-mobile-hub toEpochMs(negative) must return 0')
+      assert.notEqual(hubToEpochMs('2026'), 2026000, 'dsh-mobile-hub toEpochMs("2026") must not treat 4-digit year as epoch seconds')
+      assert.deepEqual(
+        hubParseCompositeId({ app: 'codex', sessionId: 'thr-25' }),
+        { app: 'codex', sessionId: 'thr-25' },
+        'dsh-mobile-hub parseCompositeId must support object input',
+      )
+
+      // 25.3 DesktopBridgeManager strict E2EE validation & setE2eeKey clearing autoStartDisabled
+      const deskStateDir = join(tmpDir, 'desk-25')
+      mkdirSync(deskStateDir, { recursive: true })
+      const deskCfgPath = join(deskStateDir, 'config.json')
+      const deskKey1 = generateE2eeKey()
+      const deskKey2 = generateE2eeKey()
+      saveConfigSecure(deskCfgPath, {
+        mode: 'account',
+        roomId: 'usr_desk25',
+        bridgeId: 'pc-25',
+        bridgeSecret: 'sec-25',
+        serverUrl: httpBase,
+        e2eeKey: deskKey1,
+        autoStartDisabled: true,
+      }, null)
+      const dm25 = new DesktopBridgeManager({ secretStore: null })
+      dm25.stateDir = deskStateDir
+      dm25.configPath = deskCfgPath
+      dm25.logPath = join(deskStateDir, 'desktop-bridge.log')
+      dm25.enabled = true
+      dm25.spawnBridgeProcess = async () => {}
+      await assert.rejects(
+        () => dm25.setE2eeKey('usr_desk25', `${deskKey2}=GARBAGE`),
+        /无效的端到端密钥格式/,
+        'DesktopBridgeManager.setE2eeKey must reject malformed E2EE key padding',
+      )
+      await dm25.setE2eeKey('usr_desk25', deskKey2)
+      const afterDeskCfg = loadConfigDecrypted(deskCfgPath, null)
+      assert.equal(afterDeskCfg.e2eeKey, deskKey2)
+      assert.equal(afterDeskCfg.autoStartDisabled, undefined, 'setE2eeKey must clear autoStartDisabled when bridge is enabled')
+
+      // 25.4 Setup scripts LF/UTF-8 & Node 20+ check + unused icon.svg removed
+      const distSetupSh = readFileSync(join(process.cwd(), 'packages/mobile-app/dist/setup.sh'))
+      assert.equal(distSetupSh.includes(0x0d), false, 'dist/setup.sh must have zero CR (\\r) bytes')
+      assert.match(distSetupSh.toString('utf8'), /-lt 20/, 'setup.sh must enforce Node.js v20+')
+      const distSetupPs1 = readFileSync(join(process.cwd(), 'packages/mobile-app/dist/setup.ps1'), 'utf8')
+      assert.match(distSetupPs1, /UTF8Encoding/, 'setup.ps1 must write Desktop .cmd using UTF-8 (non-ASCII safe)')
+      assert.match(distSetupPs1, /-lt 20/, 'setup.ps1 must enforce Node.js v20+')
+      assert.equal(existsSync(join(process.cwd(), 'packages/mobile-app/dist/icon.svg')), false, 'Unused icon.svg must not exist in dist/')
+
+      // 25.5 Mobile upsertDevice loginEmail2fa preservation & sessionCache unbridged scope safety
+      let st25 = loadDeviceState()
+      let r25 = upsertDevice(st25, {
+        baseUrl: 'https://example.com/dsh',
+        token: 'tok-25a',
+        roomId: 'usr_25',
+        username: 'u25',
+        loginEmail2fa: false,
+      })
+      r25 = upsertDevice(r25.state, {
+        baseUrl: 'https://example.com/dsh',
+        token: 'tok-25b',
+        roomId: 'usr_25',
+        username: 'u25',
+        loginEmail2fa: true,
+      })
+      assert.equal(r25.device.loginEmail2fa, true, 'upsertDevice must update loginEmail2fa on re-login')
+
+      await saveCachedSession('codex:s-unbridged', { meta: { app: 'codex', id: 'codex:s-unbridged' }, messages: [{ id: 'm1', role: 'user', text: 'a', ts: 1 }] }, 'acct25')
+      await saveCachedSession('codex:s-bridged', { meta: { app: 'codex', id: 'codex:s-bridged' }, messages: [{ id: 'm2', role: 'user', text: 'b', ts: 2 }] }, 'acct25::pc-1')
+      await clearSessionCache('acct25', { prefix: false })
+      assert.equal(await loadCachedSession('codex:s-unbridged', 'acct25'), null, 'Unbridged scope must be cleared')
+      assert.ok(await loadCachedSession('codex:s-bridged', 'acct25::pc-1'), 'Unbridged non-prefix clear must NOT wipe bridged caches')
+
+      // 25.6 Relay changePasswordAsync TOCTOU protection against concurrent revoke-all
+      const inv25 = await (await fetch(`${httpBase}/api/admin/invites`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+        body: JSON.stringify({ note: 'toctou-25' }),
+      })).json()
+      const reg25 = await (await fetch(`${httpBase}/api/account/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'toctou_u25', password: 'InitPassword25!', inviteCode: inv25.invites[0].code }),
+      })).json()
+      assert.equal(reg25.ok, true)
+      const [pwRaceRes, revokeRaceRes] = await Promise.all([
+        fetch(`${httpBase}/api/account/password`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${reg25.token}` },
+          body: JSON.stringify({ currentPassword: 'InitPassword25!', newPassword: 'HijackPassword25!' }),
+        }),
+        new Promise((resolveRev) =>
+          setTimeout(() => {
+            resolveRev(
+              fetch(`${httpBase}/api/auth/sessions/revoke-all`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${reg25.token}` },
+                body: JSON.stringify({}),
+              }),
+            )
+          }, 5),
+        ),
+      ])
+      if (revokeRaceRes.status === 200) {
+        assert.equal(pwRaceRes.status, 401, 'Stale password change finishing after revoke-all must return 401')
+        const verifyOrig = await (await fetch(`${httpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'toctou_u25', password: 'InitPassword25!' }),
+        })).json()
+        assert.equal(verifyOrig.ok, true, 'Original password must remain intact after rejected TOCTOU change')
+      }
+    }
+    console.log('[smoke] 25/25 Full-Stack v0.5.1 Regression Suite (401 WS stop, protocol/E2EE parity, Desktop E2EE, LF/UTF-8 scripts, scope safety & password TOCTOU) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
@@ -4355,9 +4500,6 @@ async function main() {
       try { acctPortableChild.kill() } catch {}
     }
     if (acctBridge2) await acctBridge2.stop()
-    if (portableChild) {
-      try { portableChild.kill() } catch {}
-    }
     if (ownerBridge2) await ownerBridge2.stop()
     if (friendBridgeA) await friendBridgeA.stop()
     if (bridge) await bridge.stop()

@@ -121,7 +121,7 @@ npm run admin -- users
 | **Codex** | `codex app-server --stdio` | 读写会话、切模型与推理强度、中断 | 自动探测 PATH 及 macOS `ChatGPT.app` 内置 CLI |
 | **Claude Code** | `claude -p --resume --output-format stream-json` | 读写 `~/.claude/projects/` 会话、切模型、中断 | 自动复用本地登录态 |
 | **Antigravity** | `agy acp --app-data-dir antigravity` | 共享桌面端历史与登录态、切模型与档位、后台任务同步 | 桌面端进度自动同步到 All in One；远程改写同一对话后，切回原生 `Antigravity.app` 续聊前请先重启一次桌面端 |
-| **DeepSeek Harness** | 原生 Cordis 插件 (`dsh-mobile-hub`) | 挂载插件后支持读写与切模型；独立运行时支持只读历史 | 挂载方式见下方开发者指南 |
+| **DeepSeek Harness** | 自动安装本地 IPC 插件 (`allinone-dsh-ipc`) / 原生插件 (`dsh-mobile-hub`) | DSH 桌面端运行时开箱即用读写与切模型；DSH 未运行时自动降级为只读历史 | 检测到 `~/.dsh/profiles/desktop` 时零终端自动安装本地环回 IPC 插件（设 `ALLINONE_NO_AUTOFIX=1` 可关闭） |
 
 - **跨设备互联**：手机和电脑登录同一账号即可互控名下所有在线电脑，随时切换。
 - **零知识端到端加密（E2EE）**：电脑端自动生成随机 256-bit 密钥（存于系统钥匙串 / DPAPI），所有对话、代码、附件与本地图片均经 `AES-256-GCM` 端到端加密后通过中转服务器盲转发；新手机通过本地离线二维码扫码同步密钥，中转服务器无法查看或伪造任何内容。
@@ -199,15 +199,16 @@ npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运
 <details>
 <summary>3. Capacitor 手机壳、DeepSeek Harness 插件与环境变量</summary>
 
-- **Capacitor 手机壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的 HTTPS 地址后执行：
+- **Capacitor Android 手机壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的 HTTPS 地址后执行：
   ```bash
   cd packages/mobile-app
   npm run build
-  npx cap sync android   # 或 ios
+  npx cap add android   # 首次初始化 Android 工程时执行
+  npx cap sync android
   npx cap open android
   ```
-- **DeepSeek Harness 插件模式**：复制 `packages/dsh-mobile-hub/cordis.patch.example.yml` 为 `cordis.patch.yml` 并填入配置，在 `~/.dsh/profiles/desktop/package.json` 链接 `dsh-mobile-hub` 并加入 `dsh.profile.bundles`，重启 DSH 生效。
-- **关闭后台自动补装 CLI**：设置环境变量 `ALLINONE_NO_AUTOFIX=1`。
+- **DeepSeek Harness 本地 IPC 与手动插件模式**：All in One 桌面端/桥接器检测到本机已安装 DeepSeek Harness（`~/.dsh/profiles/desktop`）时，会自动安装零依赖本地环回 IPC 插件 `allinone-dsh-ipc`（`127.0.0.1` + 256-bit Bearer Token），无需终端配置，DSH 桌面端运行期间即可开箱即用读写与切模型。如需高级手动挂载完整 `dsh-mobile-hub`，可复制 `packages/dsh-mobile-hub/cordis.patch.example.yml` 为 `cordis.patch.yml` 并填入配置，在 `~/.dsh/profiles/desktop/package.json` 链接 `dsh-mobile-hub` 并加入 `dsh.profile.bundles`，重启 DSH 生效。
+- **关闭后台自动补装 CLI 与 DSH 本地 IPC 自动安装**：设置环境变量 `ALLINONE_NO_AUTOFIX=1`。
 
 </details>
 
@@ -217,7 +218,7 @@ npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运
 ```text
 AllinOne/
 ├── packages/
-│   ├── shared/          # RPC / Event 协议与路径校验
+│   ├── shared/          # 共享协议、端到端加密与离线二维码（protocol.js、e2ee.js、qr-svg.js）
 │   ├── relay-server/    # 中转网关、账号邀请码与静态托管
 │   ├── dsh-mobile-hub/  # 4 大 AI 适配器、环境补齐与单文件桥接 CLI
 │   ├── mobile-app/      # React + Tailwind + PWA 前端

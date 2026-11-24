@@ -24,7 +24,6 @@ export const APP_META = Object.freeze({
     shortName: 'DeepSeek',
     color: '#4D6BFE',
     badge: 'DSH',
-    canOrchestrate: false,
     description: '零侵入直连本机 DeepSeek Harness 原生会话与缓存（0 额外工具与 Token）',
   },
   codex: {
@@ -33,7 +32,6 @@ export const APP_META = Object.freeze({
     shortName: 'Codex',
     color: '#10A37F',
     badge: 'CDX',
-    canOrchestrate: false,
     description: 'OpenAI Codex（官方 app-server 读写分离，每轮自动释放写入锁）',
   },
   claude: {
@@ -42,7 +40,6 @@ export const APP_META = Object.freeze({
     shortName: 'Claude',
     color: '#D97757',
     badge: 'CLD',
-    canOrchestrate: false,
     description: 'Claude Desktop / Code 本地项目会话（原生 CLI --resume 复用官方缓存）',
   },
   antigravity: {
@@ -51,7 +48,6 @@ export const APP_META = Object.freeze({
     shortName: 'Antigravity',
     color: '#7C5CFF',
     badge: 'AGY',
-    canOrchestrate: false,
     description: '官方 ACP 协议直连 Antigravity，与桌面端原生共享同一会话与缓存',
   },
 })

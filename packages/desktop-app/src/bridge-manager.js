@@ -6,10 +6,9 @@
  *  - Otherwise auto-binds this PC via POST /api/account/devices/register using the logged-in JWT
  *  - Runs the bundled single-file bridge in an isolated child process using Electron's embedded Node runtime
  *    (zero Node.js installation required on the user's computer!)
- *  - Auto-disables legacy com.allinone.bridge LaunchAgent on macOS to prevent duplicate bridge collisions
  */
 
-import { execFileSync, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
@@ -44,14 +43,21 @@ function readJsonSafe(filePath) {
 }
 
 function normalizeDesktopE2eeKey(raw) {
-  const clean = String(raw || '').trim().replace(/\s+/g, '')
-  if (!clean || !/^[A-Za-z0-9+/_=-]+$/.test(clean)) return ''
+  if (typeof raw !== 'string') return ''
+  const clean = raw.trim().replace(/\s+/g, '')
+  if (!clean || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) return ''
+  const eqIdx = clean.indexOf('=')
+  if (eqIdx !== -1 && clean.length % 4 !== 0) return ''
+  const unpadded = eqIdx !== -1 ? clean.slice(0, eqIdx) : clean
+  if (!unpadded || unpadded.length % 4 === 1) return ''
+  const std = unpadded.replace(/-/g, '+').replace(/_/g, '/')
+  const padLen = (4 - (std.length % 4)) % 4
   try {
-    const std = clean.replace(/-/g, '+').replace(/_/g, '/')
-    const pad = (4 - (std.length % 4)) % 4
-    const buf = Buffer.from(`${std}${'='.repeat(pad)}`, 'base64')
+    const buf = Buffer.from(`${std}${'='.repeat(padLen)}`, 'base64')
     if (buf.length !== 32) return ''
-    return buf.toString('base64url')
+    const normalized = buf.toString('base64url')
+    if (normalized !== unpadded.replace(/\+/g, '-').replace(/\//g, '_')) return ''
+    return normalized
   } catch {
     return ''
   }
@@ -903,6 +909,9 @@ export class DesktopBridgeManager extends EventEmitter {
     const prevCfg = { ...cfg }
     const prevDeviceMeta = this.deviceMeta ? { ...this.deviceMeta } : null
     const nextCfg = { ...cfg, e2eeKey: normalized }
+    if (this.enabled && !this.disposed) {
+      delete nextCfg.autoStartDisabled
+    }
     saveConfigSecure(this.configPath, nextCfg, this.secretStore)
     const keyId = computeDesktopE2eeKeyId(normalized)
     this.deviceMeta = {

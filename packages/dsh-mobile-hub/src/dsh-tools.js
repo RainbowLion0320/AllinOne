@@ -5,7 +5,7 @@ import { APP_LIST } from './protocol.js'
  * Any DSH conversation (mobile OR desktop) can then inspect and dispatch work to:
  *   - Codex (via official `codex app-server`)
  *   - Claude Code / Desktop Code (via official `claude` CLI)
- *   - Antigravity (history reading + official Python SDK)
+ *   - Antigravity (official agy acp)
  *   - Other DeepSeek Harness sessions
  */
 export function registerDshDispatchTools(ctx, orchestrator, log = console) {

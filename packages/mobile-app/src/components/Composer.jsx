@@ -3,7 +3,7 @@ import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
-import { resolveImageSrc } from '../lib/imageUrls.js'
+import { isRelayUploadTarget, resolveImageSrc } from '../lib/imageUrls.js'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
@@ -42,11 +42,7 @@ function ComposerAttachmentChip({ att, imageContext, onRemove }) {
       return
     }
     const targetUrl = String(effectiveAtt?.url || '').trim()
-    const isUploadUrl =
-      targetUrl.startsWith('/api/uploads/') ||
-      /^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(targetUrl) ||
-      /^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(targetUrl)
-    if (isUploadUrl && effectiveAtt?.e2ee?.iv && imageContext?.baseUrl && !imageContext?.mediaToken) {
+    if (isRelayUploadTarget(targetUrl) && effectiveAtt?.e2ee?.iv && imageContext?.baseUrl && !imageContext?.mediaToken) {
       return
     }
     let cancelled = false
@@ -138,12 +134,14 @@ export function Composer({
   onUploadFile,
   onSend,
   onInterrupt,
+  onError = null,
 }) {
   const { lang, bi } = useI18n()
   const [text, setText] = useState(() => loadDraft(draftKey).text)
   const [attachments, setAttachments] = useState(() => loadDraft(draftKey).attachments)
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
+  const [inlineError, setInlineError] = useState('')
   const fileRef = useRef(null)
   const textareaRef = useRef(null)
   const draftKeyRef = useRef(draftKey)
@@ -182,6 +180,8 @@ export function Composer({
       for (const att of attachmentsRef.current) {
         revokeAttachmentPreview(att)
       }
+    } else if (prevKey.includes('::__new__::')) {
+      clearDraft(prevKey)
     }
     draftKeyRef.current = draftKey
     const nextDraft = loadDraft(draftKey)
@@ -189,6 +189,7 @@ export function Composer({
     attachmentsRef.current = nextDraft.attachments
     setText(nextDraft.text)
     setAttachments(nextDraft.attachments)
+    setInlineError('')
   }, [draftKey])
 
   // Keep textarea height synced cleanly after switching to a restored draft (or empty box)
@@ -225,6 +226,7 @@ export function Composer({
     if (!file || !onUploadFile) return
     const targetKey = draftKeyRef.current
     setUploading(true)
+    setInlineError('')
     try {
       const uploaded = await onUploadFile(file)
       if (!uploaded || typeof uploaded !== 'object') return
@@ -249,7 +251,9 @@ export function Composer({
         })
       }
     } catch (err) {
-      alert(bi(`上传失败：${err.message || err}`, `Upload failed: ${err.message || err}`))
+      const msg = bi(`上传失败：${err?.message || err}`, `Upload failed: ${err?.message || err}`)
+      if (onError) onError(msg)
+      else if (mountedRef.current) setInlineError(msg)
     } finally {
       if (mountedRef.current) {
         setUploading(false)
@@ -263,23 +267,40 @@ export function Composer({
     const curAttachments = attachmentsRef.current
     if (!trimmed && curAttachments.length === 0) return
     if (disabled || streaming || uploading || sendingRef.current || needsWorkspace) return
-    const curKey = draftKeyRef.current
+    const originDraftKey = draftKeyRef.current
     sendingRef.current = true
     setSending(true)
-    try {
-      const result = await onSend({ text: trimmed, attachments: curAttachments })
-      if (result === false) {
-        if (mountedRef.current && textRef.current === '' && attachmentsRef.current.length === 0) {
+    setInlineError('')
+
+    const restoreOnFailure = () => {
+      if (mountedRef.current && draftKeyRef.current === originDraftKey) {
+        if (textRef.current === '' && attachmentsRef.current.length === 0) {
           textRef.current = rawText
           attachmentsRef.current = curAttachments
           setText(rawText)
           setAttachments(curAttachments)
-          saveDraft(draftKeyRef.current, { text: rawText, attachments: curAttachments })
         }
+        saveDraft(originDraftKey, { text: textRef.current, attachments: attachmentsRef.current })
+      } else {
+        for (const att of curAttachments) {
+          revokeAttachmentPreview(att)
+        }
+        if (originDraftKey.includes('::__new__::')) {
+          clearDraft(originDraftKey)
+        } else {
+          saveDraft(originDraftKey, { text: rawText, attachments: curAttachments })
+        }
+      }
+    }
+
+    try {
+      const result = await onSend({ text: trimmed, attachments: curAttachments })
+      if (result === false) {
+        restoreOnFailure()
         return
       }
-      clearDraft(curKey)
-      if (mountedRef.current && (draftKeyRef.current === curKey || curKey.includes('::__new__::'))) {
+      clearDraft(originDraftKey)
+      if (mountedRef.current && draftKeyRef.current === originDraftKey) {
         textRef.current = ''
         attachmentsRef.current = []
         setText('')
@@ -287,13 +308,7 @@ export function Composer({
         if (textareaRef.current) textareaRef.current.style.height = 'auto'
       }
     } catch {
-      if (mountedRef.current && textRef.current === '' && attachmentsRef.current.length === 0) {
-        textRef.current = rawText
-        attachmentsRef.current = curAttachments
-        setText(rawText)
-        setAttachments(curAttachments)
-        saveDraft(draftKeyRef.current, { text: rawText, attachments: curAttachments })
-      }
+      restoreOnFailure()
     } finally {
       sendingRef.current = false
       if (mountedRef.current) {
@@ -326,6 +341,14 @@ export function Composer({
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
       <div className="mx-auto w-full max-w-2xl lg:max-w-3xl">
+        {inlineError && (
+          <div className="mb-2 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
+            <span className="min-w-0 flex-1 truncate">{inlineError}</span>
+            <button type="button" onClick={() => setInlineError('')} className="shrink-0 p-0.5 hover:opacity-75">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
         {/* Pending attachment chips (with E2EE-capable image thumbnails!) */}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 px-1">
@@ -380,7 +403,7 @@ export function Composer({
                     {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (
-                    <span className="shrink-0 rounded-full bg-[#4D6BFE]/12 px-1.5 py-0.2 text-[10px] font-semibold text-[#3552E8] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
+                    <span className="shrink-0 rounded-full bg-[#4D6BFE]/12 px-1.5 py-0.5 text-[10px] font-semibold text-[#3552E8] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
                       {formatEffortLabel(modelPref.reasoningEffort, lang)}
                     </span>
                   )}

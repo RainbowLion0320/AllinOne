@@ -22,9 +22,9 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 
 | Adapter | Default Permission Setting | How to Restrict |
 | :--- | :--- | :--- |
-| **Antigravity** (`antigravity.js`) | `autoApprove: true` (`--dangerously-skip-permissions`) | Pass `antigravityAutoApprove: false` in adapter config |
+| **Antigravity** (`antigravity.js`) | `autoApprove: true` (`--dangerously-skip-permissions`) | Pass `agyAutoApprove: false` in `dsh-mobile-hub` adapter config |
 | **Claude Code** (`claude.js`) | `claudePermissionMode: 'acceptEdits'` | Set `claudePermissionMode: 'default'` or `'plan'` in config |
-| **DeepSeek Harness** (`dsh.js`) | `permissionPreset: 'danger-full-access'` | Change `permissionPreset` in `cordis.patch.yml` (e.g., `'workspace-write'` or `'read-only'`) |
+| **DeepSeek Harness** (`dsh.js`) | `permissionPreset: 'danger-full-access'` | Change `permissionPreset` in `cordis.patch.yml` (e.g., `'workspace-write'` or `'read-only'`); note that the auto-installed `allinone-dsh-ipc` plugin manages `~/.dsh/profiles/desktop/node_modules/allinone-dsh-ipc/cordis.patch.yml` unless `ALLINONE_NO_AUTOFIX=1` is set |
 | **Codex** (`codex.js`) | Uses your local Codex CLI approval/sandbox configuration | Configure sandbox/approval policy in your local `~/.codex/config.toml` |
 
 **Implication**: Anyone who obtains valid credentials for your All in One account can instruct AI agents on your online computers to read, edit, or execute code in your local projects. Protect your account password, restrict who receives invite codes, and keep your relay server locked down.
@@ -34,7 +34,7 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 - **Production secret guard**: Refuses to start with `NODE_ENV=production` if `JWT_SECRET` is missing or shorter than 16 characters.
 - **Mandatory one-time WebSocket tickets**: Client WebSocket upgrades strictly require short-lived, single-use `/api/auth/ws-ticket` tickets (no master JWTs in URLs).
 - **Origin allowlist & CORS**: Enforces same-origin / configured `PUBLIC_RELAY_URL` / `ALLOWED_ORIGINS` (plus explicit Capacitor and Electron `app://allinone` origins).
-- **SSRF & Path Traversal checks**: Attachment fetch validates target origin against the relay server itself and blocks private/metadata destinations; local file reads enforce canonical path containment (`assertPathWithinDir`) and safe session IDs.
+- **SSRF & Path Traversal checks**: Attachment fetch validates `/api/uploads/<uuid>` paths against the configured relay server (`redirect: 'error'`) and blocks caller-supplied local paths; agent session and transcript reads enforce canonical path containment (`assertPathWithinDir`) and safe session IDs, while local image preview (`RPC.FILE_READ`) validates allowed image extensions, canonical `realpathSync` targets, and a 20 MB size cap.
 - **Rate limiting**: Applies per-IP, per-account, and per-(IP, roomId) rate limiting on authentication and bridge endpoints, handling reverse-proxy `X-Forwarded-For` headers safely.
 - **Scoped CLI auto-completion**: The PC bridge only invokes official vendor CLI installers (`antigravity.google`, `claude.ai`, `@openai/codex`) when a local half-installed footprint is already present, applies a 6-hour failure cooldown, and can be disabled entirely via `ALLINONE_NO_AUTOFIX=1`.
 

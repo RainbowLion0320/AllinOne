@@ -8,28 +8,16 @@ import {
 import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
-const STORAGE_KEY = 'allinone_dsh_auth_v1'
+const MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
-export function loadSavedAuth() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed.token === 'string') return parsed
-  } catch {}
-  return null
-}
-
-export function saveAuth(data) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
-  } catch {}
-}
-
-export function clearAuth() {
-  try {
-    localStorage.removeItem(STORAGE_KEY)
-  } catch {}
+function normalizeE2eeKeysMap(keysMap) {
+  const out = {}
+  for (const [k, v] of Object.entries(keysMap || {})) {
+    const cleanK = String(k || '').trim().toLowerCase()
+    const cleanV = String(v || '').trim()
+    if (cleanK && cleanV) out[cleanK] = cleanV
+  }
+  return out
 }
 
 export const DEFAULT_PROD_SERVER =
@@ -582,7 +570,7 @@ export class MobileRelayClient {
     this.token = token
     this.roomId = String(roomId || '').trim()
     this.targetBridgeId = String(bridgeId || '').trim()
-    this.e2eeKeys = { ...(e2eeKeys || {}) }
+    this.e2eeKeys = normalizeE2eeKeysMap(e2eeKeys)
     this._inboundEventQueue = Promise.resolve()
     this.ws = null
     this.closed = false
@@ -601,7 +589,6 @@ export class MobileRelayClient {
     this.bridges = []
     this.devices = null
     this.clientId = ''
-    this.liveClients = []
     this.onlineClientCount = 0
     this.pendingGrants = []
     this._grantListResolvers = new Map()
@@ -628,7 +615,7 @@ export class MobileRelayClient {
   }
 
   setE2eeKeys(keysMap) {
-    this.e2eeKeys = { ...(keysMap || {}) }
+    this.e2eeKeys = normalizeE2eeKeysMap(keysMap)
   }
 
   getBridgeE2eeContext(bridgeId = '') {
@@ -640,7 +627,7 @@ export class MobileRelayClient {
     if (!bridge) {
       bridge = this.bridges.find((b) => b.online) || this.bridges[0] || null
     }
-    const keyId = String(bridge?.e2ee?.keyId || '').trim()
+    const keyId = String(bridge?.e2ee?.keyId || '').trim().toLowerCase()
     const key = keyId ? String(this.e2eeKeys[keyId] || '').trim() : ''
     return {
       enabled: true,
@@ -667,7 +654,6 @@ export class MobileRelayClient {
       bridges: this.bridges,
       devices: this.devices,
       clientId: this.clientId,
-      liveClients: this.liveClients,
       onlineClientCount: this.onlineClientCount,
     })
     return () => this.statusListeners.delete(fn)
@@ -680,7 +666,6 @@ export class MobileRelayClient {
       bridges: this.bridges,
       devices: this.devices,
       clientId: this.clientId,
-      liveClients: this.liveClients,
       onlineClientCount: this.onlineClientCount,
     }
     for (const fn of this.statusListeners) {
@@ -797,7 +782,6 @@ export class MobileRelayClient {
         this.bridges = msg.bridges || []
         if (Array.isArray(msg.devices)) this.devices = msg.devices
         if (Array.isArray(msg.clients)) {
-          this.liveClients = msg.clients
           this.onlineClientCount = Number(msg.onlineClientCount) || msg.clients.length
         }
         this.connectionState = 'connected'
@@ -889,7 +873,6 @@ export class MobileRelayClient {
             }
           } else if (msg.event === 'clients.status') {
             if (Array.isArray(msg.payload?.clients)) {
-              this.liveClients = msg.payload.clients
               this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
               this.emitStatus()
             }
@@ -1130,6 +1113,9 @@ export class MobileRelayClient {
   }
 
   async uploadFile(file) {
+    if (typeof file?.size === 'number' && file.size > MAX_UPLOAD_BYTES) {
+      throw new Error(L('文件过大，单个附件最大支持 15 MB', 'File is too large (max 15 MB per attachment)'))
+    }
     const e2eeCtx = this.getBridgeE2eeContext(this.targetBridgeId)
     if (!e2eeCtx.ready) {
       const err = new Error(
@@ -1148,19 +1134,32 @@ export class MobileRelayClient {
       kind: 'upload',
       roomId: this.roomId,
     })
-    const res = await fetch(`${this.baseUrl}/api/uploads`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({
-        filename: 'encrypted.bin',
-        mimeType: 'application/octet-stream',
-        encrypted: true,
-        dataBase64: bytesToBase64(enc.ciphertext),
-      }),
-    })
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+    const timer = controller ? setTimeout(() => controller.abort(), 60_000) : null
+    let res
+    try {
+      res = await fetch(`${this.baseUrl}/api/uploads`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          filename: 'encrypted.bin',
+          mimeType: 'application/octet-stream',
+          encrypted: true,
+          dataBase64: bytesToBase64(enc.ciphertext),
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      })
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw new Error(L('附件上传超时，请检查网络后重试', 'Upload timed out. Check your connection and retry.'))
+      }
+      throw err
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
       throw new Error(data.error || L('上传失败', 'Upload failed'))

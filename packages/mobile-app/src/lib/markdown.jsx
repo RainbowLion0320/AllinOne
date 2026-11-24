@@ -1,25 +1,7 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import hljs from 'highlight.js/lib/core'
-import bash from 'highlight.js/lib/languages/bash'
-import cpp from 'highlight.js/lib/languages/cpp'
-import css from 'highlight.js/lib/languages/css'
-import diff from 'highlight.js/lib/languages/diff'
-import dockerfile from 'highlight.js/lib/languages/dockerfile'
-import go from 'highlight.js/lib/languages/go'
-import ini from 'highlight.js/lib/languages/ini'
-import java from 'highlight.js/lib/languages/java'
-import javascript from 'highlight.js/lib/languages/javascript'
-import json from 'highlight.js/lib/languages/json'
-import markdownLang from 'highlight.js/lib/languages/markdown'
-import powershell from 'highlight.js/lib/languages/powershell'
-import python from 'highlight.js/lib/languages/python'
-import rust from 'highlight.js/lib/languages/rust'
-import sql from 'highlight.js/lib/languages/sql'
-import typescript from 'highlight.js/lib/languages/typescript'
-import xml from 'highlight.js/lib/languages/xml'
-import yaml from 'highlight.js/lib/languages/yaml'
 import {
   AlertCircle,
   AlertTriangle,
@@ -35,44 +17,115 @@ import { useI18n } from './i18n.jsx'
 import {
   getImageLabel,
   isImageTarget,
+  isRelayUploadTarget,
   resolveImageSrc,
 } from './imageUrls.js'
+import { needsE2eeMediaLoad } from './e2eeMedia.js'
+import { copyTextToClipboard } from './clientHelpers.js'
 
-hljs.registerLanguage('bash', bash)
-hljs.registerLanguage('sh', bash)
-hljs.registerLanguage('shell', bash)
-hljs.registerLanguage('zsh', bash)
-hljs.registerLanguage('cpp', cpp)
-hljs.registerLanguage('c', cpp)
-hljs.registerLanguage('css', css)
-hljs.registerLanguage('diff', diff)
-hljs.registerLanguage('dockerfile', dockerfile)
-hljs.registerLanguage('docker', dockerfile)
-hljs.registerLanguage('go', go)
-hljs.registerLanguage('ini', ini)
-hljs.registerLanguage('toml', ini)
-hljs.registerLanguage('java', java)
-hljs.registerLanguage('javascript', javascript)
-hljs.registerLanguage('js', javascript)
-hljs.registerLanguage('jsx', javascript)
-hljs.registerLanguage('json', json)
-hljs.registerLanguage('markdown', markdownLang)
-hljs.registerLanguage('md', markdownLang)
-hljs.registerLanguage('powershell', powershell)
-hljs.registerLanguage('ps1', powershell)
-hljs.registerLanguage('python', python)
-hljs.registerLanguage('py', python)
-hljs.registerLanguage('rust', rust)
-hljs.registerLanguage('rs', rust)
-hljs.registerLanguage('sql', sql)
-hljs.registerLanguage('typescript', typescript)
-hljs.registerLanguage('ts', typescript)
-hljs.registerLanguage('tsx', typescript)
-hljs.registerLanguage('xml', xml)
-hljs.registerLanguage('html', xml)
-hljs.registerLanguage('svg', xml)
-hljs.registerLanguage('yaml', yaml)
-hljs.registerLanguage('yml', yaml)
+const HLJS_ALIASES = {
+  bash: 'bash',
+  sh: 'bash',
+  shell: 'bash',
+  zsh: 'bash',
+  cpp: 'cpp',
+  c: 'cpp',
+  'c++': 'cpp',
+  cc: 'cpp',
+  h: 'cpp',
+  hpp: 'cpp',
+  css: 'css',
+  diff: 'diff',
+  patch: 'diff',
+  dockerfile: 'dockerfile',
+  docker: 'dockerfile',
+  go: 'go',
+  golang: 'go',
+  ini: 'ini',
+  toml: 'ini',
+  java: 'java',
+  javascript: 'javascript',
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  json: 'json',
+  markdown: 'markdown',
+  md: 'markdown',
+  powershell: 'powershell',
+  ps1: 'powershell',
+  pwsh: 'powershell',
+  python: 'python',
+  py: 'python',
+  rust: 'rust',
+  rs: 'rust',
+  sql: 'sql',
+  typescript: 'typescript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  xml: 'xml',
+  html: 'xml',
+  svg: 'xml',
+  yaml: 'yaml',
+  yml: 'yaml',
+}
+
+const HLJS_LOADERS = {
+  bash: () => import('highlight.js/lib/languages/bash'),
+  cpp: () => import('highlight.js/lib/languages/cpp'),
+  css: () => import('highlight.js/lib/languages/css'),
+  diff: () => import('highlight.js/lib/languages/diff'),
+  dockerfile: () => import('highlight.js/lib/languages/dockerfile'),
+  go: () => import('highlight.js/lib/languages/go'),
+  ini: () => import('highlight.js/lib/languages/ini'),
+  java: () => import('highlight.js/lib/languages/java'),
+  javascript: () => import('highlight.js/lib/languages/javascript'),
+  json: () => import('highlight.js/lib/languages/json'),
+  markdown: () => import('highlight.js/lib/languages/markdown'),
+  powershell: () => import('highlight.js/lib/languages/powershell'),
+  python: () => import('highlight.js/lib/languages/python'),
+  rust: () => import('highlight.js/lib/languages/rust'),
+  sql: () => import('highlight.js/lib/languages/sql'),
+  typescript: () => import('highlight.js/lib/languages/typescript'),
+  xml: () => import('highlight.js/lib/languages/xml'),
+  yaml: () => import('highlight.js/lib/languages/yaml'),
+}
+
+const loadedHljsLangs = new Set()
+const loadingHljsLangs = new Map()
+
+function resolveCanonicalHljsLang(raw) {
+  const clean = String(raw || '').trim().toLowerCase()
+  return HLJS_ALIASES[clean] || ''
+}
+
+function ensureHljsLanguage(canonical) {
+  if (!canonical) return Promise.resolve(false)
+  if (loadedHljsLangs.has(canonical) || hljs.getLanguage(canonical)) {
+    loadedHljsLangs.add(canonical)
+    return Promise.resolve(true)
+  }
+  const existing = loadingHljsLangs.get(canonical)
+  if (existing) return existing
+  const loader = HLJS_LOADERS[canonical]
+  if (!loader) return Promise.resolve(false)
+  const job = loader()
+    .then((mod) => {
+      const def = mod?.default || mod
+      if (typeof def === 'function') {
+        hljs.registerLanguage(canonical, def)
+        loadedHljsLangs.add(canonical)
+        return true
+      }
+      return false
+    })
+    .catch(() => false)
+    .finally(() => {
+      loadingHljsLangs.delete(canonical)
+    })
+  loadingHljsLangs.set(canonical, job)
+  return job
+}
 
 const REMARK_PLUGINS = [remarkGfm]
 
@@ -156,23 +209,43 @@ function CodeBlock({ language, code }) {
   const { t, bi } = useI18n()
   const [copied, setCopied] = useState(false)
   const [wrap, setWrap] = useState(false)
+  const canonicalLang = resolveCanonicalHljsLang(language)
+  const [langReady, setLangReady] = useState(() => Boolean(canonicalLang && hljs.getLanguage(canonicalLang)))
+
+  useEffect(() => {
+    if (!canonicalLang) {
+      setLangReady(false)
+      return
+    }
+    if (hljs.getLanguage(canonicalLang)) {
+      setLangReady(true)
+      return
+    }
+    let cancelled = false
+    ensureHljsLanguage(canonicalLang).then((ok) => {
+      if (!cancelled && ok) setLangReady(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [canonicalLang])
 
   const highlightedHtml = useMemo(() => {
-    const cleanLang = String(language || '').trim().toLowerCase()
-    if (!code) return ''
+    if (!code || !canonicalLang || !langReady) return ''
     try {
-      if (cleanLang && hljs.getLanguage(cleanLang)) {
-        return hljs.highlight(code, { language: cleanLang, ignoreIllegals: true }).value
+      if (hljs.getLanguage(canonicalLang)) {
+        return hljs.highlight(code, { language: canonicalLang, ignoreIllegals: true }).value
       }
     } catch {}
     return ''
-  }, [language, code])
+  }, [canonicalLang, code, langReady])
 
   const handleCopy = () => {
-    navigator.clipboard?.writeText(code).then(() => {
+    void copyTextToClipboard(code).then((ok) => {
+      if (!ok) return
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
-    }).catch(() => {})
+    })
   }
 
   return (
@@ -220,17 +293,22 @@ function CodeBlock({ language, code }) {
 }
 
 function ImageChip({ target, label, imageContext }) {
-  const isDirectSrc = /^(?:https?:\/\/|data:|blob:)/i.test(target)
-  const useE2ee = Boolean(imageContext?.e2eeActive && !isDirectSrc)
-  const src = useE2ee ? '' : resolveImageSrc(target, imageContext || {})
   const displayLabel = label || getImageLabel(target)
+  const isUrlRef = /^(?:https?:\/\/|data:|blob:|\/api\/)/i.test(target) || isRelayUploadTarget(target)
+  const item = {
+    ...(isUrlRef ? { url: target } : { path: target }),
+    raw: target,
+    name: displayLabel,
+  }
+  const useE2ee = needsE2eeMediaLoad(item, imageContext || {})
+  const src = useE2ee ? '' : resolveImageSrc(item, imageContext || {})
   return (
     <button
       type="button"
       onClick={() =>
         (src || useE2ee) &&
         imageContext?.onOpenImage?.({
-          images: [{ item: { path: target, name: displayLabel }, src, label: displayLabel, rawPath: target }],
+          images: [{ item, src, label: displayLabel, rawPath: target }],
           index: 0,
         })
       }
@@ -484,7 +562,7 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
   if (!text) return null
 
   return (
-    <div className={`md-body min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
+    <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
       <ReactMarkdown
         remarkPlugins={REMARK_PLUGINS}
         urlTransform={safeUrlTransform}

@@ -58,6 +58,16 @@ class AppErrorBoundary extends React.Component {
   }
 }
 
+// Synchronously apply saved theme before React mounts to eliminate dark-mode FOUC (CSP-safe)
+try {
+  const isDark = localStorage.getItem('allinone_dark') === '1'
+  document.documentElement.classList.toggle('dark', isDark)
+  const themeMeta = document.querySelector('meta[name="theme-color"]')
+  if (themeMeta) {
+    themeMeta.setAttribute('content', isDark ? '#03080E' : '#FFFFFF')
+  }
+} catch {}
+
 // Auto-reload cleanly whenever a newer PWA Service Worker takes control
 if ('serviceWorker' in navigator) {
   let reloading = false

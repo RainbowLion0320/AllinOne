@@ -4,7 +4,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getAgyCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -102,9 +102,29 @@ function computeAgyExternalRunning({ selfActive, desktopRunning, status, notFull
   return Boolean(notFullyIdle && recentlyModified)
 }
 
+const AGY_SQLITE_PY_SCRIPT = [
+  'import base64, json, pathlib, sqlite3, sys',
+  'req = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))',
+  'con = sqlite3.connect(pathlib.Path(req["dbPath"]).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
+  'try:',
+  '    con.row_factory = sqlite3.Row',
+  '    cur = con.execute(req["sql"], req.get("params") or [])',
+  '    if req.get("single"):',
+  '        row = cur.fetchone()',
+  '        out = dict(row) if row else None',
+  '    else:',
+  '        out = [dict(r) for r in cur.fetchall()]',
+  '    print(json.dumps(out))',
+  'finally:',
+  '    con.close()',
+].join('\n')
+
 function runPythonSqliteJson(pyCode, args, fallbackValue, timeoutMs = 3_000) {
   const pyBin = findExecutable(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) ||
     (process.platform === 'win32' ? 'python' : 'python3')
+  // Encode Python code as base64 on a single line so Windows .bat/.cmd shims never split on newlines or mangle quotes
+  const encoded = Buffer.from(String(pyCode || ''), 'utf8').toString('base64')
+  const launcher = `exec(__import__('base64').b64decode('${encoded}').decode('utf-8'))`
   return new Promise((resolvePromise) => {
     let settled = false
     const done = (val) => {
@@ -120,9 +140,10 @@ function runPythonSqliteJson(pyCode, args, fallbackValue, timeoutMs = 3_000) {
     }, timeoutMs)
     timer.unref?.()
     try {
-      proc = spawnCrossPlatform(pyBin, ['-c', pyCode, ...args], {
+      proc = spawnCrossPlatform(pyBin, ['-c', launcher, ...args], {
         stdio: ['ignore', 'pipe', 'ignore'],
         windowsHide: true,
+        env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
       })
       let out = ''
       proc.stdout.setEncoding('utf8')
@@ -141,21 +162,19 @@ function runPythonSqliteJson(pyCode, args, fallbackValue, timeoutMs = 3_000) {
   })
 }
 
-async function queryAgyConversationState(dbPath, conversationId) {
-  if (!conversationId || !existsSync(dbPath)) return null
+/**
+ * Shared read-only SQLite query helper for Antigravity's `conversation_summaries.db`.
+ * Uses Node's built-in `node:sqlite` first; falls back to Python `sqlite3` for Electron compatibility.
+ */
+async function runAgySqliteQuery(dbPath, { sql, params = [], single = false, fallbackValue = null }) {
+  if (!dbPath || !existsSync(dbPath)) return fallbackValue
   try {
     const sqlite = await import('node:sqlite')
     const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
     try {
-      const row = db
-        .prepare('SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1')
-        .get(conversationId)
-      if (!row) return null
-      return {
-        status: String(row.status || ''),
-        notFullyIdle: Boolean(row.not_fully_idle),
-        stepCount: Number(row.step_count || 0),
-      }
+      const stmt = db.prepare(sql)
+      const res = single ? stmt.get(...params) : stmt.all(...params)
+      return res ?? fallbackValue
     } finally {
       db.close()
     }
@@ -163,16 +182,18 @@ async function queryAgyConversationState(dbPath, conversationId) {
     // Fallback to Python sqlite3 read-only query
   }
 
-  const pyCode = [
-    'import pathlib, sqlite3, json, sys',
-    'db_path, cid = sys.argv[1], sys.argv[2]',
-    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
-    'con.row_factory = sqlite3.Row',
-    'row = con.execute("SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (cid,)).fetchone()',
-    'print(json.dumps(dict(row) if row else None))',
-  ].join('\n')
+  const payloadB64 = Buffer.from(JSON.stringify({ dbPath, sql, params, single }), 'utf8').toString('base64')
+  return runPythonSqliteJson(AGY_SQLITE_PY_SCRIPT, [payloadB64], fallbackValue)
+}
 
-  const row = await runPythonSqliteJson(pyCode, [dbPath, conversationId], null)
+async function queryAgyConversationState(dbPath, conversationId) {
+  if (!conversationId) return null
+  const row = await runAgySqliteQuery(dbPath, {
+    sql: 'SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1',
+    params: [conversationId],
+    single: true,
+    fallbackValue: null,
+  })
   if (!row) return null
   return {
     status: String(row.status || ''),
@@ -182,36 +203,15 @@ async function queryAgyConversationState(dbPath, conversationId) {
 }
 
 async function queryAgySummaryById(dbPath, conversationId) {
-  if (!conversationId || !existsSync(dbPath)) return null
-  try {
-    const sqlite = await import('node:sqlite')
-    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
-    try {
-      const row = db
-        .prepare(
-          `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
-           FROM conversation_summaries
-           WHERE conversation_id = ? LIMIT 1`,
-        )
-        .get(conversationId)
-      return row || null
-    } finally {
-      db.close()
-    }
-  } catch {
-    // Fallback to Python sqlite3 read-only query
-  }
-
-  const pyCode = [
-    'import pathlib, sqlite3, json, sys',
-    'db_path, cid = sys.argv[1], sys.argv[2]',
-    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
-    'con.row_factory = sqlite3.Row',
-    'row = con.execute("SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (cid,)).fetchone()',
-    'print(json.dumps(dict(row) if row else None, ensure_ascii=False))',
-  ].join('\n')
-
-  return runPythonSqliteJson(pyCode, [dbPath, conversationId], null)
+  if (!conversationId) return null
+  return runAgySqliteQuery(dbPath, {
+    sql: `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
+          FROM conversation_summaries
+          WHERE conversation_id = ? LIMIT 1`,
+    params: [conversationId],
+    single: true,
+    fallbackValue: null,
+  })
 }
 
 function getAgyHome() {
@@ -219,30 +219,9 @@ function getAgyHome() {
 }
 
 function findAgyBinary(configuredBin) {
-  const home = homedir()
-  const candidates = [configuredBin, process.env.AGY_BIN]
+  const candidates = getAgyCandidates(homedir(), process.platform, process.env, configuredBin)
   if (process.platform === 'win32') {
-    const localApp = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
-    candidates.push(
-      join(localApp, 'agy', 'bin', 'agy.exe'),
-      join(localApp, 'Programs', 'Antigravity', 'bin', 'agy.cmd'),
-      join(localApp, 'Programs', 'Antigravity', 'resources', 'app', 'bin', 'agy.cmd'),
-    )
     return findExecutable(['agy.exe', 'agy.cmd', 'agy'], candidates) || 'agy.exe'
-  }
-  candidates.push(
-    join(home, '.local', 'bin', 'agy'),
-    join(home, '.antigravity', 'antigravity', 'bin', 'agy'),
-    join(home, '.antigravity', 'bin', 'agy'),
-    join(home, '.agy', 'bin', 'agy'),
-    '/opt/homebrew/bin/agy',
-    '/usr/local/bin/agy',
-  )
-  if (process.platform === 'darwin') {
-    candidates.push(
-      '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
-      join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agy'),
-    )
   }
   return findExecutable(['agy'], candidates) || 'agy'
 }
@@ -273,51 +252,26 @@ export function parseWorkspaceUri(raw) {
 
 /**
  * Query Antigravity's local SQLite conversation index read-only (top-level chats only).
- * Uses Node 24 built-in `node:sqlite` first; falls back to Python `sqlite3` for Electron compatibility.
  */
 async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
-  if (!existsSync(dbPath)) return []
-
-  try {
-    const sqlite = await import('node:sqlite')
-    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
-    try {
-      let sql = `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
-                 FROM conversation_summaries
-                 WHERE nesting_depth = 0 AND (parent_conversation_id IS NULL OR parent_conversation_id = '')`
-      const args = []
-      if (search) {
-        sql += ` AND (title LIKE ? OR preview LIKE ? OR workspace_uris LIKE ?)`
-        const pattern = `%${search}%`
-        args.push(pattern, pattern, pattern)
-      }
-      sql += ` ORDER BY last_modified_time DESC LIMIT ?`
-      args.push(limit)
-      const stmt = db.prepare(sql)
-      return stmt.all(...args)
-    } finally {
-      db.close()
-    }
-  } catch {
-    // Fallback to Python sqlite3 read-only query
+  let sql = `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
+             FROM conversation_summaries
+             WHERE nesting_depth = 0 AND (parent_conversation_id IS NULL OR parent_conversation_id = '')`
+  const params = []
+  if (search) {
+    sql += ` AND (title LIKE ? OR preview LIKE ? OR workspace_uris LIKE ?)`
+    const pattern = `%${search}%`
+    params.push(pattern, pattern, pattern)
   }
+  sql += ` ORDER BY last_modified_time DESC LIMIT ?`
+  params.push(Number(limit) || 80)
 
-  const pyCode = [
-    'import pathlib, sqlite3, json, sys',
-    'db_path, limit, search = sys.argv[1], int(sys.argv[2]), sys.argv[3]',
-    'con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
-    'con.row_factory = sqlite3.Row',
-    'cur = con.cursor()',
-    'sql = "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle FROM conversation_summaries WHERE nesting_depth = 0 AND (parent_conversation_id IS NULL OR parent_conversation_id = \'\')"',
-    'args = []',
-    'if search: sql += " AND (title LIKE ? OR preview LIKE ? OR workspace_uris LIKE ?)"; p = f"%{search}%"; args = [p, p, p]',
-    'sql += " ORDER BY last_modified_time DESC LIMIT ?"',
-    'args.append(limit)',
-    'rows = [dict(r) for r in cur.execute(sql, args).fetchall()]',
-    'print(json.dumps(rows, ensure_ascii=False))',
-  ].join('\n')
-
-  const rows = await runPythonSqliteJson(pyCode, [dbPath, String(limit), search || ''], [])
+  const rows = await runAgySqliteQuery(dbPath, {
+    sql,
+    params,
+    single: false,
+    fallbackValue: [],
+  })
   return Array.isArray(rows) ? rows : []
 }
 
@@ -743,6 +697,8 @@ export class AntigravityAdapter {
     this.activeTurns = new Map() // conversationId -> { client, aborted }
     this.warmSessions = new Map() // conversationId -> warm entry keeping background tasks alive
     this.startingWarmSessions = new Map() // conversationId -> Promise<entry> deduplicating concurrent acquireWarmSession
+    this.startingClients = new Set() // in-flight AgyAcpClient instances before warmSessions registration
+    this.disposed = false
     this.pendingCreated = new Map() // conversationId -> summary (before first turn hits conversation_summaries.db)
     this.sessionPrefs = new Map() // conversationId -> { model, reasoningEffort }
     this.bridgeWrittenSessions = new Map() // conversationId -> { writtenAt, stepCount }
@@ -808,16 +764,20 @@ export class AntigravityAdapter {
   }
 
   async listModelsViaAcpFallback() {
+    if (this.disposed) return []
     const client = new AgyAcpClient({
       agyBin: this.agyBin,
       cwd: this.defaultCwd,
       autoApprove: this.autoApprove,
       log: this.log,
     })
+    this.startingClients.add(client)
     let sessionId = ''
     try {
       await client.start()
+      if (this.disposed) return []
       const res = await client.rpc('session/new', { cwd: this.defaultCwd, mcpServers: [] }, 15_000)
+      if (this.disposed) return []
       sessionId = res?.sessionId || ''
       const raw = res?.models?.availableModels || res?.availableModels || []
       return raw
@@ -827,9 +787,12 @@ export class AntigravityAdapter {
         }))
         .filter((x) => x.id)
     } catch (err) {
-      this.log.warn?.(`mobile-hub: agy ACP model fallback failed: ${String(err?.message || err)}`)
+      if (!this.disposed) {
+        this.log.warn?.(`mobile-hub: agy ACP model fallback failed: ${String(err?.message || err)}`)
+      }
       return []
     } finally {
+      this.startingClients.delete(client)
       await client.close(sessionId).catch(() => {})
     }
   }
@@ -1024,7 +987,6 @@ export class AntigravityAdapter {
         status: selfActive || externalRunning ? 'running' : 'idle',
         syncState: { externalRunning },
         writable: cliReady,
-        readOnlyDesktop: false,
         createdAt: toEpochMs(r.last_modified_time),
         updatedAt: toEpochMs(r.last_modified_time),
       })
@@ -1121,7 +1083,6 @@ export class AntigravityAdapter {
       model: pref?.model || '',
       reasoningEffort: pref?.reasoningEffort || '',
       writable: cliReady,
-      readOnlyDesktop: false,
       status,
       syncState: {
         externalRunning,
@@ -1180,7 +1141,7 @@ export class AntigravityAdapter {
   }
 
   ensureWatcherRunning() {
-    if (this.watchTimer || this.watchedSessions.size === 0) return
+    if (this.disposed || this.watchTimer || this.watchedSessions.size === 0) return
     this.watchTimer = setInterval(() => {
       void this.pollWatchedSessions().catch(() => {})
     }, this.watchPollIntervalMs)
@@ -1262,7 +1223,6 @@ export class AntigravityAdapter {
             status: externalRunning ? 'running' : 'idle',
             syncState: { externalRunning },
             writable: w.cliReady,
-            readOnlyDesktop: false,
             updatedAt: curFp.mtimeMs || now,
           },
         })
@@ -1278,7 +1238,9 @@ export class AntigravityAdapter {
   }
 
   async createSession({ cwd, title, model, reasoningEffort } = {}) {
+    if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
     const cliVer = await this.checkCliVersion()
+    if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
     if (!cliVer) {
       throw new Error(
         process.platform === 'win32'
@@ -1296,31 +1258,36 @@ export class AntigravityAdapter {
       autoApprove: this.autoApprove,
       log: this.log,
     })
+    this.startingClients.add(client)
 
     let sessionId = ''
     const entry = this.registerWarmSession('', targetCwd, client, { starting: true, addToMap: false })
     try {
       await client.start()
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       const res = await client.rpc('session/new', { cwd: targetCwd, mcpServers: [] }, 25_000)
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       sessionId = res?.sessionId || ''
       if (!sessionId) throw new Error('Antigravity ACP 未返回有效 sessionId')
 
-      // Key warm entry under the authoritative sessionId while still marked starting during model setup
       entry.sessionId = sessionId
       entry.lastActivityAt = Date.now()
-      this.warmSessions.set(sessionId, entry)
 
       if (model || reasoningEffort) {
         this.sessionPrefs.set(sessionId, { model: model || '', reasoningEffort: reasoningEffort || '' })
         const resolvedModel = await this.resolveAcpModelId(model, reasoningEffort)
+        if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
         if (resolvedModel) {
           await client.rpc('session/set_model', { sessionId, modelId: resolvedModel }, 10_000).catch((err) => {
             this.log.warn?.(`mobile-hub: agy session/set_model(${resolvedModel}) failed: ${String(err?.message || err)}`)
           })
+          if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
         }
       }
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       entry.starting = false
       entry.lastActivityAt = Date.now()
+      this.warmSessions.set(sessionId, entry)
       this.ensureReaperRunning()
     } catch (err) {
       entry.starting = false
@@ -1329,6 +1296,8 @@ export class AntigravityAdapter {
       }
       await client.close(sessionId).catch(() => {})
       throw err
+    } finally {
+      this.startingClients.delete(client)
     }
 
     const now = Date.now()
@@ -1344,7 +1313,6 @@ export class AntigravityAdapter {
       reasoningEffort: reasoningEffort || '',
       status: 'idle',
       writable: true,
-      readOnlyDesktop: false,
       createdAt: now,
       updatedAt: now,
     }
@@ -1392,7 +1360,7 @@ export class AntigravityAdapter {
   }
 
   ensureReaperRunning() {
-    if (this.reaperTimer) return
+    if (this.disposed || this.reaperTimer) return
     this.reaperTimer = setInterval(() => {
       void this.reapIdleSessions().catch(() => {})
     }, 30_000)
@@ -1678,10 +1646,12 @@ export class AntigravityAdapter {
   }
 
   async _acquireWarmSessionInternal(sessionId, targetCwd) {
+    if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
     const dbPath = join(this.agyHome, 'conversation_summaries.db')
     const existing = this.warmSessions.get(sessionId)
     if (existing && !existing.starting && existing.client.isAlive()) {
       const dbState = await queryAgyConversationState(dbPath, sessionId)
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       const curFp = getTranscriptFingerprint(this.agyHome, sessionId)
       const busyInDb = Boolean(dbState?.notFullyIdle || dbState?.status === 'CASCADE_RUN_STATUS_RUNNING')
       const curStepCount = Number(dbState?.stepCount || 0)
@@ -1701,6 +1671,7 @@ export class AntigravityAdapter {
         return existing
       }
       await this.closeWarmSession(sessionId, existing)
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
     } else if (existing && !existing.starting) {
       this.warmSessions.delete(sessionId)
     }
@@ -1711,14 +1682,18 @@ export class AntigravityAdapter {
       autoApprove: this.autoApprove,
       log: this.log,
     })
+    this.startingClients.add(client)
     const entry = this.registerWarmSession(sessionId, targetCwd, client, { starting: true, addToMap: false })
     try {
       await client.start()
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       await client.rpc('session/resume', { sessionId, cwd: targetCwd, mcpServers: [] }, 30_000)
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       const [fp, dbState] = await Promise.all([
         Promise.resolve(getTranscriptFingerprint(this.agyHome, sessionId)),
         queryAgyConversationState(dbPath, sessionId),
       ])
+      if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       entry.lastTranscriptMtimeMs = fp.mtimeMs
       entry.lastTranscriptSize = fp.size
       entry.lastStepCount = Number(dbState?.stepCount || 0)
@@ -1734,6 +1709,8 @@ export class AntigravityAdapter {
       }
       await client.close(sessionId).catch(() => {})
       throw err
+    } finally {
+      this.startingClients.delete(client)
     }
   }
 
@@ -1943,15 +1920,21 @@ export class AntigravityAdapter {
           this.updateWatchSnapshot(sessionId, { fp, dbState })
         }
         await snapNow()
-        // Re-snapshot shortly after turn end to capture trailing SQLite/transcript flush
-        const settleSnap = setTimeout(() => { void snapNow().catch(() => {}) }, 450)
-        settleSnap.unref?.()
-
-        if (failedHard) {
+        if (this.disposed) {
           await this.closeWarmSession(sessionId, entry)
         } else {
-          // Keep warm ACP worker alive so background tasks / subagents / timers NEVER get canceled on turn end!
-          this.ensureReaperRunning()
+          // Re-snapshot shortly after turn end to capture trailing SQLite/transcript flush
+          const settleSnap = setTimeout(() => {
+            if (!this.disposed) void snapNow().catch(() => {})
+          }, 450)
+          settleSnap.unref?.()
+
+          if (failedHard) {
+            await this.closeWarmSession(sessionId, entry)
+          } else {
+            // Keep warm ACP worker alive so background tasks / subagents / timers NEVER get canceled on turn end!
+            this.ensureReaperRunning()
+          }
         }
       }
     }
@@ -2151,6 +2134,7 @@ export class AntigravityAdapter {
   }
 
   async dispose() {
+    this.disposed = true
     if (this.reaperTimer) {
       clearInterval(this.reaperTimer)
       this.reaperTimer = null
@@ -2160,6 +2144,11 @@ export class AntigravityAdapter {
       this.watchTimer = null
     }
     this.watchedSessions.clear()
+    this.startingWarmSessions.clear()
+    for (const client of this.startingClients) {
+      client?.killImmediate()
+    }
+    this.startingClients.clear()
     for (const active of this.activeTurns.values()) {
       active.client?.killImmediate()
     }

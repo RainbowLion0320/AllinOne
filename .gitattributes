@@ -1,0 +1,18 @@
+* text=auto
+
+# Shell scripts must use LF so macOS/Linux bash never encounters stray CR (\r)
+*.sh text eol=lf
+
+# Windows PowerShell & batch scripts use CRLF
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.apk binary
+*.exe binary
+*.dmg binary
+*.woff2 binary

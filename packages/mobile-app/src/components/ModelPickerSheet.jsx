@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { Check, Loader2, Search, Sparkles, X } from 'lucide-react'
 import { VendorBadge, formatEffortLabel } from './VendorIcon.jsx'
@@ -10,7 +10,6 @@ export function ModelPickerSheet({
   catalog,
   loading = false,
   value = {},
-  mode = 'midchat', // 'midchat' | 'newchat'
   onClose,
   onApply,
 }) {
@@ -24,9 +23,19 @@ export function ModelPickerSheet({
   const [pickedModel, setPickedModel] = useState('')
   const [pickedProvider, setPickedProvider] = useState('')
   const [pickedEffort, setPickedEffort] = useState('')
+  const userPickedRef = useRef(false)
+  const initializedKeyRef = useRef('')
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      userPickedRef.current = false
+      initializedKeyRef.current = ''
+      return
+    }
+    const initKey = `${app}|${value?.model || ''}|${value?.provider || ''}|${value?.reasoningEffort || ''}`
+    const isFreshInit = initializedKeyRef.current !== initKey
+    if (!isFreshInit && userPickedRef.current) return
+
     const initModel = value?.model || catalog?.defaultModel || models[0]?.id || ''
     const matched = models.find(
       (m) => m.id === initModel && (!value?.provider || !m.provider || m.provider === value.provider),
@@ -43,9 +52,25 @@ export function ModelPickerSheet({
     } else {
       setPickedEffort(matched?.defaultEffort || allowed[0] || '')
     }
-    setSelectedProvider('all')
-    setSearch('')
+    if (isFreshInit) {
+      initializedKeyRef.current = initKey
+      userPickedRef.current = false
+      setSelectedProvider('all')
+      setSearch('')
+    }
   }, [open, app, catalog, value?.model, value?.provider, value?.reasoningEffort])
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopImmediatePropagation()
+        onClose?.()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [open, onClose])
 
   const activeModelObj = useMemo(() => {
     return (
@@ -71,6 +96,7 @@ export function ModelPickerSheet({
   if (!open) return null
 
   const handleSelectModel = (m) => {
+    userPickedRef.current = true
     setPickedModel(m.id)
     setPickedProvider(m.provider || '')
     const allowed = m.efforts || []
@@ -220,7 +246,7 @@ export function ModelPickerSheet({
                       {hasSubMeta && (
                         <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
                           {m.providerName && (
-                            <span className="rounded bg-slate-100 px-1.5 py-0.2 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
                               {m.providerName}
                             </span>
                           )}
@@ -263,7 +289,10 @@ export function ModelPickerSheet({
                     <button
                       key={eff}
                       type="button"
-                      onClick={() => setPickedEffort(eff)}
+                      onClick={() => {
+                        userPickedRef.current = true
+                        setPickedEffort(eff)
+                      }}
                       className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition active:scale-95 ${
                         active
                           ? 'bg-[#4D6BFE] text-white shadow-xs shadow-[#4D6BFE]/30'

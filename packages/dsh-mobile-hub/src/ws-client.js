@@ -177,6 +177,41 @@ export class RelayBridgeLink {
     }
 
     this.ws = ws
+    let authRejected = false
+
+    ws.on('unexpected-response', (_req, res) => {
+      if (this.ws !== ws) {
+        try { res?.resume?.() } catch {}
+        try { ws.terminate() } catch {}
+        return
+      }
+      const statusCode = Number(res?.statusCode || 0)
+      try { res?.resume?.() } catch {}
+      if (statusCode === 401) {
+        authRejected = true
+        this.clearHeartbeat()
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer)
+          this.reconnectTimer = null
+        }
+        this.ws = null
+        try { ws.terminate() } catch {}
+        if (this.stopped) return
+        const detail = 'HTTP 401 Unauthorized'
+        this.log.warn?.(`mobile-hub: relay rejected bridge (${detail})`)
+        this.emitState('unauthorized', detail)
+        return
+      }
+      const detail = `Unexpected server response: ${statusCode || 'unknown'}`
+      this.clearHeartbeat()
+      this.ws = null
+      try { ws.terminate() } catch {}
+      if (this.stopped) return
+      this.log.warn?.(`mobile-hub: relay ${detail}`)
+      this.emitState('error', detail)
+      this.emitState('disconnected', detail)
+      this.scheduleReconnect()
+    })
 
     ws.on('open', async () => {
       if (this.ws !== ws || this.stopped) {
@@ -222,7 +257,7 @@ export class RelayBridgeLink {
     })
 
     ws.on('close', (code, reasonBuf) => {
-      if (this.ws !== ws) return
+      if (this.ws !== ws || authRejected) return
       const reason = reasonBuf ? reasonBuf.toString('utf8') : ''
       this.clearHeartbeat()
       this.ws = null
@@ -240,7 +275,7 @@ export class RelayBridgeLink {
     })
 
     ws.on('error', (err) => {
-      if (this.ws !== ws) return
+      if (this.ws !== ws || authRejected) return
       this.log.warn?.(`mobile-hub: relay socket error: ${String(err?.message || err)}`)
       this.emitState('error', String(err?.message || err))
     })

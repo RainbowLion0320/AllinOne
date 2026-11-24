@@ -2,23 +2,12 @@ import React from 'react'
 import { APP_META } from '@allinone/shared'
 import { bi, getCurrentLang, translate } from '../lib/i18n.js'
 
-export const EFFORT_LABELS = {
-  off: '关闭',
-  none: '关闭',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '极高',
-  max: '最大',
-  ultra: 'Ultra',
-}
-
 export function formatEffortLabel(effort, lang = getCurrentLang()) {
   if (!effort) return ''
   const key = String(effort).toLowerCase()
   const dictKey = `effort.${key}`
   const val = translate(lang, dictKey)
-  return val === dictKey ? (EFFORT_LABELS[key] || effort) : val
+  return val === dictKey ? effort : val
 }
 
 export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {

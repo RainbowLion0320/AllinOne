@@ -1,6 +1,6 @@
 import { RPC } from '@allinone/shared'
 import { base64ToBytes, decryptBytes } from '@allinone/shared/e2ee'
-import { resolveImageSrc } from './imageUrls.js'
+import { isRelayUploadTarget, resolveImageSrc } from './imageUrls.js'
 import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
@@ -11,14 +11,6 @@ const blobUrlCache = new Map()
 /** @type {Map<string, Promise<string>>} */
 const inflightLoads = new Map()
 let cacheEpoch = 0
-
-function isRelayUploadTarget(target) {
-  if (!target) return false
-  if (target.startsWith('/api/uploads/')) return true
-  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(target)) return true
-  if (/^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(target)) return true
-  return false
-}
 
 function cacheBlobUrl(cacheKey, url) {
   const existing = blobUrlCache.get(cacheKey)

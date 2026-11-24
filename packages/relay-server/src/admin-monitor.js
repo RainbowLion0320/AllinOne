@@ -1,8 +1,7 @@
 import os from 'node:os'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-
-const KNOWN_APPS = ['dsh', 'codex', 'claude', 'antigravity']
+import { APP_LIST } from '@allinone/shared'
 
 function normalizeApps(rawApps) {
   if (!Array.isArray(rawApps)) return []
@@ -39,7 +38,7 @@ export function collectServerHealth({
   mailer = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '0.3.9',
+  version = '0.5.1',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -146,7 +145,7 @@ export function buildAdminOverview({
 
   // Distributions across online connections
   const appStats = {}
-  for (const appId of KNOWN_APPS) {
+  for (const appId of APP_LIST) {
     appStats[appId] = { available: 0, writable: 0 }
   }
   const bridgePlatforms = { win32: 0, darwin: 0, linux: 0, other: 0 }

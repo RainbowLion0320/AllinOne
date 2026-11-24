@@ -37,7 +37,7 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
   'github-releases.githubusercontent.com',
 ])
 
-export function parseSemver(raw) {
+function parseSemver(raw) {
   const clean = String(raw || '').trim().replace(/^v/i, '')
   const m = clean.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/)
   if (!m) return null
@@ -278,7 +278,9 @@ export class DesktopUpdater extends EventEmitter {
   }
 
   async checkForUpdates({ silent = false } = {}) {
-    if (this.state.status === 'checking' || this.state.status === 'downloading' || this.state.status === 'installing') {
+    const isBusy = () =>
+      this.state.status === 'downloading' || this.state.status === 'installing' || this._installing
+    if (this.state.status === 'checking' || isBusy()) {
       return this.getState()
     }
 
@@ -302,10 +304,13 @@ export class DesktopUpdater extends EventEmitter {
         clearTimeout(timer)
       }
 
+      if (isBusy()) return this.getState()
+
       if (!res.ok) {
         throw new Error(this.bi(`GitHub API 返回 HTTP ${res.status}`, `GitHub API returned HTTP ${res.status}`))
       }
       const release = await res.json()
+      if (isBusy()) return this.getState()
       const latestVersion = String(release.tag_name || '').trim().replace(/^v/i, '')
       if (!parseSemver(latestVersion)) {
         throw new Error(this.bi(`无法解析远端版本号: ${release.tag_name || '(空)'}`, `Invalid remote version tag: ${release.tag_name || '(empty)'}`))
@@ -357,6 +362,7 @@ export class DesktopUpdater extends EventEmitter {
           const st = statSync(cachedPath)
           const sizeOk = !asset.size || st.size === asset.size
           const hashOk = !expectedSha256 || (await sha256File(cachedPath)) === expectedSha256
+          if (isBusy()) return this.getState()
           if (sizeOk && hashOk) {
             return this.setState({
               status: 'downloaded',
@@ -379,6 +385,8 @@ export class DesktopUpdater extends EventEmitter {
         } catch {}
       }
 
+      if (isBusy()) return this.getState()
+
       return this.setState({
         status: 'available',
         latestVersion,
@@ -397,7 +405,7 @@ export class DesktopUpdater extends EventEmitter {
         error: '',
       })
     } catch (err) {
-      if (silent) {
+      if (silent || isBusy()) {
         return this.getState()
       }
       const msg = err?.name === 'AbortError'
@@ -872,7 +880,7 @@ export class DesktopUpdater extends EventEmitter {
             'mv "$TARGET_APP" "$BACKUP"',
             'if ditto "$SRC_APP" "$TARGET_APP"; then',
             '  xattr -cr "$TARGET_APP" 2>/dev/null || true',
-            '  rm -rf "$BACKUP"',
+            '  rm -rf "$BACKUP" 2>/dev/null || true',
             '  open "$TARGET_APP"',
             'else',
             '  rm -rf "$TARGET_APP" 2>/dev/null || true',

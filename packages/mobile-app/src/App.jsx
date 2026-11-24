@@ -1,10 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { APP_META, EVENTS, RPC } from '@allinone/shared'
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { EVENTS, RPC } from '@allinone/shared'
 import {
   ArrowLeftRight,
   ChevronDown,
   KeyRound,
-  Loader2,
   Lock,
   Menu,
   ScanLine,
@@ -37,7 +36,6 @@ import {
   getDeviceDisplayName,
   loadDeviceState,
   removeDevice,
-  renameDevice,
   saveDeviceState,
   selectDevice,
   updateDeviceMeta,
@@ -63,18 +61,37 @@ import { LoginScreen } from './components/LoginScreen.jsx'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
 import { Composer } from './components/Composer.jsx'
-import { NewChatModal } from './components/NewChatModal.jsx'
-import { ModelPickerSheet } from './components/ModelPickerSheet.jsx'
-import { ImageLightbox } from './components/ImageLightbox.jsx'
-import { ShareModal } from './components/ShareModal.jsx'
-import { DeviceSwitcherModal } from './components/DeviceSwitcherModal.jsx'
-import { InviteManagerModal } from './components/InviteManagerModal.jsx'
-import { SettingsModal } from './components/SettingsModal.jsx'
-import { E2eeSyncModal } from './components/E2eeSyncModal.jsx'
-import { E2eeGrantApproveModal } from './components/E2eeGrantApproveModal.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 import { useI18n } from './lib/i18n.jsx'
 import { bi as biLang, getCurrentLang } from './lib/i18n.js'
+
+const NewChatModal = React.lazy(() =>
+  import('./components/NewChatModal.jsx').then((m) => ({ default: m.NewChatModal })),
+)
+const ModelPickerSheet = React.lazy(() =>
+  import('./components/ModelPickerSheet.jsx').then((m) => ({ default: m.ModelPickerSheet })),
+)
+const ImageLightbox = React.lazy(() =>
+  import('./components/ImageLightbox.jsx').then((m) => ({ default: m.ImageLightbox })),
+)
+const ShareModal = React.lazy(() =>
+  import('./components/ShareModal.jsx').then((m) => ({ default: m.ShareModal })),
+)
+const DeviceSwitcherModal = React.lazy(() =>
+  import('./components/DeviceSwitcherModal.jsx').then((m) => ({ default: m.DeviceSwitcherModal })),
+)
+const InviteManagerModal = React.lazy(() =>
+  import('./components/InviteManagerModal.jsx').then((m) => ({ default: m.InviteManagerModal })),
+)
+const SettingsModal = React.lazy(() =>
+  import('./components/SettingsModal.jsx').then((m) => ({ default: m.SettingsModal })),
+)
+const E2eeSyncModal = React.lazy(() =>
+  import('./components/E2eeSyncModal.jsx').then((m) => ({ default: m.E2eeSyncModal })),
+)
+const E2eeGrantApproveModal = React.lazy(() =>
+  import('./components/E2eeGrantApproveModal.jsx').then((m) => ({ default: m.E2eeGrantApproveModal })),
+)
 
 export function App() {
   const { lang, bi, t } = useI18n()
@@ -142,7 +159,6 @@ export function App() {
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
-  const isAccountMode = Boolean(activeDevice && String(activeDevice.roomId || '').startsWith('usr_'))
   const isAdmin = Boolean(activeDevice && activeDevice.role === 'admin')
 
   const onlineBridges = useMemo(() => bridges.filter((b) => b.online), [bridges])
@@ -156,8 +172,7 @@ export function App() {
       if (matched) {
         chosen = matched
       } else {
-        const knownOfflineDevice =
-          isAccountMode && accountDevices.some((d) => d.bridgeId === preferredId)
+        const knownOfflineDevice = accountDevices.some((d) => d.bridgeId === preferredId)
         if (knownOfflineDevice || activeSession || sessions.length > 0) {
           // Never silently reroute away from an explicitly selected offline computer or mid-conversation
           return null
@@ -165,24 +180,24 @@ export function App() {
       }
     }
     if (!chosen) chosen = onlineBridges[0] || null
-    if (chosen && isAccountMode) {
+    if (chosen) {
       const boundMeta = accountDevices.find((d) => d.bridgeId === chosen.bridgeId)
       if (boundMeta?.label) {
         return { ...chosen, label: boundMeta.label }
       }
     }
     return chosen
-  }, [activeDevice, onlineBridges, activeSession, sessions.length, isAccountMode, accountDevices])
+  }, [activeDevice, onlineBridges, activeSession, sessions.length, accountDevices])
 
   const bridgeOnline = Boolean(activeBridge)
   const activeBridgeId = activeBridge?.bridgeId || ''
   const activeDeviceName = useMemo(() => {
-    if (isAccountMode && !activeBridge && activeDevice?.selectedBridgeId) {
+    if (!activeBridge && activeDevice?.selectedBridgeId) {
       const bound = accountDevices.find((d) => d.bridgeId === activeDevice.selectedBridgeId)
       if (bound) return bound.label || bound.hostname || bound.bridgeId
     }
     return getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length, lang)
-  }, [activeDevice, activeBridge, onlineBridges.length, isAccountMode, accountDevices, lang])
+  }, [activeDevice, activeBridge, onlineBridges.length, accountDevices, lang])
   const cacheScope = useMemo(
     () => getCacheScopeKey(activeDevice, activeBridgeId),
     [activeDevice, activeBridgeId],
@@ -191,6 +206,12 @@ export function App() {
   const skipFirstSaveRef = useRef(true)
   const deviceStateRef = useRef(deviceState)
   deviceStateRef.current = deviceState
+  const activeDeviceRef = useRef(activeDevice)
+  activeDeviceRef.current = activeDevice
+  const activeDeviceTokenRef = useRef(activeDevice?.token || '')
+  activeDeviceTokenRef.current = activeDevice?.token || ''
+  const connStateRef = useRef(connState)
+  connStateRef.current = connState
   const clientRef = useRef(null)
   const activeSessionRef = useRef(null)
   activeSessionRef.current = activeSession
@@ -354,11 +375,7 @@ export function App() {
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
   useEffect(() => {
     if (!desktopApi) return
-    if (
-      activeDevice?.token &&
-      activeDevice?.baseUrl &&
-      (activeDevice.authMode === 'account' || String(activeDevice.roomId || '').startsWith('usr_'))
-    ) {
+    if (activeDevice?.token && activeDevice?.baseUrl) {
       hadDesktopAccountRef.current = true
       desktopApi
         .syncAccount?.({
@@ -382,7 +399,7 @@ export function App() {
       hadDesktopAccountRef.current = false
       desktopApi.stopBridge?.().catch(() => {})
     }
-  }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, activeDevice?.roomId, activeDevice?.username, activeDevice?.authMode])
+  }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, activeDevice?.roomId, activeDevice?.username])
 
   // Keep Desktop UI's local E2EE key ring synced with the embedded bridge key (zero friction on the host PC!)
   useEffect(() => {
@@ -424,8 +441,9 @@ export function App() {
       }
       if (e.key === 'Escape') {
         if (lightboxState) setLightboxState(null)
-        else if (e2eeModal.open) setE2eeModal((prev) => ({ ...prev, open: false }))
+        else if (pendingGrantPopup) setPendingGrantPopup(null)
         else if (modelPickerOpen) setModelPickerOpen(false)
+        else if (e2eeModal.open) setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))
         else if (newChatOpen) setNewChatOpen(false)
         else if (settingsOpen) setSettingsOpen(false)
         else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
@@ -436,7 +454,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -450,6 +468,10 @@ export function App() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode)
     localStorage.setItem('allinone_dark', darkMode ? '1' : '0')
+    const themeMeta = document.querySelector('meta[name="theme-color"]')
+    if (themeMeta) {
+      themeMeta.setAttribute('content', darkMode ? '#03080E' : '#FFFFFF')
+    }
   }, [darkMode])
 
   const resetTransientWorkspace = useCallback(() => {
@@ -503,21 +525,13 @@ export function App() {
     setDeviceSwitcherOpen(false)
     if (preview.device) {
       const curLang = getCurrentLang()
-      if (payload.authMode === 'account') {
-        const onlineN = (payload.devices || payload.bridges || []).filter((x) => x.online).length
-        showToast(
-          onlineN > 0
-            ? biLang(curLang, `已登录 @${payload.username} · 发现 ${onlineN} 台在线电脑`, `Signed in as @${payload.username} · ${onlineN} PC${onlineN === 1 ? '' : 's'} online`)
-            : biLang(curLang, `已登录 @${payload.username}`, `Signed in as @${payload.username}`),
-        )
-      } else {
-        const name = getDeviceDisplayName(preview.device, null, 0, curLang)
-        showToast(
-          preview.isNew
-            ? biLang(curLang, `已添加并切换到 ${name}`, `Added and switched to ${name}`)
-            : biLang(curLang, `已更新并切换到 ${name}`, `Updated and switched to ${name}`),
-        )
-      }
+      const onlineN = (payload.devices || payload.bridges || []).filter((x) => x.online).length
+      const userLabel = payload.username || preview.device.username || preview.device.roomId
+      showToast(
+        onlineN > 0
+          ? biLang(curLang, `已登录 @${userLabel} · 发现 ${onlineN} 台在线电脑`, `Signed in as @${userLabel} · ${onlineN} PC${onlineN === 1 ? '' : 's'} online`)
+          : biLang(curLang, `已登录 @${userLabel}`, `Signed in as @${userLabel}`),
+      )
     }
   }, [resetTransientWorkspace, showToast])
 
@@ -646,11 +660,16 @@ export function App() {
   const activeBridgeE2ee = useMemo(() => {
     const raw = activeBridge?.e2ee || null
     const enabled = Boolean(raw?.enabled && raw?.keyId)
-    const keyId = enabled ? String(raw.keyId) : ''
-    const keysMap = activeDevice?.e2eeKeys || {}
+    const keyId = enabled ? String(raw.keyId).trim().toLowerCase() : ''
+    const keysMap = {}
+    for (const [k, v] of Object.entries(activeDevice?.e2eeKeys || {})) {
+      const ck = String(k || '').trim().toLowerCase()
+      if (ck && v) keysMap[ck] = v
+    }
     const matchedKey = keyId ? String(keysMap[keyId] || '') : ''
     const locked = Boolean(enabled && !matchedKey)
-    const desktopKeyId = desktopBridge?.e2eeKeyId && keysMap[desktopBridge.e2eeKeyId] ? desktopBridge.e2eeKeyId : ''
+    const rawDesktopKid = String(desktopBridge?.e2eeKeyId || '').trim().toLowerCase()
+    const desktopKeyId = rawDesktopKid && keysMap[rawDesktopKid] ? rawDesktopKid : ''
     const fallbackKeyId = desktopKeyId || Object.keys(keysMap)[0] || ''
     const shareableKeyId = matchedKey ? keyId : fallbackKeyId
     const shareableKey = shareableKeyId ? String(keysMap[shareableKeyId] || '') : ''
@@ -684,7 +703,6 @@ export function App() {
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       client: clientRef.current,
-      e2eeActive: activeBridgeE2ee.active,
       e2eeKey: activeBridgeE2ee.matchedKey,
       e2eeKeyId: activeBridgeE2ee.keyId,
       e2eeKeys: activeDevice?.e2eeKeys || {},
@@ -699,7 +717,6 @@ export function App() {
     mediaAuth.mediaToken,
     activeSession?.cwd,
     activeBridgeId,
-    activeBridgeE2ee.active,
     activeBridgeE2ee.matchedKey,
     activeBridgeE2ee.keyId,
   ])
@@ -872,7 +889,8 @@ export function App() {
   // (e.g. after background auto-completion finishes installing a missing CLI like `agy` / `claude` / `codex`).
   const activeBridgeMetaApps = useMemo(() => {
     const matched = bridges.find((b) => b.bridgeId === activeBridgeId && b.online !== false)
-    return Array.isArray(matched?.meta?.apps) ? matched.meta.apps : null
+    const apps = matched?.apps ?? matched?.meta?.apps
+    return Array.isArray(apps) ? apps : null
   }, [bridges, activeBridgeId])
 
   const activeBridgeAppsSig = useMemo(() => {
@@ -1037,8 +1055,14 @@ export function App() {
       }
     } catch (err) {
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
-      if (!cached || !cached.messages?.length) {
-        const errEntry = { active: false, error: String(err?.message || err) }
+      if ((!cached || !cached.messages?.length) && !liveStreamMapRef.current[id]?.active) {
+        const errEntry = {
+          active: false,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: String(err?.message || err),
+        }
         liveStreamMapRef.current[id] = errEntry
         setStreamingBySession((prev) => ({
           ...prev,
@@ -1180,7 +1204,9 @@ export function App() {
 
   // Connect WebSocket whenever the active saved account changes
   useEffect(() => {
-    if (!activeDevice?.token || !activeDevice?.baseUrl) {
+    const devSnap = activeDeviceRef.current
+    const initialToken = activeDeviceTokenRef.current
+    if (!activeDevice?.id || !activeDevice?.baseUrl || !initialToken) {
       setConnState('disconnected')
       setConnError('')
       setBridges([])
@@ -1196,8 +1222,6 @@ export function App() {
       return
     }
 
-    let cancelled = false
-    const probedDeviceId = activeDevice.id
     setConnError('')
     setBridges([])
     setAccountDevices([])
@@ -1210,28 +1234,12 @@ export function App() {
     })
     setLiveOnlineClientCount(0)
 
-    // Refresh persisted account profile (role/username/devices) cleanly on mount/switch
-    probeDeviceStatus(activeDevice, 5000)
-      .then((res) => {
-        if (cancelled) return
-        if (Array.isArray(res.devices)) setAccountDevices(res.devices)
-        if (res.username || res.role) {
-          setDeviceState((prev) =>
-            updateDeviceMeta(prev, probedDeviceId, {
-              ...(res.username ? { username: res.username } : {}),
-              ...(res.role ? { role: res.role } : {}),
-            }),
-          )
-        }
-      })
-      .catch(() => {})
-
     const client = new MobileRelayClient({
       baseUrl: activeDevice.baseUrl,
-      token: activeDevice.token,
-      roomId: activeDevice.roomId,
-      bridgeId: activeDevice.selectedBridgeId || '',
-      e2eeKeys: activeDevice.e2eeKeys || {},
+      token: initialToken,
+      roomId: devSnap?.roomId || '',
+      bridgeId: devSnap?.selectedBridgeId || '',
+      e2eeKeys: devSnap?.e2eeKeys || {},
     })
     setPendingGrantPopup(null)
     clientRef.current = client
@@ -1316,6 +1324,16 @@ export function App() {
       const sid = payload?.sessionId
       if (!sid) return
 
+      const normalizeStreamBase = (raw, now) => ({
+        active: true,
+        text: typeof raw?.text === 'string' ? raw.text : '',
+        thinking: typeof raw?.thinking === 'string' ? raw.thinking : '',
+        tools: Array.isArray(raw?.tools) ? raw.tools : [],
+        error: '',
+        startedAt: Number(raw?.startedAt) || now,
+        lastDeltaAt: now,
+      })
+
       if (event === EVENTS.STREAM_START) {
         const now = Date.now()
         const entry = {
@@ -1332,84 +1350,51 @@ export function App() {
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'running' } : s)))
       } else if (event === EVENTS.STREAM_DELTA) {
         const now = Date.now()
-        const cur = liveStreamMapRef.current[sid] || {
-          active: true,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: '',
-          startedAt: now,
-          lastDeltaAt: now,
-        }
+        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
         const nextEntry = {
           ...cur,
-          active: true,
           text: cur.text + (payload.delta || ''),
-          lastDeltaAt: now,
         }
         liveStreamMapRef.current[sid] = nextEntry
         setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_THINKING) {
         const now = Date.now()
-        const cur = liveStreamMapRef.current[sid] || {
-          active: true,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: '',
-          startedAt: now,
-          lastDeltaAt: now,
-        }
+        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
         const nextEntry = {
           ...cur,
-          active: true,
           thinking: cur.thinking + (payload.delta || ''),
-          lastDeltaAt: now,
         }
         liveStreamMapRef.current[sid] = nextEntry
         setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_TOOL_START && payload.tool) {
         const now = Date.now()
-        const cur = liveStreamMapRef.current[sid] || {
-          active: true,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: '',
-          startedAt: now,
-          lastDeltaAt: now,
-        }
+        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
         const exists = cur.tools.some((t) => t.id === payload.tool.id)
         const tools = exists
           ? cur.tools
           : [...cur.tools, { ...payload.tool, status: 'running', output: '' }]
-        const nextEntry = { ...cur, active: true, tools, lastDeltaAt: now }
+        const nextEntry = { ...cur, tools }
         liveStreamMapRef.current[sid] = nextEntry
         setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_TOOL_END && payload.toolId) {
         const now = Date.now()
-        const cur = liveStreamMapRef.current[sid] || {
-          active: true,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: '',
-          startedAt: now,
-          lastDeltaAt: now,
-        }
+        const prevRaw = liveStreamMapRef.current[sid]
+        const cur = normalizeStreamBase(prevRaw, now)
         const tools = cur.tools.map((t) =>
           t.id === payload.toolId
             ? { ...t, status: payload.status || 'completed', output: payload.output || '' }
             : t,
         )
-        const nextEntry = { ...cur, tools, lastDeltaAt: now }
+        const nextEntry = { ...cur, active: prevRaw?.active ?? true, tools }
         liveStreamMapRef.current[sid] = nextEntry
         setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
       } else if (event === EVENTS.STREAM_ERROR) {
-        const cur = liveStreamMapRef.current[sid] || { active: false, text: '', thinking: '', tools: [] }
+        const prevRaw = liveStreamMapRef.current[sid]
         const nextEntry = {
-          ...cur,
           active: false,
+          text: typeof prevRaw?.text === 'string' ? prevRaw.text : '',
+          thinking: typeof prevRaw?.thinking === 'string' ? prevRaw.thinking : '',
+          tools: Array.isArray(prevRaw?.tools) ? prevRaw.tools : [],
           error: payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error'),
         }
         liveStreamMapRef.current[sid] = nextEntry
@@ -1470,7 +1455,6 @@ export function App() {
     client.connect()
 
     return () => {
-      cancelled = true
       unsubStatus()
       unsubEvents()
       client.disconnect()
@@ -1478,7 +1462,18 @@ export function App() {
         clientRef.current = null
       }
     }
-  }, [activeDevice?.id, activeDevice?.token, activeDevice?.baseUrl, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+  }, [activeDevice?.id, activeDevice?.baseUrl, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+
+  // Hot-swap rotated JWT without tearing down an active WebSocket; only reconnect if unauthorized
+  useEffect(() => {
+    const token = activeDevice?.token
+    const client = clientRef.current
+    if (!token || !client) return
+    client.updateToken(token)
+    if (connStateRef.current === 'unauthorized') {
+      client.connect()
+    }
+  }, [activeDevice?.token])
 
   const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
     const cleanBridgeId = String(bridgeId || '').trim()
@@ -1511,10 +1506,6 @@ export function App() {
       showToast(biLang(getCurrentLang(), `已切换到 ${name}`, `Switched to ${name}`))
     }
   }, [activeDevice?.id, activeDevice?.selectedBridgeId, devices, accountDevices, onlineBridges, resetTransientWorkspace, showToast])
-
-  const handleRenameDevice = useCallback((deviceId, customName) => {
-    setDeviceState((prev) => renameDevice(prev, deviceId, customName))
-  }, [])
 
   const handleSyncDeviceMeta = useCallback((deviceId, patch) => {
     setDeviceState((prev) => updateDeviceMeta(prev, deviceId, patch))
@@ -1570,7 +1561,7 @@ export function App() {
     } catch {}
   }, [activeDevice?.baseUrl, activeDevice?.token])
 
-  // Auto-refresh detailed client session list whenever live client count changes while modal is open or on connect
+  // Auto-refresh detailed client session list whenever live client count changes while settings is open or on connect
   useEffect(() => {
     if (!activeDevice?.baseUrl || !activeDevice?.token || connState !== 'connected') return
     void handleRefreshClientSessions()
@@ -1579,7 +1570,6 @@ export function App() {
     activeDevice?.token,
     connState,
     liveOnlineClientCount,
-    deviceSwitcherOpen,
     settingsOpen,
     handleRefreshClientSessions,
   ])
@@ -1624,19 +1614,21 @@ export function App() {
   }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast])
 
   const handleRefreshAccountDevices = useCallback(async () => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token) return
+    const targetDeviceId = activeDevice?.id
+    const baseUrl = activeDevice?.baseUrl
+    const token = activeDevice?.token
+    const roomId = activeDevice?.roomId || ''
+    if (!targetDeviceId || !baseUrl || !token) return
     const gen = deviceGenRef.current
-    const targetDeviceId = activeDevice.id
-    void handleRefreshClientSessions()
-    if (!isAccountMode) return
     try {
       const [devRes, meRes] = await Promise.all([
-        listAccountDevices(activeDevice.baseUrl, activeDevice.token).catch(() => null),
-        probeDeviceStatus(activeDevice, 5000).catch(() => null),
+        listAccountDevices(baseUrl, token).catch(() => null),
+        probeDeviceStatus({ baseUrl, token, roomId }, 5000).catch(() => null),
       ])
       if (deviceGenRef.current !== gen) return
       if (devRes) setAccountDevices(devRes.devices)
       if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
+        if (!devRes && Array.isArray(meRes.devices)) setAccountDevices(meRes.devices)
         setServerEmailEnabled(Boolean(meRes.emailEnabled))
         setDeviceState((prev) =>
           updateDeviceMeta(prev, targetDeviceId, {
@@ -1648,20 +1640,26 @@ export function App() {
         )
       }
     } catch {}
-  }, [activeDevice, isAccountMode, handleRefreshClientSessions])
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId])
 
+  // Single unified account status probe on mount/switch/token refresh
   useEffect(() => {
-    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token || !isAccountMode) {
+    const devId = activeDevice?.id
+    const baseUrl = activeDevice?.baseUrl
+    const token = activeDevice?.token
+    const roomId = activeDevice?.roomId || ''
+    if (!devId || !baseUrl || !token) {
       setServerEmailEnabled(false)
       return
     }
     let cancelled = false
-    probeDeviceStatus(activeDevice, 5000)
+    probeDeviceStatus({ baseUrl, token, roomId }, 5000)
       .then((res) => {
         if (cancelled || !res || res.status === 'expired' || res.status === 'unreachable') return
+        if (Array.isArray(res.devices)) setAccountDevices(res.devices)
         setServerEmailEnabled(Boolean(res.emailEnabled))
         setDeviceState((prev) =>
-          updateDeviceMeta(prev, activeDevice.id, {
+          updateDeviceMeta(prev, devId, {
             ...(res.username ? { username: res.username } : {}),
             ...(res.role ? { role: res.role } : {}),
             email: res.email || '',
@@ -1673,7 +1671,7 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, isAccountMode])
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId])
 
   const handleSendBindEmailCode = useCallback(
     async (targetEmail) => {
@@ -1731,12 +1729,12 @@ export function App() {
     async (rawKey, keyId, { applyToDesktopBridge = false } = {}) => {
       if (!activeDevice?.id || !rawKey || !keyId) return
       let finalKey = rawKey
-      let finalKeyId = keyId
+      let finalKeyId = String(keyId).trim().toLowerCase()
       if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId) {
         const res = await desktopApi.setE2eeKey(activeDevice.roomId, rawKey)
         if (res?.key && res?.keyId) {
           finalKey = res.key
-          finalKeyId = res.keyId
+          finalKeyId = String(res.keyId).trim().toLowerCase()
         }
         const st = await desktopApi.getBridgeStatus?.().catch(() => null)
         if (st) setDesktopBridge(st)
@@ -1761,11 +1759,14 @@ export function App() {
   const handleImportE2eeKeyring = useCallback(
     async (entries = [], preferredKeyId = '', { applyToDesktopBridge = false, approverName = '' } = {}) => {
       if (!activeDevice?.id || !Array.isArray(entries) || entries.length === 0) return
-      const validEntries = entries.filter((e) => e?.keyId && e?.key)
+      const validEntries = entries
+        .filter((e) => e?.keyId && e?.key)
+        .map((e) => ({ keyId: String(e.keyId).trim().toLowerCase(), key: e.key }))
       if (validEntries.length === 0) return
 
+      const normPreferred = String(preferredKeyId || '').trim().toLowerCase()
       const preferred =
-        validEntries.find((e) => e.keyId === preferredKeyId) || validEntries[0]
+        validEntries.find((e) => e.keyId === normPreferred) || validEntries[0]
 
       const nextKeys = { ...(activeDevice.e2eeKeys || {}) }
       for (const item of validEntries) {
@@ -1777,9 +1778,10 @@ export function App() {
       if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId && preferred?.key) {
         const res = await desktopApi.setE2eeKey(activeDevice.roomId, preferred.key)
         if (res?.key && res?.keyId) {
-          delete nextKeys[res.keyId]
-          nextKeys[res.keyId] = res.key
-          desktopKeyEntry = { keyId: res.keyId, key: res.key }
+          const desktopKid = String(res.keyId).trim().toLowerCase()
+          delete nextKeys[desktopKid]
+          nextKeys[desktopKid] = res.key
+          desktopKeyEntry = { keyId: desktopKid, key: res.key }
         }
         const st = await desktopApi.getBridgeStatus?.().catch(() => null)
         if (st) setDesktopBridge(st)
@@ -1849,12 +1851,13 @@ export function App() {
     if (!desktopApi?.rotateE2eeKey || !activeDevice?.id || !activeDevice?.roomId) return
     const res = await desktopApi.rotateE2eeKey(activeDevice.roomId)
     if (res?.key && res?.keyId) {
+      const nextKid = String(res.keyId).trim().toLowerCase()
       const nextKeys = {
         ...(activeDevice.e2eeKeys || {}),
-        [res.keyId]: res.key,
+        [nextKid]: res.key,
       }
       clientRef.current?.setE2eeKeys(nextKeys)
-      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, res.keyId, res.key))
+      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, nextKid, res.key))
     }
     const st = await desktopApi.getBridgeStatus?.().catch(() => null)
     if (st) setDesktopBridge(st)
@@ -2002,7 +2005,7 @@ export function App() {
         })
         if (deviceGenRef.current !== gen || !target) return false
       } catch (err) {
-        alert(String(err?.message || err))
+        showToast(String(err?.message || err))
         return false
       }
     }
@@ -2111,19 +2114,19 @@ export function App() {
     } catch (err) {
       if (deviceGenRef.current !== gen) return true
       const streamUntouched = liveStreamMapRef.current[target.id] === initStream
-      const errEntry = {
-        active: false,
-        text: '',
-        thinking: '',
-        tools: [],
-        error: String(err?.message || err),
-      }
-      liveStreamMapRef.current[target.id] = errEntry
-      setStreamingBySession((prev) => ({
-        ...prev,
-        [target.id]: errEntry,
-      }))
       if (streamUntouched) {
+        const errEntry = {
+          active: false,
+          text: '',
+          thinking: '',
+          tools: [],
+          error: String(err?.message || err),
+        }
+        liveStreamMapRef.current[target.id] = errEntry
+        setStreamingBySession((prev) => ({
+          ...prev,
+          [target.id]: errEntry,
+        }))
         // Return preview URL ownership back to Composer and roll back unsent optimistic bubble
         for (const a of imgAtts) {
           if (a?.localPreviewUrl) sentPreviewUrlsRef.current.delete(a.localPreviewUrl)
@@ -2205,7 +2208,7 @@ export function App() {
       setApprovals((prev) => prev.filter((a) => a.id !== id))
     } catch (err) {
       if (deviceGenRef.current !== gen) return
-      alert(String(err?.message || err))
+      showToast(String(err?.message || err))
       // Background re-sync so stale/already-handled prompts are removed from UI
       client
         .rpc(RPC.APPROVAL_LIST, {}, 20_000, rpcOpts)
@@ -2296,9 +2299,6 @@ export function App() {
         connState={connState}
         bridgeOnline={bridgeOnline}
         activeDeviceName={activeDeviceName}
-        devicesCount={isAccountMode ? Math.max(accountDevices.length, onlineBridges.length) : devices.length}
-        onlineBridgesCount={onlineBridges.length}
-        roomId={activeDevice?.roomId}
         username={activeDevice?.username || ''}
         isAdmin={isAdmin}
         isMacDesktop={isMacDesktop}
@@ -2410,7 +2410,7 @@ export function App() {
             onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false, inviteCode: '' })}
             className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
           >
-            {isAccountMode ? bi('重新登录', 'Sign In Again') : bi('重新配对', 'Pair Again')}
+            {bi('重新登录', 'Sign In Again')}
           </button>
           {devices.length > 1 && (
             <button
@@ -2444,20 +2444,18 @@ export function App() {
         <div className="flex flex-wrap items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
           <span>
-            {isAccountMode && accountDevices.length === 0
+            {accountDevices.length === 0
               ? bi('尚未绑定电脑', 'No computer linked')
               : `${activeDeviceName} ${t('common.offline')}`}
           </span>
-          {(devices.length > 1 || onlineBridges.length > 0 || isAccountMode) && (
-            <button
-              type="button"
-              onClick={() => setDeviceSwitcherOpen(true)}
-              className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
-            >
-              <ArrowLeftRight className="h-3 w-3" />
-              <span>{isAccountMode && accountDevices.length === 0 ? bi('绑定', 'Link') : t('common.switch')}</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => setDeviceSwitcherOpen(true)}
+            className="inline-flex items-center gap-1 rounded-lg bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-500/25 dark:text-amber-100"
+          >
+            <ArrowLeftRight className="h-3 w-3" />
+            <span>{accountDevices.length === 0 ? bi('绑定', 'Link') : t('common.switch')}</span>
+          </button>
         </div>
       )}
 
@@ -2581,7 +2579,6 @@ export function App() {
         olderError={olderError}
         prependSeq={prependSeq}
         sessionOpenSeq={sessionOpenSeq}
-        totalHistoryCount={historyMeta.totalCount}
         onLoadOlder={loadOlderMessages}
         appsStatus={appsStatus}
         activeApp={activeApp}
@@ -2647,227 +2644,243 @@ export function App() {
         onUploadFile={(file) => clientRef.current?.uploadFile(file)}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
+        onError={showToast}
       />
       </>
       )}
       </div>
 
-      {/* Multi-Computer Switcher & Account Device Manager Modal */}
-      <DeviceSwitcherModal
-        open={deviceSwitcherOpen}
-        onClose={() => setDeviceSwitcherOpen(false)}
-        devices={devices}
-        activeDeviceId={activeDevice?.id}
-        activeBridgeId={activeBridgeId}
-        activeConnState={connState}
-        activeBridges={bridges}
-        accountDevices={accountDevices}
-        clientSessions={clientSessions}
-        onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
-        isAdmin={isAdmin}
-        emailEnabled={serverEmailEnabled}
-        desktopBridge={desktopBridge}
-        onToggleDesktopBridge={
-          desktopApi
-            ? () => {
-                desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
-              }
-            : null
-        }
-        onToggleDesktopAutoLaunch={
-          desktopApi
-            ? () => {
-                desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
-              }
-            : null
-        }
-        onSelectDevice={handleSelectDevice}
-        onAddDevice={(prefillServerUrl = '', opts = {}) => {
-          setPairError('')
-          setAddingDevice({
-            open: true,
-            serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
-            openScanner: Boolean(opts?.openScanner),
-            inviteCode: '',
-          })
-        }}
-        onRenameDevice={handleRenameDevice}
-        onRemoveDevice={handleRemoveDevice}
-        onSyncDeviceMeta={handleSyncDeviceMeta}
-        onRenameAccountDevice={handleRenameAccountDevice}
-        onRemoveAccountDevice={handleRemoveAccountDevice}
-        onRefreshAccountDevices={handleRefreshAccountDevices}
-        onRefreshClientSessions={handleRefreshClientSessions}
-        onRevokeClientSession={handleRevokeClientSession}
-        onRevokeOtherClientSessions={handleRevokeOtherClientSessions}
-        onSendBindEmailCode={handleSendBindEmailCode}
-        onBindAccountEmail={handleBindAccountEmail}
-        onOpenInviteManager={() => setInviteManagerOpen(true)}
-      />
-
-      {/* Admin Single-Use Invite Code Manager */}
-      <InviteManagerModal
-        open={inviteManagerOpen}
-        onClose={() => setInviteManagerOpen(false)}
-        baseUrl={activeDevice?.baseUrl}
-        token={activeDevice?.token}
-      />
-
-      {/* New Chat Bottom Sheet */}
-      <NewChatModal
-        open={newChatOpen}
-        scopeKey={cacheScope}
-        initialCwd={newChatCwd}
-        initialApp={newChatApp}
-        onClose={() => {
-          setNewChatOpen(false)
-          setNewChatCwd('')
-          setNewChatApp('')
-        }}
-        workspaces={effectiveWorkspaces}
-        appsStatus={appsStatus}
-        modelsCatalog={modelsCatalog}
-        onCreate={handleCreateSession}
-      />
-
-      {/* Mid-Chat Model & Reasoning Effort Picker */}
-      <ModelPickerSheet
-        open={modelPickerOpen}
-        app={activeApp}
-        catalog={activeCatalog}
-        loading={loadingModels}
-        value={activeModelPref}
-        mode="midchat"
-        onClose={() => setModelPickerOpen(false)}
-        onApply={(next) => {
-          if (activeSession?.id) {
-            setSessionModelPrefs((prev) => ({
-              ...prev,
-              [activeSession.id]: next,
-            }))
-            setActiveSession((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    model: next.model || prev.model,
-                    provider: next.provider || prev.provider,
-                    reasoningEffort: next.reasoningEffort ?? prev.reasoningEffort,
+      {/* Lazily loaded Modals & Sheets (only fetched/mounted when opened) */}
+      <Suspense fallback={null}>
+        {deviceSwitcherOpen && (
+          <DeviceSwitcherModal
+            open={deviceSwitcherOpen}
+            onClose={() => setDeviceSwitcherOpen(false)}
+            devices={devices}
+            activeDeviceId={activeDevice?.id}
+            activeBridgeId={activeBridgeId}
+            activeConnState={connState}
+            accountDevices={accountDevices}
+            clientSessions={clientSessions}
+            onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
+            isAdmin={isAdmin}
+            emailEnabled={serverEmailEnabled}
+            desktopBridge={desktopBridge}
+            onToggleDesktopBridge={
+              desktopApi
+                ? () => {
+                    desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
                   }
-                : prev,
-            )
-          } else {
-            setDraftDshPref(next)
-          }
-        }}
-      />
+                : null
+            }
+            onToggleDesktopAutoLaunch={
+              desktopApi
+                ? () => {
+                    desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+                  }
+                : null
+            }
+            onSelectDevice={handleSelectDevice}
+            onAddDevice={(prefillServerUrl = '', opts = {}) => {
+              setPairError('')
+              setAddingDevice({
+                open: true,
+                serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
+                openScanner: Boolean(opts?.openScanner),
+                inviteCode: '',
+              })
+            }}
+            onRemoveDevice={handleRemoveDevice}
+            onSyncDeviceMeta={handleSyncDeviceMeta}
+            onRenameAccountDevice={handleRenameAccountDevice}
+            onRemoveAccountDevice={handleRemoveAccountDevice}
+            onRefreshAccountDevices={handleRefreshAccountDevices}
+            onRefreshClientSessions={handleRefreshClientSessions}
+            onRevokeClientSession={handleRevokeClientSession}
+            onRevokeOtherClientSessions={handleRevokeOtherClientSessions}
+            onSendBindEmailCode={handleSendBindEmailCode}
+            onBindAccountEmail={handleBindAccountEmail}
+            onOpenInviteManager={() => setInviteManagerOpen(true)}
+          />
+        )}
 
-      {/* Share with Friends Modal */}
-      <ShareModal
-        open={shareOpen}
-        onClose={() => setShareOpen(false)}
-        serverUrl={activeDevice?.baseUrl}
-        token={activeDevice?.token}
-        isAdmin={isAdmin}
-        onOpenInviteManager={() => setInviteManagerOpen(true)}
-      />
-      {/* Settings Modal (account, theme, desktop bridge, cache, version & about) */}
-      <SettingsModal
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        activeDevice={activeDevice}
-        activeDeviceName={activeDeviceName}
-        isAccountMode={isAccountMode}
-        isAdmin={isAdmin}
-        emailEnabled={serverEmailEnabled}
-        connState={connState}
-        bridgeOnline={bridgeOnline}
-        onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
-        darkMode={darkMode}
-        onToggleDark={() => setDarkMode((v) => !v)}
-        cacheScope={cacheScope}
-        desktopApi={desktopApi}
-        desktopBridge={desktopBridge}
-        onToggleDesktopBridge={
-          desktopApi
-            ? () => {
-                desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+        {inviteManagerOpen && (
+          <InviteManagerModal
+            open={inviteManagerOpen}
+            onClose={() => setInviteManagerOpen(false)}
+            baseUrl={activeDevice?.baseUrl}
+            token={activeDevice?.token}
+          />
+        )}
+
+        {newChatOpen && (
+          <NewChatModal
+            open={newChatOpen}
+            scopeKey={cacheScope}
+            initialCwd={newChatCwd}
+            initialApp={newChatApp}
+            onClose={() => {
+              setNewChatOpen(false)
+              setNewChatCwd('')
+              setNewChatApp('')
+            }}
+            workspaces={effectiveWorkspaces}
+            appsStatus={appsStatus}
+            modelsCatalog={modelsCatalog}
+            onCreate={handleCreateSession}
+          />
+        )}
+
+        {modelPickerOpen && (
+          <ModelPickerSheet
+            open={modelPickerOpen}
+            app={activeApp}
+            catalog={activeCatalog}
+            loading={loadingModels}
+            value={activeModelPref}
+            onClose={() => setModelPickerOpen(false)}
+            onApply={(next) => {
+              if (activeSession?.id) {
+                setSessionModelPrefs((prev) => ({
+                  ...prev,
+                  [activeSession.id]: next,
+                }))
+                setActiveSession((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        model: next.model || prev.model,
+                        provider: next.provider || prev.provider,
+                        reasoningEffort: next.reasoningEffort ?? prev.reasoningEffort,
+                      }
+                    : prev,
+                )
+              } else {
+                setDraftDshPref(next)
               }
-            : null
-        }
-        onToggleDesktopAutoLaunch={
-          desktopApi
-            ? () => {
-                desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
-              }
-            : null
-        }
-        onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
-        updateState={updateState}
-        onCheckUpdate={desktopApi ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) } : null}
-        onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-        onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
-        onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-        onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
-        onOpenShare={() => setShareOpen(true)}
-        onOpenInviteManager={() => setInviteManagerOpen(true)}
-        onSendBindEmailCode={handleSendBindEmailCode}
-        onBindAccountEmail={handleBindAccountEmail}
-        onToggleLogin2fa={handleToggleLoginEmail2fa}
-        e2eeStatus={{
-          enabled: activeBridgeE2ee.active,
-          locked: activeBridgeE2ee.locked,
-          keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
-        }}
-        onOpenE2eeSync={() =>
-          setE2eeModal({
-            open: true,
-            tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'auto',
-            autoOpenScanner: false,
-          })
-        }
-        onRemoveDevice={handleRemoveDevice}
-      />
-      {/* Zero-Knowledge End-to-End Encryption (E2EE) QR Key Sync Modal */}
-      <E2eeSyncModal
-        open={e2eeModal.open}
-        onClose={() => setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))}
-        roomId={activeDevice?.roomId || ''}
-        username={activeDevice?.username || ''}
-        bridgeName={activeDeviceName}
-        bridgeE2ee={activeBridge?.e2ee || null}
-        isBridgeLocked={e2eeLocked}
-        activeKey={activeBridgeE2ee.shareableKey}
-        activeKeyId={activeBridgeE2ee.shareableKeyId}
-        isDesktopApp={Boolean(desktopApi)}
-        client={clientRef.current}
-        onlineOtherClientCount={Math.max(0, liveOnlineClientCount - 1)}
-        initialTab={e2eeModal.tab}
-        autoOpenScanner={e2eeModal.autoOpenScanner}
-        onImportKey={handleImportE2eeKey}
-        onImportKeyring={handleImportE2eeKeyring}
-        onScanGrantQr={handleScanGrantQr}
-        onRotateDesktopKey={desktopApi ? handleRotateDesktopE2eeKey : null}
-      />
-      {/* Zero-Knowledge Device-to-Device Key Grant Approval Popup (Phone B -> Computer C) */}
-      <E2eeGrantApproveModal
-        open={Boolean(pendingGrantPopup)}
-        grant={pendingGrantPopup}
-        e2eeKeys={activeDevice?.e2eeKeys || {}}
-        preferredKeyId={activeBridgeE2ee.shareableKeyId || ''}
-        client={clientRef.current}
-        onDone={(g) => {
-          showToast(
-            biLang(
-              getCurrentLang(),
-              `已安全授权「${g?.deviceName || '新设备'}」同步端到端密钥`,
-              `Authorized ${g?.deviceName || 'new device'} via zero-knowledge E2EE handoff`,
-            ),
-          )
-        }}
-        onClose={() => setPendingGrantPopup(null)}
-      />
-      {/* Full-Screen Zoomable Image Lightbox */}
-      <ImageLightbox state={lightboxState} imageContext={imageContext} onClose={() => setLightboxState(null)} />
+            }}
+          />
+        )}
+
+        {shareOpen && (
+          <ShareModal
+            open={shareOpen}
+            onClose={() => setShareOpen(false)}
+            serverUrl={activeDevice?.baseUrl}
+            token={activeDevice?.token}
+            isAdmin={isAdmin}
+            onOpenInviteManager={() => setInviteManagerOpen(true)}
+          />
+        )}
+
+        {settingsOpen && (
+          <SettingsModal
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            activeDevice={activeDevice}
+            activeDeviceName={activeDeviceName}
+            isAdmin={isAdmin}
+            emailEnabled={serverEmailEnabled}
+            connState={connState}
+            bridgeOnline={bridgeOnline}
+            onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
+            darkMode={darkMode}
+            onToggleDark={() => setDarkMode((v) => !v)}
+            cacheScope={cacheScope}
+            desktopApi={desktopApi}
+            desktopBridge={desktopBridge}
+            onToggleDesktopBridge={
+              desktopApi
+                ? () => {
+                    desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+                  }
+                : null
+            }
+            onToggleDesktopAutoLaunch={
+              desktopApi
+                ? () => {
+                    desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
+                  }
+                : null
+            }
+            onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
+            updateState={updateState}
+            onCheckUpdate={desktopApi ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) } : null}
+            onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
+            onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
+            onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
+            onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
+            onOpenShare={() => setShareOpen(true)}
+            onOpenInviteManager={() => setInviteManagerOpen(true)}
+            onSendBindEmailCode={handleSendBindEmailCode}
+            onBindAccountEmail={handleBindAccountEmail}
+            onToggleLogin2fa={handleToggleLoginEmail2fa}
+            e2eeStatus={{
+              enabled: activeBridgeE2ee.active,
+              locked: activeBridgeE2ee.locked,
+              keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
+            }}
+            onOpenE2eeSync={() =>
+              setE2eeModal({
+                open: true,
+                tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'auto',
+                autoOpenScanner: false,
+              })
+            }
+            onRemoveDevice={handleRemoveDevice}
+          />
+        )}
+
+        {e2eeModal.open && (
+          <E2eeSyncModal
+            open={e2eeModal.open}
+            onClose={() => setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))}
+            roomId={activeDevice?.roomId || ''}
+            username={activeDevice?.username || ''}
+            bridgeName={activeDeviceName}
+            bridgeE2ee={activeBridge?.e2ee || null}
+            isBridgeLocked={e2eeLocked}
+            activeKey={activeBridgeE2ee.shareableKey}
+            activeKeyId={activeBridgeE2ee.shareableKeyId}
+            isDesktopApp={Boolean(desktopApi)}
+            client={clientRef.current}
+            initialTab={e2eeModal.tab}
+            autoOpenScanner={e2eeModal.autoOpenScanner}
+            onImportKey={handleImportE2eeKey}
+            onImportKeyring={handleImportE2eeKeyring}
+            onScanGrantQr={handleScanGrantQr}
+            onRotateDesktopKey={desktopApi ? handleRotateDesktopE2eeKey : null}
+          />
+        )}
+
+        {pendingGrantPopup && (
+          <E2eeGrantApproveModal
+            open={Boolean(pendingGrantPopup)}
+            grant={pendingGrantPopup}
+            e2eeKeys={activeDevice?.e2eeKeys || {}}
+            preferredKeyId={activeBridgeE2ee.shareableKeyId || ''}
+            client={clientRef.current}
+            onDone={(g) => {
+              showToast(
+                biLang(
+                  getCurrentLang(),
+                  `已安全授权「${g?.deviceName || '新设备'}」同步端到端密钥`,
+                  `Authorized ${g?.deviceName || 'new device'} via zero-knowledge E2EE handoff`,
+                ),
+              )
+            }}
+            onClose={() => setPendingGrantPopup(null)}
+          />
+        )}
+
+        {lightboxState && (
+          <ImageLightbox
+            state={lightboxState}
+            imageContext={imageContext}
+            onClose={() => setLightboxState(null)}
+          />
+        )}
+      </Suspense>
     </div>
   )
 }

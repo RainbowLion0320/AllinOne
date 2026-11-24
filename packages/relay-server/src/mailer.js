@@ -118,7 +118,7 @@ function buildMimeMessage({ fromHeader, toAddr, subject, text, html, hostDomain 
  * - STARTTLS upgrade (port 587)
  * - AUTH LOGIN & AUTH PLAIN
  */
-export async function sendViaSmtp({
+async function sendViaSmtp({
   host,
   port = 465,
   secure = port === 465,

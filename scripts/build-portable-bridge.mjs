@@ -68,7 +68,7 @@ await esbuild.build({
   bundle: true,
   platform: 'node',
   format: 'esm',
-  target: 'node18',
+  target: 'node20',
   minify: true,
   sourcemap: false,
   legalComments: 'none',

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Check,
@@ -28,8 +28,12 @@ import {
   parseE2eeQrInput,
 } from '@allinone/shared/e2ee'
 import { renderQrDataUrl } from '@allinone/shared/qr-svg'
-import { QrScannerModal } from './QrScannerModal.jsx'
 import { useI18n } from '../lib/i18n.jsx'
+import { copyTextToClipboard } from '../lib/clientHelpers.js'
+
+const QrScannerModal = React.lazy(() =>
+  import('./QrScannerModal.jsx').then((m) => ({ default: m.QrScannerModal })),
+)
 
 export function E2eeSyncModal({
   open,
@@ -43,7 +47,6 @@ export function E2eeSyncModal({
   activeKeyId = '',
   isDesktopApp = false,
   client = null,
-  onlineOtherClientCount = 0,
   initialTab = 'auto', // 'auto' | 'show' | 'request' | 'import'
   autoOpenScanner = false,
   onImportKey = null,
@@ -89,10 +92,14 @@ export function E2eeSyncModal({
   const applyToDesktopRef = useRef(applyToDesktop)
   applyToDesktopRef.current = applyToDesktop
   const didAutoOpenScannerRef = useRef(false)
+  const prevOpenRef = useRef(false)
+  const resolveInitialTabRef = useRef(resolveInitialTab)
+  resolveInitialTabRef.current = resolveInitialTab
 
   const cancelActiveGrant = useCallback(() => {
     grantSessionGenRef.current += 1
     const cur = grantStateRef.current
+    grantStateRef.current = null
     if (cur?.reqId) {
       try {
         client?.sendGrantCancel?.({ reqId: cur.reqId })
@@ -151,6 +158,7 @@ export function E2eeSyncModal({
 
   useEffect(() => {
     if (!open) {
+      prevOpenRef.current = false
       didAutoOpenScannerRef.current = false
       cancelActiveGrant()
       setScannerOpen(false)
@@ -162,13 +170,16 @@ export function E2eeSyncModal({
       setInfo('')
       return
     }
-    const nextTab = resolveInitialTab()
-    setTab(nextTab)
-    if (autoOpenScanner && nextTab === 'import' && !didAutoOpenScannerRef.current) {
-      didAutoOpenScannerRef.current = true
-      setScannerOpen(true)
+    if (!prevOpenRef.current) {
+      prevOpenRef.current = true
+      const nextTab = resolveInitialTabRef.current()
+      setTab(nextTab)
+      if (autoOpenScanner && nextTab === 'import' && !didAutoOpenScannerRef.current) {
+        didAutoOpenScannerRef.current = true
+        setScannerOpen(true)
+      }
     }
-  }, [open, resolveInitialTab, autoOpenScanner, cancelActiveGrant])
+  }, [open, autoOpenScanner, cancelActiveGrant])
 
   // Auto-start Reverse-Auth grant session whenever entering the `request` tab
   useEffect(() => {
@@ -230,19 +241,33 @@ export function E2eeSyncModal({
         return
       }
 
-      if (event === 'e2ee.grant.cancel' && payload.reopen) {
-        setGrantState((prev) =>
-          prev && prev.reqId === cur.reqId
-            ? {
-                ...prev,
-                phase: 'waiting',
-                sasCode: '',
-                approverPubKey: '',
-                approverDeviceName: '',
-                approverIp: '',
-              }
-            : prev,
-        )
+      if (event === 'e2ee.grant.cancel') {
+        if (payload.reopen) {
+          setGrantState((prev) =>
+            prev && prev.reqId === cur.reqId
+              ? {
+                  ...prev,
+                  phase: 'waiting',
+                  sasCode: '',
+                  approverPubKey: '',
+                  approverDeviceName: '',
+                  approverIp: '',
+                }
+              : prev,
+          )
+        } else {
+          grantPrivateKeyRef.current = null
+          setGrantState((prev) =>
+            prev && prev.reqId === cur.reqId
+              ? {
+                  ...prev,
+                  phase: 'expired',
+                  sasCode: '',
+                  approverPubKey: '',
+                }
+              : prev,
+          )
+        }
         return
       }
 
@@ -278,8 +303,9 @@ export function E2eeSyncModal({
           for (const entry of rawKeys) {
             if (!entry?.key) continue
             try {
-              const cid = await computeE2eeKeyId(entry.key)
-              if (!entry.keyId || entry.keyId === cid) {
+              const cid = (await computeE2eeKeyId(entry.key)).toLowerCase()
+              const declaredId = String(entry.keyId || '').trim().toLowerCase()
+              if (!declaredId || declaredId === cid) {
                 verifiedKeys.push({ keyId: cid, key: entry.key })
               }
             } catch {}
@@ -288,11 +314,14 @@ export function E2eeSyncModal({
             throw new Error(bi('授权包中未包含有效密钥', 'No valid keys in authorization payload'))
           }
           grantPrivateKeyRef.current = null
+          grantStateRef.current = null
           setGrantState(null)
+          const bridgeKid = String(bridgeE2ee?.keyId || '').trim().toLowerCase()
+          const decPrefKid = String(decrypted?.preferredKeyId || '').trim().toLowerCase()
           const preferredKeyId =
-            (bridgeE2ee?.keyId && verifiedKeys.some((k) => k.keyId === bridgeE2ee.keyId) ? bridgeE2ee.keyId : '') ||
-            (decrypted?.preferredKeyId && verifiedKeys.some((k) => k.keyId === decrypted.preferredKeyId)
-              ? decrypted.preferredKeyId
+            (bridgeKid && verifiedKeys.some((k) => k.keyId === bridgeKid) ? bridgeKid : '') ||
+            (decPrefKid && verifiedKeys.some((k) => k.keyId === decPrefKid)
+              ? decPrefKid
               : verifiedKeys[0].keyId)
 
           const shouldApplyDesktop = Boolean(isDesktopApp && applyToDesktopRef.current)
@@ -336,11 +365,10 @@ export function E2eeSyncModal({
 
   const handleCopyKey = async () => {
     if (!activeKey) return
-    try {
-      await navigator.clipboard.writeText(activeKey)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    } catch {}
+    const ok = await copyTextToClipboard(activeKey)
+    if (!ok) return
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1800)
   }
 
   const processImportedText = async (rawText) => {
@@ -392,13 +420,14 @@ export function E2eeSyncModal({
     }
     setBusy(true)
     try {
-      const importedKeyId = await computeE2eeKeyId(parsed.key)
+      const importedKeyId = (await computeE2eeKeyId(parsed.key)).toLowerCase()
+      const expectedKeyId = String(bridgeE2ee?.keyId || '').trim().toLowerCase()
       const shouldUpdateDesktop = Boolean(isDesktopApp && applyToDesktop)
       if (
         !shouldUpdateDesktop &&
         bridgeE2ee?.enabled &&
-        bridgeE2ee?.keyId &&
-        importedKeyId !== bridgeE2ee.keyId
+        expectedKeyId &&
+        importedKeyId !== expectedKeyId
       ) {
         await onImportKey?.(parsed.key, importedKeyId, { applyToDesktopBridge: false })
         setError(
@@ -667,11 +696,9 @@ export function E2eeSyncModal({
                     <p className="mt-3 text-xs text-slate-600 dark:text-slate-300">
                       {bi('核对手机上的 6 位数字一致后，在手机点击确认', 'Confirm this code matches your phone, then approve')}
                     </p>
-                    {grantState.approverIp && (
-                      <div className="mt-2 font-mono text-[11px] text-slate-400">
-                        {grantState.approverIp} · {grantCountdownSec}s
-                      </div>
-                    )}
+                    <div className="mt-2 font-mono text-[11px] text-slate-400">
+                      {grantState.approverIp ? `${grantState.approverIp} · ${grantCountdownSec}s` : `${grantCountdownSec}s`}
+                    </div>
                   </div>
                 ) : grantState?.phase === 'rejected' || grantState?.phase === 'expired' ? (
                   <div className="flex flex-col items-center rounded-2xl border border-slate-200/80 bg-slate-50/70 p-5 text-center dark:border-slate-800 dark:bg-[#14171F]">
@@ -824,14 +851,18 @@ export function E2eeSyncModal({
         </div>
       </div>
 
-      <QrScannerModal
-        open={scannerOpen}
-        onClose={() => setScannerOpen(false)}
-        onDetected={(raw) => {
-          setScannerOpen(false)
-          void processImportedText(raw)
-        }}
-      />
+      <Suspense fallback={null}>
+        {scannerOpen && (
+          <QrScannerModal
+            open={scannerOpen}
+            onClose={() => setScannerOpen(false)}
+            onDetected={(raw) => {
+              setScannerOpen(false)
+              void processImportedText(raw)
+            }}
+          />
+        )}
+      </Suspense>
     </>
   )
 }

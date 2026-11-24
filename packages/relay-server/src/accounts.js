@@ -69,7 +69,7 @@ function generateInviteCode() {
   return `INV-${raw.slice(0, 4)}-${raw.slice(4)}`
 }
 
-export function normalizeInviteCode(input) {
+function normalizeInviteCode(input) {
   let clean = String(input || '')
     .trim()
     .toUpperCase()
@@ -89,7 +89,7 @@ function sanitizeBridgeSlug(raw) {
   return slug || 'my-pc'
 }
 
-export function validateUsername(raw) {
+function validateUsername(raw) {
   const u = String(raw || '').trim()
   if (!USERNAME_RE.test(u)) {
     return { ok: false, error: '用户名需为 3~32 位字母、数字、点、下划线或连字符' }
@@ -137,6 +137,8 @@ export function createAccountStore({ filePath }) {
   const userIdByEmailLower = new Map()
   /** @type {Map<string, any>} */
   const invitesById = new Map()
+  /** @type {Set<string>} */
+  const changingPasswordUsers = new Set()
 
   function load() {
     if (!existsSync(filePath)) return
@@ -506,42 +508,44 @@ export function createAccountStore({ filePath }) {
     return { ok: true, user: sanitizeUser(record) }
   }
 
-  function changePassword(userId, currentPassword, newPassword) {
+  async function changePasswordAsync(userId, currentPassword, newPassword, { validateSession } = {}) {
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
-    if (!verifyPasswordHash(currentPassword, record.passwordSalt, record.passwordHash)) {
-      return { ok: false, error: '当前密码不正确' }
+    if (changingPasswordUsers.has(userId)) {
+      return { ok: false, error: '正在修改密码，请稍后重试' }
     }
-    const pCheck = validatePassword(newPassword)
-    if (!pCheck.ok) return pCheck
-    const { salt, hash } = hashPassword(pCheck.password)
-    record.passwordSalt = salt
-    record.passwordHash = hash
-    record.tokenVersion = Number(record.tokenVersion || 0) + 1
-    record.sessions = []
-    record.revokedSids = {}
-    save()
-    return { ok: true, user: sanitizeUser(record) }
-  }
-
-  async function changePasswordAsync(userId, currentPassword, newPassword) {
-    const record = usersById.get(userId)
-    if (!record) return { ok: false, error: '用户不存在' }
-    const valid = await verifyPasswordHashAsync(currentPassword, record.passwordSalt, record.passwordHash)
-    if (!valid) {
-      return { ok: false, error: '当前密码不正确' }
+    const origHash = record.passwordHash
+    const origSalt = record.passwordSalt
+    const origTv = Number(record.tokenVersion || 0)
+    changingPasswordUsers.add(userId)
+    try {
+      const valid = await verifyPasswordHashAsync(currentPassword, origSalt, origHash)
+      if (!valid) {
+        return { ok: false, error: '当前密码不正确' }
+      }
+      const pCheck = validatePassword(newPassword)
+      if (!pCheck.ok) return pCheck
+      const { salt, hash } = await hashPasswordAsync(pCheck.password)
+      const sessionValid = typeof validateSession === 'function' ? Boolean(validateSession()) : true
+      if (
+        usersById.get(userId) !== record ||
+        record.passwordHash !== origHash ||
+        record.passwordSalt !== origSalt ||
+        Number(record.tokenVersion || 0) !== origTv ||
+        !sessionValid
+      ) {
+        return { ok: false, error: '会话已失效或密码已被更新，请重新登录', code: 'stale_session' }
+      }
+      record.passwordSalt = salt
+      record.passwordHash = hash
+      record.tokenVersion = origTv + 1
+      record.sessions = []
+      record.revokedSids = {}
+      save()
+      return { ok: true, user: sanitizeUser(record) }
+    } finally {
+      changingPasswordUsers.delete(userId)
     }
-    const pCheck = validatePassword(newPassword)
-    if (!pCheck.ok) return pCheck
-    const { salt, hash } = await hashPasswordAsync(pCheck.password)
-    if (usersById.get(userId) !== record) return { ok: false, error: '用户不存在' }
-    record.passwordSalt = salt
-    record.passwordHash = hash
-    record.tokenVersion = Number(record.tokenVersion || 0) + 1
-    record.sessions = []
-    record.revokedSids = {}
-    save()
-    return { ok: true, user: sanitizeUser(record) }
   }
 
   function bindDevice({ userId, label = '', hostname = '', platform = 'unknown', bridgeId = '' } = {}) {
@@ -923,7 +927,6 @@ export function createAccountStore({ filePath }) {
     setLoginEmail2fa,
     checkAndRememberLoginContext,
     resetPasswordByEmail,
-    changePassword,
     changePasswordAsync,
     bindDevice,
     verifyDeviceBridge,

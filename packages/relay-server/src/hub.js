@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { EVENTS } from '@allinone/shared'
+import { E2EE_EVENT_MARKER, E2EE_METHOD_MARKER } from '@allinone/shared/e2ee'
 
 const EVENT_BUFFER_SIZE = 200
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
@@ -605,12 +606,7 @@ export class RelayHub {
         (a, b) => (a[1].lastSeenAt || a[1].connectedAt || 0) - (b[1].lastSeenAt || b[1].connectedAt || 0),
       )
       const toEvict = roomClientEntries.slice(0, roomClientEntries.length - MAX_CLIENTS_PER_ROOM + 1)
-      for (const [evictId, evictEntry] of toEvict) {
-        this.clients.delete(evictId)
-        this.clearPendingRpcsForClient(evictId)
-        this.cancelClientGrants(evictId, 'evicted')
-        try { evictEntry.ws.close(4029, 'Too many concurrent client connections') } catch {}
-      }
+      this._dropClients(toEvict, 4029, 'Too many concurrent client connections', 'evicted')
     }
     const parsed = parseClientDeviceInfo(user?.dev || '', userAgent, user?.kind || '')
     const now = Date.now()
@@ -775,7 +771,7 @@ export class RelayHub {
 
     if (msg.type === 'event') {
       if (!msg.e2ee) return
-      this.broadcastEvent(roomId, bridgeId, '__e2ee__', null, msg.e2ee)
+      this.broadcastEvent(roomId, bridgeId, E2EE_EVENT_MARKER, null, msg.e2ee)
     }
   }
 
@@ -1026,14 +1022,14 @@ export class RelayHub {
       this.globalStats.totalRpcs += 1
       const rStats = this.getOrCreateRoomStats(roomId)
       rStats.rpcCount += 1
-      rStats.lastRpcMethod = '__e2ee__'
+      rStats.lastRpcMethod = E2EE_METHOD_MARKER
       rStats.lastRpcAt = rpcNow
       rStats.lastActivityAt = rpcNow
 
       const sent = this.sendRaw(bridge.ws, {
         type: 'rpc.req',
         id: relayReqId,
-        method: '__e2ee__',
+        method: E2EE_METHOD_MARKER,
         e2ee: msg.e2ee,
       })
       if (!sent) {
@@ -1064,7 +1060,7 @@ export class RelayHub {
           seq: evState.seq,
           ts: now,
           bridgeId,
-          event: '__e2ee__',
+          event: E2EE_EVENT_MARKER,
           e2ee,
         }
       : {
@@ -1150,34 +1146,34 @@ export class RelayHub {
     return true
   }
 
+  _dropClients(targets, code = 4401, reason = 'Session revoked', grantReason = 'revoked') {
+    if (!targets.length) return 0
+    for (const [cid, client] of targets) {
+      this.clients.delete(cid)
+      try {
+        client.ws.close(code, reason)
+      } catch {}
+    }
+    for (const [cid] of targets) {
+      this.cancelClientGrants(cid, grantReason)
+      this.clearPendingRpcsForClient(cid)
+    }
+    return targets.length
+  }
+
   disconnectClient(roomId, { clientId = '', sid = '' } = {}, code = 4401, reason = 'Session revoked') {
     const rid = String(roomId || '').trim()
     const targetCid = String(clientId || '').trim()
     const targetSid = String(sid || '').trim()
     if (!rid || (!targetCid && !targetSid)) return 0
-    let disconnected = 0
-    const droppedClientIds = new Set()
+    const targets = []
     for (const [cid, client] of this.clients.entries()) {
       if (client.roomId !== rid) continue
       const matchCid = targetCid && cid === targetCid
       const matchSid = targetSid && client.sid && client.sid === targetSid
-      if (!matchCid && !matchSid) continue
-      droppedClientIds.add(cid)
-      this.clients.delete(cid)
-      disconnected += 1
-      try {
-        client.ws.close(code, reason)
-      } catch {}
+      if (matchCid || matchSid) targets.push([cid, client])
     }
-    for (const cid of droppedClientIds) {
-      this.cancelClientGrants(cid, 'revoked')
-    }
-    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
-        clearTimeout(pending.timer)
-        this.pendingRpc.delete(relayReqId)
-      }
-    }
+    const disconnected = this._dropClients(targets, code, reason)
     if (disconnected > 0) {
       this.log.info(`[relay] Kicked ${disconnected} client connection(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
@@ -1190,34 +1186,16 @@ export class RelayHub {
     if (!rid) return 0
     const keepCid = String(keepClientId || '').trim()
     const keepSession = String(keepSid || '').trim()
-    let disconnected = 0
-    const droppedClientIds = new Set()
+    const targets = []
     for (const [cid, client] of this.clients.entries()) {
       if (client.roomId !== rid) continue
-      if (keepCid && cid === keepCid) {
+      if ((keepCid && cid === keepCid) || (keepSession && client.sid && client.sid === keepSession)) {
         if (newSidForKept) client.sid = String(newSidForKept)
         continue
       }
-      if (keepSession && client.sid && client.sid === keepSession) {
-        if (newSidForKept) client.sid = String(newSidForKept)
-        continue
-      }
-      droppedClientIds.add(cid)
-      this.clients.delete(cid)
-      disconnected += 1
-      try {
-        client.ws.close(code, reason)
-      } catch {}
+      targets.push([cid, client])
     }
-    for (const cid of droppedClientIds) {
-      this.cancelClientGrants(cid, 'revoked')
-    }
-    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
-        clearTimeout(pending.timer)
-        this.pendingRpc.delete(relayReqId)
-      }
-    }
+    const disconnected = this._dropClients(targets, code, reason)
     if (disconnected > 0) {
       this.log.info(`[relay] Kicked ${disconnected} other client(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
@@ -1228,26 +1206,11 @@ export class RelayHub {
   disconnectRoomClients(roomId, code = 4401, reason = 'Session revoked') {
     const rid = String(roomId || '').trim()
     if (!rid) return 0
-    let disconnected = 0
-    const droppedClientIds = new Set()
+    const targets = []
     for (const [cid, client] of this.clients.entries()) {
-      if (client.roomId !== rid) continue
-      droppedClientIds.add(cid)
-      this.clients.delete(cid)
-      disconnected += 1
-      try {
-        client.ws.close(code, reason)
-      } catch {}
+      if (client.roomId === rid) targets.push([cid, client])
     }
-    for (const cid of droppedClientIds) {
-      this.cancelClientGrants(cid, 'revoked')
-    }
-    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-      if (pending.roomId === rid && pending.clientId && droppedClientIds.has(pending.clientId)) {
-        clearTimeout(pending.timer)
-        this.pendingRpc.delete(relayReqId)
-      }
-    }
+    const disconnected = this._dropClients(targets, code, reason)
     const evState = this.roomEvents.get(rid)
     if (evState) {
       evState.buffer = []

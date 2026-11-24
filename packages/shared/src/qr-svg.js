@@ -255,7 +255,7 @@ function evaluatePenalty(grid, size) {
   return penalty
 }
 
-export function encodeQrMatrix(text) {
+function encodeQrMatrix(text) {
   const bytes = textEncoder.encode(String(text ?? ''))
   const spec = VERSION_SPECS_M.find((s) => {
     const capBytes = totalDataBytes(s)
@@ -317,26 +317,29 @@ export function encodeQrMatrix(text) {
     }
   }
 
-  const drawFormat = (mask) => {
-    const bits = getFormatBits(mask)
-    const bitAt = (idx) => (bits >>> idx) & 1
-    const c1 = [
-      [8, 0], [8, 1], [8, 2], [8, 3], [8, 4], [8, 5], [8, 7], [8, 8],
-      [7, 8], [5, 8], [4, 8], [3, 8], [2, 8], [1, 8], [0, 8],
-    ]
+  const FORMAT_COORDS_1 = [
+    [8, 0], [8, 1], [8, 2], [8, 3], [8, 4], [8, 5], [8, 7], [8, 8],
+    [7, 8], [5, 8], [4, 8], [3, 8], [2, 8], [1, 8], [0, 8],
+  ]
+  const drawFormat = (targetGrid, formatBits, markFunc = false) => {
+    const write = (r, c, dark) => {
+      targetGrid[r][c] = dark ? 1 : 0
+      if (markFunc) isFunc[r][c] = 1
+    }
+    const bitAt = (idx) => (formatBits >>> idx) & 1
     for (let i = 0; i < 15; i += 1) {
-      const [r, c] = c1[i]
-      setFunc(r, c, bitAt(14 - i))
+      const [r, c] = FORMAT_COORDS_1[i]
+      write(r, c, bitAt(14 - i))
     }
     for (let i = 0; i < 7; i += 1) {
-      setFunc(size - 1 - i, 8, bitAt(14 - i))
+      write(size - 1 - i, 8, bitAt(14 - i))
     }
-    setFunc(size - 8, 8, 1)
+    write(size - 8, 8, 1)
     for (let i = 0; i < 8; i += 1) {
-      setFunc(8, size - 8 + i, bitAt(7 - i))
+      write(8, size - 8 + i, bitAt(7 - i))
     }
   }
-  drawFormat(0)
+  drawFormat(grid, getFormatBits(0), true)
 
   if (spec.version >= 7) {
     const vBits = getVersionBits(spec.version)
@@ -385,19 +388,7 @@ export function encodeQrMatrix(text) {
         }
       }
     }
-    const bits = getFormatBits(m)
-    const bitAt = (idx) => (bits >>> idx) & 1
-    const c1 = [
-      [8, 0], [8, 1], [8, 2], [8, 3], [8, 4], [8, 5], [8, 7], [8, 8],
-      [7, 8], [5, 8], [4, 8], [3, 8], [2, 8], [1, 8], [0, 8],
-    ]
-    for (let i = 0; i < 15; i += 1) {
-      const [r, c] = c1[i]
-      candidate[r][c] = bitAt(14 - i)
-    }
-    for (let i = 0; i < 7; i += 1) candidate[size - 1 - i][8] = bitAt(14 - i)
-    candidate[size - 8][8] = 1
-    for (let i = 0; i < 8; i += 1) candidate[8][size - 8 + i] = bitAt(7 - i)
+    drawFormat(candidate, getFormatBits(m))
 
     const p = evaluatePenalty(candidate, size)
     if (p < bestPenalty) {

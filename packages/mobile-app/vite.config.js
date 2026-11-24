@@ -10,7 +10,7 @@ export default defineConfig({
   base: './',
   envDir: '../..',
   define: {
-    __APP_VERSION__: JSON.stringify(pkg.version || '0.5.0'),
+    __APP_VERSION__: JSON.stringify(pkg.version || '0.5.1'),
   },
   plugins: [
     react(),
@@ -47,7 +47,7 @@ export default defineConfig({
         clientsClaim: true,
         cleanupOutdatedCaches: true,
         globPatterns: ['**/*.{js,css,svg,png,woff2}'],
-        globIgnores: ['downloads/**', 'wallpapers/**'],
+        globIgnores: ['downloads/**'],
         navigateFallback: null,
         runtimeCaching: [
           {
@@ -62,6 +62,33 @@ export default defineConfig({
       },
     }),
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined
+          const norm = id.replace(/\\/g, '/')
+          if (/\/node_modules\/(react|react-dom|scheduler)\//.test(norm)) {
+            return 'react-vendor'
+          }
+          if (
+            /\/node_modules\/(react-markdown|remark-gfm|remark-[^/]+|rehype-[^/]+|micromark[^/]*|mdast[^/]*|hast[^/]*|unified|unist[^/]*|vfile[^/]*|property-information|comma-separated-tokens|space-separated-tokens|decode-named-character-reference|character-entities[^/]*|html-url-attributes|devlop|bail|is-plain-obj|trough|trim-lines|ccount|escape-string-regexp|markdown-table|longest-streak|zwitch)\//.test(
+              norm,
+            )
+          ) {
+            return 'markdown-vendor'
+          }
+          if (/\/node_modules\/highlight\.js\/lib\/core\.js$/.test(norm)) {
+            return 'hljs-core'
+          }
+          if (/\/node_modules\/lucide-react\//.test(norm)) {
+            return 'lucide'
+          }
+          return undefined
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {

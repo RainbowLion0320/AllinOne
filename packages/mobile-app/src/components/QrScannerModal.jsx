@@ -99,10 +99,20 @@ export function QrScannerModal({ open, onClose, onDetected }) {
   const timerRef = useRef(null)
   const busyRef = useRef(false)
   const detectedRef = useRef(false)
+  const activeOpenRef = useRef(Boolean(open))
+  activeOpenRef.current = Boolean(open)
+  const mountedRef = useRef(true)
   const onDetectedRef = useRef(onDetected)
   onDetectedRef.current = onDetected
   const captureInputRef = useRef(null)
   const albumInputRef = useRef(null)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const [camState, setCamState] = useState('starting') // 'starting' | 'active' | 'error'
   const [camError, setCamError] = useState('')
@@ -227,19 +237,32 @@ export function QrScannerModal({ open, onClose, onDetected }) {
       } catch {}
 
       const detector = createNativeQrDetector()
-      const jsQR = await loadJsQr().catch(() => null)
-      if (cancelled) return
-      if (!canvasRef.current) {
-        canvasRef.current = document.createElement('canvas')
+      let jsQR = null
+      let jsQrLoading = false
+      let nativeMisses = 0
+      let tickCount = 0
+
+      if (!detector) {
+        jsQR = await loadJsQr().catch(() => null)
+        if (cancelled) return
       }
-      const canvas = canvasRef.current
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+      let ctx = null
+      const ensureCanvasCtx = () => {
+        if (ctx) return ctx
+        if (!canvasRef.current) {
+          canvasRef.current = document.createElement('canvas')
+        }
+        ctx = canvasRef.current.getContext('2d', { willReadFrequently: true })
+        return ctx
+      }
 
       timerRef.current = setInterval(async () => {
         if (cancelled || detectedRef.current || busyRef.current) return
         const v = videoRef.current
         if (!v || v.readyState < 2 || !v.videoWidth || !v.videoHeight) return
         busyRef.current = true
+        tickCount += 1
         try {
           if (detector) {
             try {
@@ -250,11 +273,28 @@ export function QrScannerModal({ open, onClose, onDetected }) {
                 return
               }
             } catch {}
+            nativeMisses += 1
+            // Only lazy-load jsQR as a throttled fallback after 10 native misses
+            if (nativeMisses >= 10 && !jsQR && !jsQrLoading) {
+              jsQrLoading = true
+              loadJsQr()
+                .then((fn) => {
+                  if (!cancelled) jsQR = fn
+                })
+                .catch(() => {})
+                .finally(() => {
+                  jsQrLoading = false
+                })
+            }
+            if (!jsQR || tickCount % 4 !== 0) return
           }
-          if (ctx && jsQR) {
-            const val = drawAndDecodeJsQr(jsQR, v, 0, 0, v.videoWidth, v.videoHeight, 720, canvas, ctx)
-            if (val) {
-              emitDetected(val)
+          if (jsQR) {
+            const c = ensureCanvasCtx()
+            if (c) {
+              const val = drawAndDecodeJsQr(jsQR, v, 0, 0, v.videoWidth, v.videoHeight, 720, canvasRef.current, c)
+              if (val) {
+                emitDetected(val)
+              }
             }
           }
         } finally {
@@ -270,6 +310,19 @@ export function QrScannerModal({ open, onClose, onDetected }) {
       stopCamera()
     }
   }, [open, retrySeq, emitDetected, stopCamera])
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopImmediatePropagation()
+        stopCamera()
+        onClose?.()
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [open, stopCamera, onClose])
 
   const handleToggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks?.()[0]
@@ -289,6 +342,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
     setImageError('')
     try {
       const found = await decodeQrFromImageFile(file)
+      if (!mountedRef.current || !activeOpenRef.current) return
       if (found) {
         emitDetected(found)
       } else {
@@ -298,9 +352,12 @@ export function QrScannerModal({ open, onClose, onDetected }) {
         ))
       }
     } catch (err) {
+      if (!mountedRef.current || !activeOpenRef.current) return
       setImageError(String(err?.message || err || bi('识别图片二维码失败', 'Failed to decode QR code')))
     } finally {
-      setDecodingImage(false)
+      if (mountedRef.current) {
+        setDecodingImage(false)
+      }
     }
   }
 

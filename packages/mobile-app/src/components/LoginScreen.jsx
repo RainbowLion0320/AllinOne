@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { Suspense, useCallback, useEffect, useState } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
@@ -31,8 +31,12 @@ import {
   resetAccountPassword,
   sendEmailVerificationCode,
 } from '../lib/wsClient.js'
-import { QrScannerModal } from './QrScannerModal.jsx'
 import { useI18n } from '../lib/i18n.jsx'
+import { copyTextToClipboard } from '../lib/clientHelpers.js'
+
+const QrScannerModal = React.lazy(() =>
+  import('./QrScannerModal.jsx').then((m) => ({ default: m.QrScannerModal })),
+)
 
 const LOGIN_INPUT_CLS =
   'w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white focus:ring-2 focus:ring-[#4D6BFE]/15 dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26] dark:focus:ring-[#4D6BFE]/25'
@@ -100,14 +104,17 @@ export function LoginScreen({
 
   useEffect(() => {
     let cancelled = false
-    fetchBootstrapStatus(effectiveServer).then((st) => {
-      if (!cancelled) {
-        setHasUsers(st.hasUsers)
-        setEmailEnabled(Boolean(st.emailEnabled))
-      }
-    })
+    const timer = setTimeout(() => {
+      fetchBootstrapStatus(effectiveServer).then((st) => {
+        if (!cancelled) {
+          setHasUsers(st.hasUsers)
+          setEmailEnabled(Boolean(st.emailEnabled))
+        }
+      })
+    }, 350)
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
   }, [effectiveServer])
 
@@ -153,11 +160,19 @@ export function LoginScreen({
   const activeSetupCmd = osTab === 'win' ? winSetupCmd : unixSetupCmd
 
   const handleCopySetupCmd = async () => {
-    try {
-      await navigator.clipboard.writeText(activeSetupCmd)
-    } catch {}
+    await copyTextToClipboard(activeSetupCmd)
     setCopiedCmd(true)
     setTimeout(() => setCopiedCmd(false), 1800)
+  }
+
+  const switchAuthMode = (nextMode) => {
+    setMode(nextMode)
+    setError('')
+    setInfoMsg('')
+    setAccountPassword('')
+    setConfirmPassword('')
+    setEmailCode('')
+    setLogin2fa({ required: false, maskedEmail: '' })
   }
 
   const handleQrDetected = useCallback((rawText) => {
@@ -338,7 +353,7 @@ export function LoginScreen({
   const isDesktopApp = typeof window !== 'undefined' && Boolean(window.allinoneDesktop)
 
   return (
-    <div className="relative flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
+    <div className="relative flex h-full w-full flex-col items-center overflow-y-auto bg-gradient-to-b from-[#F5F8FF] to-white px-5 py-8 dark:from-[#16171A] dark:to-[#111216]">
       {isDesktopApp && <div className="app-drag fixed inset-x-0 top-0 z-10 h-9" />}
       {/* Floating theme + bilingual switcher on login screen */}
       <div className="app-no-drag pt-safe fixed top-3 right-4 z-20 flex items-center gap-2">
@@ -363,7 +378,7 @@ export function LoginScreen({
           <span>{lang === 'en' ? '中文' : 'EN'}</span>
         </button>
       </div>
-      <div className="w-full max-w-sm">
+      <div className="my-auto w-full max-w-sm">
         {isAddingDevice && onCancel && (
           <div className="pt-safe mb-3 flex items-center">
             <button
@@ -396,11 +411,7 @@ export function LoginScreen({
             <div className="grid grid-cols-2 gap-1 rounded-2xl bg-slate-100 p-1 dark:bg-[#14161C]">
               <button
                 type="button"
-                onClick={() => {
-                  setMode('login')
-                  setError('')
-                  setInfoMsg('')
-                }}
+                onClick={() => switchAuthMode('login')}
                 className={`flex items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold transition ${
                   mode === 'login'
                     ? 'bg-white text-[#4D6BFE] shadow-xs dark:bg-[#262A36] dark:text-white'
@@ -412,11 +423,7 @@ export function LoginScreen({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setMode('register')
-                  setError('')
-                  setInfoMsg('')
-                }}
+                onClick={() => switchAuthMode('register')}
                 className={`flex items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold transition ${
                   mode === 'register'
                     ? 'bg-white text-[#4D6BFE] shadow-xs dark:bg-[#262A36] dark:text-white'
@@ -460,10 +467,7 @@ export function LoginScreen({
                     <button
                       type="button"
                       onClick={() => {
-                        setMode('reset')
-                        setError('')
-                        setInfoMsg('')
-                        setEmailCode('')
+                        switchAuthMode('reset')
                         if (username.includes('@') && !email) setEmail(username.trim())
                       }}
                       className="text-[11.5px] font-medium text-[#4D6BFE] hover:underline"
@@ -534,7 +538,8 @@ export function LoginScreen({
                             password: accountPassword,
                           })
                           if (res.cooldownSec > 0) setCodeCooldown(res.cooldownSec)
-                          if (res.message) setInfoMsg(res.message)
+                          if (res.error) setError(res.error)
+                          else if (res.message) setInfoMsg(res.message)
                         } catch (err) {
                           setError(String(err?.message || err))
                         } finally {
@@ -713,11 +718,7 @@ export function LoginScreen({
                 </span>
                 <button
                   type="button"
-                  onClick={() => {
-                    setMode('login')
-                    setError('')
-                    setInfoMsg('')
-                  }}
+                  onClick={() => switchAuthMode('login')}
                   className="text-xs font-medium text-[#4D6BFE] hover:underline"
                 >
                   {bi('返回登录', 'Back to Sign In')}
@@ -919,11 +920,15 @@ export function LoginScreen({
         </form>
       </div>
 
-      <QrScannerModal
-        open={scannerOpen}
-        onClose={() => setScannerOpen(false)}
-        onDetected={handleQrDetected}
-      />
+      <Suspense fallback={null}>
+        {scannerOpen && (
+          <QrScannerModal
+            open={scannerOpen}
+            onClose={() => setScannerOpen(false)}
+            onDetected={handleQrDetected}
+          />
+        )}
+      </Suspense>
     </div>
   )
 }

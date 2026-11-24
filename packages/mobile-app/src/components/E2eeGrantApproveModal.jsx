@@ -87,10 +87,17 @@ export function E2eeGrantApproveModal({
 
   if (!open || !grant) return null
 
-  const keyEntries = Object.entries(e2eeKeys || {})
-    .filter(([, k]) => typeof k === 'string' && k.length >= 42)
-    .map(([keyId, key]) => ({ keyId, key }))
-  const hasWantedKey = !grant.wantedKeyId || Boolean(e2eeKeys?.[grant.wantedKeyId])
+  const normalizedKeys = {}
+  for (const [keyId, key] of Object.entries(e2eeKeys || {})) {
+    const cleanKid = String(keyId || '').trim().toLowerCase()
+    if (cleanKid && typeof key === 'string' && key.length >= 42) {
+      normalizedKeys[cleanKid] = key
+    }
+  }
+  const keyEntries = Object.entries(normalizedKeys).map(([keyId, key]) => ({ keyId, key }))
+  const wantedKid = String(grant.wantedKeyId || '').trim().toLowerCase()
+  const prefKid = String(preferredKeyId || '').trim().toLowerCase()
+  const hasWantedKey = !wantedKid || Boolean(normalizedKeys[wantedKid])
   const isDesktopRequester = grant.clientKind === 'desktop' || /desktop|桌面|mac|win/i.test(grant.deviceName || '')
 
   const handleReject = () => {
@@ -171,8 +178,8 @@ export function E2eeGrantApproveModal({
       const pair = pairRef.current || (await generateGrantKeyPair())
       pairRef.current = pair
       const resolvedPreferred =
-        (grant.wantedKeyId && e2eeKeys?.[grant.wantedKeyId] ? grant.wantedKeyId : '') ||
-        (preferredKeyId && e2eeKeys?.[preferredKeyId] ? preferredKeyId : '') ||
+        (wantedKid && normalizedKeys[wantedKid] ? wantedKid : '') ||
+        (prefKid && normalizedKeys[prefKid] ? prefKid : '') ||
         keyEntries[0]?.keyId ||
         ''
 

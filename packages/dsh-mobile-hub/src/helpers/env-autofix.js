@@ -18,7 +18,15 @@ import { execFileSync, spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
-import { ensureRichPath, findExecutable, isExecutableFile, spawnCmdShim } from './bin-finder.js'
+import {
+  ensureRichPath,
+  findExecutable,
+  getAgyCandidates,
+  getClaudeCandidates,
+  getCodexCandidates,
+  isExecutableFile,
+  spawnCmdShim,
+} from './bin-finder.js'
 
 const FAILURE_COOLDOWN_MS = 6 * 60 * 60 * 1000 // 6 hours after failed attempt
 const INSTALL_TIMEOUT_MS = 180_000 // 3 minutes per official installer
@@ -98,85 +106,6 @@ function hasAnyPath(paths) {
     if (p && existsSync(p)) return true
   }
   return false
-}
-
-function getAgyCandidates(home, platform, env) {
-  const list = [env.AGY_BIN]
-  if (platform === 'win32') {
-    const localApp = env.LOCALAPPDATA || join(home, 'AppData', 'Local')
-    list.push(
-      join(localApp, 'agy', 'bin', 'agy.exe'),
-      join(home, '.local', 'bin', 'agy.exe'),
-      join(home, '.agy', 'bin', 'agy.exe'),
-    )
-  } else {
-    list.push(
-      join(home, '.local', 'bin', 'agy'),
-      join(home, '.agy', 'bin', 'agy'),
-      join(home, '.antigravity', 'antigravity', 'bin', 'agy'),
-      join(home, '.antigravity', 'bin', 'agy'),
-      '/opt/homebrew/bin/agy',
-      '/usr/local/bin/agy',
-    )
-    if (platform === 'darwin') {
-      list.push(
-        '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
-        join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agy'),
-      )
-    }
-  }
-  return list
-}
-
-function getClaudeCandidates(home, platform, env) {
-  const list = [env.CLAUDE_BIN]
-  if (platform === 'win32') {
-    const appData = env.APPDATA || join(home, 'AppData', 'Roaming')
-    list.push(
-      join(home, '.local', 'bin', 'claude.exe'),
-      join(home, '.claude', 'local', 'claude.exe'),
-      join(appData, 'npm', 'claude.cmd'),
-      join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
-    )
-  } else {
-    list.push(
-      join(home, '.local', 'bin', 'claude'),
-      join(home, '.claude', 'local', 'claude'),
-      '/opt/homebrew/bin/claude',
-      '/usr/local/bin/claude',
-    )
-  }
-  return list
-}
-
-function getCodexCandidates(home, platform, env) {
-  const list = [
-    env.CODEX_BIN,
-    join(home, '.codex', '.sandbox-bin', 'codex.exe'),
-    join(home, '.codex', '.sandbox-bin', 'codex'),
-  ]
-  if (platform === 'darwin') {
-    list.push(
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
-      '/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex',
-      '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      '/Applications/Codex.app/Contents/Resources/codex',
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
-      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
-    )
-  } else if (platform === 'win32') {
-    const appData = env.APPDATA || join(home, 'AppData', 'Roaming')
-    const localApp = env.LOCALAPPDATA || join(home, 'AppData', 'Local')
-    list.push(
-      join(appData, 'npm', 'codex.cmd'),
-      join(appData, 'npm', 'codex.exe'),
-      join(localApp, 'Programs', 'ChatGPT', 'resources', 'codex-cli', 'codex.exe'),
-      join(localApp, 'Programs', 'Codex', 'resources', 'codex.exe'),
-    )
-  }
-  return list
 }
 
 function defaultCheckBin(names, candidates) {

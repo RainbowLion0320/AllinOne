@@ -19,16 +19,7 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
-
-const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
-const RELEASES_URL = String(import.meta.env.VITE_RELEASES_URL || '').trim() || DEFAULT_RELEASES_URL
-const CONFIGURED_APK_URL = String(import.meta.env.VITE_APK_URL || '').trim()
-
-function resolveApkUrl(base) {
-  if (!CONFIGURED_APK_URL) return ''
-  if (/^https?:\/\//i.test(CONFIGURED_APK_URL)) return CONFIGURED_APK_URL
-  return `${base}/${CONFIGURED_APK_URL.replace(/^\/+/, '')}`
-}
+import { RELEASES_URL, copyTextToClipboard, resolveApkUrl } from '../lib/clientHelpers.js'
 
 function formatTimeShort(ts) {
   if (!ts) return ''
@@ -42,21 +33,6 @@ function formatTimeShort(ts) {
   } catch {
     return ''
   }
-}
-
-async function copyClipboard(text) {
-  try {
-    await navigator.clipboard.writeText(text)
-    return
-  } catch {}
-  const ta = document.createElement('textarea')
-  ta.value = text
-  ta.style.position = 'fixed'
-  ta.style.opacity = '0'
-  document.body.appendChild(ta)
-  ta.select()
-  try { document.execCommand('copy') } catch {}
-  document.body.removeChild(ta)
 }
 
 export function InviteManagerModal({ open, onClose, baseUrl, token }) {
@@ -106,7 +82,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   if (!open) return null
 
   const doCopy = async (key, text) => {
-    await copyClipboard(text)
+    await copyTextToClipboard(text)
     setCopiedKey(key)
     setTimeout(() => setCopiedKey((cur) => (cur === key ? '' : cur)), 1800)
   }
@@ -245,7 +221,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         <span className="truncate text-[10.5px] text-slate-400">{u.email}</span>
                       )}
                       {u.role === 'admin' && (
-                        <span className="shrink-0 rounded bg-[#4D6BFE]/15 px-1.5 py-0.2 text-[10px] font-semibold text-[#4D6BFE]">
+                        <span className="shrink-0 rounded bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE]">
                           {t('common.admin')}
                         </span>
                       )}

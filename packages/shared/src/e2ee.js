@@ -32,9 +32,11 @@ export function isE2eeCryptoAvailable() {
 }
 
 function toUint8Array(x) {
-  return ArrayBuffer.isView(x)
-    ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength)
-    : new Uint8Array(x)
+  if (x instanceof Uint8Array && x.constructor === Uint8Array) return x
+  if (ArrayBuffer.isView(x)) {
+    return new Uint8Array(x.buffer, x.byteOffset, x.byteLength)
+  }
+  return new Uint8Array(x)
 }
 
 export function bytesToBase64(bytes) {
@@ -69,20 +71,25 @@ export function bytesToBase64Url(bytes) {
   return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-export function base64UrlToBytes(str) {
-  if (typeof str !== 'string') return null
-  const clean = str.trim()
-  if (!clean || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) return null
-  const hasPadding = clean.includes('=')
-  if (hasPadding) {
-    if (clean.length % 4 !== 0) return null
-  } else if (clean.length % 4 === 1) {
-    return null
-  }
-  const std = clean.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = hasPadding ? std : `${std}${'='.repeat((4 - (std.length % 4)) % 4)}`
+export function base64UrlToBytes(str, expectedByteLength) {
+  if (typeof str !== 'string' || !str) return null
+  if (/\s/.test(str)) return null
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(str)) return null
+  const eqIdx = str.indexOf('=')
+  if (eqIdx !== -1 && str.length % 4 !== 0) return null
+  const unpadded = eqIdx !== -1 ? str.slice(0, eqIdx) : str
+  if (!unpadded || unpadded.length % 4 === 1) return null
+  const std = unpadded.replace(/-/g, '+').replace(/_/g, '/')
+  const padLen = (4 - (std.length % 4)) % 4
+  if (eqIdx !== -1 && str.length - eqIdx !== padLen) return null
+  const expectedLen =
+    Math.floor(unpadded.length / 4) * 3 +
+    (unpadded.length % 4 === 2 ? 1 : unpadded.length % 4 === 3 ? 2 : 0)
+  if (Number.isInteger(expectedByteLength) && expectedLen !== expectedByteLength) return null
   try {
-    return base64ToBytes(padded)
+    const bytes = base64ToBytes(`${std}${'='.repeat(padLen)}`)
+    if (bytes.byteLength !== expectedLen) return null
+    return bytes
   } catch {
     return null
   }
@@ -198,13 +205,8 @@ export async function decryptBytes(rawKeyStr, cipherBytes, { iv, kid = '', kind 
     err.expectedKeyId = String(kid)
     throw err
   }
-  if (typeof iv !== 'string' || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(iv)) {
-    const err = new Error('端到端密文 IV 无效')
-    err.code = 'E2EE_DECRYPT_FAILED'
-    throw err
-  }
-  const ivBytes = base64UrlToBytes(iv)
-  if (!ivBytes || ivBytes.byteLength !== E2EE_IV_BYTES) {
+  const ivBytes = typeof iv === 'string' ? base64UrlToBytes(iv, E2EE_IV_BYTES) : null
+  if (!ivBytes || ivBytes.byteLength !== E2EE_IV_BYTES || bytesToBase64Url(ivBytes) !== iv) {
     const err = new Error('端到端密文 IV 无效')
     err.code = 'E2EE_DECRYPT_FAILED'
     throw err
@@ -484,9 +486,9 @@ export async function decryptGrantPayload({
     reqFp,
     appFp,
   })
-  const ivBytes = base64UrlToBytes(envelope.iv)
+  const ivBytes = typeof envelope.iv === 'string' ? base64UrlToBytes(envelope.iv, E2EE_IV_BYTES) : null
   const ctBytes = base64UrlToBytes(envelope.ct)
-  if (!ivBytes || ivBytes.byteLength !== E2EE_IV_BYTES || !ctBytes || ctBytes.byteLength < 16) {
+  if (!ivBytes || ivBytes.byteLength !== E2EE_IV_BYTES || bytesToBase64Url(ivBytes) !== envelope.iv || !ctBytes || ctBytes.byteLength < 16) {
     const err = new Error('授权密文格式损坏')
     err.code = 'E2EE_GRANT_DECRYPT_FAILED'
     throw err

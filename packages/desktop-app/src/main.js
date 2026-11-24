@@ -275,6 +275,14 @@ function sendMenuAction(action) {
   }
 }
 
+function triggerCheckForUpdatesFromMenu() {
+  sendMenuAction('settings')
+  const curStatus = updater.getState().status
+  if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
+    void updater.checkForUpdates()
+  }
+}
+
 function createMainWindow({ showOnReady = true } = {}) {
   const bounds = loadWindowBounds()
   const iconPath = join(BUILD_DIR, 'icon.png')
@@ -421,13 +429,7 @@ function refreshTrayMenu() {
         updState.status === 'available' || updState.status === 'downloaded'
           ? bi(`发现新版本 v${updState.latestVersion}`, `Update Available (v${updState.latestVersion})`)
           : bi('检查更新...', 'Check for Updates...'),
-      click: () => {
-        sendMenuAction('settings')
-        const curStatus = updater.getState().status
-        if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
-          void updater.checkForUpdates()
-        }
-      },
+      click: triggerCheckForUpdatesFromMenu,
     },
     { type: 'separator' },
     {
@@ -481,13 +483,7 @@ function buildAppMenu() {
               { role: 'about', label: bi('关于 All in One', 'About All in One') },
               {
                 label: bi('检查更新...', 'Check for Updates...'),
-                click: () => {
-                  sendMenuAction('settings')
-                  const curStatus = updater.getState().status
-                  if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
-                    void updater.checkForUpdates()
-                  }
-                },
+                click: triggerCheckForUpdatesFromMenu,
               },
               { type: 'separator' },
               { label: bi('设置...', 'Settings...'), accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
@@ -515,13 +511,7 @@ function buildAppMenu() {
         { label: bi('设置...', 'Settings...'), accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('settings') },
         {
           label: bi('检查更新...', 'Check for Updates...'),
-          click: () => {
-            sendMenuAction('settings')
-            const curStatus = updater.getState().status
-            if (curStatus !== 'downloading' && curStatus !== 'downloaded' && curStatus !== 'installing') {
-              void updater.checkForUpdates()
-            }
-          },
+          click: triggerCheckForUpdatesFromMenu,
         },
         { type: 'separator' },
         isMac

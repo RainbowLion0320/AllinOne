@@ -279,7 +279,11 @@ function matchesScope(record, scopeOrPrefix, prefix = false) {
       recKey.startsWith(`${scopeOrPrefix}::`)
     )
   }
-  return recScope === scopeOrPrefix || recKey.startsWith(`${scopeOrPrefix}::`)
+  if (record?.scope !== undefined) {
+    return recScope === scopeOrPrefix
+  }
+  if (!recKey.startsWith(`${scopeOrPrefix}::`)) return false
+  return !recKey.slice(scopeOrPrefix.length + 2).includes('::')
 }
 
 export async function getSessionCacheStats(scope = '') {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Prepares icons, bundled renderer UI, and embedded portable PC bridge for @allinone/desktop-app.
- * Works on macOS (generates .icns + .ico + tray PNGs) and Windows/Linux (.ico + tray PNGs).
+ * Works on macOS (generates .icns + tray PNGs) and Windows/Linux (icon.png + tray PNGs).
  */
 
 import { execFileSync } from 'node:child_process'
@@ -128,35 +128,6 @@ function renderTrayTemplatePng(size) {
   return encodeRgbaPng(size, size, rgba)
 }
 
-/**
- * Wrap PNG buffers into a valid Windows .ico file (PNG-compressed entries supported since Vista+).
- */
-function buildIcoFromPngBuffers(entries) {
-  const count = entries.length
-  const header = Buffer.alloc(6 + count * 16)
-  header.writeUInt16LE(0, 0) // reserved
-  header.writeUInt16LE(1, 2) // type: ICO
-  header.writeUInt16LE(count, 4)
-
-  let offset = header.length
-  const chunks = [header]
-  for (let i = 0; i < count; i += 1) {
-    const { size, buf } = entries[i]
-    const entryOff = 6 + i * 16
-    header[entryOff] = size >= 256 ? 0 : size
-    header[entryOff + 1] = size >= 256 ? 0 : size
-    header[entryOff + 2] = 0 // color palette
-    header[entryOff + 3] = 0 // reserved
-    header.writeUInt16LE(1, entryOff + 4) // planes
-    header.writeUInt16LE(32, entryOff + 6) // bit count
-    header.writeUInt32LE(buf.length, entryOff + 8)
-    header.writeUInt32LE(offset, entryOff + 12)
-    offset += buf.length
-    chunks.push(buf)
-  }
-  return Buffer.concat(chunks)
-}
-
 function resizePngWithSips(srcPath, destPath, size) {
   execFileSync('sips', ['-z', String(size), String(size), srcPath, '--out', destPath], {
     stdio: 'ignore',
@@ -165,6 +136,7 @@ function resizePngWithSips(srcPath, destPath, size) {
 
 function generateIcons() {
   mkdirSync(BUILD_DIR, { recursive: true })
+  rmSync(join(BUILD_DIR, 'icon.ico'), { force: true })
   const srcIcon512 = join(MOBILE_PUBLIC, 'icon-512.png')
   if (!existsSync(srcIcon512)) {
     throw new Error(`Missing source app icon: ${srcIcon512}`)
@@ -200,20 +172,8 @@ function generateIcons() {
 
     // Windows tray icon (32x32 color PNG)
     resizePngWithSips(srcIcon512, join(BUILD_DIR, 'tray-icon.png'), 32)
-
-    // Multi-resolution Windows .ico (16, 32, 48, 64, 128, 256)
-    const icoSizes = [16, 32, 48, 64, 128, 256]
-    const icoEntries = icoSizes.map((sz) => {
-      const tmp = join(iconsetDir, `ico_${sz}.png`)
-      resizePngWithSips(srcIcon512, tmp, sz)
-      return { size: sz, buf: readFileSync(tmp) }
-    })
-    writeFileSync(join(BUILD_DIR, 'icon.ico'), buildIcoFromPngBuffers(icoEntries))
     rmSync(iconsetDir, { recursive: true, force: true })
   } else {
-    // Fallback on non-macOS hosts: embed 512px PNG into .ico (>=256x256 required by electron-builder) and 192px for tray
-    const icoEntries = [{ size: 256, buf: readFileSync(srcIcon512) }]
-    writeFileSync(join(BUILD_DIR, 'icon.ico'), buildIcoFromPngBuffers(icoEntries))
     const src192 = join(MOBILE_PUBLIC, 'icon-192.png')
     copyFileSync(existsSync(src192) ? src192 : srcIcon512, join(BUILD_DIR, 'tray-icon.png'))
   }
@@ -252,8 +212,8 @@ function stageRendererAndBridge() {
   rmSync(RENDERER_DIR, { recursive: true, force: true })
   mkdirSync(RENDERER_DIR, { recursive: true })
 
-  // Copy ONLY clean UI runtime files (never copy APKs, wallpapers, SW precache, or installer downloads into desktop asar)
-  const copyItems = ['index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'icon.svg', 'assets']
+  // Copy ONLY clean UI runtime files (skip PWA-only manifest/icons, SW precache, APKs, or installer downloads)
+  const copyItems = ['index.html', 'icon-192.png', 'assets']
   for (const item of copyItems) {
     const src = join(MOBILE_DIST, item)
     if (existsSync(src)) {
@@ -261,13 +221,12 @@ function stageRendererAndBridge() {
     }
   }
 
-  // Strip VitePWA registerSW.js tag from desktop renderer index.html so Electron doesn't try to register a service worker on app://
+  // Strip PWA-only tags from desktop renderer index.html so Electron never requests registerSW/manifest/apple-touch-icon on app://
   const indexPath = join(RENDERER_DIR, 'index.html')
   if (existsSync(indexPath)) {
-    const html = readFileSync(indexPath, 'utf8').replace(
-      /<script[^>]+registerSW\.js[^>]*><\/script>\s*/gi,
-      '',
-    )
+    const html = readFileSync(indexPath, 'utf8')
+      .replace(/<script[^>]+registerSW\.js[^>]*><\/script>\s*/gi, '')
+      .replace(/<link[^>]+rel=["'](?:manifest|apple-touch-icon)["'][^>]*>\s*/gi, '')
     writeFileSync(indexPath, html, 'utf8')
   }
 

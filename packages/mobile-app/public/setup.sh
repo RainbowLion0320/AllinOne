@@ -33,14 +33,14 @@ if [ -z "${NODE_BIN}" ]; then
 fi
 
 if [ -z "${NODE_BIN}" ]; then
-  echo "[!] Node.js (v18+) not found. Please install it from https://nodejs.org/ (or brew install node) and re-run."
+  echo "[!] Node.js v20+ (Node 22 LTS recommended) not found. Please install it from https://nodejs.org/ (or brew install node) and re-run."
   exit 1
 fi
 
 NODE_VER="$("${NODE_BIN}" -v)"
 NODE_MAJOR="$(echo "${NODE_VER}" | sed -E 's/^v([0-9]+).*/\1/')"
-if [ "${NODE_MAJOR}" -lt 18 ]; then
-  echo "[!] Found Node.js ${NODE_VER}, but v18+ is required. Please upgrade Node.js."
+if [ "${NODE_MAJOR}" -lt 20 ]; then
+  echo "[!] Found Node.js ${NODE_VER}, but Node.js v20+ (Node 22 LTS recommended) is required. Please upgrade Node.js."
   exit 1
 fi
 echo "[1/3] Node.js ready: ${NODE_VER} (${NODE_BIN})"

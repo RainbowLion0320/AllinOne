@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
-import { renderQrSvg } from './src/helpers/qr-svg.js'
+import { renderQrSvg } from '../shared/src/qr-svg.js'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
 import { ensureDshLocalIpcPlugin } from './src/helpers/dsh-ipc-installer.js'
 import {
@@ -30,8 +30,7 @@ import {
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const CONFIGURED_APK_URL = String(process.env.ALLINONE_APK_URL || '').trim()
-const BRIDGE_VERSION = '0.5.0'
+const BRIDGE_VERSION = '0.5.1'
 
 function normalizeServerUrl(raw) {
   const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
@@ -311,6 +310,10 @@ async function interactiveAccountLogin(serverUrl, label) {
           continue
         }
         bound = await loginDeviceWithAccount(serverUrl, { username, password, label, emailCode: otp })
+        if (bound?.requires2fa || !bound?.ok) {
+          console.log('  [!] 邮箱验证码验证未通过，请重试。\n')
+          continue
+        }
       }
       console.log(`  ✓ 绑定成功！欢迎 @${bound.username}（设备标识: ${bound.bridgeId}）`)
       return bound
@@ -473,11 +476,48 @@ async function main() {
 
   if (opts.username && opts.password) {
     console.log(`[allinone] 正在使用账号 @${opts.username} 绑定本机到 ${opts.server}...`)
-    const bound = await loginDeviceWithAccount(opts.server, {
+    let bound = await loginDeviceWithAccount(opts.server, {
       username: opts.username,
       password: opts.password,
       label: opts.label,
     })
+    if (bound?.requires2fa) {
+      if (!process.stdin.isTTY) {
+        throw new Error('该账号已开启登录邮箱二次验证，请在交互终端运行并输入验证码')
+      }
+      console.log(`[allinone] [2FA] ${bound.message || `已向 ${bound.maskedEmail || '绑定邮箱'} 发送 6 位登录验证码`}`)
+      let verified = null
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        const emailCode = await promptText('  邮箱验证码: ')
+        if (!emailCode) {
+          console.log('  [!] 验证码不能为空，请重试。')
+          continue
+        }
+        try {
+          const next = await loginDeviceWithAccount(opts.server, {
+            username: opts.username,
+            password: opts.password,
+            label: opts.label,
+            emailCode,
+          })
+          if (next?.requires2fa) {
+            console.log(`  [!] 验证码校验未完成，请重试 (第 ${attempt}/5 次)`)
+            continue
+          }
+          verified = next
+          break
+        } catch (err) {
+          console.error(`  [!] ${String(err?.message || err)} (第 ${attempt}/5 次)`)
+        }
+      }
+      if (!verified) {
+        throw new Error('邮箱验证码验证失败，请稍后重试。')
+      }
+      bound = verified
+    }
+    if (!bound?.ok || !bound?.roomId || !bound?.deviceSecret) {
+      throw new Error(bound?.error || '账号登录绑定未返回有效的设备凭证')
+    }
     await bindAndSaveAccount(bound)
   } else if (cfg && String(cfg.roomId || '').startsWith('usr_')) {
     console.log(`[allinone] 已加载本机账号绑定 @${cfg.username || cfg.roomId} (${cfg.bridgeId})...`)

@@ -31,8 +31,11 @@ jobs:
       - name: Build portable bridge & frontend
         run: npm run build
 
-      - name: Verify portable bridge asset
-        run: test -s packages/mobile-app/dist/downloads/allinone-bridge.mjs
+      - name: Verify portable bridge & setup scripts
+        run: |
+          test -s packages/mobile-app/dist/downloads/allinone-bridge.mjs
+          test -s packages/mobile-app/dist/setup.sh
+          node -e "const fs = require('fs'); if (fs.readFileSync('packages/mobile-app/dist/setup.sh').includes(13)) { console.error('setup.sh contains CR bytes'); process.exit(1); }"
 
       - name: Run end-to-end smoke & security tests
         run: npm run test:smoke
@@ -47,5 +50,5 @@ jobs:
       - name: Build Docker image
         run: docker build -f deploy/Dockerfile -t allinone-relay:ci .
 
-      - name: Verify built bridge exists in image
-        run: docker run --rm --entrypoint sh allinone-relay:ci -c "test -s /app/packages/mobile-app/dist/downloads/allinone-bridge.mjs && test -s /app/packages/mobile-app/dist/index.html"
+      - name: Verify built assets exist in image
+        run: docker run --rm --entrypoint sh allinone-relay:ci -c "test -s /app/packages/mobile-app/dist/downloads/allinone-bridge.mjs && test -s /app/packages/mobile-app/dist/index.html && test -s /app/packages/mobile-app/dist/setup.sh"

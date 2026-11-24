@@ -30,11 +30,7 @@ import {
 import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
 import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { useI18n } from '../lib/i18n.jsx'
-
-const REPO_URL = 'https://github.com/RainbowLion0320/AllinOne'
-const RELEASES_URL =
-  String(import.meta.env.VITE_RELEASES_URL || '').trim() ||
-  'https://github.com/RainbowLion0320/AllinOne/releases/latest'
+import { RELEASES_URL, REPO_URL } from '../lib/clientHelpers.js'
 
 function ToggleSwitch({ checked, onChange, disabled = false, label }) {
   return (
@@ -63,7 +59,6 @@ export function SettingsModal({
   onClose,
   activeDevice = null,
   activeDeviceName = '',
-  isAccountMode = false,
   isAdmin = false,
   emailEnabled = false,
   connState = 'disconnected',
@@ -108,11 +103,18 @@ export function SettingsModal({
   const [confirmLogout, setConfirmLogout] = useState(false)
 
   useEffect(() => {
+    if (!open) {
+      setShowEmailForm(false)
+      setEmailDraft('')
+      setEmailCodeDraft('')
+      setEmailInfo('')
+      setEmailError('')
+      setConfirmLogout(false)
+    }
+  }, [open])
+
+  useEffect(() => {
     if (!open) return
-    setShowEmailForm(false)
-    setConfirmLogout(false)
-    setEmailInfo('')
-    setEmailError('')
     getSessionCacheStats(cacheScope).then(setCacheStats).catch(() => {})
   }, [open, cacheScope])
 
@@ -129,7 +131,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '0.5.0'
+    '0.5.1'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -310,7 +312,7 @@ export function SettingsModal({
                 )}
               </div>
 
-              {isAccountMode && (
+              {activeDevice && (
                 <div className="border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
@@ -401,7 +403,7 @@ export function SettingsModal({
                 </div>
               )}
 
-              {isAccountMode && emailEnabled && boundEmail && onToggleLogin2fa && (
+              {activeDevice && emailEnabled && boundEmail && onToggleLogin2fa && (
                 <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
                   <div className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                     <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
@@ -415,7 +417,7 @@ export function SettingsModal({
                 </div>
               )}
 
-              {isAccountMode && onOpenE2eeSync && (
+              {activeDevice && onOpenE2eeSync && (
                 <button
                   type="button"
                   onClick={() => {

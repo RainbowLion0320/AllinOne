@@ -80,7 +80,7 @@ docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite cr
 docker compose restart allinone-relay
 ```
 
-Then follow **1. Install the Client** above to register your admin account. Additional single-use invite codes can be created and revoked directly inside the app UI.
+Then follow **1. Install the Client** above to register your admin account. Additional single-use invite codes can be created and revoked directly inside the app UI, and admins can visit **`https://your-server/admin`** (or open **Settings → Server Monitoring Dashboard** in the app) to inspect online users, computer bridges, connected terminals, and a live server resource snapshot on demand (zero extra processes or background polling overhead).
 
 <details>
 <summary>Optional: Enable free email binding & self-service password reset (SMTP / Resend)</summary>
@@ -100,6 +100,18 @@ SMTP_FROM=All in One <your-email@gmail.com>
 
 </details>
 
+<details>
+<summary>Common admin CLI commands</summary>
+
+```bash
+npm run admin -- invite create --count 3 --note "for friend"
+npm run admin -- invite list
+npm run admin -- invite revoke INV-XXXX-XXXX
+npm run admin -- users
+```
+
+</details>
+
 ---
 
 ## Supported Agents
@@ -109,7 +121,7 @@ SMTP_FROM=All in One <your-email@gmail.com>
 | **Codex** | `codex app-server --stdio` | Read/write sessions, model & reasoning switching, interrupt | Auto-discovers PATH & macOS `ChatGPT.app` bundled CLI |
 | **Claude Code** | `claude -p --resume --output-format stream-json` | Read/write `~/.claude/projects/` sessions, model switching, interrupt | Reuses local login |
 | **Antigravity** | `agy acp --app-data-dir antigravity` | Shared desktop history & auth, model & effort switching, background tasks | Syncs Desktop updates live to All in One; after sending turns remotely to an already-open Desktop thread, restart `Antigravity.app` before resuming that thread natively |
-| **DeepSeek Harness** | Native Cordis plugin (`dsh-mobile-hub`) | Read/write & model switching as plugin; read-only history standalone | Plugin setup in Developer Guide below |
+| **DeepSeek Harness** | Auto-installed local IPC plugin (`allinone-dsh-ipc`) / native plugin (`dsh-mobile-hub`) | Out-of-the-box read/write & model switching while DSH Desktop is running; read-only history fallback when DSH is closed | Zero-terminal auto-install when `~/.dsh/profiles/desktop` is detected (set `ALLINONE_NO_AUTOFIX=1` to disable) |
 
 - **Multi-Device Control**: Sign in with the same account on phones and desktops to operate any of your online computers.
 - **Zero-Knowledge End-to-End Encryption (E2EE)**: Each desktop bridge automatically generates a random 256-bit key (stored in OS Keychain / DPAPI). All prompts, streaming replies, attachments, and local image previews are encrypted with `AES-256-GCM` end-to-end so the relay server only forwards opaque ciphertext; sync new phones via offline QR scan.
@@ -182,12 +194,41 @@ You can also run **Actions → Build Desktop Installers → Run workflow** on yo
 </details>
 
 <details>
-<summary>3. Capacitor mobile shell, DSH plugin & smoke tests</summary>
+<summary>3. Capacitor Android shell, DeepSeek Harness plugin & environment variables</summary>
 
-- **Capacitor**: Update `server.url` in `packages/mobile-app/capacitor.config.json`, then run `npm run build && npx cap sync android`.
-- **DeepSeek Harness plugin**: Copy `packages/dsh-mobile-hub/cordis.patch.example.yml` to `cordis.patch.yml`, link `dsh-mobile-hub` in `~/.dsh/profiles/desktop/package.json`, and restart DSH.
-- **Disable background CLI completion**: Set `ALLINONE_NO_AUTOFIX=1`.
-- **Run smoke & security tests**: `npm run test:smoke`.
+- **Capacitor Android shell**: Update `server.url` in `packages/mobile-app/capacitor.config.json` to your HTTPS URL, then run:
+  ```bash
+  cd packages/mobile-app
+  npm run build
+  npx cap add android   # first-time Android project setup
+  npx cap sync android
+  npx cap open android
+  ```
+- **DeepSeek Harness local IPC & manual plugin mode**: When All in One Desktop / PC Bridge detects DeepSeek Harness (`~/.dsh/profiles/desktop`), it automatically installs the zero-dependency loopback IPC plugin `allinone-dsh-ipc` (`127.0.0.1` + 256-bit Bearer token) so read/write and model switching work out of the box with zero terminal setup while DSH Desktop is running. For advanced manual integration with the full `dsh-mobile-hub` plugin, copy `packages/dsh-mobile-hub/cordis.patch.example.yml` to `cordis.patch.yml`, link `dsh-mobile-hub` in `~/.dsh/profiles/desktop/package.json` under `dsh.profile.bundles`, and restart DSH.
+- **Disable background CLI completion & DSH local IPC auto-install**: Set `ALLINONE_NO_AUTOFIX=1`.
+
+</details>
+
+<details>
+<summary>4. Repository layout & smoke tests</summary>
+
+```text
+AllinOne/
+├── packages/
+│   ├── shared/          # Shared protocol, E2EE & offline QR SVG (protocol.js, e2ee.js, qr-svg.js)
+│   ├── relay-server/    # Relay gateway, account/invite store, /admin dashboard & static hosting
+│   ├── dsh-mobile-hub/  # 4 AI agent adapters, CLI auto-completion & portable bridge CLI
+│   ├── mobile-app/      # React + Tailwind + Vite PWA frontend
+│   └── desktop-app/     # Electron desktop app & DMG/NSIS installer packaging
+├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
+├── scripts/             # Portable bridge bundler & end-to-end smoke test suite
+└── .github/workflows/   # CI checks & desktop release workflows
+```
+
+Run end-to-end smoke & security tests:
+```bash
+npm run test:smoke
+```
 
 </details>
 

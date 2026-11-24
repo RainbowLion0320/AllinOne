@@ -1,9 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { APP_LIST, APP_META } from '@allinone/shared'
 import { ChevronRight, FolderOpen, Loader2, SlidersHorizontal, Sparkles, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel } from './VendorIcon.jsx'
-import { ModelPickerSheet } from './ModelPickerSheet.jsx'
 import { useI18n } from '../lib/i18n.jsx'
+
+const ModelPickerSheet = React.lazy(() =>
+  import('./ModelPickerSheet.jsx').then((m) => ({ default: m.ModelPickerSheet })),
+)
 
 export function NewChatModal({
   open,
@@ -21,6 +24,7 @@ export function NewChatModal({
   const [cwd, setCwd] = useState(initialCwd || '')
   const [title, setTitle] = useState('')
   const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState('')
 
   const [model, setModel] = useState('')
   const [provider, setProvider] = useState('')
@@ -29,6 +33,8 @@ export function NewChatModal({
   const prevOpenRef = useRef(false)
   const prevScopeKeyRef = useRef(scopeKey)
   const userClearedCwdRef = useRef(false)
+  const userPickedModelRef = useRef(false)
+  const syncedModelAppRef = useRef('')
   const cwdRef = useRef(cwd)
   cwdRef.current = cwd
   const appRef = useRef(app)
@@ -51,13 +57,20 @@ export function NewChatModal({
     prevOpenRef.current = open
     if (!open) {
       userClearedCwdRef.current = false
+      userPickedModelRef.current = false
+      syncedModelAppRef.current = ''
       setCwd('')
+      setTitle('')
+      setCreateError('')
       setPickerOpen(false)
       return
     }
 
     if (justOpened) {
       userClearedCwdRef.current = false
+      userPickedModelRef.current = false
+      syncedModelAppRef.current = ''
+      setCreateError('')
       setPickerOpen(false)
       if (initialCwd) {
         setCwd(initialCwd)
@@ -85,9 +98,15 @@ export function NewChatModal({
     }
   }, [open, initialApp, initialCwd, workspaces, appsStatus])
 
-  // Sync default model/provider/effort whenever app switches or catalog arrives
+  // Sync default model/provider/effort whenever app switches or catalog arrives (never clobber user's manual pick)
   useEffect(() => {
     if (!open) return
+    const appChanged = syncedModelAppRef.current !== app
+    if (!appChanged && userPickedModelRef.current) return
+    syncedModelAppRef.current = app
+    if (appChanged) {
+      userPickedModelRef.current = false
+    }
     const defModel = appCatalog?.defaultModel || appModels[0]?.id || ''
     const defProvider = appCatalog?.defaultProvider || ''
     const matched =
@@ -118,6 +137,7 @@ export function NewChatModal({
   const handleSubmit = async (e) => {
     e.preventDefault()
     setCreating(true)
+    setCreateError('')
     try {
       await onCreate({
         app,
@@ -130,7 +150,7 @@ export function NewChatModal({
       setTitle('')
       onClose()
     } catch (err) {
-      alert(String(err?.message || err))
+      setCreateError(String(err?.message || err))
     } finally {
       setCreating(false)
     }
@@ -259,7 +279,10 @@ export function NewChatModal({
                         <button
                           key={eff}
                           type="button"
-                          onClick={() => setReasoningEffort(eff)}
+                          onClick={() => {
+                            userPickedModelRef.current = true
+                            setReasoningEffort(eff)
+                          }}
                           className={`rounded-lg px-2.5 py-1 text-[11.5px] font-semibold transition active:scale-95 ${
                             active
                               ? 'bg-[#4D6BFE] text-white shadow-2xs'
@@ -325,6 +348,12 @@ export function NewChatModal({
               />
             </div>
 
+            {createError && (
+              <div className="rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
+                {createError}
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={creating}
@@ -337,19 +366,23 @@ export function NewChatModal({
         </div>
       </div>
 
-      <ModelPickerSheet
-        open={pickerOpen}
-        app={app}
-        catalog={appCatalog}
-        value={{ model, provider, reasoningEffort }}
-        mode="newchat"
-        onClose={() => setPickerOpen(false)}
-        onApply={(next) => {
-          setModel(next.model || '')
-          setProvider(next.provider || '')
-          setReasoningEffort(next.reasoningEffort || '')
-        }}
-      />
+      <Suspense fallback={null}>
+        {pickerOpen && (
+          <ModelPickerSheet
+            open={pickerOpen}
+            app={app}
+            catalog={appCatalog}
+            value={{ model, provider, reasoningEffort }}
+            onClose={() => setPickerOpen(false)}
+            onApply={(next) => {
+              userPickedModelRef.current = true
+              setModel(next.model || '')
+              setProvider(next.provider || '')
+              setReasoningEffort(next.reasoningEffort || '')
+            }}
+          />
+        )}
+      </Suspense>
     </>
   )
 }

@@ -12,7 +12,6 @@ const I18nContext = createContext({
   lang: 'zh',
   isEn: false,
   setLang: () => {},
-  toggleLang: () => {},
   t: (key, params) => translate('zh', key, params),
   bi: (zh) => zh,
 })
@@ -41,24 +40,15 @@ export function I18nProvider({ children }) {
     setLangState(normalized)
   }, [])
 
-  const toggleLang = useCallback(() => {
-    setLangState((prev) => {
-      const next = prev === 'en' ? 'zh' : 'en'
-      saveLang(next)
-      return next
-    })
-  }, [])
-
   const value = useMemo(
     () => ({
       lang,
       isEn: lang === 'en',
       setLang,
-      toggleLang,
       t: (key, params) => translate(lang, key, params),
       bi: (zh, en) => biHelper(lang, zh, en),
     }),
-    [lang, setLang, toggleLang],
+    [lang, setLang],
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

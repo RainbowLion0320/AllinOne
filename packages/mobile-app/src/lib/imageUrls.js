@@ -87,8 +87,13 @@ export function resolveImageSrc(item, { baseUrl = '', mediaToken = '' } = {}) {
   return ''
 }
 
-export function buildDownloadUrl(src) {
-  return src || ''
+export function isRelayUploadTarget(target) {
+  const s = String(target || '').trim()
+  if (!s) return false
+  if (s.startsWith('/api/uploads/')) return true
+  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(s)) return true
+  if (/^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(s)) return true
+  return false
 }
 
 /**
@@ -203,9 +208,10 @@ export function extractImageRefsFromText(text) {
     const key = normalizeImageKey(clean)
     if (!key || seen.has(key)) return
     seen.add(key)
+    const isUrlRef = /^https?:\/\/|^data:|^blob:|^\/api\//i.test(clean) || isRelayUploadTarget(clean)
     out.push({
-      path: /^https?:\/\/|^data:|^blob:|^\/api\//i.test(clean) ? undefined : clean,
-      url: /^https?:\/\/|^data:|^blob:|^\/api\//i.test(clean) ? clean : undefined,
+      path: isUrlRef ? undefined : clean,
+      url: isUrlRef ? clean : undefined,
       raw: clean,
       name: label || getImageLabel(clean),
     })

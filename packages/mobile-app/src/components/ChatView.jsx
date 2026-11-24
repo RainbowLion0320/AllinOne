@@ -20,7 +20,7 @@ import {
 } from 'lucide-react'
 import { MarkdownView } from '../lib/markdown.jsx'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
-import { ChatImageGallery } from './ImageLightbox.jsx'
+import { ChatImageGallery } from './ChatImageGallery.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
 import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { useI18n } from '../lib/i18n.jsx'
@@ -239,11 +239,18 @@ function mergeAssistantRuns(messages) {
       const nextText = [prev.text, msg.text].filter(Boolean).join('\n\n')
       const nextTools = mergeUniqueTools(prev.tools, msg.tools)
       const nextImages = mergeUniqueImages(prev.images, msg.images)
+      const prevToolCount = Number(prev.toolCount) || (Array.isArray(prev.tools) ? prev.tools.length : 0)
+      const msgToolCount = Number(msg.toolCount) || (Array.isArray(msg.tools) ? msg.tools.length : 0)
+      const nextToolCount =
+        prev.toolCount != null || msg.toolCount != null
+          ? Math.max(nextTools.length, prevToolCount + msgToolCount)
+          : undefined
       merged[merged.length - 1] = {
         ...prev,
         text: nextText,
         thinking: nextThinking || undefined,
         tools: nextTools.length > 0 ? nextTools : undefined,
+        ...(nextToolCount !== undefined ? { toolCount: nextToolCount } : {}),
         images: nextImages.length > 0 ? nextImages : undefined,
         ts: msg.ts || prev.ts,
       }
@@ -309,7 +316,6 @@ export function ChatView({
   olderError = '',
   prependSeq = 0,
   sessionOpenSeq = 0,
-  totalHistoryCount = null,
   onLoadOlder,
   appsStatus,
   activeApp = 'dsh',
@@ -354,49 +360,42 @@ export function ChatView({
 
   useEffect(() => cancelPendingRafs, [])
 
-  const meta = APP_META[session?.app || 'dsh'] || APP_META.dsh
   const displayMessages = useMemo(() => mergeAssistantRuns(messages), [messages])
+  const streamingImages = useMemo(
+    () => (streamingState?.active && streamingState?.text ? extractImageRefsFromText(streamingState.text) : []),
+    [streamingState?.active, streamingState?.text],
+  )
 
-  const captureVisibleAnchor = (forSeq = null) => {
+  const captureVisibleAnchor = () => {
     const el = scrollRef.current
     if (!el) return null
     const containerRect = el.getBoundingClientRect()
-    let msgId = ''
-    let relTop = 0
+    const anchors = []
     if (contentRef.current) {
       const nodes = contentRef.current.querySelectorAll('[data-msg-id]')
       for (const node of nodes) {
         const rect = node.getBoundingClientRect()
         if (rect.bottom >= containerRect.top) {
-          msgId = node.getAttribute('data-msg-id') || ''
-          relTop = rect.top - containerRect.top
-          break
+          const msgId = node.getAttribute('data-msg-id') || ''
+          if (msgId) anchors.push({ msgId, relTop: rect.top - containerRect.top })
+          if (anchors.length >= 3) break
         }
       }
-      if (!msgId && nodes.length > 0) {
-        const first = nodes[0]
-        msgId = first.getAttribute('data-msg-id') || ''
-        relTop = first.getBoundingClientRect().top - containerRect.top
+      if (anchors.length === 0 && nodes.length > 0) {
+        for (let i = 0; i < Math.min(3, nodes.length); i += 1) {
+          const node = nodes[i]
+          const msgId = node.getAttribute('data-msg-id') || ''
+          if (msgId) anchors.push({ msgId, relTop: node.getBoundingClientRect().top - containerRect.top })
+        }
       }
     }
     const snap = {
-      forSeq,
-      msgId,
-      relTop,
+      anchors,
       scrollHeight: el.scrollHeight,
       scrollTop: el.scrollTop,
     }
     anchorBeforePrependRef.current = snap
     return snap
-  }
-
-  // Capture the exact live visible message element right before React commits a prepend
-  if (
-    prependSeq !== lastAppliedPrependSeqRef.current &&
-    anchorBeforePrependRef.current?.forSeq !== prependSeq &&
-    scrollRef.current
-  ) {
-    captureVisibleAnchor(prependSeq)
   }
 
   const scrollToBottomImmediate = () => {
@@ -420,7 +419,7 @@ export function ChatView({
     const now = Date.now()
     if (now - loadCooldownRef.current < 320) return
     loadCooldownRef.current = now
-    captureVisibleAnchor(null)
+    captureVisibleAnchor()
     onLoadOlder()
   }
 
@@ -526,20 +525,23 @@ export function ChatView({
       anchorBeforePrependRef.current = null
       if (snap) {
         let restored = false
-        if (snap.msgId && contentRef.current) {
-          const escapedId =
-            typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-              ? CSS.escape(snap.msgId)
-              : String(snap.msgId).replace(/["\\]/g, '\\$&')
-          const anchorEl = contentRef.current.querySelector(`[data-msg-id="${escapedId}"]`)
-          if (anchorEl) {
-            const containerRect = el.getBoundingClientRect()
-            const nextRelTop = anchorEl.getBoundingClientRect().top - containerRect.top
-            const shift = nextRelTop - snap.relTop
-            if (Number.isFinite(shift) && Math.abs(shift) > 0.5) {
-              el.scrollTop = Math.max(0, el.scrollTop + shift)
+        if (Array.isArray(snap.anchors) && contentRef.current) {
+          for (const anchor of snap.anchors) {
+            const escapedId =
+              typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+                ? CSS.escape(anchor.msgId)
+                : String(anchor.msgId).replace(/["\\]/g, '\\$&')
+            const anchorEl = contentRef.current.querySelector(`[data-msg-id="${escapedId}"]`)
+            if (anchorEl) {
+              const containerRect = el.getBoundingClientRect()
+              const nextRelTop = anchorEl.getBoundingClientRect().top - containerRect.top
+              const shift = nextRelTop - anchor.relTop
+              if (Number.isFinite(shift) && Math.abs(shift) > 0.5) {
+                el.scrollTop = Math.max(0, el.scrollTop + shift)
+              }
+              restored = true
+              break
             }
-            restored = true
           }
         }
         if (!restored) {
@@ -611,7 +613,7 @@ export function ChatView({
       pinnedToBottomRef.current = false
     }
     if (loadingOlder) {
-      captureVisibleAnchor(null)
+      captureVisibleAnchor()
     }
     if (
       !pendingInitialScrollRef.current &&
@@ -909,10 +911,12 @@ export function ChatView({
                   {streamingState.text ? (
                     <>
                       <MarkdownView text={streamingState.text} streaming={true} imageContext={imageContext} />
-                      <ChatImageGallery
-                        images={extractImageRefsFromText(streamingState.text)}
-                        imageContext={imageContext}
-                      />
+                      {streamingImages.length > 0 && (
+                        <ChatImageGallery
+                          images={streamingImages}
+                          imageContext={imageContext}
+                        />
+                      )}
                     </>
                   ) : (
                     <div className="inline-flex items-center gap-2 py-1 text-sm text-slate-400">

@@ -246,3 +246,98 @@ export function spawnCrossPlatform(bin, args = [], options = {}) {
   }
   return spawn(bin, args, options)
 }
+
+/**
+ * Unified candidate executable paths for Antigravity CLI (`agy`).
+ */
+export function getAgyCandidates(home = homedir(), platform = process.platform, env = process.env, configuredBin = '') {
+  const list = [configuredBin, env?.AGY_BIN]
+  if (platform === 'win32') {
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(
+      join(localApp, 'agy', 'bin', 'agy.exe'),
+      join(home, '.local', 'bin', 'agy.exe'),
+      join(home, '.agy', 'bin', 'agy.exe'),
+      join(localApp, 'Programs', 'Antigravity', 'bin', 'agy.cmd'),
+      join(localApp, 'Programs', 'Antigravity', 'resources', 'app', 'bin', 'agy.cmd'),
+    )
+  } else {
+    list.push(
+      join(home, '.local', 'bin', 'agy'),
+      join(home, '.agy', 'bin', 'agy'),
+      join(home, '.antigravity', 'antigravity', 'bin', 'agy'),
+      join(home, '.antigravity', 'bin', 'agy'),
+      '/opt/homebrew/bin/agy',
+      '/usr/local/bin/agy',
+    )
+    if (platform === 'darwin') {
+      list.push(
+        '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
+        join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agy'),
+      )
+    }
+  }
+  return list.filter(Boolean)
+}
+
+/**
+ * Unified candidate executable paths for Claude Code CLI (`claude`).
+ */
+export function getClaudeCandidates(home = homedir(), platform = process.platform, env = process.env, configuredBin = '') {
+  const list = [configuredBin, env?.CLAUDE_BIN]
+  if (platform === 'win32') {
+    const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+    list.push(
+      join(home, '.local', 'bin', 'claude.exe'),
+      join(home, '.claude', 'local', 'claude.exe'),
+      join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+      join(appData, 'npm', 'claude.cmd'),
+    )
+  } else {
+    list.push(
+      join(home, '.local', 'bin', 'claude'),
+      join(home, '.claude', 'local', 'claude'),
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+    )
+  }
+  return list.filter(Boolean)
+}
+
+/**
+ * Unified candidate executable paths for OpenAI Codex CLI (`codex`).
+ */
+export function getCodexCandidates(home = homedir(), platform = process.platform, env = process.env, configuredBin = '') {
+  const list = [
+    configuredBin,
+    env?.CODEX_BIN,
+    join(home, '.codex', '.sandbox-bin', 'codex.exe'),
+    join(home, '.codex', '.sandbox-bin', 'codex'),
+  ]
+  if (platform === 'darwin') {
+    list.push(
+      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
+      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
+      join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
+      '/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex',
+      '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+      '/Applications/Codex.app/Contents/Resources/codex',
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'bin', 'codex'),
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex'),
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
+      '/Applications/Codex.app/Contents/Resources/bin/codex',
+      join(home, 'Applications', 'Codex.app', 'Contents', 'Resources', 'bin', 'codex'),
+    )
+  } else if (platform === 'win32') {
+    const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(
+      join(appData, 'npm', 'codex.cmd'),
+      join(appData, 'npm', 'codex.exe'),
+      join(localApp, 'Programs', 'ChatGPT', 'resources', 'codex-cli', 'codex.exe'),
+      join(localApp, 'Programs', 'Codex', 'resources', 'codex.exe'),
+    )
+  }
+  return list.filter(Boolean)
+}

@@ -137,11 +137,6 @@ function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSu
             className="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
           />
         ) : null}
-        {session.readOnlyDesktop && (
-          <span className="shrink-0 rounded bg-slate-200/80 px-1 py-0.5 text-[9px] text-slate-500 dark:bg-slate-700/80 dark:text-slate-300">
-            {bi('历史', 'History')}
-          </span>
-        )}
       </div>
       {showProjectSubtitle && (
         <div className="mt-0.5 pl-8 text-[11px] text-slate-400 truncate">
@@ -167,9 +162,6 @@ export function SidebarDrawer({
   connState,
   bridgeOnline,
   activeDeviceName,
-  devicesCount = 1,
-  onlineBridgesCount = 0,
-  roomId,
   username = '',
   isAdmin = false,
   isMacDesktop = false,
@@ -251,8 +243,8 @@ export function SidebarDrawer({
 
       {/* Drawer Panel (slide-over on mobile, permanently docked sidebar on desktop lg:) */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-transform duration-250 ease-out dark:bg-[#1B1D23] lg:static lg:inset-auto lg:z-auto lg:w-[292px] lg:max-w-none lg:shrink-0 lg:translate-x-0 lg:border-r lg:border-slate-200/80 lg:shadow-none lg:transition-none lg:dark:border-slate-800/80 ${
-          open ? 'translate-x-0' : '-translate-x-full'
+        className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-[transform,visibility] duration-250 ease-out dark:bg-[#1B1D23] lg:static lg:inset-auto lg:z-auto lg:visible lg:pointer-events-auto lg:w-[292px] lg:max-w-none lg:shrink-0 lg:translate-x-0 lg:border-r lg:border-slate-200/80 lg:shadow-none lg:transition-none lg:dark:border-slate-800/80 ${
+          open ? 'visible pointer-events-auto translate-x-0' : 'invisible pointer-events-none -translate-x-full'
         }`}
       >
         {/* Top header (includes macOS traffic-light clearance & drag bar when running in Electron) */}
@@ -444,7 +436,7 @@ export function SidebarDrawer({
             </button>
           </div>
 
-          {groupMode === 'project' && projectGroups.length > 0 && (
+          {groupMode === 'project' && projectGroups.length > 0 && search.trim().length === 0 && (
             <button
               type="button"
               onClick={toggleAllProjects}
@@ -459,7 +451,11 @@ export function SidebarDrawer({
         <div className="flex-1 overflow-y-auto px-3 pb-4">
           {filtered.length === 0 ? (
             <div className="py-12 text-center text-xs text-slate-400">
-              {bridgeOnline ? bi('暂无匹配的对话', 'No matching conversations') : bi('等待电脑端上线...', 'Waiting for computer to come online...')}
+              {e2eeLocked
+                ? bi('请先同步端到端密钥以查看对话', 'Sync E2EE key to view conversations')
+                : bridgeOnline
+                  ? bi('暂无匹配的对话', 'No matching conversations')
+                  : bi('等待电脑端上线...', 'Waiting for computer to come online...')}
             </div>
           ) : groupMode === 'project' ? (
             <div className="space-y-1.5">
@@ -582,11 +578,11 @@ export function SidebarDrawer({
                   {username ? `@${username}` : activeDeviceName || t('common.settings')}
                 </span>
                 {hasUpdate ? (
-                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.2 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
+                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
                     {bi('有更新', 'Update')}
                   </span>
                 ) : isAdmin ? (
-                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.2 text-[9.5px] font-semibold text-[#4D6BFE]">
+                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE]">
                     {t('common.admin')}
                   </span>
                 ) : null}

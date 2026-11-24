@@ -273,34 +273,3 @@ export function encodeE2eeQrUri({ key, roomId = '' } = {}) {
   if (roomId) params.set('r', String(roomId).trim())
   return `${E2EE_URI_PREFIX}?${params.toString()}`
 }
-
-/**
- * Parse either a scanned `allinone-e2ee://v1?k=...&r=...` QR payload or a manually pasted 43-char Base64URL key.
- */
-export function parseE2eeQrInput(raw) {
-  const text = String(raw || '').trim()
-  if (!text) return null
-  if (text.toLowerCase().startsWith('allinone-e2ee://')) {
-    try {
-      const qIdx = text.indexOf('?')
-      const query = qIdx !== -1 ? text.slice(qIdx + 1) : ''
-      const params = new URLSearchParams(query)
-      const key = normalizeE2eeKey(params.get('k') || '')
-      if (!key) return null
-      return {
-        key,
-        roomId: String(params.get('r') || '').trim(),
-        isUri: true,
-      }
-    } catch {
-      return null
-    }
-  }
-  const key = normalizeE2eeKey(text)
-  if (!key) return null
-  return {
-    key,
-    roomId: '',
-    isUri: false,
-  }
-}

@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $ServerUrl = if ($env:ALLINONE_SERVER) { $env:ALLINONE_SERVER.TrimEnd('/') } else { 'https://your-relay.example.com' }
-$InstallDir = Join-Path $env:USERPROFILE '.allinone-bridge'
+$HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$InstallDir = Join-Path $HomeDir '.allinone-bridge'
 $BridgeFile = Join-Path $InstallDir 'allinone-bridge.mjs'
 $DownloadUrl = "$ServerUrl/downloads/allinone-bridge.mjs"
 
@@ -18,12 +19,19 @@ function Find-NodeExe {
     if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
         return $cmd.Source
     }
-    $candidates = @(
-        (Join-Path $env:ProgramFiles 'nodejs\node.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe'),
-        (Join-Path $env:USERPROFILE '.dsh\runtime\node\node.exe')
-    )
+    $candidates = @()
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe')
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe')
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE '.dsh\runtime\node\node.exe')
+    }
     foreach ($p in $candidates) {
         if ($p -and (Test-Path $p)) { return $p }
     }
@@ -32,7 +40,7 @@ function Find-NodeExe {
 
 $NodeExe = Find-NodeExe
 if (-not $NodeExe) {
-    Write-Host '[!] Node.js (v18+) was not found on this PC.' -ForegroundColor Yellow
+    Write-Host '[!] Node.js v20+ (Node 22 LTS recommended) was not found on this PC.' -ForegroundColor Yellow
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Host '    You can install Node.js LTS automatically with:' -ForegroundColor White
@@ -46,7 +54,7 @@ if (-not $NodeExe) {
     }
     if (-not $NodeExe) {
         Write-Host ''
-        Write-Host 'Please install Node.js LTS from https://nodejs.org/ and re-run this command.' -ForegroundColor Red
+        Write-Host 'Please install Node.js LTS (v20+, Node 22 LTS recommended) from https://nodejs.org/ and re-run this command.' -ForegroundColor Red
         return
     }
 }
@@ -54,8 +62,8 @@ if (-not $NodeExe) {
 $nodeVerText = (& $NodeExe -v).Trim()
 $nodeMajor = 0
 if ($nodeVerText -match '^v(\d+)') { $nodeMajor = [int]$Matches[1] }
-if ($nodeMajor -lt 18) {
-    Write-Host "[!] Found Node.js $nodeVerText, but Node.js v18+ is required. Please upgrade at https://nodejs.org/" -ForegroundColor Red
+if ($nodeMajor -lt 20) {
+    Write-Host "[!] Found Node.js $nodeVerText, but Node.js v20+ (Node 22 LTS recommended) is required. Please upgrade at https://nodejs.org/" -ForegroundColor Red
     return
 }
 Write-Host "[1/3] Node.js ready: $nodeVerText ($NodeExe)" -ForegroundColor Green
@@ -74,7 +82,7 @@ if ($DesktopDir -and (Test-Path $DesktopDir)) {
         "`"$NodeExe`" `"$BridgeFile`" --server `"$ServerUrl`"",
         'pause'
     ) -join "`r`n"
-    [System.IO.File]::WriteAllText($LauncherPath, $LauncherContent, [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($LauncherPath, $LauncherContent, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "[3/3] Created Desktop shortcut: $LauncherPath" -ForegroundColor Green
 } else {
     Write-Host '[3/3] Setup files saved.' -ForegroundColor Green

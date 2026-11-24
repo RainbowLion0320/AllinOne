@@ -12,6 +12,7 @@ const MAX_TEXT_CHARS = 32_000
 const memoryDrafts = new Map()
 const memoryLastSessions = new Map()
 const memoryLastWorkspaces = new Map()
+const hydratedScopeMaps = new WeakSet()
 let hydrated = false
 
 function readRawStorage() {
@@ -137,6 +138,8 @@ export function clearDraftsForScope(scopePrefix) {
     memoryDrafts.clear()
     memoryLastSessions.clear()
     memoryLastWorkspaces.clear()
+    hydratedScopeMaps.add(memoryLastSessions)
+    hydratedScopeMaps.add(memoryLastWorkspaces)
     persistDrafts()
     persistScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
     persistScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
@@ -156,7 +159,8 @@ export function clearDraftsForScope(scopePrefix) {
 }
 
 function hydrateScopeMap(storageKey, map) {
-  if (map.size > 0) return
+  if (hydratedScopeMaps.has(map)) return
+  hydratedScopeMaps.add(map)
   try {
     if (typeof localStorage === 'undefined') return
     const raw = localStorage.getItem(storageKey)

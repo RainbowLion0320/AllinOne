@@ -4,7 +4,6 @@
  */
 
 export const LANG_STORAGE_KEY = 'allinone_lang_v1'
-export const SUPPORTED_LANGS = ['zh', 'en']
 
 let activeLangCache = null
 
@@ -96,7 +95,6 @@ export const MESSAGES = {
     'common.copy': '复制',
     'common.copied': '已复制',
     'common.retry': '重试',
-    'common.close': '关闭',
     'common.loading': '加载中...',
     'common.all': '全部',
     'common.default': '默认',
@@ -127,9 +125,6 @@ export const MESSAGES = {
     'time.minsAgo': '{n} 分钟前',
     'time.hoursAgo': '{n} 小时前',
     'time.daysAgo': '{n} 天前',
-    'lang.label': '语言',
-    'lang.zh': '中文',
-    'lang.en': 'English',
   },
   en: {
     'common.cancel': 'Cancel',
@@ -138,7 +133,6 @@ export const MESSAGES = {
     'common.copy': 'Copy',
     'common.copied': 'Copied',
     'common.retry': 'Retry',
-    'common.close': 'Close',
     'common.loading': 'Loading...',
     'common.all': 'All',
     'common.default': 'Default',
@@ -169,9 +163,6 @@ export const MESSAGES = {
     'time.minsAgo': '{n}m ago',
     'time.hoursAgo': '{n}h ago',
     'time.daysAgo': '{n}d ago',
-    'lang.label': 'Language',
-    'lang.zh': '中文',
-    'lang.en': 'English',
   },
 }
 

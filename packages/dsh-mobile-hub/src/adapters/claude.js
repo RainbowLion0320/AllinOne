@@ -5,7 +5,7 @@ import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getClaudeCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 
 const claudeParseCache = createFileParseCache(16)
@@ -15,23 +15,10 @@ function getClaudeHome() {
 }
 
 function findClaudeCommand(configured) {
-  const home = homedir()
-  const candidates = [configured, process.env.CLAUDE_BIN]
+  const candidates = getClaudeCandidates(homedir(), process.platform, process.env, configured)
   if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || join(home, 'AppData', 'Roaming')
-    candidates.push(
-      join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
-      join(appData, 'npm', 'claude.cmd'),
-      join(home, '.claude', 'local', 'claude.exe'),
-    )
     return findExecutable(['claude.exe', 'claude.cmd', 'claude'], candidates) || 'claude.exe'
   }
-  candidates.push(
-    join(home, '.claude', 'local', 'claude'),
-    join(home, '.local', 'bin', 'claude'),
-    '/opt/homebrew/bin/claude',
-    '/usr/local/bin/claude',
-  )
   return findExecutable(['claude'], candidates) || 'claude'
 }
 
@@ -664,31 +651,56 @@ export class ClaudeAdapter {
               fullText += b.text
             }
           }
-          const prevThinkLen = emittedThinkByMsg.get(msgId) || 0
-          if (fullThink.length > prevThinkLen) {
-            const rawThinkDelta = fullThink.slice(prevThinkLen)
-            const thinkPrefix = lastThinkMsgId && lastThinkMsgId !== msgId && prevThinkLen === 0 ? '\n\n' : ''
-            emittedThinkByMsg.set(msgId, fullThink.length)
-            lastThinkMsgId = msgId
-            this.emitEvent(EVENTS.STREAM_THINKING, {
-              sessionId: compositeId,
-              app: APPS.CLAUDE,
-              delta: `${thinkPrefix}${rawThinkDelta}`,
-            })
+          const prevThink = emittedThinkByMsg.get(msgId) || ''
+          if (fullThink) {
+            if (prevThink && fullThink.startsWith(prevThink)) {
+              const rawThinkDelta = fullThink.slice(prevThink.length)
+              if (rawThinkDelta) {
+                emittedThinkByMsg.set(msgId, fullThink)
+                lastThinkMsgId = msgId
+                this.emitEvent(EVENTS.STREAM_THINKING, {
+                  sessionId: compositeId,
+                  app: APPS.CLAUDE,
+                  delta: rawThinkDelta,
+                })
+              }
+            } else if (fullThink !== prevThink) {
+              const thinkPrefix = lastThinkMsgId ? '\n\n' : ''
+              emittedThinkByMsg.set(msgId, fullThink)
+              lastThinkMsgId = msgId
+              this.emitEvent(EVENTS.STREAM_THINKING, {
+                sessionId: compositeId,
+                app: APPS.CLAUDE,
+                delta: `${thinkPrefix}${fullThink}`,
+              })
+            }
           }
-          const prevTextLen = emittedTextByMsg.get(msgId) || 0
-          if (fullText.length > prevTextLen) {
-            const rawDelta = fullText.slice(prevTextLen)
-            const textPrefix = lastTextMsgId && lastTextMsgId !== msgId && prevTextLen === 0 ? '\n\n' : ''
-            const delta = `${textPrefix}${rawDelta}`
-            emittedTextByMsg.set(msgId, fullText.length)
-            lastTextMsgId = msgId
-            finalText += delta
-            this.emitEvent(EVENTS.STREAM_DELTA, {
-              sessionId: compositeId,
-              app: APPS.CLAUDE,
-              delta,
-            })
+          const prevText = emittedTextByMsg.get(msgId) || ''
+          if (fullText) {
+            if (prevText && fullText.startsWith(prevText)) {
+              const rawDelta = fullText.slice(prevText.length)
+              if (rawDelta) {
+                emittedTextByMsg.set(msgId, fullText)
+                lastTextMsgId = msgId
+                finalText += rawDelta
+                this.emitEvent(EVENTS.STREAM_DELTA, {
+                  sessionId: compositeId,
+                  app: APPS.CLAUDE,
+                  delta: rawDelta,
+                })
+              }
+            } else if (fullText !== prevText) {
+              const textPrefix = finalText ? '\n\n' : ''
+              const delta = `${textPrefix}${fullText}`
+              emittedTextByMsg.set(msgId, fullText)
+              lastTextMsgId = msgId
+              finalText += delta
+              this.emitEvent(EVENTS.STREAM_DELTA, {
+                sessionId: compositeId,
+                app: APPS.CLAUDE,
+                delta,
+              })
+            }
           }
         } else if (obj.type === 'user' && Array.isArray(obj.message?.content)) {
           for (const b of obj.message.content) {
@@ -709,6 +721,7 @@ export class ClaudeAdapter {
           if (obj.is_error) {
             resultError = String(obj.result || obj.error || 'Claude 执行返回错误')
           } else if (typeof obj.result === 'string' && obj.result.length > 0) {
+            const trimmedResult = obj.result.trim()
             if (!lastTextMsgId) {
               finalText = obj.result
               this.emitEvent(EVENTS.STREAM_DELTA, {
@@ -716,15 +729,16 @@ export class ClaudeAdapter {
                 app: APPS.CLAUDE,
                 delta: obj.result,
               })
-            } else if (!finalText.endsWith(obj.result)) {
-              const lastEmittedLen = emittedTextByMsg.get(lastTextMsgId) || 0
+            } else if (trimmedResult && !finalText.trimEnd().endsWith(trimmedResult)) {
+              const lastEmitted = emittedTextByMsg.get(lastTextMsgId) || ''
               if (
-                lastEmittedLen > 0 &&
-                obj.result.length > lastEmittedLen &&
-                finalText.endsWith(obj.result.slice(0, lastEmittedLen))
+                lastEmitted &&
+                obj.result.startsWith(lastEmitted) &&
+                obj.result.length > lastEmitted.length &&
+                finalText.endsWith(lastEmitted)
               ) {
-                const suffix = obj.result.slice(lastEmittedLen)
-                emittedTextByMsg.set(lastTextMsgId, obj.result.length)
+                const suffix = obj.result.slice(lastEmitted.length)
+                emittedTextByMsg.set(lastTextMsgId, obj.result)
                 finalText += suffix
                 this.emitEvent(EVENTS.STREAM_DELTA, {
                   sessionId: compositeId,
@@ -733,6 +747,7 @@ export class ClaudeAdapter {
                 })
               } else {
                 const delta = `${finalText ? '\n\n' : ''}${obj.result}`
+                emittedTextByMsg.set(lastTextMsgId, obj.result)
                 finalText += delta
                 this.emitEvent(EVENTS.STREAM_DELTA, {
                   sessionId: compositeId,

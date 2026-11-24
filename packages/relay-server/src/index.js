@@ -16,9 +16,9 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '0.3.9')
+    return String(pkg?.version || '0.5.1')
   } catch {
-    return '0.3.9'
+    return '0.5.1'
   }
 })()
 
@@ -73,14 +73,6 @@ const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 
-function parseEnvBool(raw, fallback = false) {
-  if (raw === undefined || raw === null || raw === '') return fallback
-  const lower = String(raw).trim().toLowerCase()
-  if (lower === '1' || lower === 'true' || lower === 'yes') return true
-  if (lower === '0' || lower === 'false' || lower === 'no') return false
-  return fallback
-}
-
 function maskEmailAddress(email) {
   const clean = String(email || '').trim()
   const at = clean.indexOf('@')
@@ -90,14 +82,6 @@ function maskEmailAddress(email) {
   const prefix = local.slice(0, Math.min(2, local.length))
   return `${prefix}***${domain}`
 }
-const SAFE_INLINE_IMAGE_MIMES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/webp',
-  'image/gif',
-  'image/bmp',
-  'image/avif',
-])
 
 const LOCAL_DEV_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i
 const CAPACITOR_ORIGINS = new Set([
@@ -558,6 +542,80 @@ export function createRelayServer(options = {}) {
     return payload
   }
 
+  /**
+   * Enforce optional Email 2FA challenge/send/verify/consume flow for login endpoints.
+   * Returns `true` if login may proceed; returns `false` if an HTTP response was already sent.
+   */
+  async function handleOptionalEmail2fa(res, { user, emailCode, ip, accountRateKey }) {
+    if (!user?.loginEmail2fa || !mailer.isConfigured() || !user.email || !user.emailVerified) {
+      return true
+    }
+    const cleanCode = String(emailCode || '').trim()
+    const maskedEmail = maskEmailAddress(user.email)
+    if (!cleanCode) {
+      const issued = emailCodes.issueCode({
+        purpose: 'login_2fa',
+        email: user.email,
+        ip,
+        userId: user.userId,
+      })
+      if (!issued.ok) {
+        if (issued.retryAfterSec) {
+          sendJson(res, 200, {
+            ok: false,
+            requires2fa: true,
+            maskedEmail,
+            cooldownSec: issued.retryAfterSec,
+            message: `验证码已发送至 ${maskedEmail}，请直接输入或 ${issued.retryAfterSec} 秒后重发`,
+          })
+          return false
+        }
+        sendJson(res, 429, { ok: false, error: issued.error })
+        return false
+      }
+      try {
+        await mailer.sendVerificationCode({
+          to: user.email,
+          code: issued.code,
+          purpose: 'login_2fa',
+          username: user.username,
+        })
+      } catch (mailErr) {
+        issued.rollback?.()
+        sendJson(res, 502, { ok: false, error: `发送登录验证码失败：${String(mailErr?.message || mailErr)}` })
+        return false
+      }
+      sendJson(res, 200, {
+        ok: false,
+        requires2fa: true,
+        maskedEmail,
+        cooldownSec: issued.cooldownSec,
+        message: `已向 ${maskedEmail} 发送 6 位登录验证码`,
+      })
+      return false
+    }
+    const check2fa = emailCodes.verifyCode({
+      purpose: 'login_2fa',
+      email: user.email,
+      code: cleanCode,
+      userId: user.userId,
+      consume: false,
+    })
+    if (!check2fa.ok) {
+      auth.recordFailure(ip)
+      auth.recordAccountFailure(accountRateKey)
+      sendJson(res, 401, {
+        ok: false,
+        requires2fa: true,
+        maskedEmail,
+        error: check2fa.error,
+      })
+      return false
+    }
+    emailCodes.consumeCode({ purpose: 'login_2fa', email: user.email })
+    return true
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       setSecurityHeaders(req, res)
@@ -982,71 +1040,10 @@ export function createRelayServer(options = {}) {
           return
         }
         let { user } = verified
-        const emailCode = String(body.emailCode || '').trim()
 
         // Optional Email 2FA: require verified 6-digit OTP when enabled on account & SMTP is active
-        if (user.loginEmail2fa && mailer.isConfigured() && user.email && user.emailVerified) {
-          if (!emailCode) {
-            const issued = emailCodes.issueCode({
-              purpose: 'login_2fa',
-              email: user.email,
-              ip,
-              userId: user.userId,
-            })
-            if (!issued.ok) {
-              if (issued.retryAfterSec) {
-                sendJson(res, 200, {
-                  ok: false,
-                  requires2fa: true,
-                  maskedEmail: maskEmailAddress(user.email),
-                  cooldownSec: issued.retryAfterSec,
-                  message: `验证码已发送至 ${maskEmailAddress(user.email)}，请直接输入或 ${issued.retryAfterSec} 秒后重发`,
-                })
-                return
-              }
-              sendJson(res, 429, { ok: false, error: issued.error })
-              return
-            }
-            try {
-              await mailer.sendVerificationCode({
-                to: user.email,
-                code: issued.code,
-                purpose: 'login_2fa',
-                username: user.username,
-              })
-            } catch (mailErr) {
-              issued.rollback?.()
-              sendJson(res, 502, { ok: false, error: `发送登录验证码失败：${String(mailErr?.message || mailErr)}` })
-              return
-            }
-            sendJson(res, 200, {
-              ok: false,
-              requires2fa: true,
-              maskedEmail: maskEmailAddress(user.email),
-              cooldownSec: issued.cooldownSec,
-              message: `已向 ${maskEmailAddress(user.email)} 发送 6 位登录验证码`,
-            })
-            return
-          }
-          const check2fa = emailCodes.verifyCode({
-            purpose: 'login_2fa',
-            email: user.email,
-            code: emailCode,
-            userId: user.userId,
-            consume: false,
-          })
-          if (!check2fa.ok) {
-            auth.recordFailure(ip)
-            auth.recordAccountFailure(accountRateKey)
-            sendJson(res, 401, {
-              ok: false,
-              requires2fa: true,
-              maskedEmail: maskEmailAddress(user.email),
-              error: check2fa.error,
-            })
-            return
-          }
-          emailCodes.consumeCode({ purpose: 'login_2fa', email: user.email })
+        if (!(await handleOptionalEmail2fa(res, { user, emailCode: body.emailCode, ip, accountRateKey }))) {
+          return
         }
 
         auth.clearFailure(ip)
@@ -1129,71 +1126,10 @@ export function createRelayServer(options = {}) {
           return
         }
         const { user } = verified
-        const emailCode = String(body.emailCode || '').trim()
 
         // Enforce the same Email 2FA verification when enabled on account & SMTP is configured
-        if (user.loginEmail2fa && mailer.isConfigured() && user.email && user.emailVerified) {
-          if (!emailCode) {
-            const issued = emailCodes.issueCode({
-              purpose: 'login_2fa',
-              email: user.email,
-              ip,
-              userId: user.userId,
-            })
-            if (!issued.ok) {
-              if (issued.retryAfterSec) {
-                sendJson(res, 200, {
-                  ok: false,
-                  requires2fa: true,
-                  maskedEmail: maskEmailAddress(user.email),
-                  cooldownSec: issued.retryAfterSec,
-                  message: `验证码已发送至 ${maskEmailAddress(user.email)}，请直接输入或 ${issued.retryAfterSec} 秒后重发`,
-                })
-                return
-              }
-              sendJson(res, 429, { ok: false, error: issued.error })
-              return
-            }
-            try {
-              await mailer.sendVerificationCode({
-                to: user.email,
-                code: issued.code,
-                purpose: 'login_2fa',
-                username: user.username,
-              })
-            } catch (mailErr) {
-              issued.rollback?.()
-              sendJson(res, 502, { ok: false, error: `发送登录验证码失败：${String(mailErr?.message || mailErr)}` })
-              return
-            }
-            sendJson(res, 200, {
-              ok: false,
-              requires2fa: true,
-              maskedEmail: maskEmailAddress(user.email),
-              cooldownSec: issued.cooldownSec,
-              message: `已向 ${maskEmailAddress(user.email)} 发送 6 位登录验证码`,
-            })
-            return
-          }
-          const check2fa = emailCodes.verifyCode({
-            purpose: 'login_2fa',
-            email: user.email,
-            code: emailCode,
-            userId: user.userId,
-            consume: false,
-          })
-          if (!check2fa.ok) {
-            auth.recordFailure(ip)
-            auth.recordAccountFailure(accountRateKey)
-            sendJson(res, 401, {
-              ok: false,
-              requires2fa: true,
-              maskedEmail: maskEmailAddress(user.email),
-              error: check2fa.error,
-            })
-            return
-          }
-          emailCodes.consumeCode({ purpose: 'login_2fa', email: user.email })
+        if (!(await handleOptionalEmail2fa(res, { user, emailCode: body.emailCode, ip, accountRateKey }))) {
+          return
         }
 
         auth.clearFailure(ip)
@@ -1375,7 +1311,8 @@ export function createRelayServer(options = {}) {
         sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
         return
       }
-      const payload = auth.verifySessionToken(extractBearer(req))
+      const bearerToken = extractBearer(req)
+      const payload = auth.verifySessionToken(bearerToken)
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
@@ -1386,8 +1323,29 @@ export function createRelayServer(options = {}) {
       }
       try {
         const body = await readJsonBody(req)
-        const changed = await accounts.changePasswordAsync(payload.room, body.currentPassword, body.newPassword)
+        if (!auth.checkRateLimit(ip)) {
+          sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
+          return
+        }
+        if (!auth.checkAccountRateLimit(payload.room)) {
+          sendJson(res, 429, { ok: false, error: '该账号尝试次数过多，请 15 分钟后再试' })
+          return
+        }
+        if (!auth.verifySessionToken(bearerToken)) {
+          sendJson(res, 401, { ok: false, error: '会话已失效或密码已被更新，请重新登录' })
+          return
+        }
+        const changed = await accounts.changePasswordAsync(
+          payload.room,
+          body.currentPassword,
+          body.newPassword,
+          { validateSession: () => Boolean(auth.verifySessionToken(bearerToken)) },
+        )
         if (!changed.ok) {
+          if (changed.code === 'stale_session') {
+            sendJson(res, 401, { ok: false, error: changed.error })
+            return
+          }
           if (changed.error === '当前密码不正确') {
             auth.recordFailure(ip)
             auth.recordAccountFailure(payload.room)
