@@ -20,8 +20,9 @@ import {
   screen,
   shell,
 } from 'electron'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
 import { DesktopUpdater } from './updater.js'
@@ -665,6 +666,74 @@ function registerIpc() {
       return shell.openPath(bridgeManager.logPath)
     }
     return shell.openPath(bridgeManager.stateDir)
+  })
+
+  const SAFE_DELIVERABLE_EXTS = new Set([
+    '.html',
+    '.htm',
+    '.pdf',
+    '.doc',
+    '.docx',
+    '.xls',
+    '.xlsx',
+    '.csv',
+    '.ppt',
+    '.pptx',
+    '.md',
+    '.markdown',
+    '.txt',
+    '.rtf',
+    '.epub',
+    '.zip',
+  ])
+
+  const resolveSafeDesktopDeliverable = (rawPath, cwd = '') => {
+    let p = String(rawPath || '').trim()
+    if (!p) return { ok: false, error: '缺少文件路径' }
+    if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+      p = p.slice(1, -1).trim()
+    }
+    if (/^file:\/\//i.test(p)) {
+      p = p.replace(/[?#].*$/, '').replace(/^file:\/\/(?:localhost)?/i, '')
+      try { p = decodeURIComponent(p) } catch {}
+      if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) p = p.slice(1)
+    }
+    if (p.startsWith('~/') || p.startsWith('~\\')) {
+      p = join(homedir(), p.slice(2))
+    }
+    if (process.platform === 'win32') p = p.replace(/\//g, '\\')
+    const baseDir = String(cwd || '').trim() || homedir()
+    const resolved = isAbsolute(p) ? resolve(p) : resolve(baseDir, p)
+    const ext = extname(resolved).toLowerCase()
+    if (!SAFE_DELIVERABLE_EXTS.has(ext)) {
+      return { ok: false, error: `不支持直接打开该格式（${ext || '未知格式'}）` }
+    }
+    if (!existsSync(resolved)) {
+      return { ok: false, error: `找不到本机文件：${resolved}` }
+    }
+    const realPath = realpathSync(resolved)
+    const realExt = extname(realPath).toLowerCase()
+    if (!SAFE_DELIVERABLE_EXTS.has(realExt)) {
+      return { ok: false, error: `符号链接目标格式不受支持（${realExt || '未知格式'}）` }
+    }
+    if (!statSync(realPath).isFile()) {
+      return { ok: false, error: '目标路径不是文件' }
+    }
+    return { ok: true, realPath }
+  }
+
+  ipcMain.handle('desktop:open-deliverable', async (_event, rawPath, cwd = '') => {
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd)
+    if (!check.ok) return check
+    const err = await shell.openPath(check.realPath)
+    return err ? { ok: false, error: err } : { ok: true, path: check.realPath }
+  })
+
+  ipcMain.handle('desktop:reveal-deliverable', (_event, rawPath, cwd = '') => {
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd)
+    if (!check.ok) return check
+    shell.showItemInFolder(check.realPath)
+    return { ok: true, path: check.realPath }
   })
 
   ipcMain.handle('updater:state', () => updater.getState())

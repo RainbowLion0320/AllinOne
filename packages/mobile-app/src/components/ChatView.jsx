@@ -20,7 +20,9 @@ import {
 } from 'lucide-react'
 import { MarkdownView } from '../lib/markdown.jsx'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
+import { extractDeliverableRefsFromMessage } from '../lib/deliverableFiles.js'
 import { ChatImageGallery } from './ChatImageGallery.jsx'
+import { ChatDeliverableList } from './ChatDeliverableList.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
 import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { useI18n } from '../lib/i18n.jsx'
@@ -270,6 +272,10 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
     () => mergeUniqueImages(msg.images || [], extractImageRefsFromText(msg.text)),
     [msg.images, msg.text],
   )
+  const deliverables = useMemo(
+    () => (msg.role === 'assistant' ? extractDeliverableRefsFromMessage(msg) : []),
+    [msg.role, msg.text, msg.tools],
+  )
   const rowClass = virtualize ? 'chat-msg-row ' : ''
 
   if (msg.role === 'user') {
@@ -300,6 +306,9 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
         <MarkdownView text={msg.text} imageContext={imageContext} />
         {allImages.length > 0 && (
           <ChatImageGallery images={allImages} imageContext={imageContext} />
+        )}
+        {deliverables.length > 0 && (
+          <ChatDeliverableList files={deliverables} imageContext={imageContext} />
         )}
       </div>
     </div>

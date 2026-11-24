@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('allinoneDesktop', {
   rotateE2eeKey: (roomId) => ipcRenderer.invoke('bridge:e2ee-rotate', roomId),
   toggleAutoLaunch: () => ipcRenderer.invoke('desktop:toggle-auto-launch'),
   openLog: () => ipcRenderer.invoke('bridge:open-log'),
+  openDeliverable: (filePath, cwd) => ipcRenderer.invoke('desktop:open-deliverable', filePath, cwd),
+  revealDeliverable: (filePath, cwd) => ipcRenderer.invoke('desktop:reveal-deliverable', filePath, cwd),
   getUpdateState: () => ipcRenderer.invoke('updater:state'),
   checkForUpdates: () => ipcRenderer.invoke('updater:check'),
   downloadUpdate: () => ipcRenderer.invoke('updater:download'),

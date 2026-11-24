@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { basename, extname, isAbsolute, join, resolve } from 'node:path'
+import { readFile as readFileAsync } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
 import { decryptBytes, normalizeE2eeKey } from './helpers/e2ee.js'
@@ -35,6 +36,7 @@ export class MultiAppOrchestrator {
     /** @type {Map<string, any>} */
     this.dispatches = new Map()
     this._lastInboundPruneAt = 0
+    this._activeDocReads = 0
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -473,10 +475,13 @@ export class MultiAppOrchestrator {
   }
 
   /**
-   * Read a local image file on the PC so the mobile client can display screenshots / generated images.
-   * Strictly limited to image extensions and <= 20MB for security and stability.
+   * Read a local image or deliverable document file on the PC so the remote client
+   * can preview images/HTML or download office deliverables over E2EE WS RPC.
+   * - Image mode (default): image extensions only, <= 20MB.
+   * - Document mode (`mode: 'document'`): deliverable extensions only (HTML/PDF/Word/Excel/PPT/CSV/MD/TXT/RTF/EPUB/ZIP),
+   *   <= 10MB, max 2 concurrent reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
    */
-  async readLocalFile({ path: rawPath, cwd = '' } = {}) {
+  async readLocalFile({ path: rawPath, cwd = '', mode = 'image' } = {}) {
     const IMAGE_MIMES = {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
@@ -488,10 +493,31 @@ export class MultiAppOrchestrator {
       '.avif': 'image/avif',
       '.ico': 'image/x-icon',
     }
-    const MAX_IMAGE_BYTES = 20 * 1024 * 1024
+    const DOCUMENT_MIMES = {
+      '.html': 'text/html; charset=utf-8',
+      '.htm': 'text/html; charset=utf-8',
+      '.pdf': 'application/pdf',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.csv': 'text/csv; charset=utf-8',
+      '.ppt': 'application/vnd.ms-powerpoint',
+      '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      '.md': 'text/markdown; charset=utf-8',
+      '.markdown': 'text/markdown; charset=utf-8',
+      '.txt': 'text/plain; charset=utf-8',
+      '.rtf': 'application/rtf',
+      '.epub': 'application/epub+zip',
+      '.zip': 'application/zip',
+    }
+    const isDocumentMode = String(mode || '').trim().toLowerCase() === 'document'
+    const ALLOWED_MIMES = isDocumentMode ? DOCUMENT_MIMES : IMAGE_MIMES
+    const MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 20 * 1024 * 1024
+    const MAX_CONCURRENT_DOC_READS = 2
 
     let p = String(rawPath || '').trim()
-    if (!p) throw new Error('缺少图片路径')
+    if (!p) throw new Error(isDocumentMode ? '缺少文件路径' : '缺少图片路径')
     // Strip wrapping quotes or angle brackets
     if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
       p = p.slice(1, -1).trim()
@@ -542,31 +568,151 @@ export class MultiAppOrchestrator {
     }
 
     const ext = extname(resolved).toLowerCase()
-    const mimeType = IMAGE_MIMES[ext]
+    const mimeType = ALLOWED_MIMES[ext]
     if (!mimeType) {
-      throw new Error(`出于安全限制，仅允许远程预览图片文件（不支持 ${ext || '未知格式'}）`)
+      throw new Error(
+        isDocumentMode
+          ? `出于安全限制，不支持远程下载该格式文件（${ext || '未知格式'}）`
+          : `出于安全限制，仅允许远程预览图片文件（不支持 ${ext || '未知格式'}）`,
+      )
     }
     if (!existsSync(resolved)) {
-      throw new Error(`找不到本机图片文件：${resolved}`)
+      throw new Error(isDocumentMode ? `找不到电脑端文件：${resolved}` : `找不到本机图片文件：${resolved}`)
     }
-    // Resolve symlinks and re-validate the real target's extension so `fake.png -> /etc/passwd` is blocked
+    // Resolve symlinks and re-validate the real target's extension so `fake.pdf -> ~/.ssh/id_rsa` is blocked
     const realPath = realpathSync(resolved)
     const realExt = extname(realPath).toLowerCase()
-    const realMimeType = IMAGE_MIMES[realExt]
+    const realMimeType = ALLOWED_MIMES[realExt]
     if (!realMimeType) {
-      throw new Error(`出于安全限制，符号链接指向非图片文件，已拒绝访问（${realExt || '未知格式'}）`)
+      throw new Error(
+        isDocumentMode
+          ? `出于安全限制，符号链接指向不允许的格式，已拒绝下载（${realExt || '未知格式'}）`
+          : `出于安全限制，符号链接指向非图片文件，已拒绝访问（${realExt || '未知格式'}）`,
+      )
     }
+
+    if (isDocumentMode) {
+      const normReal = realPath.replace(/\\/g, '/').toLowerCase()
+      const segments = normReal.split('/').filter(Boolean)
+      const fileName = basename(realPath).toLowerCase()
+      const BLOCKED_SEGMENTS = new Set([
+        '.ssh',
+        '.aws',
+        '.gnupg',
+        '.kube',
+        '.docker',
+        '.npm',
+        '.allinone',
+        '.dsh-mobile',
+        '.dsh',
+        '.git',
+        'keychains',
+      ])
+      const isBlockedDir =
+        segments.some((seg) => BLOCKED_SEGMENTS.has(seg)) ||
+        normReal.includes('/.gemini/config/') ||
+        normReal.includes('/library/application support/google/chrome/') ||
+        normReal.includes('/library/application support/microsoft edge/') ||
+        normReal.includes('/library/application support/firefox/') ||
+        normReal.includes('/appdata/local/google/chrome/') ||
+        normReal.includes('/appdata/local/microsoft/edge/') ||
+        normReal.includes('/appdata/roaming/mozilla/') ||
+        normReal.startsWith('/etc/') ||
+        normReal.startsWith('/private/etc/') ||
+        normReal.startsWith('/proc/') ||
+        normReal.startsWith('/sys/') ||
+        normReal.startsWith('/system/') ||
+        normReal.startsWith('c:/windows/')
+      const isBlockedName =
+        /^\.env(?:\.|$)/i.test(fileName) ||
+        /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json)(?:\.|$)/i.test(fileName) ||
+        /^(?:secrets?|credentials?|passwords?|tokens?)\.(?:txt|csv|md|zip)$/i.test(fileName) ||
+        /\.(?:pem|key|p12|pfx|kdbx)$/i.test(fileName)
+      if (isBlockedDir || isBlockedName) {
+        throw new Error('出于安全限制，禁止远程下载系统敏感目录或凭据文件')
+      }
+
+      const caseInsensitiveFs = process.platform === 'win32' || process.platform === 'darwin'
+      const cmpPath = (targetPath) => (caseInsensitiveFs ? targetPath.toLowerCase() : targetPath)
+      const normTarget = cmpPath(realPath)
+      const checkRoots = (roots) => {
+        for (const root of roots) {
+          const clean = String(root || '').trim()
+          if (!clean) continue
+          let rootReal = ''
+          try {
+            if (!existsSync(clean)) continue
+            rootReal = realpathSync(clean)
+          } catch {
+            continue
+          }
+          const normRoot = cmpPath(rootReal)
+          const prefix = normRoot.endsWith(sep) ? normRoot : `${normRoot}${sep}`
+          if (normTarget === normRoot || normTarget.startsWith(prefix)) {
+            return true
+          }
+        }
+        return false
+      }
+
+      const home = homedir()
+      const fastRoots = [
+        cwd,
+        this.config.cwd,
+        join(home, 'Desktop'),
+        join(home, 'Downloads'),
+        join(home, 'Documents'),
+        join(home, '.gemini', 'antigravity', 'brain'),
+        tmpdir(),
+        process.platform !== 'win32' ? '/tmp' : '',
+      ]
+      let inAllowedRoot = checkRoots(fastRoots)
+      if (!inAllowedRoot) {
+        try {
+          const workspaces = await this.listWorkspaces()
+          inAllowedRoot = checkRoots(workspaces.map((w) => w?.path))
+        } catch {}
+      }
+      if (!inAllowedRoot) {
+        throw new Error('出于安全限制，仅允许远程下载当前工作目录、已识别项目目录或桌面/文档/下载目录中的交付文件')
+      }
+    }
+
     const st = statSync(realPath)
     if (!st.isFile()) {
       throw new Error('目标路径不是文件')
     }
-    if (st.size <= 0 || st.size > MAX_IMAGE_BYTES) {
-      throw new Error(`图片文件大小超出限制（${Math.round(st.size / 1024 / 1024)}MB / 最大 20MB）`)
+    if (st.size <= 0) {
+      throw new Error(isDocumentMode ? '文件内容为空，无法下载' : '图片文件为空')
+    }
+    if (st.size > MAX_BYTES) {
+      const actualMb = (st.size / 1024 / 1024).toFixed(1)
+      const limitMb = Math.round(MAX_BYTES / 1024 / 1024)
+      throw new Error(
+        isDocumentMode
+          ? `文件大小超出限制（${actualMb}MB / 最大 ${limitMb}MB），请在电脑端直接查看`
+          : `图片文件大小超出限制（${Math.round(st.size / 1024 / 1024)}MB / 最大 ${limitMb}MB）`,
+      )
     }
 
-    const buf = readFileSync(realPath)
+    let buf
+    if (isDocumentMode) {
+      if (this._activeDocReads >= MAX_CONCURRENT_DOC_READS) {
+        throw new Error('当前有其他文档正在传输，请稍后再试')
+      }
+      this._activeDocReads += 1
+      try {
+        buf = await readFileAsync(realPath)
+      } finally {
+        this._activeDocReads = Math.max(0, this._activeDocReads - 1)
+      }
+    } else {
+      buf = readFileSync(realPath)
+    }
+
     return {
       ok: true,
+      kind: isDocumentMode ? 'document' : 'image',
       filename: basename(realPath),
       mimeType: realMimeType,
       size: buf.length,

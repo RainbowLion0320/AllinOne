@@ -43,6 +43,7 @@ import {
   probeClaudeTranscriptTail,
 } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
+import { extractDeliverableRefsFromMessage } from '../packages/mobile-app/src/lib/deliverableFiles.js'
 import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
 import {
   parseCompositeId as hubParseCompositeId,
@@ -5132,6 +5133,112 @@ async function main() {
       }
     }
     console.log('[smoke] 31/31 Mobile-to-Desktop E2EE QR scan nudge (isolation, rate limit & disconnect cleanup) OK')
+
+    // 32. Deliverable document download (HTML/PDF/Word/Excel/PPT) + 10MB cap + security guards + frontend extractor
+    {
+      const docDir = join(tmpDir, 'deliverables-workspace')
+      mkdirSync(docDir, { recursive: true })
+      const htmlPath = join(docDir, 'dashboard.html')
+      const docxPath = join(docDir, 'weekly-report.docx')
+      const xlsxPath = join(docDir, 'budget.xlsx')
+      const pptxPath = join(docDir, 'q4-deck.pptx')
+      const pdfPath = join(docDir, 'contract.pdf')
+      writeFileSync(htmlPath, '<!doctype html><html><body><h1>Q4 KPI</h1></body></html>', 'utf8')
+      writeFileSync(docxPath, Buffer.from('PK\x03\x04mock-docx-bytes'))
+      writeFileSync(xlsxPath, Buffer.from('PK\x03\x04mock-xlsx-bytes'))
+      writeFileSync(pptxPath, Buffer.from('PK\x03\x04mock-pptx-bytes'))
+      writeFileSync(pdfPath, Buffer.from('%PDF-1.7 mock-pdf'))
+
+      const docOrch = new MultiAppOrchestrator({ config: { cwd: docDir }, log: { info() {}, warn() {}, error() {} } })
+      try {
+        // 32a. Document mode reads whitelisted deliverables with accurate MIME & bytes
+        const htmlRes = await docOrch.readLocalFile({ path: 'dashboard.html', cwd: docDir, mode: 'document' })
+        assert.equal(htmlRes.ok, true)
+        assert.equal(htmlRes.kind, 'document')
+        assert.equal(htmlRes.mimeType, 'text/html; charset=utf-8')
+        assert.ok(Buffer.from(htmlRes.dataBase64, 'base64').toString('utf8').includes('Q4 KPI'))
+
+        const xlsxRes = await docOrch.readLocalFile({ path: `file://${xlsxPath}`, cwd: docDir, mode: 'document' })
+        assert.equal(xlsxRes.ok, true)
+        assert.equal(xlsxRes.filename, 'budget.xlsx')
+        assert.equal(xlsxRes.mimeType, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+        const docxRes = await docOrch.readLocalFile({ path: docxPath, cwd: docDir, mode: 'document' })
+        assert.equal(docxRes.mimeType, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+
+        const pptxRes = await docOrch.readLocalFile({ path: pptxPath, cwd: docDir, mode: 'document' })
+        assert.equal(pptxRes.mimeType, 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
+
+        const pdfRes = await docOrch.readLocalFile({ path: pdfPath, cwd: docDir, mode: 'document' })
+        assert.equal(pdfRes.mimeType, 'application/pdf')
+
+        // 32b. Default image mode MUST still reject documents (strict backward compat)
+        await assert.rejects(
+          () => docOrch.readLocalFile({ path: htmlPath, cwd: docDir }),
+          /仅允许远程预览图片/,
+        )
+
+        // 32c. Disallowed extensions (.js, .json, .env) rejected
+        const jsFile = join(docDir, 'script.js')
+        const jsonFile = join(docDir, 'accounts.json')
+        const envFile = join(docDir, '.env')
+        writeFileSync(jsFile, 'console.log(1)')
+        writeFileSync(jsonFile, '{"secret":1}')
+        writeFileSync(envFile, 'JWT_SECRET=abc')
+        await assert.rejects(() => docOrch.readLocalFile({ path: jsFile, cwd: docDir, mode: 'document' }), /不支持远程下载该格式/)
+        await assert.rejects(() => docOrch.readLocalFile({ path: jsonFile, cwd: docDir, mode: 'document' }), /不支持远程下载该格式/)
+        await assert.rejects(() => docOrch.readLocalFile({ path: envFile, cwd: docDir, mode: 'document' }), /不支持远程下载该格式/)
+
+        // 32d. Sensitive filename & sensitive directory blocked even with whitelisted .txt extension
+        const secretTxt = join(docDir, 'secrets.txt')
+        writeFileSync(secretTxt, 'top-secret')
+        await assert.rejects(() => docOrch.readLocalFile({ path: secretTxt, cwd: docDir, mode: 'document' }), /敏感目录或凭据文件/)
+
+        const sshDir = join(docDir, '.ssh')
+        mkdirSync(sshDir, { recursive: true })
+        const sshTxt = join(sshDir, 'notes.txt')
+        writeFileSync(sshTxt, 'ssh-note')
+        await assert.rejects(() => docOrch.readLocalFile({ path: sshTxt, cwd: docDir, mode: 'document' }), /敏感目录或凭据文件/)
+
+        // 32e. Symlink masquerading (`fake-report.pdf -> secret.key`) blocked
+        const keyTarget = join(docDir, 'private.key')
+        writeFileSync(keyTarget, 'PRIVATE KEY')
+        const fakePdfLink = join(docDir, 'fake-report.pdf')
+        symlinkSync(keyTarget, fakePdfLink)
+        await assert.rejects(() => docOrch.readLocalFile({ path: fakePdfLink, cwd: docDir, mode: 'document' }), /符号链接指向不允许的格式/)
+
+        // 32f. Oversized document (> 10MB) rejected cleanly
+        const hugePpt = join(docDir, 'huge-deck.pptx')
+        writeFileSync(hugePpt, Buffer.alloc(10 * 1024 * 1024 + 65536, 0x41))
+        await assert.rejects(() => docOrch.readLocalFile({ path: hugePpt, cwd: docDir, mode: 'document' }), /超出限制.*10MB/)
+
+        // 32g. Frontend deliverable extractor: keeps real deliverables, filters boilerplate & external URLs
+        const extracted = extractDeliverableRefsFromMessage({
+          role: 'assistant',
+          text: [
+            '已完成报告：[Q4汇报.pptx](file:///Users/demo/Desktop/Q4%E6%B1%87%E6%8A%A5.pptx)',
+            '数据看板已输出到 `./reports/dashboard.html`，请查收。',
+            '参考文档 `README.md` 与 `node_modules/pkg/index.html` 以及 https://example.com/public.pdf 。',
+          ].join('\n'),
+          tools: [
+            { name: 'write_file', status: 'done', input: { Path: '/Users/demo/Documents/budget-2026.xlsx' } },
+          ],
+        })
+        const extractedNames = extracted.map((x) => x.filename)
+        assert.ok(extractedNames.includes('Q4汇报.pptx'), 'Should extract file:// markdown link')
+        assert.ok(extractedNames.includes('dashboard.html'), 'Should extract backticked HTML deliverable')
+        assert.ok(extractedNames.includes('budget-2026.xlsx'), 'Should extract tool-written Excel deliverable')
+        assert.equal(extractedNames.includes('README.md'), false, 'Should ignore boilerplate README.md')
+        assert.equal(extractedNames.includes('index.html'), false, 'Should ignore node_modules/pkg/index.html')
+        assert.equal(extractedNames.includes('public.pdf'), false, 'Should ignore remote https:// URL')
+        const htmlItem = extracted.find((x) => x.filename === 'dashboard.html')
+        assert.equal(htmlItem?.previewable, true)
+        assert.equal(htmlItem?.badge, 'HTML')
+      } finally {
+        await docOrch.dispose()
+      }
+    }
+    console.log('[smoke] 32/32 Deliverable document E2EE download (HTML/PDF/Word/Excel/PPT, 10MB cap, security guards & extractor) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

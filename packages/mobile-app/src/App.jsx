@@ -76,6 +76,9 @@ const ModelPickerSheet = React.lazy(() =>
 const ImageLightbox = React.lazy(() =>
   import('./components/ImageLightbox.jsx').then((m) => ({ default: m.ImageLightbox })),
 )
+const HtmlPreviewModal = React.lazy(() =>
+  import('./components/HtmlPreviewModal.jsx').then((m) => ({ default: m.HtmlPreviewModal })),
+)
 const ShareModal = React.lazy(() =>
   import('./components/ShareModal.jsx').then((m) => ({ default: m.ShareModal })),
 )
@@ -134,6 +137,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [e2eeModal, setE2eeModal] = useState({ open: false, tab: 'auto', autoOpenScanner: false })
   const [lightboxState, setLightboxState] = useState(null)
+  const [htmlPreviewState, setHtmlPreviewState] = useState(null)
 
   const [appsStatus, setAppsStatus] = useState([])
   const [modelsCatalog, setModelsCatalog] = useState({})
@@ -444,7 +448,8 @@ export function App() {
         }
       }
       if (e.key === 'Escape') {
-        if (lightboxState) setLightboxState(null)
+        if (htmlPreviewState) setHtmlPreviewState(null)
+        else if (lightboxState) setLightboxState(null)
         else if (pendingGrantPopup) setPendingGrantPopup(null)
         else if (modelPickerOpen) setModelPickerOpen(false)
         else if (e2eeModal.open) setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))
@@ -458,7 +463,7 @@ export function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, htmlPreviewState, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -757,6 +762,13 @@ export function App() {
 
   const imageContext = useMemo(() => {
     const matched = mediaAuth.deviceId === activeDevice?.id
+    const localBridgeId = String(desktopBridge?.bridgeId || '').trim()
+    const isLocalDesktopBridge = Boolean(
+      desktopApi &&
+      localBridgeId &&
+      activeBridgeId &&
+      localBridgeId === activeBridgeId,
+    )
     return {
       baseUrl: activeDevice?.baseUrl || '',
       roomId: activeDevice?.roomId || '',
@@ -768,6 +780,10 @@ export function App() {
       e2eeKeyId: activeBridgeE2ee.keyId,
       e2eeKeys: activeDevice?.e2eeKeys || {},
       onOpenImage: setLightboxState,
+      onOpenHtmlPreview: setHtmlPreviewState,
+      onNotify: showToast,
+      desktopApi,
+      isLocalDesktopBridge,
     }
   }, [
     activeDevice?.id,
@@ -780,6 +796,9 @@ export function App() {
     activeBridgeId,
     activeBridgeE2ee.matchedKey,
     activeBridgeE2ee.keyId,
+    desktopApi,
+    desktopBridge?.bridgeId,
+    showToast,
   ])
 
   const syncActiveSessionQuietly = useCallback(async (sessionId = '') => {
@@ -3118,6 +3137,13 @@ export function App() {
             state={lightboxState}
             imageContext={imageContext}
             onClose={() => setLightboxState(null)}
+          />
+        )}
+
+        {htmlPreviewState && (
+          <HtmlPreviewModal
+            state={htmlPreviewState}
+            onClose={() => setHtmlPreviewState(null)}
           />
         )}
       </Suspense>

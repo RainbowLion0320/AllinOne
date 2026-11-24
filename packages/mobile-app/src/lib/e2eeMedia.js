@@ -1,6 +1,7 @@
 import { RPC } from '@allinone/shared'
 import { base64ToBytes, decryptBytes } from '@allinone/shared/e2ee'
 import { isRelayUploadTarget, resolveImageSrc } from './imageUrls.js'
+import { clearE2eeDeliverableCache } from './e2eeFiles.js'
 import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
@@ -39,6 +40,7 @@ export function clearE2eeMediaCache() {
   }
   blobUrlCache.clear()
   inflightLoads.clear()
+  clearE2eeDeliverableCache()
 }
 
 export function needsE2eeMediaLoad(item, imageContext = {}) {

@@ -7,9 +7,12 @@ import {
   AlertTriangle,
   Check,
   Copy,
+  Download,
+  Eye,
   Image as ImageIcon,
   Info,
   Lightbulb,
+  Loader2,
   ShieldAlert,
   WrapText,
 } from 'lucide-react'
@@ -21,6 +24,12 @@ import {
   resolveImageSrc,
 } from './imageUrls.js'
 import { needsE2eeMediaLoad } from './e2eeMedia.js'
+import {
+  getDeliverableMeta,
+  getDeliverableName,
+  isDeliverableTarget,
+} from './deliverableFiles.js'
+import { fetchE2eeDeliverableFile, triggerDeliverableDownload } from './e2eeFiles.js'
 import { copyTextToClipboard } from './clientHelpers.js'
 
 const HLJS_ALIASES = {
@@ -320,6 +329,67 @@ function ImageChip({ target, label, imageContext }) {
   )
 }
 
+function DeliverableChip({ target, label, imageContext }) {
+  const { bi } = useI18n()
+  const [busy, setBusy] = useState(false)
+  const displayLabel = label || getDeliverableName(target)
+  const meta = getDeliverableMeta(target)
+
+  const handleClick = async () => {
+    if (busy || !imageContext) return
+    setBusy(true)
+    try {
+      if (
+        !meta.previewable &&
+        imageContext.isLocalDesktopBridge &&
+        typeof imageContext.desktopApi?.openDeliverable === 'function'
+      ) {
+        const res = await imageContext.desktopApi.openDeliverable(target, imageContext.cwd || '')
+        if (res?.ok !== false) return
+      }
+      const entry = await fetchE2eeDeliverableFile(target, imageContext)
+      if (meta.previewable && imageContext.onOpenHtmlPreview) {
+        const htmlText = await entry.blob.text()
+        imageContext.onOpenHtmlPreview({
+          html: htmlText,
+          filename: entry.filename || displayLabel,
+          size: entry.size,
+          entry,
+        })
+      } else {
+        await triggerDeliverableDownload(entry)
+      }
+    } catch (err) {
+      imageContext?.onNotify?.(String(err?.message || err || bi('读取文件失败', 'Failed to fetch file')))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={() => void handleClick()}
+      title={
+        meta.previewable
+          ? bi(`点击在安全沙盒中预览 ${displayLabel}`, `Preview ${displayLabel} in sandbox`)
+          : bi(`点击下载 ${displayLabel}`, `Download ${displayLabel}`)
+      }
+      className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] transition hover:bg-[#E0E7FF] active:scale-95 disabled:opacity-60 dark:bg-[#273154] dark:text-[#96AEFF] dark:hover:bg-[#313D66]"
+    >
+      {busy ? (
+        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+      ) : meta.previewable ? (
+        <Eye className="h-3.5 w-3.5 shrink-0" />
+      ) : (
+        <Download className="h-3.5 w-3.5 shrink-0" />
+      )}
+      <span className="truncate">{displayLabel}</span>
+    </button>
+  )
+}
+
 function RichBlockquote({ children }) {
   const { lang } = useI18n()
   const childArr = React.Children.toArray(children).filter(
@@ -520,6 +590,9 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
         const label = extractPlainText(children).trim()
         if (imageContext && isImageTarget(dest)) {
           return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageContext} />
+        }
+        if (imageContext && isDeliverableTarget(dest)) {
+          return <DeliverableChip target={dest} label={label || getDeliverableName(dest)} imageContext={imageContext} />
         }
         if (/^(?:https?:\/\/|mailto:|tel:)/i.test(dest)) {
           return (
