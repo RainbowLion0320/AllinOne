@@ -4798,6 +4798,136 @@ async function main() {
     }
     console.log('[smoke] 28/28 Antigravity Gemini-only weekly quota normalization & non-blocking disk cache OK')
 
+    // 29. DSH Two-Way Prompt Sync: answering in All in One must abort DSH Desktop's downstream `next()` signal without aborting the parent Turn
+    {
+      const dshSyncCards = []
+      const dshSyncEvents = []
+      const listeners = new Map()
+      const mockCtx = {
+        agents: {},
+        on: (name, fn) => {
+          listeners.set(name, fn)
+          return () => listeners.delete(name)
+        },
+      }
+      const dshSync = new DshAdapter({
+        ctx: mockCtx,
+        config: { dshHome: join(tmpDir, 'dsh-sync-29') },
+        log: { info() {}, warn() {}, error() {} },
+        emitEvent: (ev, payload) => dshSyncEvents.push({ ev, payload }),
+        onApprovalRequest: (card) => dshSyncCards.push(card),
+      })
+
+      try {
+        // 29.1 Legacy user-questions/request: mobile answers first -> downstream desktop signal aborts cleanly, parent signal stays intact
+        const parentAc1 = new AbortController()
+        const req1 = {
+          agent: { id: 'sync-s1', session: { id: 'sync-s1' } },
+          signal: parentAc1.signal,
+          questions: [
+            {
+              id: 'choice',
+              question: 'Pick a target',
+              options: [{ label: 'Alpha' }, { label: 'Beta' }],
+            },
+          ],
+        }
+        let desktopSignal1 = null
+        let desktopCancelCount1 = 0
+        const qPromise1 = listeners.get('user-questions/request')(req1, () => new Promise((_, reject) => {
+          desktopSignal1 = req1.signal
+          desktopSignal1.addEventListener('abort', () => {
+            desktopCancelCount1 += 1
+            reject(new Error('cancelled by host'))
+          }, { once: true })
+        }))
+        await new Promise((r) => setTimeout(r, 15))
+        assert.ok(desktopSignal1 && desktopSignal1 !== parentAc1.signal, 'Downstream next() must receive a child AbortSignal')
+        assert.equal(desktopSignal1.aborted, false)
+        const card1 = dshSyncCards.pop()
+        await dshSync.resolveApproval(card1.id, { decision: 'submit', answers: { choice: { selected: ['Beta'] } } })
+        const res1 = await qPromise1
+        assert.deepEqual(res1, { answers: [{ id: 'choice', selected: ['Beta'] }] })
+        assert.equal(desktopSignal1.aborted, true, 'DSH Desktop downstream signal MUST abort when All in One answers')
+        assert.equal(desktopCancelCount1, 1, 'DSH Desktop cancel listener must fire exactly once')
+        assert.equal(parentAc1.signal.aborted, false, 'Parent Turn signal must NEVER be aborted when mobile answers')
+        await new Promise((r) => setTimeout(r, 15))
+        assert.equal(req1.signal, parentAc1.signal, 'request.signal must be restored to original parent signal')
+
+        // 29.2 Non-timed question with wait.callId: desktop cancel fires BEFORE promise resolves (so Desktop reconcile removes card!)
+        const parentAc2 = new AbortController()
+        const req2 = {
+          agent: { id: 'sync-s2', session: { id: 'sync-s2' } },
+          signal: parentAc2.signal,
+          wait: { callId: 'call-sync-2' },
+          questions: [{ id: 'q2', question: 'Confirm?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+        }
+        const order2 = []
+        const qPromise2 = listeners.get('user-questions/request')(req2, () => new Promise((_, reject) => {
+          req2.signal.addEventListener('abort', () => {
+            order2.push('desktop-cancel')
+            reject(new Error('cancelled'))
+          }, { once: true })
+        })).then((res) => {
+          order2.push('tool-resolved')
+          return res
+        })
+        await new Promise((r) => setTimeout(r, 15))
+        const card2 = dshSyncCards.pop()
+        await dshSync.resolveApproval(card2.id, { decision: 'submit', answers: { q2: { selected: ['Yes'] } } })
+        const res2 = await qPromise2
+        assert.deepEqual(res2, { answers: [{ id: 'q2', selected: ['Yes'] }] })
+        assert.deepEqual(order2, ['desktop-cancel', 'tool-resolved'], 'Desktop cancel must fire before tool resolution')
+        assert.equal(req2.signal, parentAc2.signal)
+
+        // 29.3 approval/request: mobile approves first -> downstream desktop approval signal aborts cleanly, parent stays intact
+        const parentAc3 = new AbortController()
+        const req3 = {
+          agent: { id: 'sync-s3', session: { id: 'sync-s3', meta: { cwd: tmpDir } } },
+          signal: parentAc3.signal,
+          toolName: 'bash',
+          reason: 'run build',
+        }
+        let desktopSignal3 = null
+        const aprPromise3 = listeners.get('approval/request')(req3, () => new Promise((_, reject) => {
+          desktopSignal3 = req3.signal
+          desktopSignal3.addEventListener('abort', () => reject(new Error('cancelled')), { once: true })
+        }))
+        await new Promise((r) => setTimeout(r, 15))
+        assert.ok(desktopSignal3 && desktopSignal3 !== parentAc3.signal)
+        const card3 = dshSyncCards.pop()
+        await dshSync.resolveApproval(card3.id, 'allowed-once')
+        const res3 = await aprPromise3
+        assert.equal(res3, 'allowed-once')
+        assert.equal(desktopSignal3.aborted, true, 'DSH Desktop approval signal MUST abort when All in One resolves')
+        assert.equal(parentAc3.signal.aborted, false, 'Parent approval signal must stay intact')
+
+        // 29.4 Reverse direction: parent abort must propagate to DSH Desktop AND clear All in One card
+        const parentAc4 = new AbortController()
+        const req4 = {
+          agent: { id: 'sync-s4', session: { id: 'sync-s4' } },
+          signal: parentAc4.signal,
+          questions: [{ id: 'q4', question: 'Abort me', options: [{ label: 'A' }] }],
+        }
+        let desktopSignal4 = null
+        const qPromise4 = listeners.get('user-questions/request')(req4, () => new Promise(() => {
+          desktopSignal4 = req4.signal
+        }))
+        await new Promise((r) => setTimeout(r, 15))
+        const card4 = dshSyncCards.pop()
+        parentAc4.abort(new Error('turn stopped'))
+        await assert.rejects(() => qPromise4, /turn stopped/)
+        assert.equal(desktopSignal4.aborted, true, 'Parent abort must propagate to DSH Desktop child signal')
+        assert.ok(
+          dshSyncEvents.some((e) => e.ev === EVENTS.APPROVAL_RESOLVED && e.payload?.id === card4.id),
+          'Parent abort must emit APPROVAL_RESOLVED to clear All in One card',
+        )
+      } finally {
+        await dshSync.dispose()
+      }
+    }
+    console.log('[smoke] 29/29 DSH two-way prompt & approval sync (downstream Desktop cancel on remote answer + parent abort propagation) OK')
+
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
     if (acctPortableChild) {

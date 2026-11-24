@@ -214,6 +214,94 @@ function parseProjCacheMessages(cacheRecord) {
   return messages
 }
 
+/**
+ * Wrap `request.signal` with a child AbortController before forwarding a Cordis waterfall
+ * (`user-questions/request` / `approval/request`) to DSH Desktop (`next()`).
+ * - Parent aborts propagate straight into the child signal so DSH Desktop clears normally.
+ * - When All in One answers first, `abortDesktop()` aborts ONLY the downstream child signal,
+ *   causing DSH's `dsh-api-gateway` to drop `pendingRemoteEvents` and send `{ type: 'cancel' }`
+ *   to silently dismiss DSH Desktop's pending question / approval card without aborting the
+ *   parent tool call or Turn.
+ */
+function attachDownstreamDesktopSignal(request) {
+  const origSignal = request?.signal
+  const desktopAc = new AbortController()
+  const onOrigAbort = () => {
+    if (!desktopAc.signal.aborted) {
+      desktopAc.abort(origSignal?.reason ?? new Error('request aborted'))
+    }
+  }
+  if (origSignal) {
+    if (origSignal.aborted) {
+      desktopAc.abort(origSignal.reason)
+    } else {
+      try { origSignal.addEventListener('abort', onOrigAbort, { once: true }) } catch {}
+    }
+  }
+
+  let swapped = false
+  let hadOwnSignal = false
+  let origDesc = null
+
+  const install = () => {
+    if (swapped || !request || typeof request !== 'object') return false
+    try {
+      hadOwnSignal = Object.prototype.hasOwnProperty.call(request, 'signal')
+      origDesc = hadOwnSignal ? Object.getOwnPropertyDescriptor(request, 'signal') : null
+      if (!hadOwnSignal || origDesc?.writable) {
+        request.signal = desktopAc.signal
+        swapped = true
+      } else if (origDesc?.configurable) {
+        Object.defineProperty(request, 'signal', {
+          value: desktopAc.signal,
+          writable: true,
+          enumerable: origDesc.enumerable,
+          configurable: true,
+        })
+        swapped = true
+      }
+    } catch {}
+    return swapped
+  }
+
+  const restore = () => {
+    if (!swapped || !request || typeof request !== 'object') return
+    swapped = false
+    try {
+      if (hadOwnSignal && origDesc) {
+        Object.defineProperty(request, 'signal', origDesc)
+      } else if (hadOwnSignal) {
+        request.signal = origSignal
+      } else {
+        delete request.signal
+      }
+    } catch {}
+  }
+
+  const detachParent = () => {
+    if (origSignal) {
+      try { origSignal.removeEventListener('abort', onOrigAbort) } catch {}
+    }
+  }
+
+  const abortDesktop = (reason = 'Answered remotely via All in One') => {
+    if (!desktopAc.signal.aborted) {
+      try {
+        desktopAc.abort(new Error(reason))
+      } catch {}
+    }
+  }
+
+  return {
+    origSignal,
+    desktopSignal: desktopAc.signal,
+    install,
+    restore,
+    detachParent,
+    abortDesktop,
+  }
+}
+
 export class DshAdapter {
   constructor({ ctx = null, config = {}, log = console, emitEvent, onApprovalRequest }) {
     this.ctx = ctx
@@ -354,10 +442,21 @@ export class DshAdapter {
 
     return new Promise((resolvePromise, rejectPromise) => {
       let settled = false
+      let desktopForwarded = false
+      let desktopSettled = false
+      let flushTimer = null
+      const desktopRace = attachDownstreamDesktopSignal(request)
+      const origSignal = desktopRace.origSignal
+
       const cleanup = (resolvedDecision = '') => {
+        if (flushTimer) {
+          clearTimeout(flushTimer)
+          flushTimer = null
+        }
         this.pendingApprovals.delete(aprId)
-        if (request?.signal && onAbort) {
-          try { request.signal.removeEventListener('abort', onAbort) } catch {}
+        desktopRace.detachParent()
+        if (origSignal && onAbort) {
+          try { origSignal.removeEventListener('abort', onAbort) } catch {}
         }
         if (resolvedDecision) {
           this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
@@ -368,10 +467,35 @@ export class DshAdapter {
         }
       }
 
-      const finishResolve = (result, resolvedDecision) => {
+      const finishResolve = (result, resolvedDecision, { cancelDesktop = false } = {}) => {
         if (settled) return
         settled = true
         cleanup(resolvedDecision)
+        const shouldCancelDesktop = cancelDesktop && desktopForwarded && !desktopSettled
+        if (shouldCancelDesktop) {
+          desktopRace.abortDesktop()
+          // Non-timed questions with a durable `wait.callId` rely on DSH Desktop's `reconcile()`
+          // running AFTER the loopback `{ type: 'cancel' }` frame clears `card.hasRequest()` and
+          // `card.pending.hasWaterfall()`. Giving the cancel frame 50ms avoids racing the
+          // `userQuestions` projection patch. For `wait.timed === true`, resolve immediately so
+          // `TimedQuestionWait` never fires `ASK_TIMED_OUT` when desktop releases its claim.
+          if (request?.wait?.callId && !request?.wait?.timed) {
+            flushTimer = setTimeout(() => {
+              flushTimer = null
+              desktopRace.restore()
+              resolvePromise(result)
+            }, 50)
+            flushTimer.unref?.()
+            return
+          }
+          // Defer signal restoration to next macrotask so any queued gateway microtask still
+          // observes the aborted `desktopSignal`.
+          const restoreTimer = setTimeout(() => desktopRace.restore(), 0)
+          restoreTimer.unref?.()
+          resolvePromise(result)
+          return
+        }
+        desktopRace.restore()
         resolvePromise(result)
       }
 
@@ -379,18 +503,19 @@ export class DshAdapter {
         if (settled) return
         settled = true
         cleanup(resolvedDecision)
+        desktopRace.restore()
         rejectPromise(err)
       }
 
       const onAbort = () => {
-        finishReject(request?.signal?.reason || new Error('ask_user_question aborted'), 'cancel')
+        finishReject(origSignal?.reason || new Error('ask_user_question aborted'), 'cancel')
       }
-      if (request?.signal) {
-        if (request.signal.aborted) {
+      if (origSignal) {
+        if (origSignal.aborted) {
           onAbort()
           return
         }
-        try { request.signal.addEventListener('abort', onAbort, { once: true }) } catch {}
+        try { origSignal.addEventListener('abort', onAbort, { once: true }) } catch {}
       }
 
       this.pendingApprovals.set(aprId, {
@@ -406,7 +531,11 @@ export class DshAdapter {
               : single.intent?.reject
                 ? [single.intent.reject]
                 : []
-            finishResolve({ answers: [{ id: single.id, selected: chosen }] }, decision || 'cancel')
+            finishResolve(
+              { answers: [{ id: single.id, selected: chosen }] },
+              decision || 'cancel',
+              { cancelDesktop: true },
+            )
             return { resolved: true, id: aprId, decision: decision || 'cancel' }
           }
           const cancelled = decision === 'cancel' || decision === 'decline'
@@ -420,7 +549,11 @@ export class DshAdapter {
               ...(ans.custom ? { custom: ans.custom } : {}),
             }
           })
-          finishResolve({ answers: outAnswers }, cancelled ? 'cancel' : 'submit')
+          finishResolve(
+            { answers: outAnswers },
+            cancelled ? 'cancel' : 'submit',
+            { cancelDesktop: true },
+          )
           return { resolved: true, id: aprId, decision: cancelled ? 'cancel' : 'submit' }
         },
       })
@@ -429,14 +562,22 @@ export class DshAdapter {
 
       // Race against DSH Desktop UI (`next()`): absorb NO_PROVIDER so headless DSH still waits for mobile!
       Promise.resolve()
-        .then(() => next())
+        .then(() => {
+          if (settled) return undefined
+          desktopRace.install()
+          desktopForwarded = true
+          return next()
+        })
         .then(
           (desktopRes) => {
+            desktopSettled = true
             if (desktopRes && Array.isArray(desktopRes.answers)) {
               finishResolve(desktopRes, 'desktop')
             }
           },
           (err) => {
+            desktopSettled = true
+            if (settled) return
             if (err?.code === 'NO_PROVIDER') return
             finishReject(err, 'cancel')
           },
@@ -466,10 +607,16 @@ export class DshAdapter {
 
     return new Promise((resolvePromise) => {
       let settled = false
+      let desktopForwarded = false
+      let desktopSettled = false
+      const desktopRace = attachDownstreamDesktopSignal(request)
+      const origSignal = desktopRace.origSignal
+
       const cleanup = (resolvedDecision = '') => {
         this.pendingApprovals.delete(aprId)
-        if (request?.signal && onAbort) {
-          try { request.signal.removeEventListener('abort', onAbort) } catch {}
+        desktopRace.detachParent()
+        if (origSignal && onAbort) {
+          try { origSignal.removeEventListener('abort', onAbort) } catch {}
         }
         if (resolvedDecision) {
           this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
@@ -480,20 +627,28 @@ export class DshAdapter {
         }
       }
 
-      const finish = (outcome, resolvedDecision) => {
+      const finish = (outcome, resolvedDecision, { cancelDesktop = false } = {}) => {
         if (settled) return
         settled = true
         cleanup(resolvedDecision)
+        const shouldCancelDesktop = cancelDesktop && desktopForwarded && !desktopSettled
+        if (shouldCancelDesktop) {
+          desktopRace.abortDesktop()
+          const restoreTimer = setTimeout(() => desktopRace.restore(), 0)
+          restoreTimer.unref?.()
+        } else {
+          desktopRace.restore()
+        }
         resolvePromise(outcome)
       }
 
       const onAbort = () => finish('cancelled', 'cancel')
-      if (request?.signal) {
-        if (request.signal.aborted) {
+      if (origSignal) {
+        if (origSignal.aborted) {
           onAbort()
           return
         }
-        try { request.signal.addEventListener('abort', onAbort, { once: true }) } catch {}
+        try { origSignal.addEventListener('abort', onAbort, { once: true }) } catch {}
       }
 
       this.pendingApprovals.set(aprId, {
@@ -507,7 +662,7 @@ export class DshAdapter {
               : decision === 'cancel' || decision === 'cancelled'
                 ? 'cancelled'
                 : 'rejected'
-          finish(outcome, outcome)
+          finish(outcome, outcome, { cancelDesktop: true })
           return { resolved: true, id: aprId, decision: outcome }
         },
       })
@@ -515,9 +670,15 @@ export class DshAdapter {
       this.onApprovalRequest(card)
 
       Promise.resolve()
-        .then(() => next())
+        .then(() => {
+          if (settled) return undefined
+          desktopRace.install()
+          desktopForwarded = true
+          return next()
+        })
         .then(
           (desktopOutcome) => {
+            desktopSettled = true
             if (
               desktopOutcome === 'allowed-once' ||
               desktopOutcome === 'rejected' ||
@@ -526,7 +687,9 @@ export class DshAdapter {
               finish(desktopOutcome, desktopOutcome)
             }
           },
-          () => {},
+          () => {
+            desktopSettled = true
+          },
         )
     })
   }
