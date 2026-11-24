@@ -43,8 +43,13 @@ Linux 或纯终端环境可直接运行一行命令接入：
 
 #### 手机端
 
-- **Android**：在 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载 `All-in-One-Android.apk` 安装（自动热更新最新界面），或直接在浏览器打开服务器地址。
-- **iOS / 通用网页**：用手机浏览器打开服务器地址，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
+| 手机端网页直连（iOS / Android 通用） | Android 客户端 APK（永久最新） |
+| :---: | :---: |
+| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="168" height="168" alt="手机端网页直连二维码" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="168" height="168" alt="Android APK 下载二维码" /></a> |
+| [直接打开网页端](https://123.206.218.214/dsh/) | [直接下载最新 APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) |
+
+- **iOS / 通用网页**：手机扫码或直接打开网页端，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
+- **Android**：手机扫码下载安装 `All-in-One-Android.apk`（自动热更新最新界面），也可前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载。
 
 ---
 

@@ -43,8 +43,13 @@ On Linux or headless machines, connect with a single command:
 
 #### Mobile
 
-- **Android**: Download and install `All-in-One-Android.apk` from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) (auto hot-updates the web UI), or open your server URL in Chrome.
-- **iOS / Universal Web**: Open your server URL in your mobile browser and tap **Add to Home Screen** to install as a PWA. Sign in with the same account to access all of your online computers.
+| Mobile Web Direct Access (iOS / Android) | Android APK (Always Latest) |
+| :---: | :---: |
+| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="168" height="168" alt="Mobile Web QR Code" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="168" height="168" alt="Android APK Download QR Code" /></a> |
+| [Open Web App](https://123.206.218.214/dsh/) | [Download Latest APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) |
+
+- **iOS / Universal Web**: Scan the QR code or open the web app in your mobile browser and tap **Add to Home Screen** to install as a PWA. Sign in with the same account to access all of your online computers.
+- **Android**: Scan to download and install `All-in-One-Android.apk` (auto hot-updates the web UI), or download from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest).
 
 ---
 
