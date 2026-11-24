@@ -108,7 +108,7 @@ function groupByTime(sessions, lang) {
   return groups.filter((g) => g.items.length > 0)
 }
 
-function SessionRow({ session, isActive, showProjectSubtitle, onSelect }) {
+function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSubtitle, onSelect }) {
   const { bi } = useI18n()
   const meta = APP_META[session.app] || APP_META.dsh
   return (
@@ -126,12 +126,17 @@ function SessionRow({ session, isActive, showProjectSubtitle, onSelect }) {
         <span className="flex-1 truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
           {session.title}
         </span>
-        {session.status === 'running' && (
+        {hasPendingPrompt ? (
+          <span
+            title={bi('等待你的选择', 'Waiting for your input')}
+            className="h-2 w-2 shrink-0 rounded-full bg-amber-500 animate-pulse"
+          />
+        ) : session.status === 'running' ? (
           <span
             title={bi('运行中', 'Running')}
             className="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
           />
-        )}
+        ) : null}
         {session.readOnlyDesktop && (
           <span className="shrink-0 rounded bg-slate-200/80 px-1 py-0.5 text-[9px] text-slate-500 dark:bg-slate-700/80 dark:text-slate-300">
             {bi('历史', 'History')}
@@ -152,6 +157,7 @@ export function SidebarDrawer({
   onClose,
   sessions,
   activeSessionId,
+  pendingApprovalSessionIds = null,
   onSelectSession,
   onNewChat,
   filterApp: controlledFilterApp,
@@ -513,6 +519,7 @@ export function SidebarDrawer({
                             key={s.id}
                             session={s}
                             isActive={s.id === activeSessionId}
+                            hasPendingPrompt={Boolean(pendingApprovalSessionIds?.has?.(s.id))}
                             showProjectSubtitle={false}
                             onSelect={() => {
                               onSelectSession(s)
@@ -538,6 +545,7 @@ export function SidebarDrawer({
                       key={s.id}
                       session={s}
                       isActive={s.id === activeSessionId}
+                      hasPendingPrompt={Boolean(pendingApprovalSessionIds?.has?.(s.id))}
                       showProjectSubtitle={true}
                       onSelect={() => {
                         onSelectSession(s)

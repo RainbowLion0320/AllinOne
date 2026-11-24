@@ -1,9 +1,15 @@
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import {
+  answersToElicitationContent,
+  elicitationSchemaToQuestions,
+  normalizeResolvePayload,
+} from '../helpers/interactive-schema.js'
 
 const AGY_APP_DATA_DIR = 'antigravity'
 const transcriptCache = createFileParseCache(16)
@@ -421,12 +427,13 @@ function extractAcpText(content) {
  * (`not_fully_idle = 1`) so reactive wakeups complete uninterrupted and stream live to mobile!
  */
 class AgyAcpClient {
-  constructor({ agyBin, cwd, autoApprove = true, log = console, onSessionUpdate, onExit }) {
+  constructor({ agyBin, cwd, autoApprove = true, log = console, onSessionUpdate, onServerRequest, onExit }) {
     this.agyBin = agyBin
     this.cwd = cwd
     this.autoApprove = autoApprove
     this.log = log
     this.onSessionUpdate = onSessionUpdate || null
+    this.onServerRequest = onServerRequest || null
     this.onExit = onExit || null
     this.proc = null
     this.nextId = 1
@@ -442,6 +449,10 @@ class AgyAcpClient {
 
   setSessionUpdateHandler(fn) {
     this.onSessionUpdate = fn || null
+  }
+
+  setServerRequestHandler(fn) {
+    this.onServerRequest = fn || null
   }
 
   touchSlidingTimeouts() {
@@ -496,7 +507,11 @@ class AgyAcpClient {
       } catch {}
     })
 
-    await this.rpc('initialize', { protocolVersion: 1, clientCapabilities: {} }, 25_000)
+    await this.rpc(
+      'initialize',
+      { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } },
+      25_000,
+    )
   }
 
   handleLine(line) {
@@ -527,8 +542,13 @@ class AgyAcpClient {
       return
     }
 
-    // Handle any unexpected permission request safely if autoApprove wasn't enough
+    // Handle server-to-client requests (elicitation/create, session/request_permission, etc.)
     if (msg.id !== undefined && msg.method) {
+      this.touchSlidingTimeouts()
+      if (this.onServerRequest) {
+        this.onServerRequest(this, msg)
+        return
+      }
       if (msg.method === 'session/request_permission' && this.autoApprove) {
         const opts = msg.params?.options || []
         const allow = opts.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always') || opts[0]
@@ -641,7 +661,7 @@ class AgyAcpClient {
  *    without premature `session/close`, and auto-reaps truly idle sessions cleanly!
  */
 export class AntigravityAdapter {
-  constructor({ config = {}, log = console, emitEvent }) {
+  constructor({ config = {}, log = console, emitEvent, onApprovalRequest }) {
     this.agyHome = String(config.agyHome || '').trim() || getAgyHome()
     this.configuredBin = config.agyBin
     this.agyBin = findAgyBinary(this.configuredBin)
@@ -649,6 +669,8 @@ export class AntigravityAdapter {
     this.autoApprove = config.agyAutoApprove !== false
     this.log = log
     this.emitEvent = emitEvent || (() => {})
+    this.onApprovalRequest = onApprovalRequest || (() => {})
+    this.pendingServerRequests = new Map() // approvalId -> { client, rpcId, method, sessionId, params }
     this.activeTurns = new Map() // conversationId -> { client, aborted }
     this.warmSessions = new Map() // conversationId -> warm entry keeping background tasks alive
     this.pendingCreated = new Map() // conversationId -> summary (before first turn hits conversation_summaries.db)
@@ -1233,7 +1255,9 @@ export class AntigravityAdapter {
       sawBackgroundTask: false,
     }
     client.setSessionUpdateHandler((params) => this.handleWarmSessionUpdate(entry, params))
+    client.setServerRequestHandler((c, msg) => this.handleServerRequest(entry, c, msg))
     client.onExit = () => {
+      this.clearPendingForClient(client)
       if (entry.wakeup?.settleTimer) clearTimeout(entry.wakeup.settleTimer)
       if (entry.wakeup) {
         const compositeId = makeCompositeId(APPS.ANTIGRAVITY, entry.sessionId)
@@ -1736,8 +1760,185 @@ export class AntigravityAdapter {
     }
   }
 
+  clearPendingForClient(client) {
+    for (const [aprId, item] of this.pendingServerRequests.entries()) {
+      if (item.client === client) {
+        this.pendingServerRequests.delete(aprId)
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.ANTIGRAVITY, decision: 'cancel' })
+      }
+    }
+  }
+
+  handleServerRequest(entry, client, msg) {
+    const method = msg.method
+    const params = msg.params || {}
+    const sid = String(params.sessionId || entry?.sessionId || '').trim()
+    const compositeId = sid ? makeCompositeId(APPS.ANTIGRAVITY, sid) : ''
+    if (entry) entry.lastActivityAt = Date.now()
+
+    if (method === 'elicitation/create') {
+      const aprId = `agy-q-${randomUUID().slice(0, 10)}`
+      const isUrlMode = params.mode === 'url'
+      const questions = isUrlMode
+        ? []
+        : elicitationSchemaToQuestions(params.requestedSchema, params.message || '请做出选择')
+
+      this.pendingServerRequests.set(aprId, {
+        client,
+        rpcId: msg.id,
+        method,
+        sessionId: sid,
+        params,
+        questions,
+      })
+
+      this.onApprovalRequest({
+        id: aprId,
+        app: APPS.ANTIGRAVITY,
+        sessionId: compositeId,
+        kind: isUrlMode ? 'url_elicitation' : 'question',
+        title: 'Antigravity 需要你做选择',
+        detail: String(params.message || '').trim(),
+        ...(isUrlMode && params.url ? { url: String(params.url) } : {}),
+        ...(isUrlMode
+          ? {
+              options: [
+                { value: 'accept', label: '确认继续', style: 'primary' },
+                { value: 'decline', label: '拒绝', style: 'danger' },
+              ],
+            }
+          : { questions }),
+        createdAt: Date.now(),
+      })
+      return
+    }
+
+    if (method === 'session/request_permission') {
+      const rawOpts = Array.isArray(params.options) ? params.options : []
+      if (this.autoApprove) {
+        const allow = rawOpts.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always') || rawOpts[0]
+        try {
+          client.sendRaw({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { outcome: allow ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' } },
+          })
+        } catch {}
+        return
+      }
+
+      const aprId = `agy-apr-${randomUUID().slice(0, 10)}`
+      this.pendingServerRequests.set(aprId, {
+        client,
+        rpcId: msg.id,
+        method,
+        sessionId: sid,
+        params,
+      })
+
+      const options = rawOpts.map((o) => ({
+        value: String(o.optionId || o.name || ''),
+        label: String(o.name || o.optionId || ''),
+        style:
+          o.kind === 'reject_once' || o.kind === 'reject_always'
+            ? 'danger'
+            : o.kind === 'allow_once'
+              ? 'primary'
+              : 'secondary',
+      }))
+      const tc = params.toolCall || {}
+      const detail =
+        extractAcpText(tc.content) ||
+        (tc.rawInput ? (typeof tc.rawInput === 'string' ? tc.rawInput : JSON.stringify(tc.rawInput, null, 2)) : '') ||
+        tc.title ||
+        '请求执行操作'
+
+      this.onApprovalRequest({
+        id: aprId,
+        app: APPS.ANTIGRAVITY,
+        sessionId: compositeId,
+        kind: 'command',
+        title: tc.title ? `Antigravity 请求：${tc.title}` : 'Antigravity 请求授权',
+        detail: String(detail).slice(0, 1200),
+        cwd: entry?.cwd || '',
+        options,
+        createdAt: Date.now(),
+      })
+      return
+    }
+
+    try {
+      client.sendRaw({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32601, message: `Unsupported client method: ${method}` },
+      })
+    } catch {}
+  }
+
+  async resolveApproval(approvalId, decisionOrPayload) {
+    const item = this.pendingServerRequests.get(approvalId)
+    if (!item) return { resolved: false, reason: 'approval not found' }
+    this.pendingServerRequests.delete(approvalId)
+
+    const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
+
+    if (item.method === 'elicitation/create') {
+      const action = decision === 'decline' ? 'decline' : decision === 'cancel' ? 'cancel' : 'accept'
+      const result = action === 'accept'
+        ? item.params?.mode === 'url'
+          ? { action: 'accept' }
+          : { action: 'accept', content: answersToElicitationContent(item.params?.requestedSchema, answers) }
+        : { action }
+      item.client.sendRaw({
+        jsonrpc: '2.0',
+        id: item.rpcId,
+        result,
+      })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.ANTIGRAVITY,
+        decision: action,
+      })
+      return { resolved: true, id: approvalId, decision: action }
+    }
+
+    if (item.method === 'session/request_permission') {
+      const outcome =
+        !decision || decision === 'cancel'
+          ? { outcome: 'cancelled' }
+          : { outcome: 'selected', optionId: decision }
+      item.client.sendRaw({
+        jsonrpc: '2.0',
+        id: item.rpcId,
+        result: { outcome },
+      })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.ANTIGRAVITY,
+        decision: decision || 'cancel',
+      })
+      return { resolved: true, id: approvalId, decision: decision || 'cancel' }
+    }
+
+    return { resolved: false, reason: `unsupported method: ${item.method}` }
+  }
+
   async interrupt(sessionId) {
     sessionId = assertSafeSessionId(sessionId, 'Antigravity conversationId')
+    for (const [aprId, item] of this.pendingServerRequests.entries()) {
+      if (item.sessionId === sessionId) {
+        this.pendingServerRequests.delete(aprId)
+        try {
+          if (item.method === 'elicitation/create') {
+            item.client.sendRaw({ jsonrpc: '2.0', id: item.rpcId, result: { action: 'cancel' } })
+          } else if (item.method === 'session/request_permission') {
+            item.client.sendRaw({ jsonrpc: '2.0', id: item.rpcId, result: { outcome: { outcome: 'cancelled' } } })
+          }
+        } catch {}
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.ANTIGRAVITY, decision: 'cancel' })
+      }
+    }
     const active = this.activeTurns.get(sessionId)
     if (active) {
       active.aborted = true

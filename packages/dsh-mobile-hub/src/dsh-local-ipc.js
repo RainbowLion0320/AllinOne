@@ -25,6 +25,8 @@ const ALLOWED_METHODS = new Set([
   'createSession',
   'sendMessage',
   'interrupt',
+  'listApprovals',
+  'resolveApproval',
 ])
 
 export function getDshIpcFilePath(dshHome = '') {
@@ -167,6 +169,17 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
           result = await dshAdapter.sendMessage(params.sessionId, params.payload || {})
         } else if (method === 'interrupt') {
           result = await dshAdapter.interrupt(params.sessionId)
+        } else if (method === 'listApprovals') {
+          result = typeof dshAdapter.listPendingApprovals === 'function'
+            ? await dshAdapter.listPendingApprovals()
+            : []
+        } else if (method === 'resolveApproval') {
+          const payload = params.answers && typeof params.answers === 'object'
+            ? { decision: params.decision, answers: params.answers }
+            : params.decision
+          result = typeof dshAdapter.resolveApproval === 'function'
+            ? await dshAdapter.resolveApproval(params.id, payload)
+            : { resolved: false, reason: 'resolveApproval not supported' }
         }
         sendJson(res, 200, { ok: true, result })
       } catch (err) {

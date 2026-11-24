@@ -13,7 +13,6 @@ import {
   History,
   Info,
   Loader2,
-  ShieldAlert,
   Terminal,
   Wrench,
   X,
@@ -23,6 +22,7 @@ import { MarkdownView } from '../lib/markdown.jsx'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
 import { ChatImageGallery } from './ImageLightbox.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang } from '../lib/i18n.js'
 
@@ -516,6 +516,13 @@ export function ChatView({
     }
   }, [session?.id, initialScrollReady, displayMessages.length, hasMoreHistory, loadingOlder, loadingSession])
 
+  // Auto-scroll to show newly arrived interactive question/approval cards immediately
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || !approvals || approvals.length === 0) return
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+  }, [approvals?.length])
+
   // Follow live streaming output only if user hasn't scrolled up reading history
   useEffect(() => {
     const el = scrollRef.current
@@ -864,45 +871,11 @@ export function ChatView({
           </div>
         )}
 
-        {/* Interactive Approvals Banner */}
+        {/* Interactive Questions & Approvals Cards */}
         {approvals.length > 0 && (
           <div className="mt-5 space-y-2.5">
             {approvals.map((apr) => (
-              <div
-                key={apr.id}
-                className="rounded-2xl border border-amber-300/80 bg-amber-50/90 p-3.5 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/35"
-              >
-                <div className="flex items-center gap-2 text-xs font-bold text-amber-900 dark:text-amber-200">
-                  <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                  <span>{apr.title}</span>
-                </div>
-                <pre className="mt-2 max-h-28 overflow-auto rounded-xl bg-white/80 p-2.5 font-mono text-[11px] whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-slate-800 dark:bg-black/30 dark:text-slate-200">
-                  {apr.detail}
-                </pre>
-                {apr.cwd && (
-                  <div className="mt-1 break-all text-[10.5px] text-amber-800/70 dark:text-amber-300/70">
-                    {bi('目录：', 'Directory: ')}{apr.cwd}
-                  </div>
-                )}
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {(apr.options || []).map((opt) => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() => onResolveApproval(apr.id, opt.value)}
-                      className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition active:scale-95 ${
-                        opt.style === 'primary'
-                          ? 'bg-[#4D6BFE] text-white'
-                          : opt.style === 'danger'
-                            ? 'bg-rose-500 text-white'
-                            : 'bg-white text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
+              <InteractivePromptCard key={apr.id} prompt={apr} onResolve={onResolveApproval} />
             ))}
           </div>
         )}

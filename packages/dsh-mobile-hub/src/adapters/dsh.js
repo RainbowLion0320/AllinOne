@@ -5,6 +5,7 @@ import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
+import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 import { DshLocalIpcClient } from '../dsh-local-ipc.js'
 
 /**
@@ -214,11 +215,12 @@ function parseProjCacheMessages(cacheRecord) {
 }
 
 export class DshAdapter {
-  constructor({ ctx = null, config = {}, log = console, emitEvent }) {
+  constructor({ ctx = null, config = {}, log = console, emitEvent, onApprovalRequest }) {
     this.ctx = ctx
     this.config = config
     this.log = log
     this.emitEvent = emitEvent || (() => {})
+    this.onApprovalRequest = onApprovalRequest || (() => {})
     this.dshHome = String(config.dshHome ?? '').trim() || getDshHome()
     this.defaultCwd = resolve(
       String(config.cwd ?? '').trim() ||
@@ -230,13 +232,336 @@ export class DshAdapter {
     this.activeTurns = new Map() // sessionId -> { agent, aborting, startedAt }
     this.ownedHandles = new Map()
     this.sessionModels = new Map() // sessionId -> { provider, model, reasoningEffort }
+    this.pendingApprovals = new Map() // id -> { req, resolveMobile, rejectMobile }
+    this.cordisDisposers = []
     this.ipcClient = this.ctx
       ? null
       : new DshLocalIpcClient({
           dshHome: this.dshHome,
-          emitEvent: this.emitEvent,
+          emitEvent: (event, payload) => {
+            if (event === EVENTS.APPROVAL_REQUEST && payload?.id) {
+              this.onApprovalRequest(payload)
+              return
+            }
+            this.emitEvent(event, payload)
+          },
           log: this.log,
         })
+    if (this.ctx) {
+      this.attachCordisInteractiveHooks()
+    }
+  }
+
+  /**
+   * Bridge DSH's native Cordis waterfall seams (`user-questions/request` and `approval/request`)
+   * to mobile/remote clients while racing cleanly against DSH Desktop UI (`next()`).
+   * Whichever side answers first wins, and the other surface clears immediately!
+   */
+  attachCordisInteractiveHooks() {
+    if (!this.ctx || typeof this.ctx.on !== 'function') return
+    try {
+      const disposeQ = this.ctx.on(
+        'user-questions/request',
+        (request, next) => this.handleCordisUserQuestions(request, next),
+        { prepend: true, global: true },
+      )
+      if (typeof disposeQ === 'function') this.cordisDisposers.push(disposeQ)
+    } catch (err) {
+      this.log.warn?.(`mobile-hub: failed hooking DSH user-questions/request: ${String(err)}`)
+    }
+    try {
+      const disposeA = this.ctx.on(
+        'approval/request',
+        (request, next) => this.handleCordisApprovalRequest(request, next),
+        { prepend: true, global: true },
+      )
+      if (typeof disposeA === 'function') this.cordisDisposers.push(disposeA)
+    } catch (err) {
+      this.log.warn?.(`mobile-hub: failed hooking DSH approval/request: ${String(err)}`)
+    }
+  }
+
+  handleCordisUserQuestions(request, next) {
+    const rawQuestions = Array.isArray(request?.questions) ? request.questions : []
+    if (rawQuestions.length === 0) return next()
+
+    const nativeSessionId = String(request?.agent?.session?.id || request?.agent?.id || '').trim()
+    const compositeId = nativeSessionId ? makeCompositeId(APPS.DSH, nativeSessionId) : ''
+    const aprId = `dsh-q-${randomUUID().slice(0, 10)}`
+
+    // Detect DSH single-question approval / plan-review intent for crisp button presentation
+    const single = rawQuestions.length === 1 ? rawQuestions[0] : null
+    const isApprovalIntent = Boolean(single?.intent?.kind === 'approval')
+
+    let card
+    if (isApprovalIntent) {
+      const intent = single.intent
+      const options = (Array.isArray(single.options) ? single.options : []).map((opt) => ({
+        value: String(opt?.label || ''),
+        label: String(opt?.label || ''),
+        description: String(opt?.description || ''),
+        style:
+          opt?.label === intent.reject
+            ? 'danger'
+            : opt?.label === intent.approve
+              ? 'primary'
+              : 'secondary',
+      }))
+      card = {
+        id: aprId,
+        app: APPS.DSH,
+        sessionId: compositeId,
+        kind: 'command',
+        title: String(single.question || single.header || 'DeepSeek 请求确认').trim(),
+        detail: String(single.detail || '').trim(),
+        options,
+        createdAt: Date.now(),
+      }
+    } else {
+      const questions = rawQuestions.map((q, idx) => {
+        const opts = Array.isArray(q?.options)
+          ? q.options
+              .filter((o) => o && typeof o.label === 'string')
+              .map((o) => ({
+                value: o.label,
+                label: o.label,
+                description: typeof o.description === 'string' ? o.description : '',
+              }))
+          : []
+        return {
+          id: String(q?.id || `q_${idx}`),
+          header: String(q?.header || '').trim(),
+          question: String(q?.question || '').trim() || `问题 ${idx + 1}`,
+          description: String(q?.detail || '').trim(),
+          multiSelect: Boolean(q?.multiSelect),
+          allowOther: true,
+          inputType: opts.length > 0 ? 'select' : 'text',
+          required: false,
+          options: opts,
+        }
+      })
+      card = {
+        id: aprId,
+        app: APPS.DSH,
+        sessionId: compositeId,
+        kind: 'question',
+        title: single?.intent?.kind === 'plan-review' ? 'DeepSeek 计划确认' : 'DeepSeek 需要你做选择',
+        detail: '',
+        questions,
+        createdAt: Date.now(),
+      }
+    }
+
+    return new Promise((resolvePromise, rejectPromise) => {
+      let settled = false
+      const cleanup = (resolvedDecision = '') => {
+        this.pendingApprovals.delete(aprId)
+        if (request?.signal && onAbort) {
+          try { request.signal.removeEventListener('abort', onAbort) } catch {}
+        }
+        if (resolvedDecision) {
+          this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+            id: aprId,
+            app: APPS.DSH,
+            decision: resolvedDecision,
+          })
+        }
+      }
+
+      const finishResolve = (result, resolvedDecision) => {
+        if (settled) return
+        settled = true
+        cleanup(resolvedDecision)
+        resolvePromise(result)
+      }
+
+      const finishReject = (err, resolvedDecision) => {
+        if (settled) return
+        settled = true
+        cleanup(resolvedDecision)
+        rejectPromise(err)
+      }
+
+      const onAbort = () => {
+        finishReject(request?.signal?.reason || new Error('ask_user_question aborted'), 'cancel')
+      }
+      if (request?.signal) {
+        if (request.signal.aborted) {
+          onAbort()
+          return
+        }
+        try { request.signal.addEventListener('abort', onAbort, { once: true }) } catch {}
+      }
+
+      this.pendingApprovals.set(aprId, {
+        req: card,
+        type: 'user-questions',
+        rawQuestions,
+        isApprovalIntent,
+        resolveMobile: (decisionOrPayload) => {
+          const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
+          if (isApprovalIntent && single) {
+            const chosen = decision && decision !== 'cancel'
+              ? [decision]
+              : single.intent?.reject
+                ? [single.intent.reject]
+                : []
+            finishResolve({ answers: [{ id: single.id, selected: chosen }] }, decision || 'cancel')
+            return { resolved: true, id: aprId, decision: decision || 'cancel' }
+          }
+          const cancelled = decision === 'cancel' || decision === 'decline'
+          const outAnswers = rawQuestions.map((q, idx) => {
+            const qKey = String(q?.id || `q_${idx}`)
+            if (cancelled) return { id: qKey, selected: [] }
+            const ans = normalizeSingleAnswer(answers[qKey])
+            return {
+              id: qKey,
+              selected: ans.selected,
+              ...(ans.custom ? { custom: ans.custom } : {}),
+            }
+          })
+          finishResolve({ answers: outAnswers }, cancelled ? 'cancel' : 'submit')
+          return { resolved: true, id: aprId, decision: cancelled ? 'cancel' : 'submit' }
+        },
+      })
+
+      this.onApprovalRequest(card)
+
+      // Race against DSH Desktop UI (`next()`): absorb NO_PROVIDER so headless DSH still waits for mobile!
+      Promise.resolve()
+        .then(() => next())
+        .then(
+          (desktopRes) => {
+            if (desktopRes && Array.isArray(desktopRes.answers)) {
+              finishResolve(desktopRes, 'desktop')
+            }
+          },
+          (err) => {
+            if (err?.code === 'NO_PROVIDER') return
+            finishReject(err, 'cancel')
+          },
+        )
+    })
+  }
+
+  handleCordisApprovalRequest(request, next) {
+    const nativeSessionId = String(request?.agent?.session?.id || request?.agent?.id || '').trim()
+    const compositeId = nativeSessionId ? makeCompositeId(APPS.DSH, nativeSessionId) : ''
+    const aprId = `dsh-apr-${randomUUID().slice(0, 10)}`
+    const toolName = String(request?.toolName || 'tool')
+    const card = {
+      id: aprId,
+      app: APPS.DSH,
+      sessionId: compositeId,
+      kind: 'command',
+      title: `DeepSeek 请求执行：${toolName}`,
+      detail: String(request?.reason || toolName).trim(),
+      cwd: String(request?.agent?.session?.meta?.cwd || '').trim(),
+      options: [
+        { value: 'allowed-once', label: '允许一次', style: 'primary' },
+        { value: 'rejected', label: '拒绝', style: 'danger' },
+      ],
+      createdAt: Date.now(),
+    }
+
+    return new Promise((resolvePromise) => {
+      let settled = false
+      const cleanup = (resolvedDecision = '') => {
+        this.pendingApprovals.delete(aprId)
+        if (request?.signal && onAbort) {
+          try { request.signal.removeEventListener('abort', onAbort) } catch {}
+        }
+        if (resolvedDecision) {
+          this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+            id: aprId,
+            app: APPS.DSH,
+            decision: resolvedDecision,
+          })
+        }
+      }
+
+      const finish = (outcome, resolvedDecision) => {
+        if (settled) return
+        settled = true
+        cleanup(resolvedDecision)
+        resolvePromise(outcome)
+      }
+
+      const onAbort = () => finish('cancelled', 'cancel')
+      if (request?.signal) {
+        if (request.signal.aborted) {
+          onAbort()
+          return
+        }
+        try { request.signal.addEventListener('abort', onAbort, { once: true }) } catch {}
+      }
+
+      this.pendingApprovals.set(aprId, {
+        req: card,
+        type: 'approval',
+        resolveMobile: (decisionOrPayload) => {
+          const { decision } = normalizeResolvePayload(decisionOrPayload)
+          const outcome =
+            decision === 'allowed-once' || decision === 'accept' || decision === 'allow'
+              ? 'allowed-once'
+              : decision === 'cancel' || decision === 'cancelled'
+                ? 'cancelled'
+                : 'rejected'
+          finish(outcome, outcome)
+          return { resolved: true, id: aprId, decision: outcome }
+        },
+      })
+
+      this.onApprovalRequest(card)
+
+      Promise.resolve()
+        .then(() => next())
+        .then(
+          (desktopOutcome) => {
+            if (
+              desktopOutcome === 'allowed-once' ||
+              desktopOutcome === 'rejected' ||
+              desktopOutcome === 'cancelled'
+            ) {
+              finish(desktopOutcome, desktopOutcome)
+            }
+          },
+          () => {},
+        )
+    })
+  }
+
+  async listPendingApprovals() {
+    if (this.ctx) {
+      return [...this.pendingApprovals.values()].map((entry) => entry.req)
+    }
+    if (this.ipcClient) {
+      const ipc = await this.ipcClient.checkHealth()
+      if (ipc) {
+        try {
+          const list = await this.ipcClient.call('listApprovals', {}, { timeoutMs: 5_000 })
+          return Array.isArray(list) ? list : []
+        } catch {}
+      }
+    }
+    return []
+  }
+
+  async resolveApproval(approvalId, decisionOrPayload) {
+    if (this.ctx) {
+      const entry = this.pendingApprovals.get(approvalId)
+      if (!entry) return { resolved: false, reason: 'approval not found' }
+      return entry.resolveMobile(decisionOrPayload)
+    }
+    if (this.ipcClient) {
+      const normalized = normalizeResolvePayload(decisionOrPayload)
+      return this.ipcClient.call(
+        'resolveApproval',
+        { id: approvalId, decision: normalized.decision, answers: normalized.answers },
+        { timeoutMs: 15_000 },
+      )
+    }
+    return { resolved: false, reason: 'DSH IPC not available' }
   }
 
   hasDshPluginConfigured() {
@@ -898,6 +1223,14 @@ export class DshAdapter {
   }
 
   async dispose() {
+    for (const disposeFn of this.cordisDisposers) {
+      try { disposeFn() } catch {}
+    }
+    this.cordisDisposers = []
+    for (const [id, entry] of this.pendingApprovals.entries()) {
+      try { entry.resolveMobile({ decision: 'cancel' }) } catch {}
+      this.pendingApprovals.delete(id)
+    }
     this.ipcClient?.dispose()
     for (const handle of this.ownedHandles.values()) {
       try { await handle.dispose?.() } catch {}

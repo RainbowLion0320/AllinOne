@@ -6,6 +6,7 @@ import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessio
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 
 const claudeParseCache = createFileParseCache(16)
 
@@ -265,7 +266,7 @@ function parseClaudeJsonlMessages(filePath) {
  * Uses official `claude -p --output-format stream-json --verbose [--resume <id>]`.
  */
 export class ClaudeAdapter {
-  constructor({ config = {}, log = console, emitEvent }) {
+  constructor({ config = {}, log = console, emitEvent, onApprovalRequest }) {
     this.configuredBin = config.claudeBin
     this.claudeBin = findClaudeCommand(this.configuredBin)
     this.claudeHome = getClaudeHome()
@@ -273,7 +274,9 @@ export class ClaudeAdapter {
     this.permissionMode = config.claudePermissionMode || 'acceptEdits'
     this.log = log
     this.emitEvent = emitEvent || (() => {})
+    this.onApprovalRequest = onApprovalRequest || (() => {})
     this.activeProcs = new Map() // sessionId -> { proc, aborted }
+    this.pendingControlRequests = new Map() // approvalId -> { proc, requestId, toolName, toolInput, questions, sessionId }
     this.pendingCreated = new Map() // sessionId -> summary (before first turn persists jsonl)
     this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
   }
@@ -521,9 +524,13 @@ export class ClaudeAdapter {
 
     const args = [
       '-p',
+      '--input-format',
+      'stream-json',
       '--output-format',
       'stream-json',
       '--verbose',
+      '--permission-prompt-tool',
+      'stdio',
       '--permission-mode',
       effectivePermissionMode,
     ]
@@ -628,6 +635,8 @@ export class ClaudeAdapter {
               })
             }
           }
+        } else if (obj.type === 'control_request' && obj.request_id && obj.request) {
+          this.handleControlRequest(proc, sessionId, compositeId, targetCwd, obj)
         } else if (obj.type === 'result') {
           if (obj.is_error) {
             resultError = String(obj.result || obj.error || 'Claude 执行返回错误')
@@ -642,8 +651,12 @@ export class ClaudeAdapter {
             }
             finalText = obj.result
           }
+          // Close stdin cleanly once the turn finishes so the bidirectional stream-json process exits
+          try { proc.stdin.end() } catch {}
         }
       }
+
+      proc.stdin?.on('error', () => {})
 
       proc.stdout.on('data', (chunk) => {
         stdoutBuf += chunk.toString('utf8')
@@ -661,6 +674,7 @@ export class ClaudeAdapter {
 
       proc.on('error', (err) => {
         this.activeProcs.delete(sessionId)
+        this.clearPendingControlRequests(proc)
         this.emitEvent(EVENTS.STREAM_ERROR, {
           sessionId: compositeId,
           app: APPS.CLAUDE,
@@ -673,6 +687,7 @@ export class ClaudeAdapter {
         if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
         this.activeProcs.delete(sessionId)
         this.pendingCreated.delete(sessionId)
+        this.clearPendingControlRequests(proc)
 
         if (resultError && !state.aborted) {
           this.emitEvent(EVENTS.STREAM_ERROR, {
@@ -710,10 +725,210 @@ export class ClaudeAdapter {
         })
       })
 
-      // Feed prompt cleanly via stdin to avoid shell escaping issues
-      proc.stdin.write(prompt, 'utf8')
-      proc.stdin.end()
+      // Feed turn cleanly via bidirectional NDJSON stream-json protocol (keep stdin open for control_response!)
+      const userFrame = JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: prompt },
+      })
+      proc.stdin.write(`${userFrame}\n`, 'utf8')
     })
+  }
+
+  clearPendingControlRequests(proc) {
+    for (const [aprId, entry] of this.pendingControlRequests.entries()) {
+      if (entry.proc === proc) {
+        this.pendingControlRequests.delete(aprId)
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CLAUDE, decision: 'cancel' })
+      }
+    }
+  }
+
+  writeControlResponse(proc, requestId, responseBody) {
+    if (!proc || !proc.stdin?.writable) return false
+    const frame = JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: responseBody,
+      },
+    })
+    proc.stdin.write(`${frame}\n`, 'utf8')
+    return true
+  }
+
+  handleControlRequest(proc, sessionId, compositeId, cwd, obj) {
+    const requestId = String(obj.request_id)
+    const req = obj.request || {}
+    if (req.subtype !== 'can_use_tool') {
+      // Acknowledge non-tool control requests safely
+      this.writeControlResponse(proc, requestId, { behavior: 'allow' })
+      return
+    }
+
+    const toolName = String(req.tool_name || 'tool')
+    const toolInput = req.input && typeof req.input === 'object' ? req.input : {}
+
+    if (toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions) && toolInput.questions.length > 0) {
+      const aprId = `cld-q-${randomUUID().slice(0, 10)}`
+      const questions = toolInput.questions.map((q, idx) => {
+        const opts = Array.isArray(q?.options)
+          ? q.options
+              .filter((o) => o && typeof o.label === 'string')
+              .map((o) => ({
+                value: o.label,
+                label: o.label,
+                description: typeof o.description === 'string' ? o.description : '',
+              }))
+          : []
+        return {
+          id: String(q?.id || `q_${idx}`),
+          origQuestion: String(q?.question || ''),
+          header: String(q?.header || '').trim(),
+          question: String(q?.question || '').trim() || `问题 ${idx + 1}`,
+          description: '',
+          multiSelect: Boolean(q?.multiSelect),
+          allowOther: true,
+          inputType: opts.length > 0 ? 'select' : 'text',
+          required: true,
+          options: opts,
+        }
+      })
+
+      this.pendingControlRequests.set(aprId, {
+        proc,
+        requestId,
+        toolName,
+        toolInput,
+        questions,
+        sessionId,
+      })
+
+      this.onApprovalRequest({
+        id: aprId,
+        app: APPS.CLAUDE,
+        sessionId: compositeId,
+        kind: 'question',
+        title: 'Claude 需要你做选择',
+        detail: '',
+        questions: questions.map(({ origQuestion: _drop, ...publicQ }) => publicQ),
+        createdAt: Date.now(),
+      })
+      return
+    }
+
+    if (toolName === 'ExitPlanMode') {
+      const aprId = `cld-plan-${randomUUID().slice(0, 10)}`
+      this.pendingControlRequests.set(aprId, {
+        proc,
+        requestId,
+        toolName,
+        toolInput,
+        sessionId,
+      })
+      this.onApprovalRequest({
+        id: aprId,
+        app: APPS.CLAUDE,
+        sessionId: compositeId,
+        kind: 'permissions',
+        title: 'Claude 计划已就绪',
+        detail: String(toolInput.plan || '是否批准当前计划并开始执行？').slice(0, 1500),
+        cwd,
+        options: [
+          { value: 'allow', label: '批准执行', style: 'primary' },
+          { value: 'deny', label: '拒绝', style: 'danger' },
+        ],
+        createdAt: Date.now(),
+      })
+      return
+    }
+
+    const aprId = `cld-apr-${randomUUID().slice(0, 10)}`
+    this.pendingControlRequests.set(aprId, {
+      proc,
+      requestId,
+      toolName,
+      toolInput,
+      sessionId,
+    })
+
+    const detail =
+      toolInput.command ||
+      toolInput.file_path ||
+      toolInput.path ||
+      toolInput.description ||
+      JSON.stringify(toolInput, null, 2)
+
+    this.onApprovalRequest({
+      id: aprId,
+      app: APPS.CLAUDE,
+      sessionId: compositeId,
+      kind: toolName === 'Edit' || toolName === 'Write' ? 'file_change' : 'command',
+      title: `Claude 请求使用 ${toolName}`,
+      detail: String(detail || toolName).slice(0, 1200),
+      cwd,
+      options: [
+        { value: 'allow', label: '允许', style: 'primary' },
+        { value: 'deny', label: '拒绝', style: 'danger' },
+      ],
+      createdAt: Date.now(),
+    })
+  }
+
+  async resolveApproval(approvalId, decisionOrPayload) {
+    const entry = this.pendingControlRequests.get(approvalId)
+    if (!entry) return { resolved: false, reason: 'approval not found' }
+    this.pendingControlRequests.delete(approvalId)
+
+    const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
+
+    if (entry.toolName === 'AskUserQuestion') {
+      const cancelled = decision === 'cancel' || decision === 'decline' || decision === 'deny'
+      if (cancelled) {
+        this.writeControlResponse(entry.proc, entry.requestId, {
+          behavior: 'deny',
+          message: 'User cancelled the question',
+        })
+      } else {
+        const claudeAnswers = {}
+        for (const q of entry.questions || []) {
+          const ans = normalizeSingleAnswer(answers[q.id])
+          const key = q.origQuestion || q.question
+          claudeAnswers[key] = q.multiSelect
+            ? ans.combined.join(', ')
+            : (ans.selected[0] || ans.custom || '')
+        }
+        this.writeControlResponse(entry.proc, entry.requestId, {
+          behavior: 'allow',
+          updatedInput: {
+            ...entry.toolInput,
+            questions: entry.toolInput?.questions || [],
+            answers: claudeAnswers,
+          },
+        })
+      }
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.CLAUDE,
+        decision: cancelled ? 'cancel' : 'submit',
+      })
+      return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit' }
+    }
+
+    const allowed = decision === 'allow' || decision === 'accept' || decision === 'acceptForSession'
+    this.writeControlResponse(
+      entry.proc,
+      entry.requestId,
+      allowed
+        ? { behavior: 'allow', updatedInput: entry.toolInput || {} }
+        : { behavior: 'deny', message: 'User denied tool execution' },
+    )
+    this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+      id: approvalId,
+      app: APPS.CLAUDE,
+      decision: allowed ? 'allow' : 'deny',
+    })
+    return { resolved: true, id: approvalId, decision: allowed ? 'allow' : 'deny' }
   }
 
   async interrupt(sessionId) {
@@ -721,6 +936,10 @@ export class ClaudeAdapter {
     const active = this.activeProcs.get(sessionId)
     if (!active) return { interrupted: false, sessionId }
     active.aborted = true
+    this.clearPendingControlRequests(active.proc)
+    try {
+      active.proc.stdin?.end()
+    } catch {}
     try {
       active.proc.kill('SIGTERM')
     } catch {}

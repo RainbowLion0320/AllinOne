@@ -6,6 +6,13 @@ import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, isExecutableFile, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import {
+  answersToElicitationContent,
+  elicitationSchemaToQuestions,
+  formatPermissionProfileDetail,
+  normalizeResolvePayload,
+  normalizeSingleAnswer,
+} from '../helpers/interactive-schema.js'
 
 /**
  * Fallback discovery on macOS/Linux: if Codex Desktop / ChatGPT app is currently running
@@ -436,7 +443,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.7' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.8' },
         capabilities: null,
       })
         .then((res) => {
@@ -700,6 +707,7 @@ export class CodexAdapter {
         rpcId: msg.id,
         method,
         threadId,
+        params,
       })
 
       const isCommand = method.includes('command') || method.includes('Command')
@@ -726,6 +734,120 @@ export class CodexAdapter {
       return
     }
 
+    if (method === 'item/tool/requestUserInput') {
+      const qId = `cdx-q-${randomUUID().slice(0, 10)}`
+      const rawQuestions = Array.isArray(params.questions) ? params.questions : []
+      const questions = rawQuestions.map((q, idx) => {
+        const opts = Array.isArray(q?.options)
+          ? q.options
+              .filter((o) => o && typeof o.label === 'string')
+              .map((o) => ({
+                value: o.label,
+                label: o.label,
+                description: typeof o.description === 'string' ? o.description : '',
+              }))
+          : []
+        return {
+          id: String(q?.id || `q_${idx}`),
+          header: String(q?.header || '').trim(),
+          question: String(q?.question || '').trim() || `问题 ${idx + 1}`,
+          description: '',
+          multiSelect: false,
+          allowOther: q?.isOther !== false || opts.length === 0,
+          isSecret: Boolean(q?.isSecret),
+          inputType: opts.length > 0 ? 'select' : 'text',
+          required: true,
+          options: opts,
+        }
+      })
+
+      this.pendingServerRequests.set(qId, {
+        writer,
+        rpcId: msg.id,
+        method,
+        threadId,
+        params,
+        questions,
+      })
+
+      this.onApprovalRequest({
+        id: qId,
+        app: APPS.CODEX,
+        sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
+        kind: 'question',
+        title: 'Codex 需要你做选择',
+        detail: '',
+        questions,
+        createdAt: Date.now(),
+      })
+      return
+    }
+
+    if (method === 'item/permissions/requestApproval') {
+      const permId = `cdx-perm-${randomUUID().slice(0, 10)}`
+      this.pendingServerRequests.set(permId, {
+        writer,
+        rpcId: msg.id,
+        method,
+        threadId,
+        params,
+      })
+
+      this.onApprovalRequest({
+        id: permId,
+        app: APPS.CODEX,
+        sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
+        kind: 'permissions',
+        title: 'Codex 请求附加权限',
+        detail: formatPermissionProfileDetail(params.permissions, params.reason),
+        cwd: params.cwd || '',
+        createdAt: Date.now(),
+        options: [
+          { value: 'accept', label: '允许一次', style: 'primary' },
+          { value: 'acceptForSession', label: '本会话自动允许', style: 'secondary' },
+          { value: 'decline', label: '拒绝', style: 'danger' },
+        ],
+      })
+      return
+    }
+
+    if (method === 'mcpServer/elicitation/request') {
+      const elicitId = `cdx-elicit-${randomUUID().slice(0, 10)}`
+      const isUrlMode = params.mode === 'url'
+      const questions = isUrlMode
+        ? []
+        : elicitationSchemaToQuestions(params.requestedSchema, params.message || '请填写所需信息')
+
+      this.pendingServerRequests.set(elicitId, {
+        writer,
+        rpcId: msg.id,
+        method,
+        threadId,
+        params,
+        questions,
+      })
+
+      this.onApprovalRequest({
+        id: elicitId,
+        app: APPS.CODEX,
+        sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
+        kind: isUrlMode ? 'url_elicitation' : 'question',
+        title: params.serverName ? `Codex · ${params.serverName}` : 'Codex 请求补充信息',
+        detail: String(params.message || '').trim(),
+        ...(isUrlMode && params.url ? { url: String(params.url) } : {}),
+        ...(isUrlMode
+          ? {
+              options: [
+                { value: 'accept', label: '确认继续', style: 'primary' },
+                { value: 'decline', label: '拒绝', style: 'danger' },
+              ],
+            }
+          : { questions }),
+        createdAt: Date.now(),
+      })
+      return
+    }
+
     try {
       writer.sendRaw({
         jsonrpc: '2.0',
@@ -735,10 +857,73 @@ export class CodexAdapter {
     } catch {}
   }
 
-  async resolveApproval(approvalId, decision) {
+  async resolveApproval(approvalId, decisionOrPayload) {
     const entry = this.pendingServerRequests.get(approvalId)
     if (!entry) return { resolved: false, reason: 'approval not found' }
     this.pendingServerRequests.delete(approvalId)
+
+    const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
+
+    if (entry.method === 'item/tool/requestUserInput') {
+      const cancelled = decision === 'cancel' || decision === 'decline'
+      const responseAnswers = {}
+      if (!cancelled) {
+        for (const q of entry.questions || []) {
+          const ans = normalizeSingleAnswer(answers[q.id])
+          responseAnswers[q.id] = { answers: ans.combined }
+        }
+      }
+      entry.writer.sendRaw({
+        jsonrpc: '2.0',
+        id: entry.rpcId,
+        result: { answers: responseAnswers },
+      })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.CODEX,
+        decision: cancelled ? 'cancel' : 'submit',
+      })
+      return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit' }
+    }
+
+    if (entry.method === 'item/permissions/requestApproval') {
+      const accepted = decision === 'accept' || decision === 'acceptForSession'
+      const scope = decision === 'acceptForSession' ? 'session' : 'turn'
+      entry.writer.sendRaw({
+        jsonrpc: '2.0',
+        id: entry.rpcId,
+        result: {
+          permissions: accepted ? (entry.params?.permissions || {}) : {},
+          scope,
+        },
+      })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.CODEX,
+        decision: accepted ? decision : 'decline',
+      })
+      return { resolved: true, id: approvalId, decision: accepted ? decision : 'decline' }
+    }
+
+    if (entry.method === 'mcpServer/elicitation/request') {
+      const action = decision === 'decline' ? 'decline' : decision === 'cancel' ? 'cancel' : 'accept'
+      const result = action === 'accept'
+        ? entry.params?.mode === 'url'
+          ? { action: 'accept' }
+          : { action: 'accept', content: answersToElicitationContent(entry.params?.requestedSchema, answers) }
+        : { action }
+      entry.writer.sendRaw({
+        jsonrpc: '2.0',
+        id: entry.rpcId,
+        result,
+      })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.CODEX,
+        decision: action,
+      })
+      return { resolved: true, id: approvalId, decision: action }
+    }
 
     const validDecision = ['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)
       ? decision
@@ -1204,7 +1389,10 @@ export class CodexAdapter {
       // on PC can immediately take over without "已在另一个应用中打开"!
       this.activeTurns.delete(threadId)
       for (const [aprId, entry] of this.pendingServerRequests.entries()) {
-        if (entry.writer === writer) this.pendingServerRequests.delete(aprId)
+        if (entry.writer === writer) {
+          this.pendingServerRequests.delete(aprId)
+          this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+        }
       }
       await this.releaseWriter(writer, threadId)
     }

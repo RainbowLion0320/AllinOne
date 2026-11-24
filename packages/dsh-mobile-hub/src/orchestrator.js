@@ -36,21 +36,25 @@ export class MultiAppOrchestrator {
     this.dispatches = new Map()
 
     const emitEvent = (event, payload) => {
+      if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
+        this.pendingApprovals.delete(payload.id)
+      }
       try {
         this.onEvent(event, payload)
       } catch {}
     }
 
     const onApprovalRequest = (req) => {
+      if (!req?.id) return
       this.pendingApprovals.set(req.id, req)
       emitEvent(EVENTS.APPROVAL_REQUEST, req)
     }
 
     this.adapters = {
-      [APPS.DSH]: new DshAdapter({ ctx, config, log, emitEvent }),
+      [APPS.DSH]: new DshAdapter({ ctx, config, log, emitEvent, onApprovalRequest }),
       [APPS.CODEX]: new CodexAdapter({ config, log, emitEvent, onApprovalRequest }),
-      [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent }),
-      [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent }),
+      [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent, onApprovalRequest }),
+      [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent, onApprovalRequest }),
     }
   }
 
@@ -284,17 +288,32 @@ export class MultiAppOrchestrator {
     return this.getAdapter(parsed.app).interrupt(parsed.sessionId)
   }
 
-  listApprovals() {
-    return [...this.pendingApprovals.values()].sort((a, b) => b.createdAt - a.createdAt)
+  async listApprovals() {
+    // Merge any pending approvals currently held inside a live DSH IPC process (e.g. after reconnect)
+    const dshAdapter = this.adapters[APPS.DSH]
+    if (typeof dshAdapter?.listPendingApprovals === 'function') {
+      try {
+        const remote = await dshAdapter.listPendingApprovals()
+        if (Array.isArray(remote)) {
+          for (const req of remote) {
+            if (req?.id && !this.pendingApprovals.has(req.id)) {
+              this.pendingApprovals.set(req.id, req)
+            }
+          }
+        }
+      } catch {}
+    }
+    return [...this.pendingApprovals.values()].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
   }
 
-  async resolveApproval({ id, decision } = {}) {
+  async resolveApproval({ id, decision, answers } = {}) {
     const req = this.pendingApprovals.get(id)
     if (!req) throw new Error(`审批请求不存在或已处理：${id}`)
     this.pendingApprovals.delete(id)
     const adapter = this.getAdapter(req.app)
     if (typeof adapter.resolveApproval === 'function') {
-      return adapter.resolveApproval(id, decision)
+      const payload = answers && typeof answers === 'object' ? { decision, answers } : decision
+      return adapter.resolveApproval(id, payload)
     }
     return { resolved: true, id, decision }
   }
@@ -532,7 +551,7 @@ export class MultiAppOrchestrator {
       case RPC.SESSION_INTERRUPT:
         return await this.interruptSession(params)
       case RPC.APPROVAL_LIST:
-        return { approvals: this.listApprovals() }
+        return { approvals: await this.listApprovals() }
       case RPC.APPROVAL_RESOLVE:
         return await this.resolveApproval(params)
       case RPC.DISPATCH_LIST:

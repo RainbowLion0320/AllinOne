@@ -33,6 +33,9 @@ export function apply(ctx, config = {}) {
     emitEvent: (event, payload) => {
       ipcServer?.emitEvent?.(event, payload)
     },
+    onApprovalRequest: (req) => {
+      ipcServer?.emitEvent?.('approval.request', req)
+    },
   })
 
   const startPromise = startDshLocalIpcServer({

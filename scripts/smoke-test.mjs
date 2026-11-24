@@ -24,7 +24,13 @@ import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
-import { normalizeCodexTurns, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
+import { CodexAdapter, normalizeCodexTurns, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
+import { ClaudeAdapter } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
+import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
+import {
+  answersToElicitationContent,
+  elicitationSchemaToQuestions,
+} from '../packages/dsh-mobile-hub/src/helpers/interactive-schema.js'
 import { EVENTS, RPC } from '../packages/shared/src/protocol.js'
 import {
   E2EE_METHOD_MARKER,
@@ -3568,7 +3574,543 @@ async function main() {
         await grantRelay.close()
       }
     }
-    console.log('[smoke] 21/21 Zero-Knowledge Device-to-Device Key Grant (ECDH P-256, 6-digit SAS, Reverse-QR, MITM defense & cross-room isolation) OK')
+    console.log('[smoke] 21/22 Zero-Knowledge Device-to-Device Key Grant (ECDH P-256, 6-digit SAS, Reverse-QR, MITM defense & cross-room isolation) OK')
+
+    // 22. Interactive Multi-Question Q&A & Approvals across all 4 AI adapters (Codex, DSH + Local IPC, Antigravity ACP, Claude Code) & Orchestrator
+    {
+      // 22.1 JSON Schema elicitation normalization + answer serialization
+      const testSchema = {
+        type: 'object',
+        required: ['framework', 'port'],
+        properties: {
+          framework: {
+            type: 'string',
+            title: 'Framework',
+            description: 'Choose frontend framework',
+            oneOf: [
+              { const: 'react', title: 'React' },
+              { const: 'vue', title: 'Vue' },
+            ],
+          },
+          features: {
+            type: 'array',
+            title: 'Features',
+            items: {
+              anyOf: [
+                { const: 'i18n', title: 'i18n' },
+                { const: 'pwa', title: 'PWA' },
+              ],
+            },
+          },
+          useTs: { type: 'boolean', title: 'TypeScript', default: true },
+          port: { type: 'integer', title: 'Port' },
+          note: { type: 'string', title: 'Extra Note' },
+        },
+      }
+      const qs = elicitationSchemaToQuestions(testSchema, 'Fallback')
+      assert.equal(qs.length, 5)
+      assert.equal(qs[0].id, 'framework')
+      assert.equal(qs[0].multiSelect, false)
+      assert.equal(qs[0].required, true)
+      assert.equal(qs[1].id, 'features')
+      assert.equal(qs[1].multiSelect, true)
+      assert.equal(qs[2].inputType, 'boolean')
+      assert.equal(qs[3].inputType, 'number')
+      assert.equal(qs[4].inputType, 'text')
+      const content = answersToElicitationContent(testSchema, {
+        framework: { selected: ['react'] },
+        features: { selected: ['i18n', 'pwa'] },
+        useTs: { selected: ['false'] },
+        port: { custom: '8080' },
+        note: { custom: 'Ship fast' },
+      })
+      assert.deepEqual(content, {
+        framework: 'react',
+        features: ['i18n', 'pwa'],
+        useTs: false,
+        port: 8080,
+        note: 'Ship fast',
+      })
+
+      // 22.2 CodexAdapter: requestUserInput + permissions/requestApproval + mcpServer/elicitation (form & url)
+      {
+        const cdxCards = []
+        const cdxEvents = []
+        const cdxSent = []
+        const mockWriter = { sendRaw: (obj) => cdxSent.push(obj) }
+        const cdxAdapter = new CodexAdapter({
+          config: { codexHome: join(tmpDir, 'codex-qna') },
+          log: { warn() {}, log() {} },
+          emitEvent: (ev, payload) => cdxEvents.push({ ev, payload }),
+          onApprovalRequest: (req) => cdxCards.push(req),
+        })
+
+        // (a) item/tool/requestUserInput with 2 questions (1 option select + 1 custom isOther)
+        cdxAdapter.handleServerRequest(mockWriter, {
+          id: 101,
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId: 'thr-qna-1',
+            questions: [
+              {
+                id: 'db',
+                header: 'Database',
+                question: 'Which DB?',
+                options: [
+                  { label: 'PostgreSQL', description: 'Relational' },
+                  { label: 'SQLite', description: 'Embedded' },
+                ],
+                isOther: true,
+              },
+              {
+                id: 'branch',
+                header: 'Branch',
+                question: 'Target branch name?',
+                options: [],
+                isOther: true,
+              },
+            ],
+          },
+        })
+        assert.equal(cdxCards.length, 1)
+        assert.equal(cdxCards[0].kind, 'question')
+        assert.equal(cdxCards[0].sessionId, 'codex:thr-qna-1')
+        assert.equal(cdxCards[0].questions.length, 2)
+        await cdxAdapter.resolveApproval(cdxCards[0].id, {
+          decision: 'submit',
+          answers: {
+            db: { selected: ['PostgreSQL'] },
+            branch: { custom: 'feat/qna' },
+          },
+        })
+        assert.deepEqual(cdxSent[0], {
+          jsonrpc: '2.0',
+          id: 101,
+          result: {
+            answers: {
+              db: { answers: ['PostgreSQL'] },
+              branch: { answers: ['feat/qna'] },
+            },
+          },
+        })
+
+        // (b) item/permissions/requestApproval with session scope
+        cdxAdapter.handleServerRequest(mockWriter, {
+          id: 102,
+          method: 'item/permissions/requestApproval',
+          params: {
+            threadId: 'thr-qna-1',
+            reason: 'Need network access',
+            permissions: { network: { enabled: true } },
+          },
+        })
+        assert.equal(cdxCards[1].kind, 'permissions')
+        await cdxAdapter.resolveApproval(cdxCards[1].id, 'acceptForSession')
+        assert.deepEqual(cdxSent[1], {
+          jsonrpc: '2.0',
+          id: 102,
+          result: { permissions: { network: { enabled: true } }, scope: 'session' },
+        })
+
+        // (c) mcpServer/elicitation/request (form + url)
+        cdxAdapter.handleServerRequest(mockWriter, {
+          id: 103,
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'thr-qna-1',
+            serverName: 'github',
+            mode: 'form',
+            message: 'Select repo options',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                visibility: { type: 'string', enum: ['public', 'private'] },
+              },
+            },
+          },
+        })
+        assert.equal(cdxCards[2].kind, 'question')
+        await cdxAdapter.resolveApproval(cdxCards[2].id, {
+          decision: 'submit',
+          answers: { visibility: { selected: ['private'] } },
+        })
+        assert.deepEqual(cdxSent[2], {
+          jsonrpc: '2.0',
+          id: 103,
+          result: { action: 'accept', content: { visibility: 'private' } },
+        })
+
+        cdxAdapter.handleServerRequest(mockWriter, {
+          id: 104,
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'thr-qna-1',
+            serverName: 'oauth',
+            mode: 'url',
+            message: 'Authorize OAuth',
+            url: 'https://example.com/auth',
+          },
+        })
+        assert.equal(cdxCards[3].kind, 'url_elicitation')
+        assert.equal(cdxCards[3].url, 'https://example.com/auth')
+        await cdxAdapter.resolveApproval(cdxCards[3].id, 'decline')
+        assert.deepEqual(cdxSent[3], {
+          jsonrpc: '2.0',
+          id: 104,
+          result: { action: 'decline' },
+        })
+        assert.equal(cdxEvents.filter((e) => e.ev === EVENTS.APPROVAL_RESOLVED).length, 4)
+      }
+
+      // 22.3 DshAdapter Cordis waterfall hooks + authenticated Local IPC (listApprovals + resolveApproval + desktop-first race)
+      {
+        const ipcQnaHome = join(tmpDir, 'dsh-qna-ipc')
+        mkdirSync(ipcQnaHome, { recursive: true })
+        const hooks = new Map()
+        const mockCtx = {
+          agents: {},
+          get(key) {
+            return key === 'agents' || key === 'sessionController' ? {} : null
+          },
+          on(eventName, fn) {
+            hooks.set(eventName, fn)
+            return () => hooks.delete(eventName)
+          },
+        }
+        const dshLiveEvents = []
+        const dshLiveCards = []
+        let ipcQnaSrv = null
+        const dshLive = new DshAdapter({
+          ctx: mockCtx,
+          config: { dshHome: ipcQnaHome },
+          log: { info() {}, warn() {}, error() {} },
+          emitEvent: (ev, payload) => {
+            dshLiveEvents.push({ ev, payload })
+            ipcQnaSrv?.emitEvent?.(ev, payload)
+          },
+          onApprovalRequest: (req) => {
+            dshLiveCards.push(req)
+            ipcQnaSrv?.emitEvent?.(EVENTS.APPROVAL_REQUEST, req)
+          },
+        })
+        const dshClientEvents = []
+        const dshClientCards = []
+        const dshStandalone = new DshAdapter({
+          ctx: null,
+          config: { dshHome: ipcQnaHome },
+          log: { info() {}, warn() {}, error() {} },
+          emitEvent: (ev, payload) => dshClientEvents.push({ ev, payload }),
+          onApprovalRequest: (req) => dshClientCards.push(req),
+        })
+
+        try {
+          ipcQnaSrv = await startDshLocalIpcServer({
+            dshAdapter: dshLive,
+            dshHome: ipcQnaHome,
+            log: { info() {}, warn() {}, error() {} },
+          })
+
+          // (a) Headless DSH `user-questions/request` (next() rejects with NO_PROVIDER) -> listed & answered via IPC!
+          const uqHook = hooks.get('user-questions/request')
+          assert.equal(typeof uqHook, 'function', 'DshAdapter must hook Cordis user-questions/request')
+          const noProviderErr = Object.assign(new Error('No desktop UI'), { code: 'NO_PROVIDER' })
+          const uqPromise = uqHook(
+            {
+              agent: { session: { id: 'dsh-sess-q1' } },
+              questions: [
+                {
+                  id: 'q1',
+                  header: 'Deploy',
+                  question: 'Deploy target?',
+                  multiSelect: false,
+                  options: [{ label: 'Staging' }, { label: 'Production' }],
+                },
+                {
+                  id: 'q2',
+                  header: 'Extras',
+                  question: 'Extra options?',
+                  multiSelect: true,
+                  options: [{ label: 'Cache' }, { label: 'CDN' }],
+                },
+              ],
+            },
+            () => Promise.reject(noProviderErr),
+          )
+
+          const pendingViaIpc = await dshStandalone.listPendingApprovals()
+          assert.equal(pendingViaIpc.length, 1, 'Standalone bridge must see live DSH question via IPC listApprovals')
+          assert.equal(pendingViaIpc[0].kind, 'question')
+          assert.equal(pendingViaIpc[0].sessionId, 'dsh:dsh-sess-q1')
+
+          const ipcRes = await dshStandalone.resolveApproval(pendingViaIpc[0].id, {
+            decision: 'submit',
+            answers: {
+              q1: { selected: ['Staging'] },
+              q2: { selected: ['Cache'], custom: 'Edge' },
+            },
+          })
+          assert.equal(ipcRes.resolved, true)
+          const uqOutcome = await uqPromise
+          assert.deepEqual(uqOutcome, {
+            answers: [
+              { id: 'q1', selected: ['Staging'] },
+              { id: 'q2', selected: ['Cache'], custom: 'Edge' },
+            ],
+          })
+
+          // (b) `approval/request` resolved via Mobile IPC
+          const aprHook = hooks.get('approval/request')
+          assert.equal(typeof aprHook, 'function', 'DshAdapter must hook Cordis approval/request')
+          const aprPromise = aprHook(
+            {
+              agent: { session: { id: 'dsh-sess-q1', meta: { cwd: ipcQnaHome } } },
+              toolName: 'bash',
+              reason: 'npm test',
+            },
+            () => Promise.resolve('unavailable'),
+          )
+          const aprList = await dshStandalone.listPendingApprovals()
+          assert.equal(aprList.length, 1)
+          await dshStandalone.resolveApproval(aprList[0].id, 'allowed-once')
+          assert.equal(await aprPromise, 'allowed-once')
+
+          // (c) Desktop-first race: DSH Desktop UI resolves `next()` first -> emits APPROVAL_RESOLVED & clears pending
+          const racePromise = uqHook(
+            {
+              agent: { session: { id: 'dsh-sess-q2' } },
+              questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'Yes' }] }],
+            },
+            () => new Promise((r) => setTimeout(() => r({ answers: [{ id: 'confirm', selected: ['Yes'] }] }), 25)),
+          )
+          const raceResult = await racePromise
+          assert.deepEqual(raceResult, { answers: [{ id: 'confirm', selected: ['Yes'] }] })
+          assert.equal((await dshLive.listPendingApprovals()).length, 0)
+          assert.ok(
+            dshLiveEvents.some((e) => e.ev === EVENTS.APPROVAL_RESOLVED && e.payload?.decision === 'desktop'),
+            'Desktop-first resolution must emit APPROVAL_RESOLVED to clear mobile card',
+          )
+        } finally {
+          await dshStandalone.dispose()
+          await dshLive.dispose()
+          if (ipcQnaSrv) await ipcQnaSrv.close()
+        }
+      }
+
+      // 22.4 AntigravityAdapter: elicitation/create (form) + session/request_permission (manual approval)
+      {
+        const agyCards = []
+        const agyEvents = []
+        const agySent = []
+        const mockClient = { sendRaw: (obj) => agySent.push(obj) }
+        const agyAdapter = new AntigravityAdapter({
+          config: { agyHome: join(tmpDir, 'agy-qna'), agyAutoApprove: false },
+          log: { warn() {}, log() {} },
+          emitEvent: (ev, payload) => agyEvents.push({ ev, payload }),
+          onApprovalRequest: (req) => agyCards.push(req),
+        })
+        try {
+          const fakeEntry = { sessionId: 'agy-conv-1', cwd: tmpDir, lastActivityAt: 0 }
+          agyAdapter.handleServerRequest(fakeEntry, mockClient, {
+            id: 201,
+            method: 'elicitation/create',
+            params: {
+              sessionId: 'agy-conv-1',
+              mode: 'form',
+              message: 'Pick release channel',
+              requestedSchema: {
+                type: 'object',
+                required: ['channel'],
+                properties: {
+                  channel: {
+                    type: 'string',
+                    title: 'Channel',
+                    oneOf: [
+                      { const: 'stable', title: 'Stable' },
+                      { const: 'canary', title: 'Canary' },
+                    ],
+                  },
+                },
+              },
+            },
+          })
+          assert.equal(agyCards.length, 1)
+          assert.equal(agyCards[0].kind, 'question')
+          assert.equal(agyCards[0].sessionId, 'antigravity:agy-conv-1')
+          await agyAdapter.resolveApproval(agyCards[0].id, {
+            decision: 'submit',
+            answers: { channel: { selected: ['stable'] } },
+          })
+          assert.deepEqual(agySent[0], {
+            jsonrpc: '2.0',
+            id: 201,
+            result: { action: 'accept', content: { channel: 'stable' } },
+          })
+
+          agyAdapter.handleServerRequest(fakeEntry, mockClient, {
+            id: 202,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'agy-conv-1',
+              toolCall: { title: 'Run shell', rawInput: { cmd: 'git status' } },
+              options: [
+                { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+                { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+              ],
+            },
+          })
+          assert.equal(agyCards.length, 2)
+          assert.equal(agyCards[1].kind, 'command')
+          await agyAdapter.resolveApproval(agyCards[1].id, 'allow_once')
+          assert.deepEqual(agySent[1], {
+            jsonrpc: '2.0',
+            id: 202,
+            result: { outcome: { outcome: 'selected', optionId: 'allow_once' } },
+          })
+          assert.equal(agyEvents.filter((e) => e.ev === EVENTS.APPROVAL_RESOLVED).length, 2)
+        } finally {
+          await agyAdapter.dispose()
+        }
+      }
+
+      // 22.5 ClaudeAdapter: bidirectional stream-json control_request / control_response (AskUserQuestion, ExitPlanMode, Bash)
+      {
+        const cldCards = []
+        const cldEvents = []
+        const cldWritten = []
+        const mockProc = {
+          stdin: {
+            writable: true,
+            write: (chunk) => cldWritten.push(JSON.parse(String(chunk).trim())),
+          },
+        }
+        const cldAdapter = new ClaudeAdapter({
+          config: { claudeHome: join(tmpDir, 'claude-qna') },
+          log: { warn() {}, log() {} },
+          emitEvent: (ev, payload) => cldEvents.push({ ev, payload }),
+          onApprovalRequest: (req) => cldCards.push(req),
+        })
+
+        // (a) AskUserQuestion (single-select + multi-select)
+        const askInput = {
+          questions: [
+            {
+              header: 'Auth',
+              question: 'Which auth provider?',
+              multiSelect: false,
+              options: [{ label: 'JWT' }, { label: 'OAuth' }],
+            },
+            {
+              header: 'Targets',
+              question: 'Target platforms?',
+              multiSelect: true,
+              options: [{ label: 'Web' }, { label: 'Android' }, { label: 'Desktop' }],
+            },
+          ],
+        }
+        cldAdapter.handleControlRequest(mockProc, 'cld-s1', 'claude:cld-s1', tmpDir, {
+          type: 'control_request',
+          request_id: 'req-ask-1',
+          request: {
+            subtype: 'can_use_tool',
+            tool_name: 'AskUserQuestion',
+            input: askInput,
+          },
+        })
+        assert.equal(cldCards.length, 1)
+        assert.equal(cldCards[0].kind, 'question')
+        assert.equal(cldCards[0].questions.length, 2)
+        await cldAdapter.resolveApproval(cldCards[0].id, {
+          decision: 'submit',
+          answers: {
+            [cldCards[0].questions[0].id]: { selected: ['JWT'] },
+            [cldCards[0].questions[1].id]: { selected: ['Web', 'Android'] },
+          },
+        })
+        assert.equal(cldWritten[0].type, 'control_response')
+        assert.equal(cldWritten[0].response.request_id, 'req-ask-1')
+        assert.equal(cldWritten[0].response.response.behavior, 'allow')
+        assert.deepEqual(cldWritten[0].response.response.updatedInput.answers, {
+          'Which auth provider?': 'JWT',
+          'Target platforms?': 'Web, Android',
+        })
+
+        // (b) ExitPlanMode allow
+        cldAdapter.handleControlRequest(mockProc, 'cld-s1', 'claude:cld-s1', tmpDir, {
+          type: 'control_request',
+          request_id: 'req-plan-2',
+          request: {
+            subtype: 'can_use_tool',
+            tool_name: 'ExitPlanMode',
+            input: { plan: '1. Edit files\n2. Run tests' },
+          },
+        })
+        assert.equal(cldCards[1].kind, 'permissions')
+        await cldAdapter.resolveApproval(cldCards[1].id, 'allow')
+        assert.equal(cldWritten[1].response.request_id, 'req-plan-2')
+        assert.equal(cldWritten[1].response.response.behavior, 'allow')
+
+        // (c) Bash deny
+        cldAdapter.handleControlRequest(mockProc, 'cld-s1', 'claude:cld-s1', tmpDir, {
+          type: 'control_request',
+          request_id: 'req-bash-3',
+          request: {
+            subtype: 'can_use_tool',
+            tool_name: 'Bash',
+            input: { command: 'rm -rf /tmp/demo' },
+          },
+        })
+        assert.equal(cldCards[2].kind, 'command')
+        await cldAdapter.resolveApproval(cldCards[2].id, 'deny')
+        assert.equal(cldWritten[2].response.request_id, 'req-bash-3')
+        assert.equal(cldWritten[2].response.response.behavior, 'deny')
+        assert.equal(cldEvents.filter((e) => e.ev === EVENTS.APPROVAL_RESOLVED).length, 3)
+      }
+
+      // 22.6 MultiAppOrchestrator RPC.APPROVAL_LIST + RPC.APPROVAL_RESOLVE ({ id, decision, answers }) + APPROVAL_RESOLVED cleanup
+      {
+        const orchEvents = []
+        const orch = new MultiAppOrchestrator({
+          config: {
+            dshHome: join(tmpDir, 'orch-dsh'),
+            codexHome: join(tmpDir, 'orch-codex'),
+            claudeHome: join(tmpDir, 'orch-claude'),
+            agyHome: join(tmpDir, 'orch-agy'),
+          },
+          log: { info() {}, warn() {}, error() {} },
+          onEvent: (ev, payload) => orchEvents.push({ ev, payload }),
+        })
+        try {
+          const mockWriter = { sendRaw: (obj) => mockWriter.sent.push(obj), sent: [] }
+          orch.adapters.codex.handleServerRequest(mockWriter, {
+            id: 301,
+            method: 'item/tool/requestUserInput',
+            params: {
+              threadId: 'orch-thr-1',
+              questions: [{ id: 'env', question: 'Env?', options: [{ label: 'dev' }, { label: 'prod' }] }],
+            },
+          })
+          const listed = await orch.handleRpc(RPC.APPROVAL_LIST, {})
+          assert.equal(listed.approvals.length, 1)
+          const aprId = listed.approvals[0].id
+          assert.equal(listed.approvals[0].kind, 'question')
+
+          const resolved = await orch.handleRpc(RPC.APPROVAL_RESOLVE, {
+            id: aprId,
+            decision: 'submit',
+            answers: { env: { selected: ['prod'] } },
+          })
+          assert.equal(resolved.resolved, true)
+          assert.deepEqual(mockWriter.sent[0].result, { answers: { env: { answers: ['prod'] } } })
+          const afterList = await orch.handleRpc(RPC.APPROVAL_LIST, {})
+          assert.equal(afterList.approvals.length, 0)
+          assert.ok(orchEvents.some((e) => e.ev === EVENTS.APPROVAL_REQUEST && e.payload?.id === aprId))
+          assert.ok(orchEvents.some((e) => e.ev === EVENTS.APPROVAL_RESOLVED && e.payload?.id === aprId))
+        } finally {
+          await orch.dispose()
+        }
+      }
+    }
+    console.log('[smoke] 22/22 Interactive Multi-Question Q&A & Approvals across Codex, DSH (+IPC), Antigravity ACP, Claude Code & Orchestrator OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

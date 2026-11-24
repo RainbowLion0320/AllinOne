@@ -1796,14 +1796,18 @@ export function App() {
     } catch {}
   }
 
-  const handleResolveApproval = async (id, decision) => {
+  const handleResolveApproval = async (id, decisionOrPayload) => {
     const client = clientRef.current
     if (!client) return
     const targetBridge = activeBridgeIdRef.current
+    const payload =
+      decisionOrPayload && typeof decisionOrPayload === 'object'
+        ? { id, decision: decisionOrPayload.decision || 'submit', answers: decisionOrPayload.answers }
+        : { id, decision: decisionOrPayload }
     try {
       await client.rpc(
         RPC.APPROVAL_RESOLVE,
-        { id, decision },
+        payload,
         45_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
@@ -1860,6 +1864,11 @@ export function App() {
     return currentWorkspaceLabel || activeDeviceName || bi('已连接', 'Connected')
   })()
 
+  const activeSessionId = activeSession?.id || ''
+  const activeSessionApprovals = approvals.filter((a) => !a.sessionId || a.sessionId === activeSessionId)
+  const otherSessionApprovals = approvals.filter((a) => a.sessionId && a.sessionId !== activeSessionId)
+  const pendingApprovalSessionIds = new Set(approvals.map((a) => a.sessionId).filter(Boolean))
+
   return (
     <div className="relative flex h-full w-full bg-white dark:bg-[#16171A]">
       {/* Responsive Sidebar (slide-over drawer on mobile, docked left column on desktop lg:) */}
@@ -1868,6 +1877,7 @@ export function App() {
         onClose={() => setDrawerOpen(false)}
         sessions={sessions}
         activeSessionId={activeSession?.id}
+        pendingApprovalSessionIds={pendingApprovalSessionIds}
         onSelectSession={openSession}
         filterApp={sidebarFilterApp}
         onFilterAppChange={setSidebarFilterApp}
@@ -2027,6 +2037,32 @@ export function App() {
         </div>
       )}
 
+      {/* Cross-session pending question/approval jump banner */}
+      {otherSessionApprovals.length > 0 && connState === 'connected' && bridgeOnline && !e2eeLocked && (() => {
+        const first = otherSessionApprovals[0]
+        const targetSess = sessions.find((s) => s.id === first.sessionId)
+        return (
+          <div className="flex items-center justify-center gap-2 bg-[#EEF2FF] px-3 py-1.5 text-xs text-[#2842C9] dark:bg-[#1F2742] dark:text-[#B4C4FF]">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[#4D6BFE] animate-pulse" />
+            <span className="truncate">
+              {bi(
+                `「${targetSess?.title || first.title}」等待你的选择`,
+                `${targetSess?.title || first.title} is waiting for your input`,
+              )}
+            </span>
+            {targetSess && (
+              <button
+                type="button"
+                onClick={() => openSession(targetSess)}
+                className="shrink-0 rounded-lg bg-[#4D6BFE] px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
+              >
+                {bi('去查看', 'View')}
+              </button>
+            )}
+          </div>
+        )
+      })()}
+
       {/* Non-intrusive toast pill */}
       {toastMsg && (
         <div className="pointer-events-none fixed top-16 left-1/2 z-[60] -translate-x-1/2">
@@ -2135,7 +2171,7 @@ export function App() {
           if (cwdPath) saveLastWorkspace(cacheScopeRef.current, cwdPath)
         }}
         onOpenNewChatModal={() => openNewChatModal(selectedDraftCwd || '', effectiveDefaultApp)}
-        approvals={approvals}
+        approvals={activeSessionApprovals}
         imageContext={imageContext}
         onResolveApproval={handleResolveApproval}
       />
