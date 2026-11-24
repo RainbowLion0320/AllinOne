@@ -20,7 +20,7 @@ function CodeBlock({ language, code }) {
   }
 
   return (
-    <div className="my-2.5 overflow-hidden rounded-2xl border border-slate-200/80 bg-[#F7F9FC] dark:border-slate-700/80 dark:bg-[#1E2028]">
+    <div className="my-2.5 max-w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#F7F9FC] dark:border-slate-700/80 dark:bg-[#1E2028]">
       <div className="flex items-center justify-between border-b border-slate-200/70 px-3.5 py-1.5 text-[11px] font-medium text-slate-500 dark:border-slate-700/70 dark:text-slate-400">
         <span>{language || 'code'}</span>
         <button
@@ -32,7 +32,7 @@ function CodeBlock({ language, code }) {
           <span>{copied ? t('common.copied') : t('common.copy')}</span>
         </button>
       </div>
-      <pre className="overflow-x-auto p-3.5 text-[13px] leading-relaxed text-slate-800 dark:text-slate-200">
+      <pre className="max-w-full overflow-x-auto p-3.5 text-[13px] leading-relaxed text-slate-800 dark:text-slate-200">
         <code>{code}</code>
       </pre>
     </div>
@@ -77,7 +77,7 @@ function renderPlainTokens(segment, imageContext, keyRef) {
         parts.push(
           <code
             key={`c-${keyRef.n++}`}
-            className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
+            className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
           >
             {inner}
           </code>,
@@ -167,7 +167,7 @@ function renderInline(text, imageContext) {
           href={item.dest}
           target="_blank"
           rel="noreferrer"
-          className="text-[#4D6BFE] underline underline-offset-2"
+          className="break-all text-[#4D6BFE] underline underline-offset-2"
         >
           {item.label || item.dest}
         </a>,
@@ -177,7 +177,7 @@ function renderInline(text, imageContext) {
       parts.push(
         <code
           key={`fl-${keyRef.n++}`}
-          className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
+          className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
         >
           {item.label || item.dest}
         </code>,
@@ -194,9 +194,40 @@ function renderInline(text, imageContext) {
   return parts
 }
 
+function splitTableRow(line) {
+  const trimmed = String(line || '').trim()
+  const inner = trimmed.replace(/^\|/, '').replace(/\|$/, '')
+  return inner.split('|').map((cell) => cell.trim())
+}
+
+function parseTableAlignments(sepLine) {
+  const trimmed = String(sepLine || '').trim()
+  if (!trimmed.includes('|') || !/^[\s|:-]+$/.test(trimmed)) return null
+  const cells = splitTableRow(trimmed)
+  if (cells.length === 0) return null
+  const aligns = []
+  for (const c of cells) {
+    if (!/^:?-{2,}:?$/.test(c)) return null
+    if (c.startsWith(':') && c.endsWith(':')) aligns.push('text-center')
+    else if (c.endsWith(':')) aligns.push('text-right')
+    else aligns.push('text-left')
+  }
+  return aligns
+}
+
+function isTableStart(lines, idx) {
+  if (idx + 1 >= lines.length) return false
+  const header = String(lines[idx] || '').trim()
+  if (!header.includes('|')) return false
+  const aligns = parseTableAlignments(lines[idx + 1])
+  if (!aligns) return false
+  return splitTableRow(header).length > 0
+}
+
 /**
  * Lightweight, XSS-safe Markdown renderer styled to match DeepSeek Mobile typography.
- * Supports balanced-parenthesis image links (e.g. `屏幕截图(1).png`) and inline lightbox chips.
+ * Supports balanced-parenthesis image links (e.g. `屏幕截图(1).png`), inline lightbox chips,
+ * and locally scrollable GFM tables & fenced code blocks.
  */
 export function MarkdownView({ text, streaming = false, imageContext = null }) {
   if (!text) return null
@@ -221,6 +252,57 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
       continue
     }
 
+    // GFM Markdown table (scrolls locally inside its own card without widening the page)
+    if (isTableStart(lines, i)) {
+      const headers = splitTableRow(lines[i])
+      const aligns = parseTableAlignments(lines[i + 1]) || []
+      i += 2
+      const rows = []
+      while (i < lines.length) {
+        const cur = String(lines[i] || '').trim()
+        if (!cur || !cur.includes('|')) break
+        rows.push(splitTableRow(cur))
+        i += 1
+      }
+      const colCount = Math.max(headers.length, aligns.length)
+      blocks.push(
+        <div
+          key={blocks.length}
+          className="my-2.5 max-w-full overflow-x-auto rounded-2xl border border-slate-200/80 bg-white dark:border-slate-700/80 dark:bg-[#1B1D25]"
+        >
+          <table className="w-full min-w-max border-collapse text-[13px] leading-snug">
+            <thead className="bg-slate-50/90 text-slate-600 dark:bg-[#232631] dark:text-slate-300">
+              <tr>
+                {Array.from({ length: colCount }).map((_, cIdx) => (
+                  <th
+                    key={cIdx}
+                    className={`border-b border-slate-200/80 px-3 py-2 font-semibold whitespace-nowrap dark:border-slate-700/80 ${aligns[cIdx] || 'text-left'}`}
+                  >
+                    {renderInline(headers[cIdx] || '', imageContext)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200/60 text-slate-700 dark:divide-slate-700/60 dark:text-slate-200">
+              {rows.map((row, rIdx) => (
+                <tr key={rIdx} className="hover:bg-slate-50/60 dark:hover:bg-white/[0.02]">
+                  {Array.from({ length: colCount }).map((__, cIdx) => (
+                    <td
+                      key={cIdx}
+                      className={`px-3 py-2 align-top whitespace-nowrap ${aligns[cIdx] || 'text-left'}`}
+                    >
+                      {renderInline(row[cIdx] || '', imageContext)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      continue
+    }
+
     // Headings
     const hMatch = line.match(/^(#{1,4})\s+(.+)$/)
     if (hMatch) {
@@ -232,7 +314,7 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
         4: 'text-sm font-semibold mt-2 mb-1',
       }
       blocks.push(
-        <div key={blocks.length} className={`${sizes[level]} text-slate-900 dark:text-white`}>
+        <div key={blocks.length} className={`${sizes[level]} break-words [overflow-wrap:anywhere] text-slate-900 dark:text-white`}>
           {renderInline(hMatch[2], imageContext)}
         </div>,
       )
@@ -250,7 +332,7 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
       blocks.push(
         <blockquote
           key={blocks.length}
-          className="my-2 border-l-3 border-[#4D6BFE]/50 pl-3 text-[14px] text-slate-600 dark:text-slate-300"
+          className="my-2 border-l-3 border-[#4D6BFE]/50 pl-3 text-[14px] break-words [overflow-wrap:anywhere] text-slate-600 dark:text-slate-300"
         >
           {quoteLines.map((ql, idx) => (
             <p key={idx} className="my-0.5">{renderInline(ql, imageContext)}</p>
@@ -268,7 +350,7 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
         i += 1
       }
       blocks.push(
-        <ul key={blocks.length} className="my-1.5 list-disc space-y-1 pl-5 text-[15px] leading-relaxed">
+        <ul key={blocks.length} className="my-1.5 list-disc space-y-1 pl-5 text-[15px] leading-relaxed break-words [overflow-wrap:anywhere]">
           {items.map((item, idx) => (
             <li key={idx}>{renderInline(item, imageContext)}</li>
           ))}
@@ -285,7 +367,7 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
         i += 1
       }
       blocks.push(
-        <ol key={blocks.length} className="my-1.5 list-decimal space-y-1 pl-5 text-[15px] leading-relaxed">
+        <ol key={blocks.length} className="my-1.5 list-decimal space-y-1 pl-5 text-[15px] leading-relaxed break-words [overflow-wrap:anywhere]">
           {items.map((item, idx) => (
             <li key={idx}>{renderInline(item, imageContext)}</li>
           ))}
@@ -312,20 +394,22 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
       i < lines.length &&
       lines[i].trim() !== '' &&
       !lines[i].trim().startsWith('```') &&
+      !isTableStart(lines, i) &&
       !/^(#{1,4})\s+/.test(lines[i]) &&
       !lines[i].startsWith('> ') &&
       !/^\s*[-*•]\s+/.test(lines[i]) &&
-      !/^\s*\d+\.\s+/.test(lines[i])
+      !/^\s*\d+\.\s+/.test(lines[i]) &&
+      !/^---+$/.test(lines[i].trim())
     ) {
       para.push(lines[i])
       i += 1
     }
     blocks.push(
-      <p key={blocks.length} className="my-1.5 whitespace-pre-wrap text-[15px] leading-[1.7] text-slate-800 dark:text-slate-100">
+      <p key={blocks.length} className="my-1.5 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[15px] leading-[1.7] text-slate-800 dark:text-slate-100">
         {renderInline(para.join('\n'), imageContext)}
       </p>,
     )
   }
 
-  return <div className={streaming ? 'stream-caret' : ''}>{blocks}</div>
+  return <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>{blocks}</div>
 }

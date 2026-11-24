@@ -1059,6 +1059,9 @@ async function main() {
         // Bind PC-1 via portable single-file CLI in account mode (verifying password is NEVER written & e2eeKey is auto-generated!)
         if (existsSync(bundlePath)) {
           const acctStateDir = join(tmpDir, 'portable-account-home')
+          const childEnv = { ...process.env, ALLINONE_NO_AUTOFIX: '1' }
+          delete childEnv.ALLINONE_E2EE_KEY
+          delete childEnv.ALLINONE_BRIDGE_SECRET
           acctPortableChild = spawn(process.execPath, [
             bundlePath,
             '--server', acctHttpBase,
@@ -1068,7 +1071,7 @@ async function main() {
             '--password', alicePass,
             '--no-browser',
           ], {
-            env: { ...process.env, ALLINONE_NO_AUTOFIX: '1' },
+            env: childEnv,
             stdio: ['ignore', 'pipe', 'pipe'],
           })
           let acctOut = ''
