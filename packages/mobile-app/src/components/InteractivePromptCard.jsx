@@ -247,7 +247,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
                         ? bi('或输入其他回答...', 'Or type another answer...')
                         : bi('输入回答...', 'Type your answer...')
                     }
-                    className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1A1E2B] dark:text-white dark:focus:border-[#4D6BFE]"
+                    className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1A1E2B] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#1E2333]"
                   />
                 )}
               </div>
@@ -261,7 +261,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
             type="button"
             disabled={submitting}
             onClick={() => void runResolve({ decision: 'cancel', answers: {} })}
-            className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 active:scale-95 disabled:opacity-50 dark:border-slate-700 dark:bg-[#232736] dark:text-slate-300"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 active:scale-95 disabled:opacity-50 dark:border-slate-700 dark:bg-[#232736] dark:text-slate-300 dark:hover:bg-[#2C3144]"
           >
             {prompt.cancelLabel || bi('跳过', 'Skip')}
           </button>
