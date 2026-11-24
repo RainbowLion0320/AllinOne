@@ -103,11 +103,14 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
  * and Relay NEVER forwards plaintext RPCs or bridge events.
  */
 export class RelayHub {
-  constructor({ log = console, getRoomDevices = null, trafficGuard = null, isAdminRoom = null } = {}) {
+  constructor({ log = console, getRoomDevices = null, trafficGuard = null, isAdminRoom = null, getRoomTier = null } = {}) {
     this.log = log
     this.getRoomDevices = typeof getRoomDevices === 'function' ? getRoomDevices : null
     this.trafficGuard = trafficGuard || null
     this.isAdminRoom = typeof isAdminRoom === 'function' ? isAdminRoom : () => false
+    this.getRoomTier = typeof getRoomTier === 'function'
+      ? getRoomTier
+      : (rid) => (this.isAdminRoom(rid) ? 'admin' : 'free')
     /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number }>} */
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
     /** @type {Map<string, { roomId: string, ws: import('ws').WebSocket, user: any, connectedAt: number }>} */
@@ -326,7 +329,11 @@ export class RelayHub {
       ? { ...st }
       : { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
     if (this.trafficGuard) {
-      base.traffic = this.trafficGuard.getRoomUsage(rid)
+      let tier = 'free'
+      try {
+        tier = String(this.getRoomTier(rid) || 'free')
+      } catch {}
+      base.traffic = this.trafficGuard.getRoomUsage(rid, tier)
     }
     return base
   }
@@ -334,11 +341,13 @@ export class RelayHub {
   getTrafficSummary() {
     if (!this.trafficGuard) {
       return {
+        monthKey: '',
         totalBytes10m: 0,
         totalBytes24h: 0,
+        totalBytesMonth: 0,
         totalBytesLifetime: 0,
         totalThrottledCount: 0,
-        limits: { burst10mBytes: 0, daily24hBytes: 0, uploadPerMin: 0, adminExempt: true },
+        limits: { burst10mBytes: 0, daily24hBytes: 0, proMonthlyBytes: 0, uploadPerMin: 0, adminExempt: true },
       }
     }
     return this.trafficGuard.getGlobalSummary()
@@ -346,17 +355,17 @@ export class RelayHub {
 
   checkRoomTraffic(roomId, bytes, { sourceLabel = '', ip = '' } = {}) {
     if (!this.trafficGuard || !roomId) return { allowed: true, hardKick: false }
-    let isAdmin = false
+    let tier = 'free'
     try {
-      isAdmin = Boolean(this.isAdminRoom(roomId))
+      tier = String(this.getRoomTier(roomId) || 'free')
     } catch {}
-    const res = this.trafficGuard.consumeBytes(roomId, bytes, { isAdmin })
+    const res = this.trafficGuard.consumeBytes(roomId, bytes, { tier })
     if (!res.allowed) {
       this.recordActivity({
         type: 'traffic.throttled',
         roomId,
         label: sourceLabel || 'ws',
-        detail: `${res.code || 'TRAFFIC_QUOTA_EXCEEDED'} (${Math.round((Number(bytes) || 0) / 1024)}KB)`,
+        detail: `${res.code || 'TRAFFIC_QUOTA_EXCEEDED'}${res.quotaWindow ? `/${res.quotaWindow}` : ''} [${tier}] (${Math.round((Number(bytes) || 0) / 1024)}KB)`,
         ip,
       })
     }

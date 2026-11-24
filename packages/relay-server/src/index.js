@@ -2,7 +2,7 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
 import { readFile as readFileAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
-import { basename, extname, join, normalize, resolve, sep } from 'node:path'
+import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
@@ -377,13 +377,20 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  const trafficGuard = new RelayTrafficGuard(options.trafficGuard || {})
-  const isAdminRoom = (rid) => accounts.getUserById(rid)?.role === 'admin'
+  const defaultTrafficStateFile = join(dirname(accountsFile), 'traffic-usage.json')
+  const rawTgOpts = options.trafficGuard || {}
+  const trafficGuard = new RelayTrafficGuard({
+    ...rawTgOpts,
+    stateFile: rawTgOpts.stateFile === false ? '' : (rawTgOpts.stateFile || defaultTrafficStateFile),
+  })
+  const getRoomTier = (rid) => accounts.getUserTier(rid)
+  const isAdminRoom = (rid) => getRoomTier(rid) === 'admin'
 
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
     trafficGuard,
     isAdminRoom,
+    getRoomTier,
   })
 
   function isAllowedOrigin(rawOrigin, req) {
@@ -1469,12 +1476,15 @@ export function createRelayServer(options = {}) {
           note: body.note || '',
           createdBy: payload.uname || payload.sub || 'admin',
           grantAdmin: Boolean(body.grantAdmin),
+          plan: body.plan || '',
+          tier: body.tier || '',
         })
+        const createdTier = created[0]?.tier || 'free'
         hub.recordActivity({
           type: 'admin.invite',
           roomId: payload.room,
           label: payload.uname ? `@${payload.uname}` : 'admin',
-          detail: `Created ${created.length} invite(s)${body.note ? ` · ${String(body.note).slice(0, 32)}` : ''}`,
+          detail: `Created ${created.length} ${createdTier.toUpperCase()} invite(s)${body.note ? ` · ${String(body.note).slice(0, 32)}` : ''}`,
           ip: getClientIp(req),
         })
         sendJson(res, 200, { ok: true, invites: created })
@@ -1609,6 +1619,43 @@ export function createRelayServer(options = {}) {
           roomId: revoked.roomId,
           tokenVersion: revoked.tokenVersion,
           disconnectedClients,
+        })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Admin Monitor: Update a user's tier (free | pro | ultra | admin) in real time
+    if (pathname === '/api/admin/users/set-tier' && req.method === 'POST') {
+      const payload = requireAdmin(req, res)
+      if (!payload) return
+      try {
+        const body = await readJsonBody(req)
+        const targetRoom = String(body.userId || body.roomId || '').trim()
+        const targetTier = String(body.tier || body.plan || '').trim().toLowerCase()
+        if (!targetRoom.startsWith('usr_') || !targetTier) {
+          sendJson(res, 400, { ok: false, error: '缺少目标用户或等级参数' })
+          return
+        }
+        const updated = accounts.setUserTier(targetRoom, targetTier, { actorUserId: payload.room })
+        if (!updated.ok) {
+          sendJson(res, updated.error === '用户不存在' ? 404 : 400, { ok: false, error: updated.error })
+          return
+        }
+        hub.recordActivity({
+          type: 'admin.tier',
+          roomId: targetRoom,
+          label: updated.user ? `@${updated.user.username}` : targetRoom,
+          detail: `Tier ${updated.prevTier} -> ${updated.tier} (by ${payload.uname ? `@${payload.uname}` : 'admin'})`,
+          ip: getClientIp(req),
+        })
+        sendJson(res, 200, {
+          ok: true,
+          prevTier: updated.prevTier,
+          tier: updated.tier,
+          user: updated.user,
+          traffic: hub.getRoomStats(targetRoom).traffic || null,
         })
       } catch {
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
@@ -1886,6 +1933,9 @@ export function createRelayServer(options = {}) {
         loginEmail2fa: Boolean(acctUser.loginEmail2fa),
         emailEnabled: mailer.isConfigured(),
         role: acctUser.role,
+        plan: acctUser.plan || 'free',
+        tier: acctUser.tier || (acctUser.role === 'admin' ? 'admin' : 'free'),
+        traffic: hub.getRoomStats(payload.room).traffic || null,
         label: `@${acctUser.username}`,
         devices: getMergedAccountDevices(payload.room, bridges),
         bridges,
@@ -1919,15 +1969,16 @@ export function createRelayServer(options = {}) {
           return
         }
         const ownerRoom = payload.room
+        const ownerTier = getRoomTier(ownerRoom)
         const tCheck = trafficGuard.consumeUploadPost(ownerRoom, buf.length, {
-          isAdmin: payload.role === 'admin' || isAdminRoom(ownerRoom),
+          tier: ownerTier,
         })
         if (!tCheck.allowed) {
           hub.recordActivity({
             type: 'traffic.throttled',
             roomId: ownerRoom,
             label: 'upload:post',
-            detail: `${tCheck.code} (${Math.round(buf.length / 1024)}KB)`,
+            detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(buf.length / 1024)}KB)`,
             ip: getClientIp(req),
           })
           res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
@@ -2028,15 +2079,16 @@ export function createRelayServer(options = {}) {
         sendJson(res, 403, { ok: false, error: '无权访问其他账号的文件' })
         return
       }
+      const callerTier = getRoomTier(callerRoom)
       const dlCheck = trafficGuard.consumeUploadGet(callerRoom, fileSize, {
-        isAdmin: clientUser?.role === 'admin' || isAdminRoom(callerRoom),
+        tier: callerTier,
       })
       if (!dlCheck.allowed) {
         hub.recordActivity({
           type: 'traffic.throttled',
           roomId: callerRoom,
           label: 'upload:get',
-          detail: `${dlCheck.code} (${Math.round(fileSize / 1024)}KB)`,
+          detail: `${dlCheck.code}${dlCheck.quotaWindow ? `/${dlCheck.quotaWindow}` : ''} [${callerTier}] (${Math.round(fileSize / 1024)}KB)`,
           ip: getClientIp(req),
         })
         res.setHeader('Retry-After', String(dlCheck.retryAfterSec || 300))
@@ -2344,6 +2396,7 @@ export function createRelayServer(options = {}) {
     new Promise((resolveClose) => {
       clearInterval(cleanupTimer)
       accounts.flush()
+      trafficGuard.flush()
       hub.shutdown()
       wss.close(() => {
         server.close(() => resolveClose())

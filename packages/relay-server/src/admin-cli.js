@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 /**
- * Server-side Admin CLI for managing single-use registration invite codes & accounts.
+ * Server-side Admin CLI for managing single-use registration invite codes & user tiers.
  *
  * Usage:
- *   node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--admin]
+ *   node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--tier free|pro|ultra|admin] [--admin]
  *   node packages/relay-server/src/admin-cli.js invite list
  *   node packages/relay-server/src/admin-cli.js invite revoke <id-or-code>
  *   node packages/relay-server/src/admin-cli.js users
+ *   node packages/relay-server/src/admin-cli.js user tier <username-or-id> <free|pro|ultra|admin>
  */
 
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createAccountStore } from './accounts.js'
+import { createAccountStore, VALID_TIERS } from './accounts.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
@@ -52,17 +53,30 @@ function getFlag(name, fallback = '') {
   return fallback
 }
 
+const TIER_LABELS = {
+  free: '普通用户 (Free)',
+  pro: 'Pro (5GB/月 · 10倍日额)',
+  ultra: 'Ultra (不限流)',
+  admin: '管理员 (Admin · 不限流)',
+}
+
 if (cmd === 'invite' && sub === 'create') {
   const count = Number(getFlag('--count', getFlag('-n', '1'))) || 1
   const note = getFlag('--note', '')
-  const grantAdmin = args.includes('--admin')
-  const created = store.createInvites({ count, note, createdBy: 'cli', grantAdmin })
-  console.log(`\n✓ 已生成 ${created.length} 个一次性邀请码${grantAdmin ? '（含管理员权限）' : ''}：\n`)
+  const rawTier = String(getFlag('--tier', getFlag('--plan', '')) || '').trim().toLowerCase()
+  if (rawTier && !VALID_TIERS.has(rawTier)) {
+    console.error(`无效的用户等级 "${rawTier}"，仅支持: free | pro | ultra | admin`)
+    process.exit(1)
+  }
+  const grantAdmin = args.includes('--admin') || rawTier === 'admin'
+  const created = store.createInvites({ count, note, createdBy: 'cli', grantAdmin, tier: rawTier })
+  const tierLabel = TIER_LABELS[created[0]?.tier || 'free'] || '普通用户'
+  console.log(`\n✓ 已生成 ${created.length} 个一次性邀请码 [${tierLabel}]：\n`)
   for (const inv of created) {
     const link = publicUrl ? `  ->  ${publicUrl}/?invite=${encodeURIComponent(inv.code)}` : ''
     console.log(`  ${inv.code}${inv.note ? `  (${inv.note})` : ''}${link}`)
   }
-  console.log('\n提示：如果中转服务正在运行，通过 App 管理员后台生成无需重启；CLI 修改后请重启中转服务（例如 docker compose restart allinone-relay 或 systemctl restart allinone-relay）使运行中内存生效。\n')
+  console.log('\n提示：如果中转服务正在运行，通过管理员监控后台 (/admin) 生成无需重启；CLI 修改后请重启中转服务（例如 systemctl restart allinone-relay）使运行中内存生效。\n')
   process.exit(0)
 }
 
@@ -75,8 +89,8 @@ if (cmd === 'invite' && sub === 'list') {
   for (const inv of list) {
     const usedInfo = inv.status === 'used' ? ` -> @${inv.usedByUsername}` : ''
     const note = inv.note ? ` [${inv.note}]` : ''
-    const adminTag = inv.grantAdmin ? ' (ADMIN)' : ''
-    console.log(`${inv.code}  ${inv.status.padEnd(7)}  ${inv.id}${adminTag}${note}${usedInfo}`)
+    const tierTag = inv.tier && inv.tier !== 'free' ? ` (${inv.tier.toUpperCase()})` : ''
+    console.log(`${inv.code}  ${inv.status.padEnd(7)}  ${inv.id}${tierTag}${note}${usedInfo}`)
   }
   process.exit(0)
 }
@@ -104,16 +118,39 @@ if (cmd === 'users') {
   }
   for (const u of users) {
     const emailPart = u.email ? `  email=${u.email}` : ''
-    console.log(`${u.userId}  @${u.username.padEnd(18)}  role=${u.role.padEnd(5)}  devices=${u.deviceCount}${emailPart}`)
+    console.log(`${u.userId}  @${u.username.padEnd(18)}  tier=${(u.tier || 'free').padEnd(5)}  role=${u.role.padEnd(5)}  devices=${u.deviceCount}${emailPart}`)
   }
+  process.exit(0)
+}
+
+if (cmd === 'user' && sub === 'tier') {
+  const target = args[2] || ''
+  const nextTier = String(args[3] || '').trim().toLowerCase()
+  if (!target || !nextTier) {
+    console.error('用法: node packages/relay-server/src/admin-cli.js user tier <username-or-id> <free|pro|ultra|admin>')
+    process.exit(1)
+  }
+  const found = store.findUserByIdentifier(target)
+  if (!found) {
+    console.error(`找不到用户: ${target}`)
+    process.exit(1)
+  }
+  const res = store.setUserTier(found.userId, nextTier)
+  if (!res.ok) {
+    console.error(res.error)
+    process.exit(1)
+  }
+  console.log(`✓ 已将 @${res.user.username} (${res.user.userId}) 等级从 ${res.prevTier} 调整为 ${res.tier} [${TIER_LABELS[res.tier] || res.tier}]`)
+  console.log('提示：如通过管理员监控后台 (/admin) 调整可即时生效；CLI 调整后请重启中转服务使运行中内存加载最新配置。')
   process.exit(0)
 }
 
 console.log(`All in One Account & Invite Admin CLI
 
 用法:
-  node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--admin]
+  node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--tier free|pro|ultra|admin] [--admin]
   node packages/relay-server/src/admin-cli.js invite list
   node packages/relay-server/src/admin-cli.js invite revoke <id-or-code>
   node packages/relay-server/src/admin-cli.js users
+  node packages/relay-server/src/admin-cli.js user tier <username-or-id> <free|pro|ultra|admin>
 `)

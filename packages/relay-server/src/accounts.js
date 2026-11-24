@@ -12,6 +12,31 @@ const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
 const MAX_DEVICES_PER_USER = 20
 const MAX_REVOKED_SIDS = 64
 
+export const VALID_PLANS = new Set(['free', 'pro', 'ultra'])
+export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
+
+export function normalizePlan(raw) {
+  const p = String(raw || '').trim().toLowerCase()
+  return VALID_PLANS.has(p) ? p : 'free'
+}
+
+export function normalizeTier(raw) {
+  const t = String(raw || '').trim().toLowerCase()
+  return VALID_TIERS.has(t) ? t : 'free'
+}
+
+export function resolveUserTier(user) {
+  if (!user) return 'free'
+  if (user.role === 'admin') return 'admin'
+  return normalizePlan(user.plan)
+}
+
+export function resolveInviteTier(inv) {
+  if (!inv) return 'free'
+  if (inv.grantAdmin) return 'admin'
+  return normalizePlan(inv.plan)
+}
+
 function sha256Hex(val) {
   return createHash('sha256').update(String(val ?? ''), 'utf8').digest('hex')
 }
@@ -169,6 +194,7 @@ export function createAccountStore({ filePath }) {
         loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
         knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
         role: u.role === 'admin' ? 'admin' : 'user',
+        plan: u.role === 'admin' ? 'free' : normalizePlan(u.plan),
         tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
         devices: Array.isArray(u.devices) ? u.devices : [],
         sessions: Array.isArray(u.sessions) ? u.sessions : [],
@@ -182,7 +208,14 @@ export function createAccountStore({ filePath }) {
     }
     for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
       if (!inv?.id || !inv?.code) continue
-      invitesById.set(inv.id, inv)
+      const grantAdmin = Boolean(inv.grantAdmin)
+      const plan = grantAdmin ? 'free' : normalizePlan(inv.plan)
+      invitesById.set(inv.id, {
+        ...inv,
+        grantAdmin,
+        plan,
+        tier: grantAdmin ? 'admin' : plan,
+      })
     }
   }
 
@@ -292,13 +325,18 @@ export function createAccountStore({ filePath }) {
 
   function sanitizeUser(u) {
     if (!u) return null
+    const role = u.role === 'admin' ? 'admin' : 'user'
+    const plan = role === 'admin' ? 'free' : normalizePlan(u.plan)
+    const tier = role === 'admin' ? 'admin' : plan
     return {
       userId: u.userId,
       username: u.username,
       email: u.email || '',
       emailVerified: Boolean(u.email && u.emailVerified),
       loginEmail2fa: Boolean(u.email && u.emailVerified && u.loginEmail2fa),
-      role: u.role,
+      role,
+      plan,
+      tier,
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
       lastLoginAt: u.lastLoginAt || 0,
@@ -306,9 +344,18 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function createInvites({ count = 1, note = '', createdBy = 'admin', grantAdmin = false } = {}) {
+  function createInvites({ count = 1, note = '', createdBy = 'admin', grantAdmin = false, plan = '', tier = '' } = {}) {
     const n = Math.max(1, Math.min(50, Math.floor(Number(count) || 1)))
     const cleanNote = String(note || '').trim().slice(0, 80)
+    const resolvedTier = grantAdmin
+      ? 'admin'
+      : String(tier || '').trim()
+        ? normalizeTier(tier)
+        : String(plan || '').trim()
+          ? normalizePlan(plan)
+          : 'free'
+    const finalGrantAdmin = resolvedTier === 'admin'
+    const finalPlan = finalGrantAdmin ? 'free' : normalizePlan(resolvedTier)
     const existingCodes = new Set([...invitesById.values()].map((i) => i.code))
     const created = []
     const now = Date.now()
@@ -323,7 +370,9 @@ export function createAccountStore({ filePath }) {
         id: `inv_${randomBytes(6).toString('hex')}`,
         code,
         note: cleanNote,
-        grantAdmin: Boolean(grantAdmin),
+        grantAdmin: finalGrantAdmin,
+        plan: finalPlan,
+        tier: resolvedTier,
         createdBy: String(createdBy || 'admin').slice(0, 64),
         createdAt: now,
         status: 'active', // 'active' | 'used' | 'revoked'
@@ -342,7 +391,11 @@ export function createAccountStore({ filePath }) {
   function listInvites() {
     return [...invitesById.values()]
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-      .map((inv) => ({ ...inv }))
+      .map((inv) => {
+        const grantAdmin = Boolean(inv.grantAdmin)
+        const plan = grantAdmin ? 'free' : normalizePlan(inv.plan)
+        return { ...inv, grantAdmin, plan, tier: grantAdmin ? 'admin' : plan }
+      })
   }
 
   function revokeInvite(idOrCode) {
@@ -444,6 +497,7 @@ export function createAccountStore({ filePath }) {
     const userId = `usr_${randomBytes(8).toString('hex')}`
     const { salt, hash } = hashPassword(pCheck.password)
     const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
+    const plan = role === 'admin' ? 'free' : normalizePlan(matchedInvite?.plan)
 
     // Strictly burn the single-use invite synchronously before persisting
     if (matchedInvite) {
@@ -464,6 +518,7 @@ export function createAccountStore({ filePath }) {
       loginEmail2fa: false,
       knownLoginIps: [],
       role,
+      plan,
       passwordSalt: salt,
       passwordHash: hash,
       tokenVersion: 0,
@@ -566,6 +621,7 @@ export function createAccountStore({ filePath }) {
     const now = Date.now()
     const userId = `usr_${randomBytes(8).toString('hex')}`
     const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
+    const plan = role === 'admin' ? 'free' : normalizePlan(matchedInvite?.plan)
 
     if (matchedInvite) {
       matchedInvite.status = 'used'
@@ -585,6 +641,7 @@ export function createAccountStore({ filePath }) {
       loginEmail2fa: false,
       knownLoginIps: [],
       role,
+      plan,
       passwordSalt: salt,
       passwordHash: hash,
       tokenVersion: 0,
@@ -926,6 +983,54 @@ export function createAccountStore({ filePath }) {
     return sanitizeUser(record)
   }
 
+  function findUserByIdentifier(identifier) {
+    const clean = String(identifier || '').trim()
+    if (!clean) return null
+    if (usersById.has(clean)) return sanitizeUser(usersById.get(clean))
+    const lower = clean.replace(/^@/, '').toLowerCase()
+    const uid = userIdByLower.get(lower) || (lower.includes('@') ? userIdByEmailLower.get(lower) : '')
+    return uid ? sanitizeUser(usersById.get(uid)) : null
+  }
+
+  function getUserTier(userId) {
+    const record = usersById.get(userId)
+    return resolveUserTier(record)
+  }
+
+  function setUserTier(userId, targetTier, { actorUserId = '' } = {}) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    const raw = String(targetTier || '').trim().toLowerCase()
+    if (!VALID_TIERS.has(raw)) {
+      return { ok: false, error: '无效的用户等级，仅支持 free / pro / ultra / admin' }
+    }
+    if (actorUserId && actorUserId === userId && raw !== 'admin') {
+      return { ok: false, error: '不能取消当前管理员自身的管理员身份' }
+    }
+    if (record.role === 'admin' && raw !== 'admin') {
+      let adminCount = 0
+      for (const u of usersById.values()) {
+        if (u.role === 'admin') adminCount += 1
+      }
+      if (adminCount <= 1) {
+        return { ok: false, error: '系统至少需要保留一名管理员' }
+      }
+    }
+    const prevTier = resolveUserTier(record)
+    if (raw === 'admin') {
+      record.role = 'admin'
+      record.plan = 'free'
+    } else {
+      record.role = 'user'
+      record.plan = raw
+    }
+    const nextTier = resolveUserTier(record)
+    if (prevTier !== nextTier) {
+      save()
+    }
+    return { ok: true, prevTier, tier: nextTier, user: sanitizeUser(record) }
+  }
+
   function getTokenVersion(userId) {
     const record = usersById.get(userId)
     if (!record) return -1
@@ -1179,6 +1284,9 @@ export function createAccountStore({ filePath }) {
     renameUserDevice,
     removeUserDevice,
     getUserById,
+    findUserByIdentifier,
+    getUserTier,
+    setUserTier,
     getTokenVersion,
     recordUserSession,
     touchUserSession,

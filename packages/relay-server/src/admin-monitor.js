@@ -123,7 +123,7 @@ export function buildAdminOverview({
   const metrics = hub.getMetricsSummary()
   const trafficSummary = typeof hub.getTrafficSummary === 'function'
     ? hub.getTrafficSummary()
-    : { totalBytes10m: 0, totalBytes24h: 0, totalBytesLifetime: 0, totalThrottledCount: 0, limits: null }
+    : { monthKey: '', totalBytes10m: 0, totalBytes24h: 0, totalBytesMonth: 0, totalBytesLifetime: 0, totalThrottledCount: 0, limits: null }
 
   // Index username by roomId (`usr_*`) for enriching live connections & activity log
   const ownerNameByRoom = new Map()
@@ -170,6 +170,7 @@ export function buildAdminOverview({
   }
 
   const userStatusDist = { active: 0, bridgeOnly: 0, clientOnly: 0, offline: 0 }
+  const tierDistribution = { free: 0, pro: 0, ultra: 0, admin: 0 }
   let totalBoundDevices = 0
   let recent24hUsers = 0
 
@@ -177,6 +178,9 @@ export function buildAdminOverview({
     const roomBridges = bridgesByRoom.get(u.userId) || []
     const roomClients = clientsByRoom.get(u.userId) || []
     const rStats = hub.getRoomStats(u.userId)
+    const plan = u.role === 'admin' ? 'free' : (u.plan || 'free')
+    const tier = u.tier || (u.role === 'admin' ? 'admin' : plan)
+    if (tierDistribution[tier] !== undefined) tierDistribution[tier] += 1
 
     const liveBridgeById = new Map(roomBridges.map((b) => [b.bridgeId, b]))
     const mergedDevices = (u.devices || []).map((dev) => {
@@ -294,6 +298,8 @@ export function buildAdminOverview({
       email: u.email || '',
       emailVerified: Boolean(u.emailVerified),
       role: u.role,
+      plan,
+      tier,
       isCurrentAdmin: currentAdminRoom === u.userId,
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
@@ -373,12 +379,16 @@ export function buildAdminOverview({
       totalClientConnects: metrics.totalClientConnects,
       totalTraffic10mBytes: trafficSummary.totalBytes10m || 0,
       totalTraffic24hBytes: trafficSummary.totalBytes24h || 0,
+      totalTrafficMonthBytes: trafficSummary.totalBytesMonth || 0,
+      trafficMonthKey: trafficSummary.monthKey || '',
       totalTrafficLifetimeBytes: trafficSummary.totalBytesLifetime || 0,
       totalThrottledCount: trafficSummary.totalThrottledCount || 0,
       trafficLimits: trafficSummary.limits || null,
+      tierDistribution,
     },
     distributions: {
       userStatus: userStatusDist,
+      userTiers: tierDistribution,
       apps: appStats,
       bridgePlatforms,
       clientKinds,

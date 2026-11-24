@@ -1203,6 +1203,27 @@ input:focus {
   gap: 6px 14px;
 }
 
+.detail-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tier-switch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-sec);
+}
+
+.select-xs {
+  padding: 4px 22px 4px 8px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+
 /* Connections Tables */
 .conn-grid {
   display: flex;

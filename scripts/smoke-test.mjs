@@ -5376,6 +5376,257 @@ async function main() {
     }
     console.log('[smoke] 33/33 Relay per-room traffic quota, upload 429 rate limit, WS flood guard & admin traffic metrics OK')
 
+    // 34. Four-tier user system (free / pro / ultra / admin): Pro 5GB/month + 10x daily, Ultra & Admin unlimited, persistent monthly usage & live tier API
+    {
+      const tierDir = join(tmpDir, 'tier-relay')
+      mkdirSync(tierDir, { recursive: true })
+      const tierStateFile = join(tierDir, 'traffic-usage.json')
+
+      // 34a. Unit verification of all 4 tiers, Pro 10x daily + monthly cap, disk persistence & calendar-month auto-reset
+      let mockNow = new Date('2026-03-15T10:00:00Z').getTime()
+      const tg1 = new RelayTrafficGuard({
+        burstLimitBytes: 100 * 1024, // 100 KB / 10m (free) -> 1000 KB / 10m (pro)
+        dailyLimitBytes: 200 * 1024, // 200 KB / 24h (free) -> 2000 KB / 24h (pro = 10x)
+        proMonthlyLimitBytes: 3 * 1024 * 1024, // 3 MB / month for fast deterministic test
+        uploadMaxPerMinute: 2, // 2/min (free) -> 10/min (pro)
+        largeFrameThresholdBytes: 64 * 1024,
+        hardDisconnectMultiplier: 2,
+        adminExempt: true,
+        stateFile: tierStateFile,
+        saveDebounceMs: 60_000,
+        nowFn: () => mockNow,
+      })
+
+      // Verify effective limits for all 4 tiers
+      assert.equal(tg1.getLimitsForTier('free').daily24hBytes, 200 * 1024)
+      assert.equal(tg1.getLimitsForTier('free').monthlyBytes, 0)
+      assert.equal(tg1.getLimitsForTier('pro').daily24hBytes, 200 * 1024 * 10, 'Pro daily limit must be 10x normal user')
+      assert.equal(tg1.getLimitsForTier('pro').burst10mBytes, 100 * 1024 * 10, 'Pro 10m burst limit must be 10x normal user')
+      assert.equal(tg1.getLimitsForTier('pro').monthlyBytes, 3 * 1024 * 1024)
+      assert.equal(tg1.getLimitsForTier('ultra').unlimited, true, 'Ultra tier must be unlimited')
+      assert.equal(tg1.getLimitsForTier('admin').unlimited, true, 'Admin tier must be unlimited')
+
+      // Free user hits 100KB burst immediately on 120KB frame
+      assert.equal(tg1.consumeBytes('usr_t_free', 120 * 1024, { tier: 'free' }).allowed, false)
+
+      // Pro user easily transfers 900KB in 10m & 1.8MB in 24h (well above free's 200KB daily limit)
+      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true)
+      mockNow += 11 * 60 * 1000 // +11m -> burst resets, still same 24h
+      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true) // 1.8MB in 24h (<= 2000KB)
+      mockNow += 11 * 60 * 1000 // +11m -> burst resets again, 24h total still 1.8MB
+      // Pushing past Pro's 2000KB daily cap blocks with quotaWindow === '24h'
+      const proDayBlocked = tg1.consumeBytes('usr_t_pro', 300 * 1024, { tier: 'pro' })
+      assert.equal(proDayBlocked.allowed, false)
+      assert.equal(proDayBlocked.quotaWindow, '24h')
+
+      // Advance 25 hours -> 24h window clears, but monthly total (1.8MB) remains!
+      mockNow += 25 * 60 * 60 * 1000
+      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true) // 2.7MB / 3MB monthly
+      tg1.flush()
+
+      // Reload into a fresh RelayTrafficGuard instance (simulating server restart)
+      const tg2 = new RelayTrafficGuard({
+        burstLimitBytes: 100 * 1024,
+        dailyLimitBytes: 200 * 1024,
+        proMonthlyLimitBytes: 3 * 1024 * 1024,
+        uploadMaxPerMinute: 2,
+        largeFrameThresholdBytes: 64 * 1024,
+        hardDisconnectMultiplier: 2,
+        adminExempt: true,
+        stateFile: tierStateFile,
+        nowFn: () => mockNow,
+      })
+      assert.equal(tg2.getRoomUsage('usr_t_pro', 'pro').bytesMonth, 2700 * 1024, 'Monthly usage must persist across restarts')
+      const proMonthBlocked = tg2.consumeBytes('usr_t_pro', 500 * 1024, { tier: 'pro' })
+      assert.equal(proMonthBlocked.allowed, false, 'Pro user exceeding monthly cap must be blocked')
+      assert.equal(proMonthBlocked.quotaWindow, 'month')
+      assert.equal(proMonthBlocked.hardKick, false, 'Soft monthly block must not hard-kick')
+      // Small chat frame still allowed even when monthly file quota reached
+      assert.equal(tg2.consumeBytes('usr_t_pro', 4 * 1024, { tier: 'pro' }).allowed, true)
+
+      // Advance to next calendar month (April 2026) -> monthly usage auto-resets!
+      mockNow = new Date('2026-04-02T10:00:00Z').getTime()
+      const nextMonthOk = tg2.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' })
+      assert.equal(nextMonthOk.allowed, true, 'Pro monthly quota must reset on new calendar month')
+      assert.equal(tg2.getRoomUsage('usr_t_pro', 'pro').bytesMonth, 900 * 1024)
+
+      // Ultra & Admin are never throttled even past 20MB, yet remain metered
+      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
+      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
+      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
+      assert.equal(tg2.getRoomUsage('usr_t_ultra', 'ultra').bytesMonth, 30 * 1024 * 1024)
+      assert.equal(tg2.getRoomUsage('usr_t_ultra', 'ultra').unlimited, true)
+      assert.equal(tg2.consumeUploadPost('usr_t_admin', 10 * 1024 * 1024, { tier: 'admin' }).allowed, true)
+      assert.equal(tg2.getRoomUsage('usr_t_admin', 'admin').unlimited, true)
+
+      // 34b. Live HTTP APIs: tiered invites, strict non-admin isolation for Pro/Ultra, live tier switching & overview
+      const tierRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-tier-secret-123456',
+        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
+        accountsFile: join(tierDir, 'accounts.json'),
+        uploadDir: join(tierDir, 'uploads'),
+        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
+        trafficGuard: {
+          burstLimitBytes: 128 * 1024,
+          dailyLimitBytes: 256 * 1024,
+          proMonthlyLimitBytes: 5 * 1024 * 1024,
+          uploadMaxPerMinute: 2,
+          adminExempt: true,
+        },
+      })
+      const tAddr = await tierRelay.start()
+      const tBase = `http://127.0.0.1:${tAddr.port}`
+      try {
+        const tAdmin = await (await fetch(`${tBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 't_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
+        })).json()
+        assert.equal(tAdmin.ok, true)
+        assert.equal(tAdmin.user.tier, 'admin')
+
+        const [invFree, invPro, invUltra] = await Promise.all([
+          fetch(`${tBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'free', note: 'free-inv' }),
+          }).then((r) => r.json()),
+          fetch(`${tBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'pro', note: 'pro-inv' }),
+          }).then((r) => r.json()),
+          fetch(`${tBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'ultra', note: 'ultra-inv' }),
+          }).then((r) => r.json()),
+        ])
+        assert.equal(invFree.invites[0].tier, 'free')
+        assert.equal(invPro.invites[0].tier, 'pro')
+        assert.equal(invPro.invites[0].grantAdmin, false)
+        assert.equal(invUltra.invites[0].tier, 'ultra')
+        assert.equal(invUltra.invites[0].grantAdmin, false)
+
+        const [uFree, uPro, uUltra] = await Promise.all([
+          fetch(`${tBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 't_free', password: SMOKE_ADMIN_PASS, inviteCode: invFree.invites[0].code }),
+          }).then((r) => r.json()),
+          fetch(`${tBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 't_pro', password: SMOKE_ADMIN_PASS, inviteCode: invPro.invites[0].code }),
+          }).then((r) => r.json()),
+          fetch(`${tBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 't_ultra', password: SMOKE_ADMIN_PASS, inviteCode: invUltra.invites[0].code }),
+          }).then((r) => r.json()),
+        ])
+        assert.equal(uFree.user.tier, 'free')
+        assert.equal(uFree.user.role, 'user')
+        assert.equal(uPro.user.tier, 'pro')
+        assert.equal(uPro.user.role, 'user')
+        assert.equal(uUltra.user.tier, 'ultra')
+        assert.equal(uUltra.user.role, 'user')
+
+        // Pro and Ultra users must NEVER gain admin API access
+        const proAdminTry = await fetch(`${tBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${uPro.token}` },
+        })
+        const ultraAdminTry = await fetch(`${tBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${uUltra.token}` },
+        })
+        assert.equal(proAdminTry.status, 403, 'Pro user must get 403 on admin endpoints')
+        assert.equal(ultraAdminTry.status, 403, 'Ultra user must get 403 on admin endpoints')
+
+        // /api/auth/me exposes tier & traffic snapshot
+        const proMe = await (await fetch(`${tBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${uPro.token}` },
+        })).json()
+        assert.equal(proMe.tier, 'pro')
+        assert.equal(proMe.traffic.limitMonthBytes, 5 * 1024 * 1024)
+        assert.equal(proMe.traffic.limit24hBytes, 256 * 1024 * 10)
+
+        // Upload rate enforcement: free user hits 429 on 3rd upload, while pro & ultra pass 3+ uploads cleanly
+        const sampleBody = JSON.stringify({ encrypted: true, dataBase64: Buffer.alloc(4096, 0x62).toString('base64') })
+        for (let i = 0; i < 3; i += 1) {
+          const rPro = await fetch(`${tBase}/api/uploads`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uPro.token}` },
+            body: sampleBody,
+          })
+          assert.equal(rPro.status, 200, `Pro upload #${i + 1} must succeed`)
+          const rUltra = await fetch(`${tBase}/api/uploads`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uUltra.token}` },
+            body: sampleBody,
+          })
+          assert.equal(rUltra.status, 200, `Ultra upload #${i + 1} must succeed`)
+        }
+        await fetch(`${tBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
+          body: sampleBody,
+        })
+        await fetch(`${tBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
+          body: sampleBody,
+        })
+        const freeBlocked = await fetch(`${tBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
+          body: sampleBody,
+        })
+        assert.equal(freeBlocked.status, 429, 'Free user must hit 429 on 3rd upload/min')
+
+        // Admin cannot demote self
+        const selfDemote = await fetch(`${tBase}/api/admin/users/set-tier`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
+          body: JSON.stringify({ userId: tAdmin.user.userId, tier: 'ultra' }),
+        })
+        assert.equal(selfDemote.status, 400, 'Admin must not be allowed to demote themselves')
+
+        // Live upgrade free -> ultra immediately lifts rate limit with zero re-login
+        const upgradeRes = await (await fetch(`${tBase}/api/admin/users/set-tier`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
+          body: JSON.stringify({ userId: uFree.user.userId, tier: 'ultra' }),
+        })).json()
+        assert.equal(upgradeRes.ok, true)
+        assert.equal(upgradeRes.prevTier, 'free')
+        assert.equal(upgradeRes.tier, 'ultra')
+        assert.equal(upgradeRes.user.role, 'user')
+
+        const freeNowUltraUpload = await fetch(`${tBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
+          body: sampleBody,
+        })
+        assert.equal(freeNowUltraUpload.status, 200, 'Upgrading user to Ultra must lift limits immediately')
+
+        // Admin overview reports tier distribution and monthly totals
+        const ovTier = await (await fetch(`${tBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${tAdmin.token}` },
+        })).json()
+        assert.equal(ovTier.ok, true)
+        assert.deepEqual(ovTier.summary.tierDistribution, { free: 0, pro: 1, ultra: 2, admin: 1 })
+        assert.ok(ovTier.summary.totalTrafficMonthBytes >= 4096 * 9)
+        const proRow = ovTier.users.find((u) => u.username === 't_pro')
+        assert.equal(proRow.tier, 'pro')
+        assert.equal(proRow.stats.traffic.limitMonthBytes, 5 * 1024 * 1024)
+      } finally {
+        await tierRelay.close()
+      }
+    }
+    console.log('[smoke] 34/34 Four-tier user quotas (Free / Pro 5GB-mo+10x-day / Ultra / Admin), monthly persistence & live tier API OK')
+
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
     if (acctPortableChild) {
