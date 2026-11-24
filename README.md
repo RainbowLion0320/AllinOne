@@ -26,7 +26,7 @@
   <a href="#-快速开始">快速开始</a> ·
   <a href="#-支持的工具与能力">支持工具</a> ·
   <a href="#-安全与架构">安全与架构</a> ·
-  <a href="#-自建中转服务器docker">自建部署</a> ·
+  <a href="#-一键私有化部署docker">一键部署</a> ·
   <a href="#-开发者指南">开发者指南</a>
 </p>
 
@@ -103,7 +103,7 @@
 > | :---: | :---: | :---: | :---: | :---: |
 > | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
 >
-> 如已被领完，可按下方 [Docker 自建教程](#-自建中转服务器docker) 几分钟部署私有中转，或提 Issue 留言获取新码。
+> 如已被领完，可按下方 [一键私有化部署](#-一键私有化部署docker) 1 分钟拥有独立私有中转，或提 Issue 留言获取新码。
 
 ### 3 步完成首次连接
 
@@ -200,9 +200,29 @@ flowchart LR
 
 ---
 
-## 🐳 自建中转服务器（Docker）
+## 🐳 一键私有化部署（Docker）
 
-只需一台带公网 IP 的 Linux 服务器，5 步即可拥有完全私有可控的中转服务（内置 Caddy 自动签发 Let's Encrypt HTTPS 证书）：
+只需一台 Linux 服务器（支持 `amd64` / `arm64`），**一行命令即可完成全自动私有化部署**（自动拉取 `ghcr.io` 多架构预构建镜像，免本地编译）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash
+```
+
+脚本会引导你 1 分钟内完成全部配置：
+- **三种接入模式任选**：① 自有域名 + Caddy 自动申请免费 Let's Encrypt HTTPS 证书（推荐） · ② **纯公网 IP + Let's Encrypt 正规 HTTPS 证书**（免域名） · ③ 仅启动中转容器（不占 80/443，适配已有 Nginx / 宝塔 / 1Panel / Cloudflare Tunnel）。
+- **零手动填密钥**：自动生成 256-bit 随机 `JWT_SECRET`（权限 `600`），可选引导配置免费邮箱 2FA（QQ / 163 / Gmail SMTP）。
+- **开箱即出邀请码**：健康检查通过后自动生成首个管理员一次性邀请码与注册链接，后续只需追加 `--upgrade` 即可无损升级镜像。
+
+```bash
+# 常用非交互参数示例（也可直接用于 cloud-init / 自动化脚本）
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --domain ai.yourdomain.com --yes
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --upgrade
+```
+
+完成注册后，管理员可直接在客户端「**邀请码管理**」中随时签发或作废一次性邀请码，并可通过 **`https://你的服务器/admin`**（或客户端「**设置 → 服务器监控看板**」）按需查看在线用户、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询开销）。
+
+<details>
+<summary>手动 Docker Compose 部署（含源码本地构建）</summary>
 
 ```bash
 # 1. 拉取代码
@@ -218,16 +238,17 @@ PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
-# 4. 构建并启动（Caddy 自动申请 HTTPS）
+# 4. 直接拉取 ghcr.io 预构建镜像启动（或加 --build 本地源码构建）
 cd deploy
-docker compose --env-file .env up -d --build
+docker compose --env-file .env pull
+docker compose --env-file .env up -d
 
 # 5. 生成首个管理员邀请码
 docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
 docker compose restart allinone-relay
 ```
 
-完成注册后，管理员可直接在客户端「**邀请码管理**」中随时签发或作废一次性邀请码，并可通过 **`https://你的服务器/admin`**（或客户端「**设置 → 服务器监控看板**」）按需查看在线用户、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询开销）。
+</details>
 
 <details>
 <summary>可选：开启免费邮箱 2FA 验证与自助找回密码（QQ / 163 / Gmail SMTP 或 Resend）</summary>

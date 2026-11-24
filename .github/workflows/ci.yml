@@ -35,7 +35,9 @@ jobs:
         run: |
           test -s packages/mobile-app/dist/downloads/allinone-bridge.mjs
           test -s packages/mobile-app/dist/setup.sh
-          node -e "const fs = require('fs'); if (fs.readFileSync('packages/mobile-app/dist/setup.sh').includes(13)) { console.error('setup.sh contains CR bytes'); process.exit(1); }"
+          test -s deploy/install.sh
+          bash -n deploy/install.sh
+          node -e "const fs = require('fs'); for (const p of ['packages/mobile-app/dist/setup.sh', 'deploy/install.sh']) { if (fs.readFileSync(p).includes(13)) { console.error(p + ' contains CR bytes'); process.exit(1); } }"
 
       - name: Run end-to-end smoke & security tests
         run: npm run test:smoke

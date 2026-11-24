@@ -26,7 +26,7 @@
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-supported-agents">Supported Agents</a> ·
   <a href="#-security--architecture">Security &amp; Architecture</a> ·
-  <a href="#-self-host-the-relay-docker">Self-Hosting</a> ·
+  <a href="#-one-click-self-hosting-docker">Self-Hosting</a> ·
   <a href="#-developer-guide">Developer Guide</a>
 </p>
 
@@ -103,7 +103,7 @@
 > | :---: | :---: | :---: | :---: | :---: |
 > | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
 >
-> If all codes are claimed, self-host your own relay in minutes with [Docker below](#-self-host-the-relay-docker) or open an Issue to request a fresh code.
+> If all codes are claimed, spin up your own private relay in one minute with [One-Click Self-Hosting](#-one-click-self-hosting-docker) or open an Issue to request a fresh code.
 
 ### Up and Running in 3 Steps
 
@@ -200,9 +200,29 @@ flowchart LR
 
 ---
 
-## 🐳 Self-Host the Relay (Docker)
+## 🐳 One-Click Self-Hosting (Docker)
 
-Deploy a private relay on any Linux VPS in 5 steps (bundled Caddy handles automatic Let's Encrypt HTTPS):
+Deploy your own private zero-knowledge relay on any Linux server (`amd64` / `arm64`) with **one command** — pulls the prebuilt multi-arch `ghcr.io` image automatically with zero local compilation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash
+```
+
+The interactive wizard finishes everything in under a minute:
+- **3 Deployment Modes**: ① Custom Domain + automatic Let's Encrypt HTTPS via Caddy (Recommended) · ② **Bare Public IP + trusted Let's Encrypt IP HTTPS** (no domain required) · ③ Relay Container Only (binds `127.0.0.1:8787` for existing Nginx / Caddy / Cloudflare Tunnel setups).
+- **Secure Defaults**: Automatically generates a 256-bit `JWT_SECRET` (`chmod 600 .env`) with an optional Email 2FA / SMTP wizard (Gmail, QQ Mail, 163 Mail, or custom SMTP).
+- **Ready to Sign Up**: Runs a health check, automatically issues your first single-use admin invite code + clickable registration link, and supports zero-downtime upgrades via `--upgrade`.
+
+```bash
+# Non-interactive examples (great for automation / cloud-init)
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --domain ai.yourdomain.com --yes
+curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --upgrade
+```
+
+After registering your admin account, create or revoke single-use invite codes directly in **Settings → Invite Codes**, and open **`https://your-server/admin`** (or **Settings → Server Monitoring Dashboard**) to inspect online users, bridges, terminals, and live server health on demand (zero background polling overhead).
+
+<details>
+<summary>Manual Docker Compose deployment (or build from source)</summary>
 
 ```bash
 # 1. Clone the repository
@@ -218,16 +238,17 @@ PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
-# 4. Build and start (includes Caddy for automatic HTTPS)
+# 4. Pull the prebuilt ghcr.io image and start (or add --build to compile from source)
 cd deploy
-docker compose --env-file .env up -d --build
+docker compose --env-file .env pull
+docker compose --env-file .env up -d
 
 # 5. Create your first admin invite code
 docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
 docker compose restart allinone-relay
 ```
 
-After registering your admin account, create or revoke single-use invite codes directly in **Settings → Invite Codes**, and open **`https://your-server/admin`** (or **Settings → Server Monitoring Dashboard**) to inspect online users, bridges, terminals, and live server health on demand (zero background polling overhead).
+</details>
 
 <details>
 <summary>Optional: Enable free Email 2FA & self-service password reset (SMTP / Resend)</summary>

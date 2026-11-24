@@ -1,5 +1,6 @@
 services:
   allinone-relay:
+    image: ${ALLINONE_IMAGE:-ghcr.io/rainbowlion0320/allinone-relay:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
