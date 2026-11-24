@@ -1,70 +1,208 @@
-# All in One
+<div align="center">
 
-<p align="center">
+<img src="./packages/mobile-app/public/icon-192.png" width="84" height="84" alt="All in One Logo" />
+
+<h1>All in One</h1>
+
+<p>
+  <strong>End-to-End Encrypted Remote Control for Your Local AI Coding Agents</strong><br/>
+  Unified workspace for <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong>
+</p>
+
+<p>
   <a href="./README.md">中文</a> · <strong>English</strong>
 </p>
 
-<p align="center">
-  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=Download&color=4D6BFE" alt="Download" /></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20PWA-slate.svg" alt="Platform" />
-  <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+<p>
+  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=Release&color=4D6BFE&style=flat-square" alt="Latest Release" /></a>
+  <img src="https://img.shields.io/badge/E2EE-AES--256--GCM-10B981?style=flat-square" alt="E2EE AES-256-GCM" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Android%20%7C%20PWA-334155?style=flat-square" alt="Platform" />
+  <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RainbowLion0320/AllinOne/ci.yml?label=CI&style=flat-square" alt="CI" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-3B82F6?style=flat-square" alt="MIT License" /></a>
 </p>
 
-Continue your local **Codex, Claude Code, Antigravity, and DeepSeek Harness** conversations from your phone or any other computer.
+<p>
+  <a href="#-highlights">Highlights</a> ·
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-supported-agents">Supported Agents</a> ·
+  <a href="#-security--architecture">Security &amp; Architecture</a> ·
+  <a href="#-self-host-the-relay-docker">Self-Hosting</a> ·
+  <a href="#-developer-guide">Developer Guide</a>
+</p>
 
-All in One runs a lightweight relay on your own server and connects directly to each agent's official local interface, reusing your local workspaces, session history, and vendor prompt caches. Sign in with the same account across devices to discover and switch between all of your online computers automatically.
+</div>
 
 ---
 
-## Quick Start
+## Preview
 
-### 1. Install the Client (You Have a Server URL & Invite Code)
+<table>
+  <tr>
+    <td width="72%" align="center" valign="bottom">
+      <img src="./docs/preview-desktop.png" alt="All in One Desktop & Web UI" />
+      <br/>
+      <sub><strong>Desktop / Web</strong> — Unified 4-agent sidebar, border-integrated weekly quota rings, project tree &amp; interactive Q&amp;A cards</sub>
+    </td>
+    <td width="28%" align="center" valign="bottom">
+      <img src="./docs/preview-mobile.png" alt="All in One Mobile UI" />
+      <br/>
+      <sub><strong>Mobile PWA / Android</strong> — Continue chats, inspect code &amp; resolve prompts anywhere</sub>
+    </td>
+  </tr>
+</table>
 
-#### Desktop
+> All in One runs a lightweight zero-knowledge relay on your own server and talks directly to each agent's official local interface, **preserving your local workspaces, session history, and vendor prompt caches**. Sign in with the same account on your phones and computers to discover and switch between all online machines automatically.
 
-1. Download and install from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest):
-   - **macOS (Apple Silicon)**: `All.in.One-*-arm64.dmg`
-   - **Windows (x64)**: `All.in.One.Setup.*.exe`
-2. Open **All in One**, enter your server URL, and register with your invite code or sign in.
-3. Once signed in, the app binds this computer to your account, stays connected in the system tray, and detects your installed AI coding tools (automatically installing missing official CLI companions when a desktop app or session store is already present).
+---
 
-> [!NOTE]
-> **First-launch OS security prompts (community builds are not commercially notarized):**
-> - **macOS**: If Gatekeeper warns that the app cannot be verified or is "damaged", click **Cancel** and allow it in **System Settings → Privacy & Security → Open Anyway**, or run once in Terminal:
->   ```bash
->   xattr -cr "/Applications/All in One.app"
->   ```
-> - **Windows**: If SmartScreen appears, click **More info → Run anyway**.
+## ✨ Highlights
 
-On Linux or headless machines, connect with a single command:
-- macOS / Linux: `curl -fsSL https://your-server/setup.sh | bash`
-- Windows (PowerShell): `irm https://your-server/setup.ps1 | iex`
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>🧩 4 AI Coding Agents, One Interface</h4>
+      <p>Control your local <strong>Codex</strong>, <strong>Claude Code / Desktop</strong>, <strong>Antigravity</strong>, and <strong>DeepSeek Harness</strong> sessions grouped by project or time from a single unified UI.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>🔒 Mandatory Zero-Knowledge E2EE</h4>
+      <p>Every prompt, code reply, attachment, and local image is encrypted end-to-end with <code>AES-256-GCM</code> before reaching the relay; sync new devices via offline QR or <strong>ECDH P-256 + 6-digit SAS</strong>.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>⚡ Interactive Q&amp;A &amp; Bidirectional Sync</h4>
+      <p>Answer agent questions and approvals directly on mobile — including <strong>Codex</strong> async questions &amp; mid-turn <code>turn/steer</code>, plus automatic card dismissal on <strong>DSH</strong> Desktop when answered remotely.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>📊 Live Weekly Subscription Quota Rings</h4>
+      <p>Border-integrated clockwise progress rings in the sidebar show remaining weekly quota and reset times for Codex, Claude, and Antigravity (Gemini) — synced strictly over E2EE.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>📱 Cross-Platform Multi-Machine Control</h4>
+      <p>Native macOS / Windows desktop apps (with embedded tray bridge), one-line Linux CLI setup, iOS / Android PWA, and Android APK — seamlessly switch across all computers under your account.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>🐳 Lightweight Self-Hosting, MIT Open Source</h4>
+      <p>Spin up your own private relay with one <code>docker compose</code> command (automatic HTTPS via Caddy), complete with an on-demand <code>/admin</code> dashboard and zero vendor lock-in.</p>
+    </td>
+  </tr>
+</table>
 
-#### Mobile
+---
 
-| Mobile Web Direct Access (iOS / Android) | Android APK (Always Latest) |
-| :---: | :---: |
-| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="168" height="168" alt="Mobile Web QR Code" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="168" height="168" alt="Android APK Download QR Code" /></a> |
-| [Open Web App](https://123.206.218.214/dsh/) | [Download Latest APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) |
-
-- **iOS / Universal Web**: Scan the QR code or open the web app in your mobile browser and tap **Add to Home Screen** to install as a PWA. Sign in with the same account to access all of your online computers.
-- **Android**: Scan to download and install `All-in-One-Android.apk` (auto hot-updates the web UI), or download from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest).
+## 🚀 Quick Start
 
 > [!TIP]
 > **Public Trial Invite Codes (Single-Use, First-Come First-Served)**
 >
-> Want to try it immediately? Connect to the trial relay `https://123.206.218.214/dsh/` (trusted Let's Encrypt HTTPS + mandatory zero-knowledge AES-256-GCM E2EE — the relay server cannot read any of your chats, code, or files) and register with any of the codes below:
+> Want to try All in One right now? Connect to the trial relay **`https://123.206.218.214/dsh/`** (trusted Let's Encrypt HTTPS + mandatory zero-knowledge `AES-256-GCM` E2EE — the relay server cannot read any of your chats, code, or files) and register with any code below:
 >
-> `INV-KXRR-6BNB` · `INV-DCMM-3WFY` · `INV-AFCC-SX2F` · `INV-NUER-YGDK` · `INV-3HXE-UGEK`
+> | Code 1 | Code 2 | Code 3 | Code 4 | Code 5 |
+> | :---: | :---: | :---: | :---: | :---: |
+> | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
 >
-> If all codes are claimed, self-host your own relay in minutes with Docker below or open an Issue to request a fresh code.
+> If all codes are claimed, self-host your own relay in minutes with [Docker below](#-self-host-the-relay-docker) or open an Issue to request a fresh code.
+
+### Up and Running in 3 Steps
+
+1. **Install on Your Computer**: Download the Desktop app (or run the one-line CLI script), enter your server URL, and register / sign in to bind your machine and keep the tray bridge online.
+2. **Open on Your Phone**: Scan the QR code to open the Mobile Web app (iOS: **Add to Home Screen**) or install the Android APK, then sign in with the **same account**.
+3. **Sync Your E2EE Key**: On a new phone, scan the offline QR code on your computer or verify the **6-digit security code (SAS)** to transfer your 256-bit room key with zero server visibility.
+
+### Desktop Download
+
+Download from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest):
+
+- **macOS (Apple Silicon)**: `All.in.One-*-arm64.dmg`
+- **Windows (x64)**: `All.in.One.Setup.*.exe`
+
+After signing in, the app automatically detects installed AI coding tools (and installs missing official CLI companions when a desktop app or session store is already present; set `ALLINONE_NO_AUTOFIX=1` to disable).
+
+<details>
+<summary>First-launch macOS / Windows OS prompts (community builds are not commercially notarized)</summary>
+
+- **macOS**: If Gatekeeper warns that the app cannot be verified or is "damaged", click **Cancel** and allow it in **System Settings → Privacy & Security → Open Anyway**, or run once in Terminal:
+  ```bash
+  xattr -cr "/Applications/All in One.app"
+  ```
+- **Windows**: If SmartScreen appears, click **More info → Run anyway**.
+
+</details>
+
+On Linux or headless machines, connect with a single command:
+
+```bash
+# macOS / Linux
+curl -fsSL https://your-server/setup.sh | bash
+
+# Windows (PowerShell)
+irm https://your-server/setup.ps1 | iex
+```
+
+### Mobile Quick Access
+
+| Mobile Web Direct Access (iOS / Android) | Android APK (Always Latest) |
+| :---: | :---: |
+| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="164" height="164" alt="Mobile Web QR Code" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="164" height="164" alt="Android APK Download QR Code" /></a> |
+| [Open Web App](https://123.206.218.214/dsh/) · iOS: Tap **Add to Home Screen** | [Download Latest APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · Auto hot-updates UI |
 
 ---
 
-### 2. Self-Host the Relay Server (Docker)
+## 🤖 Supported Agents
 
-Deploy the relay on your own Linux server:
+| Agent | Local Integration | Capabilities | Highlights & Notes |
+| :--- | :--- | :--- | :--- |
+| **Codex** | `codex app-server --stdio` | Read/write sessions, model & reasoning switching, async Q&A, mid-turn `turn/steer`, interrupt | Auto-discovers `PATH`, macOS `ChatGPT.app`, and newest Windows Codex Desktop CLI; weekly quota ring supported |
+| **Claude Code / Desktop** | `claude -p --resume --output-format stream-json` | Read/write `~/.claude/projects/` sessions, model switching, interrupt, Cowork/Code mirror | Reuses local login; Claude Desktop Cowork threads sync live with a `Desktop` badge; weekly quota ring supported |
+| **Antigravity** | `agy acp --app-data-dir antigravity` | Shared desktop history & auth, model & effort switching, background task sync | Live Desktop sync + Gemini weekly quota ring; after sending remote turns to an already-open Desktop thread, restart `Antigravity.app` before resuming natively |
+| **DeepSeek Harness** | Auto-installed loopback IPC (`allinone-dsh-ipc`) / native plugin (`dsh-mobile-hub`) | Read/write, model switching, bidirectional prompt sync; read-only history fallback when DSH is closed | Zero-terminal auto-install when `~/.dsh/profiles/desktop` is detected (`127.0.0.1` + 256-bit token); answering remotely dismisses DSH Desktop prompt cards automatically |
+
+---
+
+## 🛡️ Security & Architecture
+
+All in One is built around **6 layers of zero-knowledge defense-in-depth** — even a compromised or third-party-hosted relay cannot inspect or tamper with your conversations, source code, or local files:
+
+| Layer | Mechanism | Guarantee |
+| :--- | :--- | :--- |
+| **1. Mandatory E2EE** | `AES-256-GCM` + 256-bit room key + AAD bound to room & message type | All chats, tool calls, attachments, local images & quotas are encrypted client-side; bridges reject plaintext RPCs with anti-replay IV tracking |
+| **2. Zero-Knowledge Blind Relay** | Relay holds zero encryption keys; temporary encrypted uploads burn on fetch | The server only routes opaque ciphertext — no plaintext in memory, disk, or logs |
+| **3. Zero-Knowledge Device Grant** | Offline QR scan **or** `ECDH P-256` + `HKDF-SHA256` + **6-digit SAS** | Remote key sync derives an independent 6-digit verification code on both devices to prevent MITM attacks |
+| **4. Zero Open Inbound Ports** | PC bridges initiate **outbound WSS** only | No router port forwarding, no public SSH/daemon exposure on your home or office machine |
+| **5. OS Hardware Key Storage** | macOS Keychain / Windows DPAPI (Electron `safeStorage`) | 256-bit E2EE keys are encrypted by your OS credential vault instead of plaintext files |
+| **6. Account & Device Governance** | Single-use invites + optional Email 2FA + one-time WS tickets + live device kick | Strict per-account room isolation; revoke any lost device in real time (verified by 30 automated smoke & security tests) |
+
+### Architecture
+
+```mermaid
+flowchart LR
+  subgraph Clients["Clients (Same Account · Holds 256-bit E2EE Key)"]
+    M["Mobile PWA / Android APK"]
+    D["All in One Desktop<br/>(Electron UI + Embedded Tray Bridge)"]
+  end
+
+  subgraph Server["Relay Server (HTTPS / WSS · Zero-Knowledge Blind Forwarding)"]
+    R["@allinone/relay-server<br/>Accounts & Invites · Tenant Isolation · Ciphertext Router"]
+  end
+
+  subgraph PCs["Your Computers (Outbound WSS Only · Zero Open Ports)"]
+    B1["macOS / Windows / Linux Bridge"]
+    A1["Codex · Claude · Antigravity · DSH"]
+    B1 <-->|"Local Official Interface"| A1
+  end
+
+  M <-->|"TLS + AES-256-GCM Ciphertext"| R
+  D <-->|"TLS + AES-256-GCM Ciphertext"| R
+  R <-->|"Outbound WSS + Ciphertext"| B1
+```
+
+---
+
+## 🐳 Self-Host the Relay (Docker)
+
+Deploy a private relay on any Linux VPS in 5 steps (bundled Caddy handles automatic Let's Encrypt HTTPS):
 
 ```bash
 # 1. Clone the repository
@@ -73,7 +211,7 @@ cd AllinOne
 
 # 2. Replace ai.yourdomain.com in deploy/Caddyfile with your domain (DNS pointed to this server)
 
-# 3. Create deploy/.env with strong random secrets
+# 3. Create deploy/.env with strong random secrets (32+ chars)
 cat > deploy/.env <<'EOF'
 JWT_SECRET=replace-with-32-plus-char-random-secret
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
@@ -89,12 +227,12 @@ docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite cr
 docker compose restart allinone-relay
 ```
 
-Then follow **1. Install the Client** above to register your admin account. Additional single-use invite codes can be created and revoked directly inside the app UI, and admins can visit **`https://your-server/admin`** (or open **Settings → Server Monitoring Dashboard** in the app) to inspect online users, computer bridges, connected terminals, and a live server resource snapshot on demand (zero extra processes or background polling overhead).
+After registering your admin account, create or revoke single-use invite codes directly in **Settings → Invite Codes**, and open **`https://your-server/admin`** (or **Settings → Server Monitoring Dashboard**) to inspect online users, bridges, terminals, and live server health on demand (zero background polling overhead).
 
 <details>
-<summary>Optional: Enable free email binding & self-service password reset (SMTP / Resend)</summary>
+<summary>Optional: Enable free Email 2FA & self-service password reset (SMTP / Resend)</summary>
 
-Add any standard SMTP credentials (such as Gmail, QQ Mail, or 163 Mail on TLS port 465) to `deploy/.env` and restart the relay to enable optional email binding during signup, email login, post-login email binding, and forgot-password reset:
+Add any standard SMTP credentials (Gmail, QQ Mail, 163 Mail on TLS port 465) to `deploy/.env` and restart the relay to enable email binding, login email 2FA verification, email changes, and forgot-password reset:
 
 ```env
 SMTP_HOST=smtp.gmail.com
@@ -123,49 +261,7 @@ npm run admin -- users
 
 ---
 
-## Supported Agents
-
-| Agent | Integration | Capabilities | Notes |
-| :--- | :--- | :--- | :--- |
-| **Codex** | `codex app-server --stdio` | Read/write sessions, model & reasoning switching, interrupt | Auto-discovers PATH & macOS `ChatGPT.app` bundled CLI |
-| **Claude Code** | `claude -p --resume --output-format stream-json` | Read/write `~/.claude/projects/` sessions, model switching, interrupt | Reuses local login |
-| **Antigravity** | `agy acp --app-data-dir antigravity` | Shared desktop history & auth, model & effort switching, background tasks | Syncs Desktop updates live to All in One; after sending turns remotely to an already-open Desktop thread, restart `Antigravity.app` before resuming that thread natively |
-| **DeepSeek Harness** | Auto-installed local IPC plugin (`allinone-dsh-ipc`) / native plugin (`dsh-mobile-hub`) | Out-of-the-box read/write & model switching while DSH Desktop is running; read-only history fallback when DSH is closed | Zero-terminal auto-install when `~/.dsh/profiles/desktop` is detected (set `ALLINONE_NO_AUTOFIX=1` to disable) |
-
-- **Multi-Device Control**: Sign in with the same account on phones and desktops to operate any of your online computers.
-- **Zero-Knowledge End-to-End Encryption (E2EE)**: Each desktop bridge automatically generates a random 256-bit key (stored in OS Keychain / DPAPI). All prompts, streaming replies, attachments, and local image previews are encrypted with `AES-256-GCM` end-to-end so the relay server only forwards opaque ciphertext; sync new phones via offline QR scan.
-- **Single-Use Invites**: Issue `INV-XXXX-XXXX` codes on demand with strict per-account isolation.
-- **Native Sessions**: Uses each agent's local storage and official protocol directly so context and prompt caches carry over seamlessly.
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-  subgraph Clients["Clients (Same Account)"]
-    M["Mobile PWA / Capacitor"]
-    D["All in One Desktop<br/>(Electron UI + Embedded Tray Bridge)"]
-  end
-
-  subgraph Server["Self-Hosted Relay (HTTPS / WSS)"]
-    R["@allinone/relay-server<br/>Accounts & Invites · Multi-Tenant Isolation · Attachment Relay"]
-  end
-
-  subgraph PCs["Your Computers (Outbound WSS)"]
-    B1["macOS / Windows / Linux Bridge"]
-    A1["Codex / Claude Code / Antigravity / DSH"]
-    B1 <--> A1
-  end
-
-  M <-->|"HTTPS / WSS"| R
-  D <-->|"HTTPS / WSS"| R
-  R <-->|"Outbound WSS"| B1
-```
-
----
-
-## Developer Guide
+## 🛠️ Developer Guide
 
 > Building from source requires **Node.js >= 22.13.0**.
 
@@ -203,7 +299,7 @@ You can also run **Actions → Build Desktop Installers → Run workflow** on yo
 </details>
 
 <details>
-<summary>3. Capacitor Android shell, DeepSeek Harness plugin & environment variables</summary>
+<summary>3. Capacitor Android shell, DeepSeek Harness plugin &amp; environment variables</summary>
 
 - **Capacitor Android shell**: Update `server.url` in `packages/mobile-app/capacitor.config.json` to your HTTPS URL, then run:
   ```bash
@@ -219,22 +315,23 @@ You can also run **Actions → Build Desktop Installers → Run workflow** on yo
 </details>
 
 <details>
-<summary>4. Repository layout & smoke tests</summary>
+<summary>4. Repository layout &amp; automated security smoke tests</summary>
 
 ```text
 AllinOne/
 ├── packages/
-│   ├── shared/          # Shared protocol, E2EE & offline QR SVG (protocol.js, e2ee.js, qr-svg.js)
-│   ├── relay-server/    # Relay gateway, account/invite store, /admin dashboard & static hosting
-│   ├── dsh-mobile-hub/  # 4 AI agent adapters, CLI auto-completion & portable bridge CLI
+│   ├── shared/          # Shared protocol, AES-256-GCM / ECDH E2EE & offline QR SVG
+│   ├── relay-server/    # Blind relay gateway, accounts/invites, email 2FA, /admin & static hosting
+│   ├── dsh-mobile-hub/  # 4 AI agent adapters, weekly quota collector, CLI autofix & portable bridge
 │   ├── mobile-app/      # React + Tailwind + Vite PWA frontend
-│   └── desktop-app/     # Electron desktop app & DMG/NSIS installer packaging
+│   └── desktop-app/     # Electron desktop app, OS keychain storage & DMG/NSIS packaging
 ├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
-├── scripts/             # Portable bridge bundler & end-to-end smoke test suite
-└── .github/workflows/   # CI checks & desktop release workflows
+├── scripts/             # Portable bridge bundler & 30-step E2E smoke + security test suite
+└── .github/workflows/   # CI checks & multi-platform release workflows
 ```
 
-Run end-to-end smoke & security tests:
+Run the full end-to-end smoke & security test suite:
+
 ```bash
 npm run test:smoke
 ```
@@ -243,11 +340,8 @@ npm run test:smoke
 
 ---
 
-## Security, Contributing & License
+## 📄 Security, Contributing & License
 
-Please review [SECURITY.md](./SECURITY.md) before deploying:
-
-- **Self-Host Over HTTPS/WSS**: Traffic uses TLS and the relay routes messages and temporary attachments, so connect only to a server you control.
-- **Permissions**: Adapters default to autonomous approval/edit presets for remote usability; see [SECURITY.md](./SECURITY.md) to tighten them.
-- **Notice**: Independent open-source project; affiliated with none of DeepSeek, OpenAI, Anthropic, or Google.
-- **Contributing & License**: See [CONTRIBUTING.md](./CONTRIBUTING.md) · Licensed under [MIT](./LICENSE).
+- **Security**: Please review [SECURITY.md](./SECURITY.md) before deploying. Adapters default to autonomous approval/edit presets for remote usability and can be tightened per [SECURITY.md](./SECURITY.md); connect only to a trusted HTTPS/WSS relay.
+- **Notice**: Independent open-source project; not affiliated with DeepSeek, OpenAI, Anthropic, or Google.
+- **Contributing & License**: Contributions welcome via Issues & PRs ([CONTRIBUTING.md](./CONTRIBUTING.md)) · Licensed under [MIT](./LICENSE).

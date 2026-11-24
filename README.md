@@ -1,86 +1,224 @@
-# All in One
+<div align="center">
 
-<p align="center">
+<img src="./packages/mobile-app/public/icon-192.png" width="84" height="84" alt="All in One Logo" />
+
+<h1>All in One</h1>
+
+<p>
+  <strong>在手机或任意电脑上，端到端加密远程续聊你本机的 AI 编程对话</strong><br/>
+  统一接入 <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong>
+</p>
+
+<p>
   <strong>中文</strong> · <a href="./README_EN.md">English</a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=%E4%B8%8B%E8%BD%BD&color=4D6BFE" alt="Download" /></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20PWA-slate.svg" alt="Platform" />
-  <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+<p>
+  <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest"><img src="https://img.shields.io/github/v/release/RainbowLion0320/AllinOne?display_name=tag&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=4D6BFE&style=flat-square" alt="Latest Release" /></a>
+  <img src="https://img.shields.io/badge/E2EE-AES--256--GCM-10B981?style=flat-square" alt="E2EE AES-256-GCM" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Android%20%7C%20PWA-334155?style=flat-square" alt="Platform" />
+  <a href="https://github.com/RainbowLion0320/AllinOne/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RainbowLion0320/AllinOne/ci.yml?label=CI&style=flat-square" alt="CI" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-3B82F6?style=flat-square" alt="MIT License" /></a>
 </p>
 
-在手机和其他电脑上，远程续聊你本机的 **Codex / Claude Code / Antigravity / DeepSeek Harness** 对话。
+<p>
+  <a href="#-核心亮点">核心亮点</a> ·
+  <a href="#-快速开始">快速开始</a> ·
+  <a href="#-支持的工具与能力">支持工具</a> ·
+  <a href="#-安全与架构">安全与架构</a> ·
+  <a href="#-自建中转服务器docker">自建部署</a> ·
+  <a href="#-开发者指南">开发者指南</a>
+</p>
 
-它在你自己的服务器上运行一个轻量中转，直接调用各 AI 工具的本地官方接口，延续本机项目工作区、历史会话与 Prompt Cache。用同一账号在多台设备登录后，自动发现并随时切换操控。
+</div>
 
 ---
 
-## 快速开始
+## 界面预览
 
-### 1. 安装客户端（已有服务器地址和邀请码）
+<table>
+  <tr>
+    <td width="72%" align="center" valign="bottom">
+      <img src="./docs/preview-desktop.png" alt="All in One 桌面端与网页端界面" />
+      <br/>
+      <sub><strong>桌面端 / Web</strong> — 四大工具聚合侧边栏、边框集成周额度环、项目分组与交互式问答卡片</sub>
+    </td>
+    <td width="28%" align="center" valign="bottom">
+      <img src="./docs/preview-mobile.png" alt="All in One 手机端界面" />
+      <br/>
+      <sub><strong>手机端 PWA / Android</strong> — 随时续聊、代码高亮与远程交互审批</sub>
+    </td>
+  </tr>
+</table>
 
-#### 电脑端
+> All in One 在你自己的服务器上运行一个轻量盲中转，直接调用本机各 AI 工具的官方接口，**100% 延续原有项目工作区、本地历史会话与官方 Prompt Cache**。同一账号登录多台电脑与手机后，自动发现并随时切换操控。
 
-1. 前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载并安装：
-   - **macOS (Apple Silicon)**：`All.in.One-*-arm64.dmg`
-   - **Windows (x64)**：`All.in.One.Setup.*.exe`
-2. 打开 **All in One**，填入服务器地址，用邀请码注册或直接登录。
-3. 登录后会自动把这台电脑绑定到你的账号、在系统托盘保持后台连接，并识别本机已有的 AI 编程工具（若已装桌面端但缺对应 CLI，后台会自动补齐）。
+---
 
-> [!NOTE]
-> **首次打开系统拦截提醒（开源安装包未购商业公证证书）：**
-> - **macOS**：安装后首次打开若提示「无法验证」或「已损坏，无法打开」，请先点「取消」，在「系统设置 → 隐私与安全性」点「仍要打开」；若仍提示已损坏，在终端运行一次：
->   ```bash
->   xattr -cr "/Applications/All in One.app"
->   ```
-> - **Windows**：若弹出 SmartScreen「Windows 已保护你的电脑」，点击「更多信息 → 仍要运行」即可。
+## ✨ 核心亮点
 
-Linux 或纯终端环境可直接运行一行命令接入：
-- macOS / Linux：`curl -fsSL https://你的服务器/setup.sh | bash`
-- Windows (PowerShell)：`irm https://你的服务器/setup.ps1 | iex`
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>🧩 四大 AI 编程工具一站聚合</h4>
+      <p>统一管理本机的 <strong>Codex</strong>、<strong>Claude Code / Desktop</strong>、<strong>Antigravity</strong> 与 <strong>DeepSeek Harness</strong>，按项目或时间分组，一个入口续聊所有对话。</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>🔒 强制零知识端到端加密（E2EE）</h4>
+      <p>所有对话、代码、附件与图片均经 <code>AES-256-GCM</code> 端到端加密后由中转盲转发；支持离线二维码扫码与 <strong>ECDH P-256 + 6 位安全码</strong>免扫码授权。</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>⚡ 交互式问答卡片与双向同步</h4>
+      <p>手机端原生渲染工具提问与审批卡片，支持 <strong>Codex</strong> 异步问答与运行中转向（<code>turn/steer</code>），以及 <strong>DSH</strong> 桌面端回答后双向静默消卡。</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>📊 订阅周额度一眼掌握</h4>
+      <p>侧边栏图标边框集成顺时针进度环，实时展示 Codex / Claude / Antigravity（Gemini）剩余周额度与重置时间（全程经 E2EE 密文传输）。</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>📱 全平台多设备无缝切换</h4>
+      <p>提供 macOS / Windows 桌面端（内置托盘后台桥接）、Linux 一行接入脚本、iOS / Android 网页 PWA 与 Android 原生壳 APK，自动发现名下所有在线电脑。</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>🐳 轻量自建，零厂商锁定</h4>
+      <p>单条 <code>docker compose</code> 命令即可在自有 VPS 启动（内置 Caddy 自动 HTTPS），附带零额外负载的 <code>/admin</code> 实时监控看板，MIT 协议完全开源可审计。</p>
+    </td>
+  </tr>
+</table>
 
-#### 手机端
+---
 
-| 手机端网页直连（iOS / Android 通用） | Android 客户端 APK（永久最新） |
-| :---: | :---: |
-| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="168" height="168" alt="手机端网页直连二维码" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="168" height="168" alt="Android APK 下载二维码" /></a> |
-| [直接打开网页端](https://123.206.218.214/dsh/) | [直接下载最新 APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) |
-
-- **iOS / 通用网页**：手机扫码或直接打开网页端，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
-- **Android**：手机扫码下载安装 `All-in-One-Android.apk`（自动热更新最新界面），也可前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载。
+## 🚀 快速开始
 
 > [!TIP]
 > **公开体验邀请码（一码一人，先到先得）**
 >
-> 想直接试用可填入体验服务器 `https://123.206.218.214/dsh/`（正规 Let's Encrypt HTTPS + 强制零知识 AES-256-GCM 端到端加密，中转服务器无法查看你的任何对话、代码与文件），任选以下一个邀请码注册体验：
+> 想先直接体验？打开下方网页端或客户端，服务器地址填入 **`https://123.206.218.214/dsh/`**（正规 Let's Encrypt HTTPS + 强制零知识 `AES-256-GCM` 端到端加密，中转服务器无法查看你的任何对话、代码与文件），任选以下一个邀请码注册即可：
 >
-> `INV-KXRR-6BNB` · `INV-DCMM-3WFY` · `INV-AFCC-SX2F` · `INV-NUER-YGDK` · `INV-3HXE-UGEK`
+> | 邀请码 1 | 邀请码 2 | 邀请码 3 | 邀请码 4 | 邀请码 5 |
+> | :---: | :---: | :---: | :---: | :---: |
+> | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
 >
-> 如已用完可按下方 Docker 教程一键自建，或提交 Issue 留言获取新码。
+> 如已被领完，可按下方 [Docker 自建教程](#-自建中转服务器docker) 几分钟部署私有中转，或提 Issue 留言获取新码。
+
+### 3 步完成首次连接
+
+1. **电脑端安装登录**：在需要被远程操控的电脑上安装桌面端（或运行终端一行脚本），填入服务器地址并用邀请码注册 / 登录，自动绑定电脑并在托盘常驻。
+2. **手机端打开登录**：扫码打开网页端（iOS 可「添加到主屏幕」）或安装 Android APK，登录**同一账号**即可看到名下所有在线电脑。
+3. **同步 E2EE 密钥**：首次使用新手机时，扫描电脑端离线二维码或核对 **6 位安全码**完成零知识密钥授权，立即开始加密续聊。
+
+### 电脑端下载
+
+前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载对应安装包：
+
+- **macOS (Apple Silicon)**：`All.in.One-*-arm64.dmg`
+- **Windows (x64)**：`All.in.One.Setup.*.exe`
+
+登录后会自动识别本机已有的 AI 编程工具（若已装桌面端但缺少对应官方 CLI，后台会自动补齐；设 `ALLINONE_NO_AUTOFIX=1` 可关闭）。
+
+<details>
+<summary>首次打开 macOS / Windows 系统拦截提醒（开源安装包未购商业公证证书）</summary>
+
+- **macOS**：首次打开若提示「无法验证」或「已损坏，无法打开」，请先点「取消」，前往「系统设置 → 隐私与安全性」点击「仍要打开」；若仍提示已损坏，在终端运行一次：
+  ```bash
+  xattr -cr "/Applications/All in One.app"
+  ```
+- **Windows**：若弹出 SmartScreen「Windows 已保护你的电脑」，点击「**更多信息 → 仍要运行**」即可。
+
+</details>
+
+Linux 或纯终端环境可直接运行一行命令接入：
+
+```bash
+# macOS / Linux
+curl -fsSL https://你的服务器/setup.sh | bash
+
+# Windows (PowerShell)
+irm https://你的服务器/setup.ps1 | iex
+```
+
+### 手机端扫码直连
+
+| 手机端网页直连（iOS / Android 通用） | Android 客户端 APK（永久最新） |
+| :---: | :---: |
+| <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="164" height="164" alt="手机端网页直连二维码" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="164" height="164" alt="Android APK 下载二维码" /></a> |
+| [直接打开网页端](https://123.206.218.214/dsh/) · iOS 推荐「添加到主屏幕」 | [直接下载最新 APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · 自动热更新界面 |
 
 ---
 
-### 2. 自建中转服务器（Docker）
+## 🤖 支持的工具与能力
 
-All in One 部署在你自己的 Linux 服务器上：
+| 工具 | 本地接入方式 | 核心能力 | 亮点与说明 |
+| :--- | :--- | :--- | :--- |
+| **Codex** | `codex app-server --stdio` | 读写会话、切模型与推理强度、异步问答、运行中转向（`turn/steer`）、中断 | 自动探测 `PATH`、macOS `ChatGPT.app` 及 Windows Codex Desktop 最新内置 CLI；支持周额度环形展示 |
+| **Claude Code / Desktop** | `claude -p --resume --output-format stream-json` | 读写 `~/.claude/projects/` 会话、切模型、中断、Cowork/Code 桌面端镜像 | 自动复用本地登录态；桌面端 Cowork 会话附带 `Desktop` 徽章实时同步；支持周额度展示 |
+| **Antigravity** | `agy acp --app-data-dir antigravity` | 共享桌面端历史与登录态、切模型与档位、后台任务同步 | 桌面端进度自动同步；支持 Gemini 周额度环形展示；远程续写同一会话后，切回原生桌面端前请先重启一次 `Antigravity.app` |
+| **DeepSeek Harness** | 自动安装本地环回 IPC (`allinone-dsh-ipc`) / 原生插件 (`dsh-mobile-hub`) | 读写会话、切模型、交互问答双向同步；未运行时自动降级为只读历史 | 检测到 `~/.dsh/profiles/desktop` 时零终端自动安装本地环回 IPC（`127.0.0.1` + 256-bit Token）；手机端回答后桌面端卡片自动静默关闭 |
+
+---
+
+## 🛡️ 安全与架构
+
+All in One 从协议层设计为 **六道零知识纵深防御**，即使中转服务器被攻破或由他人托管，也无法窥探或篡改你的对话、源码与本地文件：
+
+| 防线 | 核心机制 | 安全保障 |
+| :--- | :--- | :--- |
+| **1. 强制端到端加密** | `AES-256-GCM` + 256-bit 房间密钥 + AAD 绑定房间与消息类型 | 所有对话、工具调用、附件、本地图片与额度均在端侧加解密；桥接端强制拒绝明文 RPC，防重放窗口 + 随机 IV |
+| **2. 零知识盲中转** | 中转服务器不持有任何房间密钥，临时加密附件下载即焚 | 中转仅负责路由不透明密文；服务端日志与内存均无明文内容 |
+| **3. 零知识设备授权** | 离线二维码扫码 **或** `ECDH P-256` + `HKDF-SHA256` + **6 位安全码（SAS）** | 异地免扫码同步密钥时，双方独立派生 6 位安全码防中间人攻击，中转全程盲转发 |
+| **4. 零公网开端口** | 电脑桥接仅发起**出站 WSS** 连接，拒绝公网直连本机 | 无需配置路由器端口转发或内网穿透，本机零暴露公网端口 |
+| **5. 本机硬件级密钥保护** | macOS Keychain / Windows DPAPI（Electron `safeStorage`） | 256-bit 密钥加密存储于系统保险库，不以明文落盘 |
+| **6. 账号与设备治理** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + 实时设备踢下线 | 账号间严格多租户房间隔离，支持在客户端随时踢出异常终端并使旧 Token 立即失效（30 项自动化安全与冒烟测试持续覆盖） |
+
+### 架构概览
+
+```mermaid
+flowchart LR
+  subgraph Clients["客户端（同一账号 · 持有 256-bit E2EE 密钥）"]
+    M["手机端 PWA / Android APK"]
+    D["All in One 桌面端<br/>(Electron UI + 内置托盘桥接)"]
+  end
+
+  subgraph Server["中转服务器 (HTTPS / WSS · 零知识盲转发)"]
+    R["@allinone/relay-server<br/>账号邀请码 · 多租户隔离 · 密文路由"]
+  end
+
+  subgraph PCs["名下电脑 (仅出站 WSS · 零开端口)"]
+    B1["macOS / Windows / Linux 桥接器"]
+    A1["Codex · Claude · Antigravity · DSH"]
+    B1 <-->|"本地官方接口"| A1
+  end
+
+  M <-->|"TLS + AES-256-GCM 密文"| R
+  D <-->|"TLS + AES-256-GCM 密文"| R
+  R <-->|"出站 WSS + 密文"| B1
+```
+
+---
+
+## 🐳 自建中转服务器（Docker）
+
+只需一台带公网 IP 的 Linux 服务器，5 步即可拥有完全私有可控的中转服务（内置 Caddy 自动签发 Let's Encrypt HTTPS 证书）：
 
 ```bash
 # 1. 拉取代码
 git clone https://github.com/RainbowLion0320/AllinOne.git
 cd AllinOne
 
-# 2. 把 deploy/Caddyfile 中的 ai.yourdomain.com 改为你的域名（DNS 已指向本机）
+# 2. 将 deploy/Caddyfile 中的 ai.yourdomain.com 改为你的域名（DNS 已指向本机）
 
-# 3. 创建 deploy/.env，填入你的随机密钥
+# 3. 创建 deploy/.env，填入 32 位以上随机密钥
 cat > deploy/.env <<'EOF'
 JWT_SECRET=替换成32位以上随机串
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
 EOF
 
-# 4. 构建并启动（内置 Caddy 自动签发 HTTPS 证书）
+# 4. 构建并启动（Caddy 自动申请 HTTPS）
 cd deploy
 docker compose --env-file .env up -d --build
 
@@ -89,12 +227,12 @@ docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite cr
 docker compose restart allinone-relay
 ```
 
-接着按上面的 **「1. 安装客户端」** 注册你的管理员账号。之后可以直接在客户端的「邀请码管理」里随时生成和作废一次性邀请码，或访问 **`https://你的服务器/admin`**（也可在客户端「设置 → 服务器监控看板」直达）按需查看全服用户在线状态、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询消耗）。
+完成注册后，管理员可直接在客户端「**邀请码管理**」中随时签发或作废一次性邀请码，并可通过 **`https://你的服务器/admin`**（或客户端「**设置 → 服务器监控看板**」）按需查看在线用户、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询开销）。
 
 <details>
-<summary>可选：开启免费邮箱绑定与自助找回密码（QQ / 163 / Gmail SMTP）</summary>
+<summary>可选：开启免费邮箱 2FA 验证与自助找回密码（QQ / 163 / Gmail SMTP 或 Resend）</summary>
 
-在 `deploy/.env`（或 `packages/relay-server/.env`）中补充任意免费邮箱的 SMTP 授权码并重启中转服务，即可开启注册选填邮箱、邮箱登录、账号补绑/换绑邮箱及「忘记密码」重置：
+在 `deploy/.env`（或 `packages/relay-server/.env`）中添加任意标准 SMTP 授权码并重启中转服务，即可开启注册绑定邮箱、登录邮箱 2FA 验证、账号换绑邮箱与「忘记密码」自助重置：
 
 ```env
 SMTP_HOST=smtp.qq.com
@@ -110,7 +248,7 @@ SMTP_FROM=All in One <你的邮箱@qq.com>
 </details>
 
 <details>
-<summary>常用管理命令</summary>
+<summary>常用管理员 CLI 命令</summary>
 
 ```bash
 npm run admin -- invite create --count 3 --note "给朋友"
@@ -123,49 +261,7 @@ npm run admin -- users
 
 ---
 
-## 支持的工具与能力
-
-| 工具 | 接入方式 | 支持能力 | 说明 |
-| :--- | :--- | :--- | :--- |
-| **Codex** | `codex app-server --stdio` | 读写会话、切模型与推理强度、中断 | 自动探测 PATH 及 macOS `ChatGPT.app` 内置 CLI |
-| **Claude Code** | `claude -p --resume --output-format stream-json` | 读写 `~/.claude/projects/` 会话、切模型、中断 | 自动复用本地登录态 |
-| **Antigravity** | `agy acp --app-data-dir antigravity` | 共享桌面端历史与登录态、切模型与档位、后台任务同步 | 桌面端进度自动同步到 All in One；远程改写同一对话后，切回原生 `Antigravity.app` 续聊前请先重启一次桌面端 |
-| **DeepSeek Harness** | 自动安装本地 IPC 插件 (`allinone-dsh-ipc`) / 原生插件 (`dsh-mobile-hub`) | DSH 桌面端运行时开箱即用读写与切模型；DSH 未运行时自动降级为只读历史 | 检测到 `~/.dsh/profiles/desktop` 时零终端自动安装本地环回 IPC 插件（设 `ALLINONE_NO_AUTOFIX=1` 可关闭） |
-
-- **跨设备互联**：手机和电脑登录同一账号即可互控名下所有在线电脑，随时切换。
-- **零知识端到端加密（E2EE）**：电脑端自动生成随机 256-bit 密钥（存于系统钥匙串 / DPAPI），所有对话、代码、附件与本地图片均经 `AES-256-GCM` 端到端加密后通过中转服务器盲转发；新手机通过本地离线二维码扫码同步密钥，中转服务器无法查看或伪造任何内容。
-- **一次性邀请码**：管理员按需签发 `INV-XXXX-XXXX` 邀请码，一码一人，账号间数据与设备完全隔离。
-- **直连原生会话**：直接通过各工具官方接口读写本地数据，延续原有的对话上下文与 Prompt Cache。
-
----
-
-## 架构概览
-
-```mermaid
-flowchart LR
-  subgraph Clients["客户端（同一账号）"]
-    M["手机端 PWA / Capacitor"]
-    D["All in One 桌面端<br/>(Electron UI + 内置托盘桥接)"]
-  end
-
-  subgraph Server["自建中转服务器 (HTTPS / WSS)"]
-    R["@allinone/relay-server<br/>账号与邀请码 · 多租户隔离 · 附件中转"]
-  end
-
-  subgraph PCs["名下电脑 (出站 WSS)"]
-    B1["Mac / Windows / Linux 桥接器"]
-    A1["Codex / Claude Code / Antigravity / DSH"]
-    B1 <--> A1
-  end
-
-  M <-->|"HTTPS / WSS"| R
-  D <-->|"HTTPS / WSS"| R
-  R <-->|"出站 WSS"| B1
-```
-
----
-
-## 开发者指南
+## 🛠️ 开发者指南
 
 > 源码运行与打包需要 **Node.js >= 22.13.0**。
 
@@ -206,7 +302,7 @@ npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运
 </details>
 
 <details>
-<summary>3. Capacitor 手机壳、DeepSeek Harness 插件与环境变量</summary>
+<summary>3. Capacitor Android 手机壳、DeepSeek Harness 插件与环境变量</summary>
 
 - **Capacitor Android 手机壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的 HTTPS 地址后执行：
   ```bash
@@ -222,22 +318,23 @@ npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运
 </details>
 
 <details>
-<summary>4. 目录结构与冒烟测试</summary>
+<summary>4. 目录结构与自动化安全冒烟测试</summary>
 
 ```text
 AllinOne/
 ├── packages/
-│   ├── shared/          # 共享协议、端到端加密与离线二维码（protocol.js、e2ee.js、qr-svg.js）
-│   ├── relay-server/    # 中转网关、账号邀请码与静态托管
-│   ├── dsh-mobile-hub/  # 4 大 AI 适配器、环境补齐与单文件桥接 CLI
-│   ├── mobile-app/      # React + Tailwind + PWA 前端
-│   └── desktop-app/     # Electron 桌面客户端与安装包构建
+│   ├── shared/          # 共享协议、AES-256-GCM / ECDH 端到端加密与离线二维码
+│   ├── relay-server/    # 盲中转网关、账号邀请码、邮箱 2FA、/admin 看板与静态托管
+│   ├── dsh-mobile-hub/  # 4 大 AI 适配器、周额度采集、环境补齐与单文件桥接 CLI
+│   ├── mobile-app/      # React + Tailwind + Vite + PWA 前端
+│   └── desktop-app/     # Electron 桌面客户端、安全存储与安装包构建
 ├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
-├── scripts/             # 桥接打包器与端到端冒烟测试
-└── .github/workflows/   # CI 测试与桌面端发版工作流
+├── scripts/             # 桥接打包器与 30 项端到端冒烟与安全测试套件
+└── .github/workflows/   # CI 测试与多端发版工作流
 ```
 
-运行端到端冒烟与安全测试：
+运行全部端到端冒烟与安全测试：
+
 ```bash
 npm run test:smoke
 ```
@@ -246,11 +343,9 @@ npm run test:smoke
 
 ---
 
-## 安全说明、贡献与协议
+## 📄 安全说明、贡献与协议
 
-部署前建议阅读 [SECURITY.md](./SECURITY.md)：
-
-- **仅连接自己部署的 HTTPS/WSS 中转**：传输层使用 TLS 加密，中转服务负责路由消息与临时附件，请只在受信任的自建服务器上使用。
-- **权限配置**：适配器默认以自动审批/编辑模式运行以方便远程操作，可按 [SECURITY.md](./SECURITY.md) 中的说明收紧权限。
-- **声明**：本项目为独立开源工具，与 DeepSeek、OpenAI、Anthropic、Google 无官方关联。
-- **贡献与协议**：欢迎提 Issue / PR（见 [CONTRIBUTING.md](./CONTRIBUTING.md)），采用 [MIT License](./LICENSE)。
+- **安全策略**：部署前建议阅读 [SECURITY.md](./SECURITY.md)，可根据需要收紧适配器默认远程审批/编辑权限；建议仅连接受信任的自建 HTTPS/WSS 中转。
+- **免责声明**：本项目为独立开源工具，与 DeepSeek、OpenAI、Anthropic、Google 无官方关联。
+- **参与贡献**：欢迎提交 Issue 与 Pull Request，请查阅 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+- **开源协议**：采用 [MIT License](./LICENSE)。
