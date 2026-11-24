@@ -26,8 +26,13 @@ import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packa
 import { AntigravityAdapter, normalizeAntigravityQuota, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
 import {
   CodexAdapter,
+  buildCodexQuestionReplyText,
+  extractPendingCodexAsyncQuestionFromRollout,
+  formatCodexQuestionReplyForDisplay,
+  normalizeCodexAsyncQuestionCard,
   normalizeCodexQuota,
   normalizeCodexTurns,
+  parseCodexQuestionReply,
   probeCodexRolloutStatus,
   readCodexRolloutTail,
 } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
@@ -3227,10 +3232,10 @@ async function main() {
         const secretToken = 'ZERO_KNOWLEDGE_SECRET_DELTA_987654'
         e2eeBridge.link.pushEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:s1', delta: secretToken })
         for (let i = 0; i < 30; i++) {
-          if (rawEvents.some((e) => e.e2ee?.ct)) break
+          if (rawEvents.some((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)) break
           await new Promise((r) => setTimeout(r, 50))
         }
-        const encEvent = rawEvents.find((e) => e.e2ee?.ct)
+        const encEvent = rawEvents.find((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)
         assert.ok(encEvent, 'Client must receive E2EE-wrapped streaming event')
         assert.equal(encEvent.event, '__e2ee__')
         assert.equal(
@@ -4927,6 +4932,146 @@ async function main() {
       }
     }
     console.log('[smoke] 29/29 DSH two-way prompt & approval sync (downstream Desktop cancel on remote answer + parent abort propagation) OK')
+
+    // 30. Codex Async Questions (`request_user_input_async`), `turn/steer` delivery, rollout extraction & pretty reply formatting
+    {
+      const callId30 = 'call_async_smoke_30'
+      const card30 = normalizeCodexAsyncQuestionCard('thr-async-30', {
+        id: callId30,
+        delivery: 'async',
+        questions: [{ title: '今晚的菜单，你想走哪种口味？', options: ['香辣下饭', '清淡鲜甜', '酸甜开胃'] }],
+      })
+      assert.ok(card30)
+      assert.equal(card30.id, `cdx-aq-${callId30}`)
+      assert.equal(card30.kind, 'question')
+      assert.equal(card30.questions.length, 1)
+      assert.deepEqual(card30.questions[0].options.map((o) => o.label), ['香辣下饭', '清淡鲜甜', '酸甜开胃'])
+      assert.equal(card30.readOnlyHint, undefined)
+
+      const lockedCard30 = normalizeCodexAsyncQuestionCard(
+        'thr-async-30',
+        { id: callId30, questions: [{ title: 'Pick one', options: ['A', 'B'] }] },
+        { externalRunning: true },
+      )
+      assert.equal(lockedCard30.readOnlyHint, 'desktop-running')
+      assert.ok(lockedCard30.detail.includes('电脑端'))
+
+      const replyWire = buildCodexQuestionReplyText(callId30, card30.questions, { q_0: { selected: ['香辣下饭'] } })
+      const parsedReply = parseCodexQuestionReply(replyWire)
+      assert.ok(parsedReply)
+      assert.equal(parsedReply.entries[0].answer, '香辣下饭')
+      assert.equal(parsedReply.callIds.has(callId30), true)
+      assert.equal(formatCodexQuestionReplyForDisplay(replyWire), '已选择：香辣下饭')
+
+      // Rollout tail extraction: unanswered -> detected; after reply -> cleared
+      const rollout30 = join(tmpDir, 'rollout-async-30.jsonl')
+      writeFileSync(
+        rollout30,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            item: {
+              type: 'AgentMessage',
+              id: callId30,
+              delivery: 'async',
+              content: [{ type: 'Text', text: '今晚的菜单？\n- 香辣下饭' }],
+              questions: [{ title: '今晚的菜单，你想走哪种口味？', options: ['香辣下饭', '清淡鲜甜'] }],
+            },
+          },
+        }) + '\n',
+      )
+      const pending30 = extractPendingCodexAsyncQuestionFromRollout(rollout30)
+      assert.equal(pending30?.id, callId30, 'Unanswered async question in rollout must be extracted')
+
+      writeFileSync(
+        rollout30,
+        readFileSync(rollout30, 'utf8') +
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'event_msg',
+            payload: {
+              type: 'item_completed',
+              item: {
+                type: 'UserMessage',
+                id: 'u-reply-30',
+                content: [{ type: 'text', text: replyWire }],
+              },
+            },
+          }) + '\n',
+      )
+      assert.equal(
+        extractPendingCodexAsyncQuestionFromRollout(rollout30),
+        null,
+        'Answered async question must no longer be pending',
+      )
+
+      // Live CodexAdapter `item/completed` -> `turn/steer` when active, and post-turn `sendMessage` / `cancel` when idle
+      const asyncCards = []
+      const asyncEvents = []
+      const cdxAsync = new CodexAdapter({
+        config: {},
+        log: { info() {}, warn() {}, error() {} },
+        emitEvent: (ev, payload) => asyncEvents.push({ ev, payload }),
+        onApprovalRequest: (c) => asyncCards.push(c),
+      })
+      try {
+        const steeredCalls = []
+        cdxAsync.activeTurns.set('thr-live-30', {
+          writer: {
+            rpc: async (method, params) => {
+              steeredCalls.push({ method, params })
+              return { ok: true }
+            },
+          },
+          turnId: 'turn-live-30',
+          cwd: tmpDir,
+          textBuffer: '',
+          aborted: false,
+          settled: false,
+        })
+        cdxAsync.handleNotification('item/completed', {
+          threadId: 'thr-live-30',
+          item: {
+            type: 'agentMessage',
+            id: 'call_live_steer_30',
+            delivery: 'async',
+            text: 'Choose flavor',
+            questions: [{ title: 'Choose flavor', options: ['Spicy', 'Mild'] }],
+          },
+        })
+        assert.equal(asyncCards.length, 1)
+        const liveCard = asyncCards[0]
+        const steerRes = await cdxAsync.resolveApproval(liveCard.id, {
+          decision: 'submit',
+          answers: { q_0: { selected: ['Spicy'] } },
+        })
+        assert.equal(steerRes.resolved, true)
+        assert.equal(steerRes.steered, true)
+        assert.equal(steeredCalls.length, 1)
+        assert.equal(steeredCalls[0].method, 'turn/steer')
+        assert.equal(steeredCalls[0].params.expectedTurnId, 'turn-live-30')
+        assert.ok(steeredCalls[0].params.input[0].text.includes('<send_user_message_question_reply>'))
+        assert.ok(steeredCalls[0].params.input[0].text.includes('Spicy'))
+
+        // Idle post-turn async question: Skip dismisses locally without sending a turn
+        cdxAsync.activeTurns.delete('thr-live-30')
+        cdxAsync.registerAsyncQuestionPrompt('thr-idle-30', {
+          id: 'call_idle_skip_30',
+          questions: [{ title: 'Optional?', options: ['A', 'B'] }],
+        })
+        const idleCard = asyncCards.find((c) => c.callId === 'call_idle_skip_30')
+        assert.ok(idleCard)
+        const skipRes = await cdxAsync.resolveApproval(idleCard.id, { decision: 'cancel', answers: {} })
+        assert.equal(skipRes.resolved, true)
+        assert.equal(cdxAsync.dismissedAsyncQuestions.has('call_idle_skip_30'), true)
+        assert.ok(asyncEvents.some((e) => e.ev === EVENTS.APPROVAL_RESOLVED && e.payload?.id === idleCard.id))
+      } finally {
+        await cdxAsync.dispose()
+      }
+    }
+    console.log('[smoke] 30/30 Codex async questions (request_user_input_async), turn/steer delivery, rollout extraction & pretty reply OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

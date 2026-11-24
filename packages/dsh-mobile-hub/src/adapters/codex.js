@@ -71,6 +71,202 @@ function normalizeThreadSummary(t) {
   }
 }
 
+const CODEX_QUESTION_REPLY_RE = /<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>/i
+
+/**
+ * Parse a Codex `<send_user_message_question_reply>` user message payload.
+ * Returns `{ entries: Array<{ callId, questionItemId, question, answer }>, callIds: Set<string> }` or `null`.
+ */
+export function parseCodexQuestionReply(rawText) {
+  const text = String(rawText || '')
+  const m = text.match(CODEX_QUESTION_REPLY_RE)
+  if (!m) return null
+  try {
+    const arr = JSON.parse(m[1])
+    if (!Array.isArray(arr) || arr.length === 0) return null
+    const callIds = new Set()
+    const entries = arr
+      .filter((x) => x && typeof x === 'object')
+      .map((x) => {
+        let callId = ''
+        if (typeof x.questionItemId === 'string') {
+          try {
+            const parsedId = JSON.parse(x.questionItemId)
+            if (Array.isArray(parsedId) && typeof parsedId[1] === 'string') {
+              callId = parsedId[1]
+            }
+          } catch {}
+        }
+        if (callId) callIds.add(callId)
+        return {
+          callId,
+          questionItemId: String(x.questionItemId || ''),
+          question: String(x.question || '').trim(),
+          answer: String(x.answer ?? '').trim(),
+        }
+      })
+    if (entries.length === 0) return null
+    return { entries, callIds }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Format Codex `<send_user_message_question_reply>` XML/JSON blocks into clean, human-readable text.
+ */
+export function formatCodexQuestionReplyForDisplay(rawText) {
+  const text = String(rawText || '')
+  const parsed = parseCodexQuestionReply(text)
+  if (!parsed) return text
+  const remainder = text.replace(CODEX_QUESTION_REPLY_RE, '').trim()
+  const formatted =
+    parsed.entries.length === 1
+      ? parsed.entries[0].answer
+        ? `已选择：${parsed.entries[0].answer}`
+        : '已跳过该问题'
+      : parsed.entries
+          .map((e) => {
+            const ans = e.answer || '（已跳过）'
+            return e.question ? `• ${e.question}：${ans}` : `• ${ans}`
+          })
+          .join('\n')
+  return remainder ? `${formatted}\n\n${remainder}` : formatted
+}
+
+/**
+ * Build Codex's native `<send_user_message_question_reply>` wire payload for `request_user_input_async`.
+ */
+export function buildCodexQuestionReplyText(callId, questions = [], answers = {}, { cancelled = false } = {}) {
+  const entries = (Array.isArray(questions) ? questions : []).map((q, idx) => {
+    const ans = cancelled ? { combined: [] } : normalizeSingleAnswer(answers[q.id])
+    const answerText = cancelled ? '' : (ans.combined || []).join(', ').trim()
+    return {
+      questionItemId: JSON.stringify(['request_user_input_async', String(callId || ''), idx]),
+      question: String(q.question || q.title || '').trim(),
+      answer: answerText,
+    }
+  })
+  return `<send_user_message_question_reply>\n${JSON.stringify(entries)}\n</send_user_message_question_reply>\n`
+}
+
+/**
+ * Normalize a Codex `agentMessage` containing `questions` (from `request_user_input_async`)
+ * into an All in One interactive prompt card.
+ */
+export function normalizeCodexAsyncQuestionCard(threadId, item, { externalRunning = false } = {}) {
+  if (!threadId || !item || !Array.isArray(item.questions) || item.questions.length === 0) return null
+  const callId = String(item.id || '').trim()
+  if (!callId) return null
+  const questions = item.questions
+    .filter((q) => q && typeof q.title === 'string' && q.title.trim())
+    .map((q, idx) => {
+      const opts = Array.isArray(q.options)
+        ? q.options
+            .map((o) => (typeof o === 'string' ? o : o?.label || ''))
+            .map((s) => String(s).trim())
+            .filter(Boolean)
+            .map((label) => ({ value: label, label, description: '' }))
+        : []
+      return {
+        id: `q_${idx}`,
+        header: '',
+        question: q.title.trim(),
+        description: '',
+        multiSelect: false,
+        allowOther: true,
+        inputType: opts.length > 0 ? 'select' : 'text',
+        required: true,
+        options: opts,
+      }
+    })
+  if (questions.length === 0) return null
+  return {
+    id: `cdx-aq-${callId}`,
+    app: APPS.CODEX,
+    sessionId: makeCompositeId(APPS.CODEX, threadId),
+    kind: 'question',
+    asyncQuestion: true,
+    callId,
+    title: 'Codex 需要你做选择',
+    detail: externalRunning
+      ? '电脑端 Codex 正在运行此轮：可直接去电脑端点击，或等待本轮暂停后在此提交。'
+      : '',
+    ...(externalRunning ? { readOnlyHint: 'desktop-running' } : {}),
+    questions,
+    createdAt: toEpochMs(item.completedAtMs || item.startedAtMs || Date.now()),
+  }
+}
+
+/**
+ * Scan the tail of a Codex rollout `.jsonl` file (zero-OOM) for an unanswered `request_user_input_async` item.
+ */
+export function extractPendingCodexAsyncQuestionFromRollout(rawPath, { tailBytes = 128 * 1024 } = {}) {
+  const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
+  if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
+    return null
+  }
+  let fd = null
+  try {
+    fd = openSync(cleanPath, 'r')
+    const totalSize = fstatSync(fd).size
+    if (totalSize <= 0) return null
+    const readLen = Math.min(totalSize, tailBytes)
+    const startOffset = totalSize - readLen
+    const buf = Buffer.alloc(readLen)
+    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
+    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
+    if (startOffset > 0 && lines.length > 0) lines.shift()
+
+    const answeredCallIds = new Set()
+    let latestItem = null
+    for (const line of lines) {
+      if (!line || line[0] !== '{') continue
+      let obj
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (obj.type === 'event_msg' && obj.payload?.type === 'item_completed') {
+        const it = obj.payload.item
+        if (!it || typeof it !== 'object') continue
+        if (it.type === 'UserMessage') {
+          const text = (Array.isArray(it.content) ? it.content : [])
+            .map((c) => (c?.type === 'text' ? c.text || '' : ''))
+            .join('\n')
+          const reply = parseCodexQuestionReply(text)
+          if (reply) {
+            for (const cid of reply.callIds) answeredCallIds.add(cid)
+            if (latestItem && reply.callIds.has(latestItem.id)) {
+              latestItem = null
+            }
+          } else if (text.trim().length > 0) {
+            // A subsequent normal user message supersedes earlier unanswered async prompts
+            latestItem = null
+          }
+        } else if (it.type === 'AgentMessage' && Array.isArray(it.questions) && it.questions.length > 0 && it.id) {
+          if (!answeredCallIds.has(String(it.id))) {
+            latestItem = {
+              id: String(it.id),
+              questions: it.questions,
+              startedAtMs: obj.payload.started_at_ms,
+              completedAtMs: obj.payload.completed_at_ms,
+            }
+          }
+        }
+      }
+    }
+    return latestItem && !answeredCallIds.has(latestItem.id) ? latestItem : null
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+  }
+}
+
 export function normalizeCodexTurns(turns = []) {
   const messages = []
   let milestoneEpoch = 0
@@ -118,7 +314,7 @@ export function normalizeCodexTurns(turns = []) {
           messages.push({
             id: item.id || `cdx-u-${messages.length}`,
             role: 'user',
-            text,
+            text: formatCodexQuestionReplyForDisplay(text),
             ...(images.length > 0 ? { images } : {}),
             ts,
           })
@@ -400,7 +596,12 @@ export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limi
           if (!text) continue
           if (role === 'user') {
             currentAssistant = null
-            messages.push({ id: p.id || `cdx-tail-u-${messages.length}`, role: 'user', text, ts })
+            messages.push({
+              id: p.id || `cdx-tail-u-${messages.length}`,
+              role: 'user',
+              text: formatCodexQuestionReplyForDisplay(text),
+              ts,
+            })
           } else {
             const a = ensureAssistant(ts, p.id)
             a.text = a.text ? `${a.text}\n\n${text}` : text
@@ -550,7 +751,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.5' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.5.6' },
         capabilities: null,
       })
         .then((res) => {
@@ -785,6 +986,8 @@ export class CodexAdapter {
     this.releasingWriters = new Map() // threadId -> Promise<void> (in-flight writer release before next thread/resume)
     this.pendingNewWriters = new Map() // threadId -> { writer, summary, timer }
     this.pendingServerRequests = new Map() // approvalId -> { writer, rpcId, method, threadId }
+    this.dismissedAsyncQuestions = new Set() // callId skipped locally by user on idle threads
+    this.answeredAsyncQuestions = new Set() // callId already answered via All in One
     this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
     this.modelsCache = null
     this.modelsCacheAt = 0
@@ -1055,12 +1258,146 @@ export class CodexAdapter {
     } catch {}
   }
 
+  registerAsyncQuestionPrompt(threadId, item, { externalRunning = false, cwd = '' } = {}) {
+    const card = normalizeCodexAsyncQuestionCard(threadId, item, { externalRunning })
+    if (!card) return null
+    if (this.dismissedAsyncQuestions.has(card.callId) || this.answeredAsyncQuestions.has(card.callId)) {
+      return null
+    }
+    // Dismiss any older async question cards on the same thread
+    this.clearAsyncQuestionsForThread(threadId, { keepCallId: card.callId, decision: 'superseded' })
+    const existing = this.pendingServerRequests.get(card.id)
+    const nextHint = card.readOnlyHint || ''
+    if (existing && existing.method === 'codex/asyncQuestion' && (existing.readOnlyHint || '') === nextHint) {
+      if (cwd && !existing.cwd) existing.cwd = cwd
+      return card
+    }
+    this.pendingServerRequests.set(card.id, {
+      writer: null,
+      rpcId: null,
+      method: 'codex/asyncQuestion',
+      threadId,
+      callId: card.callId,
+      cwd: cwd || existing?.cwd || '',
+      questions: card.questions,
+      readOnlyHint: nextHint,
+    })
+    this.onApprovalRequest(card)
+    return card
+  }
+
+  clearAsyncQuestionsForThread(threadId, { keepCallId = '', decision = 'desktop' } = {}) {
+    for (const [aprId, entry] of [...this.pendingServerRequests.entries()]) {
+      if (entry.method !== 'codex/asyncQuestion' || entry.threadId !== threadId) continue
+      if (keepCallId && entry.callId === keepCallId) continue
+      this.pendingServerRequests.delete(aprId)
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision })
+    }
+  }
+
+  syncAsyncQuestionFromTurns(threadId, turns = [], { externalRunning = false, cwd = '' } = {}) {
+    const answeredCallIds = new Set()
+    let latestItem = null
+    for (const turn of turns || []) {
+      for (const item of turn?.items || []) {
+        if (!item || typeof item !== 'object') continue
+        if (item.type === 'userMessage') {
+          const text = (Array.isArray(item.content) ? item.content : [])
+            .map((c) => (c?.type === 'text' ? c.text || '' : ''))
+            .join('\n')
+          const reply = parseCodexQuestionReply(text)
+          if (reply) {
+            for (const cid of reply.callIds) answeredCallIds.add(cid)
+            if (latestItem && reply.callIds.has(String(latestItem.id || ''))) {
+              latestItem = null
+            }
+          } else if (text.trim().length > 0) {
+            latestItem = null
+          }
+        } else if (item.type === 'agentMessage' && Array.isArray(item.questions) && item.questions.length > 0 && item.id) {
+          const cid = String(item.id)
+          if (!answeredCallIds.has(cid)) {
+            latestItem = item
+          }
+        }
+      }
+    }
+    if (latestItem && !answeredCallIds.has(String(latestItem.id))) {
+      this.registerAsyncQuestionPrompt(threadId, latestItem, { externalRunning, cwd })
+    } else {
+      this.clearAsyncQuestionsForThread(threadId, { decision: 'desktop' })
+    }
+  }
+
   async resolveApproval(approvalId, decisionOrPayload) {
     const entry = this.pendingServerRequests.get(approvalId)
     if (!entry) return { resolved: false, reason: 'approval not found' }
     this.pendingServerRequests.delete(approvalId)
 
     const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
+
+    if (entry.method === 'codex/asyncQuestion') {
+      const cancelled = decision === 'cancel' || decision === 'decline'
+      const active = this.activeTurns.get(entry.threadId)
+      if (active && active.writer && active.turnId && !active.settled) {
+        const replyText = buildCodexQuestionReplyText(entry.callId, entry.questions, answers, { cancelled })
+        try {
+          await active.writer.rpc(
+            'turn/steer',
+            {
+              threadId: entry.threadId,
+              expectedTurnId: active.turnId,
+              input: [{ type: 'text', text: replyText, text_elements: [] }],
+            },
+            15_000,
+          )
+        } catch (err) {
+          this.pendingServerRequests.set(approvalId, entry)
+          throw err
+        }
+        this.answeredAsyncQuestions.add(entry.callId)
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: approvalId,
+          app: APPS.CODEX,
+          decision: cancelled ? 'cancel' : 'submit',
+        })
+        return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit', steered: true }
+      }
+
+      if (cancelled) {
+        this.dismissedAsyncQuestions.add(entry.callId)
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: approvalId,
+          app: APPS.CODEX,
+          decision: 'cancel',
+        })
+        return { resolved: true, id: approvalId, decision: 'cancel' }
+      }
+
+      const watched = this.watchedSessions.get(entry.threadId) || this.trackedListSessions.get(entry.threadId)
+      if (watched?.path) {
+        const cur = probeCodexRolloutStatus(watched.path, { maxIdleMs: this.externalMaxIdleMs })
+        if (cur.running) {
+          this.pendingServerRequests.set(approvalId, entry)
+          throw new Error('电脑端 Codex 正在运行此轮，请直接在电脑端点击选项，或等本轮暂停后再在手机端提交。')
+        }
+      }
+
+      this.answeredAsyncQuestions.add(entry.callId)
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+        id: approvalId,
+        app: APPS.CODEX,
+        decision: 'submit',
+      })
+      const replyText = buildCodexQuestionReplyText(entry.callId, entry.questions, answers, { cancelled: false })
+      void this.sendMessage(entry.threadId, {
+        text: replyText,
+        ...(entry.cwd ? { cwd: entry.cwd } : {}),
+      }).catch((err) => {
+        this.log.warn?.(`codex: async question follow-up sendMessage failed: ${String(err?.message || err)}`)
+      })
+      return { resolved: true, id: approvalId, decision: 'submit', steered: false }
+    }
 
     if (entry.method === 'item/tool/requestUserInput') {
       const cancelled = decision === 'cancel' || decision === 'decline'
@@ -1195,8 +1532,16 @@ export class CodexAdapter {
           status: item.status === 'failed' || item.error ? 'error' : 'completed',
           output: (item.aggregatedOutput || (item.result ? JSON.stringify(item.result) : '')).slice(0, 3000),
         })
-      } else if (item.type === 'agentMessage' && item.text && active && !active.textBuffer) {
-        active.textBuffer = item.text
+      } else if (item.type === 'agentMessage') {
+        if (item.text && active && !active.textBuffer) {
+          active.textBuffer = item.text
+        }
+        if (Array.isArray(item.questions) && item.questions.length > 0) {
+          this.registerAsyncQuestionPrompt(threadId, item, {
+            externalRunning: false,
+            cwd: active?.cwd || '',
+          })
+        }
       }
       return
     }
@@ -1414,6 +1759,15 @@ export class CodexAdapter {
           tracked.externalRunning = cur.running
         }
         emittedIds.add(tid)
+        const pendingAsync = extractPendingCodexAsyncQuestionFromRollout(w.path)
+        if (pendingAsync) {
+          this.registerAsyncQuestionPrompt(tid, pendingAsync, {
+            externalRunning: cur.running,
+            cwd: w.cwd || '',
+          })
+        } else {
+          this.clearAsyncQuestionsForThread(tid, { decision: 'desktop' })
+        }
         this.emitEvent(EVENTS.SESSION_UPDATED, {
           historyChanged: fileChanged,
           statusChanged,
@@ -1585,6 +1939,7 @@ export class CodexAdapter {
     let messages = []
     let nextCursor = null
     let hasMore = false
+    let loadedTurns = null
 
     const targetBubbles = Math.max(6, Math.min(Number(limit) || 12, 30))
     const maxRawBatches = 16 // up to 1,600 raw items per page so heavy tool runs stay fast & complete
@@ -1670,6 +2025,7 @@ export class CodexAdapter {
             })
           }
         }
+        loadedTurns = turns
         messages = mergeAndCompactMessages(normalizeCodexTurns(turns))
       }
     }
@@ -1677,7 +2033,8 @@ export class CodexAdapter {
     if (messages.length === 0 && !cursor && !pendingNew) {
       try {
         const fullRes = await this.rpc('thread/read', { threadId, includeTurns: true }, 12_000)
-        const all = mergeAndCompactMessages(normalizeCodexTurns(fullRes?.thread?.turns || []))
+        loadedTurns = fullRes?.thread?.turns || null
+        const all = mergeAndCompactMessages(normalizeCodexTurns(loadedTurns || []))
         const start = Math.max(0, all.length - targetBubbles)
         messages = all.slice(start)
         hasMore = false
@@ -1710,8 +2067,21 @@ export class CodexAdapter {
       Math.round(rolloutProbe?.mtimeMs || 0),
     )
 
-    if (!cursor && t.path) {
-      this.rememberWatchedSession(threadId, {
+      if (!cursor) {
+        if (Array.isArray(loadedTurns) && loadedTurns.length > 0) {
+          this.syncAsyncQuestionFromTurns(threadId, loadedTurns, { externalRunning, cwd })
+        } else if (t.path) {
+          const pendingAsync = extractPendingCodexAsyncQuestionFromRollout(t.path)
+          if (pendingAsync) {
+            this.registerAsyncQuestionPrompt(threadId, pendingAsync, { externalRunning, cwd })
+          } else {
+            this.clearAsyncQuestionsForThread(threadId, { decision: 'desktop' })
+          }
+        }
+      }
+
+      if (!cursor && t.path) {
+        this.rememberWatchedSession(threadId, {
         path: t.path,
         probe: rolloutProbe,
         externalRunning,
@@ -1831,6 +2201,7 @@ export class CodexAdapter {
     const turnState = {
       writer: null,
       turnId: null,
+      cwd: cwd || '',
       textBuffer: '',
       aborted: false,
       settled: false,
@@ -1838,6 +2209,8 @@ export class CodexAdapter {
       reject: rejectTurn,
     }
     this.activeTurns.set(threadId, turnState)
+    // A new user message supersedes any older unanswered async question card on this thread
+    this.clearAsyncQuestionsForThread(threadId, { decision: 'superseded' })
 
     let writer = null
     let alreadyLoaded = false
@@ -1993,7 +2366,7 @@ export class CodexAdapter {
   async interrupt(threadId) {
     threadId = assertSafeSessionId(threadId, 'Codex threadId')
     for (const [aprId, entry] of this.pendingServerRequests.entries()) {
-      if (entry.threadId === threadId) {
+      if (entry.threadId === threadId && entry.method !== 'codex/asyncQuestion') {
         this.pendingServerRequests.delete(aprId)
         try {
           if (entry.method === 'item/tool/requestUserInput') {

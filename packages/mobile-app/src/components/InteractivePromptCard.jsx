@@ -32,6 +32,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
   const { bi } = useI18n()
   const isQuestion = prompt?.kind === 'question' && Array.isArray(prompt.questions) && prompt.questions.length > 0
   const isUrlMode = prompt?.kind === 'url_elicitation'
+  const isDesktopLocked = prompt?.readOnlyHint === 'desktop-running'
   const questions = isQuestion ? prompt.questions : []
 
   const [answers, setAnswers] = useState(() => initDraftAnswers(questions))
@@ -97,7 +98,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
       return (cur?.selected?.length || 0) === 0 && !cur?.custom?.trim()
     })
 
-    const canSubmit = !submitting && hasAnyAnswer && !missingRequired
+    const canSubmit = !submitting && !isDesktopLocked && hasAnyAnswer && !missingRequired
 
     const handleSubmit = (e) => {
       e?.preventDefault?.()
@@ -135,7 +136,13 @@ export function InteractivePromptCard({ prompt, onResolve }) {
         </div>
 
         {prompt.detail && (
-          <div className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+          <div
+            className={`mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed ${
+              isDesktopLocked
+                ? 'rounded-xl border border-amber-300/70 bg-amber-50/90 px-2.5 py-1.5 text-[11.5px] font-medium text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-200'
+                : 'text-slate-600 dark:text-slate-300'
+            }`}
+          >
             {prompt.detail}
           </div>
         )}
@@ -248,6 +255,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
           })}
         </div>
 
+        {!isDesktopLocked && (
         <div className="mt-3 flex items-center justify-end gap-2">
           <button
             type="button"
@@ -266,6 +274,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
             <span>{prompt.submitLabel || bi('提交', 'Submit')}</span>
           </button>
         </div>
+        )}
       </form>
     )
   }

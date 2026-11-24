@@ -16,9 +16,9 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '0.5.5')
+    return String(pkg?.version || '0.5.6')
   } catch {
-    return '0.5.5'
+    return '0.5.6'
   }
 })()
 

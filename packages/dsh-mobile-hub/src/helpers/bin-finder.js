@@ -304,6 +304,27 @@ export function getClaudeCandidates(home = homedir(), platform = process.platfor
   return list.filter(Boolean)
 }
 
+function listNewestCodexDesktopBins(localApp) {
+  const baseDir = join(localApp, 'OpenAI', 'Codex', 'bin')
+  if (!existsSync(baseDir)) return []
+  try {
+    const found = []
+    for (const name of readdirSync(baseDir)) {
+      if (!name || name.startsWith('.')) continue
+      const candidate = join(baseDir, name, 'codex.exe')
+      if (!existsSync(candidate)) continue
+      try {
+        const st = statSync(candidate)
+        if (st.isFile()) found.push({ path: candidate, mtimeMs: st.mtimeMs || 0 })
+      } catch {}
+    }
+    found.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return found.map((x) => x.path)
+  } catch {
+    return []
+  }
+}
+
 /**
  * Unified candidate executable paths for OpenAI Codex CLI (`codex`).
  */
@@ -311,9 +332,15 @@ export function getCodexCandidates(home = homedir(), platform = process.platform
   const list = [
     configuredBin,
     env?.CODEX_BIN,
+  ]
+  if (platform === 'win32') {
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(...listNewestCodexDesktopBins(localApp))
+  }
+  list.push(
     join(home, '.codex', '.sandbox-bin', 'codex.exe'),
     join(home, '.codex', '.sandbox-bin', 'codex'),
-  ]
+  )
   if (platform === 'darwin') {
     list.push(
       '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
