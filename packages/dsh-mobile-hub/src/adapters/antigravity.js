@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getAgyCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
@@ -21,8 +21,290 @@ const WATCH_POLL_INTERVAL_MS = 2_000          // Lightweight active-session exte
 const WATCH_TTL_MS = 15 * 60_000              // Stop watching inactive sessions after 15 min
 const MAX_WATCHED_SESSIONS = 3
 const DESKTOP_PROC_CACHE_TTL_MS = 10_000
+const AGY_QUOTA_CACHE_TTL_MS = 3 * 60_000
+const AGY_QUOTA_PROBE_TIMEOUT_MS = 12_000
 
 let desktopProcCache = { running: false, checkedAt: 0 }
+
+/**
+ * Normalize an official Antigravity CLI `statusLine` JSON payload into a uniform E2EE quota object.
+ * Strictly displays ONLY the Gemini model weekly quota (`gemini-weekly`), ignoring 3P / other buckets,
+ * and attaches `gemini-5h` as `shortWindow` for hover tooltip details.
+ */
+export function normalizeAntigravityQuota(payload, now = Date.now()) {
+  if (!payload || typeof payload !== 'object') return null
+  const buckets = payload.quota && typeof payload.quota === 'object' ? payload.quota : payload
+  if (!buckets || typeof buckets !== 'object') return null
+
+  const parseBucket = (b, defaultMinutes) => {
+    if (!b || typeof b !== 'object' || b.disabled === true) return null
+    const rawFrac = b.remaining_fraction ?? b.remainingFraction
+    if (typeof rawFrac !== 'number' || !Number.isFinite(rawFrac)) return null
+    const pct = rawFrac >= 0 && rawFrac <= 1 ? rawFrac * 100 : rawFrac
+    const remainingPercent = Math.max(0, Math.min(100, Math.round(pct)))
+    const resetsAt = toEpochMs(b.reset_time || b.resetTime || 0)
+    if (resetsAt > 0 && now > resetsAt + 60_000) return null
+    return {
+      remainingPercent,
+      usedPercent: 100 - remainingPercent,
+      windowMinutes: defaultMinutes,
+      resetsAt,
+    }
+  }
+
+  const weekly = parseBucket(buckets['gemini-weekly'], 10080)
+  if (!weekly) return null
+  const shortWin = parseBucket(buckets['gemini-5h'], 300)
+  const planType = String(payload.plan_tier || payload.planTier || '').trim()
+
+  return {
+    remainingPercent: weekly.remainingPercent,
+    usedPercent: weekly.usedPercent,
+    windowKind: 'weekly',
+    windowMinutes: weekly.windowMinutes,
+    resetsAt: weekly.resetsAt,
+    bucketLabel: 'Gemini',
+    ...(planType ? { planType } : {}),
+    ...(shortWin ? { shortWindow: shortWin } : {}),
+    updatedAt: now,
+  }
+}
+
+function getAgyQuotaCachePath() {
+  const base = String(process.env.ALLINONE_HOME || '').trim() || join(homedir(), '.allinone-bridge')
+  return join(base, 'agy-quota-cache.json')
+}
+
+function readDiskAgyQuota(cachePath, now = Date.now()) {
+  try {
+    if (!cachePath || !existsSync(cachePath)) return null
+    const raw = JSON.parse(readFileSync(cachePath, 'utf8'))
+    if (!raw || typeof raw.remainingPercent !== 'number' || !Number.isFinite(raw.remainingPercent)) return null
+    if (raw.resetsAt > 0 && now > raw.resetsAt + 60_000) return null
+    return raw
+  } catch {
+    return null
+  }
+}
+
+function writeDiskAgyQuota(cachePath, quota) {
+  if (!cachePath || !quota) return
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true })
+    writeFileSync(cachePath, JSON.stringify(quota), { encoding: 'utf8', mode: 0o600 })
+  } catch {}
+}
+
+/**
+ * Fetch official Gemini weekly quota via Antigravity CLI's documented `--settings` `statusLine` JSON hook.
+ * Runs `agy` briefly in a hidden pseudo-terminal without touching user's settings.json, terminates
+ * immediately once the quota JSON arrives, and cleans up all temporary files.
+ */
+function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROBE_TIMEOUT_MS, onSpawn } = {}) {
+  if (!agyBin) return Promise.resolve(null)
+  let workDir = ''
+  try {
+    workDir = mkdtempSync(join(tmpdir(), 'allinone-agy-quota-'))
+  } catch {
+    return Promise.resolve(null)
+  }
+
+  const captureJs = join(workDir, 'capture.mjs')
+  const outJson = join(workDir, 'quota.json')
+  const settingsJson = join(workDir, 'settings.json')
+
+  const cleanup = () => {
+    try { rmSync(workDir, { recursive: true, force: true }) } catch {}
+  }
+
+  try {
+    writeFileSync(
+      captureJs,
+      [
+        "import fs from 'node:fs'",
+        "let s = ''",
+        "process.stdin.setEncoding('utf8')",
+        "process.stdin.on('data', (d) => { s += d })",
+        "process.stdin.on('end', () => {",
+        '  try {',
+        '    const o = JSON.parse(s)',
+        '    if (o && o.quota && Object.keys(o.quota).length > 0) {',
+        `      fs.writeFileSync(${JSON.stringify(outJson)}, s, 'utf8')`,
+        '    }',
+        '  } catch {}',
+        '})',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+
+    let wrapperCmd = ''
+    if (process.platform === 'win32') {
+      const wrapperBat = join(workDir, 'capture.cmd')
+      writeFileSync(
+        wrapperBat,
+        `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${process.execPath}" "${captureJs}"\r\n`,
+        'utf8',
+      )
+      wrapperCmd = wrapperBat
+    } else {
+      const wrapperSh = join(workDir, 'capture.sh')
+      writeFileSync(
+        wrapperSh,
+        `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(captureJs)}\n`,
+        { encoding: 'utf8', mode: 0o700 },
+      )
+      wrapperCmd = wrapperSh
+    }
+
+    writeFileSync(
+      settingsJson,
+      JSON.stringify({ statusLine: { type: 'command', command: wrapperCmd, enabled: true } }),
+      'utf8',
+    )
+  } catch {
+    cleanup()
+    return Promise.resolve(null)
+  }
+
+  return new Promise((resolvePromise) => {
+    let settled = false
+    let proc = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(hardTimer)
+      let result = null
+      try {
+        if (existsSync(outJson)) {
+          const parsed = JSON.parse(readFileSync(outJson, 'utf8'))
+          result = normalizeAntigravityQuota(parsed)
+        }
+      } catch {}
+      cleanup()
+      resolvePromise(result)
+    }
+
+    const hardTimer = setTimeout(() => {
+      try { proc?.kill() } catch {}
+      finish()
+    }, timeoutMs + 3_000)
+    hardTimer.unref?.()
+
+    try {
+      if (process.platform === 'win32') {
+        const ps1Path = join(workDir, 'run-pty.ps1')
+        const ps1Body = [
+          'param([string]$AgyBin, [string]$SettingsPath, [string]$OutPath, [int]$TimeoutMs)',
+          'Add-Type -TypeDefinition @"',
+          'using System;',
+          'using System.Runtime.InteropServices;',
+          'using System.Threading;',
+          'using System.IO;',
+          'public class AllInOneAgyConPty {',
+          '  [StructLayout(LayoutKind.Sequential)] struct COORD { public short X; public short Y; }',
+          '  [StructLayout(LayoutKind.Sequential)] struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr lpAttributeList; }',
+          '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct STARTUPINFO {',
+          '    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;',
+          '    public int dwX; public int dwY; public int dwXSize; public int dwYSize;',
+          '    public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute;',
+          '    public int dwFlags; public short wShowWindow; public short cbReserved2;',
+          '    public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;',
+          '  }',
+          '  [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CreatePipe(out IntPtr hRead, out IntPtr hWrite, IntPtr sa, int size);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern void ClosePseudoConsole(IntPtr hPC);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);',
+          '  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);',
+          '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(IntPtr hFile, byte[] buf, int toRead, out int read, IntPtr ov);',
+          '  public static void Run(string cmdLine, string watchFile, int timeoutMs) {',
+          '    IntPtr inR, inW, outR, outW, hPC;',
+          '    if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0)) return;',
+          '    if (!CreatePipe(out outR, out outW, IntPtr.Zero, 0)) { CloseHandle(inR); CloseHandle(inW); return; }',
+          '    COORD sz = new COORD { X = 120, Y = 30 };',
+          '    if (CreatePseudoConsole(sz, inR, outW, 0, out hPC) != 0) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW); return; }',
+          '    CloseHandle(inR); CloseHandle(outW);',
+          '    Thread drain = new Thread(() => { byte[] b = new byte[4096]; int n; while (ReadFile(outR, b, b.Length, out n, IntPtr.Zero) && n > 0) {} });',
+          '    drain.IsBackground = true; drain.Start();',
+          '    IntPtr lpSize = IntPtr.Zero;',
+          '    InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref lpSize);',
+          '    IntPtr attrList = Marshal.AllocHGlobal(lpSize);',
+          '    InitializeProcThreadAttributeList(attrList, 1, 0, ref lpSize);',
+          '    UpdateProcThreadAttribute(attrList, 0, (IntPtr)0x00020016, hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero);',
+          '    STARTUPINFOEX si = new STARTUPINFOEX();',
+          '    si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));',
+          '    si.lpAttributeList = attrList;',
+          '    PROCESS_INFORMATION pi;',
+          '    if (CreateProcess(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, 0x00080000 | 0x08000000, IntPtr.Zero, null, ref si, out pi)) {',
+          '      int waited = 0;',
+          '      while (waited < timeoutMs && !File.Exists(watchFile)) { Thread.Sleep(150); waited += 150; }',
+          '      TerminateProcess(pi.hProcess, 0);',
+          '      CloseHandle(pi.hProcess); CloseHandle(pi.hThread);',
+          '    }',
+          '    DeleteProcThreadAttributeList(attrList); Marshal.FreeHGlobal(attrList);',
+          '    ClosePseudoConsole(hPC); CloseHandle(inW); CloseHandle(outR);',
+          '  }',
+          '}',
+          '"@',
+          '$cmd = "`"$AgyBin`" --settings `"$SettingsPath`""',
+          '[AllInOneAgyConPty]::Run($cmd, $OutPath, $TimeoutMs)',
+        ].join('\r\n')
+        writeFileSync(ps1Path, ps1Body, 'utf8')
+        proc = spawnCrossPlatform(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1Path, agyBin, settingsJson, outJson, String(timeoutMs)],
+          { stdio: 'ignore', windowsHide: true },
+        )
+      } else {
+        const pyBin = findExecutable(['python3', 'python']) || 'python3'
+        const pyRunner = join(workDir, 'run-pty.py')
+        writeFileSync(
+          pyRunner,
+          [
+            'import os, pty, select, subprocess, sys, time',
+            'agy_bin, settings_path, out_path, timeout_ms = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])',
+            'master_fd, slave_fd = pty.openpty()',
+            'proc = subprocess.Popen([agy_bin, "--settings", settings_path], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)',
+            'os.close(slave_fd)',
+            'deadline = time.monotonic() + (timeout_ms / 1000.0)',
+            'try:',
+            '  while time.monotonic() < deadline and not os.path.exists(out_path) and proc.poll() is None:',
+            '    r, _, _ = select.select([master_fd], [], [], 0.15)',
+            '    if r:',
+            '      try: os.read(master_fd, 4096)',
+            '      except OSError: break',
+            'finally:',
+            '  try: proc.terminate()',
+            '  except Exception: pass',
+            '  try: proc.wait(timeout=1.5)',
+            '  except Exception:',
+            '    try: proc.kill()',
+            '    except Exception: pass',
+            '  try: os.close(master_fd)',
+            '  except Exception: pass',
+            '',
+          ].join('\n'),
+          'utf8',
+        )
+        proc = spawnCrossPlatform(
+          pyBin,
+          [pyRunner, agyBin, settingsJson, outJson, String(timeoutMs)],
+          { stdio: 'ignore' },
+        )
+      }
+      onSpawn?.(proc)
+      proc.on('close', finish)
+      proc.on('error', finish)
+    } catch {
+      finish()
+    }
+  })
+}
 
 function getTranscriptPathSafe(agyHome, conversationId) {
   const safeId = assertSafeSessionId(conversationId, 'Antigravity conversationId')
@@ -710,6 +992,12 @@ export class AntigravityAdapter {
     this.cliVersionCache = null
     this.modelsCache = null
     this.modelsCacheAt = 0
+    this.quotaCachePath = config.agyQuotaCachePath || getAgyQuotaCachePath()
+    this.quotaCache = readDiskAgyQuota(this.quotaCachePath)
+    this.quotaCacheAt = this.quotaCache?.updatedAt || 0
+    this.quotaRefreshInFlight = null
+    this.activeQuotaProcs = new Set()
+    this.disableQuotaProbe = Boolean(config.disableAgyQuotaProbe)
     this.reaperTimer = null
   }
 
@@ -927,10 +1215,70 @@ export class AntigravityAdapter {
     return ver
   }
 
+  getValidQuota(now = Date.now()) {
+    if (!this.quotaCache) return null
+    if (this.quotaCache.resetsAt > 0 && now > this.quotaCache.resetsAt + 60_000) {
+      this.quotaCache = null
+      return null
+    }
+    return this.quotaCache
+  }
+
+  refreshQuotaInBackground({ force = false } = {}) {
+    if (this.disposed || this.disableQuotaProbe) return Promise.resolve(this.getValidQuota())
+    const now = Date.now()
+    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < AGY_QUOTA_CACHE_TTL_MS) {
+      return Promise.resolve(this.getValidQuota(now))
+    }
+    if (this.quotaRefreshInFlight) return this.quotaRefreshInFlight
+    const bin = this.agyBin || findAgyBinary(this.configuredBin)
+    if (!bin) return Promise.resolve(this.getValidQuota(now))
+
+    let spawnedProc = null
+    const p = fetchAntigravityQuotaViaStatusLine(bin, {
+      onSpawn: (proc) => {
+        spawnedProc = proc
+        if (this.disposed) {
+          try { proc.kill() } catch {}
+          return
+        }
+        this.activeQuotaProcs.add(proc)
+      },
+    })
+      .then((fresh) => {
+        if (this.disposed) return null
+        this.quotaCacheAt = Date.now()
+        if (fresh) {
+          this.quotaCache = fresh
+          writeDiskAgyQuota(this.quotaCachePath, fresh)
+          this.emitEvent(EVENTS.BRIDGE_STATUS, {
+            type: 'quota.updated',
+            app: APPS.ANTIGRAVITY,
+            quota: fresh,
+          })
+        }
+        return this.getValidQuota()
+      })
+      .catch(() => this.getValidQuota())
+      .finally(() => {
+        if (spawnedProc) this.activeQuotaProcs.delete(spawnedProc)
+        if (this.quotaRefreshInFlight === p) {
+          this.quotaRefreshInFlight = null
+        }
+      })
+    this.quotaRefreshInFlight = p
+    return p
+  }
+
   async getStatus() {
     const dbExists = existsSync(join(this.agyHome, 'conversation_summaries.db'))
     const cliVer = await this.checkCliVersion()
     const writable = Boolean(cliVer)
+    const quota = this.getValidQuota()
+    if (writable) {
+      // Refresh Gemini weekly quota non-blockingly in background; emits E2EE BRIDGE_STATUS once ready
+      void this.refreshQuotaInBackground()
+    }
     return {
       app: APPS.ANTIGRAVITY,
       available: dbExists || writable,
@@ -940,6 +1288,7 @@ export class AntigravityAdapter {
         ? `已直连 Antigravity 官方 ACP (v${cliVer})，与桌面端原生共享同一会话与缓存（零额外 Token）`
         : '仅支持 Antigravity 桌面端历史浏览；安装官方 Antigravity CLI (`agy`) 后即可原位续聊',
       activeCount: this.activeTurns.size,
+      ...(quota ? { quota } : {}),
     }
   }
 
@@ -1923,9 +2272,12 @@ export class AntigravityAdapter {
         if (this.disposed) {
           await this.closeWarmSession(sessionId, entry)
         } else {
-          // Re-snapshot shortly after turn end to capture trailing SQLite/transcript flush
+          // Re-snapshot shortly after turn end to capture trailing SQLite/transcript flush & refresh Gemini quota
           const settleSnap = setTimeout(() => {
-            if (!this.disposed) void snapNow().catch(() => {})
+            if (!this.disposed) {
+              void snapNow().catch(() => {})
+              void this.refreshQuotaInBackground({ force: true })
+            }
           }, 450)
           settleSnap.unref?.()
 
@@ -2145,6 +2497,10 @@ export class AntigravityAdapter {
     }
     this.watchedSessions.clear()
     this.startingWarmSessions.clear()
+    for (const proc of this.activeQuotaProcs) {
+      try { proc.kill() } catch {}
+    }
+    this.activeQuotaProcs.clear()
     for (const client of this.startingClients) {
       client?.killImmediate()
     }

@@ -174,28 +174,29 @@ function getQuotaTone(remainingPercent) {
   if (remainingPercent >= 40) {
     return {
       text: 'text-emerald-600 dark:text-emerald-400',
-      bar: 'bg-emerald-500 dark:bg-emerald-400',
+      ring: '#10B981',
     }
   }
   if (remainingPercent >= 15) {
     return {
       text: 'text-amber-600 dark:text-amber-400',
-      bar: 'bg-amber-500 dark:bg-amber-400',
+      ring: '#F59E0B',
     }
   }
   return {
     text: 'text-rose-600 dark:text-rose-400',
-    bar: 'bg-rose-500 dark:bg-rose-400',
+    ring: '#F43F5E',
   }
 }
 
 function formatQuotaTooltip(label, quota, lang) {
   if (!quota || typeof quota.remainingPercent !== 'number') return label
   const planSuffix = quota.planType ? ` (${String(quota.planType).toUpperCase()})` : ''
+  const bucketPrefix = quota.bucketLabel ? `${quota.bucketLabel} ` : ''
   const windowLabel =
     quota.windowKind === 'weekly'
-      ? lang === 'en' ? 'Weekly left' : '周额度剩余'
-      : lang === 'en' ? 'Quota left' : '额度剩余'
+      ? lang === 'en' ? `${bucketPrefix}Weekly left` : `${bucketPrefix}周额度剩余`
+      : lang === 'en' ? `${bucketPrefix}Quota left` : `${bucketPrefix}额度剩余`
   const parts = [`${label}${planSuffix}`, `${windowLabel} ${quota.remainingPercent}%`]
   if (quota.shortWindow && typeof quota.shortWindow.remainingPercent === 'number') {
     const hrs = Math.max(1, Math.round((quota.shortWindow.windowMinutes || 300) / 60))
@@ -420,7 +421,7 @@ export function SidebarDrawer({
           </div>
         </div>
 
-        {/* Vendor Icon & Subscription Quota Filter Bar (5-column grid, zero clipping) */}
+        {/* Vendor Icon & Border-Integrated Subscription Quota Filter Bar (5-column grid) */}
         <div className="px-4 pb-2">
           <div className="grid grid-cols-5 gap-1.5">
             {filterTabs.map((tab) => {
@@ -435,6 +436,42 @@ export function SidebarDrawer({
               const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
               const tone = pct !== null ? getQuotaTone(pct) : null
               const tooltip = formatQuotaTooltip(tab.label, quota, lang)
+
+              // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
+              if (pct !== null && tone) {
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    title={tooltip}
+                    aria-label={tooltip}
+                    onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
+                    className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
+                      active ? 'shadow-xs' : ''
+                    }`}
+                    style={{
+                      background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
+                    }}
+                  >
+                    <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
+                      {active && (
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute inset-0"
+                          style={{ backgroundColor: `${tab.color}24` }}
+                        />
+                      )}
+                      <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
+                        <VendorIcon app={tab.id} size={16} />
+                        <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
+                          {pct}%
+                        </span>
+                      </span>
+                    </span>
+                  </button>
+                )
+              }
+
               return (
                 <button
                   key={tab.id}
@@ -442,9 +479,7 @@ export function SidebarDrawer({
                   title={tooltip}
                   aria-label={tooltip}
                   onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                  className={`relative flex h-12 flex-col items-center justify-center overflow-hidden rounded-xl border transition active:scale-95 ${
-                    quota ? 'gap-1 pt-0.5 pb-1.5' : ''
-                  } ${
+                  className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
                     active
                       ? 'border-transparent shadow-xs'
                       : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
@@ -461,25 +496,9 @@ export function SidebarDrawer({
                 >
                   <VendorIcon
                     app={tab.id}
-                    size={tab.id === 'all' ? 17 : quota ? 15 : 19}
+                    size={tab.id === 'all' ? 17 : 19}
                     mono={tab.id === 'all'}
                   />
-                  {pct !== null && tone && (
-                    <>
-                      <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
-                        {pct}%
-                      </span>
-                      <span
-                        aria-hidden="true"
-                        className="pointer-events-none absolute inset-x-1.5 bottom-1 h-[2.5px] overflow-hidden rounded-full bg-slate-200/80 dark:bg-white/10"
-                      >
-                        <span
-                          className={`block h-full rounded-full transition-[width] duration-300 ${tone.bar}`}
-                          style={{ width: `${pct}%` }}
-                        />
-                      </span>
-                    </>
-                  )}
                 </button>
               )
             })}

@@ -1301,6 +1301,15 @@ export function App() {
         return
       }
 
+      if (event === EVENTS.BRIDGE_STATUS && payload?.app && payload?.quota) {
+        setAppsStatus((prev) => {
+          const exists = prev.some((a) => a?.app === payload.app)
+          if (!exists) return prev
+          return prev.map((a) => (a?.app === payload.app ? { ...a, quota: payload.quota } : a))
+        })
+        return
+      }
+
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
         const updated = payload.session
         let clearedStaleStream = false
@@ -1455,8 +1464,8 @@ export function App() {
           if (activeSessionRef.current?.id === sid && !liveStreamMapRef.current[sid]?.active) {
             void syncActiveSessionQuietly(sid)
           }
-          // Quietly refresh E2EE subscription quota (e.g. Codex / Claude) after a turn finishes
-          if (payload?.app === 'codex' || payload?.app === 'claude') {
+          // Quietly refresh E2EE subscription quota (Codex / Claude / Antigravity) after a turn finishes
+          if (payload?.app === 'codex' || payload?.app === 'claude' || payload?.app === 'antigravity') {
             const curClient = clientRef.current
             const reqBridgeId = activeBridgeIdRef.current
             if (curClient && curClient === client && reqBridgeId && deviceGenRef.current === doneGen) {

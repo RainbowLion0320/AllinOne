@@ -23,7 +23,7 @@ import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
 import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local-ipc.js'
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
-import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
+import { AntigravityAdapter, normalizeAntigravityQuota, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
 import {
   CodexAdapter,
   normalizeCodexQuota,
@@ -4737,6 +4737,66 @@ async function main() {
       assert.equal(zkLink.metaApps[0].quota, undefined, 'Plaintext bridge.meta.apps sent to Relay must NEVER include subscription quota')
     }
     console.log('[smoke] 27/27 Subscription weekly quota normalization (Codex Pro/Plus + Claude) & zero-knowledge Relay stripping OK')
+
+    // 28. Antigravity Gemini-Only Weekly Quota Normalization & Disk Cache Hydration
+    {
+      const futureIso = new Date(Date.now() + 5 * 86400 * 1000).toISOString()
+      const future5hIso = new Date(Date.now() + 3 * 3600 * 1000).toISOString()
+      const pastIso = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+
+      const agyQuota = normalizeAntigravityQuota({
+        quota: {
+          '3p-5h': { remaining_fraction: 1, disabled: true },
+          '3p-weekly': { remaining_fraction: 0 },
+          'gemini-5h': { remaining_fraction: 0.8405911, reset_time: future5hIso },
+          'gemini-weekly': { remaining_fraction: 0.92589515, reset_time: futureIso },
+        },
+      })
+      assert.ok(agyQuota, 'Valid Antigravity statusLine payload must normalize')
+      assert.equal(agyQuota.remainingPercent, 93, 'Must strictly pick gemini-weekly (93%), ignoring 3p-weekly (0%)')
+      assert.equal(agyQuota.usedPercent, 7)
+      assert.equal(agyQuota.windowKind, 'weekly')
+      assert.equal(agyQuota.bucketLabel, 'Gemini')
+      assert.equal(agyQuota.shortWindow?.remainingPercent, 84, 'gemini-5h must be preserved in shortWindow for tooltip')
+
+      // Only 3p buckets without gemini-weekly -> must return null
+      assert.equal(
+        normalizeAntigravityQuota({ quota: { '3p-weekly': { remaining_fraction: 0.5 } } }),
+        null,
+        'Missing gemini-weekly bucket must return null',
+      )
+      // Disabled gemini-weekly -> must return null
+      assert.equal(
+        normalizeAntigravityQuota({ quota: { 'gemini-weekly': { remaining_fraction: 0.9, disabled: true } } }),
+        null,
+        'Disabled gemini-weekly bucket must return null',
+      )
+      // Expired gemini-weekly -> must return null
+      assert.equal(
+        normalizeAntigravityQuota({ quota: { 'gemini-weekly': { remaining_fraction: 0.5, reset_time: pastIso } } }),
+        null,
+        'Expired gemini-weekly bucket must return null',
+      )
+
+      // Disk cache hydration in AntigravityAdapter.getStatus() without blocking
+      const agyCachePath28 = join(tmpDir, 'agy-quota-cache-28.json')
+      writeFileSync(agyCachePath28, JSON.stringify(agyQuota), 'utf8')
+      const agyAdapter28 = new AntigravityAdapter({
+        config: {
+          agyHome: join(tmpDir, 'agy-home-28'),
+          agyQuotaCachePath: agyCachePath28,
+          disableAgyQuotaProbe: true,
+        },
+      })
+      try {
+        const st28 = await agyAdapter28.getStatus()
+        assert.equal(st28.quota?.remainingPercent, 93, 'AntigravityAdapter.getStatus() must hydrate cached Gemini weekly quota immediately')
+        assert.equal(st28.quota?.bucketLabel, 'Gemini')
+      } finally {
+        await agyAdapter28.dispose()
+      }
+    }
+    console.log('[smoke] 28/28 Antigravity Gemini-only weekly quota normalization & non-blocking disk cache OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
