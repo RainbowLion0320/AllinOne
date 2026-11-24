@@ -10,7 +10,7 @@ export default defineConfig({
   base: './',
   envDir: '../..',
   define: {
-    __APP_VERSION__: JSON.stringify(pkg.version || '0.4.8'),
+    __APP_VERSION__: JSON.stringify(pkg.version || '0.4.9'),
   },
   plugins: [
     react(),

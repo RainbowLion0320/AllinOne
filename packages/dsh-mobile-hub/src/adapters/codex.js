@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
@@ -158,6 +158,7 @@ export function normalizeCodexTurns(turns = []) {
       } else if (item.type === 'imageView') {
         if (item.path) {
           const a = ensureAssistant(ts, item.id)
+          a.ts = Math.max(a.ts || 0, ts)
           a.tools.push({
             id: item.id || `cdx-iv-${turn.id}-${a.tools.length}`,
             name: 'view_image',
@@ -168,6 +169,7 @@ export function normalizeCodexTurns(turns = []) {
         }
       } else if (item.type === 'reasoning') {
         const a = ensureAssistant(ts, item.id)
+        a.ts = Math.max(a.ts || 0, ts)
         const parts = [...(item.summary || []), ...(item.content || [])].filter(Boolean)
         if (parts.length > 0) {
           a.thinking = a.thinking ? `${a.thinking}\n${parts.join('\n')}` : parts.join('\n')
@@ -176,7 +178,7 @@ export function normalizeCodexTurns(turns = []) {
         const a = ensureAssistant(ts, item.id)
         if (item.text) {
           a.text = a.text ? `${a.text}\n\n${item.text}` : item.text
-          a.ts = ts || a.ts
+          a.ts = Math.max(a.ts || 0, ts)
           // Close this assistant milestone bubble so long autonomous multi-step runs render
           // each progress update chronologically with its preceding commands (matching Codex Desktop).
           milestoneEpoch += 1
@@ -184,6 +186,7 @@ export function normalizeCodexTurns(turns = []) {
         }
       } else if (item.type === 'commandExecution') {
         const a = ensureAssistant(ts)
+        a.ts = Math.max(a.ts || 0, ts)
         a.tools.push({
           id: item.id,
           name: 'command',
@@ -193,6 +196,7 @@ export function normalizeCodexTurns(turns = []) {
         })
       } else if (item.type === 'fileChange') {
         const a = ensureAssistant(ts)
+        a.ts = Math.max(a.ts || 0, ts)
         a.tools.push({
           id: item.id,
           name: 'file_change',
@@ -202,6 +206,7 @@ export function normalizeCodexTurns(turns = []) {
         })
       } else if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') {
         const a = ensureAssistant(ts)
+        a.ts = Math.max(a.ts || 0, ts)
         a.tools.push({
           id: item.id,
           name: item.server ? `${item.server}.${item.tool}` : item.tool || 'tool',
@@ -215,6 +220,7 @@ export function normalizeCodexTurns(turns = []) {
         })
       } else if (item.type === 'webSearch') {
         const a = ensureAssistant(ts)
+        a.ts = Math.max(a.ts || 0, ts)
         a.tools.push({
           id: item.id,
           name: 'web_search',
@@ -232,6 +238,121 @@ export function normalizeCodexTurns(turns = []) {
     if (!out.tools || out.tools.length === 0) delete out.tools
     return out
   })
+}
+
+const CODEX_EXTERNAL_MAX_IDLE_MS = 20 * 60_000 // Ignore crashed/abandoned rollouts untouched for >20m
+const CODEX_WATCH_POLL_INTERVAL_MS = 2_500
+const CODEX_WATCH_TTL_MS = 10 * 60_000
+const CODEX_TRACKED_LIST_TTL_MS = 30 * 60_000
+const CODEX_MAX_WATCHED_SESSIONS = 8
+const CODEX_TRACKED_LIST_LIMIT = 15
+const CODEX_LIST_DISCOVERY_INTERVAL_MS = 15_000
+
+const CODEX_TERMINAL_EVENT_TYPES = new Set([
+  'task_complete',
+  'turn_aborted',
+  'turn_complete',
+  'turn_failed',
+])
+
+const CODEX_METADATA_EVENT_TYPES = new Set([
+  'thread_name_updated',
+  'thread_name',
+  'session_configured',
+  'thread_rolled_back',
+])
+
+/**
+ * Zero-OOM, sub-millisecond external running-state probe for Codex `.jsonl` rollout files.
+ * Works accurately even on 8 GB+ rollouts and forked `parent_child.jsonl` files where an
+ * independent `codex app-server` reader process always reports `status: { type: "notLoaded" }`.
+ */
+export function probeCodexRolloutStatus(
+  rawPath,
+  { now = Date.now(), maxIdleMs = CODEX_EXTERNAL_MAX_IDLE_MS, tailBytes = 64 * 1024 } = {},
+) {
+  const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
+  if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl')) {
+    return { exists: false, running: false, size: 0, mtimeMs: 0, lastEvent: '' }
+  }
+  let st
+  try {
+    st = statSync(cleanPath)
+  } catch {
+    return { exists: false, running: false, size: 0, mtimeMs: 0, lastEvent: '' }
+  }
+  const size = Number(st.size || 0)
+  const mtimeMs = Number(st.mtimeMs || 0)
+  if (size <= 0) {
+    return { exists: true, running: false, size, mtimeMs, lastEvent: '' }
+  }
+  // Stale rollouts untouched beyond maxIdleMs are never running (prevents zombie inProgress after crashes)
+  if (now - mtimeMs > maxIdleMs) {
+    return { exists: true, running: false, size, mtimeMs, lastEvent: 'stale' }
+  }
+
+  let fd = null
+  try {
+    fd = openSync(cleanPath, 'r')
+    const actualSize = fstatSync(fd).size
+    const readLen = Math.min(actualSize, tailBytes)
+    const startOffset = actualSize - readLen
+    const buf = Buffer.alloc(readLen)
+    readSync(fd, buf, 0, readLen, startOffset)
+    const lines = buf.toString('utf8').split(/\r?\n/)
+    if (startOffset > 0 && lines.length > 0) lines.shift()
+
+    let sawActiveLine = false
+    let lastEvent = ''
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i]
+      if (!line || line[0] !== '{') continue
+      let obj
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const topType = String(obj.type || '')
+      const pType = String(obj.payload?.type || '')
+
+      if (topType === 'event_msg') {
+        if (CODEX_TERMINAL_EVENT_TYPES.has(pType)) {
+          return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent: pType }
+        }
+        if (CODEX_METADATA_EVENT_TYPES.has(pType)) {
+          continue
+        }
+        sawActiveLine = true
+        lastEvent = pType || 'event_msg'
+        break
+      }
+
+      if (topType === 'session_meta') {
+        continue
+      }
+
+      if (topType === 'response_item' || topType === 'token_usage_record' || topType === 'turn_context') {
+        sawActiveLine = true
+        lastEvent = pType || topType
+        break
+      }
+    }
+
+    // If a recently modified giant rollout (>tailBytes) ended mid-huge-line (e.g. >64KB screenshot tool output)
+    // with no terminal event after it, treat it as actively running.
+    if (!sawActiveLine && startOffset > 0) {
+      return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent: 'giant_item' }
+    }
+
+    return { exists: true, running: sawActiveLine, size: actualSize, mtimeMs, lastEvent }
+  } catch {
+    return { exists: true, running: false, size, mtimeMs, lastEvent: '' }
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+  }
 }
 
 /**
@@ -443,7 +564,7 @@ class CodexRpcClient {
       })
 
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.8' },
+        clientInfo: { name: 'allinone-dsh-mobile', version: '0.4.9' },
         capabilities: null,
       })
         .then((res) => {
@@ -596,6 +717,13 @@ export class CodexAdapter {
     this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
     this.modelsCache = null
     this.modelsCacheAt = 0
+    this.watchedSessions = new Map() // threadId -> live open-chat external watch snapshot
+    this.trackedListSessions = new Map() // threadId -> recent sidebar thread external status snapshot
+    this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || CODEX_WATCH_POLL_INTERVAL_MS)
+    this.externalMaxIdleMs = Math.max(1000, Number(config.codexExternalMaxIdleMs) || CODEX_EXTERNAL_MAX_IDLE_MS)
+    this.watchTimer = null
+    this.watchPollInFlight = false
+    this.lastListDiscoveryAt = 0
   }
 
   refreshBinary() {
@@ -1057,6 +1185,216 @@ export class CodexAdapter {
     }
   }
 
+  rememberWatchedSession(threadId, snapshot = {}) {
+    const cleanPath = String(snapshot.path || '').replace(/^\\\\\?\\/, '').trim()
+    if (!threadId || !cleanPath) return
+    const existing = this.watchedSessions.get(threadId)
+    const probe = snapshot.probe || probeCodexRolloutStatus(cleanPath, { maxIdleMs: this.externalMaxIdleMs })
+    this.watchedSessions.delete(threadId)
+    this.watchedSessions.set(threadId, {
+      threadId,
+      path: cleanPath,
+      lastSeenAt: Date.now(),
+      size: probe.size,
+      mtimeMs: probe.mtimeMs,
+      externalRunning: Boolean(snapshot.externalRunning ?? probe.running),
+      title: snapshot.title || existing?.title || threadId,
+      preview: snapshot.preview ?? existing?.preview ?? '',
+      cwd: snapshot.cwd ?? existing?.cwd ?? '',
+      workspace: snapshot.workspace ?? existing?.workspace ?? (snapshot.cwd ? basename(snapshot.cwd) : ''),
+      model: snapshot.model ?? existing?.model ?? '',
+      createdAt: snapshot.createdAt ?? existing?.createdAt ?? 0,
+    })
+    while (this.watchedSessions.size > CODEX_MAX_WATCHED_SESSIONS) {
+      const oldest = this.watchedSessions.keys().next().value
+      if (!oldest) break
+      this.watchedSessions.delete(oldest)
+    }
+    this.ensureWatcherRunning()
+  }
+
+  rememberTrackedListSession(threadId, snapshot = {}) {
+    const cleanPath = String(snapshot.path || '').replace(/^\\\\\?\\/, '').trim()
+    if (!threadId || !cleanPath) return
+    const existing = this.trackedListSessions.get(threadId)
+    const probe = snapshot.probe || probeCodexRolloutStatus(cleanPath, { maxIdleMs: this.externalMaxIdleMs })
+    this.trackedListSessions.delete(threadId)
+    this.trackedListSessions.set(threadId, {
+      threadId,
+      path: cleanPath,
+      lastSeenAt: Date.now(),
+      size: probe.size,
+      mtimeMs: probe.mtimeMs,
+      externalRunning: Boolean(snapshot.externalRunning ?? probe.running),
+      title: snapshot.title || existing?.title || threadId,
+      preview: snapshot.preview ?? existing?.preview ?? '',
+      cwd: snapshot.cwd ?? existing?.cwd ?? '',
+      workspace: snapshot.workspace ?? existing?.workspace ?? (snapshot.cwd ? basename(snapshot.cwd) : ''),
+      model: snapshot.model ?? existing?.model ?? '',
+      createdAt: snapshot.createdAt ?? existing?.createdAt ?? 0,
+    })
+    while (this.trackedListSessions.size > CODEX_TRACKED_LIST_LIMIT) {
+      const oldest = this.trackedListSessions.keys().next().value
+      if (!oldest) break
+      this.trackedListSessions.delete(oldest)
+    }
+    this.ensureWatcherRunning()
+  }
+
+  ensureWatcherRunning() {
+    if (this.watchTimer || (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0)) return
+    this.watchTimer = setInterval(() => {
+      void this.pollExternalSessions().catch(() => {})
+    }, this.watchPollIntervalMs)
+    this.watchTimer.unref?.()
+  }
+
+  buildSessionUpdatedPayload(entry, probe, externalRunning) {
+    const pref = this.sessionPrefs.get(entry.threadId)
+    const isRunning = this.activeTurns.has(entry.threadId) || externalRunning
+    return {
+      id: makeCompositeId(APPS.CODEX, entry.threadId),
+      app: APPS.CODEX,
+      nativeId: entry.threadId,
+      title: entry.title || entry.threadId,
+      preview: entry.preview || '',
+      cwd: entry.cwd || '',
+      workspace: entry.workspace || (entry.cwd ? basename(entry.cwd) : ''),
+      model: pref?.model || entry.model || '',
+      status: isRunning ? 'running' : 'idle',
+      syncState: { externalRunning },
+      writable: true,
+      createdAt: entry.createdAt || 0,
+      updatedAt: Math.round(probe.mtimeMs || Date.now()),
+    }
+  }
+
+  async pollExternalSessions() {
+    if (this.watchPollInFlight) return
+    if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0) {
+      if (this.watchTimer) {
+        clearInterval(this.watchTimer)
+        this.watchTimer = null
+      }
+      return
+    }
+    this.watchPollInFlight = true
+    try {
+      const now = Date.now()
+      const emittedIds = new Set()
+
+      // 1. Poll actively watched (opened) Codex sessions for live message/tool progress & status transitions
+      for (const [tid, w] of [...this.watchedSessions.entries()]) {
+        if (now - w.lastSeenAt > CODEX_WATCH_TTL_MS) {
+          this.watchedSessions.delete(tid)
+          continue
+        }
+        if (this.activeTurns.has(tid)) {
+          const cur = probeCodexRolloutStatus(w.path, { now, maxIdleMs: this.externalMaxIdleMs })
+          w.size = cur.size
+          w.mtimeMs = cur.mtimeMs
+          w.externalRunning = false
+          continue
+        }
+        const cur = probeCodexRolloutStatus(w.path, { now, maxIdleMs: this.externalMaxIdleMs })
+        const fileChanged = cur.exists && (cur.size !== w.size || cur.mtimeMs !== w.mtimeMs)
+        const statusChanged = cur.running !== w.externalRunning
+        if (!fileChanged && !statusChanged) continue
+
+        w.size = cur.size
+        w.mtimeMs = cur.mtimeMs
+        w.externalRunning = cur.running
+        const tracked = this.trackedListSessions.get(tid)
+        if (tracked) {
+          tracked.size = cur.size
+          tracked.mtimeMs = cur.mtimeMs
+          tracked.externalRunning = cur.running
+        }
+        emittedIds.add(tid)
+        this.emitEvent(EVENTS.SESSION_UPDATED, {
+          historyChanged: fileChanged,
+          statusChanged,
+          externalUpdate: true,
+          session: this.buildSessionUpdatedPayload(w, cur, cur.running),
+        })
+      }
+
+      // 2. Poll top recent sidebar Codex sessions so running dots flip live when Desktop starts/finishes any task
+      for (const [tid, entry] of [...this.trackedListSessions.entries()]) {
+        if (now - entry.lastSeenAt > CODEX_TRACKED_LIST_TTL_MS) {
+          this.trackedListSessions.delete(tid)
+          continue
+        }
+        if (emittedIds.has(tid) || this.watchedSessions.has(tid)) continue
+        if (this.activeTurns.has(tid)) {
+          entry.externalRunning = false
+          continue
+        }
+        const cur = probeCodexRolloutStatus(entry.path, { now, maxIdleMs: this.externalMaxIdleMs })
+        const statusChanged = cur.running !== entry.externalRunning
+        entry.size = cur.size
+        entry.mtimeMs = cur.mtimeMs
+        if (!statusChanged) continue
+
+        entry.externalRunning = cur.running
+        this.emitEvent(EVENTS.SESSION_UPDATED, {
+          historyChanged: false,
+          statusChanged: true,
+          externalUpdate: true,
+          session: this.buildSessionUpdatedPayload(entry, cur, cur.running),
+        })
+      }
+
+      // 3. Periodically discover newly started / resumed Desktop Codex threads via existing reader daemon
+      if (
+        this.trackedListSessions.size > 0 &&
+        this.reader.proc &&
+        !this.reader.proc.killed &&
+        now - this.lastListDiscoveryAt >= CODEX_LIST_DISCOVERY_INTERVAL_MS
+      ) {
+        this.lastListDiscoveryAt = now
+        try {
+          const res = await this.rpc(
+            'thread/list',
+            { limit: 10, useStateDbOnly: true, sortKey: 'updated_at', sortDirection: 'desc' },
+            5_000,
+          )
+          for (const raw of res?.data || []) {
+            if (!raw?.id || !raw?.path || this.activeTurns.has(raw.id)) continue
+            const probe = probeCodexRolloutStatus(raw.path, { now, maxIdleMs: this.externalMaxIdleMs })
+            const prev = this.trackedListSessions.get(raw.id)
+            const summary = normalizeThreadSummary(raw)
+            const prevRunning = Boolean(prev?.externalRunning)
+            this.rememberTrackedListSession(raw.id, {
+              ...summary,
+              path: raw.path,
+              probe,
+              externalRunning: probe.running,
+            })
+            if ((!prev && probe.running) || (prev && prevRunning !== probe.running)) {
+              const entry = this.trackedListSessions.get(raw.id)
+              if (entry && !emittedIds.has(raw.id)) {
+                this.emitEvent(EVENTS.SESSION_UPDATED, {
+                  historyChanged: false,
+                  statusChanged: true,
+                  externalUpdate: true,
+                  session: this.buildSessionUpdatedPayload(entry, probe, probe.running),
+                })
+              }
+            }
+          }
+        } catch {}
+      }
+
+      if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0 && this.watchTimer) {
+        clearInterval(this.watchTimer)
+        this.watchTimer = null
+      }
+    } finally {
+      this.watchPollInFlight = false
+    }
+  }
+
   async listSessions({ limit = 80, search = '' } = {}) {
     const res = await this.rpc('thread/list', {
       limit,
@@ -1065,7 +1403,41 @@ export class CodexAdapter {
       sortDirection: 'desc',
       ...(search ? { searchTerm: search } : {}),
     })
-    const items = (res?.data || []).map(normalizeThreadSummary)
+    const now = Date.now()
+    const rawList = Array.isArray(res?.data) ? res.data : []
+    const items = []
+    for (let i = 0; i < rawList.length; i += 1) {
+      const raw = rawList[i]
+      const item = normalizeThreadSummary(raw)
+      const isLocalActive = this.activeTurns.has(item.nativeId)
+      let probe = null
+      let externalRunning = false
+      // Probe recent threads (top 15 or updated within maxIdleMs+5m) via zero-OOM rollout tail-seek
+      if (!isLocalActive && raw?.path && (i < CODEX_TRACKED_LIST_LIMIT || now - (item.updatedAt || 0) <= this.externalMaxIdleMs + 5 * 60_000)) {
+        probe = probeCodexRolloutStatus(raw.path, { now, maxIdleMs: this.externalMaxIdleMs })
+        externalRunning = probe.running
+        if (probe.mtimeMs > (item.updatedAt || 0)) {
+          item.updatedAt = Math.round(probe.mtimeMs)
+        }
+      }
+      if (isLocalActive) {
+        item.status = 'running'
+        item.syncState = { externalRunning: false }
+      } else if (externalRunning) {
+        item.status = 'running'
+        item.syncState = { externalRunning: true }
+      }
+      if (!search && i < CODEX_TRACKED_LIST_LIMIT && raw?.path) {
+        this.rememberTrackedListSession(item.nativeId, {
+          ...item,
+          path: raw.path,
+          probe,
+          externalRunning,
+        })
+      }
+      items.push(item)
+    }
+    this.lastListDiscoveryAt = now
     const seen = new Set(items.map((x) => x.nativeId))
     for (const [tid, entry] of this.pendingNewWriters.entries()) {
       if (!seen.has(tid) && entry.summary) {
@@ -1212,16 +1584,45 @@ export class CodexAdapter {
     }
 
     const pref = this.sessionPrefs.get(threadId)
+    const isLocalActive = this.activeTurns.has(threadId)
+    const rolloutProbe = !isLocalActive && t.path
+      ? probeCodexRolloutStatus(t.path, { maxIdleMs: this.externalMaxIdleMs })
+      : null
+    const externalRunning = Boolean(!isLocalActive && rolloutProbe?.running)
+    const title = (t.name && t.name.trim()) || (t.preview && t.preview.trim().slice(0, 56)) || pendingNew?.summary?.title || threadId
+    const cwd = t.cwd || pendingNew?.summary?.cwd || ''
+    const model = pref?.model || t.model || ''
+    const updatedAt = Math.max(
+      toEpochMs(t.updatedAt || t.recencyAt || t.createdAt),
+      Math.round(rolloutProbe?.mtimeMs || 0),
+    )
+
+    if (!cursor && t.path) {
+      this.rememberWatchedSession(threadId, {
+        path: t.path,
+        probe: rolloutProbe,
+        externalRunning,
+        title,
+        preview: (t.preview || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        cwd,
+        workspace: cwd ? basename(cwd) : '',
+        model,
+        createdAt: toEpochMs(t.createdAt),
+      })
+    }
+
     return {
       id: makeCompositeId(APPS.CODEX, threadId),
       app: APPS.CODEX,
       nativeId: threadId,
-      title: (t.name && t.name.trim()) || (t.preview && t.preview.trim().slice(0, 56)) || pendingNew?.summary?.title || threadId,
-      cwd: t.cwd || pendingNew?.summary?.cwd || '',
-      model: pref?.model || t.model || '',
+      title,
+      cwd,
+      model,
       reasoningEffort: pref?.reasoningEffort || t.reasoningEffort || '',
       writable: true,
-      status: this.activeTurns.has(threadId) ? 'running' : 'idle',
+      status: isLocalActive || externalRunning ? 'running' : 'idle',
+      syncState: { externalRunning },
+      updatedAt,
       messages,
       hasMore,
       nextCursor,
@@ -1410,6 +1811,12 @@ export class CodexAdapter {
   }
 
   async dispose() {
+    if (this.watchTimer) {
+      clearInterval(this.watchTimer)
+      this.watchTimer = null
+    }
+    this.watchedSessions.clear()
+    this.trackedListSessions.clear()
     for (const [tid, entry] of this.pendingNewWriters.entries()) {
       clearTimeout(entry.timer)
       entry.writer.killImmediate()

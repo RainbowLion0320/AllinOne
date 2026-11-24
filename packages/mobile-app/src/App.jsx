@@ -883,7 +883,13 @@ export function App() {
         setSessions((prev) =>
           prev.map((s) =>
             s.id === targetId
-              ? { ...s, status: res.session.status || s.status, title: res.session.title || s.title }
+              ? {
+                  ...s,
+                  status: res.session.status || s.status,
+                  title: res.session.title || s.title,
+                  ...(res.session.syncState ? { syncState: res.session.syncState } : {}),
+                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
+                }
               : s,
           ),
         )
@@ -1089,7 +1095,9 @@ export function App() {
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
         const updated = payload.session
         setSessions((prev) => {
-          const next = [updated, ...prev.filter((s) => s.id !== updated.id)]
+          const prevItem = prev.find((s) => s.id === updated.id)
+          const merged = prevItem ? { ...prevItem, ...updated } : updated
+          const next = [merged, ...prev.filter((s) => s.id !== updated.id)]
           next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
           return next
         })

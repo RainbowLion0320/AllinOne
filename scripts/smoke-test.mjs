@@ -24,7 +24,7 @@ import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import { AntigravityAdapter, parseAgyTranscriptContent } from '../packages/dsh-mobile-hub/src/adapters/antigravity.js'
-import { CodexAdapter, normalizeCodexTurns, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
+import { CodexAdapter, normalizeCodexTurns, probeCodexRolloutStatus, readCodexRolloutTail } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
 import { ClaudeAdapter } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
 import {
@@ -4110,7 +4110,143 @@ async function main() {
         }
       }
     }
-    console.log('[smoke] 22/22 Interactive Multi-Question Q&A & Approvals across Codex, DSH (+IPC), Antigravity ACP, Claude Code & Orchestrator OK')
+    console.log('[smoke] 22/23 Interactive Multi-Question Q&A & Approvals across Codex, DSH (+IPC), Antigravity ACP, Claude Code & Orchestrator OK')
+
+    // 23. Codex external running-state detection (zero-OOM rollout tail probe + giant line resilience + live external watcher)
+    {
+      const cdxDir = join(tmpDir, 'codex-live-watch')
+      mkdirSync(cdxDir, { recursive: true })
+      const emptyFile = join(cdxDir, 'empty-thread.jsonl')
+      const activeFile = join(cdxDir, 'active-thread.jsonl')
+      const giantFile = join(cdxDir, 'giant-screenshot.jsonl')
+      const doneFile = join(cdxDir, 'done-thread.jsonl')
+      const abortedFile = join(cdxDir, 'aborted-thread.jsonl')
+
+      // (a) Brand-new empty thread (session_meta only) -> idle
+      writeFileSync(emptyFile, `${JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: 't-empty' } })}\n`)
+      assert.equal(probeCodexRolloutStatus(emptyFile).running, false, 'Empty thread with only session_meta must be idle')
+
+      // (b) Completed thread ending with task_complete (even with trailing metadata rename) -> idle
+      writeFileSync(doneFile, [
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_complete' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'thread_name_updated', name: 'Renamed' } }),
+      ].join('\n') + '\n')
+      assert.equal(probeCodexRolloutStatus(doneFile).running, false, 'Completed thread must be idle even after rename metadata')
+
+      // (c) Aborted thread ending with turn_aborted -> idle
+      writeFileSync(abortedFile, [
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'turn_aborted' } }),
+      ].join('\n') + '\n')
+      assert.equal(probeCodexRolloutStatus(abortedFile).running, false, 'Aborted thread must be idle')
+
+      // (d) Active thread mid-tool-execution -> running; stale beyond maxIdleMs -> idle
+      writeFileSync(activeFile, [
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count' } }),
+      ].join('\n') + '\n')
+      assert.equal(probeCodexRolloutStatus(activeFile).running, true, 'Active thread mid-turn must be detected as running')
+      assert.equal(
+        probeCodexRolloutStatus(activeFile, { now: Date.now() + 30 * 60_000, maxIdleMs: 20 * 60_000 }).running,
+        false,
+        'Stale crashed rollout beyond maxIdleMs must never report running',
+      )
+
+      // (e) Giant >64KB line (e.g., base64 screenshot) + trailing token_count -> running; once task_complete appended -> idle
+      const bigPayload = 'A'.repeat(90 * 1024)
+      writeFileSync(giantFile, [
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'function_call_output', output: bigPayload } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count' } }),
+      ].join('\n') + '\n')
+      assert.equal(probeCodexRolloutStatus(giantFile).running, true, 'Giant rollout after >64KB screenshot must still detect running')
+      writeFileSync(giantFile, [
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'function_call_output', output: bigPayload } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count' } }),
+        JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_complete' } }),
+      ].join('\n') + '\n')
+      assert.equal(probeCodexRolloutStatus(giantFile).running, false, 'Giant rollout must flip idle immediately on task_complete')
+
+      // (f) Live external watcher on CodexAdapter: watched open chat + tracked sidebar thread transitions
+      const cdxWatchEvents = []
+      const cdxWatch = new CodexAdapter({
+        config: { watchPollIntervalMs: 200 },
+        log: { info() {}, warn() {}, debug() {} },
+        emitEvent: (ev, payload) => cdxWatchEvents.push({ ev, payload }),
+      })
+      try {
+        cdxWatch.rememberWatchedSession('thr-watch-open', { path: doneFile, title: 'Open Chat', cwd: cdxDir })
+        cdxWatch.rememberTrackedListSession('thr-watch-side', { path: abortedFile, title: 'Sidebar Chat', cwd: cdxDir })
+
+        // Desktop starts a task in both threads!
+        await new Promise((r) => setTimeout(r, 60))
+        writeFileSync(doneFile, [
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_complete' } }),
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec' } }),
+        ].join('\n') + '\n')
+        writeFileSync(abortedFile, [
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'turn_aborted' } }),
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+        ].join('\n') + '\n')
+
+        for (let i = 0; i < 20; i += 1) {
+          const openHit = cdxWatchEvents.some(
+            (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === 'thr-watch-open' && e.payload?.session?.status === 'running',
+          )
+          const sideHit = cdxWatchEvents.some(
+            (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === 'thr-watch-side' && e.payload?.session?.status === 'running',
+          )
+          if (openHit && sideHit) break
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        const openStartEv = cdxWatchEvents.find(
+          (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === 'thr-watch-open' && e.payload?.session?.status === 'running',
+        )
+        const sideStartEv = cdxWatchEvents.find(
+          (e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.session?.nativeId === 'thr-watch-side' && e.payload?.session?.status === 'running',
+        )
+        assert.ok(openStartEv, 'Watched Codex chat must emit SESSION_UPDATED(running) when Desktop starts a turn')
+        assert.equal(openStartEv.payload.historyChanged, true)
+        assert.equal(openStartEv.payload.statusChanged, true)
+        assert.equal(openStartEv.payload.session.syncState?.externalRunning, true)
+        assert.ok(sideStartEv, 'Sidebar tracked Codex thread must emit SESSION_UPDATED(running) when Desktop starts a turn')
+        assert.equal(sideStartEv.payload.statusChanged, true)
+
+        // Desktop finishes the open chat -> must flip back to idle automatically!
+        await new Promise((r) => setTimeout(r, 60))
+        writeFileSync(doneFile, [
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
+          JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_complete' } }),
+        ].join('\n') + '\n')
+        for (let i = 0; i < 20; i += 1) {
+          if (
+            cdxWatchEvents.some(
+              (e) =>
+                e.ev === EVENTS.SESSION_UPDATED &&
+                e.payload?.session?.nativeId === 'thr-watch-open' &&
+                e.payload?.session?.status === 'idle',
+            )
+          ) {
+            break
+          }
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        const openDoneEv = cdxWatchEvents.find(
+          (e) =>
+            e.ev === EVENTS.SESSION_UPDATED &&
+            e.payload?.session?.nativeId === 'thr-watch-open' &&
+            e.payload?.session?.status === 'idle',
+        )
+        assert.ok(openDoneEv, 'Watched Codex chat must flip back to idle automatically on task_complete')
+        assert.equal(openDoneEv.payload.session.syncState?.externalRunning, false)
+      } finally {
+        await cdxWatch.dispose()
+      }
+    }
+    console.log('[smoke] 23/23 Codex external running-state detection (zero-OOM rollout tail probe + giant file + live watcher) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
