@@ -104,3 +104,104 @@ html.dark textarea:-webkit-autofill {
   background-color: var(--brand);
   animation: caret-blink 0.9s infinite;
 }
+
+/* Syntax highlighting palette (GitHub Light / One Dark Pro) */
+.hljs {
+  color: #24292f;
+}
+.hljs-comment,
+.hljs-quote {
+  color: #6e7781;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-meta .hljs-keyword,
+.hljs-doctag,
+.hljs-template-tag {
+  color: #cf222e;
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute,
+.hljs-meta .hljs-string {
+  color: #0a3069;
+}
+.hljs-number,
+.hljs-literal,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-tag .hljs-attr {
+  color: #0550ae;
+}
+.hljs-title,
+.hljs-section,
+.hljs-selector-id,
+.hljs-title.function_,
+.hljs-title.class_ {
+  color: #8250df;
+}
+.hljs-built_in,
+.hljs-type,
+.hljs-symbol,
+.hljs-bullet {
+  color: #953800;
+}
+.hljs-deletion {
+  color: #82071e;
+  background-color: rgba(255, 129, 130, 0.18);
+}
+.hljs-addition {
+  color: #116329;
+  background-color: rgba(74, 194, 107, 0.18);
+}
+
+html.dark .hljs {
+  color: #abb2bf;
+}
+html.dark .hljs-comment,
+html.dark .hljs-quote {
+  color: #7f848e;
+}
+html.dark .hljs-keyword,
+html.dark .hljs-selector-tag,
+html.dark .hljs-meta .hljs-keyword,
+html.dark .hljs-doctag,
+html.dark .hljs-template-tag {
+  color: #c678dd;
+}
+html.dark .hljs-string,
+html.dark .hljs-regexp,
+html.dark .hljs-attribute,
+html.dark .hljs-meta .hljs-string {
+  color: #98c379;
+}
+html.dark .hljs-number,
+html.dark .hljs-literal,
+html.dark .hljs-variable,
+html.dark .hljs-template-variable,
+html.dark .hljs-tag .hljs-attr {
+  color: #d19a66;
+}
+html.dark .hljs-title,
+html.dark .hljs-section,
+html.dark .hljs-selector-id,
+html.dark .hljs-title.function_ {
+  color: #61afef;
+}
+html.dark .hljs-built_in,
+html.dark .hljs-type,
+html.dark .hljs-title.class_,
+html.dark .hljs-symbol,
+html.dark .hljs-bullet {
+  color: #e5c07b;
+}
+html.dark .hljs-deletion {
+  color: #ff7b72;
+  background-color: rgba(248, 81, 73, 0.16);
+}
+html.dark .hljs-addition {
+  color: #7ee787;
+  background-color: rgba(46, 160, 67, 0.16);
+}

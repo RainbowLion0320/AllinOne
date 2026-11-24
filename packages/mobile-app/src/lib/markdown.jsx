@@ -1,16 +1,172 @@
-import React, { useState } from 'react'
-import { Check, Copy, Image as ImageIcon } from 'lucide-react'
+import React, { useMemo, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import hljs from 'highlight.js/lib/core'
+import bash from 'highlight.js/lib/languages/bash'
+import cpp from 'highlight.js/lib/languages/cpp'
+import css from 'highlight.js/lib/languages/css'
+import diff from 'highlight.js/lib/languages/diff'
+import dockerfile from 'highlight.js/lib/languages/dockerfile'
+import go from 'highlight.js/lib/languages/go'
+import ini from 'highlight.js/lib/languages/ini'
+import java from 'highlight.js/lib/languages/java'
+import javascript from 'highlight.js/lib/languages/javascript'
+import json from 'highlight.js/lib/languages/json'
+import markdownLang from 'highlight.js/lib/languages/markdown'
+import powershell from 'highlight.js/lib/languages/powershell'
+import python from 'highlight.js/lib/languages/python'
+import rust from 'highlight.js/lib/languages/rust'
+import sql from 'highlight.js/lib/languages/sql'
+import typescript from 'highlight.js/lib/languages/typescript'
+import xml from 'highlight.js/lib/languages/xml'
+import yaml from 'highlight.js/lib/languages/yaml'
+import {
+  AlertCircle,
+  AlertTriangle,
+  Check,
+  Copy,
+  Image as ImageIcon,
+  Info,
+  Lightbulb,
+  ShieldAlert,
+  WrapText,
+} from 'lucide-react'
 import { useI18n } from './i18n.jsx'
 import {
   getImageLabel,
   isImageTarget,
   resolveImageSrc,
-  scanMarkdownLinks,
 } from './imageUrls.js'
 
+hljs.registerLanguage('bash', bash)
+hljs.registerLanguage('sh', bash)
+hljs.registerLanguage('shell', bash)
+hljs.registerLanguage('zsh', bash)
+hljs.registerLanguage('cpp', cpp)
+hljs.registerLanguage('c', cpp)
+hljs.registerLanguage('css', css)
+hljs.registerLanguage('diff', diff)
+hljs.registerLanguage('dockerfile', dockerfile)
+hljs.registerLanguage('docker', dockerfile)
+hljs.registerLanguage('go', go)
+hljs.registerLanguage('ini', ini)
+hljs.registerLanguage('toml', ini)
+hljs.registerLanguage('java', java)
+hljs.registerLanguage('javascript', javascript)
+hljs.registerLanguage('js', javascript)
+hljs.registerLanguage('jsx', javascript)
+hljs.registerLanguage('json', json)
+hljs.registerLanguage('markdown', markdownLang)
+hljs.registerLanguage('md', markdownLang)
+hljs.registerLanguage('powershell', powershell)
+hljs.registerLanguage('ps1', powershell)
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('py', python)
+hljs.registerLanguage('rust', rust)
+hljs.registerLanguage('rs', rust)
+hljs.registerLanguage('sql', sql)
+hljs.registerLanguage('typescript', typescript)
+hljs.registerLanguage('ts', typescript)
+hljs.registerLanguage('tsx', typescript)
+hljs.registerLanguage('xml', xml)
+hljs.registerLanguage('html', xml)
+hljs.registerLanguage('svg', xml)
+hljs.registerLanguage('yaml', yaml)
+hljs.registerLanguage('yml', yaml)
+
+const REMARK_PLUGINS = [remarkGfm]
+
+const ALERT_STYLES = {
+  NOTE: {
+    Icon: Info,
+    labelZh: '说明',
+    labelEn: 'Note',
+    box: 'border-sky-200/90 bg-sky-50/80 text-sky-900 dark:border-sky-800/70 dark:bg-sky-950/35 dark:text-sky-100',
+    title: 'text-sky-700 dark:text-sky-300',
+  },
+  TIP: {
+    Icon: Lightbulb,
+    labelZh: '提示',
+    labelEn: 'Tip',
+    box: 'border-emerald-200/90 bg-emerald-50/80 text-emerald-900 dark:border-emerald-800/70 dark:bg-emerald-950/35 dark:text-emerald-100',
+    title: 'text-emerald-700 dark:text-emerald-300',
+  },
+  IMPORTANT: {
+    Icon: AlertCircle,
+    labelZh: '重要',
+    labelEn: 'Important',
+    box: 'border-violet-200/90 bg-violet-50/80 text-violet-900 dark:border-violet-800/70 dark:bg-violet-950/35 dark:text-violet-100',
+    title: 'text-violet-700 dark:text-violet-300',
+  },
+  WARNING: {
+    Icon: AlertTriangle,
+    labelZh: '注意',
+    labelEn: 'Warning',
+    box: 'border-amber-200/90 bg-amber-50/85 text-amber-950 dark:border-amber-800/70 dark:bg-amber-950/35 dark:text-amber-100',
+    title: 'text-amber-700 dark:text-amber-300',
+  },
+  CAUTION: {
+    Icon: ShieldAlert,
+    labelZh: '警告',
+    labelEn: 'Caution',
+    box: 'border-rose-200/90 bg-rose-50/85 text-rose-950 dark:border-rose-800/70 dark:bg-rose-950/35 dark:text-rose-100',
+    title: 'text-rose-700 dark:text-rose-300',
+  },
+}
+
+function safeUrlTransform(url) {
+  const trimmed = String(url || '').trim()
+  if (!trimmed) return ''
+  // Block dangerous script/HTML schemes while allowing http(s), mailto, tel, and file/local refs
+  if (/^(?:javascript|vbscript|data:text\/html)/i.test(trimmed)) {
+    return ''
+  }
+  return trimmed
+}
+
+/**
+ * Normalize line endings and safely angle-bracket local `file:///` links containing spaces
+ * so CommonMark parses them reliably without breaking code fences.
+ */
+function preprocessMarkdown(raw) {
+  const normalized = String(raw || '').replace(/\r\n?/g, '\n')
+  const lines = normalized.split('\n')
+  let inFence = false
+  const out = lines.map((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      return line
+    }
+    if (inFence) return line
+    // Wrap `file:///...` links containing spaces in angle brackets so react-markdown parses them as links
+    return line.replace(/(\[[^\]]+\])\((file:\/\/\/[^)\n]*\s[^)\n]*)\)/g, '$1(<$2>)')
+  })
+  return out.join('\n')
+}
+
+function extractPlainText(node) {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(extractPlainText).join('')
+  if (React.isValidElement(node)) return extractPlainText(node.props?.children)
+  return ''
+}
+
 function CodeBlock({ language, code }) {
-  const { t } = useI18n()
+  const { t, bi } = useI18n()
   const [copied, setCopied] = useState(false)
+  const [wrap, setWrap] = useState(false)
+
+  const highlightedHtml = useMemo(() => {
+    const cleanLang = String(language || '').trim().toLowerCase()
+    if (!code) return ''
+    try {
+      if (cleanLang && hljs.getLanguage(cleanLang)) {
+        return hljs.highlight(code, { language: cleanLang, ignoreIllegals: true }).value
+      }
+    } catch {}
+    return ''
+  }, [language, code])
 
   const handleCopy = () => {
     navigator.clipboard?.writeText(code).then(() => {
@@ -20,396 +176,320 @@ function CodeBlock({ language, code }) {
   }
 
   return (
-    <div className="my-2.5 max-w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#F7F9FC] dark:border-slate-700/80 dark:bg-[#1E2028]">
-      <div className="flex items-center justify-between border-b border-slate-200/70 px-3.5 py-1.5 text-[11px] font-medium text-slate-500 dark:border-slate-700/70 dark:text-slate-400">
-        <span>{language || 'code'}</span>
-        <button
-          type="button"
-          onClick={handleCopy}
-          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-slate-200/60 dark:hover:bg-slate-700/60"
-        >
-          {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
-          <span>{copied ? t('common.copied') : t('common.copy')}</span>
-        </button>
+    <div className="my-2.5 max-w-full overflow-hidden rounded-2xl border border-slate-200/85 bg-[#F7F9FC] dark:border-slate-700/80 dark:bg-[#191B23]">
+      <div className="flex items-center justify-between gap-2 border-b border-slate-200/75 bg-slate-100/70 px-3.5 py-1.5 text-[11px] font-medium text-slate-500 dark:border-slate-700/70 dark:bg-[#20232E] dark:text-slate-400">
+        <span className="truncate font-mono uppercase tracking-wide text-[10.5px]">
+          {language || 'code'}
+        </span>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setWrap((v) => !v)}
+            title={wrap ? bi('取消自动换行', 'Disable wrap') : bi('自动换行', 'Wrap lines')}
+            className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 transition ${
+              wrap
+                ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/20 dark:text-[#96AEFF]'
+                : 'hover:bg-slate-200/70 dark:hover:bg-slate-700/60'
+            }`}
+          >
+            <WrapText className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={handleCopy}
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 transition hover:bg-slate-200/70 dark:hover:bg-slate-700/60"
+          >
+            {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
+            <span>{copied ? t('common.copied') : t('common.copy')}</span>
+          </button>
+        </div>
       </div>
-      <pre className="max-w-full overflow-x-auto p-3.5 text-[13px] leading-relaxed text-slate-800 dark:text-slate-200">
-        <code>{code}</code>
+      <pre
+        className={`max-w-full p-3.5 font-mono text-[12.5px] leading-relaxed text-slate-800 dark:text-slate-200 ${
+          wrap ? 'overflow-x-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere]' : 'overflow-x-auto'
+        }`}
+      >
+        {highlightedHtml ? (
+          <code className="hljs" dangerouslySetInnerHTML={{ __html: highlightedHtml }} />
+        ) : (
+          <code>{code}</code>
+        )}
       </pre>
     </div>
   )
 }
 
-function renderPlainTokens(segment, imageContext, keyRef) {
-  const parts = []
-  const regex =
-    /(`[^`]+`|\*\*[^*]+\*\*|file:\/\/\/[^\s"'`<>\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif)|[A-Za-z]:[\\/][^\s`"'<>|*?\[\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))/gi
-  let lastIndex = 0
-  let match
-
-  while ((match = regex.exec(segment)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(segment.slice(lastIndex, match.index))
-    }
-    const token = match[0]
-    if (token.startsWith('`')) {
-      const inner = token.slice(1, -1)
-      if (imageContext && isImageTarget(inner)) {
-        const src = imageContext.e2eeActive ? '' : resolveImageSrc(inner, imageContext)
-        const label = getImageLabel(inner)
-        parts.push(
-          <button
-            key={`imgc-${keyRef.n++}`}
-            type="button"
-            onClick={() =>
-              (src || imageContext.e2eeActive) &&
-              imageContext.onOpenImage?.({
-                images: [{ item: { path: inner, name: label }, src, label, rawPath: inner }],
-                index: 0,
-              })
-            }
-            className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-md bg-[#EEF2FF] px-1.5 py-0.5 align-baseline font-mono text-[0.86em] text-[#3552E8] hover:bg-[#E0E7FF] dark:bg-[#273154] dark:text-[#96AEFF]"
-          >
-            <ImageIcon className="h-3 w-3 shrink-0" />
-            <span className="truncate">{label}</span>
-          </button>,
-        )
-      } else {
-        parts.push(
-          <code
-            key={`c-${keyRef.n++}`}
-            className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
-          >
-            {inner}
-          </code>,
-        )
+function ImageChip({ target, label, imageContext }) {
+  const isRemoteHttp = /^https?:\/\//i.test(target)
+  const useE2ee = Boolean(imageContext?.e2eeActive && !isRemoteHttp)
+  const src = useE2ee ? '' : resolveImageSrc(target, imageContext || {})
+  const displayLabel = label || getImageLabel(target)
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        (src || useE2ee) &&
+        imageContext?.onOpenImage?.({
+          images: [{ item: { path: target, name: displayLabel }, src, label: displayLabel, rawPath: target }],
+          index: 0,
+        })
       }
-    } else if (token.startsWith('**')) {
-      parts.push(
-        <strong key={`b-${keyRef.n++}`} className="font-semibold text-slate-900 dark:text-white">
-          {token.slice(2, -2)}
-        </strong>,
-      )
-    } else if (imageContext && isImageTarget(token)) {
-      const src = imageContext.e2eeActive ? '' : resolveImageSrc(token, imageContext)
-      const label = getImageLabel(token)
-      parts.push(
-        <button
-          key={`imgp-${keyRef.n++}`}
-          type="button"
-          onClick={() =>
-            (src || imageContext.e2eeActive) &&
-            imageContext.onOpenImage?.({
-              images: [{ item: { path: token, name: label }, src, label, rawPath: token }],
-              index: 0,
-            })
-          }
-          className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] transition hover:bg-[#E0E7FF] active:scale-95 dark:bg-[#273154] dark:text-[#96AEFF]"
-        >
-          <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">{label}</span>
-        </button>,
-      )
-    } else {
-      parts.push(token)
-    }
-    lastIndex = regex.lastIndex
-  }
-  if (lastIndex < segment.length) {
-    parts.push(segment.slice(lastIndex))
-  }
-  return parts
+      className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] transition hover:bg-[#E0E7FF] active:scale-95 dark:bg-[#273154] dark:text-[#96AEFF]"
+    >
+      <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+      <span className="truncate">{displayLabel}</span>
+    </button>
+  )
 }
 
-function renderInline(text, imageContext) {
-  const srcText = String(text || '')
-  const links = scanMarkdownLinks(srcText)
-  const keyRef = { n: 0 }
+function RichBlockquote({ children }) {
+  const { lang } = useI18n()
+  const childArr = React.Children.toArray(children)
+  const firstText = extractPlainText(childArr[0]).trim()
+  const alertMatch = firstText.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/s)
 
-  if (links.length === 0) {
-    return renderPlainTokens(srcText, imageContext, keyRef)
-  }
-
-  const parts = []
-  let cursor = 0
-
-  for (const item of links) {
-    if (item.start > cursor) {
-      parts.push(...renderPlainTokens(srcText.slice(cursor, item.start), imageContext, keyRef))
-    }
-
-    const isImg = item.isImage || isImageTarget(item.dest)
-    if (isImg && imageContext) {
-      const isRemoteHttp = /^https?:\/\//i.test(item.dest)
-      const useE2ee = Boolean(imageContext.e2eeActive && !isRemoteHttp)
-      const src = useE2ee ? '' : resolveImageSrc(item.dest, imageContext)
-      const label = item.label || getImageLabel(item.dest)
-      parts.push(
-        <button
-          key={`imgl-${keyRef.n++}`}
-          type="button"
-          onClick={() =>
-            (src || useE2ee) &&
-            imageContext.onOpenImage?.({
-              images: [{ item: { path: item.dest, name: label }, src, label, rawPath: item.dest }],
-              index: 0,
-            })
-          }
-          className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] transition hover:bg-[#E0E7FF] active:scale-95 dark:bg-[#273154] dark:text-[#96AEFF]"
-        >
-          <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">{label}</span>
-        </button>,
-      )
-    } else if (/^https?:\/\//i.test(item.dest)) {
-      parts.push(
-        <a
-          key={`a-${keyRef.n++}`}
-          href={item.dest}
-          target="_blank"
-          rel="noreferrer"
-          className="break-all text-[#4D6BFE] underline underline-offset-2"
-        >
-          {item.label || item.dest}
-        </a>,
-      )
-    } else {
-      // Non-image local file link (e.g. [app.js](file:///...)) -> clean inline code label
-      parts.push(
-        <code
-          key={`fl-${keyRef.n++}`}
-          className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[0.88em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-slate-800 dark:text-[#8CA3FF]"
-        >
-          {item.label || item.dest}
-        </code>,
-      )
-    }
-
-    cursor = item.end
-  }
-
-  if (cursor < srcText.length) {
-    parts.push(...renderPlainTokens(srcText.slice(cursor), imageContext, keyRef))
-  }
-
-  return parts
-}
-
-function splitTableRow(line) {
-  const trimmed = String(line || '').trim()
-  const inner = trimmed.replace(/^\|/, '').replace(/\|$/, '')
-  return inner.split('|').map((cell) => cell.trim())
-}
-
-function parseTableAlignments(sepLine) {
-  const trimmed = String(sepLine || '').trim()
-  if (!trimmed.includes('|') || !/^[\s|:-]+$/.test(trimmed)) return null
-  const cells = splitTableRow(trimmed)
-  if (cells.length === 0) return null
-  const aligns = []
-  for (const c of cells) {
-    if (!/^:?-{2,}:?$/.test(c)) return null
-    if (c.startsWith(':') && c.endsWith(':')) aligns.push('text-center')
-    else if (c.endsWith(':')) aligns.push('text-right')
-    else aligns.push('text-left')
-  }
-  return aligns
-}
-
-function isTableStart(lines, idx) {
-  if (idx + 1 >= lines.length) return false
-  const header = String(lines[idx] || '').trim()
-  if (!header.includes('|')) return false
-  const aligns = parseTableAlignments(lines[idx + 1])
-  if (!aligns) return false
-  return splitTableRow(header).length > 0
-}
-
-/**
- * Lightweight, XSS-safe Markdown renderer styled to match DeepSeek Mobile typography.
- * Supports balanced-parenthesis image links (e.g. `屏幕截图(1).png`), inline lightbox chips,
- * and locally scrollable GFM tables & fenced code blocks.
- */
-export function MarkdownView({ text, streaming = false, imageContext = null }) {
-  if (!text) return null
-  const blocks = []
-  const lines = String(text).split('\n')
-  let i = 0
-
-  while (i < lines.length) {
-    const line = lines[i]
-
-    // Fenced code block
-    if (line.trim().startsWith('```')) {
-      const lang = line.trim().slice(3).trim()
-      const codeLines = []
-      i += 1
-      while (i < lines.length && !lines[i].trim().startsWith('```')) {
-        codeLines.push(lines[i])
-        i += 1
-      }
-      if (i < lines.length) i += 1
-      blocks.push(<CodeBlock key={blocks.length} language={lang} code={codeLines.join('\n')} />)
-      continue
-    }
-
-    // GFM Markdown table (scrolls locally inside its own card without widening the page)
-    if (isTableStart(lines, i)) {
-      const headers = splitTableRow(lines[i])
-      const aligns = parseTableAlignments(lines[i + 1]) || []
-      i += 2
-      const rows = []
-      while (i < lines.length) {
-        const cur = String(lines[i] || '').trim()
-        if (!cur || !cur.includes('|')) break
-        rows.push(splitTableRow(cur))
-        i += 1
-      }
-      const colCount = Math.max(headers.length, aligns.length)
-      blocks.push(
-        <div
-          key={blocks.length}
-          className="my-2.5 max-w-full overflow-x-auto rounded-2xl border border-slate-200/80 bg-white dark:border-slate-700/80 dark:bg-[#1B1D25]"
-        >
-          <table className="w-full min-w-max border-collapse text-[13px] leading-snug">
-            <thead className="bg-slate-50/90 text-slate-600 dark:bg-[#232631] dark:text-slate-300">
-              <tr>
-                {Array.from({ length: colCount }).map((_, cIdx) => (
-                  <th
-                    key={cIdx}
-                    className={`border-b border-slate-200/80 px-3 py-2 font-semibold whitespace-nowrap dark:border-slate-700/80 ${aligns[cIdx] || 'text-left'}`}
-                  >
-                    {renderInline(headers[cIdx] || '', imageContext)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200/60 text-slate-700 dark:divide-slate-700/60 dark:text-slate-200">
-              {rows.map((row, rIdx) => (
-                <tr key={rIdx} className="hover:bg-slate-50/60 dark:hover:bg-white/[0.02]">
-                  {Array.from({ length: colCount }).map((__, cIdx) => (
-                    <td
-                      key={cIdx}
-                      className={`px-3 py-2 align-top whitespace-nowrap ${aligns[cIdx] || 'text-left'}`}
-                    >
-                      {renderInline(row[cIdx] || '', imageContext)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>,
-      )
-      continue
-    }
-
-    // Headings
-    const hMatch = line.match(/^(#{1,4})\s+(.+)$/)
-    if (hMatch) {
-      const level = hMatch[1].length
-      const sizes = {
-        1: 'text-lg font-bold mt-3.5 mb-1.5',
-        2: 'text-base font-bold mt-3 mb-1.5',
-        3: 'text-[15px] font-semibold mt-2.5 mb-1',
-        4: 'text-sm font-semibold mt-2 mb-1',
-      }
-      blocks.push(
-        <div key={blocks.length} className={`${sizes[level]} break-words [overflow-wrap:anywhere] text-slate-900 dark:text-white`}>
-          {renderInline(hMatch[2], imageContext)}
-        </div>,
-      )
-      i += 1
-      continue
-    }
-
-    // Blockquote
-    if (line.startsWith('> ')) {
-      const quoteLines = []
-      while (i < lines.length && lines[i].startsWith('> ')) {
-        quoteLines.push(lines[i].slice(2))
-        i += 1
-      }
-      blocks.push(
-        <blockquote
-          key={blocks.length}
-          className="my-2 border-l-3 border-[#4D6BFE]/50 pl-3 text-[14px] break-words [overflow-wrap:anywhere] text-slate-600 dark:text-slate-300"
-        >
-          {quoteLines.map((ql, idx) => (
-            <p key={idx} className="my-0.5">{renderInline(ql, imageContext)}</p>
-          ))}
-        </blockquote>,
-      )
-      continue
-    }
-
-    // Unordered list
-    if (/^\s*[-*•]\s+/.test(line)) {
-      const items = []
-      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*[-*•]\s+/, ''))
-        i += 1
-      }
-      blocks.push(
-        <ul key={blocks.length} className="my-1.5 list-disc space-y-1 pl-5 text-[15px] leading-relaxed break-words [overflow-wrap:anywhere]">
-          {items.map((item, idx) => (
-            <li key={idx}>{renderInline(item, imageContext)}</li>
-          ))}
-        </ul>,
-      )
-      continue
-    }
-
-    // Ordered list
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items = []
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''))
-        i += 1
-      }
-      blocks.push(
-        <ol key={blocks.length} className="my-1.5 list-decimal space-y-1 pl-5 text-[15px] leading-relaxed break-words [overflow-wrap:anywhere]">
-          {items.map((item, idx) => (
-            <li key={idx}>{renderInline(item, imageContext)}</li>
-          ))}
-        </ol>,
-      )
-      continue
-    }
-
-    // Horizontal rule
-    if (/^---+$/.test(line.trim())) {
-      blocks.push(<hr key={blocks.length} className="my-3 border-slate-200 dark:border-slate-700" />)
-      i += 1
-      continue
-    }
-
-    if (line.trim() === '') {
-      i += 1
-      continue
-    }
-
-    // Paragraph
-    const para = []
-    while (
-      i < lines.length &&
-      lines[i].trim() !== '' &&
-      !lines[i].trim().startsWith('```') &&
-      !isTableStart(lines, i) &&
-      !/^(#{1,4})\s+/.test(lines[i]) &&
-      !lines[i].startsWith('> ') &&
-      !/^\s*[-*•]\s+/.test(lines[i]) &&
-      !/^\s*\d+\.\s+/.test(lines[i]) &&
-      !/^---+$/.test(lines[i].trim())
-    ) {
-      para.push(lines[i])
-      i += 1
-    }
-    blocks.push(
-      <p key={blocks.length} className="my-1.5 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[15px] leading-[1.7] text-slate-800 dark:text-slate-100">
-        {renderInline(para.join('\n'), imageContext)}
-      </p>,
+  if (alertMatch) {
+    const kind = alertMatch[1]
+    const spec = ALERT_STYLES[kind] || ALERT_STYLES.NOTE
+    const Icon = spec.Icon
+    const firstRest = alertMatch[2]
+    const remainingChildren = childArr.slice(1)
+    return (
+      <div className={`my-2.5 rounded-2xl border px-3.5 py-2.5 text-[14px] leading-relaxed break-words [overflow-wrap:anywhere] ${spec.box}`}>
+        <div className={`mb-1 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide ${spec.title}`}>
+          <Icon className="h-3.5 w-3.5 shrink-0" />
+          <span>{lang === 'en' ? spec.labelEn : spec.labelZh}</span>
+        </div>
+        {firstRest && <p className="my-0.5 whitespace-pre-wrap">{firstRest}</p>}
+        {remainingChildren}
+      </div>
     )
   }
 
-  return <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>{blocks}</div>
+  return (
+    <blockquote className="my-2.5 rounded-r-xl border-l-3 border-[#4D6BFE]/60 bg-slate-50/75 py-1.5 pr-3 pl-3.5 text-[14px] leading-relaxed break-words [overflow-wrap:anywhere] text-slate-600 dark:bg-white/[0.025] dark:text-slate-300">
+      {children}
+    </blockquote>
+  )
+}
+
+/**
+ * Full GFM-compliant, XSS-safe Markdown renderer styled for both Mobile & Desktop:
+ * - GFM tables (locally scrollable rounded cards with alignment & inline formatting)
+ * - Syntax-highlighted code blocks (highlight.js) with copy & wrap toggle
+ * - Nested lists, GFM task checklists, GitHub Alert callouts, strikethrough, italic, bold+code
+ * - E2EE local image lightbox chips & safe local file path pills
+ */
+export function MarkdownView({ text, streaming = false, imageContext = null }) {
+  const prepared = useMemo(() => preprocessMarkdown(text), [text])
+
+  const components = useMemo(
+    () => ({
+      h1: ({ children }) => (
+        <h1 className="mt-4 mb-2 border-b border-slate-200/80 pb-1.5 text-[18px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/70 dark:text-white">
+          {children}
+        </h1>
+      ),
+      h2: ({ children }) => (
+        <h2 className="mt-3.5 mb-2 border-b border-slate-200/60 pb-1 text-[16.5px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/60 dark:text-white">
+          {children}
+        </h2>
+      ),
+      h3: ({ children }) => (
+        <h3 className="mt-3 mb-1.5 text-[15.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:text-white">
+          {children}
+        </h3>
+      ),
+      h4: ({ children }) => (
+        <h4 className="mt-2.5 mb-1 text-[14.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 dark:text-slate-100">
+          {children}
+        </h4>
+      ),
+      h5: ({ children }) => (
+        <h5 className="mt-2 mb-1 text-sm font-semibold break-words [overflow-wrap:anywhere] text-slate-700 dark:text-slate-200">
+          {children}
+        </h5>
+      ),
+      h6: ({ children }) => (
+        <h6 className="mt-2 mb-1 text-xs font-semibold uppercase tracking-wide break-words [overflow-wrap:anywhere] text-slate-500 dark:text-slate-400">
+          {children}
+        </h6>
+      ),
+      p: ({ children }) => (
+        <p className="my-2 text-[15px] leading-[1.72] break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 last:mb-0 dark:text-slate-100">
+          {children}
+        </p>
+      ),
+      strong: ({ children }) => (
+        <strong className="font-semibold text-slate-950 dark:text-white">{children}</strong>
+      ),
+      em: ({ children }) => (
+        <em className="italic text-slate-700 dark:text-slate-200">{children}</em>
+      ),
+      del: ({ children }) => (
+        <del className="text-slate-400 line-through dark:text-slate-500">{children}</del>
+      ),
+      hr: () => <hr className="my-3.5 border-slate-200/90 dark:border-slate-700/80" />,
+      ul: ({ className, children }) => (
+        <ul
+          className={`my-2 space-y-1.5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 dark:text-slate-100 ${
+            String(className || '').includes('contains-task-list')
+              ? 'list-none pl-1'
+              : 'list-disc pl-5 marker:text-slate-400 dark:marker:text-slate-500'
+          }`}
+        >
+          {children}
+        </ul>
+      ),
+      ol: ({ children }) => (
+        <ol className="my-2 list-decimal space-y-1.5 pl-5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 marker:font-medium marker:text-slate-400 dark:text-slate-100 dark:marker:text-slate-500">
+          {children}
+        </ol>
+      ),
+      li: ({ className, children }) => (
+        <li
+          className={
+            String(className || '').includes('task-list-item')
+              ? 'flex items-start gap-2'
+              : 'pl-0.5 [&>ul]:my-1 [&>ol]:my-1 [&>p]:my-0.5'
+          }
+        >
+          {children}
+        </li>
+      ),
+      input: ({ type, checked }) => {
+        if (type === 'checkbox') {
+          return (
+            <span
+              aria-checked={Boolean(checked)}
+              role="checkbox"
+              className={`mt-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] ${
+                checked
+                  ? 'border-[#4D6BFE] bg-[#4D6BFE] text-white'
+                  : 'border-slate-300 bg-white dark:border-slate-600 dark:bg-[#16171A]'
+              }`}
+            >
+              {checked ? <Check className="h-3 w-3 stroke-[3]" /> : null}
+            </span>
+          )
+        }
+        return null
+      },
+      blockquote: ({ children }) => <RichBlockquote>{children}</RichBlockquote>,
+      table: ({ children }) => (
+        <div className="my-3 max-w-full overflow-x-auto rounded-2xl border border-slate-200/90 bg-white shadow-2xs dark:border-slate-700/80 dark:bg-[#1A1C24]">
+          <table className="w-full min-w-full border-collapse text-[13px] leading-snug">
+            {children}
+          </table>
+        </div>
+      ),
+      thead: ({ children }) => (
+        <thead className="bg-slate-50/95 text-slate-600 dark:bg-[#232633] dark:text-slate-200">
+          {children}
+        </thead>
+      ),
+      tbody: ({ children }) => (
+        <tbody className="divide-y divide-slate-200/70 text-slate-700 dark:divide-slate-700/60 dark:text-slate-200">
+          {children}
+        </tbody>
+      ),
+      tr: ({ children }) => (
+        <tr className="even:bg-slate-50/45 hover:bg-[#4D6BFE]/[0.04] dark:even:bg-white/[0.015] dark:hover:bg-white/[0.03]">
+          {children}
+        </tr>
+      ),
+      th: ({ style, children }) => (
+        <th
+          style={style}
+          className="border-b border-slate-200/90 px-3 py-2.5 text-left font-semibold whitespace-nowrap dark:border-slate-700/80"
+        >
+          {children}
+        </th>
+      ),
+      td: ({ style, children }) => (
+        <td
+          style={style}
+          className="max-w-[260px] px-3 py-2 align-top break-words [overflow-wrap:anywhere]"
+        >
+          {children}
+        </td>
+      ),
+      pre: ({ children }) => {
+        const codeEl = React.Children.toArray(children).find((c) => React.isValidElement(c))
+        const className = String(codeEl?.props?.className || '')
+        const langMatch = className.match(/language-([\w+-]+)/i)
+        const rawCode = extractPlainText(codeEl?.props?.children ?? children).replace(/\n$/, '')
+        return <CodeBlock language={langMatch ? langMatch[1] : ''} code={rawCode} />
+      },
+      code: ({ className, children }) => {
+        const textVal = extractPlainText(children)
+        if (className && /language-/i.test(className)) {
+          return <code className={className}>{children}</code>
+        }
+        if (imageContext && isImageTarget(textVal)) {
+          return <ImageChip target={textVal} label={getImageLabel(textVal)} imageContext={imageContext} />
+        }
+        return (
+          <code className="rounded-md bg-slate-100/95 px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#242836] dark:text-[#9AB0FF]">
+            {children}
+          </code>
+        )
+      },
+      a: ({ href, children }) => {
+        const dest = String(href || '').trim()
+        const label = extractPlainText(children).trim()
+        if (imageContext && isImageTarget(dest)) {
+          return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageContext} />
+        }
+        if (/^(?:https?:\/\/|mailto:|tel:)/i.test(dest)) {
+          return (
+            <a
+              href={dest}
+              target="_blank"
+              rel="noreferrer"
+              className="break-all font-medium text-[#4D6BFE] underline decoration-[#4D6BFE]/40 underline-offset-2 transition hover:decoration-[#4D6BFE] dark:text-[#7F98FF]"
+            >
+              {children}
+            </a>
+          )
+        }
+        // Local file links (e.g. [app.js](file:///...)) -> clean inline code badge
+        return (
+          <code className="rounded-md bg-[#EEF2FF] px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#232B45] dark:text-[#9AB0FF]">
+            {label || dest}
+          </code>
+        )
+      },
+      img: ({ src, alt }) => {
+        const target = String(src || '').trim()
+        if (!target) return null
+        if (imageContext) {
+          return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageContext} />
+        }
+        return (
+          <img
+            src={target}
+            alt={alt || ''}
+            loading="lazy"
+            className="my-2 max-h-80 max-w-full rounded-xl border border-slate-200/80 object-contain dark:border-slate-700/80"
+          />
+        )
+      },
+    }),
+    [imageContext],
+  )
+
+  if (!text) return null
+
+  return (
+    <div className={`md-body min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        urlTransform={safeUrlTransform}
+        components={components}
+      >
+        {prepared}
+      </ReactMarkdown>
+    </div>
+  )
 }
