@@ -51,6 +51,15 @@ Linux 或纯终端环境可直接运行一行命令接入：
 - **iOS / 通用网页**：手机扫码或直接打开网页端，点「**添加到主屏幕**」即可作为 App 使用；登录同一账号后自动列出名下全部在线电脑。
 - **Android**：手机扫码下载安装 `All-in-One-Android.apk`（自动热更新最新界面），也可前往 [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest) 下载。
 
+> [!TIP]
+> **公开体验邀请码（一码一人，先到先得）**
+>
+> 想直接试用可填入体验服务器 `https://123.206.218.214/dsh/`（正规 Let's Encrypt HTTPS + 强制零知识 AES-256-GCM 端到端加密，中转服务器无法查看你的任何对话、代码与文件），任选以下一个邀请码注册体验：
+>
+> `INV-KXRR-6BNB` · `INV-DCMM-3WFY` · `INV-AFCC-SX2F` · `INV-NUER-YGDK` · `INV-3HXE-UGEK`
+>
+> 如已用完可按下方 Docker 教程一键自建，或提交 Issue 留言获取新码。
+
 ---
 
 ### 2. 自建中转服务器（Docker）

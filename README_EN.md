@@ -51,6 +51,15 @@ On Linux or headless machines, connect with a single command:
 - **iOS / Universal Web**: Scan the QR code or open the web app in your mobile browser and tap **Add to Home Screen** to install as a PWA. Sign in with the same account to access all of your online computers.
 - **Android**: Scan to download and install `All-in-One-Android.apk` (auto hot-updates the web UI), or download from [**GitHub Releases**](https://github.com/RainbowLion0320/AllinOne/releases/latest).
 
+> [!TIP]
+> **Public Trial Invite Codes (Single-Use, First-Come First-Served)**
+>
+> Want to try it immediately? Connect to the trial relay `https://123.206.218.214/dsh/` (trusted Let's Encrypt HTTPS + mandatory zero-knowledge AES-256-GCM E2EE — the relay server cannot read any of your chats, code, or files) and register with any of the codes below:
+>
+> `INV-KXRR-6BNB` · `INV-DCMM-3WFY` · `INV-AFCC-SX2F` · `INV-NUER-YGDK` · `INV-3HXE-UGEK`
+>
+> If all codes are claimed, self-host your own relay in minutes with Docker below or open an Issue to request a fresh code.
+
 ---
 
 ### 2. Self-Host the Relay Server (Docker)
