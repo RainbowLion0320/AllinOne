@@ -884,7 +884,8 @@ export class MobileRelayClient {
             msg.event === 'e2ee.grant.offer' ||
             msg.event === 'e2ee.grant.deliver' ||
             msg.event === 'e2ee.grant.reject' ||
-            msg.event === 'e2ee.grant.cancel'
+            msg.event === 'e2ee.grant.cancel' ||
+            msg.event === 'e2ee.qr.nudge'
           ) {
             // Relay-routed ephemeral ECDH public-key / ciphertext-envelope signaling (never plaintext E2EE keys)
             if (msg.event === 'e2ee.grant.request' && msg.payload?.reqId) {
@@ -1109,6 +1110,16 @@ export class MobileRelayClient {
   sendGrantCancel({ reqId }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     this.ws.send(JSON.stringify({ type: 'e2ee.grant.cancel', reqId }))
+    return true
+  }
+
+  sendQrNudge({ wantedKeyId = '', action = 'scanning' } = {}) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({
+      type: 'e2ee.qr.nudge',
+      action: action === 'done' ? 'done' : 'scanning',
+      ...(wantedKeyId ? { wantedKeyId } : {}),
+    }))
     return true
   }
 

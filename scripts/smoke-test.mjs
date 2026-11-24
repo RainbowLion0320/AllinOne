@@ -5073,6 +5073,66 @@ async function main() {
     }
     console.log('[smoke] 30/30 Codex async questions (request_user_input_async), turn/steer delivery, rollout extraction & pretty reply OK')
 
+    // 31. Mobile-to-Desktop E2EE QR Scan Nudge (same-room delivery, rate limit, room isolation & disconnect cleanup)
+    {
+      const nudgePc = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'Smoke-Desktop', clientKind: 'desktop' })
+      const nudgePhone = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'iPhone · Safari', clientKind: 'mobile' })
+      const nudgeOther = await openTicketClientWs(httpBase, port, friendB.token, { deviceName: 'Other-Account-PC', clientKind: 'desktop' })
+      try {
+        const waitForNudge = (cli, predicate, timeoutMs = 3000) =>
+          new Promise((resolve, reject) => {
+            const start = Date.now()
+            const check = () => {
+              const hit = cli.events.find((e) => e.event === EVENTS.E2EE_QR_NUDGE && predicate(e.payload || {}))
+              if (hit) {
+                resolve(hit.payload)
+                return
+              }
+              if (Date.now() - start > timeoutMs) {
+                reject(new Error('Timed out waiting for e2ee.qr.nudge'))
+                return
+              }
+              setTimeout(check, 25)
+            }
+            check()
+          })
+
+        // 31a. Mobile sends scanning nudge -> same-room PC receives it, sender & other account do NOT
+        nudgePhone.ws.send(JSON.stringify({ type: 'e2ee.qr.nudge', action: 'scanning', wantedKeyId: '0123456789abcdef' }))
+        const received = await waitForNudge(nudgePc, (p) => p.action === 'scanning')
+        assert.equal(received.deviceName, 'iPhone · Safari')
+        assert.equal(received.wantedKeyId, '0123456789abcdef')
+        assert.equal(received.requesterClientId, nudgePhone.hello.clientId)
+
+        // 31b. Rapid duplicate scanning nudge within 4s is rate-limited; invalid wantedKeyId is ignored
+        nudgePhone.ws.send(JSON.stringify({ type: 'e2ee.qr.nudge', action: 'scanning', wantedKeyId: '0123456789abcdef' }))
+        nudgePhone.ws.send(JSON.stringify({ type: 'e2ee.qr.nudge', action: 'scanning', wantedKeyId: 'not-valid-hex!' }))
+        await new Promise((r) => setTimeout(r, 120))
+        const pcScanningNudges = nudgePc.events.filter((e) => e.event === EVENTS.E2EE_QR_NUDGE && e.payload?.action === 'scanning')
+        assert.equal(pcScanningNudges.length, 1, 'Duplicate rapid scanning nudges must be rate-limited')
+        assert.equal(
+          nudgePhone.events.filter((e) => e.event === EVENTS.E2EE_QR_NUDGE).length,
+          0,
+          'Sender must never receive its own QR nudge echo',
+        )
+        assert.equal(
+          nudgeOther.events.filter((e) => e.event === EVENTS.E2EE_QR_NUDGE).length,
+          0,
+          'Cross-account clients must NEVER receive another account QR nudge',
+        )
+
+        // 31c. Disconnecting the nudging mobile client automatically sends `action: done` to PC
+        nudgePhone.ws.close()
+        const donePayload = await waitForNudge(nudgePc, (p) => p.action === 'done')
+        assert.equal(donePayload.requesterClientId, nudgePhone.hello.clientId)
+      } finally {
+        try { nudgePc.ws.close() } catch {}
+        try { nudgePhone.ws.close() } catch {}
+        try { nudgeOther.ws.close() } catch {}
+      }
+    }
+    console.log('[smoke] 31/31 Mobile-to-Desktop E2EE QR scan nudge (isolation, rate limit & disconnect cleanup) OK')
+
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
     if (acctPortableChild) {

@@ -348,6 +348,16 @@ export function E2eeSyncModal({
     return () => unsub?.()
   }, [open, client, tab, roomId, bridgeE2ee?.keyId, isDesktopApp, onImportKeyring, onImportKey, onClose, bi])
 
+  // When a locked device opens the QR scanner, nudge any online unlocked device (e.g. PC) to surface its QR button
+  useEffect(() => {
+    if (!open || !scannerOpen || canShowMyKey || !client) return
+    const wantedKeyId = String(bridgeE2ee?.keyId || '').trim().toLowerCase()
+    client.sendQrNudge?.({ wantedKeyId, action: 'scanning' })
+    return () => {
+      client.sendQrNudge?.({ wantedKeyId, action: 'done' })
+    }
+  }, [open, scannerOpen, canShowMyKey, client, bridgeE2ee?.keyId])
+
   const qrDataUrl = useMemo(() => {
     if (!activeKey) return ''
     try {
@@ -570,7 +580,13 @@ export function E2eeSyncModal({
                       />
                     </div>
                   )}
-                  <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-emerald-500/12 px-2.5 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                  <p className="mt-3 text-xs font-semibold text-slate-800 dark:text-slate-100">
+                    {bi('用手机 All in One 扫此码即可解锁', 'Scan with All in One on your phone to unlock')}
+                  </p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                    {bi('手机登录同账号后点击「扫一扫」（请勿使用微信扫码）', 'Sign in on your phone and tap Scan QR (do not use WeChat)')}
+                  </p>
+                  <div className="mt-2.5 inline-flex items-center gap-1.5 rounded-full bg-emerald-500/12 px-2.5 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                     <ShieldCheck className="h-3.5 w-3.5" />
                     <span>{activeFp}</span>
                   </div>

@@ -9,6 +9,7 @@ import {
   FolderOpen,
   Monitor,
   Plus,
+  QrCode,
   RefreshCw,
   ScanLine,
   Search,
@@ -229,9 +230,12 @@ export function SidebarDrawer({
   activeDeviceName,
   username = '',
   isAdmin = false,
+  isDesktopApp = false,
   isMacDesktop = false,
   hasUpdate = false,
   e2eeLocked = false,
+  canShowMyQr = false,
+  onShowMyQr = null,
   onQuickScan,
   onOpenSettings,
   onOpenDeviceSwitcher,
@@ -687,7 +691,21 @@ export function SidebarDrawer({
               </div>
             </button>
 
-            {onQuickScan && (
+            {isDesktopApp && canShowMyQr && onShowMyQr ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onShowMyQr()
+                }}
+                title={bi('显示本机二维码，供手机扫码同步', 'Show QR code for phone sync')}
+                aria-label={bi('连手机', 'Connect Phone')}
+                className="inline-flex h-9 shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE]/10 px-2.5 text-[11.5px] font-semibold text-[#3B59ED] transition hover:bg-[#4D6BFE]/18 active:scale-95 dark:bg-[#4D6BFE]/18 dark:text-[#9BB0FF] dark:hover:bg-[#4D6BFE]/28"
+              >
+                <QrCode className="h-3.5 w-3.5 shrink-0" />
+                <span>{bi('连手机', 'Phone')}</span>
+              </button>
+            ) : onQuickScan ? (
               <button
                 type="button"
                 onClick={() => {
@@ -707,7 +725,7 @@ export function SidebarDrawer({
                   <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
                 )}
               </button>
-            )}
+            ) : null}
 
             <button
               type="button"

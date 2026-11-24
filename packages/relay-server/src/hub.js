@@ -687,9 +687,18 @@ export class RelayHub {
     ws.on('close', () => {
       this.clearPendingRpcsForClient(clientId)
       this.cancelClientGrants(clientId, 'disconnected')
+      const hadQrNudge = Boolean(entry.lastQrNudgeAt)
       const existed = this.clients.delete(clientId)
       this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
       if (existed) {
+        if (hadQrNudge) {
+          this.pushRoomGrantEvent(
+            roomId,
+            EVENTS.E2EE_QR_NUDGE,
+            { requesterClientId: clientId, action: 'done', ts: Date.now() },
+            clientId,
+          )
+        }
         this.recordActivity({
           type: 'client.offline',
           roomId,
@@ -940,6 +949,33 @@ export class RelayHub {
       if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId) return
       this.e2eeGrants.delete(reqId)
       this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'cancelled' }, clientId)
+      return
+    }
+
+    // Ephemeral same-room UI nudge when a locked/scanning device wants an unlocked device (e.g. PC) to show its QR code.
+    // Strictly carries non-secret metadata only (no keys, no credentials); rate-limited per client.
+    if (msg.type === 'e2ee.qr.nudge') {
+      const action = msg.action === 'done' ? 'done' : 'scanning'
+      const wantedKeyId = String(msg.wantedKeyId || '').trim().toLowerCase()
+      if (wantedKeyId && !/^[0-9a-f]{16}$/.test(wantedKeyId)) return
+      const now = Date.now()
+      if (action === 'scanning' && client.lastQrNudgeAt && now - client.lastQrNudgeAt < 4_000) {
+        return
+      }
+      if (action === 'scanning') client.lastQrNudgeAt = now
+      this.pushRoomGrantEvent(
+        roomId,
+        EVENTS.E2EE_QR_NUDGE,
+        {
+          requesterClientId: clientId,
+          deviceName: client.deviceName || 'Mobile Device',
+          clientKind: client.clientKind || 'mobile',
+          wantedKeyId,
+          action,
+          ts: now,
+        },
+        clientId,
+      )
       return
     }
 

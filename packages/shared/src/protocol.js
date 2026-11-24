@@ -95,6 +95,7 @@ export const EVENTS = Object.freeze({
   E2EE_GRANT_DELIVER: 'e2ee.grant.deliver',
   E2EE_GRANT_REJECT: 'e2ee.grant.reject',
   E2EE_GRANT_CANCEL: 'e2ee.grant.cancel',
+  E2EE_QR_NUDGE: 'e2ee.qr.nudge',
 })
 
 /**

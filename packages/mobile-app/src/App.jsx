@@ -6,11 +6,13 @@ import {
   KeyRound,
   Lock,
   Menu,
+  QrCode,
   ScanLine,
   ShieldCheck,
   Smartphone,
   SquarePen,
   WifiOff,
+  X,
 } from 'lucide-react'
 import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
@@ -114,6 +116,8 @@ export function App() {
   const [liveOnlineClientCount, setLiveOnlineClientCount] = useState(0)
   const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
   const [pendingGrantPopup, setPendingGrantPopup] = useState(null)
+  const [qrNudge, setQrNudge] = useState(null)
+  const [phoneGuideDismissed, setPhoneGuideDismissed] = useState(false)
   const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '' })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -689,6 +693,63 @@ export function App() {
   e2eeLockedRef.current = e2eeLocked
   const activeE2eeKeysRef = useRef(activeDevice?.e2eeKeys || {})
   activeE2eeKeysRef.current = activeDevice?.e2eeKeys || {}
+  const e2eeModalOpenRef = useRef(false)
+  e2eeModalOpenRef.current = e2eeModal.open
+
+  const phoneGuideKey = activeDevice?.roomId ? `allinone_phone_guide_done::${activeDevice.roomId}` : ''
+
+  const dismissPhoneGuide = useCallback(() => {
+    setPhoneGuideDismissed(true)
+    if (phoneGuideKey) {
+      try { localStorage.setItem(phoneGuideKey, '1') } catch {}
+    }
+  }, [phoneGuideKey])
+
+  const openDesktopQrModal = useCallback(() => {
+    setQrNudge(null)
+    dismissPhoneGuide()
+    setE2eeModal({ open: true, tab: 'show', autoOpenScanner: false })
+  }, [dismissPhoneGuide])
+
+  useEffect(() => {
+    if (!phoneGuideKey) {
+      setPhoneGuideDismissed(true)
+      return
+    }
+    try {
+      setPhoneGuideDismissed(localStorage.getItem(phoneGuideKey) === '1')
+    } catch {
+      setPhoneGuideDismissed(false)
+    }
+  }, [phoneGuideKey])
+
+  // Auto-retire first-time desktop phone onboarding once a 2nd client (phone) connects to this account
+  useEffect(() => {
+    if (desktopApi && phoneGuideKey && liveOnlineClientCount >= 2 && !phoneGuideDismissed) {
+      dismissPhoneGuide()
+    }
+  }, [desktopApi, phoneGuideKey, liveOnlineClientCount, phoneGuideDismissed, dismissPhoneGuide])
+
+  // Auto-clear mobile scan nudge when QR modal opens or after 60s timeout
+  useEffect(() => {
+    if (e2eeModal.open && qrNudge) {
+      setQrNudge(null)
+      return
+    }
+    if (!qrNudge) return
+    const timer = setTimeout(() => setQrNudge(null), 60_000)
+    return () => clearTimeout(timer)
+  }, [e2eeModal.open, qrNudge])
+
+  // Mobile side C1: when locked on the E2EE unlock screen, gently nudge online desktop to surface a 1-click "Show QR" bar
+  useEffect(() => {
+    if (desktopApi || connState !== 'connected' || !bridgeOnline || !e2eeLocked) return
+    const wantedKeyId = String(activeBridgeE2ee.keyId || '').trim().toLowerCase()
+    clientRef.current?.sendQrNudge?.({ wantedKeyId, action: 'scanning' })
+    return () => {
+      clientRef.current?.sendQrNudge?.({ wantedKeyId, action: 'done' })
+    }
+  }, [desktopApi, connState, bridgeOnline, e2eeLocked, activeBridgeE2ee.keyId])
 
   useEffect(() => {
     clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
@@ -1248,6 +1309,7 @@ export function App() {
       e2eeKeys: devSnap?.e2eeKeys || {},
     })
     setPendingGrantPopup(null)
+    setQrNudge(null)
     clientRef.current = client
 
     const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ }) => {
@@ -1281,6 +1343,29 @@ export function App() {
         event === EVENTS.E2EE_GRANT_DELIVER ||
         event === EVENTS.E2EE_GRANT_REJECT
       ) {
+        return
+      }
+      if (event === EVENTS.E2EE_QR_NUDGE && payload) {
+        if (payload.requesterClientId && payload.requesterClientId === client.clientId) return
+        if (payload.action === 'done') {
+          setQrNudge((prev) =>
+            prev && (!payload.requesterClientId || prev.requesterClientId === payload.requesterClientId)
+              ? null
+              : prev,
+          )
+          return
+        }
+        const myKeys = activeE2eeKeysRef.current || {}
+        const wantedKid = String(payload.wantedKeyId || '').trim().toLowerCase()
+        const canHelp = wantedKid ? Boolean(myKeys[wantedKid]) : Object.keys(myKeys).length > 0
+        if (canHelp && !e2eeModalOpenRef.current) {
+          setQrNudge({
+            requesterClientId: payload.requesterClientId || '',
+            deviceName: payload.deviceName || bi('手机端', 'Phone'),
+            wantedKeyId: wantedKid,
+            receivedAt: Date.now(),
+          })
+        }
         return
       }
 
@@ -2338,9 +2423,12 @@ export function App() {
         activeDeviceName={activeDeviceName}
         username={activeDevice?.username || ''}
         isAdmin={isAdmin}
+        isDesktopApp={Boolean(desktopApi)}
         isMacDesktop={isMacDesktop}
         hasUpdate={updateState?.status === 'available' || updateState?.status === 'downloaded'}
         e2eeLocked={e2eeLocked}
+        canShowMyQr={Boolean(!e2eeLocked && activeBridgeE2ee.shareableKey)}
+        onShowMyQr={openDesktopQrModal}
         onQuickScan={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
@@ -2398,29 +2486,37 @@ export function App() {
               {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && (
                 <button
                   type="button"
-                  onClick={() =>
+                  onClick={() => {
+                    if (!e2eeLocked && desktopApi) {
+                      openDesktopQrModal()
+                      return
+                    }
                     setE2eeModal({
                       open: true,
                       tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'show',
                       autoOpenScanner: false,
                     })
-                  }
+                  }}
                   title={
                     e2eeLocked
                       ? bi('需扫码同步端到端加密密钥', 'Sync E2EE key')
                       : bi(
-                          `端到端加密已开启 (AES-256-GCM · ${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
-                          `End-to-End Encrypted (AES-256-GCM · ${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
+                          `端到端加密已开启，点击显示二维码供手机扫码 (${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
+                          `End-to-End Encrypted — click to show QR for phone sync (${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
                         )
                   }
-                  className={`inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold transition active:scale-95 ${
+                  className={`inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold transition active:scale-95 ${
                     e2eeLocked
                       ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
                       : 'bg-emerald-500/12 text-emerald-600 hover:bg-emerald-500/20 dark:text-emerald-400'
                   }`}
                 >
                   {e2eeLocked ? <Lock className="h-2.5 w-2.5" /> : <ShieldCheck className="h-2.5 w-2.5" />}
-                  {e2eeLocked && <span>{bi('同步密钥', 'Unlock')}</span>}
+                  {e2eeLocked ? (
+                    <span>{bi('同步密钥', 'Unlock')}</span>
+                  ) : desktopApi ? (
+                    <span>{bi('同步码', 'QR')}</span>
+                  ) : null}
                 </button>
               )}
             </div>
@@ -2523,6 +2619,78 @@ export function App() {
         )
       })()}
 
+      {/* C1: Live nudge banner when another logged-in device (e.g. phone) is waiting to scan this computer's QR */}
+      {qrNudge &&
+        connState === 'connected' &&
+        !e2eeLocked &&
+        activeBridgeE2ee.shareableKey &&
+        (!qrNudge.wantedKeyId || activeBridgeE2ee.shareableKeyId === qrNudge.wantedKeyId) &&
+        !e2eeModal.open && (
+        <div className="flex flex-wrap items-center justify-center gap-2 border-b border-[#4D6BFE]/20 bg-[#EEF2FF] px-3 py-2 text-xs text-[#2842C9] dark:border-[#4D6BFE]/30 dark:bg-[#1C243C] dark:text-[#C5D3FF]">
+          <span className="h-2 w-2 shrink-0 rounded-full bg-[#4D6BFE] animate-pulse" />
+          <Smartphone className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+          <span>
+            {bi(
+              `「${qrNudge.deviceName}」正在等待扫码同步密钥`,
+              `${qrNudge.deviceName} is waiting to scan your QR code`,
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={openDesktopQrModal}
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white shadow-xs transition hover:bg-[#3B59ED] active:scale-95"
+          >
+            <QrCode className="h-3 w-3" />
+            <span>{bi('一键显示二维码', 'Show QR Code')}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setQrNudge(null)}
+            aria-label={bi('关闭提示', 'Dismiss')}
+            className="rounded-lg p-1 text-[#4D6BFE]/70 transition hover:bg-[#4D6BFE]/12 hover:text-[#2842C9] dark:text-slate-400 dark:hover:text-slate-200"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* B1: First-time desktop non-blocking onboarding strip (auto-retires once a phone connects or dismissed) */}
+      {desktopApi &&
+        connState === 'connected' &&
+        bridgeOnline &&
+        !e2eeLocked &&
+        activeBridgeE2ee.shareableKey &&
+        liveOnlineClientCount <= 1 &&
+        !phoneGuideDismissed &&
+        !qrNudge &&
+        !e2eeModal.open && (
+          <div className="flex flex-wrap items-center justify-center gap-2 border-b border-slate-200/70 bg-[#F4F7FF] px-3 py-2 text-xs text-slate-700 dark:border-slate-800 dark:bg-[#1A1F30] dark:text-slate-200">
+            <Smartphone className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+            <span>
+              {bi(
+                '想用手机随时远程控制？手机登录同账号后扫本机二维码即可解锁',
+                'Want to control from your phone? Sign in on mobile and scan this computer’s QR',
+              )}
+            </span>
+            <button
+              type="button"
+              onClick={openDesktopQrModal}
+              className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
+            >
+              <QrCode className="h-3 w-3" />
+              <span>{bi('显示二维码', 'Show QR')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={dismissPhoneGuide}
+              aria-label={bi('以后再说', 'Dismiss')}
+              className="rounded-lg px-1.5 py-0.5 text-[11px] text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            >
+              {bi('暂不', 'Later')}
+            </button>
+          </div>
+        )}
+
       {/* Non-intrusive toast pill */}
       {toastMsg && (
         <div className="pointer-events-none fixed top-16 left-1/2 z-[60] -translate-x-1/2">
@@ -2599,6 +2767,12 @@ export function App() {
                     <KeyRound className="h-3.5 w-3.5" />
                     <span>{bi('粘贴恢复密钥', 'Paste Recovery Key')}</span>
                   </button>
+                  <p className="pt-1.5 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
+                    {bi(
+                      '电脑端已自动弹出提示，或点击电脑端左下角「连手机」/ 顶部「同步码」显示二维码',
+                      'Check the prompt on your computer, or click "Phone" (bottom-left) / "QR" (top) to display the code',
+                    )}
+                  </p>
                 </>
               )}
             </div>
