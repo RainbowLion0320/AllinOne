@@ -54,9 +54,18 @@ function formatClientDeviceLabel(name, kind, lang) {
     if (kind === 'mobile') return 'Mobile App'
     return 'Web Client'
   }
-  if (/^Windows Desktop$/i.test(raw)) return 'Windows 桌面端'
-  if (/^macOS Desktop$/i.test(raw)) return 'macOS 桌面端'
-  if (/^Linux Desktop$/i.test(raw)) return 'Linux 桌面端'
+  if (/^Windows Desktop(?:\s*·\s*(.+))?$/i.test(raw)) {
+    const host = raw.replace(/^Windows Desktop(?:\s*·\s*)?/i, '').trim()
+    return host ? `Windows 桌面端 · ${host}` : 'Windows 桌面端'
+  }
+  if (/^macOS Desktop(?:\s*·\s*(.+))?$/i.test(raw)) {
+    const host = raw.replace(/^macOS Desktop(?:\s*·\s*)?/i, '').trim()
+    return host ? `macOS 桌面端 · ${host}` : 'macOS 桌面端'
+  }
+  if (/^Linux Desktop(?:\s*·\s*(.+))?$/i.test(raw)) {
+    const host = raw.replace(/^Linux Desktop(?:\s*·\s*)?/i, '').trim()
+    return host ? `Linux 桌面端 · ${host}` : 'Linux 桌面端'
+  }
   if (/^Desktop App$/i.test(raw)) return '桌面端'
   if (/^Android App$/i.test(raw)) return 'Android 客户端'
   if (/^iOS App$/i.test(raw)) return 'iOS 客户端'

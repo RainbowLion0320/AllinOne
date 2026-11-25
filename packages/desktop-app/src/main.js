@@ -20,8 +20,9 @@ import {
   screen,
   shell,
 } from 'electron'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
@@ -123,6 +124,25 @@ function saveLangPref(lang) {
     writeFileSync(p, JSON.stringify({ ...cur, lang: norm }, null, 2), 'utf8')
   } catch {}
   return norm
+}
+
+function loadOrCreateDesktopClientUid() {
+  try {
+    const dir = app.getPath('userData')
+    const p = join(dir, 'prefs.json')
+    let cur = {}
+    try {
+      if (existsSync(p)) cur = JSON.parse(readFileSync(p, 'utf8')) || {}
+    } catch {}
+    const existing = String(cur?.clientUid || '').trim()
+    if (/^[a-zA-Z0-9._-]{8,64}$/.test(existing)) return existing
+    const fresh = `cli_${randomBytes(12).toString('hex')}`
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(p, JSON.stringify({ ...cur, clientUid: fresh }, null, 2), 'utf8')
+    return fresh
+  } catch {
+    return ''
+  }
 }
 
 let currentLang = 'zh'
@@ -621,9 +641,14 @@ function registerStaticProtocol() {
 }
 
 function registerIpc() {
+  const desktopClientUid = loadOrCreateDesktopClientUid()
+  const desktopHostname = String(hostname() || '').trim().slice(0, 40)
+
   ipcMain.on('desktop:get-init', (event) => {
     event.returnValue = {
       platform: process.platform,
+      hostname: desktopHostname,
+      clientUid: desktopClientUid,
       version: app.getVersion(),
       defaultServerUrl: DEFAULT_SERVER_URL,
       lang: currentLang,

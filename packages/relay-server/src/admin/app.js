@@ -1463,6 +1463,16 @@
         const twofaInput = document.getElementById('inp-twofa')
         const emailCode = !twofaWrap.classList.contains('hidden') ? twofaInput.value.trim() : ''
         if (!username || !password) throw new Error(bi('请输入管理员账号和密码', 'Please enter username and password'))
+        let adminClientUid = ''
+        try {
+          adminClientUid = String(localStorage.getItem('allinone_admin_client_uid_v1') || '').trim()
+          if (!/^[a-zA-Z0-9._-]{8,64}$/.test(adminClientUid)) {
+            const buf = new Uint8Array(12)
+            crypto.getRandomValues(buf)
+            adminClientUid = 'cli_' + Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+            localStorage.setItem('allinone_admin_client_uid_v1', adminClientUid)
+          }
+        } catch {}
         const res = await apiFetch('/api/account/login', {
           method: 'POST',
           auth: false,
@@ -1472,6 +1482,7 @@
             ...(emailCode ? { emailCode } : {}),
             deviceName: 'Admin Monitor',
             clientKind: 'web',
+            ...(adminClientUid ? { clientUid: adminClientUid } : {}),
           },
         })
         if (res.user?.role !== 'admin') {

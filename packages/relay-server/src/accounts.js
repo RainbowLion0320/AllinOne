@@ -699,14 +699,29 @@ export function createAccountStore({ filePath }) {
     const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
     const cleanPlatform = String(platform || 'unknown').trim().slice(0, 32) || 'unknown'
     const explicitBridgeSlug = String(bridgeId || '').trim() ? sanitizeBridgeSlug(bridgeId) : ''
+    const GENERIC_HOSTS = new Set(['', 'my-pc', 'my pc', 'localhost', 'unknown'])
+    const hostKey = cleanHost.toLowerCase()
+    const platKey = cleanPlatform.toLowerCase()
 
-    // Allow rebinding an existing explicit bridgeId in-place even when at MAX_DEVICES_PER_USER
-    const existingDevice = explicitBridgeSlug
-      ? record.devices.find((d) => d.bridgeId === explicitBridgeSlug)
-      : null
+    // Rebind existing PC in-place by explicit bridgeId OR same non-generic (hostname, platform)
+    // so reinstalling desktop / re-running setup on the same PC never creates duplicate PC entries
+    const existingDevice =
+      (explicitBridgeSlug ? record.devices.find((d) => d.bridgeId === explicitBridgeSlug) : null) ||
+      (!explicitBridgeSlug && !GENERIC_HOSTS.has(hostKey)
+        ? record.devices.find(
+            (d) =>
+              String(d.hostname || '').trim().toLowerCase() === hostKey &&
+              String(d.platform || '').trim().toLowerCase() === platKey,
+          )
+        : null)
     if (existingDevice) {
       const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
-      existingDevice.label = cleanLabel
+      const hadCustomLabel =
+        existingDevice.label &&
+        existingDevice.hostname &&
+        existingDevice.label.trim().toLowerCase() !== existingDevice.hostname.trim().toLowerCase()
+      const incomingIsDefaultLabel = !label || cleanLabel.toLowerCase() === hostKey
+      existingDevice.label = hadCustomLabel && incomingIsDefaultLabel ? existingDevice.label : cleanLabel
       existingDevice.hostname = cleanHost
       existingDevice.platform = cleanPlatform
       existingDevice.secretHash = sha256Hex(`${userId}:${existingDevice.deviceId}:${deviceSecret}`)
@@ -921,12 +936,41 @@ export function createAccountStore({ filePath }) {
   const SESSION_TTL_MS = 31 * 24 * 60 * 60 * 1000
   const MAX_USER_SESSIONS = 30
 
+  function normalizeClientUid(raw) {
+    const clean = String(raw || '').trim()
+    return /^[a-zA-Z0-9._-]{8,64}$/.test(clean) ? clean : ''
+  }
+
+  function isSameDeviceNameOrLegacyUpgrade(oldName, newName) {
+    const a = String(oldName || '').trim().toLowerCase()
+    const b = String(newName || '').trim().toLowerCase()
+    if (!a || !b) return false
+    if (a === b) return true
+    // Match legacy generic "Windows Desktop" when upgraded to "Windows Desktop · Work37" (or vice versa)
+    if (b.startsWith(`${a} · `) || a.startsWith(`${b} · `)) return true
+    return false
+  }
+
   function pruneUserSessionData(record, now = Date.now()) {
     if (!Array.isArray(record.sessions)) record.sessions = []
     if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
-    const active = record.sessions
+    const sorted = record.sessions
       .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !record.revokedSids[s.sid])
       .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
+    // Keep only the newest session per unique non-empty clientUid
+    const seenUids = new Set()
+    const active = []
+    for (const s of sorted) {
+      const uid = normalizeClientUid(s.clientUid)
+      if (uid) {
+        if (seenUids.has(uid)) {
+          record.revokedSids[s.sid] = now
+          continue
+        }
+        seenUids.add(uid)
+      }
+      active.push(s)
+    }
     if (active.length > MAX_USER_SESSIONS) {
       for (const evicted of active.slice(MAX_USER_SESSIONS)) {
         if (evicted?.sid) record.revokedSids[evicted.sid] = now
@@ -949,6 +993,49 @@ export function createAccountStore({ filePath }) {
     }
   }
 
+  function evictDuplicateSessions(record, { keepSid, deviceName, clientKind, ip, clientUid, onlineSids, now }) {
+    const onlineSet = onlineSids instanceof Set ? onlineSids : new Set(Array.isArray(onlineSids) ? onlineSids : [])
+    const replacedSids = []
+    const kept = []
+    const cleanName = String(deviceName || '').trim()
+    const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
+    const cleanIp = String(ip || '').trim()
+    const cleanUid = normalizeClientUid(clientUid)
+    const isAdminMonitor = cleanName.toLowerCase() === 'admin monitor'
+    const isNamedDesktop = cleanKind === 'desktop' && cleanName.includes(' · ')
+
+    for (const s of record.sessions) {
+      if (!s?.sid) continue
+      if (s.sid === keepSid) {
+        kept.push(s)
+        continue
+      }
+      const existingUid = normalizeClientUid(s.clientUid)
+      // 1. Exact clientUid match -> definitively the same device/installation (survives IP switches & re-logins)
+      const sameUid = Boolean(cleanUid && existingUid && existingUid === cleanUid)
+      // 2. Offline ghost dedup (reinstalled APK / cleared storage / legacy pre-clientUid entry / named PC / Admin Monitor)
+      const isOffline = !onlineSet.has(s.sid)
+      const sameKind = (s.clientKind || 'web') === cleanKind
+      const sameName = isSameDeviceNameOrLegacyUpgrade(s.deviceName, cleanName)
+      const isLegacyWithoutUid = !existingUid
+      const isSameIp = Boolean(cleanIp && s.ip && s.ip === cleanIp)
+      const isOfflineGhost = Boolean(
+        isOffline &&
+        sameKind &&
+        sameName &&
+        (isLegacyWithoutUid || isSameIp || isAdminMonitor || isNamedDesktop),
+      )
+      if (sameUid || isOfflineGhost) {
+        record.revokedSids[s.sid] = now
+        replacedSids.push(s.sid)
+        continue
+      }
+      kept.push(s)
+    }
+    record.sessions = kept
+    return replacedSids
+  }
+
   function hasUserSession(userId, sid) {
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
@@ -956,7 +1043,10 @@ export function createAccountStore({ filePath }) {
     return record.sessions.some((s) => s?.sid === cleanSid)
   }
 
-  function recordUserSession(userId, { sid, deviceName = '', clientKind = 'web', ip = '' } = {}) {
+  function recordUserSession(
+    userId,
+    { sid, deviceName = '', clientKind = 'web', ip = '', clientUid = '', onlineSids = null } = {},
+  ) {
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return null
@@ -965,11 +1055,22 @@ export function createAccountStore({ filePath }) {
     const cleanName = String(deviceName || '').trim().slice(0, 64)
     const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
     const cleanIp = String(ip || '').trim().slice(0, 64)
+    const cleanUid = normalizeClientUid(clientUid)
+    const replacedSids = evictDuplicateSessions(record, {
+      keepSid: cleanSid,
+      deviceName: cleanName,
+      clientKind: cleanKind,
+      ip: cleanIp,
+      clientUid: cleanUid,
+      onlineSids,
+      now,
+    })
     let entry = record.sessions.find((s) => s.sid === cleanSid)
     if (entry) {
       if (cleanName) entry.deviceName = cleanName
       entry.clientKind = cleanKind
       if (cleanIp) entry.ip = cleanIp
+      if (cleanUid) entry.clientUid = cleanUid
       entry.lastSeenAt = now
     } else {
       entry = {
@@ -977,6 +1078,7 @@ export function createAccountStore({ filePath }) {
         deviceName: cleanName || 'Unknown Device',
         clientKind: cleanKind,
         ip: cleanIp,
+        ...(cleanUid ? { clientUid: cleanUid } : {}),
         createdAt: now,
         lastSeenAt: now,
       }
@@ -984,10 +1086,14 @@ export function createAccountStore({ filePath }) {
     }
     pruneUserSessionData(record, now)
     save()
-    return { ...entry }
+    return { ...entry, replacedSids }
   }
 
-  function touchUserSession(userId, sid, { deviceName = '', clientKind = '', ip = '' } = {}) {
+  function touchUserSession(
+    userId,
+    sid,
+    { deviceName = '', clientKind = '', ip = '', clientUid = '', onlineSids = null } = {},
+  ) {
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return false
@@ -998,8 +1104,16 @@ export function createAccountStore({ filePath }) {
     const cleanName = String(deviceName || '').trim().slice(0, 64)
     const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' || clientKind === 'web' ? clientKind : ''
     const cleanIp = String(ip || '').trim().slice(0, 64)
+    const cleanUid = normalizeClientUid(clientUid)
     if (!entry) {
-      recordUserSession(userId, { sid: cleanSid, deviceName: cleanName, clientKind: cleanKind || 'web', ip: cleanIp })
+      recordUserSession(userId, {
+        sid: cleanSid,
+        deviceName: cleanName,
+        clientKind: cleanKind || 'web',
+        ip: cleanIp,
+        clientUid: cleanUid,
+        onlineSids,
+      })
       return true
     }
     let changed = false
@@ -1014,6 +1128,23 @@ export function createAccountStore({ filePath }) {
     if (cleanIp && entry.ip !== cleanIp) {
       entry.ip = cleanIp
       changed = true
+    }
+    if (cleanUid && entry.clientUid !== cleanUid) {
+      entry.clientUid = cleanUid
+      changed = true
+    }
+    // Retroactively clean up any offline duplicate / legacy ghost from the same device once clientUid is attached
+    if (cleanUid && onlineSids) {
+      const swept = evictDuplicateSessions(record, {
+        keepSid: cleanSid,
+        deviceName: entry.deviceName,
+        clientKind: entry.clientKind || 'web',
+        ip: entry.ip,
+        clientUid: cleanUid,
+        onlineSids,
+        now,
+      })
+      if (swept.length > 0) changed = true
     }
     const stale = now - (Number(entry.lastSeenAt) || 0) > 60_000
     entry.lastSeenAt = now
@@ -1070,17 +1201,22 @@ export function createAccountStore({ filePath }) {
     return { ok: true, user: sanitizeUser(record) }
   }
 
-  function checkAndRememberLoginContext(userId, { deviceName = '', ip = '' } = {}) {
+  function checkAndRememberLoginContext(userId, { deviceName = '', ip = '', clientUid = '' } = {}) {
     const record = usersById.get(userId)
     if (!record) return { isNewContext: false }
     const cleanIp = String(ip || '').trim()
     const cleanName = String(deviceName || '').trim()
+    const cleanUid = normalizeClientUid(clientUid)
     if (!Array.isArray(record.knownLoginIps)) record.knownLoginIps = []
     const hadHistory = record.knownLoginIps.length > 0 || (Array.isArray(record.sessions) && record.sessions.length > 0)
     const knownByIp = Boolean(cleanIp && record.knownLoginIps.includes(cleanIp))
     const knownBySession = Boolean(
       Array.isArray(record.sessions) &&
-      record.sessions.some((s) => s.ip === cleanIp && (!cleanName || s.deviceName === cleanName)),
+      record.sessions.some(
+        (s) =>
+          (cleanUid && normalizeClientUid(s.clientUid) === cleanUid) ||
+          (s.ip === cleanIp && (!cleanName || s.deviceName === cleanName)),
+      ),
     )
     const isNewContext = Boolean(hadHistory && cleanIp && !knownByIp && !knownBySession)
     if (cleanIp) {

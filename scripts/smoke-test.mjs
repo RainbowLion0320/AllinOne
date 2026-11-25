@@ -1805,16 +1805,90 @@ async function main() {
         const reLogin = await (await fetch(`${httpBase}/api/account/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'sess_alice', password: 'Password123!' }),
+          body: JSON.stringify({
+            username: 'sess_alice',
+            password: 'Password123!',
+            deviceName: 'Android App',
+            clientKind: 'mobile',
+            clientUid: 'cli_phone_stable_01',
+          }),
         })).json()
         assert.equal((await fetch(`${httpBase}/api/auth/me`, { headers: { Authorization: `Bearer ${reLogin.token}` } })).status, 200)
+
+        // Same clientUid re-login replaces & revokes previous session in-place (zero duplicate rows across IP switches)
+        const reLogin2 = await (await fetch(`${httpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'sess_alice',
+            password: 'Password123!',
+            deviceName: 'Android App',
+            clientKind: 'mobile',
+            clientUid: 'cli_phone_stable_01',
+          }),
+        })).json()
+        assert.equal((await fetch(`${httpBase}/api/auth/me`, { headers: { Authorization: `Bearer ${reLogin.token}` } })).status, 401)
+        const dedupSess = await (await fetch(`${httpBase}/api/auth/sessions`, {
+          headers: { Authorization: `Bearer ${reLogin2.token}` },
+        })).json()
+        assert.equal(dedupSess.totalCount, 1)
+
+        // Named desktop PC re-login (even after storage wipe / new clientUid) sweeps offline ghost for same machine
+        const pcLogin1 = await (await fetch(`${httpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'sess_alice',
+            password: 'Password123!',
+            deviceName: 'Windows Desktop · Work37',
+            clientKind: 'desktop',
+            clientUid: 'cli_pc_work37_old',
+          }),
+        })).json()
+        const pcLogin2 = await (await fetch(`${httpBase}/api/account/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'sess_alice',
+            password: 'Password123!',
+            deviceName: 'Windows Desktop · Work37',
+            clientKind: 'desktop',
+            clientUid: 'cli_pc_work37_reinstall',
+          }),
+        })).json()
+        assert.equal((await fetch(`${httpBase}/api/auth/me`, { headers: { Authorization: `Bearer ${pcLogin1.token}` } })).status, 401)
+        const dedupAfterPc = await (await fetch(`${httpBase}/api/auth/sessions`, {
+          headers: { Authorization: `Bearer ${pcLogin2.token}` },
+        })).json()
+        assert.equal(dedupAfterPc.totalCount, 2)
+
+        // Same PC (hostname + platform) rebinding without explicit bridgeId updates in-place & keeps custom label
+        const pcBind1 = await (await fetch(`${httpBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pcLogin2.token}` },
+          body: JSON.stringify({ label: 'Work37', hostname: 'Work37', platform: 'win32' }),
+        })).json()
+        await fetch(`${httpBase}/api/account/devices/rename`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pcLogin2.token}` },
+          body: JSON.stringify({ deviceId: pcBind1.deviceId, label: 'My Custom Work PC' }),
+        })
+        const pcBind2 = await (await fetch(`${httpBase}/api/account/devices/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pcLogin2.token}` },
+          body: JSON.stringify({ label: 'Work37', hostname: 'Work37', platform: 'win32' }),
+        })).json()
+        assert.equal(pcBind2.deviceId, pcBind1.deviceId)
+        assert.equal(pcBind2.bridgeId, pcBind1.bridgeId)
+        assert.equal(pcBind2.label, 'My Custom Work PC')
+        assert.equal(pcBind2.devices.length, 1)
       } finally {
         await cliA.closeAll()
         await cliB.closeAll()
         await cliC.closeAll()
       }
     }
-    pass(6, 'Active client sessions monitor, live push, per-device kick, revoke-others rotation & revoke-all')
+    pass(6, 'Active client sessions monitor, device/session dedup, live push, per-device kick & revoke-all')
 
     // =========================================================================
     // 7. Zero-Dep SMTP Mailer, Optional Email Bind, Password Reset, New-IP Alert, Login 2FA & Rate Limits

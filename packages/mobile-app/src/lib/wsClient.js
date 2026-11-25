@@ -78,16 +78,47 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
   }
 }
 
+const CLIENT_UID_STORAGE_KEY = 'allinone_client_uid_v1'
+
+function getOrCreateClientUid() {
+  if (typeof window !== 'undefined') {
+    const desktopUid = String(window.allinoneDesktop?.clientUid || '').trim()
+    if (/^[a-zA-Z0-9._-]{8,64}$/.test(desktopUid)) return desktopUid
+    try {
+      const existing = String(window.localStorage?.getItem(CLIENT_UID_STORAGE_KEY) || '').trim()
+      if (/^[a-zA-Z0-9._-]{8,64}$/.test(existing)) return existing
+      let randHex = ''
+      if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+        const buf = new Uint8Array(12)
+        crypto.getRandomValues(buf)
+        randHex = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+      } else {
+        randHex = `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 14)}`
+      }
+      const created = `cli_${randHex}`
+      window.localStorage?.setItem(CLIENT_UID_STORAGE_KEY, created)
+      return created
+    } catch {}
+  }
+  return ''
+}
+
 function detectClientDeviceMeta() {
+  const clientUid = getOrCreateClientUid()
   if (typeof window !== 'undefined' && window.allinoneDesktop?.isDesktop) {
     const plat = String(window.allinoneDesktop.platform || '').toLowerCase()
     const osName = plat === 'darwin' ? 'macOS' : plat === 'win32' ? 'Windows' : 'Linux'
-    return { deviceName: `${osName} Desktop`, clientKind: 'desktop' }
+    const host = String(window.allinoneDesktop.hostname || '').trim().replace(/\.local$/i, '').slice(0, 32)
+    return {
+      deviceName: host ? `${osName} Desktop · ${host}` : `${osName} Desktop`,
+      clientKind: 'desktop',
+      clientUid,
+    }
   }
   const ua = typeof navigator !== 'undefined' ? String(navigator.userAgent || '') : ''
   if (typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()) {
     const isIos = /iPhone|iPad|iPod/i.test(ua)
-    return { deviceName: isIos ? 'iOS App' : 'Android App', clientKind: 'mobile' }
+    return { deviceName: isIos ? 'iOS App' : 'Android App', clientKind: 'mobile', clientUid }
   }
   const isIPhone = /iPhone/i.test(ua)
   const isIPad = /iPad/i.test(ua)
@@ -99,12 +130,12 @@ function detectClientDeviceMeta() {
   else if (/Chrome\//i.test(ua) && !/Edg\//i.test(ua)) browser = 'Chrome'
   else if (/Firefox\//i.test(ua)) browser = 'Firefox'
   else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = 'Safari'
-  if (isIPhone) return { deviceName: browser ? `iPhone · ${browser}` : 'iPhone', clientKind: 'mobile' }
-  if (isIPad) return { deviceName: browser ? `iPad · ${browser}` : 'iPad', clientKind: 'mobile' }
-  if (isAndroid) return { deviceName: browser ? `Android · ${browser}` : 'Android', clientKind: 'mobile' }
-  if (isWindows) return { deviceName: browser ? `Windows · ${browser}` : 'Windows', clientKind: 'web' }
-  if (isMac) return { deviceName: browser ? `macOS · ${browser}` : 'macOS', clientKind: 'web' }
-  return { deviceName: browser || 'Web Client', clientKind: 'web' }
+  if (isIPhone) return { deviceName: browser ? `iPhone · ${browser}` : 'iPhone', clientKind: 'mobile', clientUid }
+  if (isIPad) return { deviceName: browser ? `iPad · ${browser}` : 'iPad', clientKind: 'mobile', clientUid }
+  if (isAndroid) return { deviceName: browser ? `Android · ${browser}` : 'Android', clientKind: 'mobile', clientUid }
+  if (isWindows) return { deviceName: browser ? `Windows · ${browser}` : 'Windows', clientKind: 'web', clientUid }
+  if (isMac) return { deviceName: browser ? `macOS · ${browser}` : 'macOS', clientKind: 'web', clientUid }
+  return { deviceName: browser || 'Web Client', clientKind: 'web', clientUid }
 }
 
 export async function loginAccount(serverUrl, { username, password, emailCode = '' }) {
@@ -120,6 +151,7 @@ export async function loginAccount(serverUrl, { username, password, emailCode = 
       ...(cleanCode ? { emailCode: cleanCode } : {}),
       deviceName: devMeta.deviceName,
       clientKind: devMeta.clientKind,
+      ...(devMeta.clientUid ? { clientUid: devMeta.clientUid } : {}),
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -181,6 +213,7 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
       ...(cleanEmail ? { email: cleanEmail, emailCode: String(emailCode || '').trim() } : {}),
       deviceName: devMeta.deviceName,
       clientKind: devMeta.clientKind,
+      ...(devMeta.clientUid ? { clientUid: devMeta.clientUid } : {}),
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -468,6 +501,7 @@ async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
       body: JSON.stringify({
         deviceName: devMeta.deviceName,
         clientKind: devMeta.clientKind,
+        ...(devMeta.clientUid ? { clientUid: devMeta.clientUid } : {}),
       }),
       ...(controller ? { signal: controller.signal } : {}),
     })
@@ -555,6 +589,7 @@ export async function revokeOtherAuthSessions(baseUrl, token, currentClientId = 
       currentClientId,
       deviceName: devMeta.deviceName,
       clientKind: devMeta.clientKind,
+      ...(devMeta.clientUid ? { clientUid: devMeta.clientUid } : {}),
     }),
   })
   const data = await res.json().catch(() => ({}))

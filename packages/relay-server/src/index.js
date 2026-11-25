@@ -958,11 +958,14 @@ export function createRelayServer(options = {}) {
         const user = result.user
         const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
         const sid = auth.generateSessionId()
+        const onlineSids = new Set(hub.getClientList(user.userId).map((c) => c.sid).filter(Boolean))
         accounts.recordUserSession(user.userId, {
           sid,
           deviceName: devInfo.deviceName,
           clientKind: devInfo.clientKind,
           ip,
+          clientUid: body.clientUid || '',
+          onlineSids,
         })
         hub.recordActivity({
           type: 'user.register',
@@ -1159,14 +1162,21 @@ export function createRelayServer(options = {}) {
         const { isNewContext } = accounts.checkAndRememberLoginContext(user.userId, {
           deviceName: devInfo.deviceName,
           ip,
+          clientUid: body.clientUid || '',
         })
         const sid = auth.generateSessionId()
-        accounts.recordUserSession(user.userId, {
+        const onlineSids = new Set(hub.getClientList(user.userId).map((c) => c.sid).filter(Boolean))
+        const recorded = accounts.recordUserSession(user.userId, {
           sid,
           deviceName: devInfo.deviceName,
           clientKind: devInfo.clientKind,
           ip,
+          clientUid: body.clientUid || '',
+          onlineSids,
         })
+        for (const oldSid of recorded?.replacedSids || []) {
+          hub.disconnectClient(user.userId, { sid: oldSid }, 4401, 'Replaced by new sign-in on same device')
+        }
         if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified) {
           mailer
             .sendLoginAlert({
@@ -1474,6 +1484,7 @@ export function createRelayServer(options = {}) {
           deviceName: devInfo.deviceName,
           clientKind: devInfo.clientKind,
           ip,
+          clientUid: body.clientUid || '',
         })
         hub.disconnectOtherRoomClients(
           payload.room,
@@ -1808,10 +1819,13 @@ export function createRelayServer(options = {}) {
         req.headers['user-agent'] || '',
         body?.clientKind || '',
       )
+      const onlineSids = new Set(hub.getClientList(payload.room).map((c) => c.sid).filter(Boolean))
       accounts.touchUserSession(payload.room, payload.sid, {
         deviceName: devInfo.deviceName,
         clientKind: devInfo.clientKind,
         ip: getClientIp(req),
+        clientUid: body?.clientUid || '',
+        onlineSids,
       })
       const { ticket, expiresAt } = auth.issueWsTicket(payload, {
         deviceName: devInfo.deviceName,
@@ -1938,6 +1952,7 @@ export function createRelayServer(options = {}) {
           deviceName: devInfo.deviceName,
           clientKind: devInfo.clientKind,
           ip,
+          clientUid: body.clientUid || '',
         })
         const freshToken = auth.signSessionToken(
           targetRoom,
