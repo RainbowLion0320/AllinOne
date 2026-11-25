@@ -9,7 +9,6 @@ import {
   QrCode,
   RefreshCw,
   ScanLine,
-  ShieldCheck,
   Smartphone,
   SquarePen,
   WifiOff,
@@ -2483,40 +2482,21 @@ export function App() {
                   <span>P2P</span>
                 </span>
               )}
-              {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && (
+              {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && e2eeLocked && (
                 <button
                   type="button"
                   onClick={() => {
-                    if (!e2eeLocked && desktopApi) {
-                      openDesktopQrModal()
-                      return
-                    }
                     setE2eeModal({
                       open: true,
-                      tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'show',
+                      tab: desktopApi ? 'request' : 'import',
                       autoOpenScanner: false,
                     })
                   }}
-                  title={
-                    e2eeLocked
-                      ? bi('需扫码同步端到端加密密钥', 'Sync E2EE key')
-                      : bi(
-                          `端到端加密已开启，点击显示二维码供手机扫码 (${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
-                          `End-to-End Encrypted — click to show QR for phone sync (${formatE2eeFingerprint(activeBridgeE2ee.keyId)})`,
-                        )
-                  }
-                  className={`inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold transition active:scale-95 ${
-                    e2eeLocked
-                      ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
-                      : 'bg-emerald-500/12 text-emerald-600 hover:bg-emerald-500/20 dark:text-emerald-400'
-                  }`}
+                  title={bi('需扫码同步端到端加密密钥', 'Sync E2EE key')}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 transition hover:bg-amber-500/25 active:scale-95 dark:text-amber-400"
                 >
-                  {e2eeLocked ? <Lock className="h-2.5 w-2.5" /> : <ShieldCheck className="h-2.5 w-2.5" />}
-                  {e2eeLocked ? (
-                    <span>{bi('同步密钥', 'Unlock')}</span>
-                  ) : desktopApi ? (
-                    <span>{bi('同步码', 'QR')}</span>
-                  ) : null}
+                  <Lock className="h-2.5 w-2.5" />
+                  <span>{bi('同步密钥', 'Unlock')}</span>
                 </button>
               )}
             </div>
@@ -2793,8 +2773,8 @@ export function App() {
                   </button>
                   <p className="pt-1.5 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
                     {bi(
-                      '电脑端已自动弹出提示，或点击电脑端左下角「连手机」/ 顶部「同步码」显示二维码',
-                      'Check the prompt on your computer, or click "Phone" (bottom-left) / "QR" (top) to display the code',
+                      '电脑端已自动弹出提示，或点击电脑端左下角「连手机」显示二维码',
+                      'Check the prompt on your computer, or click "Phone" in the bottom-left to display the QR code',
                     )}
                   </p>
                 </>
