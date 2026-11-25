@@ -15,6 +15,25 @@ const MAX_REVOKED_SIDS = 64
 export const VALID_PLANS = new Set(['free', 'pro', 'ultra'])
 export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
 
+export function getCurrentTurnMonth(now = new Date()) {
+  const d = now instanceof Date ? now : new Date(now)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  return `${y}-${m}`
+}
+
+function normalizeTurnUsageRecord(raw, now = new Date()) {
+  const curMonth = getCurrentTurnMonth(now)
+  if (raw && typeof raw === 'object' && String(raw.month || '') === curMonth) {
+    return {
+      month: curMonth,
+      bytes: Math.max(0, Math.floor(Number(raw.bytes) || 0)),
+      updatedAt: Number(raw.updatedAt) || 0,
+    }
+  }
+  return { month: curMonth, bytes: 0, updatedAt: 0 }
+}
+
 export function normalizePlan(raw) {
   const p = String(raw || '').trim().toLowerCase()
   return VALID_PLANS.has(p) ? p : 'free'
@@ -195,6 +214,7 @@ export function createAccountStore({ filePath }) {
         knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
         role: u.role === 'admin' ? 'admin' : 'user',
         plan: u.role === 'admin' ? 'free' : normalizePlan(u.plan),
+        turnUsage: normalizeTurnUsageRecord(u.turnUsage),
         tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
         devices: Array.isArray(u.devices) ? u.devices : [],
         sessions: Array.isArray(u.sessions) ? u.sessions : [],
@@ -337,6 +357,7 @@ export function createAccountStore({ filePath }) {
       role,
       plan,
       tier,
+      turnUsage: normalizeTurnUsageRecord(u.turnUsage),
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
       lastLoginAt: u.lastLoginAt || 0,
@@ -1031,6 +1052,48 @@ export function createAccountStore({ filePath }) {
     return { ok: true, prevTier, tier: nextTier, user: sanitizeUser(record) }
   }
 
+  function getTurnUsage(userId, now = new Date()) {
+    const record = usersById.get(userId)
+    if (!record) return { month: getCurrentTurnMonth(now), bytes: 0, updatedAt: 0 }
+    return normalizeTurnUsageRecord(record.turnUsage, now)
+  }
+
+  function addTurnUsage(userId, deltaBytes, now = new Date()) {
+    const record = usersById.get(userId)
+    const add = Math.max(0, Math.floor(Number(deltaBytes) || 0))
+    if (!record || add <= 0) return null
+    const cur = normalizeTurnUsageRecord(record.turnUsage, now)
+    const prevBytes = cur.bytes
+    const next = {
+      month: cur.month,
+      bytes: prevBytes + add,
+      updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
+    }
+    record.turnUsage = next
+    scheduleSave(3000)
+    return {
+      userId: record.userId,
+      tier: resolveUserTier(record),
+      month: next.month,
+      prevBytes,
+      bytes: next.bytes,
+      updatedAt: next.updatedAt,
+    }
+  }
+
+  function resetTurnUsage(userId, now = new Date()) {
+    const record = usersById.get(userId)
+    if (!record) return { ok: false, error: '用户不存在' }
+    const curMonth = getCurrentTurnMonth(now)
+    record.turnUsage = {
+      month: curMonth,
+      bytes: 0,
+      updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
+    }
+    save()
+    return { ok: true, user: sanitizeUser(record), turnUsage: { ...record.turnUsage } }
+  }
+
   function getTokenVersion(userId) {
     const record = usersById.get(userId)
     if (!record) return -1
@@ -1287,6 +1350,9 @@ export function createAccountStore({ filePath }) {
     findUserByIdentifier,
     getUserTier,
     setUserTier,
+    getTurnUsage,
+    addTurnUsage,
+    resetTurnUsage,
     getTokenVersion,
     recordUserSession,
     touchUserSession,

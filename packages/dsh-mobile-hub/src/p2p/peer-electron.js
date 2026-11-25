@@ -243,6 +243,8 @@ export class ElectronWebRtcClient {
         } else if (msg.type === 'dc.buffered' && msg.role === 'bulk') {
           bulkBuffered = Number(msg.bufferedAmount || 0)
           flushDrainWaiters()
+        } else if (msg.type === 'transport' && msg.transport) {
+          try { opts.onTransportChange?.(String(msg.transport)) } catch {}
         }
       },
       _onBinary: (role, bytes) => {

@@ -188,6 +188,19 @@ export class P2PBridgeManager {
     }
   }
 
+  /**
+   * Drop any active TURN-relayed sessions when the account crosses its monthly TURN quota,
+   * while leaving direct P2P sessions (LAN / STUN) completely untouched.
+   */
+  dropRelayedSessions() {
+    for (const [cid, sess] of [...this.sessions.entries()]) {
+      if (sess.transport !== 'direct') {
+        this.log.info?.(`mobile-hub: [p2p] closing relayed peer clientId=${cid} due to monthly TURN quota limit`)
+        void this.destroySession(cid, sess)
+      }
+    }
+  }
+
   async destroySession(clientId, expectedSess = null) {
     const sess = this.sessions.get(clientId)
     if (!sess) return
@@ -285,6 +298,7 @@ export class P2PBridgeManager {
         createdAt: Date.now(),
         closed: false,
         offerReady: false,
+        transport: '',
         pendingIce: [],
         ctrlCodec: createCtrlCodec(),
         peer: null,
@@ -304,6 +318,9 @@ export class P2PBridgeManager {
           if (st === 'failed' || st === 'closed') {
             void this.destroySession(cid, sess)
           }
+        },
+        onTransportChange: (tr) => {
+          if (!sess.closed) sess.transport = String(tr || '')
         },
         onCtrlMessage: (rawText) => {
           if (sess.closed) return

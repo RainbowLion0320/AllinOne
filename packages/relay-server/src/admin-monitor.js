@@ -39,7 +39,7 @@ export function collectServerHealth({
   turn = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '1.0.3',
+  version = '1.0.4',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -99,6 +99,7 @@ export function buildAdminOverview({
   accounts,
   hub,
   serverHealth,
+  getTurnQuota = null,
   currentAdminRoom = '',
   currentAdminSid = '',
 } = {}) {
@@ -158,6 +159,7 @@ export function buildAdminOverview({
   const tierDistribution = { free: 0, pro: 0, ultra: 0, admin: 0 }
   let totalBoundDevices = 0
   let recent24hUsers = 0
+  let totalTurnUsedBytes = 0
 
   const users = rawUsers.map((u) => {
     const roomBridges = bridgesByRoom.get(u.userId) || []
@@ -166,6 +168,8 @@ export function buildAdminOverview({
     const plan = u.role === 'admin' ? 'free' : (u.plan || 'free')
     const tier = u.tier || (u.role === 'admin' ? 'admin' : plan)
     if (tierDistribution[tier] !== undefined) tierDistribution[tier] += 1
+    const turnQuota = typeof getTurnQuota === 'function' ? getTurnQuota(u.userId) : null
+    totalTurnUsedBytes += Number(turnQuota?.usedBytes ?? u.turnUsage?.bytes ?? 0)
 
     const liveBridgeById = new Map(roomBridges.map((b) => [b.bridgeId, b]))
     const mergedDevices = (u.devices || []).map((dev) => {
@@ -285,6 +289,7 @@ export function buildAdminOverview({
       role: u.role,
       plan,
       tier,
+      turnQuota,
       isCurrentAdmin: currentAdminRoom === u.userId,
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
@@ -358,6 +363,7 @@ export function buildAdminOverview({
       totalBoundDevices,
       onlineClients: metrics.onlineClientCount,
       totalSignals: metrics.totalSignals || 0,
+      totalTurnUsedBytes,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
       tierDistribution,

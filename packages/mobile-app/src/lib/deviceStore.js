@@ -62,6 +62,13 @@ function sanitizeDevice(raw) {
     : null
   const now = Date.now()
   const role = raw.role === 'admin' ? 'admin' : 'user'
+  const rawTier = String(raw.tier || '').trim().toLowerCase()
+  const tier =
+    role === 'admin'
+      ? 'admin'
+      : rawTier === 'pro' || rawTier === 'ultra' || rawTier === 'free'
+        ? rawTier
+        : 'free'
   return {
     id,
     baseUrl,
@@ -72,6 +79,7 @@ function sanitizeDevice(raw) {
     email: String(raw.email || '').trim().slice(0, 254),
     loginEmail2fa: Boolean(raw.loginEmail2fa),
     role,
+    tier,
     customName: String(raw.customName || '').trim().slice(0, 40),
     label: String(raw.label || '').trim().slice(0, 64),
     lastHostname: String(raw.lastHostname || firstBridge?.hostname || '').trim().slice(0, 64),
@@ -162,6 +170,7 @@ export function upsertDevice(state, payload) {
           ? Boolean(payload.loginEmail2fa)
           : Boolean(existing.loginEmail2fa),
       role: incoming.role || existing.role || '',
+      tier: payload?.tier ? incoming.tier : existing.tier || incoming.tier || 'free',
       label: incoming.label || existing.label,
       lastHostname: incoming.lastHostname || existing.lastHostname,
       lastPlatform: incoming.lastPlatform || existing.lastPlatform,
@@ -276,6 +285,14 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
     const val = patch.role === 'admin' ? 'admin' : patch.role === 'user' ? 'user' : ''
     if (val && val !== cur.role) {
       next.role = val
+      changed = true
+    }
+  }
+  if (patch.tier !== undefined) {
+    const rawT = String(patch.tier || '').trim().toLowerCase()
+    const val = rawT === 'free' || rawT === 'pro' || rawT === 'ultra' || rawT === 'admin' ? rawT : ''
+    if (val && val !== cur.tier) {
+      next.tier = val
       changed = true
     }
   }

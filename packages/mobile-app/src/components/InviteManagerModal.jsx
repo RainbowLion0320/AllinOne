@@ -7,6 +7,7 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  RotateCcw,
   Ticket,
   Users,
   X,
@@ -15,7 +16,9 @@ import {
   DEFAULT_PROD_SERVER,
   adminCreateInvites,
   adminListInvites,
+  adminResetTurnUsage,
   adminRevokeInvite,
+  adminSetUserTier,
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
@@ -35,6 +38,22 @@ function formatTimeShort(ts) {
   }
 }
 
+function formatQuotaBytes(raw) {
+  const n = Math.max(0, Number(raw) || 0)
+  if (n < 1024) return `${Math.round(n)} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(n >= 100 * 1024 * 1024 ? 0 : 1)} MB`
+  const gb = n / (1024 * 1024 * 1024)
+  return `${Number.isInteger(gb) ? gb : gb.toFixed(gb >= 10 ? 1 : 2)} GB`
+}
+
+const TIER_BADGE_MAP = {
+  free: { label: 'FREE', cls: 'bg-slate-200/80 text-slate-600 dark:bg-slate-800 dark:text-slate-300' },
+  pro: { label: 'PRO', cls: 'bg-sky-500/15 text-sky-600 dark:text-sky-400' },
+  ultra: { label: 'ULTRA', cls: 'bg-violet-500/15 text-violet-600 dark:text-violet-400' },
+  admin: { label: 'ADMIN', cls: 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:text-[#96AEFF]' },
+}
+
 export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   const { isEn, bi, t } = useI18n()
   const [invites, setInvites] = useState([])
@@ -42,10 +61,11 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   const [users, setUsers] = useState([])
   const [loading, setLoading] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [busyUserId, setBusyUserId] = useState('')
   const [error, setError] = useState('')
 
   const [count, setCount] = useState(1)
-  const [grantAdmin, setGrantAdmin] = useState(false)
+  const [tier, setTier] = useState('free')
   const [note, setNote] = useState('')
   const [filter, setFilter] = useState('all') // 'all' | 'active' | 'used' | 'revoked'
   const [showUsers, setShowUsers] = useState(false)
@@ -135,15 +155,43 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
     setCreating(true)
     setError('')
     try {
-      await adminCreateInvites(baseUrl, token, { count, note, grantAdmin })
+      await adminCreateInvites(baseUrl, token, { count, note, tier, grantAdmin: tier === 'admin' })
       setNote('')
-      setGrantAdmin(false)
+      setTier('free')
       setFilter('active')
       await loadInvites()
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleSetUserTier = async (userId, nextTier) => {
+    if (!baseUrl || !token || !userId || !nextTier || busyUserId) return
+    setBusyUserId(userId)
+    setError('')
+    try {
+      await adminSetUserTier(baseUrl, token, { userId, tier: nextTier })
+      await loadInvites()
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setBusyUserId('')
+    }
+  }
+
+  const handleResetUserTurnUsage = async (userId) => {
+    if (!baseUrl || !token || !userId || busyUserId) return
+    setBusyUserId(userId)
+    setError('')
+    try {
+      await adminResetTurnUsage(baseUrl, token, { userId })
+      await loadInvites()
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setBusyUserId('')
     }
   }
 
@@ -228,8 +276,15 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
             ) : (
               <div className="space-y-2">
                 {users.map((u) => {
-                  const isAdm = u.role === 'admin'
+                  const userTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
                   const isSelf = Boolean(currentAdminRoom && currentAdminRoom === u.userId)
+                  const q = u.turnQuota || null
+                  const quotaText = q
+                    ? q.unlimited
+                      ? `${formatQuotaBytes(q.usedBytes)} / ${bi('不限', 'Unlimited')}`
+                      : `${formatQuotaBytes(q.usedBytes)} / ${formatQuotaBytes(q.quotaBytes)}`
+                    : ''
+                  const isBusy = busyUserId === u.userId
                   return (
                     <div key={u.userId} className="flex items-center justify-between gap-2">
                       <div className="min-w-0 flex-1">
@@ -243,18 +298,38 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         </div>
                         <div className="truncate text-[10px] text-slate-400">
                           {bi(`${u.deviceCount} 台电脑`, `${u.deviceCount} PC${u.deviceCount === 1 ? '' : 's'}`)}
-                          {u.email ? ` · ${u.email}` : ''}
+                          {quotaText && (
+                            <span className={q?.exceeded ? ' font-semibold text-rose-500 dark:text-rose-400' : ''}>
+                              {` · ${bi('中继', 'Relay')} ${quotaText}`}
+                            </span>
+                          )}
                         </div>
                       </div>
-                      {isAdm ? (
-                        <span className="shrink-0 rounded-lg border border-[#4D6BFE]/40 bg-[#4D6BFE]/12 px-2 py-0.5 text-[10.5px] font-semibold text-[#4D6BFE] dark:text-[#96AEFF]">
-                          Admin
-                        </span>
-                      ) : (
-                        <span className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-400">
-                          {bi('成员', 'User')}
-                        </span>
-                      )}
+                      <div className="flex shrink-0 items-center gap-1">
+                        {q && q.usedBytes > 0 && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleResetUserTurnUsage(u.userId)}
+                            title={bi('清零本月已用中继流量', 'Reset monthly relay usage')}
+                            className="rounded-lg border border-slate-200 bg-white p-1 text-slate-500 transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] disabled:opacity-40 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-400"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                          </button>
+                        )}
+                        <select
+                          aria-label={bi(`调整 @${u.username} 等级`, `Change @${u.username} tier`)}
+                          value={userTier}
+                          disabled={isSelf || isBusy}
+                          onChange={(e) => handleSetUserTier(u.userId, e.target.value)}
+                          className="rounded-lg border border-slate-200 bg-white px-1.5 py-0.5 text-[10.5px] font-semibold text-slate-700 outline-none focus:border-[#4D6BFE] disabled:opacity-55 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-200"
+                        >
+                          <option value="free">Free</option>
+                          <option value="pro">Pro</option>
+                          <option value="ultra">Ultra</option>
+                          <option value="admin">Admin</option>
+                        </select>
+                      </div>
                     </div>
                   )
                 })}
@@ -286,14 +361,16 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           </div>
 
           <div className="mt-2 flex items-center justify-between gap-2">
-            <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('账号角色', 'Role')}</span>
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('账号等级', 'Account Tier')}</span>
             <select
-              value={grantAdmin ? 'admin' : 'user'}
-              onChange={(e) => setGrantAdmin(e.target.value === 'admin')}
+              value={tier}
+              onChange={(e) => setTier(e.target.value)}
               className="rounded-xl border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-100"
             >
-              <option value="user">{bi('普通用户 (P2P 直连不限流)', 'Standard User (Direct P2P)')}</option>
-              <option value="admin">{bi('管理员 (Admin)', 'Administrator')}</option>
+              <option value="free">{bi('Free · 免费版 (中继 1 GB/月)', 'Free (1 GB/mo relay)')}</option>
+              <option value="pro">{bi('Pro · 专业版 (中继 10 GB/月)', 'Pro (10 GB/mo relay)')}</option>
+              <option value="ultra">{bi('Ultra · 旗舰版 (中继 50 GB/月)', 'Ultra (50 GB/mo relay)')}</option>
+              <option value="admin">{bi('Admin · 管理员 (中继 50 GB/月)', 'Admin (50 GB/mo relay)')}</option>
             </select>
           </div>
 
@@ -385,11 +462,15 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         >
                           {inv.code}
                         </span>
-                        {inv.grantAdmin ? (
-                          <span className="rounded-full bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-bold text-[#4D6BFE] dark:text-[#96AEFF]">
-                            ADMIN
-                          </span>
-                        ) : null}
+                        {(() => {
+                          const invTier = String(inv.tier || (inv.grantAdmin ? 'admin' : 'free')).toLowerCase()
+                          const badge = TIER_BADGE_MAP[invTier] || TIER_BADGE_MAP.free
+                          return (
+                            <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${badge.cls}`}>
+                              {badge.label}
+                            </span>
+                          )
+                        })()}
                         <span
                           className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
                             isActive

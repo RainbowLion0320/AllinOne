@@ -34,6 +34,28 @@
       if (openSent) return
       openSent = true
       api.sendControl({ type: 'dc.open', peerId, role })
+      if (role === 'ctrl' && entry.pc && typeof entry.pc.getStats === 'function') {
+        entry.pc.getStats().then((stats) => {
+          let pair = null
+          stats.forEach((rep) => {
+            if (rep.type === 'transport' && rep.selectedCandidatePairId) {
+              pair = stats.get(rep.selectedCandidatePairId) || pair
+            }
+          })
+          if (!pair) {
+            stats.forEach((rep) => {
+              if (rep.type === 'candidate-pair' && (rep.selected || (rep.nominated && rep.state === 'succeeded'))) {
+                pair = rep
+              }
+            })
+          }
+          if (!pair) return
+          const lc = pair.localCandidateId ? stats.get(pair.localCandidateId) : null
+          const rc = pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null
+          const isRelay = lc?.candidateType === 'relay' || rc?.candidateType === 'relay'
+          api.sendControl({ type: 'transport', peerId, transport: isRelay ? 'relay' : 'direct' })
+        }).catch(() => {})
+      }
     }
     dc.onopen = notifyOpen
     dc.onclose = () => {

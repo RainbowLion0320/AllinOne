@@ -106,10 +106,12 @@ function isValidE2eeEnvelope(env) {
  * NEVER relays chats, RPC payloads, images, or file bytes.
  */
 export class RelayHub {
-  constructor({ log = console, getRoomDevices = null, getIceServers = null } = {}) {
+  constructor({ log = console, getRoomDevices = null, getIceServers = null, getTurnQuota = null, iceRefreshIntervalMs = 0 } = {}) {
     this.log = log
     this.getRoomDevices = typeof getRoomDevices === 'function' ? getRoomDevices : null
     this.getIceServers = typeof getIceServers === 'function' ? getIceServers : () => []
+    this.getTurnQuota = typeof getTurnQuota === 'function' ? getTurnQuota : () => null
+    this.iceRefreshIntervalMs = Number(iceRefreshIntervalMs) > 0 ? Number(iceRefreshIntervalMs) : 0
     /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number, isAlive: boolean }>} */
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
     /** @type {Map<string, any>} */
@@ -156,6 +158,23 @@ export class RelayHub {
       }
     }, WS_HEARTBEAT_INTERVAL_MS)
     this._heartbeatTimer.unref()
+
+    this._iceRefreshTimer = null
+    if (this.iceRefreshIntervalMs > 0) {
+      this._iceRefreshTimer = setInterval(() => {
+        const activeRooms = new Set()
+        for (const b of this.bridges.values()) {
+          if (b.ws.readyState === 1) activeRooms.add(b.roomId)
+        }
+        for (const c of this.clients.values()) {
+          if (c.ws.readyState === 1) activeRooms.add(c.roomId)
+        }
+        for (const rid of activeRooms) {
+          this.pushIceUpdate(rid, { quotaExceeded: false })
+        }
+      }, this.iceRefreshIntervalMs)
+      this._iceRefreshTimer.unref()
+    }
   }
 
   pruneExpiredGrants(now = Date.now()) {
@@ -638,6 +657,7 @@ export class RelayHub {
     const devices = this.resolveRoomDevices(roomId, bridges)
     const clients = this.getClientList(roomId)
     const pendingGrants = this.getPendingGrantsForClient(roomId, clientId)
+    const turnQuota = this.getTurnQuota(roomId)
     this.sendRaw(ws, {
       type: 'hello',
       protocolVersion: P2P_PROTOCOL_VERSION,
@@ -646,6 +666,7 @@ export class RelayHub {
       sid: entry.sid,
       roomId,
       iceServers: this.getIceServers(req, roomId),
+      ...(turnQuota ? { turnQuota } : {}),
       bridges,
       ...(devices ? { devices } : {}),
       clients,
@@ -1151,6 +1172,31 @@ export class RelayHub {
     return disconnected
   }
 
+  pushIceUpdate(roomId, { quotaExceeded = false } = {}) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return
+    const iceServers = this.getIceServers(null, rid)
+    const turnQuota = this.getTurnQuota(rid)
+    const msg = {
+      type: 'ice.update',
+      iceServers,
+      ...(turnQuota ? { turnQuota } : {}),
+      quotaExceeded: Boolean(quotaExceeded || turnQuota?.exceeded),
+      ts: Date.now(),
+    }
+    const frame = JSON.stringify(msg)
+    for (const b of this.bridges.values()) {
+      if (b.roomId === rid && b.ws.readyState === 1) {
+        try { b.ws.send(frame) } catch {}
+      }
+    }
+    for (const [, client] of this._getRoomClientEntries(rid)) {
+      if (client.ws.readyState === 1) {
+        try { client.ws.send(frame) } catch {}
+      }
+    }
+  }
+
   shutdown() {
     if (this._grantSweepTimer) {
       clearInterval(this._grantSweepTimer)
@@ -1159,6 +1205,10 @@ export class RelayHub {
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer)
       this._heartbeatTimer = null
+    }
+    if (this._iceRefreshTimer) {
+      clearInterval(this._iceRefreshTimer)
+      this._iceRefreshTimer = null
     }
     for (const b of this.bridges.values()) {
       try { b.ws.close(1001, 'Server shutting down') } catch {}

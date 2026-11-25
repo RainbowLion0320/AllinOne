@@ -544,7 +544,7 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.3'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.4'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
@@ -634,15 +634,17 @@
       },
       {
         accent: '#7c5cff',
-        label: bi('P2P 加密信令 / 内置 STUN', 'P2P Signals / STUN'),
-        pill: d.server?.stun?.enabled
-          ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN :${esc(d.server.stun.port || 3478)}</span>`
-          : `<span class="pill pill-subtle">${bi('STUN 关', 'STUN Off')}</span>`,
-        value: sum.totalSignals || 0,
+        label: bi('本月全服中继流量', 'Monthly TURN Relay'),
+        pill: d.server?.turn?.enabled
+          ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN+TURN :${esc(d.server.turn.port || 3478)}</span>`
+          : d.server?.stun?.enabled
+            ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN :${esc(d.server.stun.port || 3478)}</span>`
+            : `<span class="pill pill-subtle">${bi('STUN 关', 'STUN Off')}</span>`,
+        value: fmtBytes(sum.totalTurnUsedBytes || 0),
         total: '',
         meta: bi(
-          `STUN 穿透 ${d.server?.stun?.requests || 0} 次 · 桥接累计 ${sum.totalBridgeConnects || 0} 次 · 0 字节中转`,
-          `${d.server?.stun?.requests || 0} STUN hits · ${sum.totalBridgeConnects || 0} bridge joins · 0 B relayed`,
+          `P2P 信令 ${sum.totalSignals || 0} 次 · 直连 0 流量 · 仅双对称 NAT 计入`,
+          `${sum.totalSignals || 0} P2P signals · Direct P2P is 0 B · Relay only`,
         ),
       },
     ]
@@ -824,8 +826,8 @@
           </div>
         </div>
         <div class="mini-chips">
-          <span class="mini-chip">STUN: ${esc(srv.stun?.enabled ? `UDP ${srv.stun.port || 3478} (${srv.stun.requests || 0})` : bi('未开启', 'Off'))}</span>
-          <span class="mini-chip">${esc(bi('数据面', 'Data Plane'))}: ${esc(bi('100% P2P 直连', '100% Direct P2P'))}</span>
+          <span class="mini-chip">${esc(srv.turn?.enabled ? `STUN+TURN :${srv.turn.port || 3478}` : `STUN: ${srv.stun?.enabled ? `UDP ${srv.stun.port || 3478}` : bi('未开启', 'Off')}`)}</span>
+          ${srv.turn?.quotas ? `<span class="mini-chip">Free ${esc(fmtBytes((srv.turn.quotas.freeMb || 0) * 1024 * 1024))} · Pro ${esc(fmtBytes((srv.turn.quotas.proMb || 0) * 1024 * 1024))} · Ultra/Admin ${esc(srv.turn.quotas.ultraMb > 0 ? fmtBytes(srv.turn.quotas.ultraMb * 1024 * 1024) : bi('无限', 'Unlim'))}</span>` : ''}
           <span class="mini-chip">${esc(bi('邮件服务', 'Mail'))}: ${esc(feat.emailEnabled ? feat.emailProvider.toUpperCase() : bi('未开启', 'Off'))}</span>
           <span class="mini-chip">${esc(bi('系统运行', 'Host Up'))}: ${esc(fmtUptime(host.uptimeSec || 0))}</span>
         </div>
@@ -927,9 +929,27 @@
           }).join('')
         : `<span class="muted-text">—</span>`
 
-      const roleBadgeHtml = u.role === 'admin'
-        ? `<span class="pill pill-brand">Admin</span>${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>` : ''}`
-        : ''
+      const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : u.plan || 'free')).toLowerCase()
+      const tierPillCls =
+        uTier === 'admin'
+          ? 'pill-brand'
+          : uTier === 'ultra'
+            ? 'pill-amber'
+            : uTier === 'pro'
+              ? 'pill-sky'
+              : 'pill-subtle'
+      const tierLabel =
+        uTier === 'admin' ? 'Admin' : uTier === 'ultra' ? 'Ultra' : uTier === 'pro' ? 'Pro' : 'Free'
+      const roleBadgeHtml = `<span class="pill ${tierPillCls}">${esc(tierLabel)}</span>${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>` : ''}`
+      const tq = u.turnQuota || null
+      const relaySummaryText = tq
+        ? tq.unlimited
+          ? bi(`中继 ${fmtBytes(tq.usedBytes)} / 不限`, `Relay ${fmtBytes(tq.usedBytes)} / Unlim`)
+          : bi(
+              `中继 ${fmtBytes(tq.usedBytes)} / ${fmtBytes(tq.quotaBytes)}${tq.exceeded ? ' · 已达上限' : ''}`,
+              `Relay ${fmtBytes(tq.usedBytes)} / ${fmtBytes(tq.quotaBytes)}${tq.exceeded ? ' · Limit' : ''}`,
+            )
+        : bi(`${u.stats?.signalCount || 0} 次 P2P 信令`, `${u.stats?.signalCount || 0} P2P signals`)
 
       return `
         <div class="user-row ${expanded ? 'expanded' : ''}">
@@ -968,7 +988,7 @@
 
             <div class="user-activity">
               <div>${esc(fmtRelative(u.lastActivityAt))}</div>
-              <div class="user-activity-sub">${esc(bi(`${u.stats?.signalCount || 0} 次 P2P 信令 · 0 B 中转`, `${u.stats?.signalCount || 0} P2P signals · 0 B relayed`))}</div>
+              <div class="user-activity-sub" style="${tq?.exceeded ? 'color:#f43f5e;font-weight:600' : ''}">${esc(relaySummaryText)}</div>
             </div>
 
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
@@ -1052,6 +1072,15 @@
 
     const revokeKey = `revoke-all:${u.userId}`
     const revokeArmed = state.confirmKey === revokeKey
+    const resetKey = `reset-turn:${u.userId}`
+    const resetArmed = state.confirmKey === resetKey
+    const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : u.plan || 'free')).toLowerCase()
+    const tq = u.turnQuota || null
+    const quotaText = tq
+      ? tq.unlimited
+        ? `${fmtBytes(tq.usedBytes)} / ${bi('无限', 'Unlimited')}`
+        : `${fmtBytes(tq.usedBytes)} / ${fmtBytes(tq.quotaBytes)} (${tq.pct || 0}%)`
+      : '—'
 
     return `
       <div class="user-detail">
@@ -1074,17 +1103,33 @@
         <div class="detail-footer">
           <div class="detail-meta-list">
             <span class="mono">ID: ${esc(u.userId)}</span>
+            <span>${esc(bi('本月中继', 'Monthly Relay'))}: <strong>${esc(quotaText)}</strong></span>
             <span>${esc(bi('注册时间', 'Registered'))}: ${esc(fmtDateShort(u.createdAt))}</span>
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
             ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
-            <span>${esc(bi('P2P 信令', 'P2P Signals'))}: ${esc(u.stats?.signalCount || 0)}</span>
           </div>
-          ${!u.isCurrentAdmin ? `
-            <button type="button" class="btn btn-xs ${revokeArmed ? 'btn-danger-confirm' : 'btn-danger-soft'}"
-              data-action="revoke-all" data-user-id="${esc(u.userId)}">
-              ${esc(revokeArmed ? bi('确认强制全端下线?', 'Confirm Force Sign-Out?') : bi('强制全端下线', 'Force Sign-Out All'))}
-            </button>
-          ` : ''}
+          <div class="inline-pills" data-stop-toggle="1">
+            ${!u.isCurrentAdmin ? `
+              <select class="select-compact" data-action="set-user-tier" data-user-id="${esc(u.userId)}" aria-label="${esc(bi('调整用户等级', 'Change user tier'))}">
+                <option value="free" ${uTier === 'free' ? 'selected' : ''}>Free (1 GB)</option>
+                <option value="pro" ${uTier === 'pro' ? 'selected' : ''}>Pro (10 GB)</option>
+                <option value="ultra" ${uTier === 'ultra' ? 'selected' : ''}>Ultra (50 GB)</option>
+                <option value="admin" ${uTier === 'admin' ? 'selected' : ''}>Admin (50 GB)</option>
+              </select>
+            ` : ''}
+            ${tq && tq.usedBytes > 0 ? `
+              <button type="button" class="btn btn-xs ${resetArmed ? 'btn-danger-confirm' : 'btn-ghost'}"
+                data-action="reset-turn-usage" data-user-id="${esc(u.userId)}">
+                ${esc(resetArmed ? bi('确认清零?', 'Confirm Reset?') : bi('清零中继流量', 'Reset Relay'))}
+              </button>
+            ` : ''}
+            ${!u.isCurrentAdmin ? `
+              <button type="button" class="btn btn-xs ${revokeArmed ? 'btn-danger-confirm' : 'btn-danger-soft'}"
+                data-action="revoke-all" data-user-id="${esc(u.userId)}">
+                ${esc(revokeArmed ? bi('确认强制全端下线?', 'Confirm Force Sign-Out?') : bi('强制全端下线', 'Force Sign-Out All'))}
+              </button>
+            ` : ''}
+          </div>
         </div>
       </div>
     `
@@ -1243,7 +1288,13 @@
           <div class="invite-code-row">
             <span class="invite-code mono ${inv.status === 'revoked' ? 'revoked' : ''}">${esc(inv.code)}</span>
             <div class="inline-pills">
-              ${inv.grantAdmin ? `<span class="pill pill-brand">ADMIN</span>` : ''}
+              ${(() => {
+                const it = String(inv.tier || (inv.grantAdmin ? 'admin' : inv.plan || 'free')).toLowerCase()
+                if (it === 'admin') return '<span class="pill pill-brand">ADMIN</span>'
+                if (it === 'ultra') return '<span class="pill pill-amber">ULTRA</span>'
+                if (it === 'pro') return '<span class="pill pill-sky">PRO</span>'
+                return '<span class="pill pill-subtle">FREE</span>'
+              })()}
               ${badge}
             </div>
           </div>
@@ -1277,6 +1328,8 @@
       case 'admin.kick': return { label: bi('管理操作', 'Admin Kick'), cls: 'pill-rose' }
       case 'admin.invite': return { label: bi('邀请码', 'Invite'), cls: 'pill-amber' }
       case 'admin.tier': return { label: bi('等级变更', 'Tier Change'), cls: 'pill-sky' }
+      case 'admin.quota_reset': return { label: bi('流量重置', 'Quota Reset'), cls: 'pill-emerald' }
+      case 'turn.quota_exceeded': return { label: bi('中继达上限', 'TURN Limit'), cls: 'pill-rose' }
       case 'traffic.throttled': return { label: bi('流量限流', 'Throttled'), cls: 'pill-rose' }
       default: return { label: type || 'event', cls: 'pill-subtle' }
     }
@@ -1496,7 +1549,7 @@
       const btn = document.getElementById('btn-create-invite')
       const noteEl = document.getElementById('invite-note')
       const roleEl = document.getElementById('invite-role')
-      const grantAdmin = roleEl ? roleEl.value === 'admin' : false
+      const tier = roleEl ? String(roleEl.value || 'free').toLowerCase() : 'free'
       btn.disabled = true
       try {
         const res = await apiFetch('/api/admin/invites', {
@@ -1504,11 +1557,12 @@
           body: {
             count: state.inviteQty,
             note: noteEl.value.trim(),
-            grantAdmin,
+            tier,
+            grantAdmin: tier === 'admin',
           },
         })
         noteEl.value = ''
-        if (roleEl) roleEl.value = 'user'
+        if (roleEl) roleEl.value = 'free'
         state.inviteFilter = 'active'
         showToast(bi(`已生成 ${res.invites.length} 个邀请码`, `Generated ${res.invites.length} invite(s)`))
         await loadOverview({ force: true })
@@ -1517,6 +1571,29 @@
         showToast(String(err.message || err))
       } finally {
         btn.disabled = false
+      }
+    })
+
+    document.getElementById('dashboard-view').addEventListener('change', async (e) => {
+      const sel = e.target.closest('select[data-action="set-user-tier"]')
+      if (!sel) return
+      const userId = sel.dataset.userId || ''
+      const tier = String(sel.value || 'free').toLowerCase()
+      if (!userId) return
+      sel.disabled = true
+      try {
+        await apiFetch('/api/admin/users/set-tier', {
+          method: 'POST',
+          body: { userId, tier },
+        })
+        showToast(bi(`已更新用户等级为 ${tier.toUpperCase()}`, `Updated user tier to ${tier.toUpperCase()}`))
+        await loadOverview({ force: true })
+      } catch (err) {
+        if (handleAuthError(err)) return
+        showToast(String(err.message || err))
+        await loadOverview({ force: true })
+      } finally {
+        sel.disabled = false
       }
     })
 
@@ -1637,6 +1714,28 @@
             body: { userId },
           })
           showToast(bi(`已强制下线该用户全部终端（踢出 ${res.disconnectedClients || 0} 条在线连接）`, `Signed out all sessions (${res.disconnectedClients || 0} live)`))
+          await loadOverview({ force: true })
+        } catch (err) {
+          if (handleAuthError(err)) return
+          showToast(String(err.message || err))
+        }
+        return
+      }
+
+      if (action === 'reset-turn-usage') {
+        const userId = target.dataset.userId || ''
+        const key = `reset-turn:${userId}`
+        if (state.confirmKey !== key) {
+          armConfirm(key)
+          return
+        }
+        clearConfirm()
+        try {
+          await apiFetch('/api/admin/users/reset-turn-usage', {
+            method: 'POST',
+            body: { userId },
+          })
+          showToast(bi('已清零该用户本月中继流量', 'Reset user monthly TURN relay usage'))
           await loadOverview({ force: true })
         } catch (err) {
           if (handleAuthError(err)) return

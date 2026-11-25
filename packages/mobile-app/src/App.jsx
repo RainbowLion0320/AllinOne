@@ -46,6 +46,7 @@ import {
 } from './lib/deviceStore.js'
 import {
   clearSessionCache,
+  formatBytesCompact,
   loadCachedSession,
   mergeSessionMessages,
   reconcileCachedWithFreshPage,
@@ -111,6 +112,7 @@ export function App() {
   const [p2pError, setP2pError] = useState('')
   const [p2pEngine, setP2pEngine] = useState('')
   const [p2pTransport, setP2pTransport] = useState('')
+  const [turnQuota, setTurnQuota] = useState(null)
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
   const [clientSessions, setClientSessions] = useState({
@@ -1253,6 +1255,7 @@ export function App() {
       setP2pError('')
       setP2pEngine('')
       setP2pTransport('')
+      setTurnQuota(null)
       setBridges([])
       setAccountDevices([])
       setClientSessions({
@@ -1271,6 +1274,7 @@ export function App() {
     setP2pError('')
     setP2pEngine('')
     setP2pTransport('')
+    setTurnQuota(null)
     setBridges([])
     setAccountDevices([])
     setClientSessions({
@@ -1293,7 +1297,7 @@ export function App() {
     setQrNudge(null)
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ, p2pState: nextP2p, p2pError: nextP2pErr, p2pEngine: nextP2pEngine, p2pTransport: nextP2pTransport }) => {
+    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ, p2pState: nextP2p, p2pError: nextP2pErr, p2pEngine: nextP2pEngine, p2pTransport: nextP2pTransport, turnQuota: nextTurnQuota }) => {
       if (clientRef.current !== client) return
       setConnState(state)
       setConnError(error || '')
@@ -1301,6 +1305,17 @@ export function App() {
       setP2pError(nextP2pErr || '')
       setP2pEngine(nextP2pEngine || '')
       setP2pTransport(nextP2pTransport || '')
+      if (nextTurnQuota !== undefined) {
+        setTurnQuota(nextTurnQuota || null)
+        if (nextTurnQuota?.tier && activeDeviceRef.current?.id) {
+          setDeviceState((prev) =>
+            updateDeviceMeta(prev, activeDeviceRef.current.id, {
+              tier: nextTurnQuota.tier,
+              ...(nextTurnQuota.tier === 'admin' ? { role: 'admin' } : {}),
+            }),
+          )
+        }
+      }
       setBridges(bList || [])
       if (Array.isArray(dList)) setAccountDevices(dList)
       if (typeof occ === 'number') setLiveOnlineClientCount(occ)
@@ -1736,10 +1751,12 @@ export function App() {
       if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
         if (!devRes && Array.isArray(meRes.devices)) setAccountDevices(meRes.devices)
         setServerEmailEnabled(Boolean(meRes.emailEnabled))
+        if (meRes.turnQuota) setTurnQuota(meRes.turnQuota)
         setDeviceState((prev) =>
           updateDeviceMeta(prev, targetDeviceId, {
             ...(meRes.username ? { username: meRes.username } : {}),
             ...(meRes.role ? { role: meRes.role } : {}),
+            ...(meRes.tier ? { tier: meRes.tier } : {}),
             email: meRes.email || '',
             loginEmail2fa: Boolean(meRes.loginEmail2fa),
           }),
@@ -1748,7 +1765,7 @@ export function App() {
     } catch {}
   }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId])
 
-  // Single unified account status probe on mount/switch/token refresh
+  // Single unified account status probe on mount/switch/token refresh/settings open (keeps TURN quota usage fresh)
   useEffect(() => {
     const devId = activeDevice?.id
     const baseUrl = activeDevice?.baseUrl
@@ -1764,10 +1781,12 @@ export function App() {
         if (cancelled || !res || res.status === 'expired' || res.status === 'unreachable') return
         if (Array.isArray(res.devices)) setAccountDevices(res.devices)
         setServerEmailEnabled(Boolean(res.emailEnabled))
+        if (res.turnQuota) setTurnQuota(res.turnQuota)
         setDeviceState((prev) =>
           updateDeviceMeta(prev, devId, {
             ...(res.username ? { username: res.username } : {}),
             ...(res.role ? { role: res.role } : {}),
+            ...(res.tier ? { tier: res.tier } : {}),
             email: res.email || '',
             loginEmail2fa: Boolean(res.loginEmail2fa),
           }),
@@ -1777,7 +1796,7 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId])
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId, settingsOpen])
 
   const handleSendBindEmailCode = useCallback(
     async (targetEmail) => {
@@ -2374,7 +2393,9 @@ export function App() {
     if (connState === 'error') return `${activeDeviceName} · ${bi('连接已断开', 'Disconnected')}`
     if (connState !== 'connected') return `${activeDeviceName} · ${t('common.connecting')}`
     if (!bridgeOnline) return `${activeDeviceName} · ${t('common.offline')}`
-    if (!e2eeLocked && p2pState === 'failed') return `${activeDeviceName} · ${bi('P2P 直连受限', 'P2P Blocked')}`
+    if (!e2eeLocked && p2pState === 'failed') {
+      return `${activeDeviceName} · ${turnQuota?.exceeded ? bi('中继额度已用完', 'Relay Quota Reached') : bi('P2P 直连受限', 'P2P Blocked')}`
+    }
     if (!e2eeLocked && p2pState === 'connecting') return `${activeDeviceName} · ${bi('正在建立 P2P 直连...', 'Connecting P2P...')}`
     if (hasMultipleTargets) {
       return currentWorkspaceLabel
@@ -2593,7 +2614,12 @@ export function App() {
         <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
           <span>
-            {p2pError || bi('P2P 直连受当前网络防火墙限制，请切换 Wi-Fi / 5G 后重试', 'Direct P2P blocked by network firewall. Switch Wi-Fi / 5G and retry.')}
+            {turnQuota?.exceeded
+              ? bi(
+                  `本月加密中继额度已用完（${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}），切换至同 Wi-Fi / 家用宽带可继续免费 P2P 直连，或联系管理员升级等级`,
+                  `Monthly encrypted relay quota reached (${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}). Switch to Wi-Fi / home broadband for free direct P2P or contact admin to upgrade.`,
+                )
+              : p2pError || bi('P2P 直连受当前网络防火墙限制，请切换 Wi-Fi / 5G 后重试', 'Direct P2P blocked by network firewall. Switch Wi-Fi / 5G and retry.')}
           </span>
           <button
             type="button"
@@ -3078,6 +3104,7 @@ export function App() {
               locked: activeBridgeE2ee.locked,
               keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
             }}
+            turnQuota={turnQuota}
             onOpenE2eeSync={() =>
               setE2eeModal({
                 open: true,

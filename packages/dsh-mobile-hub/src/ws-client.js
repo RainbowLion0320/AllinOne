@@ -268,6 +268,16 @@ export class RelayBridgeLink {
         return
       }
 
+      if (msg.type === 'ice.update') {
+        if (Array.isArray(msg.iceServers)) {
+          this.iceServers = msg.iceServers
+        }
+        if (msg.quotaExceeded) {
+          this.p2p.dropRelayedSessions()
+        }
+        return
+      }
+
       if (msg.type === EVENTS.CLIENT_REVOKED) {
         this.p2p.revokeClients(msg.clientIds || [])
         return

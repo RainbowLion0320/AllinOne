@@ -11,15 +11,24 @@ import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
 import { createStunServer } from './stun-server.js'
 import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
+import {
+  buildTurnQuotaSnapshot,
+  createTurnLogMeter,
+  getTurnQuotaBytesForTier,
+  parseCoturnUsageLine,
+  resolveTurnQuotaConfig,
+} from './turn-meter.js'
+
+export { buildTurnQuotaSnapshot, getTurnQuotaBytesForTier, parseCoturnUsageLine, resolveTurnQuotaConfig }
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '1.0.3')
+    return String(pkg?.version || '1.0.4')
   } catch {
-    return '1.0.3'
+    return '1.0.4'
   }
 })()
 
@@ -280,7 +289,27 @@ export function createRelayServer(options = {}) {
   const turnHostExplicit = String(options.turnHost ?? process.env.TURN_HOST ?? '').trim()
   const turnPortRaw = options.turnPort ?? process.env.TURN_PORT ?? '3478'
   const turnPort = Number.isInteger(Number(turnPortRaw)) && Number(turnPortRaw) > 0 ? Number(turnPortRaw) : 3478
-  const turnTtlSec = Number(options.turnTtlSec ?? process.env.TURN_TTL_SEC ?? 86_400) || 86_400
+  const turnTtlSec = Math.max(120, Number(options.turnTtlSec ?? process.env.TURN_TTL_SEC ?? 600) || 600)
+  const turnLogFile = String(options.turnLogFile ?? process.env.TURN_LOG_FILE ?? '').trim()
+  const turnQuotaConfig = resolveTurnQuotaConfig(options, process.env)
+
+  const accounts = createAccountStore({ filePath: accountsFile })
+  const mailer = createMailer(options)
+  const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
+  const startedAt = Date.now()
+
+  function buildUserTurnQuota(roomId) {
+    const rid = String(roomId || '').trim()
+    if (!rid.startsWith('usr_')) return null
+    const tier = accounts.getUserTier(rid)
+    const usage = accounts.getTurnUsage(rid)
+    return buildTurnQuotaSnapshot({
+      tier,
+      month: usage.month,
+      usedBytes: usage.bytes,
+      config: turnQuotaConfig,
+    })
+  }
 
   function extractPublicHostname(req = null) {
     if (turnHostExplicit) return turnHostExplicit
@@ -315,25 +344,28 @@ export function createRelayServer(options = {}) {
 
     // Mode 1: Hardened self-hosted coturn (handles BOTH STUN and TURN UDP+TCP cleanly with zero proxy-polluted public STUNs)
     if (turnSecret && formattedHost) {
-      const creds = buildTurnCredentials({
-        secret: turnSecret,
-        userId: scopeId || 'allinone',
-        ttlSec: turnTtlSec,
-      })
       const servers = [{ urls: `stun:${formattedHost}:${turnPort}` }]
-      if (creds) {
-        servers.push(
-          {
-            urls: `turn:${formattedHost}:${turnPort}?transport=udp`,
-            username: creds.username,
-            credential: creds.credential,
-          },
-          {
-            urls: `turn:${formattedHost}:${turnPort}?transport=tcp`,
-            username: creds.username,
-            credential: creds.credential,
-          },
-        )
+      const quota = scopeId ? buildUserTurnQuota(scopeId) : null
+      if (!quota || !quota.exceeded) {
+        const creds = buildTurnCredentials({
+          secret: turnSecret,
+          userId: scopeId || 'allinone',
+          ttlSec: turnTtlSec,
+        })
+        if (creds) {
+          servers.push(
+            {
+              urls: `turn:${formattedHost}:${turnPort}?transport=udp`,
+              username: creds.username,
+              credential: creds.credential,
+            },
+            {
+              urls: `turn:${formattedHost}:${turnPort}?transport=tcp`,
+              username: creds.username,
+              credential: creds.credential,
+            },
+          )
+        }
       }
       return servers
     }
@@ -347,11 +379,6 @@ export function createRelayServer(options = {}) {
     // Mode 3: Public STUN fallback (only when neither TURN nor built-in STUN is active)
     return DEFAULT_PUBLIC_STUN_SERVERS.map((u) => ({ urls: u }))
   }
-
-  const accounts = createAccountStore({ filePath: accountsFile })
-  const mailer = createMailer(options)
-  const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
-  const startedAt = Date.now()
   const auth = createAuthManager({
     jwtSecret,
     adminBootstrapToken,
@@ -464,10 +491,47 @@ export function createRelayServer(options = {}) {
     }
   }
 
+  const iceRefreshMs = turnSecret ? Math.max(60_000, Math.floor(turnTtlSec * 0.75) * 1000) : 0
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
     getIceServers: (req, roomId) => resolveIceServers(req, roomId),
+    getTurnQuota: (roomId) => buildUserTurnQuota(roomId),
+    iceRefreshIntervalMs: iceRefreshMs,
   })
+
+  function recordTurnUsageBytes(userId, billedBytes) {
+    const rid = String(userId || '').trim()
+    if (!rid.startsWith('usr_') || !Number.isFinite(billedBytes) || billedBytes <= 0) return null
+    const before = buildUserTurnQuota(rid)
+    const updated = accounts.addTurnUsage(rid, billedBytes)
+    if (!updated) return null
+    const after = buildUserTurnQuota(rid)
+    if (!before?.exceeded && after?.exceeded) {
+      const targetUser = accounts.getUserById(rid)
+      console.log(
+        `[turn-meter] User ${targetUser ? `@${targetUser.username}` : rid} (${after.tier}) reached monthly TURN quota (${after.usedBytes}/${after.quotaBytes} B); switching to P2P-only`,
+      )
+      hub.recordActivity({
+        type: 'turn.quota_exceeded',
+        roomId: rid,
+        label: targetUser ? `@${targetUser.username}` : rid,
+        detail: `${after.tier.toUpperCase()} monthly TURN limit reached`,
+      })
+      hub.pushIceUpdate(rid, { quotaExceeded: true })
+    }
+    return after
+  }
+
+  const turnMeter = turnLogFile
+    ? createTurnLogMeter({
+        logPath: turnLogFile,
+        pollIntervalMs: options.turnMeterPollMs || 3_000,
+        startFromBeginning: Boolean(options.turnMeterStartFromBeginning),
+        onUsage: ({ userId, billedBytes }) => {
+          recordTurnUsageBytes(userId, billedBytes)
+        },
+      })
+    : null
 
   function isAllowedOrigin(rawOrigin, req) {
     const origin = String(rawOrigin || '').trim()
@@ -1406,7 +1470,11 @@ export function createRelayServer(options = {}) {
         used: invites.filter((i) => i.status === 'used').length,
         revoked: invites.filter((i) => i.status === 'revoked').length,
       }
-      sendJson(res, 200, { ok: true, invites, stats, users: accounts.listUsers() })
+      const usersWithQuota = accounts.listUsers().map((u) => ({
+        ...u,
+        turnQuota: buildUserTurnQuota(u.userId),
+      }))
+      sendJson(res, 200, { ok: true, invites, stats, users: usersWithQuota })
       return
     }
 
@@ -1479,6 +1547,14 @@ export function createRelayServer(options = {}) {
           enabled: Boolean(turnSecret && extractPublicHostname(req)),
           host: extractPublicHostname(req) || '',
           port: turnSecret ? turnPort : 0,
+          ttlSec: turnTtlSec,
+          meteringEnabled: Boolean(turnLogFile),
+          quotas: {
+            freeMb: turnQuotaConfig.freeMb,
+            proMb: turnQuotaConfig.proMb,
+            ultraMb: turnQuotaConfig.ultraMb,
+            adminMb: turnQuotaConfig.adminMb,
+          },
         },
         registerInviteGated: true,
         startedAt,
@@ -1488,11 +1564,77 @@ export function createRelayServer(options = {}) {
         accounts,
         hub,
         serverHealth,
+        getTurnQuota: (uid) => buildUserTurnQuota(uid),
         currentAdminRoom: payload.room || '',
         currentAdminSid: payload.sid || '',
       })
       res.setHeader('Cache-Control', 'no-store')
       sendJson(res, 200, overview)
+      return
+    }
+
+    // Admin: Update a user's tier (`free` / `pro` / `ultra` / `admin`; `ultra` and `admin` share identical TURN quota rules)
+    if (pathname === '/api/admin/users/set-tier' && req.method === 'POST') {
+      const payload = requireAdmin(req, res)
+      if (!payload) return
+      try {
+        const body = await readJsonBody(req)
+        const targetRoom = String(body.userId || body.roomId || '').trim()
+        const targetTier = String(body.tier || '').trim().toLowerCase()
+        if (!targetRoom.startsWith('usr_') || !targetTier) {
+          sendJson(res, 400, { ok: false, error: '缺少目标用户或等级参数' })
+          return
+        }
+        const changed = accounts.setUserTier(targetRoom, targetTier, { actorUserId: payload.room })
+        if (!changed.ok) {
+          sendJson(res, 400, { ok: false, error: changed.error })
+          return
+        }
+        const turnQuota = buildUserTurnQuota(targetRoom)
+        hub.pushIceUpdate(targetRoom, { quotaExceeded: Boolean(turnQuota?.exceeded) })
+        hub.recordActivity({
+          type: 'admin.tier',
+          roomId: targetRoom,
+          label: `@${changed.user.username}`,
+          detail: `${String(changed.prevTier || 'free').toUpperCase()} -> ${String(changed.tier).toUpperCase()}`,
+          ip: getClientIp(req),
+        })
+        sendJson(res, 200, { ok: true, user: changed.user, tier: changed.tier, turnQuota })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
+      return
+    }
+
+    // Admin: Reset a user's current-month TURN relay usage to 0 bytes
+    if (pathname === '/api/admin/users/reset-turn-usage' && req.method === 'POST') {
+      const payload = requireAdmin(req, res)
+      if (!payload) return
+      try {
+        const body = await readJsonBody(req)
+        const targetRoom = String(body.userId || body.roomId || '').trim()
+        if (!targetRoom.startsWith('usr_')) {
+          sendJson(res, 400, { ok: false, error: '缺少目标用户标识' })
+          return
+        }
+        const reset = accounts.resetTurnUsage(targetRoom)
+        if (!reset.ok) {
+          sendJson(res, 404, { ok: false, error: reset.error })
+          return
+        }
+        const turnQuota = buildUserTurnQuota(targetRoom)
+        hub.pushIceUpdate(targetRoom, { quotaExceeded: false })
+        hub.recordActivity({
+          type: 'admin.quota_reset',
+          roomId: targetRoom,
+          label: `@${reset.user.username}`,
+          detail: `Monthly TURN usage reset (${reset.turnUsage.month})`,
+          ip: getClientIp(req),
+        })
+        sendJson(res, 200, { ok: true, user: reset.user, turnQuota })
+      } catch {
+        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      }
       return
     }
 
@@ -1834,8 +1976,10 @@ export function createRelayServer(options = {}) {
         loginEmail2fa: Boolean(acctUser.loginEmail2fa),
         emailEnabled: mailer.isConfigured(),
         role: acctUser.role,
+        tier: acctUser.tier,
+        turnQuota: buildUserTurnQuota(payload.room),
         mode: 'p2p-only',
-        iceServers: resolveIceServers(req),
+        iceServers: resolveIceServers(req, payload.room),
         label: `@${acctUser.username}`,
         devices: getMergedAccountDevices(payload.room, bridges),
         bridges,
@@ -2102,7 +2246,13 @@ export function createRelayServer(options = {}) {
         }
         const turnPublicHost = extractPublicHostname(null)
         if (turnSecret && turnPublicHost) {
-          console.log(`[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s)`)
+          console.log(
+            `[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s, quotas: free=${turnQuotaConfig.freeMb}MB pro=${turnQuotaConfig.proMb}MB ultra/admin=${turnQuotaConfig.ultraMb}MB)`,
+          )
+        }
+        if (turnMeter) {
+          turnMeter.start()
+          console.log(`[turn-meter] Watching coturn accounting log: ${turnLogFile}`)
         }
         console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
         console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
@@ -2116,6 +2266,7 @@ export function createRelayServer(options = {}) {
   }
 
   const close = async () => {
+    turnMeter?.stop?.()
     accounts.flush()
     hub.shutdown()
     if (stunServer) {
@@ -2128,7 +2279,7 @@ export function createRelayServer(options = {}) {
     })
   }
 
-  return { server, wss, hub, accounts, mailer, stunServer, start, close }
+  return { server, wss, hub, accounts, mailer, stunServer, turnMeter, recordTurnUsageBytes, start, close }
 }
 
 // Run directly when invoked as main script

@@ -144,6 +144,7 @@ export async function loginAccount(serverUrl, { username, password, emailCode = 
     emailVerified: Boolean(data.user?.emailVerified),
     loginEmail2fa: Boolean(data.user?.loginEmail2fa),
     role: data.user?.role || 'user',
+    tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
     label: `@${data.user?.username || String(username || '').trim()}`,
     devices: Array.isArray(data.devices) ? data.devices : [],
     bridges: Array.isArray(data.bridges) ? data.bridges : [],
@@ -195,6 +196,7 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
     email: data.user?.email || '',
     emailVerified: Boolean(data.user?.emailVerified),
     role: data.user?.role || 'user',
+    tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
     label: `@${data.user?.username || String(username || '').trim()}`,
     devices: Array.isArray(data.devices) ? data.devices : [],
     bridges: Array.isArray(data.bridges) ? data.bridges : [],
@@ -330,21 +332,69 @@ export async function adminListInvites(baseUrl, token) {
   }
 }
 
-export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false } = {}) {
+export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false, tier = '' } = {}) {
   const base = normalizeBaseUrl(baseUrl)
+  const normTier = String(tier || '').trim().toLowerCase()
+  const finalGrantAdmin = normTier ? normTier === 'admin' : Boolean(grantAdmin)
   const res = await fetch(`${base}/api/admin/invites`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ count, note, grantAdmin: Boolean(grantAdmin) }),
+    body: JSON.stringify({
+      count,
+      note,
+      grantAdmin: finalGrantAdmin,
+      ...(normTier ? { tier: normTier } : {}),
+    }),
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
     throw new Error(data.error || L(`生成邀请码失败 (HTTP ${res.status})`, `Failed to create invite codes (HTTP ${res.status})`))
   }
   return Array.isArray(data.invites) ? data.invites : []
+}
+
+export async function adminSetUserTier(baseUrl, token, { userId, tier }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/users/set-tier`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ userId, tier }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`更新用户等级失败 (HTTP ${res.status})`, `Failed to update user tier (HTTP ${res.status})`))
+  }
+  return {
+    user: data.user || null,
+    tier: String(data.tier || tier || 'free'),
+    turnQuota: data.turnQuota || null,
+  }
+}
+
+export async function adminResetTurnUsage(baseUrl, token, { userId }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/users/reset-turn-usage`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ userId }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`清零中继流量失败 (HTTP ${res.status})`, `Failed to reset relay usage (HTTP ${res.status})`))
+  }
+  return {
+    user: data.user || null,
+    turnQuota: data.turnQuota || null,
+  }
 }
 
 export async function adminRevokeInvite(baseUrl, token, { id }) {
@@ -397,6 +447,8 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
       loginEmail2fa: Boolean(data.loginEmail2fa),
       emailEnabled: Boolean(data.emailEnabled),
       role: String(data.role || ''),
+      tier: String(data.tier || ''),
+      turnQuota: data.turnQuota || null,
       roomId: String(data.roomId || device.roomId || ''),
     }
   } catch {
@@ -561,6 +613,7 @@ export class MobileRelayClient {
     this.clientId = ''
     this.onlineClientCount = 0
     this.iceServers = []
+    this.turnQuota = null
     this.pendingGrants = []
     this._grantListResolvers = new Map()
 
@@ -808,6 +861,7 @@ export class MobileRelayClient {
       p2pError: this.p2pError,
       p2pEngine: this.p2pEngine,
       p2pTransport: this.p2pTransport,
+      turnQuota: this.turnQuota,
     })
     return () => this.statusListeners.delete(fn)
   }
@@ -824,6 +878,7 @@ export class MobileRelayClient {
       p2pError: this.p2pError,
       p2pEngine: this.p2pEngine,
       p2pTransport: this.p2pTransport,
+      turnQuota: this.turnQuota,
     }
     for (const fn of this.statusListeners) {
       try { fn(snap) } catch {}
@@ -934,6 +989,7 @@ export class MobileRelayClient {
         if (msg.clientId) this.clientId = String(msg.clientId)
         if (msg.roomId && !this.roomId) this.roomId = String(msg.roomId)
         if (Array.isArray(msg.iceServers)) this.iceServers = msg.iceServers
+        if (msg.turnQuota !== undefined) this.turnQuota = msg.turnQuota || null
         this.bridges = msg.bridges || []
         if (Array.isArray(msg.devices)) this.devices = msg.devices
         if (Array.isArray(msg.clients)) {
@@ -952,6 +1008,38 @@ export class MobileRelayClient {
         }
         this.emitStatus()
         this._maybeAutoConnectP2p()
+        return
+      }
+
+      if (msg.type === 'ice.update') {
+        const wasExceeded = Boolean(this.turnQuota?.exceeded)
+        if (Array.isArray(msg.iceServers)) this.iceServers = msg.iceServers
+        if (msg.turnQuota !== undefined) this.turnQuota = msg.turnQuota || null
+        if (msg.quotaExceeded) {
+          let droppedActiveRelayed = false
+          const activeTarget = this._resolveTargetBridgeId()
+          for (const [bid, peer] of [...this.p2pPeers.entries()]) {
+            if (peer.transportType === 'relay') {
+              try { peer.close(true) } catch {}
+              this.p2pPeers.delete(bid)
+              if (bid === activeTarget) droppedActiveRelayed = true
+            }
+          }
+          if (droppedActiveRelayed) {
+            this.p2pState = 'failed'
+            this.p2pTransport = ''
+            this.p2pError = L(
+              '本月加密中继流量额度已用完，已暂停中继连接；切换至同 Wi-Fi / 家用宽带可继续免费 P2P 直连',
+              'Monthly encrypted relay quota reached. Relayed session paused; switch to Wi-Fi / home broadband for unlimited direct P2P.',
+            )
+          }
+          this.emitStatus()
+        } else {
+          this.emitStatus()
+          if (wasExceeded && !this.turnQuota?.exceeded && this.p2pState === 'failed') {
+            void this.retryP2p().catch(() => {})
+          }
+        }
         return
       }
 

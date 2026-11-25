@@ -14,7 +14,7 @@ import dgram from 'node:dgram'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
@@ -22,6 +22,12 @@ import { RTCIceCandidate, RTCPeerConnection } from 'werift'
 import { DesktopWebRtcProxy } from '../packages/desktop-app/src/webrtc-proxy.js'
 import { ElectronWebRtcClient } from '../packages/dsh-mobile-hub/src/p2p/peer-electron.js'
 import { buildTurnCredentials, createRelayServer } from '../packages/relay-server/src/index.js'
+import {
+  buildTurnQuotaSnapshot,
+  getTurnQuotaBytesForTier,
+  parseCoturnUsageLine,
+  resolveTurnQuotaConfig,
+} from '../packages/relay-server/src/turn-meter.js'
 import {
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
@@ -908,12 +914,11 @@ async function main() {
     assert.equal(wsACli.hello.bridges[0].bridgeId, friendDevA.bridgeId)
     wsACli.ws.close()
 
-    // Pure Control Plane v1.0.0: verify all server data-plane upload & tier endpoints are permanently removed (404)
+    // Pure Control Plane v1.0.0: verify all server data-plane upload endpoints are permanently removed (404)
     for (const [method, path] of [
       ['POST', '/api/uploads'],
       ['GET', '/api/uploads/00000000-0000-0000-0000-000000000000'],
       ['POST', '/api/auth/media-token'],
-      ['POST', '/api/admin/users/set-tier'],
     ]) {
       const r = await fetch(`${httpBase}${path}`, {
         method,
@@ -5921,7 +5926,243 @@ async function main() {
         await turnRelay.close()
       }
     }
-    console.log('[smoke] 36/36 Dynamic RFC HMAC-SHA1 TURN credentials, clean ICE ordering & secret non-leakage OK')
+    console.log('[smoke] 36/37 Dynamic RFC HMAC-SHA1 TURN credentials, clean ICE ordering & secret non-leakage OK')
+
+    // 37. 4-tier per-user TURN relay metering & quota enforcement (free/pro/ultra/admin, ultra === admin)
+    {
+      // 37a. coturn 4.6.1 accounting line parser (strictly ignores `peer usage:` and non-usr_ probes)
+      const parsedUsage = parseCoturnUsageLine(
+        '4: : session 001000000000000002: usage: realm=<allinone>, username=<1795581100:usr_meter1>, rp=21, rb=2606, sp=19, sb=2528',
+      )
+      assert.deepEqual(parsedUsage, { userId: 'usr_meter1', rb: 2606, sb: 2528, billedBytes: 2567 })
+      assert.equal(
+        parseCoturnUsageLine(
+          '4: : session 001000000000000002: peer usage: realm=<allinone>, username=<1795581100:usr_meter1>, rp=15, rb=9999999, sp=16, sb=9999999',
+        ),
+        null,
+        'peer usage lines must be ignored to prevent double-counting',
+      )
+      assert.equal(
+        parseCoturnUsageLine(
+          '4: : session 001000000000000002: usage: realm=<allinone>, username=<1795581100:live_e2e_probe>, rp=21, rb=2606, sp=19, sb=2528',
+        ),
+        null,
+        'non-usr_ usernames must not be billed to accounts',
+      )
+
+      // 37b. 4-tier defaults & strict `admin === ultra` parity
+      const defaultCfg = resolveTurnQuotaConfig({}, {})
+      assert.equal(defaultCfg.freeMb, 1024)
+      assert.equal(defaultCfg.proMb, 10240)
+      assert.equal(defaultCfg.ultraMb, 51200)
+      assert.equal(defaultCfg.adminMb, 51200)
+      assert.equal(
+        getTurnQuotaBytesForTier('admin', defaultCfg),
+        getTurnQuotaBytesForTier('ultra', defaultCfg),
+        'admin and ultra must strictly share identical TURN quota rules',
+      )
+      const unlimitedSnap = buildTurnQuotaSnapshot({
+        tier: 'ultra',
+        month: '2026-11',
+        usedBytes: 999_999_999,
+        config: resolveTurnQuotaConfig({ turnQuotaUltraMb: 0 }, {}),
+      })
+      assert.equal(unlimitedSnap.unlimited, true)
+      assert.equal(unlimitedSnap.exceeded, false)
+
+      // 37c. Live relay server + coturn log tailer -> quota exceed -> STUN-only + live `ice.update` -> tier upgrade & reset restore TURN
+      const quotaDir = join(tmpDir, 'turn-quota-e2e')
+      mkdirSync(quotaDir, { recursive: true })
+      const fakeTurnLog = join(quotaDir, 'turn.log')
+      writeFileSync(fakeTurnLog, '', 'utf8')
+
+      const qRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-quota-jwt-secret-123456',
+        adminBootstrapToken: 'QUOTA-BOOT-1',
+        accountsFile: join(quotaDir, 'accounts.json'),
+        publicRelayUrl: 'https://quota.example.com',
+        stunEnabled: false,
+        turnSecret: 'smoke-quota-turn-secret-998877',
+        turnHost: 'quota.example.com',
+        turnPort: 3478,
+        turnTtlSec: 600,
+        turnLogFile: fakeTurnLog,
+        turnMeterPollMs: 500,
+        turnQuotaFreeMb: 1,
+        turnQuotaProMb: 10,
+        turnQuotaUltraMb: 50,
+      })
+      const { port: qPort } = await qRelay.start()
+      const qBase = `http://127.0.0.1:${qPort}`
+      try {
+        const qAdmin = await (await fetch(`${qBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'quota_admin', password: 'QuotaPassword123!', inviteCode: 'QUOTA-BOOT-1' }),
+        })).json()
+        assert.equal(qAdmin.ok, true)
+
+        const invRes = await (await fetch(`${qBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+          body: JSON.stringify({ count: 1, tier: 'free', note: 'free-quota-test' }),
+        })).json()
+        assert.equal(invRes.ok, true)
+        assert.equal(invRes.invites[0].tier, 'free')
+
+        const qFree = await (await fetch(`${qBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'quota_free', password: 'QuotaPassword123!', inviteCode: invRes.invites[0].code }),
+        })).json()
+        assert.equal(qFree.ok, true)
+
+        // Non-admin must be blocked from set-tier and reset-turn-usage
+        assert.equal(
+          (await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qFree.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'ultra' }),
+          })).status,
+          403,
+        )
+        assert.equal(
+          (await fetch(`${qBase}/api/admin/users/reset-turn-usage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qFree.token}` },
+            body: JSON.stringify({ userId: qFree.roomId }),
+          })).status,
+          403,
+        )
+
+        // Admin /api/auth/me has 50MB quota (identical to ultra) + full STUN+TURN
+        const adminMe = await (await fetch(`${qBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${qAdmin.token}` },
+        })).json()
+        assert.equal(adminMe.tier, 'admin')
+        assert.equal(adminMe.turnQuota.quotaBytes, 50 * 1024 * 1024)
+        assert.equal(adminMe.iceServers.length, 3)
+
+        // Connect Free user's WS client and observe live `ice.update` pushes
+        const qCli = await openTicketClientWs(qBase, qPort, qFree.token, { deviceName: 'quota-phone' })
+        const iceUpdates = []
+        let iceWaiter = null
+        qCli.ws.on('message', (raw) => {
+          let m
+          try { m = JSON.parse(String(raw)) } catch { return }
+          if (m.type === 'ice.update') {
+            iceUpdates.push(m)
+            if (iceWaiter) {
+              const fn = iceWaiter
+              iceWaiter = null
+              fn(m)
+            }
+          }
+        })
+        const waitNextIceUpdate = (timeoutMs = 5000) =>
+          new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+              iceWaiter = null
+              reject(new Error('Timed out waiting for ice.update'))
+            }, timeoutMs)
+            iceWaiter = (m) => {
+              clearTimeout(timer)
+              resolve(m)
+            }
+          })
+
+        try {
+          assert.equal(qCli.hello.turnQuota.tier, 'free')
+          assert.equal(qCli.hello.turnQuota.quotaBytes, 1 * 1024 * 1024)
+          assert.equal(qCli.hello.turnQuota.exceeded, false)
+          assert.equal(qCli.hello.iceServers.length, 3)
+
+          // Append a huge `peer usage:` line (must be ignored!) plus a real `usage:` line crossing 1MB free cap
+          const nextUpdP = waitNextIceUpdate(5000)
+          appendFileSync(
+            fakeTurnLog,
+            [
+              `10: : session 001000000000000009: peer usage: realm=<allinone>, username=<1795581100:${qFree.roomId}>, rp=500, rb=50000000, sp=500, sb=50000000`,
+              `11: : session 001000000000000009: usage: realm=<allinone>, username=<1795581100:${qFree.roomId}>, rp=800, rb=1200000, sp=800, sb=1200000`,
+              '',
+            ].join('\n'),
+            'utf8',
+          )
+          const exceededMsg = await nextUpdP
+          assert.equal(exceededMsg.quotaExceeded, true)
+          assert.equal(exceededMsg.turnQuota.exceeded, true)
+          assert.equal(exceededMsg.turnQuota.usedBytes, 1_200_000, 'Must bill only `: usage:` and ignore `peer usage:`')
+          assert.equal(exceededMsg.iceServers.length, 1, 'Over-quota user must receive STUN-only iceServers')
+          assert.ok(exceededMsg.iceServers[0].urls.startsWith('stun:'))
+
+          // /api/auth/me must also enforce STUN-only while over quota
+          const freeMeOver = await (await fetch(`${qBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${qFree.token}` },
+          })).json()
+          assert.equal(freeMeOver.turnQuota.exceeded, true)
+          assert.equal(freeMeOver.turnQuota.usedBytes, 1_200_000)
+          assert.equal(freeMeOver.iceServers.length, 1, '/api/auth/me must withhold TURN when user is over quota')
+
+          // Admin upgrades Free user -> Pro (10 MB): immediately restores TURN credentials via live `ice.update`
+          const proUpdP = waitNextIceUpdate(5000)
+          const proRes = await (await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'pro' }),
+          })).json()
+          assert.equal(proRes.ok, true)
+          assert.equal(proRes.tier, 'pro')
+          assert.equal(proRes.turnQuota.exceeded, false)
+          const proMsg = await proUpdP
+          assert.equal(proMsg.quotaExceeded, false)
+          assert.equal(proMsg.turnQuota.tier, 'pro')
+          assert.equal(proMsg.iceServers.length, 3, 'Upgrading to Pro must restore TURN credentials')
+
+          // Admin upgrades -> Ultra: verify Ultra quota strictly equals Admin quota (50 MB)
+          const ultraUpdP = waitNextIceUpdate(5000)
+          const ultraRes = await (await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'ultra' }),
+          })).json()
+          assert.equal(ultraRes.ok, true)
+          assert.equal(ultraRes.turnQuota.quotaBytes, adminMe.turnQuota.quotaBytes, 'Ultra and Admin quotas must be identical')
+          await ultraUpdP
+
+          // Downgrade back to Free (exceeded again), then admin resets monthly usage -> restores TURN
+          const downUpdP = waitNextIceUpdate(5000)
+          await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'free' }),
+          })
+          const downMsg = await downUpdP
+          assert.equal(downMsg.quotaExceeded, true)
+          assert.equal(downMsg.iceServers.length, 1)
+
+          const resetUpdP = waitNextIceUpdate(5000)
+          const resetRes = await (await fetch(`${qBase}/api/admin/users/reset-turn-usage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId }),
+          })).json()
+          assert.equal(resetRes.ok, true)
+          assert.equal(resetRes.turnQuota.usedBytes, 0)
+          assert.equal(resetRes.turnQuota.exceeded, false)
+          const resetMsg = await resetUpdP
+          assert.equal(resetMsg.quotaExceeded, false)
+          assert.equal(resetMsg.turnQuota.usedBytes, 0)
+          assert.equal(resetMsg.iceServers.length, 3, 'Resetting monthly TURN usage must restore TURN credentials')
+        } finally {
+          await qCli.closeAll()
+        }
+      } finally {
+        await qRelay.close()
+      }
+    }
+    console.log('[smoke] 37/37 4-tier per-user TURN metering, quota gating & live ice.update enforcement OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

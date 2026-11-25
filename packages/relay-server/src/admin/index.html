@@ -100,7 +100,7 @@
             <div class="topbar-title-wrap">
               <div class="topbar-title-row">
                 <span class="topbar-title" id="tb-title">All in One 监控看板</span>
-                <span class="pill pill-subtle mono" id="tb-version">v1.0.3</span>
+                <span class="pill pill-subtle mono" id="tb-version">v1.0.4</span>
                 <span class="pill pill-emerald" id="tb-idle-badge">按需 · 0 空载</span>
               </div>
               <div class="topbar-sub" id="tb-subtitle">—</div>
@@ -229,9 +229,11 @@
                 <button type="button" class="qty-btn" data-qty="10">10</button>
               </div>
               <input id="invite-note" type="text" maxlength="60" placeholder="备注（如：给朋友 / 测试账号）" class="invite-note-input" />
-              <select id="invite-role" class="select-compact" aria-label="邀请角色">
-                <option value="user">普通用户 (P2P 直连)</option>
-                <option value="admin">管理员 (Admin)</option>
+              <select id="invite-role" class="select-compact" aria-label="邀请等级">
+                <option value="free">Free (中继 1 GB/月 · P2P 无限)</option>
+                <option value="pro">Pro (中继 10 GB/月 · P2P 无限)</option>
+                <option value="ultra">Ultra (中继 50 GB/月 · P2P 无限)</option>
+                <option value="admin">Admin (中继 50 GB/月 · 管理员)</option>
               </select>
               <button type="submit" id="btn-create-invite" class="btn btn-primary btn-sm">生成邀请码</button>
             </form>
