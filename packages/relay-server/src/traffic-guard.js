@@ -11,16 +11,20 @@ import { dirname } from 'node:path'
  *      - Calendar month quota:  1 GB / month (RELAY_ROOM_TRAFFIC_MONTH_MB, default 1024 MB, persisted to disk)
  *      - 24-hour daily quota:   500 MB (RELAY_ROOM_TRAFFIC_DAY_MB)
  *      - 10-minute burst quota: 120 MB (RELAY_ROOM_TRAFFIC_10M_MB)
+ *      - Single-file limit:     15 MB upload/image, 10 MB document (RELAY_FREE_MAX_FILE_MB / RELAY_FREE_MAX_DOC_MB)
  *      - /api/uploads rate:      20 uploads / minute (RELAY_ROOM_UPLOAD_PER_MIN)
  *  - `pro` (Pro 用户):
  *      - Calendar month quota:  5 GB / month (RELAY_PRO_TRAFFIC_MONTH_MB, default 5120 MB, persisted to disk)
  *      - 24-hour daily quota:   10x normal daily limit (default 5000 MB ≈ 5 GB / 24h)
  *      - 10-minute burst quota: 10x normal burst limit (default 1200 MB)
+ *      - Single-file limit:     100 MB (RELAY_PRO_MAX_FILE_MB, default 100)
  *      - /api/uploads rate:      5x normal upload rate (default 100 / min)
  *  - `ultra` (Ultra 用户):
  *      - Unlimited traffic (still metered for /admin visibility; no admin privileges)
+ *      - Single-file limit:     1 GB safety cap (RELAY_ULTRA_MAX_FILE_MB, default 1024)
  *  - `admin` (管理员):
  *      - Unlimited traffic by default (still metered for /admin visibility)
+ *      - Single-file limit:     1 GB safety cap (RELAY_ADMIN_MAX_FILE_MB, default 1024)
  *
  * Normal small text chat (< 256 KB) stays online even after soft quota is reached,
  * and only triggers hard disconnect at 2x quota to stop automated flood scripts.
@@ -83,6 +87,11 @@ export class RelayTrafficGuard {
     proDailyMultiplier = 10,
     proBurstMultiplier = 10,
     proUploadRateMultiplier = 5,
+    freeMaxUploadBytes = parseNonNegativeMb(process.env.RELAY_FREE_MAX_FILE_MB, 15),
+    freeMaxDocumentBytes = parseNonNegativeMb(process.env.RELAY_FREE_MAX_DOC_MB, 10),
+    proMaxFileBytes = parseNonNegativeMb(process.env.RELAY_PRO_MAX_FILE_MB, 100),
+    ultraMaxFileBytes = parseNonNegativeMb(process.env.RELAY_ULTRA_MAX_FILE_MB, 1024),
+    adminMaxFileBytes = parseNonNegativeMb(process.env.RELAY_ADMIN_MAX_FILE_MB, 1024),
     adminExempt = String(process.env.RELAY_ADMIN_TRAFFIC_EXEMPT ?? 'true').toLowerCase() !== 'false',
     largeFrameThresholdBytes = LARGE_FRAME_THRESHOLD_BYTES,
     hardDisconnectMultiplier = 2,
@@ -98,6 +107,11 @@ export class RelayTrafficGuard {
     this.proDailyMultiplier = Math.max(1, Number(proDailyMultiplier) || 10)
     this.proBurstMultiplier = Math.max(1, Number(proBurstMultiplier) || 10)
     this.proUploadRateMultiplier = Math.max(1, Number(proUploadRateMultiplier) || 5)
+    this.freeMaxUploadBytes = Math.max(1024 * 1024, Number(freeMaxUploadBytes) || 15 * 1024 * 1024)
+    this.freeMaxDocumentBytes = Math.max(1024 * 1024, Number(freeMaxDocumentBytes) || 10 * 1024 * 1024)
+    this.proMaxFileBytes = Math.max(1024 * 1024, Number(proMaxFileBytes) || 100 * 1024 * 1024)
+    this.ultraMaxFileBytes = Math.max(1024 * 1024, Number(ultraMaxFileBytes) || 1024 * 1024 * 1024)
+    this.adminMaxFileBytes = Math.max(1024 * 1024, Number(adminMaxFileBytes) || 1024 * 1024 * 1024)
     this.adminExempt = Boolean(adminExempt)
     this.largeFrameThresholdBytes = Math.max(1024, Number(largeFrameThresholdBytes) || LARGE_FRAME_THRESHOLD_BYTES)
     this.hardDisconnectMultiplier = Math.max(1.2, Number(hardDisconnectMultiplier) || 2)
@@ -249,6 +263,10 @@ export class RelayTrafficGuard {
         daily24hBytes: 0,
         monthlyBytes: 0,
         uploadPerMin: 0,
+        maxUploadBytes: this.ultraMaxFileBytes,
+        maxImageBytes: this.ultraMaxFileBytes,
+        maxDocumentBytes: this.ultraMaxFileBytes,
+        maxRoomTempUploadBytes: Math.max(2 * 1024 * 1024 * 1024, this.ultraMaxFileBytes * 2),
       }
     }
     if (tier === 'admin') {
@@ -260,6 +278,10 @@ export class RelayTrafficGuard {
           daily24hBytes: 0,
           monthlyBytes: 0,
           uploadPerMin: 0,
+          maxUploadBytes: this.adminMaxFileBytes,
+          maxImageBytes: this.adminMaxFileBytes,
+          maxDocumentBytes: this.adminMaxFileBytes,
+          maxRoomTempUploadBytes: Math.max(2 * 1024 * 1024 * 1024, this.adminMaxFileBytes * 2),
         }
       }
       return {
@@ -269,6 +291,10 @@ export class RelayTrafficGuard {
         daily24hBytes: this.dailyLimitBytes,
         monthlyBytes: this.monthlyLimitBytes,
         uploadPerMin: this.uploadMaxPerMinute,
+        maxUploadBytes: this.adminMaxFileBytes,
+        maxImageBytes: this.adminMaxFileBytes,
+        maxDocumentBytes: this.adminMaxFileBytes,
+        maxRoomTempUploadBytes: Math.max(2 * 1024 * 1024 * 1024, this.adminMaxFileBytes * 2),
       }
     }
     if (tier === 'pro') {
@@ -279,6 +305,10 @@ export class RelayTrafficGuard {
         daily24hBytes: this.dailyLimitBytes > 0 ? this.dailyLimitBytes * this.proDailyMultiplier : 0,
         monthlyBytes: this.proMonthlyLimitBytes,
         uploadPerMin: this.uploadMaxPerMinute > 0 ? this.uploadMaxPerMinute * this.proUploadRateMultiplier : 0,
+        maxUploadBytes: this.proMaxFileBytes,
+        maxImageBytes: this.proMaxFileBytes,
+        maxDocumentBytes: this.proMaxFileBytes,
+        maxRoomTempUploadBytes: Math.max(512 * 1024 * 1024, this.proMaxFileBytes * 4),
       }
     }
     return {
@@ -288,6 +318,10 @@ export class RelayTrafficGuard {
       daily24hBytes: this.dailyLimitBytes,
       monthlyBytes: this.monthlyLimitBytes,
       uploadPerMin: this.uploadMaxPerMinute,
+      maxUploadBytes: this.freeMaxUploadBytes,
+      maxImageBytes: this.freeMaxUploadBytes,
+      maxDocumentBytes: this.freeMaxDocumentBytes,
+      maxRoomTempUploadBytes: Math.max(64 * 1024 * 1024, this.freeMaxUploadBytes * 4),
     }
   }
 
@@ -570,6 +604,9 @@ export class RelayTrafficGuard {
       limit24hBytes: limits.daily24hBytes,
       limitMonthBytes: limits.monthlyBytes,
       limitUploadPerMin: limits.uploadPerMin,
+      maxUploadBytes: limits.maxUploadBytes,
+      maxImageBytes: limits.maxImageBytes,
+      maxDocumentBytes: limits.maxDocumentBytes,
     }
   }
 
@@ -595,6 +632,9 @@ export class RelayTrafficGuard {
         limit24hBytes: limits.daily24hBytes,
         limitMonthBytes: limits.monthlyBytes,
         limitUploadPerMin: limits.uploadPerMin,
+        maxUploadBytes: limits.maxUploadBytes,
+        maxImageBytes: limits.maxImageBytes,
+        maxDocumentBytes: limits.maxDocumentBytes,
       }
     }
     const { bytes10m, bytes24h, bytesMonth } = this.pruneAndSum(rec, now)

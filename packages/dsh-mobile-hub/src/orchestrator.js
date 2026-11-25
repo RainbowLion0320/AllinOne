@@ -1,11 +1,17 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { readFile as readFileAsync } from 'node:fs/promises'
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { open as openAsync, readFile as readFileAsync, unlink as unlinkAsync } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
-import { decryptBytes, normalizeE2eeKey } from './helpers/e2ee.js'
+import {
+  E2EE_CHUNKED_THRESHOLD,
+  decryptAutoStream,
+  encryptBytes,
+  encryptChunkedBytes,
+  normalizeE2eeKey,
+} from './helpers/e2ee.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
@@ -37,6 +43,12 @@ export class MultiAppOrchestrator {
     this.dispatches = new Map()
     this._lastInboundPruneAt = 0
     this._activeDocReads = 0
+    this.tier = 'free'
+    this.fileLimits = {
+      maxUploadBytes: 15 * 1024 * 1024,
+      maxImageBytes: 15 * 1024 * 1024,
+      maxDocumentBytes: 10 * 1024 * 1024,
+    }
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -71,6 +83,138 @@ export class MultiAppOrchestrator {
       return u.toString().replace(/\/$/, '')
     } catch {
       return ''
+    }
+  }
+
+  setTierLimits({ tier = '', fileLimits = null } = {}) {
+    if (tier) this.tier = String(tier).trim().toLowerCase() || 'free'
+    if (fileLimits && typeof fileLimits === 'object') {
+      const nextUpload = Number(fileLimits.maxUploadBytes)
+      const nextImg = Number(fileLimits.maxImageBytes)
+      const nextDoc = Number(fileLimits.maxDocumentBytes)
+      this.fileLimits = {
+        maxUploadBytes: Number.isFinite(nextUpload) && nextUpload > 0 ? nextUpload : this.fileLimits.maxUploadBytes,
+        maxImageBytes: Number.isFinite(nextImg) && nextImg > 0 ? nextImg : this.fileLimits.maxImageBytes,
+        maxDocumentBytes: Number.isFinite(nextDoc) && nextDoc > 0 ? nextDoc : this.fileLimits.maxDocumentBytes,
+      }
+    }
+  }
+
+  formatLimitLabel(bytes) {
+    const n = Number(bytes || 0)
+    if (n >= 1024 * 1024 * 1024) {
+      const gb = n / (1024 * 1024 * 1024)
+      return Number.isInteger(gb) ? `${gb}GB` : `${gb.toFixed(1)}GB`
+    }
+    return `${Math.max(1, Math.round(n / (1024 * 1024)))}MB`
+  }
+
+  async uploadLocalFileEncrypted(realPath, fileSize) {
+    if (!this.relayHttpBase || !this.bridgeSecret || !this.e2eeKey) {
+      throw new Error('当前桥接未配置中转上传通道，无法传输大文件')
+    }
+    const headers = {
+      'Content-Type': 'application/octet-stream',
+      'X-Allinone-Encrypted': '1',
+      'X-Bridge-Secret': this.bridgeSecret,
+      ...(this.roomId ? { 'X-Room-Id': this.roomId } : {}),
+    }
+    const timeoutMs = Math.max(60_000, Math.min(600_000, Math.ceil(fileSize / (256 * 1024)) * 1000))
+
+    let encMeta
+    let res
+    if (fileSize <= E2EE_CHUNKED_THRESHOLD) {
+      const plainBuf = await readFileAsync(realPath)
+      const enc = await encryptBytes(this.e2eeKey, plainBuf, {
+        kind: 'upload',
+        roomId: this.roomId,
+      })
+      encMeta = { v: enc.v, kid: enc.kid, iv: enc.iv, chunked: false }
+      res = await fetch(`${this.relayHttpBase}/api/uploads`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Length': String(enc.ciphertext.byteLength),
+        },
+        body: enc.ciphertext,
+        redirect: 'error',
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    } else {
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const encPromise = (async () => {
+        const fh = await openAsync(realPath, 'r')
+        try {
+          return await encryptChunkedBytes(
+            this.e2eeKey,
+            {
+              totalSize: fileSize,
+              readSlice: async (offset, len) => {
+                const b = Buffer.allocUnsafe(len)
+                let pos = 0
+                while (pos < len) {
+                  const { bytesRead } = await fh.read(b, pos, len - pos, offset + pos)
+                  if (bytesRead <= 0) break
+                  pos += bytesRead
+                }
+                return new Uint8Array(b.buffer, b.byteOffset, pos)
+              },
+            },
+            {
+              kind: 'upload',
+              roomId: this.roomId,
+              onChunk: async (chunk) => {
+                await writer.write(chunk)
+              },
+            },
+          )
+        } finally {
+          await fh.close().catch(() => {})
+        }
+      })()
+        .then(async (meta) => {
+          await writer.close()
+          return meta
+        })
+        .catch(async (err) => {
+          await writer.abort(err).catch(() => {})
+          throw err
+        })
+
+      const fetchPromise = fetch(`${this.relayHttpBase}/api/uploads`, {
+        method: 'POST',
+        headers,
+        body: readable,
+        duplex: 'half',
+        redirect: 'error',
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+
+      const [encSettled, fetchSettled] = await Promise.allSettled([encPromise, fetchPromise])
+      if (fetchSettled.status === 'rejected') {
+        throw fetchSettled.reason
+      }
+      if (encSettled.status === 'rejected') {
+        try { await fetchSettled.value.body?.cancel?.() } catch {}
+        throw encSettled.reason
+      }
+      encMeta = {
+        v: encSettled.value.v,
+        kid: encSettled.value.kid,
+        iv: encSettled.value.iv,
+        chunked: true,
+      }
+      res = fetchSettled.value
+    }
+
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data?.ok || !data?.upload?.url) {
+      throw new Error(data?.error || `中转上传大文件失败 (HTTP ${res.status})`)
+    }
+    return {
+      uploadUrl: data.upload.url,
+      e2ee: encMeta,
     }
   }
 
@@ -231,7 +375,9 @@ export class MultiAppOrchestrator {
   async materializeAttachments(attachments = []) {
     if (!Array.isArray(attachments) || attachments.length === 0) return []
     const RELAY_UPLOAD_PATH_RE = /^\/api\/uploads\/[a-f0-9-]{8,64}$/i
-    const MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
+    const maxPlainBytes = Math.max(1024 * 1024, Number(this.fileLimits?.maxUploadBytes) || 15 * 1024 * 1024)
+    const maxDownloadBytes = maxPlainBytes + 64 * 1024
+    const maxLabel = this.formatLimitLabel(maxPlainBytes)
     mkdirSync(this.inboundDir, { recursive: true })
     try { chmodSync(this.inboundDir, 0o700) } catch {}
     this.pruneInboundDir()
@@ -249,44 +395,105 @@ export class MultiAppOrchestrator {
         this.log.warn?.(`mobile-hub: rejected unencrypted attachment: ${String(att.filename || '').slice(0, 64)}`)
         continue
       }
+      let localPath = ''
       try {
         const isImage = String(att.mimeType || '').toLowerCase().startsWith('image/')
         // Ephemeral cleanup: consume non-image uploads on relay immediately after PC downloads them
         const fullUrl = `${this.relayHttpBase}${rawUrl}${isImage ? '' : '?consume=1'}`
         const headers = { 'X-Bridge-Secret': this.bridgeSecret }
         if (this.roomId) headers['X-Room-Id'] = this.roomId
-        const res = await fetch(fullUrl, { headers, redirect: 'error', signal: AbortSignal.timeout(30_000) })
+        const timeoutMs = Math.max(45_000, Math.min(600_000, Math.ceil(maxPlainBytes / (256 * 1024)) * 1000))
+        const res = await fetch(fullUrl, { headers, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const declaredLen = Number(res.headers.get('content-length') || 0)
-        if (declaredLen > MAX_DOWNLOAD_BYTES) {
-          throw new Error('Attachment exceeds 15MB limit')
+        if (declaredLen > maxDownloadBytes) {
+          throw new Error(`Attachment exceeds ${maxLabel} limit`)
         }
-        const arrBuf = await res.arrayBuffer()
-        if (arrBuf.byteLength === 0 || arrBuf.byteLength > MAX_DOWNLOAD_BYTES + 64) {
-          throw new Error('Attachment size invalid or exceeds 15MB limit')
-        }
-        const plainBytes = await decryptBytes(this.e2eeKey, new Uint8Array(arrBuf), {
-          iv: att.e2ee.iv,
-          kid: att.e2ee.kid || '',
-          kind: 'upload',
-          roomId: this.roomId,
-        })
         const rawBase = basename(String(att.filename || 'upload.bin'))
         const safe = rawBase
           .replace(/[^a-zA-Z0-9._\u4e00-\u9fa5-]/g, '_')
           .replace(/^\.+/, '')
           .slice(0, 100) || 'upload.bin'
-        const localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safe}`)
-        writeFileSync(localPath, Buffer.from(plainBytes.buffer, plainBytes.byteOffset, plainBytes.byteLength), { mode: 0o600 })
+        localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safe}`)
+
+        // Stream-decrypt directly to disk with bounded byte counter (constant ~16MB RAM even for 1GB files)
+        let receivedCipherBytes = 0
+        const boundedSource = (async function* () {
+          if (!res.body) return
+          const reader = res.body.getReader()
+          try {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (!value || value.byteLength === 0) continue
+              receivedCipherBytes += value.byteLength
+              if (receivedCipherBytes > maxDownloadBytes) {
+                throw new Error(`Attachment exceeds ${maxLabel} limit`)
+              }
+              yield value
+            }
+          } finally {
+            try { reader.releaseLock() } catch {}
+          }
+        })()
+
+        const ws = createWriteStream(localPath, { mode: 0o600 })
+        let wsError = null
+        ws.on('error', (err) => { wsError = err })
+        const writeChunk = (chunk) =>
+          new Promise((resolveWrite, rejectWrite) => {
+            if (wsError) return rejectWrite(wsError)
+            const ok = ws.write(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+            if (ok) return resolveWrite()
+            const onDrain = () => {
+              ws.off('error', onErr)
+              resolveWrite()
+            }
+            const onErr = (err) => {
+              ws.off('drain', onDrain)
+              rejectWrite(err)
+            }
+            ws.once('drain', onDrain)
+            ws.once('error', onErr)
+          })
+
+        let totalPlainBytes = 0
+        try {
+          const dec = await decryptAutoStream(this.e2eeKey, boundedSource, {
+            iv: att.e2ee.iv,
+            kid: att.e2ee.kid || '',
+            kind: 'upload',
+            roomId: this.roomId,
+            chunked: Boolean(att.e2ee.chunked),
+            onPlainChunk: async (plainChunk) => {
+              await writeChunk(plainChunk)
+            },
+          })
+          totalPlainBytes = dec.totalPlainBytes
+          if (receivedCipherBytes === 0) {
+            throw new Error('Attachment size invalid (empty)')
+          }
+          await new Promise((resolveEnd, rejectEnd) => {
+            if (wsError) return rejectEnd(wsError)
+            ws.once('error', rejectEnd)
+            ws.end(() => resolveEnd())
+          })
+        } catch (streamErr) {
+          try { ws.destroy() } catch {}
+          await unlinkAsync(localPath).catch(() => {})
+          throw streamErr
+        }
+        try { chmodSync(localPath, 0o600) } catch {}
         out.push({
           id: att.id,
           filename: safe,
           mimeType: att.mimeType || 'application/octet-stream',
-          size: plainBytes.byteLength,
+          size: totalPlainBytes,
           url: rawUrl,
           localPath,
         })
       } catch (err) {
+        if (localPath) await unlinkAsync(localPath).catch(() => {})
         this.log.warn?.(`mobile-hub: failed downloading attachment ${att.filename}: ${String(err)}`)
       }
     }
@@ -513,7 +720,10 @@ export class MultiAppOrchestrator {
     }
     const isDocumentMode = String(mode || '').trim().toLowerCase() === 'document'
     const ALLOWED_MIMES = isDocumentMode ? DOCUMENT_MIMES : IMAGE_MIMES
-    const MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 15 * 1024 * 1024
+    const INLINE_WS_MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 15 * 1024 * 1024
+    const MAX_BYTES = isDocumentMode
+      ? Math.max(1024 * 1024, Number(this.fileLimits?.maxDocumentBytes) || 10 * 1024 * 1024)
+      : Math.max(1024 * 1024, Number(this.fileLimits?.maxImageBytes) || 15 * 1024 * 1024)
     const MAX_CONCURRENT_DOC_READS = 2
 
     let p = String(rawPath || '').trim()
@@ -687,12 +897,38 @@ export class MultiAppOrchestrator {
     }
     if (st.size > MAX_BYTES) {
       const actualMb = (st.size / 1024 / 1024).toFixed(1)
-      const limitMb = Math.round(MAX_BYTES / 1024 / 1024)
+      const limitLabel = this.formatLimitLabel(MAX_BYTES)
       throw new Error(
         isDocumentMode
-          ? `文件大小超出限制（${actualMb}MB / 最大 ${limitMb}MB），请在电脑端直接查看`
-          : `图片文件大小超出限制（${Math.round(st.size / 1024 / 1024)}MB / 最大 ${limitMb}MB）`,
+          ? `文件大小超出限制（${actualMb}MB / 当前等级最大 ${limitLabel}），请在电脑端直接查看`
+          : `图片文件大小超出限制（${actualMb}MB / 当前等级最大 ${limitLabel}）`,
       )
+    }
+
+    // Large files (> 10MB doc / > 15MB image) stream over zero-knowledge E2EE /api/uploads
+    // instead of Base64-inflating WebSocket frames (prevents WS 32MB limit & memory spikes).
+    if (st.size > INLINE_WS_MAX_BYTES) {
+      if (this._activeDocReads >= MAX_CONCURRENT_DOC_READS) {
+        throw new Error('当前有其他大文件正在传输，请稍后再试')
+      }
+      this._activeDocReads += 1
+      try {
+        const uploaded = await this.uploadLocalFileEncrypted(realPath, st.size)
+        return {
+          ok: true,
+          kind: isDocumentMode ? 'document' : 'image',
+          transferMode: 'upload',
+          uploadUrl: uploaded.uploadUrl,
+          e2ee: uploaded.e2ee,
+          filename: basename(realPath),
+          mimeType: realMimeType,
+          size: st.size,
+          mtimeMs: st.mtimeMs,
+          path: realPath,
+        }
+      } finally {
+        this._activeDocReads = Math.max(0, this._activeDocReads - 1)
+      }
     }
 
     let buf

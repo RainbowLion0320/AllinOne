@@ -83,6 +83,7 @@ export function startStandaloneBridge(options = {}) {
       e2eeKey,
       log,
       onRpc: (method, params) => orchestrator.handleRpc(method, params),
+      onTierUpdate: (info) => orchestrator.setTierLimits(info),
       onState: (state, detail) => {
         options.onState?.(state, detail)
         if (!options.quiet) {

@@ -5656,6 +5656,303 @@ async function main() {
     }
     console.log('[smoke] 34/34 Four-tier user quotas (Free / Pro 5GB-mo+10x-day / Ultra / Admin), monthly persistence & live tier API OK')
 
+    // 35. Per-tier single-file limits (Free 15MB/10MB, Pro 100MB, Ultra/Admin 1GB), AIO2 chunked E2EE & streaming relay transfer
+    {
+      const { encryptChunkedBytes, decryptAutoStream } = await import('../packages/shared/src/e2ee.js')
+
+      // 35a. Verify default per-tier single-file caps
+      const tgFileDef = new RelayTrafficGuard()
+      assert.equal(tgFileDef.getLimitsForTier('free').maxUploadBytes, 15 * 1024 * 1024)
+      assert.equal(tgFileDef.getLimitsForTier('free').maxDocumentBytes, 10 * 1024 * 1024)
+      assert.equal(tgFileDef.getLimitsForTier('pro').maxUploadBytes, 100 * 1024 * 1024)
+      assert.equal(tgFileDef.getLimitsForTier('pro').maxDocumentBytes, 100 * 1024 * 1024)
+      assert.equal(tgFileDef.getLimitsForTier('ultra').maxUploadBytes, 1024 * 1024 * 1024)
+      assert.equal(tgFileDef.getLimitsForTier('admin').maxUploadBytes, 1024 * 1024 * 1024)
+
+      // 35b. Verify AIO2 chunked E2EE encryption & streaming decryption across fragmented boundaries + tamper rejection
+      const chunkKey = generateE2eeKey()
+      const plainSample = new Uint8Array(70_000)
+      for (let i = 0; i < plainSample.length; i += 1) plainSample[i] = (i * 31 + 7) & 0xff
+      const encChunked = await encryptChunkedBytes(chunkKey, plainSample, {
+        kind: 'upload',
+        roomId: 'usr_chunk_test',
+        chunkSize: 16 * 1024,
+      })
+      assert.equal(encChunked.v, 2)
+      assert.equal(encChunked.chunked, true)
+      assert.equal(encChunked.totalChunks, 5)
+      const combinedCipher = Buffer.concat(encChunked.chunks.map((c) => Buffer.from(c)))
+      // Feed tiny 137-byte fragments to stress-test ByteQueue reassembly
+      const fragStream = (async function* () {
+        for (let off = 0; off < combinedCipher.length; off += 137) {
+          yield combinedCipher.subarray(off, Math.min(combinedCipher.length, off + 137))
+        }
+      })()
+      const decRes = await decryptAutoStream(chunkKey, fragStream, {
+        iv: encChunked.iv,
+        kid: encChunked.kid,
+        kind: 'upload',
+        roomId: 'usr_chunk_test',
+      })
+      assert.equal(decRes.totalPlainBytes, plainSample.length)
+      assert.ok(Buffer.compare(Buffer.concat(decRes.chunks.map((c) => Buffer.from(c))), Buffer.from(plainSample)) === 0)
+      // Truncated ciphertext must be rejected
+      await assert.rejects(
+        () =>
+          decryptAutoStream(chunkKey, combinedCipher.subarray(0, combinedCipher.length - 10), {
+            iv: encChunked.iv,
+            kid: encChunked.kid,
+            kind: 'upload',
+            roomId: 'usr_chunk_test',
+            chunked: true,
+          }),
+        /不完整|截断|失败/,
+      )
+
+      // 35c. Live Relay binary streaming upload per-tier enforcement + large-document transferMode:'upload' + consume=1 + live tier.update
+      const flDir = join(tmpDir, 'file-limit-relay')
+      mkdirSync(flDir, { recursive: true })
+      const flRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-file-limit-secret-123456',
+        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
+        accountsFile: join(flDir, 'accounts.json'),
+        uploadDir: join(flDir, 'uploads'),
+        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
+        trafficGuard: {
+          freeMaxUploadBytes: 1 * 1024 * 1024, // 1 MB for fast test
+          freeMaxDocumentBytes: 1 * 1024 * 1024,
+          proMaxFileBytes: 15 * 1024 * 1024, // 15 MB for fast test
+          ultraMaxFileBytes: 30 * 1024 * 1024, // 30 MB for fast test
+          adminMaxFileBytes: 30 * 1024 * 1024,
+          burstLimitBytes: 100 * 1024 * 1024,
+          dailyLimitBytes: 200 * 1024 * 1024,
+          monthlyLimitBytes: 500 * 1024 * 1024,
+          proMonthlyLimitBytes: 500 * 1024 * 1024,
+          uploadMaxPerMinute: 100,
+        },
+      })
+      const flAddr = await flRelay.start()
+      const flBase = `http://127.0.0.1:${flAddr.port}`
+      const flWs = `ws://127.0.0.1:${flAddr.port}/ws/bridge`
+      let flBridge = null
+      try {
+        const flAdmin = await (await fetch(`${flBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'fl_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
+        })).json()
+        const [flInvFree, flInvPro, flInvUltra] = await Promise.all([
+          fetch(`${flBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'free' }),
+          }).then((r) => r.json()),
+          fetch(`${flBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'pro' }),
+          }).then((r) => r.json()),
+          fetch(`${flBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'ultra' }),
+          }).then((r) => r.json()),
+        ])
+        const [flFree, flPro, flUltra] = await Promise.all([
+          fetch(`${flBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'fl_free', password: SMOKE_ADMIN_PASS, inviteCode: flInvFree.invites[0].code }),
+          }).then((r) => r.json()),
+          fetch(`${flBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'fl_pro', password: SMOKE_ADMIN_PASS, inviteCode: flInvPro.invites[0].code }),
+          }).then((r) => r.json()),
+          fetch(`${flBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'fl_ultra', password: SMOKE_ADMIN_PASS, inviteCode: flInvUltra.invites[0].code }),
+          }).then((r) => r.json()),
+        ])
+
+        // Raw binary without X-Allinone-Encrypted: 1 must be rejected with 400
+        const unencBin = await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${flFree.token}` },
+          body: Buffer.alloc(1024, 0x41),
+        })
+        assert.equal(unencBin.status, 400)
+
+        // 2 MB binary upload: Free (1 MB limit) -> 413, Pro (15 MB limit) -> 200
+        const twoMb = Buffer.alloc(2 * 1024 * 1024, 0x55)
+        const freeOver = await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Allinone-Encrypted': '1',
+            Authorization: `Bearer ${flFree.token}`,
+          },
+          body: twoMb,
+        })
+        assert.equal(freeOver.status, 413, 'Free user exceeding 1MB test cap must get 413')
+
+        const proOk = await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Allinone-Encrypted': '1',
+            Authorization: `Bearer ${flPro.token}`,
+          },
+          body: twoMb,
+        })
+        assert.equal(proOk.status, 200, 'Pro user within 15MB test cap must succeed')
+
+        // 18 MB binary upload: Pro (15 MB limit) -> 413, Ultra (30 MB limit) -> 200
+        const eighteenMb = Buffer.alloc(18 * 1024 * 1024, 0x77)
+        const proOver = await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Allinone-Encrypted': '1',
+            Authorization: `Bearer ${flPro.token}`,
+          },
+          body: eighteenMb,
+        })
+        assert.equal(proOver.status, 413, 'Pro user exceeding 15MB test cap must get 413')
+
+        const ultraOk = await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Allinone-Encrypted': '1',
+            Authorization: `Bearer ${flUltra.token}`,
+          },
+          body: eighteenMb,
+        })
+        assert.equal(ultraOk.status, 200, 'Ultra user within 30MB test cap must succeed')
+
+        // Bind a bridge for fl_free, verify bridge.welcome sets 1MB cap, then live-upgrade fl_free -> pro
+        // and verify tier.update pushes 15MB cap to bridge AND allows 12MB PDF transfer via transferMode:'upload'
+        const devBind = await (await fetch(`${flBase}/api/account/device-login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'fl_free', password: SMOKE_ADMIN_PASS, label: 'FL-PC' }),
+        })).json()
+        assert.equal(devBind.ok, true)
+        const flKey = generateE2eeKey()
+        flBridge = startStandaloneBridge({
+          relayUrl: flWs,
+          secret: devBind.deviceSecret,
+          roomId: devBind.roomId,
+          bridgeId: devBind.bridgeId,
+          e2eeKey: flKey,
+          cwd: flDir,
+          inboundDir: join(flDir, 'inbound'),
+          quiet: true,
+        })
+        const waitUntil = async (pred, timeoutMs = 5000) => {
+          const deadline = Date.now() + timeoutMs
+          while (Date.now() < deadline) {
+            if (pred()) return
+            await new Promise((r) => setTimeout(r, 25))
+          }
+          throw new Error('Timed out waiting for condition')
+        }
+        await waitUntil(() => flBridge.orchestrator.fileLimits.maxDocumentBytes === 1 * 1024 * 1024, 5000)
+
+        const bigPdfPath = join(flDir, 'report-12mb.pdf')
+        const bigPdfBuf = Buffer.alloc(12 * 1024 * 1024, 0x25)
+        bigPdfBuf.write('%PDF-1.7\n', 0, 'ascii')
+        writeFileSync(bigPdfPath, bigPdfBuf)
+
+        // While Free, reading 12MB PDF must fail with size limit error
+        await assert.rejects(
+          () => flBridge.orchestrator.readLocalFile({ path: bigPdfPath, cwd: flDir, mode: 'document' }),
+          /超出限制/,
+        )
+
+        // Live upgrade fl_free -> pro -> bridge immediately receives tier.update with 15MB cap
+        const upg = await fetch(`${flBase}/api/admin/users/set-tier`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
+          body: JSON.stringify({ userId: flFree.user.userId, tier: 'pro' }),
+        })
+        assert.equal(upg.status, 200)
+        await waitUntil(() => flBridge.orchestrator.fileLimits.maxDocumentBytes === 15 * 1024 * 1024, 5000)
+
+        // Now reading 12MB PDF (> 10MB inline WS threshold, <= 15MB Pro cap) uses zero-knowledge E2EE upload channel!
+        const readRes = await flBridge.orchestrator.readLocalFile({ path: bigPdfPath, cwd: flDir, mode: 'document' })
+        assert.equal(readRes.ok, true)
+        assert.equal(readRes.transferMode, 'upload')
+        assert.match(readRes.uploadUrl, /^\/api\/uploads\/[a-f0-9-]+$/i)
+        assert.ok(readRes.e2ee?.iv)
+        assert.equal(readRes.size, bigPdfBuf.length)
+
+        // Client downloads with scoped mediaToken + consume=1, decrypts exact bytes, and verifies auto-cleanup
+        const mtRes = await (await fetch(`${flBase}/api/auth/media-token`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${flFree.token}` },
+        })).json()
+        assert.equal(mtRes.ok, true)
+        const dlRes = await fetch(`${flBase}${readRes.uploadUrl}?consume=1`, {
+          headers: { Authorization: `Bearer ${mtRes.mediaToken}` },
+        })
+        assert.equal(dlRes.status, 200)
+        const dlDec = await decryptAutoStream(flKey, dlRes.body, {
+          iv: readRes.e2ee.iv,
+          kid: readRes.e2ee.kid,
+          kind: 'upload',
+          roomId: devBind.roomId,
+          chunked: Boolean(readRes.e2ee.chunked),
+        })
+        assert.equal(dlDec.totalPlainBytes, bigPdfBuf.length)
+        assert.ok(Buffer.compare(Buffer.concat(dlDec.chunks.map((c) => Buffer.from(c))), bigPdfBuf) === 0)
+
+        // Consumed upload must return 404 on second download
+        const dlAgain = await fetch(`${flBase}${readRes.uploadUrl}`, {
+          headers: { Authorization: `Bearer ${mtRes.mediaToken}` },
+        })
+        assert.equal(dlAgain.status, 404, 'Consumed upload must be deleted immediately after client download')
+
+        // Bridge materializeAttachments streams & decrypts an AIO2 chunked upload cleanly to disk
+        const chunkedAttPayload = Buffer.alloc(65_536, 0x3a)
+        const chunkedEnc = await encryptChunkedBytes(flKey, chunkedAttPayload, {
+          kind: 'upload',
+          roomId: devBind.roomId,
+          chunkSize: 16 * 1024,
+        })
+        const chunkedUp = await (await fetch(`${flBase}/api/uploads`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Allinone-Encrypted': '1',
+            Authorization: `Bearer ${flFree.token}`,
+          },
+          body: Buffer.concat(chunkedEnc.chunks.map((c) => Buffer.from(c))),
+        })).json()
+        assert.equal(chunkedUp.ok, true)
+        const mat = await flBridge.orchestrator.materializeAttachments([
+          {
+            id: chunkedUp.upload.id,
+            url: chunkedUp.upload.url,
+            filename: 'chunked-test.bin',
+            mimeType: 'application/octet-stream',
+            e2ee: { v: chunkedEnc.v, kid: chunkedEnc.kid, iv: chunkedEnc.iv, chunked: true },
+          },
+        ])
+        assert.equal(mat.length, 1)
+        assert.equal(mat[0].size, chunkedAttPayload.length)
+        assert.ok(Buffer.compare(readFileSync(mat[0].localPath), chunkedAttPayload) === 0)
+      } finally {
+        if (flBridge) await flBridge.stop()
+        await flRelay.close()
+      }
+    }
+    console.log('[smoke] 35/35 Per-tier single-file caps (Free 15MB/10MB, Pro 100MB, Ultra/Admin 1GB), AIO2 chunked E2EE & streaming transfer OK')
+
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
     if (acctPortableChild) {

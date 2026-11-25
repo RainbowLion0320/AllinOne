@@ -1080,10 +1080,10 @@
     const curTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
     const tr = u.stats?.traffic || {}
     const tierOptions = [
-      { id: 'free', label: 'Free', sub: bi('1GB/月 · 500MB/日', '1GB/mo · 500MB/d') },
-      { id: 'pro', label: 'Pro', sub: bi('5GB/月 · 10倍日额', '5GB/mo · 10x daily') },
-      { id: 'ultra', label: 'Ultra', sub: bi('不限流', 'Unlimited') },
-      { id: 'admin', label: 'Admin', sub: bi('不限流 · 后台权限', 'Unlim · Admin') },
+      { id: 'free', label: 'Free', sub: bi('1GB/月 · 单文件15MB', '1GB/mo · 15MB file') },
+      { id: 'pro', label: 'Pro', sub: bi('5GB/月 · 单文件100MB', '5GB/mo · 100MB file') },
+      { id: 'ultra', label: 'Ultra', sub: bi('不限流 · 单文件1GB', 'Unlim · 1GB file') },
+      { id: 'admin', label: 'Admin', sub: bi('不限流 · 单文件1GB', 'Unlim · 1GB file') },
     ]
     const monthPct = !tr.unlimited && tr.limitMonthBytes > 0
       ? Math.min(100, Math.round(((tr.bytesMonth || 0) / tr.limitMonthBytes) * 100))

@@ -677,6 +677,7 @@ async function main() {
     e2eeKey: activeE2eeKey,
     log: quietLog,
     onRpc: (method, params) => orchestrator.handleRpc(method, params),
+    onTierUpdate: (info) => orchestrator.setTierLimits(info),
     onState: (state, detail) => {
       if (state === 'connected') {
         if (!connectedOnce) {

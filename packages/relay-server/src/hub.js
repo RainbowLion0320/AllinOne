@@ -3,7 +3,7 @@ import { EVENTS } from '@allinone/shared'
 import { E2EE_EVENT_MARKER, E2EE_METHOD_MARKER } from '@allinone/shared/e2ee'
 
 const EVENT_BUFFER_SIZE = 200
-const DEFAULT_RPC_TIMEOUT_MS = 120_000
+const DEFAULT_RPC_TIMEOUT_MS = 300_000
 const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
 const ROOM_EVENTS_MAX = 2000
@@ -338,6 +338,56 @@ export class RelayHub {
     return base
   }
 
+  getRoomFileLimits(roomId) {
+    const rid = String(roomId || '').trim()
+    let tier = 'free'
+    try {
+      tier = String(this.getRoomTier(rid) || 'free')
+    } catch {}
+    if (this.trafficGuard && typeof this.trafficGuard.getLimitsForTier === 'function') {
+      const lim = this.trafficGuard.getLimitsForTier(tier)
+      return {
+        tier: lim.tier,
+        maxUploadBytes: lim.maxUploadBytes,
+        maxImageBytes: lim.maxImageBytes,
+        maxDocumentBytes: lim.maxDocumentBytes,
+      }
+    }
+    return {
+      tier,
+      maxUploadBytes: 15 * 1024 * 1024,
+      maxImageBytes: 15 * 1024 * 1024,
+      maxDocumentBytes: 10 * 1024 * 1024,
+    }
+  }
+
+  notifyRoomTierChanged(roomId) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return
+    const info = this.getRoomFileLimits(rid)
+    const msg = {
+      type: 'tier.update',
+      roomId: rid,
+      tier: info.tier,
+      fileLimits: {
+        maxUploadBytes: info.maxUploadBytes,
+        maxImageBytes: info.maxImageBytes,
+        maxDocumentBytes: info.maxDocumentBytes,
+      },
+      ts: Date.now(),
+    }
+    for (const b of this.bridges.values()) {
+      if (b.roomId === rid && b.ws.readyState === 1) {
+        this.sendRaw(b.ws, msg)
+      }
+    }
+    for (const [, c] of this._getRoomClientEntries(rid)) {
+      if (c.ws.readyState === 1) {
+        this.sendRaw(c.ws, msg)
+      }
+    }
+  }
+
   getTrafficSummary() {
     if (!this.trafficGuard) {
       return {
@@ -575,6 +625,19 @@ export class RelayHub {
 
     const bridges = this.getBridgeList(roomId)
     const devices = this.resolveRoomDevices(roomId, bridges)
+    const tierInfo = this.getRoomFileLimits(roomId)
+    this.sendRaw(ws, {
+      type: 'bridge.welcome',
+      roomId,
+      bridgeId,
+      tier: tierInfo.tier,
+      fileLimits: {
+        maxUploadBytes: tierInfo.maxUploadBytes,
+        maxImageBytes: tierInfo.maxImageBytes,
+        maxDocumentBytes: tierInfo.maxDocumentBytes,
+      },
+      ts: now,
+    })
     this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
       bridgeId,
       online: true,
@@ -724,11 +787,18 @@ export class RelayHub {
     const devices = this.resolveRoomDevices(roomId, bridges)
     const clients = this.getClientList(roomId)
     const pendingGrants = this.getPendingGrantsForClient(roomId, clientId)
+    const tierInfo = this.getRoomFileLimits(roomId)
     this.sendRaw(ws, {
       type: 'hello',
       clientId,
       sid: entry.sid,
       roomId,
+      tier: tierInfo.tier,
+      fileLimits: {
+        maxUploadBytes: tierInfo.maxUploadBytes,
+        maxImageBytes: tierInfo.maxImageBytes,
+        maxDocumentBytes: tierInfo.maxDocumentBytes,
+      },
       seq: evState.seq,
       bridges,
       ...(devices ? { devices } : {}),

@@ -32,6 +32,7 @@ export class RelayBridgeLink {
     log = console,
     onRpc,
     onState,
+    onTierUpdate,
   }) {
     const cleanRoomId = String(roomId || '').trim()
     if (!cleanRoomId.startsWith('usr_')) {
@@ -60,6 +61,9 @@ export class RelayBridgeLink {
     this.log = log
     this.onRpc = onRpc
     this.onState = onState
+    this.onTierUpdate = onTierUpdate
+    this.tier = 'free'
+    this.fileLimits = null
     this.ws = null
     this.stopped = false
     this.attempt = 0
@@ -251,6 +255,17 @@ export class RelayBridgeLink {
 
       if (msg.type === 'pong') {
         this.lastPongAt = Date.now()
+        return
+      }
+
+      if (msg.type === 'bridge.welcome' || msg.type === 'tier.update') {
+        if (msg.tier) this.tier = String(msg.tier)
+        if (msg.fileLimits && typeof msg.fileLimits === 'object') {
+          this.fileLimits = msg.fileLimits
+        }
+        try {
+          this.onTierUpdate?.({ tier: this.tier, fileLimits: this.fileLimits })
+        } catch {}
         return
       }
 

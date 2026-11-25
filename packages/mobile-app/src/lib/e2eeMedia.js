@@ -1,5 +1,5 @@
 import { RPC } from '@allinone/shared'
-import { base64ToBytes, decryptBytes } from '@allinone/shared/e2ee'
+import { base64ToBytes, decryptAutoStream } from '@allinone/shared/e2ee'
 import { isRelayUploadTarget, resolveImageSrc } from './imageUrls.js'
 import { clearE2eeDeliverableCache } from './e2eeFiles.js'
 import { bi, getCurrentLang } from './i18n.js'
@@ -117,14 +117,14 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
       if (!res.ok) {
         throw new Error(L(`下载加密附件失败 (HTTP ${res.status})`, `Failed to download encrypted attachment (HTTP ${res.status})`))
       }
-      const cipherBytes = new Uint8Array(await res.arrayBuffer())
-      const plainBytes = await decryptBytes(key, cipherBytes, {
+      const dec = await decryptAutoStream(key, res.body || new Uint8Array(await res.arrayBuffer()), {
         iv: item.e2ee.iv,
         kid: item.e2ee.kid || '',
         kind: 'upload',
         roomId: imageContext?.roomId || '',
+        chunked: Boolean(item.e2ee.chunked),
       })
-      const blob = new Blob([plainBytes], { type: item.mimeType || 'image/png' })
+      const blob = new Blob(dec.chunks || [], { type: item.mimeType || 'image/png' })
       const url = URL.createObjectURL(blob)
       if (epoch !== cacheEpoch) {
         try { URL.revokeObjectURL(url) } catch {}
@@ -140,14 +140,26 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
     const result = await client.rpc(
       RPC.FILE_READ,
       { path: target, cwd },
-      25_000,
+      120_000,
       bridgeId ? { bridgeId } : {},
     )
-    if (!result?.dataBase64 || !String(result.mimeType || '').startsWith('image/')) {
+    if (!String(result?.mimeType || '').startsWith('image/')) {
       throw new Error(L('仅支持预览图片文件', 'Only image files can be previewed'))
     }
-    const bytes = base64ToBytes(result.dataBase64)
-    const blob = new Blob([bytes], { type: result.mimeType })
+    let blob
+    if (result?.transferMode === 'upload' && result?.uploadUrl && result?.e2ee?.iv) {
+      const dl = await client.downloadEncryptedUpload(result.uploadUrl, result.e2ee, {
+        mimeType: result.mimeType,
+        consume: true,
+        bridgeId,
+      })
+      blob = dl.blob
+    } else if (result?.dataBase64) {
+      const bytes = base64ToBytes(result.dataBase64)
+      blob = new Blob([bytes], { type: result.mimeType })
+    } else {
+      throw new Error(L('仅支持预览图片文件', 'Only image files can be previewed'))
+    }
     const url = URL.createObjectURL(blob)
     if (epoch !== cacheEpoch) {
       try { URL.revokeObjectURL(url) } catch {}

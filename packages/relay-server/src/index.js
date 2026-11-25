@@ -1,7 +1,7 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
-import { readFile as readFileAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
+import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
+import { readFile as readFileAsync, rename as renameAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
@@ -10,7 +10,7 @@ import { createAccountStore, validateEmail, validatePassword } from './accounts.
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
-import { RelayTrafficGuard } from './traffic-guard.js'
+import { RelayTrafficGuard, formatBytesShort } from './traffic-guard.js'
 import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -67,15 +67,17 @@ const MIME_TYPES = {
   '.sh': 'text/plain; charset=utf-8',
 }
 
-const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // 15MB per file
+const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // Free-tier default (15MB); Pro=100MB, Ultra/Admin=1GB via trafficGuard
+const MAX_JSON_UPLOAD_BYTES = 100 * 1024 * 1024 // Cap legacy JSON Base64 uploads to prevent server RAM spikes
+const UPLOAD_CIPHER_OVERHEAD_BYTES = 64 * 1024 // Headroom for AES-GCM tags & AIO2 chunk framing
 const MAX_TOTAL_UPLOAD_BYTES = Math.max(
-  32,
-  Number(process.env.RELAY_MAX_TOTAL_UPLOAD_MB || 256) || 256,
-) * 1024 * 1024 // default 256MB total temp upload quota (configurable via RELAY_MAX_TOTAL_UPLOAD_MB)
+  64,
+  Number(process.env.RELAY_MAX_TOTAL_UPLOAD_MB || 2048) || 2048,
+) * 1024 * 1024 // default 2GB total temp upload pool (configurable via RELAY_MAX_TOTAL_UPLOAD_MB)
 const MAX_ROOM_UPLOAD_BYTES = Math.max(
   16,
   Number(process.env.RELAY_MAX_ROOM_UPLOAD_MB || 64) || 64,
-) * 1024 * 1024 // default 64MB per-room temp upload quota (configurable via RELAY_MAX_ROOM_UPLOAD_MB)
+) * 1024 * 1024 // default 64MB per-room temp upload quota for free tier (Pro/Ultra scale via trafficGuard)
 const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
 const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
 const APP_HTML_CSP =
@@ -415,7 +417,7 @@ export function createRelayServer(options = {}) {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code',
+      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code, X-Allinone-Encrypted',
     )
   }
 
@@ -509,10 +511,12 @@ export function createRelayServer(options = {}) {
   }
 
   // Fast O(k) in-memory quota & TTL eviction (zero sync filesystem scans on upload hot path)
-  function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '') {
+  function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '', roomMaxBytes = MAX_ROOM_UPLOAD_BYTES) {
     try {
       const now = Date.now()
       const cutoff = now - UPLOAD_TTL_MS
+      const effectiveRoomQuota = Math.max(roomMaxBytes || MAX_ROOM_UPLOAD_BYTES, incomingBytes)
+      const effectiveGlobalQuota = Math.max(MAX_TOTAL_UPLOAD_BYTES, incomingBytes)
       // 1. Evict expired entries (Map preserves oldest-first insertion order)
       for (const entry of [...uploadIndex.values()]) {
         if (entry.mtimeMs < cutoff) {
@@ -520,17 +524,17 @@ export function createRelayServer(options = {}) {
         }
       }
       // 2. Enforce per-room disk quota
-      if (targetRoomId && (uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes > MAX_ROOM_UPLOAD_BYTES) {
+      if (targetRoomId && (uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes > effectiveRoomQuota) {
         for (const entry of [...uploadIndex.values()]) {
           if (entry.roomId !== targetRoomId) continue
-          if ((uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes <= MAX_ROOM_UPLOAD_BYTES) break
+          if ((uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes <= effectiveRoomQuota) break
           removeUploadEntry(entry, { deleteDisk: true })
         }
       }
       // 3. Enforce global disk quota
-      if (uploadTotalBytesCache + incomingBytes > MAX_TOTAL_UPLOAD_BYTES) {
+      if (uploadTotalBytesCache + incomingBytes > effectiveGlobalQuota) {
         for (const entry of [...uploadIndex.values()]) {
-          if (uploadTotalBytesCache + incomingBytes <= MAX_TOTAL_UPLOAD_BYTES) break
+          if (uploadTotalBytesCache + incomingBytes <= effectiveGlobalQuota) break
           removeUploadEntry(entry, { deleteDisk: true })
         }
       }
@@ -1643,6 +1647,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, updated.error === '用户不存在' ? 404 : 400, { ok: false, error: updated.error })
           return
         }
+        hub.notifyRoomTierChanged(targetRoom)
         hub.recordActivity({
           type: 'admin.tier',
           roomId: targetRoom,
@@ -1655,6 +1660,7 @@ export function createRelayServer(options = {}) {
           prevTier: updated.prevTier,
           tier: updated.tier,
           user: updated.user,
+          fileLimits: hub.getRoomFileLimits(targetRoom),
           traffic: hub.getRoomStats(targetRoom).traffic || null,
         })
       } catch {
@@ -1935,6 +1941,7 @@ export function createRelayServer(options = {}) {
         role: acctUser.role,
         plan: acctUser.plan || 'free',
         tier: acctUser.tier || (acctUser.role === 'admin' ? 'admin' : 'free'),
+        fileLimits: hub.getRoomFileLimits(payload.room),
         traffic: hub.getRoomStats(payload.room).traffic || null,
         label: `@${acctUser.username}`,
         devices: getMergedAccountDevices(payload.room, bridges),
@@ -1945,65 +1952,191 @@ export function createRelayServer(options = {}) {
     }
 
     // Encrypted attachment upload (strictly requires E2EE ciphertext scoped to caller's account roomId)
+    // Supports BOTH client JWTs and PC Bridge credentials, and BOTH zero-OOM binary streaming (`application/octet-stream`)
+    // and legacy JSON Base64 payloads for backward compatibility.
     if (pathname === '/api/uploads' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
-      if (!payload) {
+      const bridgeRoom = authenticateBridge(req, urlObj)
+      const payload = bridgeRoom ? null : auth.verifySessionToken(extractBearer(req))
+      const ownerRoom = bridgeRoom || payload?.room || ''
+      if (!ownerRoom) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
+      const ownerTier = getRoomTier(ownerRoom)
+      const tierLimits = trafficGuard.getLimitsForTier(ownerTier)
+      const maxPlainBytes = Math.max(1024 * 1024, tierLimits.maxUploadBytes || MAX_UPLOAD_BYTES)
+      const maxCipherBytes = maxPlainBytes + UPLOAD_CIPHER_OVERHEAD_BYTES
+      const maxLabel = formatBytesShort(maxPlainBytes)
+      const contentType = String(req.headers['content-type'] || '').toLowerCase()
+      const isRawBinary = contentType.startsWith('application/octet-stream')
+
       try {
-        const body = await readJsonBody(req, Math.ceil(MAX_UPLOAD_BYTES * 1.45))
-        if (body.encrypted !== true) {
-          sendJson(res, 400, {
-            ok: false,
-            code: 'E2EE_UPLOAD_REQUIRED',
-            error: '附件必须先经过端到端加密再上传',
-          })
-          return
-        }
-        const rawBase64 = String(body.dataBase64 || '')
-        const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',').pop() : rawBase64
-        const buf = Buffer.from(cleanBase64, 'base64')
-        if (buf.length === 0 || buf.length > MAX_UPLOAD_BYTES) {
-          sendJson(res, 400, { ok: false, error: '文件为空或超过 15MB 限制' })
-          return
-        }
-        const ownerRoom = payload.room
-        const ownerTier = getRoomTier(ownerRoom)
-        const tCheck = trafficGuard.consumeUploadPost(ownerRoom, buf.length, {
-          tier: ownerTier,
-        })
-        if (!tCheck.allowed) {
-          hub.recordActivity({
-            type: 'traffic.throttled',
-            roomId: ownerRoom,
-            label: 'upload:post',
-            detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(buf.length / 1024)}KB)`,
-            ip: getClientIp(req),
-          })
-          res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
-          sendJson(res, 429, {
-            ok: false,
-            code: tCheck.code,
-            retryAfterSec: tCheck.retryAfterSec || 60,
-            error: tCheck.message,
-          })
-          return
-        }
-        pruneUploadsForQuota(buf.length, ownerRoom)
         const id = randomUUID()
+        const binPath = join(uploadDir, `${id}.bin`)
+        const metaPath = join(uploadDir, `${id}.json`)
+        let finalSize = 0
+
+        if (isRawBinary) {
+          if (String(req.headers['x-allinone-encrypted'] || '').trim() !== '1') {
+            sendJson(res, 400, {
+              ok: false,
+              code: 'E2EE_UPLOAD_REQUIRED',
+              error: '附件必须先经过端到端加密再上传',
+            })
+            return
+          }
+          const declaredLen = Number(req.headers['content-length'] || 0)
+          if (Number.isFinite(declaredLen) && declaredLen > maxCipherBytes) {
+            sendJson(res, 413, {
+              ok: false,
+              code: 'FILE_TOO_LARGE',
+              maxBytes: maxPlainBytes,
+              error: `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`,
+            })
+            return
+          }
+
+          const partPath = `${binPath}.part`
+          const streamResult = await new Promise((resolveStream, rejectStream) => {
+            const ws = createWriteStream(partPath, { mode: 0o600 })
+            let received = 0
+            let settled = false
+            const fail = (err) => {
+              if (settled) return
+              settled = true
+              try { ws.destroy() } catch {}
+              rejectStream(err)
+            }
+            req.on('data', (chunk) => {
+              if (settled) return
+              received += chunk.length
+              if (received > maxCipherBytes) {
+                const err = new Error(`文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`)
+                err.statusCode = 413
+                err.code = 'FILE_TOO_LARGE'
+                req.pause()
+                fail(err)
+                return
+              }
+              if (!ws.write(chunk)) {
+                req.pause()
+                ws.once('drain', () => {
+                  if (!settled) req.resume()
+                })
+              }
+            })
+            req.on('end', () => {
+              if (settled) return
+              ws.end()
+            })
+            req.on('aborted', () => fail(new Error('上传连接已中断')))
+            req.on('error', fail)
+            ws.on('error', fail)
+            ws.on('finish', () => {
+              if (settled) return
+              settled = true
+              resolveStream({ size: received })
+            })
+          }).catch(async (err) => {
+            await unlinkAsync(partPath).catch(() => {})
+            throw err
+          })
+
+          finalSize = streamResult.size
+          if (finalSize <= 0) {
+            await unlinkAsync(partPath).catch(() => {})
+            sendJson(res, 400, { ok: false, error: '上传文件为空' })
+            return
+          }
+          const tCheck = trafficGuard.consumeUploadPost(ownerRoom, finalSize, {
+            tier: ownerTier,
+          })
+          if (!tCheck.allowed) {
+            await unlinkAsync(partPath).catch(() => {})
+            hub.recordActivity({
+              type: 'traffic.throttled',
+              roomId: ownerRoom,
+              label: 'upload:post',
+              detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(finalSize / 1024)}KB)`,
+              ip: getClientIp(req),
+            })
+            res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
+            sendJson(res, 429, {
+              ok: false,
+              code: tCheck.code,
+              retryAfterSec: tCheck.retryAfterSec || 60,
+              error: tCheck.message,
+            })
+            return
+          }
+          pruneUploadsForQuota(finalSize, ownerRoom, tierLimits.maxRoomTempUploadBytes)
+          try {
+            await renameAsync(partPath, binPath)
+          } catch (mvErr) {
+            await unlinkAsync(partPath).catch(() => {})
+            throw mvErr
+          }
+        } else {
+          const jsonPlainCap = Math.min(maxPlainBytes, MAX_JSON_UPLOAD_BYTES)
+          const body = await readJsonBody(req, Math.ceil((jsonPlainCap + UPLOAD_CIPHER_OVERHEAD_BYTES) * 1.45))
+          if (body.encrypted !== true) {
+            sendJson(res, 400, {
+              ok: false,
+              code: 'E2EE_UPLOAD_REQUIRED',
+              error: '附件必须先经过端到端加密再上传',
+            })
+            return
+          }
+          const rawBase64 = String(body.dataBase64 || '')
+          const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',').pop() : rawBase64
+          const buf = Buffer.from(cleanBase64, 'base64')
+          if (buf.length === 0) {
+            sendJson(res, 400, { ok: false, error: '上传文件为空' })
+            return
+          }
+          if (buf.length > maxCipherBytes) {
+            sendJson(res, 413, {
+              ok: false,
+              code: 'FILE_TOO_LARGE',
+              maxBytes: maxPlainBytes,
+              error: `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`,
+            })
+            return
+          }
+          finalSize = buf.length
+          const tCheck = trafficGuard.consumeUploadPost(ownerRoom, finalSize, {
+            tier: ownerTier,
+          })
+          if (!tCheck.allowed) {
+            hub.recordActivity({
+              type: 'traffic.throttled',
+              roomId: ownerRoom,
+              label: 'upload:post',
+              detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(finalSize / 1024)}KB)`,
+              ip: getClientIp(req),
+            })
+            res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
+            sendJson(res, 429, {
+              ok: false,
+              code: tCheck.code,
+              retryAfterSec: tCheck.retryAfterSec || 60,
+              error: tCheck.message,
+            })
+            return
+          }
+          pruneUploadsForQuota(finalSize, ownerRoom, tierLimits.maxRoomTempUploadBytes)
+          await writeFileAsync(binPath, buf, { mode: 0o600 })
+        }
+
         const meta = {
           id,
           roomId: ownerRoom,
           filename: 'encrypted.bin',
           mimeType: 'application/octet-stream',
           encrypted: true,
-          size: buf.length,
+          size: finalSize,
           createdAt: Date.now(),
         }
-        const binPath = join(uploadDir, `${id}.bin`)
-        const metaPath = join(uploadDir, `${id}.json`)
-        await writeFileAsync(binPath, buf, { mode: 0o600 })
         try {
           await writeFileAsync(metaPath, JSON.stringify(meta), { mode: 0o600 })
         } catch (metaErr) {
@@ -2014,7 +2147,7 @@ export function createRelayServer(options = {}) {
           id,
           binPath,
           metaPath,
-          size: buf.length,
+          size: finalSize,
           mtimeMs: meta.createdAt,
           roomId: ownerRoom,
         })
@@ -2031,7 +2164,15 @@ export function createRelayServer(options = {}) {
           },
         })
       } catch (err) {
-        sendJson(res, 400, { ok: false, error: `上传失败：${String(err.message || err)}` })
+        const statusCode = err?.statusCode === 413 || err?.message === 'Body too large' ? 413 : 400
+        sendJson(res, statusCode, {
+          ok: false,
+          ...(err?.code ? { code: err.code } : {}),
+          error:
+            statusCode === 413
+              ? `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`
+              : `上传失败：${String(err.message || err)}`,
+        })
       }
       return
     }
@@ -2100,7 +2241,7 @@ export function createRelayServer(options = {}) {
         })
         return
       }
-      const shouldConsume = Boolean(bridgeRoom && urlObj.searchParams.get('consume') === '1')
+      const shouldConsume = urlObj.searchParams.get('consume') === '1'
       if (shouldConsume) {
         consumedUploadIds.add(id)
         if (consumedUploadIds.size > 1000) {

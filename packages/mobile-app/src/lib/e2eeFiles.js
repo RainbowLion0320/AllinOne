@@ -96,16 +96,28 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
     const result = await client.rpc(
       RPC.FILE_READ,
       { path: target, cwd, mode: 'document' },
-      45_000,
+      300_000,
       bridgeId ? { bridgeId } : {},
     )
-    if (!result?.dataBase64) {
+    const mimeType = String(result?.mimeType || 'application/octet-stream')
+    const filename = String(result?.filename || getDeliverableName(target, 'download'))
+    let blob
+    let size = Number(result?.size || 0)
+    if (result?.transferMode === 'upload' && result?.uploadUrl && result?.e2ee?.iv) {
+      const dl = await client.downloadEncryptedUpload(result.uploadUrl, result.e2ee, {
+        mimeType,
+        consume: true,
+        bridgeId,
+      })
+      blob = dl.blob
+      size = size || dl.size
+    } else if (result?.dataBase64) {
+      const bytes = base64ToBytes(result.dataBase64)
+      blob = new Blob([bytes], { type: mimeType })
+      size = size || bytes.byteLength
+    } else {
       throw new Error(L('未能读取到文件内容', 'Failed to read file bytes'))
     }
-    const bytes = base64ToBytes(result.dataBase64)
-    const mimeType = String(result.mimeType || 'application/octet-stream')
-    const filename = String(result.filename || getDeliverableName(target, 'download'))
-    const blob = new Blob([bytes], { type: mimeType })
     const url = URL.createObjectURL(blob)
     if (epoch !== fileCacheEpoch) {
       try { URL.revokeObjectURL(url) } catch {}
@@ -116,7 +128,7 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
       url,
       filename,
       mimeType,
-      size: Number(result.size || bytes.byteLength || 0),
+      size: Number(size || 0),
       path: String(result.path || target),
       ts: Date.now(),
     }

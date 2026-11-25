@@ -1,14 +1,30 @@
 import {
+  E2EE_CHUNKED_THRESHOLD,
   E2EE_METHOD_MARKER,
-  bytesToBase64,
+  decryptAutoStream,
   decryptJson,
   encryptBytes,
+  encryptChunkedBytes,
   encryptJson,
 } from '@allinone/shared/e2ee'
 import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+const DEFAULT_FILE_LIMITS = {
+  maxUploadBytes: MAX_UPLOAD_BYTES,
+  maxImageBytes: MAX_UPLOAD_BYTES,
+  maxDocumentBytes: 10 * 1024 * 1024,
+}
+
+function formatFileLimitLabel(bytes) {
+  const n = Number(bytes || 0)
+  if (n >= 1024 * 1024 * 1024) {
+    const gb = n / (1024 * 1024 * 1024)
+    return Number.isInteger(gb) ? `${gb} GB` : `${gb.toFixed(1)} GB`
+  }
+  return `${Math.max(1, Math.round(n / (1024 * 1024)))} MB`
+}
 
 function normalizeE2eeKeysMap(keysMap) {
   const out = {}
@@ -608,6 +624,9 @@ export class MobileRelayClient {
     this.devices = null
     this.clientId = ''
     this.onlineClientCount = 0
+    this.tier = 'free'
+    this.fileLimits = { ...DEFAULT_FILE_LIMITS }
+    this._mediaTokenCache = { token: '', expiresAt: 0 }
     this.pendingGrants = []
     this._grantListResolvers = new Map()
   }
@@ -673,6 +692,8 @@ export class MobileRelayClient {
       devices: this.devices,
       clientId: this.clientId,
       onlineClientCount: this.onlineClientCount,
+      tier: this.tier,
+      fileLimits: this.fileLimits,
     })
     return () => this.statusListeners.delete(fn)
   }
@@ -685,6 +706,8 @@ export class MobileRelayClient {
       devices: this.devices,
       clientId: this.clientId,
       onlineClientCount: this.onlineClientCount,
+      tier: this.tier,
+      fileLimits: this.fileLimits,
     }
     for (const fn of this.statusListeners) {
       try { fn(snap) } catch {}
@@ -797,6 +820,10 @@ export class MobileRelayClient {
       if (msg.type === 'hello') {
         if (typeof msg.seq === 'number') this.lastSeq = Math.max(this.lastSeq, msg.seq)
         if (msg.clientId) this.clientId = String(msg.clientId)
+        if (msg.tier) this.tier = String(msg.tier)
+        if (msg.fileLimits && typeof msg.fileLimits === 'object') {
+          this.fileLimits = { ...DEFAULT_FILE_LIMITS, ...msg.fileLimits }
+        }
         this.bridges = msg.bridges || []
         if (Array.isArray(msg.devices)) this.devices = msg.devices
         if (Array.isArray(msg.clients)) {
@@ -811,6 +838,15 @@ export class MobileRelayClient {
               try { fn('e2ee.grant.request', g, msg) } catch {}
             }
           }
+        }
+        this.emitStatus()
+        return
+      }
+
+      if (msg.type === 'tier.update') {
+        if (msg.tier) this.tier = String(msg.tier)
+        if (msg.fileLimits && typeof msg.fileLimits === 'object') {
+          this.fileLimits = { ...DEFAULT_FILE_LIMITS, ...msg.fileLimits }
         }
         this.emitStatus()
         return
@@ -1141,9 +1177,82 @@ export class MobileRelayClient {
     return true
   }
 
+  async getMediaToken() {
+    const now = Date.now()
+    if (this._mediaTokenCache.token && this._mediaTokenCache.expiresAt - now > 60_000) {
+      return this._mediaTokenCache.token
+    }
+    const res = await fetch(`${this.baseUrl}/api/auth/media-token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token}` },
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data?.ok || !data?.mediaToken) {
+      throw new Error(data?.error || L('获取加密媒体下载凭证失败', 'Failed to obtain encrypted media token'))
+    }
+    this._mediaTokenCache = {
+      token: String(data.mediaToken),
+      expiresAt: Number(data.expiresAt) || now + 14 * 60_000,
+    }
+    return this._mediaTokenCache.token
+  }
+
+  async downloadEncryptedUpload(uploadUrl, e2eeMeta, { mimeType = 'application/octet-stream', consume = true, bridgeId = '' } = {}) {
+    const cleanPath = String(uploadUrl || '').trim()
+    if (!/^\/api\/uploads\/[a-f0-9-]{8,64}$/i.test(cleanPath)) {
+      throw new Error(L('无效的加密文件下载地址', 'Invalid encrypted upload URL'))
+    }
+    if (!e2eeMeta?.iv) {
+      throw new Error(L('缺少端到端解密元数据', 'Missing E2EE metadata'))
+    }
+    const normKid = String(e2eeMeta.kid || '').trim().toLowerCase()
+    const ctx = this.getBridgeE2eeContext(bridgeId || this.targetBridgeId)
+    const key =
+      (normKid && (this.e2eeKeys[normKid] || this.e2eeKeys[e2eeMeta.kid])) ||
+      ctx.key ||
+      ''
+    if (!key) {
+      const err = new Error(L('缺少端到端解密密钥，请先扫码同步密钥', 'Missing E2EE decryption key'))
+      err.code = 'E2EE_KEY_REQUIRED'
+      err.keyId = normKid
+      throw err
+    }
+    const mediaToken = await this.getMediaToken()
+    const fullUrl = `${this.baseUrl}${cleanPath}${consume ? '?consume=1' : ''}`
+    const res = await fetch(fullUrl, {
+      headers: { Authorization: `Bearer ${mediaToken}` },
+    })
+    if (!res.ok) {
+      let errMsg = ''
+      try {
+        const j = await res.json()
+        errMsg = j?.error || ''
+      } catch {}
+      throw new Error(errMsg || L(`下载加密文件失败 (HTTP ${res.status})`, `Failed to download encrypted file (HTTP ${res.status})`))
+    }
+    const dec = await decryptAutoStream(key, res.body || new Uint8Array(await res.arrayBuffer()), {
+      iv: e2eeMeta.iv,
+      kid: e2eeMeta.kid || '',
+      kind: 'upload',
+      roomId: this.roomId,
+      chunked: Boolean(e2eeMeta.chunked),
+    })
+    return {
+      blob: new Blob(dec.chunks || [], { type: mimeType || 'application/octet-stream' }),
+      size: dec.totalPlainBytes,
+    }
+  }
+
   async uploadFile(file) {
-    if (typeof file?.size === 'number' && file.size > MAX_UPLOAD_BYTES) {
-      throw new Error(L('文件过大，单个附件最大支持 15 MB', 'File is too large (max 15 MB per attachment)'))
+    const maxBytes = Math.max(1024 * 1024, Number(this.fileLimits?.maxUploadBytes) || MAX_UPLOAD_BYTES)
+    if (typeof file?.size === 'number' && file.size > maxBytes) {
+      const limitLabel = formatFileLimitLabel(maxBytes)
+      throw new Error(
+        L(
+          `文件过大，当前等级单个附件最大支持 ${limitLabel}`,
+          `File is too large (max ${limitLabel} per attachment for your tier)`,
+        ),
+      )
     }
     const e2eeCtx = this.getBridgeE2eeContext(this.targetBridgeId)
     if (!e2eeCtx.ready) {
@@ -1158,27 +1267,38 @@ export class MobileRelayClient {
       throw err
     }
 
-    const rawBytes = new Uint8Array(await file.arrayBuffer())
-    const enc = await encryptBytes(e2eeCtx.key, rawBytes, {
-      kind: 'upload',
-      roomId: this.roomId,
-    })
+    let uploadBody
+    let encMeta
+    if (typeof file?.size === 'number' && file.size > E2EE_CHUNKED_THRESHOLD) {
+      const enc = await encryptChunkedBytes(e2eeCtx.key, file, {
+        kind: 'upload',
+        roomId: this.roomId,
+      })
+      uploadBody = new Blob(enc.chunks || [], { type: 'application/octet-stream' })
+      encMeta = { v: enc.v, kid: enc.kid, iv: enc.iv, chunked: true }
+    } else {
+      const rawBytes = new Uint8Array(await file.arrayBuffer())
+      const enc = await encryptBytes(e2eeCtx.key, rawBytes, {
+        kind: 'upload',
+        roomId: this.roomId,
+      })
+      uploadBody = enc.ciphertext
+      encMeta = { v: enc.v, kid: enc.kid, iv: enc.iv }
+    }
+
+    const timeoutMs = Math.max(60_000, Math.min(600_000, Math.ceil((file.size || 0) / (256 * 1024)) * 1000))
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
-    const timer = controller ? setTimeout(() => controller.abort(), 60_000) : null
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
     let res
     try {
       res = await fetch(`${this.baseUrl}/api/uploads`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/octet-stream',
+          'X-Allinone-Encrypted': '1',
           Authorization: `Bearer ${this.token}`,
         },
-        body: JSON.stringify({
-          filename: 'encrypted.bin',
-          mimeType: 'application/octet-stream',
-          encrypted: true,
-          dataBase64: bytesToBase64(enc.ciphertext),
-        }),
+        body: uploadBody,
         ...(controller ? { signal: controller.signal } : {}),
       })
     } catch (err) {
@@ -1194,15 +1314,18 @@ export class MobileRelayClient {
       throw new Error(data.error || L('上传失败', 'Upload failed'))
     }
     const realMime = file.type || 'application/octet-stream'
-    const localPreviewUrl = realMime.startsWith('image/') && typeof URL?.createObjectURL === 'function'
-      ? URL.createObjectURL(file)
-      : ''
+    const localPreviewUrl =
+      realMime.startsWith('image/') &&
+      (file.size || 0) <= 50 * 1024 * 1024 &&
+      typeof URL?.createObjectURL === 'function'
+        ? URL.createObjectURL(file)
+        : ''
     return {
       ...data.upload,
       filename: file.name,
       mimeType: realMime,
       size: file.size,
-      e2ee: { v: enc.v, kid: enc.kid, iv: enc.iv },
+      e2ee: encMeta,
       ...(localPreviewUrl ? { localPreviewUrl } : {}),
     }
   }
