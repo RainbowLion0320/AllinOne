@@ -2,21 +2,15 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Check,
   Copy,
-  Globe,
   KeyRound,
   Laptop,
   Loader2,
-  LogOut,
-  Mail,
   Monitor,
   Pencil,
   Plus,
   RefreshCw,
   ScanLine,
-  ShieldCheck,
-  Smartphone,
   Terminal,
-  Ticket,
   Trash2,
   User,
   X,
@@ -81,27 +75,6 @@ function formatRelativeSeen(ts, lang) {
   return translate(lang, 'time.daysAgo', { n: Math.floor(diffSec / 86400) })
 }
 
-function formatClientDeviceLabel(name, kind, lang) {
-  const raw = String(name || '').trim()
-  if (lang === 'en') {
-    if (raw) return raw
-    if (kind === 'desktop') return 'Desktop App'
-    if (kind === 'mobile') return 'Mobile App'
-    return 'Web Client'
-  }
-  if (/^Windows Desktop$/i.test(raw)) return 'Windows 桌面端'
-  if (/^macOS Desktop$/i.test(raw)) return 'macOS 桌面端'
-  if (/^Linux Desktop$/i.test(raw)) return 'Linux 桌面端'
-  if (/^Desktop App$/i.test(raw)) return '桌面端'
-  if (/^Android App$/i.test(raw)) return 'Android 客户端'
-  if (/^iOS App$/i.test(raw)) return 'iOS 客户端'
-  if (/^Web Client$/i.test(raw)) return '网页浏览器'
-  if (raw) return raw
-  if (kind === 'desktop') return '桌面端'
-  if (kind === 'mobile') return '手机端'
-  return '网页浏览器'
-}
-
 export function DeviceSwitcherModal({
   open,
   onClose,
@@ -110,13 +83,6 @@ export function DeviceSwitcherModal({
   activeBridgeId = '',
   activeConnState = 'disconnected',
   accountDevices = [],
-  clientSessions = null,
-  onlineClientCount = 0,
-  isAdmin = false,
-  emailEnabled = false,
-  desktopBridge = null,
-  onToggleDesktopBridge = null,
-  onToggleDesktopAutoLaunch = null,
   onSelectDevice,
   onAddDevice,
   onRemoveDevice,
@@ -124,12 +90,6 @@ export function DeviceSwitcherModal({
   onRenameAccountDevice,
   onRemoveAccountDevice,
   onRefreshAccountDevices,
-  onRefreshClientSessions = null,
-  onRevokeClientSession = null,
-  onRevokeOtherClientSessions = null,
-  onSendBindEmailCode = null,
-  onBindAccountEmail = null,
-  onOpenInviteManager,
 }) {
   const { lang, bi, t } = useI18n()
   const [probes, setProbes] = useState({})
@@ -137,20 +97,8 @@ export function DeviceSwitcherModal({
   const [editingId, setEditingId] = useState(null)
   const [editDraft, setEditDraft] = useState('')
   const [confirmDeleteId, setConfirmDeleteId] = useState(null)
-  const [confirmLogoutAccount, setConfirmLogoutAccount] = useState(false)
-  const [confirmKickOthers, setConfirmKickOthers] = useState(false)
-  const [kickingKey, setKickingKey] = useState('')
-  const [kickingOthers, setKickingOthers] = useState(false)
   const [copiedCmd, setCopiedCmd] = useState('')
   const copiedCmdTimerRef = useRef(null)
-  const [showEmailPanel, setShowEmailPanel] = useState(false)
-  const [emailDraft, setEmailDraft] = useState('')
-  const [emailCodeDraft, setEmailCodeDraft] = useState('')
-  const [emailSending, setEmailSending] = useState(false)
-  const [emailBinding, setEmailBinding] = useState(false)
-  const [emailCooldown, setEmailCooldown] = useState(0)
-  const [emailError, setEmailError] = useState('')
-  const [emailInfo, setEmailInfo] = useState('')
 
   const devicesRef = useRef(devices)
   devicesRef.current = devices
@@ -161,10 +109,7 @@ export function DeviceSwitcherModal({
   const runProbeAll = useCallback(async (list) => {
     const targets = (list || []).filter((d) => d.id !== activeDeviceId)
     setProbingAll(true)
-    await Promise.all([
-      onRefreshAccountDevices?.().catch(() => {}),
-      onRefreshClientSessions?.().catch(() => {}),
-    ])
+    await onRefreshAccountDevices?.().catch(() => {})
     if (targets.length === 0) {
       setProbingAll(false)
       return
@@ -198,7 +143,7 @@ export function DeviceSwitcherModal({
     } finally {
       setProbingAll(false)
     }
-  }, [activeDeviceId, onRefreshAccountDevices, onRefreshClientSessions, onSyncDeviceMeta])
+  }, [activeDeviceId, onRefreshAccountDevices, onSyncDeviceMeta])
 
   useEffect(() => {
     return () => {
@@ -210,77 +155,12 @@ export function DeviceSwitcherModal({
     if (!open) {
       setEditingId(null)
       setConfirmDeleteId(null)
-      setConfirmLogoutAccount(false)
-      setConfirmKickOthers(false)
-      setKickingKey('')
-      setShowEmailPanel(false)
-      setEmailDraft('')
-      setEmailCodeDraft('')
-      setEmailError('')
-      setEmailInfo('')
       return
     }
     void runProbeAll(devicesRef.current)
   }, [open, devices.length, runProbeAll])
 
-  useEffect(() => {
-    if (emailCooldown <= 0) return undefined
-    const t = setTimeout(() => setEmailCooldown((v) => (v > 1 ? v - 1 : 0)), 1000)
-    return () => clearTimeout(t)
-  }, [emailCooldown])
-
   if (!open) return null
-
-  const handleSendBindCode = async () => {
-    setEmailError('')
-    setEmailInfo('')
-    const clean = emailDraft.trim()
-    if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
-      setEmailError(bi('请输入有效的邮箱地址', 'Please enter a valid email address'))
-      return
-    }
-    if (!onSendBindEmailCode) return
-    setEmailSending(true)
-    try {
-      const res = await onSendBindEmailCode(clean)
-      setEmailCooldown(res?.cooldownSec || 60)
-      setEmailInfo(res?.message || bi('验证码已发送，请查收邮件', 'Verification code sent. Please check your inbox.'))
-    } catch (err) {
-      if (err?.retryAfterSec) setEmailCooldown(err.retryAfterSec)
-      setEmailError(String(err?.message || err))
-    } finally {
-      setEmailSending(false)
-    }
-  }
-
-  const handleCommitBindEmail = async (e) => {
-    e.preventDefault()
-    setEmailError('')
-    setEmailInfo('')
-    const clean = emailDraft.trim()
-    const code = emailCodeDraft.trim()
-    if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean)) {
-      setEmailError(bi('请输入有效的邮箱地址', 'Please enter a valid email address'))
-      return
-    }
-    if (!/^\d{6}$/.test(code)) {
-      setEmailError(bi('请输入 6 位邮箱验证码', 'Please enter the 6-digit verification code'))
-      return
-    }
-    if (!onBindAccountEmail) return
-    setEmailBinding(true)
-    try {
-      await onBindAccountEmail(clean, code)
-      setShowEmailPanel(false)
-      setEmailDraft('')
-      setEmailCodeDraft('')
-      setEmailInfo('')
-    } catch (err) {
-      setEmailError(String(err?.message || err))
-    } finally {
-      setEmailBinding(false)
-    }
-  }
 
   const copyBindCmd = async (kind, cmd) => {
     await copyTextToClipboard(cmd)
@@ -308,12 +188,9 @@ export function DeviceSwitcherModal({
 
   const onlineAcctCount = accountDevices.filter((pc) => pc.online).length
   const acctServerBase = activeEntry?.baseUrl || ''
-  const sessionList = Array.isArray(clientSessions?.sessions) ? clientSessions.sessions : []
-  const effectiveOnlineClients = Math.max(
-    Number(onlineClientCount) || 0,
-    Number(clientSessions?.onlineCount) || 0,
-  )
-  const hasOtherSessions = sessionList.some((s) => !s.isCurrent) || effectiveOnlineClients > 1
+  const activeUsername = activeEntry
+    ? `@${activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}`
+    : ''
 
   return (
     <div
@@ -321,7 +198,7 @@ export function DeviceSwitcherModal({
       onClick={onClose}
     >
       <div
-        className="pb-safe flex max-h-[88vh] w-full max-w-md flex-col rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1C1F27]"
+        className="pb-safe flex max-h-[85vh] w-full max-w-md flex-col rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1C1F27]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -361,288 +238,20 @@ export function DeviceSwitcherModal({
 
         {/* Scrollable Content */}
         <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3.5">
-          {/* Local Desktop Built-in Bridge Strip (only shown inside Electron Desktop App) */}
-          {desktopBridge && (
-            <div className="flex items-center justify-between gap-2 rounded-2xl border border-slate-200/80 bg-slate-50/80 px-3 py-2.5 dark:border-slate-800 dark:bg-[#151820]">
-              <div className="flex min-w-0 items-center gap-2">
-                <span
-                  className={`h-2 w-2 shrink-0 rounded-full ${
-                    desktopBridge.state === 'connected'
-                      ? 'bg-emerald-500'
-                      : desktopBridge.state === 'starting' || desktopBridge.state === 'binding'
-                        ? 'bg-amber-400 animate-pulse'
-                        : desktopBridge.state === 'error'
-                          ? 'bg-rose-500'
-                          : 'bg-slate-400'
-                  }`}
-                />
-                <div className="min-w-0">
-                  <div className="truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
-                    {bi('本机桥接', 'Local Bridge')} ·{' '}
-                    {desktopBridge.state === 'connected'
-                      ? t('common.online')
-                      : desktopBridge.state === 'starting' || desktopBridge.state === 'binding'
-                        ? bi('启动中', 'Starting')
-                        : desktopBridge.state === 'paused'
-                          ? bi('已暂停', 'Paused')
-                          : desktopBridge.state === 'error'
-                            ? t('common.error')
-                            : bi('未启动', 'Stopped')}
-                  </div>
-                  {desktopBridge.error && (
-                    <div className="truncate text-[10.5px] text-rose-500">{desktopBridge.error}</div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex shrink-0 items-center gap-1.5">
-                {onToggleDesktopAutoLaunch && (
-                  <button
-                    type="button"
-                    onClick={onToggleDesktopAutoLaunch}
-                    className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${
-                      desktopBridge.autoLaunch
-                        ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]'
-                        : 'bg-white text-slate-500 border border-slate-200 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-400'
-                    }`}
-                  >
-                    {desktopBridge.autoLaunch ? bi('自启开', 'Auto-start On') : bi('自启关', 'Auto-start Off')}
-                  </button>
-                )}
-                {onToggleDesktopBridge && (
-                  <button
-                    type="button"
-                    onClick={onToggleDesktopBridge}
-                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition active:scale-95 ${
-                      desktopBridge.enabled
-                        ? 'bg-white text-slate-700 border border-slate-200 hover:text-rose-500 dark:border-slate-700 dark:bg-[#232631] dark:text-slate-200'
-                        : 'bg-[#4D6BFE] text-white'
-                    }`}
-                  >
-                    {desktopBridge.enabled ? bi('暂停', 'Pause') : bi('开启', 'Start')}
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Active Account Header Card */}
+          {/* Active Account Computers */}
           {activeEntry && (
-            <div className="rounded-2xl border border-[#4D6BFE]/25 bg-gradient-to-br from-[#F4F7FF] to-white p-3 dark:border-[#4D6BFE]/35 dark:from-[#1E2438] dark:to-[#181B24]">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2.5">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
-                    <User className="h-4.5 w-4.5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate text-sm font-bold text-slate-900 dark:text-white">
-                        @{activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10.5px] text-slate-400">
-                      {activeEntry.email ? (
-                        <span className="truncate">{activeEntry.email}</span>
-                      ) : emailEnabled ? (
-                        <span>{bi('未绑定邮箱', 'No email linked')}</span>
-                      ) : null}
-                      {accountDevices.length > 0 && (
-                        <span className="shrink-0">
-                          {bi(`${onlineAcctCount}/${accountDevices.length} 电脑在线`, `${onlineAcctCount}/${accountDevices.length} PCs`)}
-                        </span>
-                      )}
-                      {effectiveOnlineClients > 0 && (
-                        <span
-                          className={`shrink-0 ${
-                            effectiveOnlineClients > 1
-                              ? 'font-medium text-amber-600 dark:text-amber-400'
-                              : 'text-emerald-600 dark:text-emerald-400'
-                          }`}
-                        >
-                          {bi(`${effectiveOnlineClients} 终端在线`, `${effectiveOnlineClients} active`)}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex shrink-0 items-center gap-1">
-                  {(emailEnabled || isAdmin) && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setConfirmLogoutAccount(false)
-                        setEmailError('')
-                        setEmailInfo('')
-                        setShowEmailPanel((v) => !v)
-                      }}
-                      title={activeEntry.email ? bi('更换绑定邮箱', 'Change email') : bi('绑定邮箱', 'Link email')}
-                      className={`inline-flex items-center gap-1 rounded-xl px-2 py-1.5 text-[11px] font-medium transition ${
-                        showEmailPanel
-                          ? 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#A9BDFF]'
-                          : 'text-slate-500 hover:bg-white/80 hover:text-[#4D6BFE] dark:text-slate-300 dark:hover:bg-slate-800/80'
-                      }`}
-                    >
-                      <Mail className="h-3.5 w-3.5" />
-                      <span>{activeEntry.email ? bi('换绑', 'Email') : bi('绑邮箱', 'Email')}</span>
-                    </button>
-                  )}
-                  {isAdmin && onOpenInviteManager && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onClose()
-                        onOpenInviteManager()
-                      }}
-                      className="inline-flex items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 py-1.5 text-[11px] font-semibold text-white active:scale-95"
-                    >
-                      <Ticket className="h-3 w-3" />
-                      <span>{bi('邀请码', 'Invites')}</span>
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowEmailPanel(false)
-                      setConfirmLogoutAccount((v) => !v)
-                    }}
-                    title={bi('退出或管理当前账号', 'Sign out account')}
-                    className="rounded-xl p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-950/40"
-                  >
-                    <LogOut className="h-4 w-4" />
-                  </button>
-                </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 px-1 text-[11px] font-semibold text-slate-400">
+                <span className="truncate">{activeUsername}</span>
+                {accountDevices.length > 0 && (
+                  <span className="shrink-0">
+                    {bi(`${onlineAcctCount}/${accountDevices.length} 在线`, `${onlineAcctCount}/${accountDevices.length} online`)}
+                  </span>
+                )}
               </div>
-
-              {showEmailPanel && (
-                <div className="mt-2.5 rounded-xl border border-slate-200/80 bg-white/95 p-3 dark:border-slate-700/80 dark:bg-[#151821]">
-                  {emailEnabled ? (
-                    <form onSubmit={handleCommitBindEmail} className="space-y-2">
-                      <div className="text-[11.5px] font-semibold text-slate-700 dark:text-slate-200">
-                        {activeEntry.email ? bi('更换绑定邮箱', 'Change Email') : bi('绑定邮箱', 'Link Email')}
-                      </div>
-                      <input
-                        type="email"
-                        value={emailDraft}
-                        onChange={(e) => setEmailDraft(e.target.value)}
-                        placeholder={activeEntry.email ? bi(`新邮箱（当前：${activeEntry.email}）`, `New email (current: ${activeEntry.email})`) : bi('输入要绑定的邮箱地址', 'Enter email address')}
-                        autoComplete="email"
-                        autoCapitalize="none"
-                        autoCorrect="off"
-                        spellCheck={false}
-                        className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
-                      />
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="text"
-                          inputMode="numeric"
-                          maxLength={6}
-                          value={emailCodeDraft}
-                          onChange={(e) => setEmailCodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                          placeholder={bi('6 位验证码', '6-digit code')}
-                          autoComplete="one-time-code"
-                          className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tracking-widest text-slate-900 outline-none placeholder:font-sans placeholder:tracking-normal focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700 dark:bg-[#1C1F28] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
-                        />
-                        <button
-                          type="button"
-                          disabled={emailSending || emailCooldown > 0}
-                          onClick={handleSendBindCode}
-                          className="shrink-0 rounded-xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-2.5 py-2 text-[11px] font-semibold text-[#2842C9] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
-                        >
-                          {emailSending ? bi('发送中', 'Sending') : emailCooldown > 0 ? `${emailCooldown}s` : bi('获取验证码', 'Send Code')}
-                        </button>
-                      </div>
-                      {emailInfo && (
-                        <div className="rounded-lg bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
-                          {emailInfo}
-                        </div>
-                      )}
-                      {emailError && (
-                        <div className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">
-                          {emailError}
-                        </div>
-                      )}
-                      <div className="flex justify-end gap-1.5 pt-0.5">
-                        <button
-                          type="button"
-                          onClick={() => setShowEmailPanel(false)}
-                          className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-                        >
-                          {t('common.cancel')}
-                        </button>
-                        <button
-                          type="submit"
-                          disabled={emailBinding}
-                          className="rounded-lg bg-[#4D6BFE] px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
-                        >
-                          {emailBinding ? bi('绑定中...', 'Linking...') : bi('确认绑定', 'Confirm')}
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="space-y-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-                      <div className="font-semibold text-slate-700 dark:text-slate-200">{bi('服务器尚未启用邮件服务', 'Email Service Not Configured')}</div>
-                      <p>
-                        {lang === 'en' ? (
-                          <>
-                            Configure <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>,{' '}
-                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>, and{' '}
-                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code> in the relay server{' '}
-                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code> and restart to enable email linking and password reset.
-                          </>
-                        ) : (
-                          <>
-                            在服务器 <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">.env</code>{' '}
-                            配置免费的 QQ / 163 / Gmail SMTP（<code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_HOST</code>、
-                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_USER</code>、
-                            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800">SMTP_PASS</code>）并重启中转服务后，即可开启邮箱绑定与自助找回密码。
-                          </>
-                        )}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {confirmLogoutAccount && (
-                <div className="mt-2.5 space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                  <div className="flex items-center justify-between gap-2">
-                    <span>{bi(`退出账号 @${activeEntry.username}？`, `Sign out @${activeEntry.username}?`)}</span>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmLogoutAccount(false)}
-                      className="rounded-lg bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
-                    >
-                      {t('common.cancel')}
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap justify-end gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setConfirmLogoutAccount(false)
-                        onRemoveDevice?.(activeEntry.id, { revokeAll: false })
-                      }}
-                      className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
-                    >
-                      {bi('仅退出本设备', 'This Device Only')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setConfirmLogoutAccount(false)
-                        onRemoveDevice?.(activeEntry.id, { revokeAll: true })
-                      }}
-                      className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
-                    >
-                      {bi('退出并吊销全部设备', 'Sign Out All Devices')}
-                    </button>
-                  </div>
-                </div>
-              )}
 
               {activeConnState === 'unauthorized' && (
-                <div className="mt-2.5 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">
+                <div className="flex items-center justify-between gap-2 rounded-2xl border border-rose-200/80 bg-rose-50 px-3 py-2 text-[11.5px] text-rose-600 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300">
                   <span>{bi('当前账号登录已失效，请重新登录', 'Session expired. Please sign in again.')}</span>
                   <button
                     type="button"
@@ -650,18 +259,13 @@ export function DeviceSwitcherModal({
                       onClose()
                       onAddDevice?.(activeEntry.baseUrl, { openScanner: false })
                     }}
-                    className="rounded-lg bg-rose-500 px-2.5 py-1 font-semibold text-white"
+                    className="shrink-0 rounded-xl bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
                   >
-                    {bi('重新登录', 'Sign In Again')}
+                    {bi('重新登录', 'Sign In')}
                   </button>
                 </div>
               )}
-            </div>
-          )}
 
-          {/* Account-bound Computers List */}
-          {activeEntry && (
-            <div className="space-y-2">
               {accountDevices.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-700/80 dark:bg-[#151820]">
                   <Terminal className="mx-auto mb-2 h-6 w-6 text-[#4D6BFE]" />
@@ -671,11 +275,11 @@ export function DeviceSwitcherModal({
                   <p className="mt-1 text-[11px] text-slate-400">
                     {lang === 'en' ? (
                       <>
-                        Run the command below on your computer and sign in as <strong>@{activeEntry?.username}</strong>
+                        Run the command below on your computer and sign in as <strong>{activeUsername}</strong>
                       </>
                     ) : (
                       <>
-                        在电脑终端运行下方命令并登录 <strong>@{activeEntry?.username}</strong>
+                        在电脑终端运行下方命令并登录 <strong>{activeUsername}</strong>
                       </>
                     )}
                   </p>
@@ -847,162 +451,10 @@ export function DeviceSwitcherModal({
             </div>
           )}
 
-          {/* Signed-in Controlling / Monitoring Clients Security Audit Section */}
-          {(sessionList.length > 0 || effectiveOnlineClients > 0) && (
-            <div className="space-y-2 pt-1">
-              <div className="flex items-center justify-between gap-2 px-1">
-                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
-                  <ShieldCheck className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                  <span>{bi('已登录终端', 'Signed-in Devices')}</span>
-                  <span
-                    className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
-                      effectiveOnlineClients > 1
-                        ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-                        : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
-                    }`}
-                  >
-                    {bi(`${effectiveOnlineClients} 在线`, `${effectiveOnlineClients} online`)}
-                  </span>
-                </div>
-                {hasOtherSessions && onRevokeOtherClientSessions && (
-                  <button
-                    type="button"
-                    disabled={kickingOthers}
-                    onClick={() => setConfirmKickOthers((v) => !v)}
-                    className="rounded-lg px-2 py-0.5 text-[11px] font-medium text-rose-500 hover:bg-rose-50 disabled:opacity-50 dark:hover:bg-rose-950/40"
-                  >
-                    {bi('下线其他', 'Sign Out Others')}
-                  </button>
-                )}
-              </div>
-
-              {confirmKickOthers && (
-                <div className="flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                  <span>{bi('下线除本机外的所有终端并作废旧凭证？', 'Sign out all other devices & revoke their tokens?')}</span>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setConfirmKickOthers(false)}
-                      className="rounded-lg bg-white px-2 py-1 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
-                    >
-                      {t('common.cancel')}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={kickingOthers}
-                      onClick={async () => {
-                        setKickingOthers(true)
-                        try {
-                          await onRevokeOtherClientSessions?.()
-                          setConfirmKickOthers(false)
-                        } finally {
-                          setKickingOthers(false)
-                        }
-                      }}
-                      className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
-                    >
-                      {kickingOthers && <Loader2 className="h-3 w-3 animate-spin" />}
-                      <span>{bi('确认下线', 'Confirm')}</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {sessionList.length > 0 && (
-              <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#171920]">
-                {sessionList.map((s, idx) => {
-                  const rowKey = s.sid || s.clientId || `sess-${idx}`
-                  const isKicking = kickingKey === rowKey
-                  const IconComp =
-                    s.clientKind === 'desktop'
-                      ? Laptop
-                      : s.clientKind === 'mobile'
-                        ? Smartphone
-                        : Globe
-                  return (
-                    <div key={rowKey} className="flex items-center justify-between gap-2.5 px-3 py-2.5">
-                      <div className="flex min-w-0 items-center gap-2.5">
-                        <div
-                          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${
-                            s.isCurrent
-                              ? 'bg-[#4D6BFE]/14 text-[#4D6BFE]'
-                              : s.online
-                                ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
-                                : 'bg-slate-100 text-slate-400 dark:bg-slate-800'
-                          }`}
-                        >
-                          <IconComp className="h-4 w-4" />
-                        </div>
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span className="truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
-                              {formatClientDeviceLabel(s.deviceName, s.clientKind, lang)}
-                            </span>
-                            {s.isCurrent && (
-                              <span className="shrink-0 rounded-md bg-[#4D6BFE]/14 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE]">
-                                {bi('本机', 'This device')}
-                              </span>
-                            )}
-                            {s.connectionCount > 1 && (
-                              <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                                {bi(`${s.connectionCount} 窗口`, `${s.connectionCount} tabs`)}
-                              </span>
-                            )}
-                          </div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
-                            <span
-                              className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                                s.online ? 'bg-emerald-500' : 'bg-slate-400'
-                              }`}
-                            />
-                            <span>
-                              {s.online
-                                ? t('common.online')
-                                : s.lastSeenAt
-                                  ? `${t('common.offline')} · ${formatRelativeSeen(s.lastSeenAt, lang)}`
-                                  : t('common.offline')}
-                            </span>
-                            {s.ip && (
-                              <>
-                                <span>·</span>
-                                <span className="truncate font-mono text-[10px]">{s.ip}</span>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-
-                      {!s.isCurrent && onRevokeClientSession && (
-                        <button
-                          type="button"
-                          disabled={isKicking}
-                          onClick={async () => {
-                            setKickingKey(rowKey)
-                            try {
-                              await onRevokeClientSession({ sid: s.sid || '', clientId: s.clientId || '' })
-                            } finally {
-                              setKickingKey('')
-                            }
-                          }}
-                          title={bi('踢出此设备', 'Sign out this device')}
-                          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-500 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50 dark:border-slate-700 dark:text-slate-400 dark:hover:border-rose-900/60 dark:hover:bg-rose-950/40 dark:hover:text-rose-300"
-                        >
-                          {isKicking ? <Loader2 className="h-3 w-3 animate-spin" /> : <LogOut className="h-3 w-3" />}
-                          <span>{bi('踢下线', 'Kick')}</span>
-                        </button>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-              )}
-            </div>
-          )}
-
-          {/* Other saved accounts */}
+          {/* Other saved accounts (shown only when multi-account) */}
           {otherEntries.length > 0 && (
-            <div className="space-y-2">
-              <div className="px-1 pt-1 text-[11px] font-semibold text-slate-400">
+            <div className="space-y-2 pt-1">
+              <div className="px-1 text-[11px] font-semibold text-slate-400">
                 {bi('其他账号', 'Other Accounts')}
               </div>
               {otherEntries.map((device) => {

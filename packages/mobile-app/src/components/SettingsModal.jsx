@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import {
   Activity,
   Check,
+  ChevronDown,
   ChevronRight,
   Download,
   ExternalLink,
@@ -14,7 +15,6 @@ import {
   Lock,
   LogOut,
   Mail,
-  Monitor,
   Moon,
   Power,
   RefreshCw,
@@ -22,6 +22,7 @@ import {
   Settings,
   Share2,
   ShieldCheck,
+  Smartphone,
   Sun,
   Ticket,
   Trash2,
@@ -33,7 +34,38 @@ import {
 import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
 import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { useI18n } from '../lib/i18n.jsx'
+import { translate } from '../lib/i18n.js'
 import { RELEASES_URL, REPO_URL } from '../lib/clientHelpers.js'
+
+function formatRelativeSeen(ts, lang) {
+  if (!ts) return ''
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (diffSec < 60) return translate(lang, 'time.justNow')
+  if (diffSec < 3600) return translate(lang, 'time.minsAgo', { n: Math.floor(diffSec / 60) })
+  if (diffSec < 86400) return translate(lang, 'time.hoursAgo', { n: Math.floor(diffSec / 3600) })
+  return translate(lang, 'time.daysAgo', { n: Math.floor(diffSec / 86400) })
+}
+
+function formatClientDeviceLabel(name, kind, lang) {
+  const raw = String(name || '').trim()
+  if (lang === 'en') {
+    if (raw) return raw
+    if (kind === 'desktop') return 'Desktop App'
+    if (kind === 'mobile') return 'Mobile App'
+    return 'Web Client'
+  }
+  if (/^Windows Desktop$/i.test(raw)) return 'Windows 桌面端'
+  if (/^macOS Desktop$/i.test(raw)) return 'macOS 桌面端'
+  if (/^Linux Desktop$/i.test(raw)) return 'Linux 桌面端'
+  if (/^Desktop App$/i.test(raw)) return '桌面端'
+  if (/^Android App$/i.test(raw)) return 'Android 客户端'
+  if (/^iOS App$/i.test(raw)) return 'iOS 客户端'
+  if (/^Web Client$/i.test(raw)) return '网页浏览器'
+  if (raw) return raw
+  if (kind === 'desktop') return '桌面端'
+  if (kind === 'mobile') return '手机端'
+  return '网页浏览器'
+}
 
 function ToggleSwitch({ checked, onChange, disabled = false, label }) {
   return (
@@ -96,7 +128,11 @@ export function SettingsModal({
   emailEnabled = false,
   connState = 'disconnected',
   bridgeOnline = false,
+  clientSessions = null,
   onlineClientCount = 0,
+  onRefreshClientSessions = null,
+  onRevokeClientSession = null,
+  onRevokeOtherClientSessions = null,
   darkMode = false,
   onToggleDark,
   cacheScope = '',
@@ -110,7 +146,6 @@ export function SettingsModal({
   onDownloadUpdate = null,
   onCancelUpdate = null,
   onInstallUpdate = null,
-  onOpenDeviceSwitcher = null,
   onOpenShare = null,
   onOpenInviteManager = null,
   onSendBindEmailCode = null,
@@ -128,6 +163,12 @@ export function SettingsModal({
   const [cacheClearedHint, setCacheClearedHint] = useState(false)
   const [openHelpKey, setOpenHelpKey] = useState('')
 
+  const [showSessions, setShowSessions] = useState(false)
+  const [refreshingSessions, setRefreshingSessions] = useState(false)
+  const [confirmKickOthers, setConfirmKickOthers] = useState(false)
+  const [kickingKey, setKickingKey] = useState('')
+  const [kickingOthers, setKickingOthers] = useState(false)
+
   const [showEmailForm, setShowEmailForm] = useState(false)
   const [emailDraft, setEmailDraft] = useState('')
   const [emailCodeDraft, setEmailCodeDraft] = useState('')
@@ -142,14 +183,19 @@ export function SettingsModal({
   useEffect(() => {
     if (!open) {
       setOpenHelpKey('')
+      setShowSessions(false)
+      setConfirmKickOthers(false)
+      setKickingKey('')
       setShowEmailForm(false)
       setEmailDraft('')
       setEmailCodeDraft('')
       setEmailInfo('')
       setEmailError('')
       setConfirmLogout(false)
+      return
     }
-  }, [open])
+    onRefreshClientSessions?.().catch(() => {})
+  }, [open, onRefreshClientSessions])
 
   useEffect(() => {
     if (!open) return
@@ -180,6 +226,23 @@ export function SettingsModal({
     : activeDeviceName || bi('本地设备', 'Local Device')
   const serverDisplay = String(activeDevice?.baseUrl || '').replace(/^https?:\/\//i, '')
   const boundEmail = activeDevice?.email || ''
+
+  const sessionList = Array.isArray(clientSessions?.sessions) ? clientSessions.sessions : []
+  const effectiveOnlineClients = Math.max(
+    Number(onlineClientCount) || 0,
+    Number(clientSessions?.onlineCount) || 0,
+  )
+  const hasOtherSessions = sessionList.some((s) => !s.isCurrent) || effectiveOnlineClients > 1
+
+  const handleRefreshSessions = async () => {
+    if (!onRefreshClientSessions || refreshingSessions) return
+    setRefreshingSessions(true)
+    try {
+      await onRefreshClientSessions()
+    } finally {
+      setRefreshingSessions(false)
+    }
+  }
 
   const handleClearCache = async () => {
     await clearSessionCache(cacheScope)
@@ -359,33 +422,198 @@ export function SettingsModal({
                       }`}
                     />
                     <span className="truncate">{serverDisplay || bi('默认服务器', 'Default server')}</span>
-                    {onlineClientCount > 0 && (
-                      <span
-                        className={`shrink-0 ${
-                          onlineClientCount > 1
-                            ? 'font-medium text-amber-600 dark:text-amber-400'
-                            : 'text-slate-400'
-                        }`}
-                      >
-                        · {bi(`${onlineClientCount} 终端在线`, `${onlineClientCount} active`)}
-                      </span>
-                    )}
                   </div>
                 </div>
-                {onOpenDeviceSwitcher && (
+              </div>
+
+              {/* Signed-in Devices (collapsed single row by default; expand to audit & kick) */}
+              {activeDevice && (sessionList.length > 0 || effectiveOnlineClients > 0) && (
+                <div className="border-t border-slate-100 dark:border-slate-800">
                   <button
                     type="button"
+                    aria-expanded={showSessions}
                     onClick={() => {
-                      onClose()
-                      onOpenDeviceSwitcher()
+                      const next = !showSessions
+                      setShowSessions(next)
+                      setConfirmKickOthers(false)
+                      if (next) void handleRefreshSessions()
                     }}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-slate-200 px-2.5 py-1.5 text-[11.5px] font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    className="flex w-full items-center justify-between gap-2 px-3.5 py-2.5 text-left transition hover:bg-slate-50/80 dark:hover:bg-slate-800/50"
                   >
-                    <Monitor className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('电脑', 'PCs')}</span>
+                    <div className="flex min-w-0 items-center gap-2 text-xs text-slate-700 dark:text-slate-200">
+                      <Smartphone className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                      <span className="truncate">{bi('已登录终端', 'Signed-in Devices')}</span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <span
+                        className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${
+                          effectiveOnlineClients > 1
+                            ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                            : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                        }`}
+                      >
+                        {bi(`${effectiveOnlineClients} 在线`, `${effectiveOnlineClients} online`)}
+                      </span>
+                      <ChevronDown
+                        className={`h-3.5 w-3.5 text-slate-400 transition-transform ${showSessions ? 'rotate-180' : ''}`}
+                      />
+                    </div>
                   </button>
-                )}
-              </div>
+
+                  {showSessions && (
+                    <div className="space-y-2 border-t border-slate-100/80 bg-slate-50/70 px-3 py-2.5 dark:border-slate-800/80 dark:bg-[#171921]">
+                      <div className="flex items-center justify-between gap-2 px-0.5">
+                        <span className="text-[10.5px] text-slate-400">
+                          {bi(`共 ${sessionList.length || effectiveOnlineClients} 台设备记录`, `${sessionList.length || effectiveOnlineClients} devices`)}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          {onRefreshClientSessions && (
+                            <button
+                              type="button"
+                              onClick={() => void handleRefreshSessions()}
+                              aria-label={bi('刷新终端列表', 'Refresh devices')}
+                              className="rounded-lg p-1 text-slate-400 hover:bg-slate-200/70 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                            >
+                              <RefreshCw className={`h-3 w-3 ${refreshingSessions ? 'animate-spin text-[#4D6BFE]' : ''}`} />
+                            </button>
+                          )}
+                          {hasOtherSessions && onRevokeOtherClientSessions && (
+                            <button
+                              type="button"
+                              disabled={kickingOthers}
+                              onClick={() => setConfirmKickOthers((v) => !v)}
+                              className="rounded-lg px-2 py-0.5 text-[11px] font-medium text-rose-500 hover:bg-rose-50 disabled:opacity-50 dark:hover:bg-rose-950/40"
+                            >
+                              {bi('下线其他', 'Sign Out Others')}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {confirmKickOthers && (
+                        <div className="flex items-center justify-between gap-2 rounded-xl bg-rose-50/90 px-2.5 py-2 text-[11.5px] text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
+                          <span>{bi('下线除本机外的所有终端？', 'Sign out all other devices?')}</span>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setConfirmKickOthers(false)}
+                              className="rounded-lg bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                            >
+                              {t('common.cancel')}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={kickingOthers}
+                              onClick={async () => {
+                                setKickingOthers(true)
+                                try {
+                                  await onRevokeOtherClientSessions?.()
+                                  setConfirmKickOthers(false)
+                                } finally {
+                                  setKickingOthers(false)
+                                }
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white disabled:opacity-60"
+                            >
+                              {kickingOthers && <Loader2 className="h-3 w-3 animate-spin" />}
+                              <span>{bi('确认', 'Confirm')}</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {sessionList.length > 0 && (
+                        <div className="divide-y divide-slate-100 overflow-hidden rounded-xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#1E212B]">
+                          {sessionList.map((s, idx) => {
+                            const rowKey = s.sid || s.clientId || `sess-${idx}`
+                            const isKicking = kickingKey === rowKey
+                            const IconComp =
+                              s.clientKind === 'desktop'
+                                ? Laptop
+                                : s.clientKind === 'mobile'
+                                  ? Smartphone
+                                  : Globe
+                            return (
+                              <div key={rowKey} className="flex items-center justify-between gap-2 px-2.5 py-2">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <div
+                                    className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${
+                                      s.isCurrent
+                                        ? 'bg-[#4D6BFE]/14 text-[#4D6BFE]'
+                                        : s.online
+                                          ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                                          : 'bg-slate-100 text-slate-400 dark:bg-slate-800'
+                                    }`}
+                                  >
+                                    <IconComp className="h-3.5 w-3.5" />
+                                  </div>
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="truncate text-[11.5px] font-semibold text-slate-800 dark:text-slate-100">
+                                        {formatClientDeviceLabel(s.deviceName, s.clientKind, lang)}
+                                      </span>
+                                      {s.isCurrent && (
+                                        <span className="shrink-0 rounded bg-[#4D6BFE]/14 px-1.5 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE]">
+                                          {bi('本机', 'This device')}
+                                        </span>
+                                      )}
+                                      {s.connectionCount > 1 && (
+                                        <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[9.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                                          {bi(`${s.connectionCount} 窗口`, `${s.connectionCount} tabs`)}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-slate-400">
+                                      <span
+                                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                                          s.online ? 'bg-emerald-500' : 'bg-slate-400'
+                                        }`}
+                                      />
+                                      <span>
+                                        {s.online
+                                          ? t('common.online')
+                                          : s.lastSeenAt
+                                            ? `${t('common.offline')} · ${formatRelativeSeen(s.lastSeenAt, lang)}`
+                                            : t('common.offline')}
+                                      </span>
+                                      {s.ip && (
+                                        <>
+                                          <span>·</span>
+                                          <span className="truncate font-mono">{s.ip}</span>
+                                        </>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {!s.isCurrent && onRevokeClientSession && (
+                                  <button
+                                    type="button"
+                                    disabled={isKicking}
+                                    onClick={async () => {
+                                      setKickingKey(rowKey)
+                                      try {
+                                        await onRevokeClientSession({ sid: s.sid || '', clientId: s.clientId || '' })
+                                      } finally {
+                                        setKickingKey('')
+                                      }
+                                    }}
+                                    title={bi('踢出此设备', 'Sign out this device')}
+                                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[10.5px] font-medium text-slate-500 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50 dark:border-slate-700 dark:text-slate-400 dark:hover:border-rose-900/60 dark:hover:bg-rose-950/40 dark:hover:text-rose-300"
+                                  >
+                                    {isKicking ? <Loader2 className="h-3 w-3 animate-spin" /> : <LogOut className="h-3 w-3" />}
+                                    <span>{bi('踢下线', 'Kick')}</span>
+                                  </button>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* End-to-End Encryption */}
               {activeDevice && onOpenE2eeSync && (

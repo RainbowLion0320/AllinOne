@@ -2973,25 +2973,6 @@ export function App() {
             activeBridgeId={activeBridgeId || activeDevice?.selectedBridgeId || ''}
             activeConnState={connState}
             accountDevices={accountDevices}
-            clientSessions={clientSessions}
-            onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
-            isAdmin={isAdmin}
-            emailEnabled={serverEmailEnabled}
-            desktopBridge={desktopBridge}
-            onToggleDesktopBridge={
-              desktopApi
-                ? () => {
-                    desktopApi.toggleBridge?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
-                  }
-                : null
-            }
-            onToggleDesktopAutoLaunch={
-              desktopApi
-                ? () => {
-                    desktopApi.toggleAutoLaunch?.().then((st) => st && setDesktopBridge(st)).catch(() => {})
-                  }
-                : null
-            }
             onSelectDevice={handleSelectDevice}
             onAddDevice={(prefillServerUrl = '', opts = {}) => {
               setAddingDevice({
@@ -3006,12 +2987,6 @@ export function App() {
             onRenameAccountDevice={handleRenameAccountDevice}
             onRemoveAccountDevice={handleRemoveAccountDevice}
             onRefreshAccountDevices={handleRefreshAccountDevices}
-            onRefreshClientSessions={handleRefreshClientSessions}
-            onRevokeClientSession={handleRevokeClientSession}
-            onRevokeOtherClientSessions={handleRevokeOtherClientSessions}
-            onSendBindEmailCode={handleSendBindEmailCode}
-            onBindAccountEmail={handleBindAccountEmail}
-            onOpenInviteManager={() => setInviteManagerOpen(true)}
           />
         )}
 
@@ -3094,7 +3069,11 @@ export function App() {
             emailEnabled={serverEmailEnabled}
             connState={connState}
             bridgeOnline={bridgeOnline}
+            clientSessions={clientSessions}
             onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
+            onRefreshClientSessions={handleRefreshClientSessions}
+            onRevokeClientSession={handleRevokeClientSession}
+            onRevokeOtherClientSessions={handleRevokeOtherClientSessions}
             darkMode={darkMode}
             onToggleDark={() => setDarkMode((v) => !v)}
             cacheScope={cacheScope}
@@ -3120,7 +3099,6 @@ export function App() {
             onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
             onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
             onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-            onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
             onOpenShare={() => setShareOpen(true)}
             onOpenInviteManager={() => setInviteManagerOpen(true)}
             onSendBindEmailCode={handleSendBindEmailCode}
