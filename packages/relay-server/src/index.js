@@ -255,7 +255,7 @@ export function createRelayServer(options = {}) {
     String(rawStunPort).trim().toLowerCase() === 'off' ||
     String(rawStunPort).trim() === '-1'
   const stunPort = stunDisabled ? -1 : Number(rawStunPort)
-  const stunHost = String(options.stunHost ?? process.env.STUN_HOST ?? host)
+  const stunHost = String(options.stunHost ?? process.env.STUN_HOST ?? (options.host ? options.host : '0.0.0.0'))
   const stunServer =
     !stunDisabled && Number.isInteger(stunPort) && stunPort >= 0
       ? createStunServer({ port: stunPort, host: stunHost })
