@@ -8,10 +8,10 @@ import { dirname } from 'node:path'
  *
  * Four user tiers:
  *  - `free` (普通用户):
- *      - 10-minute burst quota: 120 MB (RELAY_ROOM_TRAFFIC_10M_MB)
+ *      - Calendar month quota:  1 GB / month (RELAY_ROOM_TRAFFIC_MONTH_MB, default 1024 MB, persisted to disk)
  *      - 24-hour daily quota:   500 MB (RELAY_ROOM_TRAFFIC_DAY_MB)
+ *      - 10-minute burst quota: 120 MB (RELAY_ROOM_TRAFFIC_10M_MB)
  *      - /api/uploads rate:      20 uploads / minute (RELAY_ROOM_UPLOAD_PER_MIN)
- *      - No separate monthly cap (preserves existing free-tier rules)
  *  - `pro` (Pro 用户):
  *      - Calendar month quota:  5 GB / month (RELAY_PRO_TRAFFIC_MONTH_MB, default 5120 MB, persisted to disk)
  *      - 24-hour daily quota:   10x normal daily limit (default 5000 MB ≈ 5 GB / 24h)
@@ -77,6 +77,7 @@ export class RelayTrafficGuard {
   constructor({
     burstLimitBytes = parseNonNegativeMb(process.env.RELAY_ROOM_TRAFFIC_10M_MB, 120),
     dailyLimitBytes = parseNonNegativeMb(process.env.RELAY_ROOM_TRAFFIC_DAY_MB, 500),
+    monthlyLimitBytes = parseNonNegativeMb(process.env.RELAY_ROOM_TRAFFIC_MONTH_MB, 1024),
     uploadMaxPerMinute = parseNonNegativeInt(process.env.RELAY_ROOM_UPLOAD_PER_MIN, 20),
     proMonthlyLimitBytes = parseNonNegativeMb(process.env.RELAY_PRO_TRAFFIC_MONTH_MB, 5120),
     proDailyMultiplier = 10,
@@ -91,6 +92,7 @@ export class RelayTrafficGuard {
   } = {}) {
     this.burstLimitBytes = Math.max(0, Number(burstLimitBytes) || 0)
     this.dailyLimitBytes = Math.max(0, Number(dailyLimitBytes) || 0)
+    this.monthlyLimitBytes = Math.max(0, Number(monthlyLimitBytes) || 0)
     this.uploadMaxPerMinute = Math.max(0, Number(uploadMaxPerMinute) || 0)
     this.proMonthlyLimitBytes = Math.max(0, Number(proMonthlyLimitBytes) || 0)
     this.proDailyMultiplier = Math.max(1, Number(proDailyMultiplier) || 10)
@@ -265,7 +267,7 @@ export class RelayTrafficGuard {
         unlimited: false,
         burst10mBytes: this.burstLimitBytes,
         daily24hBytes: this.dailyLimitBytes,
-        monthlyBytes: 0,
+        monthlyBytes: this.monthlyLimitBytes,
         uploadPerMin: this.uploadMaxPerMinute,
       }
     }
@@ -284,7 +286,7 @@ export class RelayTrafficGuard {
       unlimited: false,
       burst10mBytes: this.burstLimitBytes,
       daily24hBytes: this.dailyLimitBytes,
-      monthlyBytes: 0,
+      monthlyBytes: this.monthlyLimitBytes,
       uploadPerMin: this.uploadMaxPerMinute,
     }
   }
@@ -297,6 +299,7 @@ export class RelayTrafficGuard {
     return {
       burst10mBytes: free.burst10mBytes,
       daily24hBytes: free.daily24hBytes,
+      monthlyBytes: free.monthlyBytes,
       uploadPerMin: free.uploadPerMin,
       proBurst10mBytes: pro.burst10mBytes,
       proDaily24hBytes: pro.daily24hBytes,

@@ -5382,12 +5382,18 @@ async function main() {
       mkdirSync(tierDir, { recursive: true })
       const tierStateFile = join(tierDir, 'traffic-usage.json')
 
-      // 34a. Unit verification of all 4 tiers, Pro 10x daily + monthly cap, disk persistence & calendar-month auto-reset
+      // 34a. Unit verification of all 4 tiers, Free 1GB/month default, Pro 5GB/month + 10x daily, disk persistence & calendar-month auto-reset
+      const tgDefaults = new RelayTrafficGuard()
+      assert.equal(tgDefaults.getLimitsForTier('free').monthlyBytes, 1024 * 1024 * 1024, 'Default free monthly limit must be 1 GB')
+      assert.equal(tgDefaults.getLimitsForTier('pro').monthlyBytes, 5 * 1024 * 1024 * 1024, 'Default Pro monthly limit must be 5 GB')
+      assert.equal(tgDefaults.getLimitsForTier('pro').daily24hBytes, tgDefaults.getLimitsForTier('free').daily24hBytes * 10)
+
       let mockNow = new Date('2026-03-15T10:00:00Z').getTime()
       const tg1 = new RelayTrafficGuard({
         burstLimitBytes: 100 * 1024, // 100 KB / 10m (free) -> 1000 KB / 10m (pro)
         dailyLimitBytes: 200 * 1024, // 200 KB / 24h (free) -> 2000 KB / 24h (pro = 10x)
-        proMonthlyLimitBytes: 3 * 1024 * 1024, // 3 MB / month for fast deterministic test
+        monthlyLimitBytes: 300 * 1024, // 300 KB / month (free) for fast deterministic test
+        proMonthlyLimitBytes: 3 * 1024 * 1024, // 3 MB / month (pro) for fast deterministic test
         uploadMaxPerMinute: 2, // 2/min (free) -> 10/min (pro)
         largeFrameThresholdBytes: 64 * 1024,
         hardDisconnectMultiplier: 2,
@@ -5399,7 +5405,7 @@ async function main() {
 
       // Verify effective limits for all 4 tiers
       assert.equal(tg1.getLimitsForTier('free').daily24hBytes, 200 * 1024)
-      assert.equal(tg1.getLimitsForTier('free').monthlyBytes, 0)
+      assert.equal(tg1.getLimitsForTier('free').monthlyBytes, 300 * 1024)
       assert.equal(tg1.getLimitsForTier('pro').daily24hBytes, 200 * 1024 * 10, 'Pro daily limit must be 10x normal user')
       assert.equal(tg1.getLimitsForTier('pro').burst10mBytes, 100 * 1024 * 10, 'Pro 10m burst limit must be 10x normal user')
       assert.equal(tg1.getLimitsForTier('pro').monthlyBytes, 3 * 1024 * 1024)
@@ -5408,6 +5414,19 @@ async function main() {
 
       // Free user hits 100KB burst immediately on 120KB frame
       assert.equal(tg1.consumeBytes('usr_t_free', 120 * 1024, { tier: 'free' }).allowed, false)
+
+      // Free user accumulates 200KB on day 1, then on day 2 hits 300KB monthly cap even though 24h window cleared
+      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true)
+      mockNow += 11 * 60 * 1000
+      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true) // 180KB
+      mockNow += 25 * 60 * 60 * 1000 // +25h -> 24h cleared, monthly still 180KB
+      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true) // 270KB / 300KB
+      mockNow += 11 * 60 * 1000
+      const freeMonthBlocked = tg1.consumeBytes('usr_t_free_mo', 70 * 1024, { tier: 'free' })
+      assert.equal(freeMonthBlocked.allowed, false, 'Free user exceeding monthly cap must be blocked')
+      assert.equal(freeMonthBlocked.quotaWindow, 'month')
+      assert.equal(freeMonthBlocked.hardKick, false, 'Soft monthly block must not hard-kick free user')
+      assert.equal(tg1.consumeBytes('usr_t_free_mo', 4 * 1024, { tier: 'free' }).allowed, true, 'Small chat must still pass')
 
       // Pro user easily transfers 900KB in 10m & 1.8MB in 24h (well above free's 200KB daily limit)
       assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true)
@@ -5428,6 +5447,7 @@ async function main() {
       const tg2 = new RelayTrafficGuard({
         burstLimitBytes: 100 * 1024,
         dailyLimitBytes: 200 * 1024,
+        monthlyLimitBytes: 300 * 1024,
         proMonthlyLimitBytes: 3 * 1024 * 1024,
         uploadMaxPerMinute: 2,
         largeFrameThresholdBytes: 64 * 1024,
@@ -5436,6 +5456,7 @@ async function main() {
         stateFile: tierStateFile,
         nowFn: () => mockNow,
       })
+      assert.equal(tg2.getRoomUsage('usr_t_free_mo', 'free').bytesMonth, 274 * 1024, 'Free monthly usage must persist across restarts')
       assert.equal(tg2.getRoomUsage('usr_t_pro', 'pro').bytesMonth, 2700 * 1024, 'Monthly usage must persist across restarts')
       const proMonthBlocked = tg2.consumeBytes('usr_t_pro', 500 * 1024, { tier: 'pro' })
       assert.equal(proMonthBlocked.allowed, false, 'Pro user exceeding monthly cap must be blocked')
@@ -5471,6 +5492,7 @@ async function main() {
         trafficGuard: {
           burstLimitBytes: 128 * 1024,
           dailyLimitBytes: 256 * 1024,
+          monthlyLimitBytes: 1024 * 1024,
           proMonthlyLimitBytes: 5 * 1024 * 1024,
           uploadMaxPerMinute: 2,
           adminExempt: true,
@@ -5544,10 +5566,17 @@ async function main() {
         assert.equal(proAdminTry.status, 403, 'Pro user must get 403 on admin endpoints')
         assert.equal(ultraAdminTry.status, 403, 'Ultra user must get 403 on admin endpoints')
 
-        // /api/auth/me exposes tier & traffic snapshot
-        const proMe = await (await fetch(`${tBase}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${uPro.token}` },
-        })).json()
+        // /api/auth/me exposes tier & traffic snapshot for both free and pro users
+        const [freeMe, proMe] = await Promise.all([
+          fetch(`${tBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${uFree.token}` },
+          }).then((r) => r.json()),
+          fetch(`${tBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${uPro.token}` },
+          }).then((r) => r.json()),
+        ])
+        assert.equal(freeMe.tier, 'free')
+        assert.equal(freeMe.traffic.limitMonthBytes, 1024 * 1024)
         assert.equal(proMe.tier, 'pro')
         assert.equal(proMe.traffic.limitMonthBytes, 5 * 1024 * 1024)
         assert.equal(proMe.traffic.limit24hBytes, 256 * 1024 * 10)

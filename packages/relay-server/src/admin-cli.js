@@ -54,7 +54,7 @@ function getFlag(name, fallback = '') {
 }
 
 const TIER_LABELS = {
-  free: '普通用户 (Free)',
+  free: '普通用户 (1GB/月 · 500MB/日)',
   pro: 'Pro (5GB/月 · 10倍日额)',
   ultra: 'Ultra (不限流)',
   admin: '管理员 (Admin · 不限流)',

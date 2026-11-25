@@ -296,7 +296,7 @@
     setPh('invite-note', '备注（如：给朋友 / 测试账号）', 'Note (optional)')
     const invTierSel = document.getElementById('invite-tier')
     if (invTierSel && invTierSel.options.length >= 4) {
-      invTierSel.options[0].textContent = bi('普通用户 (默认限流)', 'Free (Standard)')
+      invTierSel.options[0].textContent = bi('普通用户 (1GB/月 · 500MB/日)', 'Free (1GB/mo · 500MB/day)')
       invTierSel.options[1].textContent = bi('Pro 用户 (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x Daily)')
       invTierSel.options[2].textContent = bi('Ultra 用户 (不限流)', 'Ultra (Unlimited)')
       invTierSel.options[3].textContent = bi('管理员 (Admin · 不限流)', 'Admin (Unlimited)')
@@ -930,20 +930,15 @@
       const tm = tierMeta(u.tier, u.role)
       const tr = u.stats?.traffic || {}
       const initial = (u.username || '?').slice(0, 1).toUpperCase()
-      const trafficSummaryText = tm.id === 'pro'
+      const trafficSummaryText = tr.unlimited || tm.id === 'ultra' || tm.id === 'admin'
         ? bi(
-            `本月 ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}`,
-            `Mo ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}`,
+            `24h ${fmtBytes(tr.bytes24h || 0)} · 不限流`,
+            `24h ${fmtBytes(tr.bytes24h || 0)} · Unlimited`,
           )
-        : tr.unlimited || tm.id === 'ultra' || tm.id === 'admin'
-          ? bi(
-              `24h ${fmtBytes(tr.bytes24h || 0)} · 不限流`,
-              `24h ${fmtBytes(tr.bytes24h || 0)} · Unlimited`,
-            )
-          : bi(
-              `24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · 限流${tr.throttledCount}` : ''}`,
-              `24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · Limited ${tr.throttledCount}` : ''}`,
-            )
+        : bi(
+            `本月 ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · 限流${tr.throttledCount}` : ''}`,
+            `Mo ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · Limited ${tr.throttledCount}` : ''}`,
+          )
       const appTags = (u.apps || []).length > 0
         ? u.apps.map((a) => {
             const meta = APP_COLORS[a.app] || { badge: a.app.toUpperCase(), color: '#94a3b8', bg: 'rgba(148,163,184,0.14)' }
@@ -1107,7 +1102,7 @@
             <label class="tier-switch-wrap">
               <span>${esc(bi('用户等级', 'Tier'))}</span>
               <select class="select-compact select-xs" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(u.tier || (u.role === 'admin' ? 'admin' : 'free'))}" ${u.isCurrentAdmin ? 'disabled' : ''}>
-                <option value="free" ${(u.tier || (u.role === 'admin' ? 'admin' : 'free')) === 'free' ? 'selected' : ''}>${esc(bi('普通用户', 'Free'))}</option>
+                <option value="free" ${(u.tier || (u.role === 'admin' ? 'admin' : 'free')) === 'free' ? 'selected' : ''}>${esc(bi('普通用户 (1GB/月)', 'Free (1GB/mo)'))}</option>
                 <option value="pro" ${u.tier === 'pro' ? 'selected' : ''}>${esc(bi('Pro (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x)'))}</option>
                 <option value="ultra" ${u.tier === 'ultra' ? 'selected' : ''}>${esc(bi('Ultra (不限流)', 'Ultra (Unlimited)'))}</option>
                 <option value="admin" ${(u.tier || u.role) === 'admin' ? 'selected' : ''}>${esc(bi('管理员 (不限流)', 'Admin (Unlimited)'))}</option>

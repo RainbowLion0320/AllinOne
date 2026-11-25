@@ -347,7 +347,7 @@ export class RelayHub {
         totalBytesMonth: 0,
         totalBytesLifetime: 0,
         totalThrottledCount: 0,
-        limits: { burst10mBytes: 0, daily24hBytes: 0, proMonthlyBytes: 0, uploadPerMin: 0, adminExempt: true },
+        limits: { burst10mBytes: 0, daily24hBytes: 0, monthlyBytes: 0, proMonthlyBytes: 0, uploadPerMin: 0, adminExempt: true },
       }
     }
     return this.trafficGuard.getGlobalSummary()
