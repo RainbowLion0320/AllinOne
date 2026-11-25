@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
-import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
+import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { resolveImageSrc } from '../lib/imageUrls.js'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
@@ -121,7 +121,6 @@ export function Composer({
   disabled,
   needsWorkspace = false,
   targetWorkspaceName = '',
-  onSwitchAppClick,
   modelPref,
   modelDisplayName,
   onOpenModelPicker,
@@ -374,18 +373,8 @@ export function Composer({
           />
 
           <div className="mt-2 flex items-center justify-between gap-2">
-            {/* Left app & model pills */}
+            {/* Left model & reasoning effort pill */}
             <div className="no-scrollbar flex min-w-0 items-center gap-1.5 overflow-x-auto">
-              <button
-                type="button"
-                onClick={onSwitchAppClick}
-                title={bi(`当前应用：${meta.name}（点击新建或切换应用）`, `Current app: ${meta.name} (click to start or switch)`)}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
-              >
-                <VendorIcon app={activeApp} size={14} />
-                <span>{meta.shortName}</span>
-              </button>
-
               {onOpenModelPicker && (
                 <button
                   type="button"
@@ -394,7 +383,7 @@ export function Composer({
                   className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:border-[#4D6BFE]/50 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
                 >
                   <SlidersHorizontal className="h-3 w-3 shrink-0 text-[#4D6BFE]" />
-                  <span className="max-w-[136px] truncate">
+                  <span className="max-w-[200px] truncate sm:max-w-[260px]">
                     {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (

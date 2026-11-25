@@ -2526,6 +2526,7 @@ export function App() {
             type="button"
             onClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
             aria-label={t('common.newChat')}
+            title={activeSession?.cwd ? bi('在当前项目新建对话', 'New chat in current project') : t('common.newChat')}
             className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
           >
             <SquarePen className="h-4.5 w-4.5" />
@@ -2869,7 +2870,6 @@ export function App() {
         disabled={!bridgeOnline || connState !== 'connected' || e2eeLocked}
         needsWorkspace={!activeSession && !selectedDraftCwd}
         targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
-        onSwitchAppClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
         onOpenModelPicker={() => {
