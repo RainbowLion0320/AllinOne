@@ -1715,7 +1715,7 @@ export class ClaudeAdapter {
 
   async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, taskMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
-    const effectiveTaskMode = normalizeTaskMode(taskMode)
+    let effectiveTaskMode = normalizeTaskMode(taskMode)
     if (this.activeProcs.has(sessionId)) {
       const err = new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
       err.code = 'SESSION_BUSY'
@@ -1757,6 +1757,14 @@ export class ClaudeAdapter {
     if (!existsSync(targetCwd)) targetCwd = this.defaultCwd
 
     let prompt = String(text || '').trim()
+    if (!effectiveTaskMode && prompt) {
+      const planMatch = /^\/plan(?:\s+([\s\S]*))?$/i.exec(prompt)
+      if (planMatch) {
+        effectiveTaskMode = 'plan'
+        const rest = String(planMatch[1] || '').trim()
+        if (rest) prompt = rest
+      }
+    }
     if (attachments.length > 0) {
       const lines = attachments.map((a) => `- 附件文件：${a.localPath || a.filename}`)
       prompt = `${prompt}\n\n[手机端上传的附件，可直接读取]\n${lines.join('\n')}`

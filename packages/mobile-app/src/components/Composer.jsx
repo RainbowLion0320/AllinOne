@@ -1,9 +1,41 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { ArrowUp, ChevronDown, ListChecks, Loader2, Paperclip, SlidersHorizontal, Square, Target, X } from 'lucide-react'
+import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
+
+// Native slash commands inherited from each AI tool (forwarded directly on send)
+const NATIVE_SLASH_COMMANDS = {
+  antigravity: [
+    { cmd: '/plan', zh: '计划模式 · 先规划步骤再执行', en: 'Plan step-by-step before executing' },
+    { cmd: '/goal', zh: '目标模式 · 持续推进直到完成', en: 'Autonomous long-running goal mode' },
+    { cmd: '/compact', zh: '压缩总结当前对话上下文', en: 'Compact & summarize conversation context' },
+    { cmd: '/grill-me', zh: '交互式访谈对齐方案细节', en: 'Interactive interview to align design' },
+    { cmd: '/boost', zh: '深度思考与多视角严格验证', en: 'Deep thinking & rigorous verification' },
+    { cmd: '/teamwork', zh: '多 Agent 协同处理复杂任务', en: 'Multi-agent teamwork mode' },
+    { cmd: '/schedule', zh: '设置定时或周期执行任务', en: 'Schedule recurring job or one-shot timer' },
+    { cmd: '/learn', zh: '固化经验偏好供后续复用', en: 'Persist learnings for future tasks' },
+  ],
+  codex: [
+    { cmd: '/plan', zh: '计划模式 · 先制定实施计划', en: 'Plan mode before executing changes' },
+    { cmd: '/goal', zh: '设定当前线程持续目标', en: 'Set an active goal for this thread' },
+    { cmd: '/compact', zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/review', zh: '审查当前代码改动', en: 'Review workspace changes' },
+    { cmd: '/diff', zh: '查看当前工作区改动', en: 'Inspect current workspace diff' },
+  ],
+  claude: [
+    { cmd: '/plan', zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
+    { cmd: '/compact', zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/review', zh: '代码审查与风险检查', en: 'Review code changes' },
+    { cmd: '/clear', zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
+    { cmd: '/init', zh: '初始化项目 CLAUDE.md 指引', en: 'Initialize project CLAUDE.md guide' },
+  ],
+  dsh: [
+    { cmd: '/plan', zh: '计划模式', en: 'Plan mode' },
+    { cmd: '/compact', zh: '压缩对话上下文', en: 'Compact conversation context' },
+  ],
+}
 
 function revokeAttachmentPreview(att) {
   const url = att?.localPreviewUrl
@@ -65,9 +97,6 @@ export function Composer({
   targetWorkspaceName = '',
   modelPref,
   modelDisplayName,
-  taskMode = '',
-  supportedTaskModes = [],
-  onChangeTaskMode = null,
   onOpenModelPicker,
   onUploadFile,
   onSend,
@@ -80,6 +109,8 @@ export function Composer({
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
   const [inlineError, setInlineError] = useState('')
+  const [slashDismissed, setSlashDismissed] = useState(false)
+  const [slashIdx, setSlashIdx] = useState(0)
   const fileRef = useRef(null)
   const textareaRef = useRef(null)
   const draftKeyRef = useRef(draftKey)
@@ -91,6 +122,21 @@ export function Composer({
   attachmentsRef.current = attachments
 
   const meta = APP_META[activeApp] || APP_META.dsh
+
+  // Match leading single slash token (e.g. "/", "/p", "/plan") before any space
+  const slashMatch = !slashDismissed && !disabled && !needsWorkspace ? /^\/([^\s]*)$/.exec(text) : null
+  const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : null
+  const slashOptions = useMemo(() => {
+    if (slashQuery === null) return []
+    const list = NATIVE_SLASH_COMMANDS[activeApp] || NATIVE_SLASH_COMMANDS.dsh
+    if (!slashQuery) return list
+    return list.filter((item) => item.cmd.slice(1).toLowerCase().includes(slashQuery))
+  }, [activeApp, slashQuery])
+  const showSlashMenu = slashQuery !== null && slashOptions.length > 0
+
+  useEffect(() => {
+    setSlashIdx(0)
+  }, [slashQuery, activeApp])
 
   const autoResize = (el) => {
     if (!el) return
@@ -128,6 +174,7 @@ export function Composer({
     setText(nextDraft.text)
     setAttachments(nextDraft.attachments)
     setInlineError('')
+    setSlashDismissed(false)
   }, [draftKey])
 
   // Keep textarea height synced cleanly after switching to a restored draft (or empty box)
@@ -138,7 +185,23 @@ export function Composer({
   const updateText = (nextText) => {
     textRef.current = nextText
     setText(nextText)
+    setSlashDismissed(false)
     saveDraft(draftKeyRef.current, { text: nextText, attachments: attachmentsRef.current })
+  }
+
+  const applySlashCommand = (cmdStr) => {
+    const next = `${cmdStr} `
+    textRef.current = next
+    setText(next)
+    setSlashDismissed(true)
+    saveDraft(draftKeyRef.current, { text: next, attachments: attachmentsRef.current })
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.focus()
+      el.setSelectionRange(next.length, next.length)
+      autoResize(el)
+    })
   }
 
   const updateAttachments = (updater) => {
@@ -262,6 +325,7 @@ export function Composer({
         attachmentsRef.current = []
         setText('')
         setAttachments([])
+        setSlashDismissed(false)
         if (textareaRef.current) textareaRef.current.style.height = 'auto'
       }
     } catch {
@@ -275,6 +339,39 @@ export function Composer({
   }
 
   const handleKeyDown = (e) => {
+    if (showSlashMenu && !e.nativeEvent.isComposing) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setSlashIdx((i) => (i + 1) % slashOptions.length)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setSlashIdx((i) => (i - 1 + slashOptions.length) % slashOptions.length)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setSlashDismissed(true)
+        return
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        const picked = slashOptions[slashIdx] || slashOptions[0]
+        if (picked) applySlashCommand(picked.cmd)
+        return
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        const picked = slashOptions[slashIdx] || slashOptions[0]
+        // If user hasn't typed the exact command yet, Enter completes it; if exact command already typed (e.g. /compact), Enter sends directly
+        if (picked && text.trim().toLowerCase() !== picked.cmd.toLowerCase()) {
+          e.preventDefault()
+          applySlashCommand(picked.cmd)
+          return
+        }
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       if (!uploading && !sendingRef.current) {
@@ -289,20 +386,55 @@ export function Composer({
     !uploading &&
     !sending &&
     !needsWorkspace
-  const hasModeControls = Array.isArray(supportedTaskModes) && supportedTaskModes.length > 0 && Boolean(onChangeTaskMode)
   const placeholderText = needsWorkspace
     ? bi('请先在上方选择目标项目目录...', 'Select a project directory above first...')
-    : taskMode === 'plan'
-      ? bi(`Plan 模式 · 先向 ${meta.shortName} 规划方案...`, `Plan mode · Plan with ${meta.shortName} first...`)
-      : taskMode === 'goal'
-        ? bi(`Goal 模式 · 为 ${meta.shortName} 设定持续目标...`, `Goal mode · Set an ongoing goal for ${meta.shortName}...`)
-        : targetWorkspaceName
-          ? bi(`在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName} in ${targetWorkspaceName}...`)
-          : bi(`给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName}...`)
+    : targetWorkspaceName
+      ? bi(`在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName} in ${targetWorkspaceName}...`)
+      : bi(`给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName}...`)
 
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
-      <div className="mx-auto w-full max-w-2xl lg:max-w-3xl">
+      <div className="relative mx-auto w-full max-w-2xl lg:max-w-3xl">
+        {/* Native Slash Command Popup (floats above composer with zero layout shift) */}
+        {showSlashMenu && (
+          <div
+            role="listbox"
+            aria-label={bi('斜杠命令', 'Slash commands')}
+            className="absolute right-0 bottom-full left-0 z-30 mb-2 max-h-64 overflow-y-auto rounded-2xl border border-slate-200/90 bg-white/95 p-1 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#1E2028]/95"
+          >
+            {slashOptions.map((item, idx) => {
+              const active = idx === slashIdx
+              return (
+                <button
+                  key={item.cmd}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onMouseEnter={() => setSlashIdx(idx)}
+                  onClick={() => applySlashCommand(item.cmd)}
+                  className={`flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition ${
+                    active
+                      ? 'bg-[#4D6BFE]/12 dark:bg-[#4D6BFE]/20'
+                      : 'hover:bg-slate-100/80 dark:hover:bg-slate-800/70'
+                  }`}
+                >
+                  <span
+                    className={`shrink-0 font-mono text-xs font-semibold ${
+                      active ? 'text-[#3552E8] dark:text-[#96AEFF]' : 'text-slate-800 dark:text-slate-100'
+                    }`}
+                  >
+                    {item.cmd}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[11.5px] text-slate-500 dark:text-slate-400">
+                    {bi(item.zh, item.en)}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        )}
+
         {inlineError && (
           <div className="mb-2 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
             <span className="min-w-0 flex-1 truncate">{inlineError}</span>
@@ -340,8 +472,8 @@ export function Composer({
           />
 
           <div className="mt-2 flex items-center justify-between gap-2">
-            {/* Left model & minimal Plan/Goal mode pills */}
-            <div className="no-scrollbar flex min-w-0 items-center gap-1.5 overflow-x-auto">
+            {/* Left model picker only (clean, zero clutter) */}
+            <div className="flex min-w-0 items-center">
               {onOpenModelPicker && (
                 <button
                   type="button"
@@ -350,11 +482,7 @@ export function Composer({
                   className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:border-[#4D6BFE]/50 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
                 >
                   <SlidersHorizontal className="h-3 w-3 shrink-0 text-[#4D6BFE]" />
-                  <span
-                    className={`truncate ${
-                      hasModeControls ? 'max-w-[140px] sm:max-w-[220px]' : 'max-w-[200px] sm:max-w-[260px]'
-                    }`}
-                  >
+                  <span className="max-w-[200px] truncate sm:max-w-[260px]">
                     {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (
@@ -365,36 +493,6 @@ export function Composer({
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />
                 </button>
               )}
-
-              {hasModeControls &&
-                supportedTaskModes.map((m) => {
-                  const isPlan = m === 'plan'
-                  const active = taskMode === m
-                  return (
-                    <button
-                      key={m}
-                      type="button"
-                      disabled={disabled}
-                      onClick={() => onChangeTaskMode(active ? '' : m)}
-                      aria-pressed={active}
-                      title={
-                        isPlan
-                          ? bi('Plan 模式：先制定方案再执行', 'Plan mode: design a plan before executing')
-                          : bi('Goal 模式：设定目标并持续推进', 'Goal mode: set a goal and work toward it')
-                      }
-                      className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11.5px] font-medium transition active:scale-95 disabled:opacity-45 ${
-                        active
-                          ? isPlan
-                            ? 'border-[#4D6BFE]/55 bg-[#EEF2FF] text-[#3552E8] dark:border-[#4D6BFE]/60 dark:bg-[#222A46] dark:text-[#9AB0FF]'
-                            : 'border-amber-400/60 bg-amber-50 text-amber-700 dark:border-amber-500/50 dark:bg-amber-950/45 dark:text-amber-300'
-                          : 'border-slate-200/80 bg-white text-slate-500 hover:border-slate-300 hover:text-slate-700 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-400 dark:hover:text-slate-200'
-                      }`}
-                    >
-                      {isPlan ? <ListChecks className="h-3 w-3 shrink-0" /> : <Target className="h-3 w-3 shrink-0" />}
-                      <span>{isPlan ? 'Plan' : 'Goal'}</span>
-                    </button>
-                  )
-                })}
             </div>
 
             {/* Right actions: Upload + Send / Stop */}

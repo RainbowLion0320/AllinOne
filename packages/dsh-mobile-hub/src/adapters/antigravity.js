@@ -2271,26 +2271,14 @@ export class AntigravityAdapter {
         }
         entry.taskTracker.setMode('plan', Date.now())
       } else if (effectiveTaskMode === 'goal') {
-        if (entry.currentModeId === 'plan') {
-          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'default' }, 8_000).catch(() => {})
-          entry.currentModeId = 'default'
-        }
         if (promptText && !/^\/goal(?:\s|$)/i.test(promptText)) {
           promptText = `/goal ${promptText}`
           setPromptTextBlock(promptText)
         }
         entry.taskTracker.applyAntigravityUserText(promptText || '/goal', Date.now())
-      } else {
-        if (entry.currentModeId === 'plan') {
-          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'default' }, 8_000).catch(() => {})
-          entry.currentModeId = 'default'
-          if (entry.taskTracker.snapshot()?.mode === 'plan') {
-            entry.taskTracker.setMode(null, Date.now())
-          }
-        }
-        if (promptText) {
-          entry.taskTracker.applyAntigravityUserText(promptText, Date.now())
-        }
+      } else if (promptText) {
+        // Forward native slash commands (/plan, /goal, /compact, etc.) verbatim to agy acp
+        entry.taskTracker.applyAntigravityUserText(promptText, Date.now())
       }
       const initTaskDiff = entry.taskTracker.consumeChanged()
       if (initTaskDiff.changed) {

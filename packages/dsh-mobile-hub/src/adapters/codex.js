@@ -2315,7 +2315,7 @@ export class CodexAdapter {
   async sendMessage(threadId, { text, cwd, attachments = [], approvalPolicy, taskMode, model, reasoningEffort } = {}) {
     threadId = assertSafeSessionId(threadId, 'Codex threadId')
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
-    const effectiveTaskMode = normalizeTaskMode(taskMode)
+    let effectiveTaskMode = normalizeTaskMode(taskMode)
     if (this.activeTurns.has(threadId)) {
       const err = new Error('该 Codex 对话正在运行中，请等待完成或先中断当前任务。')
       err.code = 'SESSION_BUSY'
@@ -2323,9 +2323,21 @@ export class CodexAdapter {
     }
 
     const input = []
-    const trimmedText = String(text || '').trim()
+    let rawText = String(text || '')
+    let trimmedText = rawText.trim()
+    if (!effectiveTaskMode && trimmedText) {
+      const slashCmd = /^\/(plan|goal)(?:\s+([\s\S]*))?$/i.exec(trimmedText)
+      if (slashCmd) {
+        effectiveTaskMode = slashCmd[1].toLowerCase()
+        const rest = String(slashCmd[2] || '').trim()
+        if (rest) {
+          rawText = rest
+          trimmedText = rest
+        }
+      }
+    }
     if (trimmedText.length > 0) {
-      input.push({ type: 'text', text: String(text), text_elements: [] })
+      input.push({ type: 'text', text: rawText, text_elements: [] })
     }
     for (const att of attachments) {
       if (att.localPath && String(att.mimeType || '').startsWith('image/')) {

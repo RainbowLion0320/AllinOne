@@ -14,6 +14,7 @@ import {
   ScanLine,
   Search,
   Settings,
+  SquarePen,
   User,
   X,
 } from 'lucide-react'
@@ -344,10 +345,40 @@ export function SidebarDrawer({
             </div>
           </div>
 
-          <div className="app-no-drag flex items-center gap-1">
+          <div className="app-no-drag flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                if (searchOpen) closeSearch()
+                else setSearchOpen(true)
+              }}
+              title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+              aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+              aria-expanded={searchOpen}
+              className={`rounded-xl p-2 transition ${
+                searchOpen || search.trim().length > 0
+                  ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
+                  : 'text-slate-500 hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'
+              }`}
+            >
+              <Search className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onNewChat('', filterApp !== 'all' ? filterApp : '')
+              }}
+              title={t('common.newChat')}
+              aria-label={t('common.newChat')}
+              className="rounded-xl p-2 text-slate-500 transition hover:bg-slate-200/70 hover:text-[#4D6BFE] lg:hidden dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-[#9AB0FF]"
+            >
+              <SquarePen className="h-4 w-4" />
+            </button>
             <button
               type="button"
               onClick={onRefresh}
+              title={bi('刷新会话列表', 'Refresh conversations')}
               aria-label={bi('刷新会话列表', 'Refresh conversations')}
               className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
             >
@@ -409,41 +440,10 @@ export function SidebarDrawer({
           </button>
         </div>
 
-        {/* Compact Primary Action Row: New Chat + Collapsible Search Toggle */}
-        <div className="px-4 pb-2">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onNewChat('', filterApp !== 'all' ? filterApp : '')
-              }}
-              className="flex h-10 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 transition hover:bg-[#3F5EF5] active:scale-[0.98]"
-            >
-              <Plus className="h-4 w-4 stroke-[2.5]" />
-              <span>{t('common.newChat')}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (searchOpen) closeSearch()
-                else setSearchOpen(true)
-              }}
-              title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-              aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-              aria-expanded={searchOpen}
-              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border transition active:scale-95 ${
-                searchOpen || search.trim().length > 0
-                  ? 'border-[#4D6BFE]/50 bg-[#4D6BFE]/12 text-[#4D6BFE] dark:border-[#4D6BFE]/60 dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
-                  : 'border-slate-200/80 bg-white text-slate-500 hover:border-[#4D6BFE]/40 hover:text-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#232631] dark:text-slate-300 dark:hover:border-[#4D6BFE]/50'
-              }`}
-            >
-              <Search className="h-4 w-4" />
-            </button>
-          </div>
-
-          {searchOpen && (
-            <div className="relative mt-2">
+        {/* Collapsible Search Input (toggled from top bar search icon) */}
+        {searchOpen && (
+          <div className="px-4 pb-2">
+            <div className="relative">
               <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
               <input
                 ref={searchInputRef}
@@ -468,8 +468,8 @@ export function SidebarDrawer({
                 <X className="h-3.5 w-3.5" />
               </button>
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
         {/* Vendor Icon & Border-Integrated Subscription Quota Filter Bar (5-column grid) */}
         <div className="px-4 pb-2">

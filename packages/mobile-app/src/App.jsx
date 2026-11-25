@@ -99,13 +99,6 @@ const E2eeGrantApproveModal = React.lazy(() =>
   import('./components/E2eeGrantApproveModal.jsx').then((m) => ({ default: m.E2eeGrantApproveModal })),
 )
 
-const SUPPORTED_TASK_MODES = {
-  dsh: [],
-  claude: ['plan'],
-  codex: ['plan', 'goal'],
-  antigravity: ['plan', 'goal'],
-}
-
 export function App() {
   const { lang, bi, t } = useI18n()
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
@@ -155,8 +148,6 @@ export function App() {
   const [modelsCatalog, setModelsCatalog] = useState({})
   const [loadingModels, setLoadingModels] = useState(false)
   const [sessionModelPrefs, setSessionModelPrefs] = useState({})
-  const [sessionTaskModes, setSessionTaskModes] = useState({})
-  const [draftTaskMode, setDraftTaskMode] = useState('')
   const [draftDshPref, setDraftDshPref] = useState(null)
   const [workspaces, setWorkspaces] = useState([])
   const [sessions, setSessions] = useState([])
@@ -526,8 +517,6 @@ export function App() {
     setAppsStatus([])
     setModelsCatalog({})
     setSessionModelPrefs({})
-    setSessionTaskModes({})
-    setDraftTaskMode('')
     setDraftDshPref(null)
     setSelectedDraftApp('')
     setSelectedDraftCwd('')
@@ -836,15 +825,6 @@ export function App() {
         setMessages(reconciled.messages)
         setHistoryMeta(nextHistoryMeta)
         pruneUnusedSentPreviewUrls(reconciled.messages)
-        setSessionTaskModes((prev) => {
-          const cur = prev[targetId]
-          const nextMode = res.session.taskState?.mode
-          if (nextMode === 'plan' && cur !== 'plan') return { ...prev, [targetId]: 'plan' }
-          if (nextMode !== 'plan' && cur === 'plan' && res.session.status === 'idle') {
-            return { ...prev, [targetId]: '' }
-          }
-          return prev
-        })
         setSessions((prev) =>
           prev.map((s) =>
             s.id === targetId
@@ -1115,15 +1095,6 @@ export function App() {
         setMessages(finalMessages)
         setHistoryMeta(nextMeta)
         pruneUnusedSentPreviewUrls(finalMessages)
-        setSessionTaskModes((prev) => {
-          const cur = prev[id]
-          const nextMode = res.session.taskState?.mode
-          if (nextMode === 'plan' && cur !== 'plan') return { ...prev, [id]: 'plan' }
-          if (nextMode !== 'plan' && cur === 'plan' && res.session.status === 'idle') {
-            return { ...prev, [id]: '' }
-          }
-          return prev
-        })
         void saveCachedSession(
           id,
           {
@@ -1456,17 +1427,6 @@ export function App() {
             activeSessionRef.current = merged
             return merged
           })
-          if (updated.taskState !== undefined) {
-            setSessionTaskModes((prev) => {
-              const cur = prev[updated.id]
-              const nextMode = updated.taskState?.mode
-              if (nextMode === 'plan' && cur !== 'plan') return { ...prev, [updated.id]: 'plan' }
-              if (nextMode !== 'plan' && cur === 'plan' && updated.status === 'idle') {
-                return { ...prev, [updated.id]: '' }
-              }
-              return prev
-            })
-          }
           if (
             (payload.historyChanged || payload.statusChanged || clearedStaleStream) &&
             !liveStreamMapRef.current[updated.id]?.active
@@ -1491,12 +1451,6 @@ export function App() {
             return merged
           })
         }
-        setSessionTaskModes((prev) => {
-          const cur = prev[targetSid]
-          if (nextTaskState?.mode === 'plan' && cur !== 'plan') return { ...prev, [targetSid]: 'plan' }
-          if (nextTaskState?.mode !== 'plan' && cur === 'plan') return { ...prev, [targetSid]: '' }
-          return prev
-        })
         return
       }
 
@@ -2213,20 +2167,6 @@ export function App() {
     }
 
     const activePref = resolveModelPrefFor(target)
-    const allowedModesForTarget = SUPPORTED_TASK_MODES[target.app] || []
-    const rawRequestedMode = createdJustNow
-      ? draftTaskMode
-      : (sessionTaskModes[target.id] ?? (target.taskState?.mode === 'plan' ? 'plan' : ''))
-    const activeTaskMode = allowedModesForTarget.includes(rawRequestedMode) ? rawRequestedMode : ''
-    if (createdJustNow) {
-      if (activeTaskMode === 'plan') {
-        setSessionTaskModes((prev) => ({ ...prev, [target.id]: 'plan' }))
-      }
-      if (draftTaskMode) setDraftTaskMode('')
-    } else if (activeTaskMode === 'goal') {
-      // Goal is a one-shot activation trigger; clear Composer toggle after send while keeping Goal bar synced from taskState
-      setSessionTaskModes((prev) => ({ ...prev, [target.id]: '' }))
-    }
     const finalText = text
 
     // Optimistically replace generic placeholder title on first user message
@@ -2319,7 +2259,6 @@ export function App() {
           cwd: target.cwd,
           attachments: wireAttachments,
           wait: false,
-          ...(activeTaskMode ? { taskMode: activeTaskMode } : {}),
           ...(activePref.model ? { model: activePref.model } : {}),
           ...(activePref.provider ? { provider: activePref.provider } : {}),
           ...(activePref.reasoningEffort ? { reasoningEffort: activePref.reasoningEffort } : {}),
@@ -2469,11 +2408,6 @@ export function App() {
   const activeApp = activeSession?.app || effectiveDefaultApp
   const activeCatalog = modelsCatalog[activeApp] || null
   const activeModelPref = resolveModelPrefFor(activeSession)
-  const supportedTaskModes = SUPPORTED_TASK_MODES[activeApp] || []
-  const rawActiveTaskMode = activeSession?.id
-    ? (sessionTaskModes[activeSession.id] ?? (activeSession?.taskState?.mode === 'plan' ? 'plan' : ''))
-    : draftTaskMode
-  const activeTaskMode = supportedTaskModes.includes(rawActiveTaskMode) ? rawActiveTaskMode : ''
   const activeModelObj = (activeCatalog?.models || []).find(
     (m) =>
       m.id === activeModelPref.model &&
@@ -2936,7 +2870,6 @@ export function App() {
         onSelectApp={(appId) => {
           setSelectedDraftApp(appId)
           setDraftDshPref(null)
-          setDraftTaskMode((prev) => ((SUPPORTED_TASK_MODES[appId] || []).includes(prev) ? prev : ''))
         }}
         workspaces={effectiveWorkspaces}
         selectedWorkspace={selectedDraftCwd}
@@ -2989,15 +2922,6 @@ export function App() {
         targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
         modelPref={activeModelPref}
         modelDisplayName={activeModelObj?.name || activeModelPref.model}
-        taskMode={activeTaskMode}
-        supportedTaskModes={supportedTaskModes}
-        onChangeTaskMode={(nextMode) => {
-          if (activeSession?.id) {
-            setSessionTaskModes((prev) => ({ ...prev, [activeSession.id]: nextMode }))
-          } else {
-            setDraftTaskMode(nextMode)
-          }
-        }}
         onOpenModelPicker={() => {
           setModelPickerOpen(true)
           const curModels = modelsCatalog?.[activeApp]?.models || []
