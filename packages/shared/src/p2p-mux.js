@@ -259,6 +259,8 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
     if (!entry) {
       entry = { parts: new Array(total), received: 0, total, createdAt: Date.now() }
       assemblies.set(id, entry)
+    } else if (entry.total !== total) {
+      return null
     }
     if (entry.parts[idx] === undefined) {
       entry.parts[idx] = String(f.d || '')

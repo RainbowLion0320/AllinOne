@@ -103,10 +103,10 @@ export function App() {
   const { lang, bi, t } = useI18n()
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
   const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
-  const [pairError, setPairError] = useState('')
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [relayDataSaver, setRelayDataSaver] = useState(() => localStorage.getItem('allinone_relay_data_saver') !== '0')
+  const [mediaCacheRev, setMediaCacheRev] = useState(0)
   const [connState, setConnState] = useState('disconnected')
   const [connError, setConnError] = useState('')
   const [p2pState, setP2pState] = useState('idle')
@@ -117,7 +117,6 @@ export function App() {
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
   const [clientSessions, setClientSessions] = useState({
-    supported: true,
     sessions: [],
     onlineCount: 0,
     onlineDeviceCount: 0,
@@ -210,8 +209,8 @@ export function App() {
       const bound = accountDevices.find((d) => d.bridgeId === activeDevice.selectedBridgeId)
       if (bound) return bound.label || bound.hostname || bound.bridgeId
     }
-    return getDeviceDisplayName(activeDevice, activeBridge, onlineBridges.length, lang)
-  }, [activeDevice, activeBridge, onlineBridges.length, accountDevices, lang])
+    return getDeviceDisplayName(activeDevice, activeBridge, lang)
+  }, [activeDevice, activeBridge, accountDevices, lang])
   const cacheScope = useMemo(
     () => getCacheScopeKey(activeDevice, activeBridgeId),
     [activeDevice, activeBridgeId],
@@ -536,7 +535,6 @@ export function App() {
   }, [revokeAllSentPreviewUrls])
 
   const handleDeviceAuthenticated = useCallback((payload) => {
-    setPairError('')
     const preview = upsertDevice(deviceStateRef.current, payload)
     resetTransientWorkspace()
     setBridges(Array.isArray(payload.bridges) ? payload.bridges : [])
@@ -569,7 +567,6 @@ export function App() {
     const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash || ''}`
     try { window.history.replaceState({}, '', cleanUrl) } catch {}
 
-    setPairError('')
     setAddingDevice({
       open: true,
       serverUrl: detectDefaultServerUrl(),
@@ -725,6 +722,10 @@ export function App() {
     clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
   }, [activeDevice?.e2eeKeys])
 
+  const handleMediaCached = useCallback(() => {
+    setMediaCacheRev((n) => n + 1)
+  }, [])
+
   const imageContext = useMemo(() => {
     const localBridgeId = String(desktopBridge?.bridgeId || '').trim()
     const isLocalDesktopBridge = Boolean(
@@ -734,17 +735,17 @@ export function App() {
       localBridgeId === activeBridgeId,
     )
     return {
-      baseUrl: activeDevice?.baseUrl || '',
       roomId: activeDevice?.roomId || '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       client: clientRef.current,
+      connState,
+      bridgeOnline,
       p2pState,
       p2pTransport,
       relayDataSaver,
-      e2eeKey: activeBridgeE2ee.matchedKey,
+      mediaCacheRev,
       e2eeKeyId: activeBridgeE2ee.keyId,
-      e2eeKeys: activeDevice?.e2eeKeys || {},
       onOpenImage: setLightboxState,
       onOpenHtmlPreview: setHtmlPreviewState,
       onNotify: showToast,
@@ -753,15 +754,15 @@ export function App() {
     }
   }, [
     activeDevice?.id,
-    activeDevice?.baseUrl,
     activeDevice?.roomId,
-    activeDevice?.e2eeKeys,
     activeSession?.cwd,
     activeBridgeId,
+    connState,
+    bridgeOnline,
     p2pState,
     p2pTransport,
     relayDataSaver,
-    activeBridgeE2ee.matchedKey,
+    mediaCacheRev,
     activeBridgeE2ee.keyId,
     desktopApi,
     desktopBridge?.bridgeId,
@@ -1270,7 +1271,6 @@ export function App() {
       setBridges([])
       setAccountDevices([])
       setClientSessions({
-        supported: true,
         sessions: [],
         onlineCount: 0,
         onlineDeviceCount: 0,
@@ -1289,7 +1289,6 @@ export function App() {
     setBridges([])
     setAccountDevices([])
     setClientSessions({
-      supported: true,
       sessions: [],
       onlineCount: 0,
       onlineDeviceCount: 0,
@@ -1322,7 +1321,7 @@ export function App() {
           setDeviceState((prev) =>
             updateDeviceMeta(prev, activeDeviceRef.current.id, {
               tier: nextTurnQuota.tier,
-              ...(nextTurnQuota.tier === 'admin' ? { role: 'admin' } : {}),
+              role: nextTurnQuota.tier === 'admin' ? 'admin' : 'user',
             }),
           )
         }
@@ -1334,7 +1333,8 @@ export function App() {
 
     const unsubEvents = client.onEvent((event, payload, rawMsg) => {
       if (clientRef.current !== client) return
-      if (event === EVENTS.BRIDGE_STATUS || event === EVENTS.CLIENTS_STATUS) return
+      if (event === EVENTS.CLIENTS_STATUS) return
+      if (event === EVENTS.BRIDGE_STATUS && !(payload?.app && payload?.quota)) return
 
       // Zero-knowledge device-to-device E2EE key-grant signaling (room-wide, independent of selected bridge)
       if (event === EVENTS.E2EE_GRANT_REQUEST && payload?.reqId && payload?.pubKey) {
@@ -1372,7 +1372,7 @@ export function App() {
         if (canHelp && !e2eeModalOpenRef.current) {
           setQrNudge({
             requesterClientId: payload.requesterClientId || '',
-            deviceName: payload.deviceName || bi('手机端', 'Phone'),
+            deviceName: payload.deviceName || biLang(getCurrentLang(), '手机端', 'Phone'),
             wantedKeyId: wantedKid,
             receivedAt: Date.now(),
           })
@@ -1634,7 +1634,7 @@ export function App() {
       const name =
         isSameDevice && (targetAcctPc || targetBridgeObj)
           ? targetAcctPc?.label || targetBridgeObj?.label || targetBridgeObj?.hostname || cleanBridgeId
-          : getDeviceDisplayName(target, null, 0, getCurrentLang())
+          : getDeviceDisplayName(target, null, getCurrentLang())
       showToast(biLang(getCurrentLang(), `已切换到 ${name}`, `Switched to ${name}`))
     }
   }, [activeDevice?.id, activeDevice?.selectedBridgeId, devices, accountDevices, onlineBridges, resetTransientWorkspace, showToast])
@@ -1687,9 +1687,7 @@ export function App() {
       )
       if (deviceGenRef.current !== gen) return
       setClientSessions(res)
-      if (res.supported) {
-        setLiveOnlineClientCount(res.onlineCount)
-      }
+      setLiveOnlineClientCount(res.onlineCount)
     } catch {}
   }, [activeDevice?.baseUrl, activeDevice?.token])
 
@@ -1715,7 +1713,7 @@ export function App() {
           clientId,
           currentClientId: clientRef.current?.clientId || '',
         })
-        setClientSessions({ supported: true, ...res })
+        setClientSessions(res)
         setLiveOnlineClientCount(res.onlineCount)
         showToast(biLang(getCurrentLang(), '已将该设备踢下线', 'Signed out device'))
       } catch (err) {
@@ -1737,7 +1735,7 @@ export function App() {
         clientRef.current?.updateToken(res.token)
         setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { token: res.token }))
       }
-      setClientSessions({ supported: true, ...res })
+      setClientSessions(res)
       setLiveOnlineClientCount(res.onlineCount)
       showToast(biLang(getCurrentLang(), '已下线其他全部登录设备，仅保留本机', 'Signed out all other devices'))
     } catch (err) {
@@ -2023,7 +2021,7 @@ export function App() {
     setDeviceState((prev) => removeDevice(prev, deviceId))
     if (target) {
       const curLang = getCurrentLang()
-      const name = getDeviceDisplayName(target, null, 0, curLang)
+      const name = getDeviceDisplayName(target, null, curLang)
       showToast(
         revokeAll
           ? biLang(curLang, `已吊销 ${name} 全部设备凭证并移除`, `Revoked all sessions and removed ${name}`)
@@ -2179,10 +2177,10 @@ export function App() {
       ...(imgAtts.length > 0
         ? {
             images: imgAtts.map((a) => ({
-              url: a.url,
+              id: a.id || a.p2pToken || a.localPreviewUrl || '',
+              ...(a.url ? { url: a.url } : {}),
               name: a.filename,
               mimeType: a.mimeType,
-              ...(a.e2ee ? { e2ee: a.e2ee } : {}),
               ...(a.localPreviewUrl ? { localPreviewUrl: a.localPreviewUrl } : {}),
             })),
           }
@@ -2367,7 +2365,6 @@ export function App() {
   if (!activeDevice || addingDevice.open) {
     return (
       <LoginScreen
-        initialError={pairError}
         isAddingDevice={Boolean(activeDevice && addingDevice.open)}
         initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
         initialInviteCode={addingDevice.inviteCode || ''}
@@ -2377,7 +2374,6 @@ export function App() {
         onCancel={
           activeDevice
             ? () => {
-                setPairError('')
                 setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
               }
             : null
@@ -2934,7 +2930,6 @@ export function App() {
               })
           }
         }}
-        imageContext={imageContext}
         onUploadFile={(file) => clientRef.current?.uploadFile(file, { bridgeId: activeBridgeId })}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
@@ -2953,7 +2948,7 @@ export function App() {
             onClose={() => setDeviceSwitcherOpen(false)}
             devices={devices}
             activeDeviceId={activeDevice?.id}
-            activeBridgeId={activeBridgeId}
+            activeBridgeId={activeBridgeId || activeDevice?.selectedBridgeId || ''}
             activeConnState={connState}
             accountDevices={accountDevices}
             clientSessions={clientSessions}
@@ -2977,7 +2972,6 @@ export function App() {
             }
             onSelectDevice={handleSelectDevice}
             onAddDevice={(prefillServerUrl = '', opts = {}) => {
-              setPairError('')
               setAddingDevice({
                 open: true,
                 serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
@@ -3175,6 +3169,7 @@ export function App() {
           <ImageLightbox
             state={lightboxState}
             imageContext={imageContext}
+            onMediaCached={handleMediaCached}
             onClose={() => setLightboxState(null)}
           />
         )}

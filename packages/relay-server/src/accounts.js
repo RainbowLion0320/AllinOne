@@ -1,4 +1,4 @@
-import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { chmod as chmodAsync, rename as renameAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -10,9 +10,8 @@ const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
 const MAX_DEVICES_PER_USER = 20
-const MAX_REVOKED_SIDS = 64
+const MAX_REVOKED_SIDS = 1024
 
-export const VALID_PLANS = new Set(['free', 'pro', 'ultra'])
 export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
 
 export function getCurrentTurnMonth(now = new Date()) {
@@ -34,11 +33,6 @@ function normalizeTurnUsageRecord(raw, now = new Date()) {
   return { month: curMonth, bytes: 0, updatedAt: 0 }
 }
 
-export function normalizePlan(raw) {
-  const p = String(raw || '').trim().toLowerCase()
-  return VALID_PLANS.has(p) ? p : 'free'
-}
-
 export function normalizeTier(raw) {
   const t = String(raw || '').trim().toLowerCase()
   return VALID_TIERS.has(t) ? t : 'free'
@@ -46,36 +40,11 @@ export function normalizeTier(raw) {
 
 export function resolveUserTier(user) {
   if (!user) return 'free'
-  if (user.role === 'admin') return 'admin'
-  return normalizePlan(user.plan)
-}
-
-export function resolveInviteTier(inv) {
-  if (!inv) return 'free'
-  if (inv.grantAdmin) return 'admin'
-  return normalizePlan(inv.plan)
+  return normalizeTier(user.tier || (user.role === 'admin' ? 'admin' : 'free'))
 }
 
 function sha256Hex(val) {
   return createHash('sha256').update(String(val ?? ''), 'utf8').digest('hex')
-}
-
-function hashPassword(password, saltHex) {
-  const salt = saltHex || randomBytes(16).toString('hex')
-  const derived = scryptSync(String(password), salt, SCRYPT_KEYLEN, SCRYPT_OPTS).toString('hex')
-  return { salt, hash: derived }
-}
-
-function verifyPasswordHash(password, salt, expectedHashHex) {
-  if (!password || !salt || !expectedHashHex) return false
-  try {
-    const derivedBuf = scryptSync(String(password), String(salt), SCRYPT_KEYLEN, SCRYPT_OPTS)
-    const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
-    if (derivedBuf.length !== expectedBuf.length) return false
-    return timingSafeEqual(derivedBuf, expectedBuf)
-  } catch {
-    return false
-  }
 }
 
 function scryptAsync(password, salt) {
@@ -169,7 +138,7 @@ export function validatePassword(raw) {
  * Persists to JSON with `0600` permissions using atomic temp-file rename:
  *  - Passwords stored strictly as salted `scrypt` hashes (never plaintext)
  *  - Per-PC `deviceSecret` stored strictly as salted SHA-256 hashes (never plaintext)
- *  - Invite codes are strictly single-use: burned synchronously inside `registerUser()`
+ *  - Invite codes are strictly single-use: burned synchronously inside `registerUserAsync()`
  */
 export function createAccountStore({ filePath }) {
   mkdirSync(dirname(filePath), { recursive: true })
@@ -201,10 +170,13 @@ export function createAccountStore({ filePath }) {
     }
     for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
       if (!u?.userId || !u?.username) continue
+      const { plan: legacyPlan, ...restUser } = u
       const rawEmail = String(u.email || '').trim()
       const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
+      const tier = normalizeTier(u.tier || (u.role === 'admin' ? 'admin' : legacyPlan || 'free'))
+      const role = tier === 'admin' ? 'admin' : 'user'
       const normalized = {
-        ...u,
+        ...restUser,
         usernameLower: String(u.usernameLower || u.username).toLowerCase(),
         email: rawEmail,
         emailLower,
@@ -212,8 +184,8 @@ export function createAccountStore({ filePath }) {
         emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
         loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
         knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
-        role: u.role === 'admin' ? 'admin' : 'user',
-        plan: u.role === 'admin' ? 'free' : normalizePlan(u.plan),
+        tier,
+        role,
         turnUsage: normalizeTurnUsageRecord(u.turnUsage),
         tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
         devices: Array.isArray(u.devices) ? u.devices : [],
@@ -228,19 +200,19 @@ export function createAccountStore({ filePath }) {
     }
     for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
       if (!inv?.id || !inv?.code) continue
-      const grantAdmin = Boolean(inv.grantAdmin)
-      const plan = grantAdmin ? 'free' : normalizePlan(inv.plan)
+      const { grantAdmin: legacyGrantAdmin, plan: legacyPlan, ...restInv } = inv
+      const tier = normalizeTier(inv.tier || (legacyGrantAdmin ? 'admin' : legacyPlan || 'free'))
       invitesById.set(inv.id, {
-        ...inv,
-        grantAdmin,
-        plan,
-        tier: grantAdmin ? 'admin' : plan,
+        ...restInv,
+        tier,
       })
     }
   }
 
   let saveTimer = null
   let saveDirty = false
+  let saveGen = 0
+  let persistedGen = 0
   let asyncSaveInFlight = null
 
   function serializeAccountsPayload() {
@@ -260,7 +232,7 @@ export function createAccountStore({ filePath }) {
       clearTimeout(saveTimer)
       saveTimer = null
     }
-    saveDirty = false
+    const targetGen = ++saveGen
     const payload = serializeAccountsPayload()
     const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
     try {
@@ -268,7 +240,10 @@ export function createAccountStore({ filePath }) {
       try { chmodSync(tmpPath, 0o600) } catch {}
       renameSync(tmpPath, filePath)
       try { chmodSync(filePath, 0o600) } catch {}
+      persistedGen = Math.max(persistedGen, targetGen)
+      saveDirty = persistedGen < saveGen
     } catch (err) {
+      saveDirty = true
       try { unlinkSync(tmpPath) } catch {}
       throw err
     }
@@ -277,25 +252,32 @@ export function createAccountStore({ filePath }) {
   async function drainAsyncSave() {
     if (asyncSaveInFlight) return asyncSaveInFlight
     asyncSaveInFlight = (async () => {
-      while (saveDirty) {
+      while (saveDirty || persistedGen < saveGen) {
+        const targetGen = saveGen
         saveDirty = false
         const payload = serializeAccountsPayload()
         const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
         try {
           await writeFileAsync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
           try { await chmodAsync(tmpPath, 0o600) } catch {}
+          if (persistedGen >= targetGen) {
+            try { await unlinkAsync(tmpPath) } catch {}
+            continue
+          }
           await renameAsync(tmpPath, filePath)
           try { await chmodAsync(filePath, 0o600) } catch {}
+          persistedGen = Math.max(persistedGen, targetGen)
         } catch (err) {
           try { await unlinkAsync(tmpPath) } catch {}
+          saveDirty = persistedGen < saveGen
           console.error(`[accounts] Async save failed: ${err?.message || err}`)
           break
         }
       }
     })().finally(() => {
       asyncSaveInFlight = null
-      if (saveDirty) {
-        scheduleSave(1000)
+      if (saveDirty || persistedGen < saveGen) {
+        scheduleSave(1000, { bumpGen: false })
       }
     })
     return asyncSaveInFlight
@@ -305,7 +287,8 @@ export function createAccountStore({ filePath }) {
    * Coalesce high-frequency non-critical metadata writes (e.g. lastSeenAt heartbeats)
    * into a single serialized non-blocking disk write every few seconds.
    */
-  function scheduleSave(delayMs = 5000) {
+  function scheduleSave(delayMs = 5000, { bumpGen = true } = {}) {
+    if (bumpGen) saveGen += 1
     saveDirty = true
     if (saveTimer) return
     saveTimer = setTimeout(() => {
@@ -320,7 +303,7 @@ export function createAccountStore({ filePath }) {
       clearTimeout(saveTimer)
       saveTimer = null
     }
-    if (saveDirty) {
+    if (saveDirty || persistedGen < saveGen) {
       try {
         save()
       } catch (err) {
@@ -345,9 +328,8 @@ export function createAccountStore({ filePath }) {
 
   function sanitizeUser(u) {
     if (!u) return null
-    const role = u.role === 'admin' ? 'admin' : 'user'
-    const plan = role === 'admin' ? 'free' : normalizePlan(u.plan)
-    const tier = role === 'admin' ? 'admin' : plan
+    const tier = resolveUserTier(u)
+    const role = tier === 'admin' ? 'admin' : 'user'
     return {
       userId: u.userId,
       username: u.username,
@@ -355,7 +337,6 @@ export function createAccountStore({ filePath }) {
       emailVerified: Boolean(u.email && u.emailVerified),
       loginEmail2fa: Boolean(u.email && u.emailVerified && u.loginEmail2fa),
       role,
-      plan,
       tier,
       turnUsage: normalizeTurnUsageRecord(u.turnUsage),
       tokenVersion: u.tokenVersion,
@@ -365,18 +346,10 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function createInvites({ count = 1, note = '', createdBy = 'admin', grantAdmin = false, plan = '', tier = '' } = {}) {
+  function createInvites({ count = 1, note = '', createdBy = 'admin', tier = 'free' } = {}) {
     const n = Math.max(1, Math.min(50, Math.floor(Number(count) || 1)))
     const cleanNote = String(note || '').trim().slice(0, 80)
-    const resolvedTier = grantAdmin
-      ? 'admin'
-      : String(tier || '').trim()
-        ? normalizeTier(tier)
-        : String(plan || '').trim()
-          ? normalizePlan(plan)
-          : 'free'
-    const finalGrantAdmin = resolvedTier === 'admin'
-    const finalPlan = finalGrantAdmin ? 'free' : normalizePlan(resolvedTier)
+    const resolvedTier = normalizeTier(tier)
     const existingCodes = new Set([...invitesById.values()].map((i) => i.code))
     const created = []
     const now = Date.now()
@@ -391,8 +364,6 @@ export function createAccountStore({ filePath }) {
         id: `inv_${randomBytes(6).toString('hex')}`,
         code,
         note: cleanNote,
-        grantAdmin: finalGrantAdmin,
-        plan: finalPlan,
         tier: resolvedTier,
         createdBy: String(createdBy || 'admin').slice(0, 64),
         createdAt: now,
@@ -412,11 +383,7 @@ export function createAccountStore({ filePath }) {
   function listInvites() {
     return [...invitesById.values()]
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-      .map((inv) => {
-        const grantAdmin = Boolean(inv.grantAdmin)
-        const plan = grantAdmin ? 'free' : normalizePlan(inv.plan)
-        return { ...inv, grantAdmin, plan, tier: grantAdmin ? 'admin' : plan }
-      })
+      .map((inv) => ({ ...inv, tier: normalizeTier(inv.tier) }))
   }
 
   function revokeInvite(idOrCode) {
@@ -466,104 +433,6 @@ export function createAccountStore({ filePath }) {
     const userId = userIdByEmailLower.get(lower)
     if (!userId) return null
     return sanitizeUser(usersById.get(userId))
-  }
-
-  function registerUser({
-    username,
-    password,
-    inviteCode = '',
-    email = '',
-    emailVerified = false,
-    isBootstrapAdmin = false,
-  } = {}) {
-    const uCheck = validateUsername(username)
-    if (!uCheck.ok) return uCheck
-    const pCheck = validatePassword(password)
-    if (!pCheck.ok) return pCheck
-
-    if (userIdByLower.has(uCheck.usernameLower)) {
-      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
-    }
-
-    let cleanEmail = ''
-    let cleanEmailLower = ''
-    if (String(email || '').trim()) {
-      const eCheck = validateEmail(email)
-      if (!eCheck.ok) return eCheck
-      if (userIdByEmailLower.has(eCheck.emailLower)) {
-        return { ok: false, error: '该邮箱已被其他账号绑定' }
-      }
-      cleanEmail = eCheck.email
-      cleanEmailLower = eCheck.emailLower
-    }
-
-    let matchedInvite = null
-    if (!isBootstrapAdmin) {
-      const normalized = normalizeInviteCode(inviteCode)
-      if (!normalized) {
-        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
-      }
-      for (const inv of invitesById.values()) {
-        if (inv.status === 'active' && safeEqual(inv.code, normalized)) {
-          matchedInvite = inv
-          break
-        }
-      }
-      if (!matchedInvite) {
-        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
-      }
-    }
-
-    const now = Date.now()
-    const userId = `usr_${randomBytes(8).toString('hex')}`
-    const { salt, hash } = hashPassword(pCheck.password)
-    const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
-    const plan = role === 'admin' ? 'free' : normalizePlan(matchedInvite?.plan)
-
-    // Strictly burn the single-use invite synchronously before persisting
-    if (matchedInvite) {
-      matchedInvite.status = 'used'
-      matchedInvite.usedByUserId = userId
-      matchedInvite.usedByUsername = uCheck.username
-      matchedInvite.usedAt = now
-    }
-
-    const record = {
-      userId,
-      username: uCheck.username,
-      usernameLower: uCheck.usernameLower,
-      email: cleanEmail,
-      emailLower: cleanEmailLower,
-      emailVerified: Boolean(cleanEmail && emailVerified),
-      emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
-      loginEmail2fa: false,
-      knownLoginIps: [],
-      role,
-      plan,
-      passwordSalt: salt,
-      passwordHash: hash,
-      tokenVersion: 0,
-      createdAt: now,
-      lastLoginAt: now,
-      invitedBy: isBootstrapAdmin ? 'bootstrap' : matchedInvite?.createdBy || '',
-      inviteId: matchedInvite?.id || '',
-      devices: [],
-      sessions: [],
-      revokedSids: {},
-    }
-
-    usersById.set(userId, record)
-    userIdByLower.set(record.usernameLower, userId)
-    if (record.emailLower) {
-      userIdByEmailLower.set(record.emailLower, userId)
-    }
-    save()
-
-    return {
-      ok: true,
-      user: sanitizeUser(record),
-      devices: [],
-    }
   }
 
   async function registerUserAsync({
@@ -641,8 +510,8 @@ export function createAccountStore({ filePath }) {
 
     const now = Date.now()
     const userId = `usr_${randomBytes(8).toString('hex')}`
-    const role = isBootstrapAdmin || matchedInvite?.grantAdmin ? 'admin' : 'user'
-    const plan = role === 'admin' ? 'free' : normalizePlan(matchedInvite?.plan)
+    const tier = isBootstrapAdmin ? 'admin' : normalizeTier(matchedInvite?.tier)
+    const role = tier === 'admin' ? 'admin' : 'user'
 
     if (matchedInvite) {
       matchedInvite.status = 'used'
@@ -661,8 +530,8 @@ export function createAccountStore({ filePath }) {
       emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
       loginEmail2fa: false,
       knownLoginIps: [],
+      tier,
       role,
-      plan,
       passwordSalt: salt,
       passwordHash: hash,
       tokenVersion: 0,
@@ -705,29 +574,6 @@ export function createAccountStore({ filePath }) {
     record.lastLoginAt = Date.now()
     scheduleSave()
     return sanitizeUser(record)
-  }
-
-  function authenticateUser(identifier, password, { recordLogin = true } = {}) {
-    const lower = String(identifier || '').trim().toLowerCase()
-    if (!lower || !password) return null
-    let userId = userIdByLower.get(lower)
-    if (!userId && lower.includes('@')) {
-      userId = userIdByEmailLower.get(lower)
-    }
-    if (!userId) return null
-    const record = usersById.get(userId)
-    if (!record) return null
-    if (!verifyPasswordHash(password, record.passwordSalt, record.passwordHash)) {
-      return null
-    }
-    if (recordLogin) {
-      record.lastLoginAt = Date.now()
-      scheduleSave()
-    }
-    return {
-      user: sanitizeUser(record),
-      devices: record.devices.map(sanitizeDeviceRecord),
-    }
   }
 
   async function authenticateUserAsync(identifier, password, { recordLogin = true } = {}) {
@@ -774,29 +620,6 @@ export function createAccountStore({ filePath }) {
     record.emailVerified = Boolean(verified)
     record.emailVerifiedAt = verified ? Date.now() : 0
     userIdByEmailLower.set(record.emailLower, userId)
-    save()
-    return { ok: true, user: sanitizeUser(record) }
-  }
-
-  function resetPasswordByEmail(email, newPassword) {
-    const eCheck = validateEmail(email)
-    if (!eCheck.ok) return eCheck
-    const pCheck = validatePassword(newPassword)
-    if (!pCheck.ok) return pCheck
-    const userId = userIdByEmailLower.get(eCheck.emailLower)
-    if (!userId) {
-      return { ok: false, error: '该邮箱未绑定任何账号' }
-    }
-    const record = usersById.get(userId)
-    if (!record) {
-      return { ok: false, error: '账号不存在' }
-    }
-    const { salt, hash } = hashPassword(pCheck.password)
-    record.passwordSalt = salt
-    record.passwordHash = hash
-    record.tokenVersion = Number(record.tokenVersion || 0) + 1
-    record.sessions = []
-    record.revokedSids = {}
     save()
     return { ok: true, user: sanitizeUser(record) }
   }
@@ -1038,13 +861,8 @@ export function createAccountStore({ filePath }) {
       }
     }
     const prevTier = resolveUserTier(record)
-    if (raw === 'admin') {
-      record.role = 'admin'
-      record.plan = 'free'
-    } else {
-      record.role = 'user'
-      record.plan = raw
-    }
+    record.tier = raw
+    record.role = raw === 'admin' ? 'admin' : 'user'
     const nextTier = resolveUserTier(record)
     if (prevTier !== nextTier) {
       save()
@@ -1328,16 +1146,13 @@ export function createAccountStore({ filePath }) {
     hasActiveInviteCode,
     isEmailTaken,
     getUserByEmail,
-    registerUser,
     registerUserAsync,
     resolveAccountKey,
     markUserLogin,
-    authenticateUser,
     authenticateUserAsync,
     setUserEmail,
     setLoginEmail2fa,
     checkAndRememberLoginContext,
-    resetPasswordByEmail,
     resetPasswordByEmailAsync,
     changePasswordAsync,
     flush,

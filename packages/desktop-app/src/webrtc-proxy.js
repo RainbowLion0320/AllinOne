@@ -58,6 +58,7 @@ export class DesktopWebRtcProxy {
     this.workerReadyPromise = null
     this.activeSocket = null
     this.activePeerIds = new Set()
+    this.pendingReqIds = new Set()
     this.idleTimer = null
     this.disposed = false
 
@@ -174,6 +175,28 @@ export class DesktopWebRtcProxy {
         } else if (this.workerWin === win) {
           this.log.warn?.(`[webrtc-proxy] worker render process ${reason}; resetting worker`)
           cleanupWorker()
+          this.activePeerIds.clear()
+          this.clearIdleTimer()
+          const sock = this.activeSocket
+          const errMsg = `WebRTC worker crashed (${reason})`
+          if (sock && !sock.destroyed) {
+            for (const reqId of this.pendingReqIds) {
+              try {
+                sock.write(encodeJsonFrame({ type: 'res', reqId, ok: false, error: errMsg }))
+              } catch {}
+            }
+          }
+          this.pendingReqIds.clear()
+          if (sock) {
+            this.activeSocket = null
+            try { sock.end() } catch {}
+            const destroyTimer = setTimeout(() => {
+              if (!sock.destroyed) {
+                try { sock.destroy() } catch {}
+              }
+            }, 100)
+            destroyTimer.unref?.()
+          }
         }
       })
 
@@ -208,7 +231,13 @@ export class DesktopWebRtcProxy {
     if (ev?.sender && this.workerWin && !this.workerWin.isDestroyed() && ev.sender !== this.workerWin.webContents) {
       return
     }
-    if (msg.type === 'state' && (msg.state === 'closed' || msg.state === 'failed')) {
+    if (msg.type === 'res' && msg.reqId) {
+      this.pendingReqIds.delete(msg.reqId)
+    }
+    const isPeerClosed =
+      ((msg.type === 'state' || msg.type === 'iceState') && (msg.state === 'closed' || msg.state === 'failed')) ||
+      (msg.type === 'dc.close' && msg.role === 'ctrl')
+    if (isPeerClosed && msg.peerId) {
       this.activePeerIds.delete(msg.peerId)
       if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
     }
@@ -271,12 +300,23 @@ export class DesktopWebRtcProxy {
           this.activePeerIds.clear()
           this.scheduleIdleDestroy()
         }
+        if (cmd.reqId) {
+          this.pendingReqIds.add(cmd.reqId)
+        }
         try {
           const win = await this.ensureWorker()
-          if (!win.isDestroyed()) {
-            win.webContents.send('webrtc-worker:cmd', cmd)
+          if (win.isDestroyed()) {
+            throw new Error('WebRTC worker destroyed before command dispatch')
           }
+          win.webContents.send('webrtc-worker:cmd', cmd)
         } catch (err) {
+          if (cmd.reqId) {
+            this.pendingReqIds.delete(cmd.reqId)
+          }
+          if (cmd.type === 'peer.offer' && cmd.peerId) {
+            this.activePeerIds.delete(cmd.peerId)
+            if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
+          }
           if (cmd.reqId && !socket.destroyed) {
             socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }))
           }
@@ -321,6 +361,7 @@ export class DesktopWebRtcProxy {
       if (this.activeSocket === socket) {
         this.activeSocket = null
         this.activePeerIds.clear()
+        this.pendingReqIds.clear()
         if (this.workerWin && !this.workerWin.isDestroyed()) {
           try { this.workerWin.webContents.send('webrtc-worker:cmd', { type: 'peer.closeAll' }) } catch {}
         }
@@ -335,6 +376,8 @@ export class DesktopWebRtcProxy {
   async dispose() {
     this.disposed = true
     this.clearIdleTimer()
+    this.activePeerIds.clear()
+    this.pendingReqIds.clear()
     this.ipcMain.removeListener('webrtc-worker:control', this._onWorkerControl)
     this.ipcMain.removeListener('webrtc-worker:binary', this._onWorkerBinary)
     if (this.activeSocket) {

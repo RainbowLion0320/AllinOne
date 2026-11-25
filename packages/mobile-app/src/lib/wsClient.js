@@ -49,7 +49,7 @@ export function normalizeBaseUrl(input) {
   return trimmed
 }
 
-export function toWsUrl(httpBase, path, queryParams = {}) {
+function toWsUrl(httpBase, path, queryParams = {}) {
   const base = normalizeBaseUrl(httpBase)
   const cleanPath = String(path || '').replace(/^\/+/, '')
   const u = new URL(`${base}/${cleanPath}`)
@@ -78,7 +78,7 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
   }
 }
 
-export function detectClientDeviceMeta() {
+function detectClientDeviceMeta() {
   if (typeof window !== 'undefined' && window.allinoneDesktop?.isDesktop) {
     const plat = String(window.allinoneDesktop.platform || '').toLowerCase()
     const osName = plat === 'darwin' ? 'macOS' : plat === 'win32' ? 'Windows' : 'Linux'
@@ -141,7 +141,6 @@ export async function loginAccount(serverUrl, { username, password, emailCode = 
     roomId: data.roomId || data.user?.userId || '',
     username: data.user?.username || String(username || '').trim(),
     email: data.user?.email || '',
-    emailVerified: Boolean(data.user?.emailVerified),
     loginEmail2fa: Boolean(data.user?.loginEmail2fa),
     role: data.user?.role || 'user',
     tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
@@ -194,7 +193,6 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
     roomId: data.roomId || data.user?.userId || '',
     username: data.user?.username || String(username || '').trim(),
     email: data.user?.email || '',
-    emailVerified: Boolean(data.user?.emailVerified),
     role: data.user?.role || 'user',
     tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
     label: `@${data.user?.username || String(username || '').trim()}`,
@@ -332,10 +330,9 @@ export async function adminListInvites(baseUrl, token) {
   }
 }
 
-export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false, tier = '' } = {}) {
+export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', tier = 'free' } = {}) {
   const base = normalizeBaseUrl(baseUrl)
-  const normTier = String(tier || '').trim().toLowerCase()
-  const finalGrantAdmin = normTier ? normTier === 'admin' : Boolean(grantAdmin)
+  const normTier = String(tier || 'free').trim().toLowerCase()
   const res = await fetch(`${base}/api/admin/invites`, {
     method: 'POST',
     headers: {
@@ -345,8 +342,7 @@ export async function adminCreateInvites(baseUrl, token, { count = 1, note = '',
     body: JSON.stringify({
       count,
       note,
-      grantAdmin: finalGrantAdmin,
-      ...(normTier ? { tier: normTier } : {}),
+      tier: normTier,
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -443,7 +439,6 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
       label: String(data.label || ''),
       username: String(data.username || ''),
       email: String(data.email || ''),
-      emailVerified: Boolean(data.emailVerified),
       loginEmail2fa: Boolean(data.loginEmail2fa),
       emailEnabled: Boolean(data.emailEnabled),
       role: String(data.role || ''),
@@ -458,7 +453,7 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
   }
 }
 
-export async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
+async function requestWsTicket(baseUrl, token, timeoutMs = 8000) {
   const base = normalizeBaseUrl(baseUrl)
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
@@ -511,14 +506,10 @@ export async function fetchAuthSessions(baseUrl, token, currentClientId = '') {
     headers: { Authorization: `Bearer ${token}` },
   })
   const data = await res.json().catch(() => ({}))
-  if (res.status === 404) {
-    return { supported: false, sessions: [], onlineCount: 0, onlineDeviceCount: 0, totalCount: 0 }
-  }
   if (!res.ok || !data.ok) {
     throw new Error(data.error || L(`读取登录终端失败 (HTTP ${res.status})`, `Failed to load active sessions (HTTP ${res.status})`))
   }
   return {
-    supported: true,
     sessions: Array.isArray(data.sessions) ? data.sessions : [],
     onlineCount: Number(data.onlineCount) || 0,
     onlineDeviceCount: Number(data.onlineDeviceCount) || 0,
@@ -623,6 +614,7 @@ export class MobileRelayClient {
     this.p2pError = ''
     this.p2pEngine = ''
     this.p2pTransport = '' // 'direct' | 'relay' | ''
+    this._quotaBlockedBridgeId = ''
 
     this._onWindowOnline = () => {
       if (this.closed) return
@@ -653,6 +645,7 @@ export class MobileRelayClient {
   _syncActiveP2pStatus() {
     const targetId = this._resolveTargetBridgeId()
     if (!targetId) {
+      this._quotaBlockedBridgeId = ''
       this.p2pState = 'idle'
       this.p2pError = ''
       this.p2pEngine = ''
@@ -662,6 +655,17 @@ export class MobileRelayClient {
     }
     const peer = this.p2pPeers.get(targetId)
     if (!peer) {
+      const targetOnline = this.bridges.some((b) => b.bridgeId === targetId && b.online)
+      if (
+        targetOnline &&
+        this._quotaBlockedBridgeId === targetId &&
+        this.turnQuota?.exceeded &&
+        this.p2pState === 'failed'
+      ) {
+        this.emitStatus()
+        return
+      }
+      if (this._quotaBlockedBridgeId === targetId) this._quotaBlockedBridgeId = ''
       this.p2pState = 'idle'
       this.p2pError = ''
       this.p2pEngine = ''
@@ -680,6 +684,7 @@ export class MobileRelayClient {
       try { peer.close(notifyPeers) } catch {}
     }
     this.p2pPeers.clear()
+    this._quotaBlockedBridgeId = ''
     this.p2pState = 'idle'
     this.p2pError = ''
     this.p2pEngine = ''
@@ -694,6 +699,9 @@ export class MobileRelayClient {
         this.p2pPeers.delete(bid)
       }
     }
+    if (this._quotaBlockedBridgeId && !onlineIds.has(this._quotaBlockedBridgeId)) {
+      this._quotaBlockedBridgeId = ''
+    }
   }
 
   _maybeAutoConnectP2p(bridgeOverride = '') {
@@ -704,6 +712,7 @@ export class MobileRelayClient {
     if (!bridge) return
     const e2eeCtx = this.getBridgeE2eeContext(targetId)
     if (!e2eeCtx.ready) return
+    if (this._quotaBlockedBridgeId === targetId && this.turnQuota?.exceeded) return
 
     const existing = this.p2pPeers.get(targetId)
     if (existing && !existing.closed && existing.state !== 'failed') return
@@ -798,10 +807,11 @@ export class MobileRelayClient {
   async retryP2p(bridgeOverride = '') {
     const targetId = this._resolveTargetBridgeId(bridgeOverride)
     if (!targetId) return null
+    if (this._quotaBlockedBridgeId === targetId) this._quotaBlockedBridgeId = ''
     const existing = this.p2pPeers.get(targetId)
     if (existing) {
-      try { existing.close(false) } catch {}
       this.p2pPeers.delete(targetId)
+      try { existing.close(false) } catch {}
     }
     this._syncActiveP2pStatus()
     return this.ensureP2pConnected(targetId)
@@ -1019,14 +1029,16 @@ export class MobileRelayClient {
           let droppedActiveRelayed = false
           const activeTarget = this._resolveTargetBridgeId()
           for (const [bid, peer] of [...this.p2pPeers.entries()]) {
-            if (peer.transportType === 'relay') {
-              try { peer.close(true) } catch {}
+            if (peer.transportType !== 'direct') {
               this.p2pPeers.delete(bid)
+              try { peer.close(true) } catch {}
               if (bid === activeTarget) droppedActiveRelayed = true
             }
           }
           if (droppedActiveRelayed) {
+            this._quotaBlockedBridgeId = activeTarget
             this.p2pState = 'failed'
+            this.p2pEngine = ''
             this.p2pTransport = ''
             this.p2pError = L(
               '本月加密中继流量额度已用完，已暂停中继连接；切换至同 Wi-Fi / 家用宽带可继续免费 P2P 直连',
@@ -1035,6 +1047,7 @@ export class MobileRelayClient {
           }
           this.emitStatus()
         } else {
+          if (!this.turnQuota?.exceeded) this._quotaBlockedBridgeId = ''
           this.emitStatus()
           if (wasExceeded && !this.turnQuota?.exceeded && this.p2pState === 'failed') {
             void this.retryP2p().catch(() => {})

@@ -4,10 +4,10 @@ import { Download, Share2, ShieldCheck, X } from 'lucide-react'
 import { useI18n } from '../lib/i18n.jsx'
 import {
   canNativeShareFiles,
-  formatFileSize,
   shareDeliverableFile,
   triggerDeliverableDownload,
 } from '../lib/e2eeFiles.js'
+import { formatBytesCompact } from '../lib/sessionCache.js'
 
 /**
  * Fullscreen sandboxed HTML preview modal for AI-generated interactive HTML reports/dashboards.
@@ -63,7 +63,7 @@ export function HtmlPreviewModal({ state, onClose }) {
   if (!open || typeof document === 'undefined') return null
 
   const filename = state.filename || 'preview.html'
-  const sizeText = formatFileSize(state.size)
+  const sizeText = Number(state.size) > 0 ? formatBytesCompact(state.size) : ''
   const handleIframeLoad = () => {
     if (deliveredRef.current) return
     const win = iframeRef.current?.contentWindow

@@ -2,11 +2,11 @@
 /**
  * All in One — Portable PC Bridge CLI (Zero-Install Single-File Edition)
  *
- * Friends run a 1-line setup command on their PC; this CLI:
- *  1. Auto-registers an isolated private room on the Relay Server (saved in ~/.allinone-bridge/config.json)
- *  2. Connects outbound via WSS (no public IP, no router config, no firewall rules needed)
+ * Run on any PC to bind it to your All in One account:
+ *  1. Authenticates with your account and saves a per-device credential in ~/.allinone-bridge/config.json
+ *  2. Maintains an outbound Control-Plane WSS link + direct E2EE WebRTC P2P data channels (no public IP or port forwarding)
  *  3. Auto-detects locally installed AI coding agents (Codex / Claude Code / Antigravity / DeepSeek Harness)
- *  4. Generates a 100% offline SVG QR code + 8-char pairing code so the friend's phone connects in 3 seconds
+ *  4. Generates a 100% offline SVG QR code to sync your 256-bit E2EE room key to phones & browsers
  */
 
 import { spawn } from 'node:child_process'
@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import readline from 'node:readline'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
-import { renderQrSvg } from '../shared/src/qr-svg.js'
+import { renderQrSvg } from '@allinone/shared/qr-svg'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
 import { ensureDshLocalIpcPlugin } from './src/helpers/dsh-ipc-installer.js'
 import {
@@ -25,12 +25,12 @@ import {
   formatE2eeFingerprint,
   generateE2eeKey,
   normalizeE2eeKey,
-} from './src/helpers/e2ee.js'
+} from '@allinone/shared/e2ee'
 
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const BRIDGE_VERSION = '1.0.5'
+const BRIDGE_VERSION = '1.0.6'
 
 function normalizeServerUrl(raw) {
   const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
@@ -111,20 +111,28 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;')
 }
 
-function readConfig(configPath) {
+function readRawConfig(configPath) {
   if (!existsSync(configPath)) return null
   try {
     const parsed = JSON.parse(readFileSync(configPath, 'utf8'))
-    const envSecret = String(process.env.ALLINONE_BRIDGE_SECRET || '').trim()
-    const envE2eeKey = normalizeE2eeKey(process.env.ALLINONE_E2EE_KEY || '')
-    if (parsed?.roomId && (parsed?.bridgeSecret || envSecret)) {
-      return {
-        ...parsed,
-        bridgeSecret: parsed.bridgeSecret || envSecret,
-        e2eeKey: normalizeE2eeKey(parsed.e2eeKey || '') || envE2eeKey || '',
-      }
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function readConfig(configPath) {
+  const parsed = readRawConfig(configPath)
+  if (!parsed) return null
+  const envSecret = String(process.env.ALLINONE_BRIDGE_SECRET || '').trim()
+  const envE2eeKey = normalizeE2eeKey(process.env.ALLINONE_E2EE_KEY || '')
+  if (parsed.roomId && (parsed.bridgeSecret || envSecret)) {
+    return {
+      ...parsed,
+      bridgeSecret: parsed.bridgeSecret || envSecret,
+      e2eeKey: normalizeE2eeKey(parsed.e2eeKey || '') || envE2eeKey || '',
     }
-  } catch {}
+  }
   return null
 }
 
@@ -449,6 +457,22 @@ async function main() {
   try { chmodSync(opts.stateDir, 0o700) } catch {}
 
   const configPath = join(opts.stateDir, 'config.json')
+  const rawExisting = readRawConfig(configPath)
+  const hasDesktopEncryptedConfig = Boolean(
+    rawExisting?.bridgeSecretEnc &&
+    !rawExisting?.bridgeSecret &&
+    !String(process.env.ALLINONE_BRIDGE_SECRET || '').trim(),
+  )
+  if (hasDesktopEncryptedConfig) {
+    if (!opts.reset) {
+      throw new Error(
+        `检测到 ${configPath} 为 All in One 桌面端加密保存的配置（bridgeSecretEnc），当前 CLI 模式无法解密系统钥匙串凭据。为避免覆盖桌面端配置与端到端加密密钥，已中止本次操作；请通过 All in One 桌面端运行桥接，或使用 --state-dir <独立目录> / --reset 显式覆盖。`,
+      )
+    }
+    console.warn(
+      `[allinone] ⚠ 警告：${configPath} 包含 All in One 桌面端加密配置（bridgeSecretEnc），已按 --reset 要求覆盖。`,
+    )
+  }
 
   let cfg = (opts.reset || opts.logout) ? null : readConfig(configPath)
   if (cfg && (normalizeServerUrl(cfg.serverUrl) !== opts.server || !String(cfg.roomId || '').startsWith('usr_'))) {
@@ -459,6 +483,11 @@ async function main() {
   let authRevoked = false
 
   const bindAndSaveAccount = async (bound) => {
+    const existingCfg = opts.reset ? null : readConfig(configPath)
+    const preservedE2eeKey =
+      existingCfg && existingCfg.roomId === bound.roomId
+        ? normalizeE2eeKey(existingCfg.e2eeKey || '')
+        : ''
     cfg = {
       mode: 'account',
       serverUrl: opts.server,
@@ -469,6 +498,7 @@ async function main() {
       bridgeId: bound.bridgeId,
       bridgeSecret: bound.deviceSecret,
       label: bound.label,
+      ...(preservedE2eeKey ? { e2eeKey: preservedE2eeKey } : {}),
       createdAt: Date.now(),
     }
     saveConfig(configPath, cfg)
@@ -658,10 +688,6 @@ async function main() {
   const orchestrator = new MultiAppOrchestrator({
     ctx: null,
     config: {
-      relayUrl: wsBridgeUrl,
-      secret: cfg.bridgeSecret,
-      roomId: cfg.roomId,
-      e2eeKey: activeE2eeKey,
       cwd: opts.cwd,
       inboundDir: join(opts.stateDir, 'uploads'),
     },
@@ -697,7 +723,6 @@ async function main() {
       }
     },
   })
-  link.start()
 
   const appsReadyPromise = orchestrator
     .getAppsStatus()
@@ -710,10 +735,11 @@ async function main() {
   bridge = {
     appsReadyPromise,
     stop: async () => {
-      link.stop()
+      await link.stop()
       await orchestrator.dispose()
     },
   }
+  link.start()
 
   // Wait briefly for local AI tool detection so the status banner shows accurate tool availability
   detectedApps = await Promise.race([

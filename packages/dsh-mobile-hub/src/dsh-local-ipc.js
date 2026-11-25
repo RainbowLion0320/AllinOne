@@ -194,7 +194,12 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
         } catch (err) {
           if (!res.headersSent) {
             const statusCode = err instanceof SyntaxError ? 400 : 500
-            sendJson(res, statusCode, { ok: false, error: String(err?.message || err) })
+            sendJson(res, statusCode, {
+              ok: false,
+              error: String(err?.message || err),
+              ...(err?.code ? { code: String(err.code) } : {}),
+              ...(err?._streamErrorEmitted ? { streamErrorEmitted: true } : {}),
+            })
           }
         }
         return
@@ -587,9 +592,10 @@ export class DshLocalIpcClient {
                 data = raw ? JSON.parse(raw) : {}
               } catch {}
               if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300 || !data?.ok) {
-                finishReject(
-                  new Error(data?.error || `DSH IPC call ${method} failed (HTTP ${res.statusCode || 0})`),
-                )
+                const err = new Error(data?.error || `DSH IPC call ${method} failed (HTTP ${res.statusCode || 0})`)
+                if (data?.code) err.code = String(data.code)
+                if (data?.streamErrorEmitted) err._streamErrorEmitted = true
+                finishReject(err)
                 return
               }
               finishResolve(data.result)

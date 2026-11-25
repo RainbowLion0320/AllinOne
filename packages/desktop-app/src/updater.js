@@ -240,6 +240,7 @@ export class DesktopUpdater extends EventEmitter {
     this.requireSha256 = requireSha256 !== false
     this.getLang = typeof getLang === 'function' ? getLang : () => 'zh'
     this.abortController = null
+    this.isChecking = false
     this._installing = false
     this._downloadSeq = 0
 
@@ -280,10 +281,11 @@ export class DesktopUpdater extends EventEmitter {
   async checkForUpdates({ silent = false } = {}) {
     const isBusy = () =>
       this.state.status === 'downloading' || this.state.status === 'installing' || this._installing
-    if (this.state.status === 'checking' || isBusy()) {
+    if (this.isChecking || this.state.status === 'checking' || isBusy()) {
       return this.getState()
     }
 
+    this.isChecking = true
     if (!silent) {
       this.setState({ status: 'checking', error: '' })
     }
@@ -416,6 +418,8 @@ export class DesktopUpdater extends EventEmitter {
         checkedAt: Date.now(),
         error: msg,
       })
+    } finally {
+      this.isChecking = false
     }
   }
 
@@ -633,8 +637,13 @@ export class DesktopUpdater extends EventEmitter {
         throw new Error(this.bi('安装包 SHA-256 校验失败，已自动丢弃，请重试下载', 'Installer SHA-256 verification failed. Discarded corrupted file, please retry.'))
       }
 
-      try { unlinkSync(finalPath) } catch {}
-      renameSync(partPath, finalPath)
+      try {
+        try { unlinkSync(finalPath) } catch {}
+        renameSync(partPath, finalPath)
+      } catch (renameErr) {
+        await closeAndUnlinkPart()
+        throw renameErr
+      }
 
       if (myDownloadSeq !== this._downloadSeq) {
         return this.getState()

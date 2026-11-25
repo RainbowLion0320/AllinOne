@@ -51,7 +51,7 @@
   </tr>
 </table>
 
-> All in One 采用 **纯控制面 + 100% WebRTC P2P 直连（`AIO-P2P v1`）** 架构：服务器仅负责账号认证、设备发现、加密信令交换与内置无状态 STUN（`UDP 3478`），**所有对话、代码、图片与 GB 级大文件均在手机与电脑之间端到端直传，0 字节流经服务器**，同时 100% 延续原有项目工作区、本地历史会话与官方 Prompt Cache。
+> All in One 采用 **纯控制面 + WebRTC P2P 直连优先（`AIO-P2P v1`）+ 可选加密 TURN 兜底** 架构：服务器仅负责账号认证、设备发现、加密信令交换与内置无状态 STUN（`UDP 3478`），不经手明文业务数据也无文件暂存。常规网络下手机与电脑通过 **`⚡ P2P` 端到端直连（0 字节经过服务器、永久不限流）**；双对称 NAT 等极端网络下可无缝自动回落至加密 **`⚡ 中继`**（自建 `coturn` 或分层 Cloudflare Realtime TURN，依然为 DTLS + AES-256-GCM 双层密文透传），同时 100% 延续原有项目工作区、本地历史会话与官方 Prompt Cache。
 
 ---
 
@@ -64,8 +64,8 @@
       <p>统一管理本机的 <strong>Codex</strong>、<strong>Claude Code / Desktop</strong>、<strong>Antigravity</strong> 与 <strong>DeepSeek Harness</strong>，按项目或时间分组，一个入口续聊所有对话。</p>
     </td>
     <td width="50%" valign="top">
-      <h4>⚡ 100% WebRTC P2P 端到端直连</h4>
-      <p>手机与电脑通过 <code>AES-256-GCM</code> + DTLS 双层加密直连，对话、代码、图片与大文件 <strong>0 字节经过服务器</strong>；服务器内置无状态 RFC 5389 STUN（<code>UDP 3478</code>），无带宽焦虑、无需限流套餐。</p>
+      <h4>⚡ WebRTC P2P 直连优先 + 可选加密 TURN 兜底</h4>
+      <p>默认 <strong><code>⚡ P2P</code> 端到端直连</strong>（<code>AES-256-GCM</code> + DTLS 双层加密，<strong>0 字节经过服务器、永久不限流</strong>），内置 RFC 5389 STUN（<code>UDP 3478</code>）；双对称 NAT 下自动回落加密 <strong><code>⚡ 中继</code></strong>（可选自建 <code>coturn</code> + 4 档月配额，或分层接入 Cloudflare Realtime TURN 免费 1 TB/月池），中继模式自动开启<strong>省流量按需加载图片</strong>。</p>
     </td>
   </tr>
   <tr>
@@ -85,7 +85,7 @@
     </td>
     <td width="50%" valign="top">
       <h4>🐳 极轻自建，1 核 1G 即可稳跑</h4>
-      <p>服务器无任何业务流量与临时文件存储，单条 <code>docker compose</code> 命令即可在自有 VPS 启动（自动 HTTPS + 内置 STUN），附带零空载 <code>/admin</code> 监控看板，MIT 完全开源。</p>
+      <p>控制面无业务数据中转与临时文件存储，单条 <code>docker compose</code> 命令即可在自有 VPS 启动（自动 HTTPS + 内置 STUN，可选接 <code>coturn</code> / Cloudflare TURN），附带零空载 <code>/admin</code> 监控看板，MIT 完全开源。</p>
     </td>
   </tr>
 </table>
@@ -168,11 +168,11 @@ All in One 从协议层设计为 **六道零知识纵深防御**，即使中转�
 | 防线 | 核心机制 | 安全保障 |
 | :--- | :--- | :--- |
 | **1. 强制端到端加密** | `AES-256-GCM` + 256-bit 房间密钥 + AAD 绑定房间与消息类型 | 所有对话、工具调用、附件、本地图片与额度均在端侧加解密；桥接端强制拒绝明文 RPC，防重放窗口 + 随机 IV |
-| **2. 纯控制面 + 零中转数据面** | 服务器彻底移除数据中转与文件暂存，仅提供账号鉴权、加密信令与内置无状态 STUN（`UDP 3478`） | 聊天、代码、图片与大文件 100% 走 WebRTC P2P 直连（DTLS + AES-256-GCM 双层加密），服务端 0 字节业务流量 |
+| **2. 纯控制面 + P2P 优先 / 加密 TURN 兜底** | 控制面彻底移除数据中转与 `/api/uploads` 暂存，仅提供鉴权、加密信令、内置 STUN（`UDP 3478`）与可选短期 TURN 凭证 | 常规走 **`⚡ P2P` 直连**（0 服务器流量、永久不限）；双对称 NAT 可选走加密 **`⚡ 中继`**（自建 `coturn` 4 档月配额 `free` 1GB / `pro` 10GB / `ultra` 50GB / `admin` 50GB，或分层 Cloudflare TURN），依然严格为 DTLS + AES-256-GCM 双层密文，配合中继省流模式按需点图 |
 | **3. 零知识设备授权** | 离线二维码扫码 **或** `ECDH P-256` + `HKDF-SHA256` + **6 位安全码（SAS）** | 异地免扫码同步密钥时，双方独立派生 6 位安全码防中间人攻击，控制面全程盲转发 |
 | **4. 零公网开端口** | 电脑端仅发起**出站 WSS** 控制连接与 **STUN UDP 打洞**，拒绝公网直连本机监听端口 | 无需配置路由器端口转发或内网穿透，本机零暴露公网端口 |
 | **5. 本机硬件级密钥保护** | macOS Keychain / Windows DPAPI（Electron `safeStorage`） | 256-bit 密钥加密存储于系统保险库，不以明文落盘 |
-| **6. 账号与毫秒级设备吊销** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + `client.revoked` 实时踢出 | 踢出异常终端时控制面毫秒级通知 PC 桥接器立刻销毁对应 WebRTC P2P 通道（34 项自动化安全与 P2P 冒烟测试持续覆盖） |
+| **6. 账号与毫秒级设备吊销** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + `client.revoked` 实时踢出 | 踢出异常终端时控制面毫秒级通知 PC 桥接器立刻销毁对应 WebRTC P2P 通道（38 项自动化安全与 P2P/TURN 冒烟测试持续覆盖） |
 
 ### 架构概览
 
@@ -184,7 +184,8 @@ flowchart LR
   end
 
   subgraph Control["纯控制面服务器 (HTTPS / WSS + 内置 STUN UDP 3478)"]
-    R["@allinone/relay-server<br/>账号鉴权 · 设备发现 · 加密信令 · 无状态 STUN<br/>(0 字节业务数据中转)"]
+    R["@allinone/relay-server<br/>账号鉴权 · 设备发现 · 加密信令 · 无状态 STUN<br/>动态 TURN 凭证与配额计量 · Cloudflare TURN 分层调度"]
+    T["可选加密 TURN 兜底 (⚡ 中继)<br/>自建 coturn / Cloudflare Realtime TURN<br/>(仅透传 DTLS + AES-256-GCM 密文)"]
   end
 
   subgraph PCs["名下电脑 (出站 WSS + WebRTC NAT 穿透 · 零开端口)"]
@@ -196,8 +197,10 @@ flowchart LR
   M -.->|"仅认证 / 加密 SDP 信令 / STUN"| R
   D -.->|"仅认证 / 加密 SDP 信令 / STUN"| R
   R -.->|"仅控制信令 / 毫秒级吊销"| B1
-  M <==>|"100% P2P 直连 (DTLS + AES-256-GCM)<br/>aio-ctrl (RPC/流式) + aio-bulk (文件/图片)"| B1
-  D <==>|"100% P2P 直连 (DTLS + AES-256-GCM)"| B1
+  M <==>|"优先 ⚡ P2P 直连 (DTLS + AES-256-GCM · 0 流量永久不限)<br/>aio-ctrl (RPC/流式) + aio-bulk (文件/图片)"| B1
+  D <==>|"优先 ⚡ P2P 直连 (DTLS + AES-256-GCM)"| B1
+  M <-.->|"双对称 NAT 兜底 ⚡ 中继 (省流按需点图)"| T
+  T <-.->|"双层密文透传"| B1
 ```
 
 ---
@@ -212,7 +215,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 
 脚本会引导你 1 分钟内完成全部配置：
 - **三种接入模式任选**：① 自有域名 + Caddy 自动申请免费 Let's Encrypt HTTPS 证书（推荐） · ② **纯公网 IP + Let's Encrypt 正规 HTTPS 证书**（免域名） · ③ 仅启动控制面容器（不占 80/443，适配已有 Nginx / 宝塔 / 1Panel / Cloudflare Tunnel）。
-- **内置无状态 STUN 穿透**：容器默认映射 **`UDP 3478`** 端口提供自建 RFC 5389 STUN 服务（请在云厂商防火墙/安全组放行 `UDP 3478`），0 流量中转、1 核 1G VPS 即可轻松承载数百在线设备。
+- **内置无状态 STUN + 可选加密 TURN**：容器默认映射 **`UDP 3478`** 端口提供自建 RFC 5389 STUN 服务（请在云厂商防火墙/安全组放行 `UDP 3478`），常规 **`⚡ P2P`** 直连 0 流量永久不限；如需穿透双对称 NAT，可在 `.env` 中按需启用自建 `coturn`（支持 4 档月配额）或免费 1 TB/月 Cloudflare Realtime TURN。
 - **零手动填密钥**：自动生成 256-bit 随机 `JWT_SECRET`（权限 `600`），可选引导配置免费邮箱 2FA（QQ / 163 / Gmail SMTP）。
 - **开箱即出邀请码**：健康检查通过后自动生成首个管理员一次性邀请码与注册链接，后续只需追加 `--upgrade` 即可无损升级镜像。
 
@@ -272,13 +275,44 @@ SMTP_FROM=All in One <你的邮箱@qq.com>
 </details>
 
 <details>
+<summary>可选：配置加密 TURN 兜底（自建 coturn 4 档月配额 / Cloudflare Realtime TURN 免费 1 TB 池）</summary>
+
+`⚡ P2P` 直连永远 **0 服务器流量、永久不限额**；仅在双方均处于严格对称 NAT（如部分校园网 / 蜂窝网络 + 企业防火墙）无法直接 UDP 打洞时，才会自动回落至加密 **`⚡ 中继`**（中继节点仅透传 DTLS + `AES-256-GCM` 双层密文，且客户端自动开启 **中继省流量模式**：点击再加载图片）。
+
+1. **自建 `coturn` 动态凭证与 4 档月配额**（在 `deploy/.env` 中添加，若与控制面同机共享 `UDP 3478` 请设 `STUN_PORT=off` 并注释 `docker-compose.yml` 中的 `3478/udp` 映射）：
+   ```env
+   STUN_PORT=off
+   TURN_HOST=ai.yourdomain.com
+   TURN_PORT=3478
+   TURN_SECRET=与coturn.conf中static-auth-secret一致的强随机密钥
+   TURN_TTL_SEC=600
+   # 可选：只读挂载 /var/log/coturn/turn.log 开启按用户月配额计量
+   TURN_LOG_FILE=/var/log/coturn/turn.log
+   TURN_QUOTA_FREE_MB=1024      # free: 1 GB/月（0 表示不限）
+   TURN_QUOTA_PRO_MB=10240      # pro: 10 GB/月
+   TURN_QUOTA_ULTRA_MB=51200    # ultra / admin: 50 GB/月（admin 严格等同 ultra）
+   ```
+2. **可选分层接入 Cloudflare Realtime TURN（每月免费 1 TB 流量池）**：
+   ```env
+   CF_TURN_TOKEN_ID=你的Cloudflare_TURN_Token_ID
+   CF_TURN_API_TOKEN=你的Cloudflare_TURN_API_Token
+   CF_TURN_TIERS=free           # 默认仅 free 档走 Cloudflare 1TB 免费池，pro/ultra/admin 走自建 coturn
+   CF_TURN_TTL_SEC=3600
+   ```
+   > 若 Cloudflare API 临时不可达或未配置，服务端自动平滑降级到自建 `coturn` / STUN，不阻塞任何连接。
+
+</details>
+
+<details>
 <summary>常用管理员 CLI 命令</summary>
 
 ```bash
-npm run admin -- invite create --count 3 --note "给朋友"
+npm run admin -- invite create --count 3 --tier free --note "给朋友"   # --tier 支持 free|pro|ultra|admin
+npm run admin -- invite create --count 1 --tier pro --note "Pro 成员"
 npm run admin -- invite list
 npm run admin -- invite revoke INV-XXXX-XXXX
 npm run admin -- users
+npm run admin -- user tier <username-or-id> <free|pro|ultra|admin>
 ```
 
 </details>
@@ -347,14 +381,14 @@ npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运
 ```text
 AllinOne/
 ├── packages/
-│   ├── shared/          # 共享协议、AES-256-GCM / ECDH 端到端加密与离线二维码
-│   ├── relay-server/    # 盲中转网关、账号邀请码、邮箱 2FA、/admin 看板与静态托管
-│   ├── dsh-mobile-hub/  # 4 大 AI 适配器、周额度采集、环境补齐与单文件桥接 CLI
-│   ├── mobile-app/      # React + Tailwind + Vite + PWA 前端
-│   └── desktop-app/     # Electron 桌面客户端、安全存储与安装包构建
-├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
-├── scripts/             # 桥接打包器与 30 项端到端冒烟与安全测试套件
-└── .github/workflows/   # CI 测试与多端发版工作流
+│   ├── shared/          # 共享协议、AES-256-GCM / ECDH 端到端加密、P2P 多路复用 (p2p-mux.js) 与离线二维码
+│   ├── relay-server/    # 纯控制面网关、内置 STUN、动态 TURN / 4 档月配额计量、Cloudflare TURN 分层调度、/admin 看板与静态托管
+│   ├── dsh-mobile-hub/  # 4 大 AI 适配器、WebRTC P2P (werift)、周额度采集、环境补齐与单文件桥接 CLI
+│   ├── mobile-app/      # React + Tailwind + Vite + PWA 前端（WebRTC P2P 与中继省流按需加载）
+│   └── desktop-app/     # Electron 桌面客户端、原生 libwebrtc worker (webrtc-proxy.js)、安全存储与安装包构建
+├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf / install.sh
+├── scripts/             # 桥接打包器与 38 项端到端冒烟与安全测试套件
+└── .github/workflows/   # CI 测试、Docker GHCR 推送与多端发版工作流
 ```
 
 运行全部端到端冒烟与安全测试：

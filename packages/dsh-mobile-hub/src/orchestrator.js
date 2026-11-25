@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs'
 import { readFile as readFileAsync } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
-import { normalizeE2eeKey } from './helpers/e2ee.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
@@ -27,8 +26,6 @@ export class MultiAppOrchestrator {
     this.config = config
     this.log = log
     this.onEvent = onEvent || (() => {})
-    this.roomId = config.roomId || ''
-    this.e2eeKey = normalizeE2eeKey(config.e2eeKey || '')
     this.inboundDir = config.inboundDir || join(
       String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh'),
       'allinone-uploads',
@@ -467,10 +464,12 @@ export class MultiAppOrchestrator {
 
   /**
    * Read a local image or deliverable document file on the PC so the remote client
-   * can preview images/HTML or download office deliverables over E2EE WS RPC.
-   * - Image mode (default): image extensions only, <= 15MB (stays safely below 32MB relay WS maxPayload after E2EE encoding).
+   * can preview images/HTML or download office deliverables over direct E2EE P2P.
+   * - Files <= 128 KB return inline Base64 over `aio-ctrl`; larger files return a `p2p-bulk` descriptor
+   *   streamed over `aio-bulk` (AIO2 4 MB chunked E2EE + 60 KB SCTP slices).
+   * - Image mode (default): image extensions only, <= 100 MB.
    * - Document mode (`mode: 'document'`): deliverable extensions only (HTML/PDF/Word/Excel/PPT/CSV/MD/TXT/RTF/EPUB/ZIP),
-   *   <= 10MB, max 2 concurrent reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
+   *   <= 2 GB, max 4 concurrent inline reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
    */
   async readLocalFile({ path: rawPath, cwd = '', mode = 'image' } = {}) {
     const IMAGE_MIMES = {

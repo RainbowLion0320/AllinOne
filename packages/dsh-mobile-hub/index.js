@@ -34,7 +34,7 @@ export function apply(ctx, config = {}) {
 
   const orchestrator = new MultiAppOrchestrator({
     ctx,
-    config: { ...config, relayUrl: '', secret: '' },
+    config,
     log,
     onEvent: (event, payload) => {
       ipcServer?.emitEvent?.(event, payload)

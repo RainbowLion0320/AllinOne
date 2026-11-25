@@ -20,7 +20,6 @@ import { useI18n } from './i18n.jsx'
 import {
   getImageLabel,
   isImageTarget,
-  isRelayUploadTarget,
   resolveImageSrc,
 } from './imageUrls.js'
 import { needsE2eeMediaLoad } from './e2eeMedia.js'
@@ -303,14 +302,14 @@ function CodeBlock({ language, code }) {
 
 function ImageChip({ target, label, imageContext }) {
   const displayLabel = label || getImageLabel(target)
-  const isUrlRef = /^(?:https?:\/\/|data:|blob:|\/api\/)/i.test(target) || isRelayUploadTarget(target)
+  const isUrlRef = /^(?:https?:\/\/|data:|blob:)/i.test(target)
   const item = {
     ...(isUrlRef ? { url: target } : { path: target }),
     raw: target,
     name: displayLabel,
   }
-  const useE2ee = needsE2eeMediaLoad(item, imageContext || {})
-  const src = useE2ee ? '' : resolveImageSrc(item, imageContext || {})
+  const useE2ee = needsE2eeMediaLoad(item)
+  const src = useE2ee ? '' : resolveImageSrc(item)
   return (
     <button
       type="button"

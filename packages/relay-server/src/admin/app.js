@@ -174,18 +174,65 @@
     }
   }
 
-  function tierMeta(rawTier, role) {
-    const t = String(rawTier || (role === 'admin' ? 'admin' : 'free')).toLowerCase()
-    if (t === 'admin') {
-      return { id: 'admin', label: bi('管理员', 'Admin'), short: 'ADMIN', pillClass: 'pill-brand' }
+  function getAppMeta(appId, upper = false) {
+    const key = String(appId || '')
+    if (Object.hasOwn(APP_COLORS, key)) return APP_COLORS[key]
+    return {
+      name: key,
+      badge: upper ? key.toUpperCase() : key,
+      color: '#94a3b8',
+      bg: 'rgba(148,163,184,0.14)',
     }
-    if (t === 'ultra') {
-      return { id: 'ultra', label: 'Ultra', short: 'ULTRA', pillClass: 'pill-amber' }
+  }
+
+  function fmtQuotaMb(mb) {
+    const n = Number(mb)
+    if (!Number.isFinite(n) || n <= 0) return bi('无限', 'Unlim')
+    if (n >= 1024 && n % 1024 === 0) return `${n / 1024} GB`
+    if (n >= 1024) return `${(n / 1024).toFixed(1)} GB`
+    return `${Math.floor(n)} MB`
+  }
+
+  function getTurnQuotaLabels(quotas = null) {
+    const freeMb = quotas && quotas.freeMb !== undefined ? Number(quotas.freeMb) : 1024
+    const proMb = quotas && quotas.proMb !== undefined ? Number(quotas.proMb) : 10240
+    const ultraMb = quotas && quotas.ultraMb !== undefined ? Number(quotas.ultraMb) : 51200
+    const adminMb = quotas && quotas.adminMb !== undefined ? Number(quotas.adminMb) : ultraMb
+    return {
+      free: fmtQuotaMb(freeMb),
+      pro: fmtQuotaMb(proMb),
+      ultra: fmtQuotaMb(ultraMb),
+      admin: fmtQuotaMb(adminMb),
+      freeUnlimited: !Number.isFinite(freeMb) || freeMb <= 0,
+      proUnlimited: !Number.isFinite(proMb) || proMb <= 0,
+      ultraUnlimited: !Number.isFinite(ultraMb) || ultraMb <= 0,
+      adminUnlimited: !Number.isFinite(adminMb) || adminMb <= 0,
     }
-    if (t === 'pro') {
-      return { id: 'pro', label: 'Pro', short: 'PRO', pillClass: 'pill-sky' }
+  }
+
+  function formatTurnLabel(turn) {
+    return Number(turn?.port) > 0 ? `STUN+TURN :${turn.port}` : 'CF TURN'
+  }
+
+  function updateInviteRoleOptions(quotas = null) {
+    const invRoleSel = document.getElementById('invite-role')
+    if (!invRoleSel) return
+    const q = getTurnQuotaLabels(quotas)
+    const perMo = bi('/月', '/mo')
+    const labels = {
+      free: `Free · ${q.free}${q.freeUnlimited ? '' : perMo}`,
+      pro: `Pro · ${q.pro}${q.proUnlimited ? '' : perMo}`,
+      ultra: `Ultra · ${q.ultra}${q.ultraUnlimited ? '' : perMo}`,
+      admin: bi(
+        `Admin · ${q.admin}${q.adminUnlimited ? '' : '/月'} (管理员)`,
+        `Admin · ${q.admin}${q.adminUnlimited ? '' : '/mo'}`,
+      ),
     }
-    return { id: 'free', label: bi('普通', 'Free'), short: 'FREE', pillClass: 'pill-subtle' }
+    for (const opt of invRoleSel.options) {
+      if (Object.hasOwn(labels, opt.value)) {
+        opt.textContent = labels[opt.value]
+      }
+    }
   }
 
   function showToast(msg) {
@@ -294,11 +341,7 @@
     setText('invites-title', '一次性注册邀请码', 'Single-Use Invite Codes')
     setText('invites-subtitle', '一码一人，注册成功后立即核销', 'One code per user, burned immediately on registration')
     setPh('invite-note', '备注（如：给朋友 / 测试账号）', 'Note (optional)')
-    const invRoleSel = document.getElementById('invite-role')
-    if (invRoleSel && invRoleSel.options.length >= 2) {
-      invRoleSel.options[0].textContent = bi('普通用户 (P2P 直连)', 'Standard User (Direct P2P)')
-      invRoleSel.options[1].textContent = bi('管理员 (Admin)', 'Administrator')
-    }
+    updateInviteRoleOptions(state.data?.server?.turn?.quotas || null)
     setText('btn-create-invite', '生成邀请码', 'Generate')
     setText('activity-title', '近期运行事件（纯内存环形缓存）', 'Recent Activity (In-Memory Ring Buffer)')
     setText(
@@ -544,7 +587,7 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.5'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.6'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
@@ -554,7 +597,7 @@
       const stun = srv.stun || {}
       const turn = srv.turn || {}
       const iceText = turn.enabled
-        ? `STUN+TURN :${turn.port || 3478}`
+        ? formatTurnLabel(turn)
         : stun.enabled
           ? `STUN UDP :${stun.port || 3478} (${stun.requests || 0})`
           : bi('STUN 关', 'STUN Off')
@@ -563,6 +606,8 @@
         `Host ${hostName} · Up ${up} · RSS ${rss} · ${iceText} · Control Plane (P2P-first)`,
       )
     }
+
+    updateInviteRoleOptions(srv.turn?.quotas || null)
 
     const luEl = document.getElementById('last-updated')
     if (luEl) {
@@ -636,7 +681,7 @@
         accent: '#7c5cff',
         label: bi('本月全服中继流量', 'Monthly TURN Relay'),
         pill: d.server?.turn?.enabled
-          ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN+TURN :${esc(d.server.turn.port || 3478)}</span>`
+          ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>${esc(formatTurnLabel(d.server.turn))}</span>`
           : d.server?.stun?.enabled
             ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN :${esc(d.server.stun.port || 3478)}</span>`
             : `<span class="pill pill-subtle">${bi('STUN 关', 'STUN Off')}</span>`,
@@ -702,7 +747,6 @@
     const srv = d.server || {}
     const host = srv.host || {}
     const node = srv.node || {}
-    const storage = srv.storage || {}
     const feat = srv.features || {}
 
     // Card 1: User status donut
@@ -826,9 +870,9 @@
           </div>
         </div>
         <div class="mini-chips">
-          <span class="mini-chip">${esc(srv.turn?.enabled ? `STUN+TURN :${srv.turn.port || 3478}` : `STUN: ${srv.stun?.enabled ? `UDP ${srv.stun.port || 3478}` : bi('未开启', 'Off')}`)}</span>
+          <span class="mini-chip">${esc(srv.turn?.enabled ? formatTurnLabel(srv.turn) : `STUN: ${srv.stun?.enabled ? `UDP ${srv.stun.port || 3478}` : bi('未开启', 'Off')}`)}</span>
           ${srv.turn?.cloudflare?.enabled ? `<span class="mini-chip">CF TURN (${esc((srv.turn.cloudflare.tiers || []).join('/'))}): ${esc(srv.turn.cloudflare.ready ? bi('就绪', 'Ready') : bi('预热中', 'Warming'))}</span>` : ''}
-          ${srv.turn?.quotas ? `<span class="mini-chip">Free ${esc(fmtBytes((srv.turn.quotas.freeMb || 0) * 1024 * 1024))} · Pro ${esc(fmtBytes((srv.turn.quotas.proMb || 0) * 1024 * 1024))} · Ultra/Admin ${esc(srv.turn.quotas.ultraMb > 0 ? fmtBytes(srv.turn.quotas.ultraMb * 1024 * 1024) : bi('无限', 'Unlim'))}</span>` : ''}
+          ${srv.turn?.quotas ? `<span class="mini-chip">Free ${esc(fmtQuotaMb(srv.turn.quotas.freeMb))} · Pro ${esc(fmtQuotaMb(srv.turn.quotas.proMb))} · Ultra/Admin ${esc(fmtQuotaMb(srv.turn.quotas.ultraMb))}</span>` : ''}
           <span class="mini-chip">${esc(bi('邮件服务', 'Mail'))}: ${esc(feat.emailEnabled ? feat.emailProvider.toUpperCase() : bi('未开启', 'Off'))}</span>
           <span class="mini-chip">${esc(bi('系统运行', 'Host Up'))}: ${esc(fmtUptime(host.uptimeSec || 0))}</span>
         </div>
@@ -925,12 +969,12 @@
       const initial = (u.username || '?').slice(0, 1).toUpperCase()
       const appTags = (u.apps || []).length > 0
         ? u.apps.map((a) => {
-            const meta = APP_COLORS[a.app] || { badge: a.app.toUpperCase(), color: '#94a3b8', bg: 'rgba(148,163,184,0.14)' }
+            const meta = getAppMeta(a.app, true)
             return `<span class="app-tag" style="color:${meta.color};background:${meta.bg};border-color:${meta.color}40" title="${esc(meta.name || a.app)} (${a.writable ? 'RW' : 'RO'})">${esc(meta.badge)}</span>`
           }).join('')
         : `<span class="muted-text">—</span>`
 
-      const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : u.plan || 'free')).toLowerCase()
+      const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
       const tierPillCls =
         uTier === 'admin'
           ? 'pill-brand'
@@ -1008,7 +1052,7 @@
           const confirmId = `disc-bridge:${u.userId}:${dev.bridgeId}`
           const isArmed = state.confirmKey === confirmId
           const appsHtml = (dev.apps || []).filter((a) => a.available).map((a) => {
-            const meta = APP_COLORS[a.app] || { badge: a.app, color: '#94a3b8', bg: 'rgba(148,163,184,0.14)' }
+            const meta = getAppMeta(a.app)
             return `<span class="app-tag" style="color:${meta.color};background:${meta.bg}">${esc(meta.badge)}${a.writable ? '' : '·RO'}</span>`
           }).join(' ')
 
@@ -1075,7 +1119,8 @@
     const revokeArmed = state.confirmKey === revokeKey
     const resetKey = `reset-turn:${u.userId}`
     const resetArmed = state.confirmKey === resetKey
-    const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : u.plan || 'free')).toLowerCase()
+    const uTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
+    const qLabels = getTurnQuotaLabels(state.data?.server?.turn?.quotas || null)
     const tq = u.turnQuota || null
     const quotaText = tq
       ? tq.unlimited
@@ -1109,13 +1154,13 @@
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
             ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
           </div>
-          <div class="inline-pills" data-stop-toggle="1">
+          <div class="inline-pills">
             ${!u.isCurrentAdmin ? `
               <select class="select-compact" data-action="set-user-tier" data-user-id="${esc(u.userId)}" aria-label="${esc(bi('调整用户等级', 'Change user tier'))}">
-                <option value="free" ${uTier === 'free' ? 'selected' : ''}>Free (1 GB)</option>
-                <option value="pro" ${uTier === 'pro' ? 'selected' : ''}>Pro (10 GB)</option>
-                <option value="ultra" ${uTier === 'ultra' ? 'selected' : ''}>Ultra (50 GB)</option>
-                <option value="admin" ${uTier === 'admin' ? 'selected' : ''}>Admin (50 GB)</option>
+                <option value="free" ${uTier === 'free' ? 'selected' : ''}>Free (${esc(qLabels.free)})</option>
+                <option value="pro" ${uTier === 'pro' ? 'selected' : ''}>Pro (${esc(qLabels.pro)})</option>
+                <option value="ultra" ${uTier === 'ultra' ? 'selected' : ''}>Ultra (${esc(qLabels.ultra)})</option>
+                <option value="admin" ${uTier === 'admin' ? 'selected' : ''}>Admin (${esc(qLabels.admin)})</option>
               </select>
             ` : ''}
             ${tq && tq.usedBytes > 0 ? `
@@ -1165,7 +1210,7 @@
               const key = `disc-bridge:${b.roomId}:${b.bridgeId}`
               const armed = state.confirmKey === key
               const appsHtml = (b.apps || []).filter((a) => a.available).map((a) => {
-                const m = APP_COLORS[a.app] || { badge: a.app, color: '#94a3b8', bg: 'rgba(148,163,184,0.14)' }
+                const m = getAppMeta(a.app)
                 return `<span class="app-tag" style="color:${m.color};background:${m.bg}">${esc(m.badge)}</span>`
               }).join(' ') || '<span class="muted-text">—</span>'
               return `
@@ -1290,7 +1335,7 @@
             <span class="invite-code mono ${inv.status === 'revoked' ? 'revoked' : ''}">${esc(inv.code)}</span>
             <div class="inline-pills">
               ${(() => {
-                const it = String(inv.tier || (inv.grantAdmin ? 'admin' : inv.plan || 'free')).toLowerCase()
+                const it = String(inv.tier || 'free').toLowerCase()
                 if (it === 'admin') return '<span class="pill pill-brand">ADMIN</span>'
                 if (it === 'ultra') return '<span class="pill pill-amber">ULTRA</span>'
                 if (it === 'pro') return '<span class="pill pill-sky">PRO</span>'
@@ -1331,7 +1376,6 @@
       case 'admin.tier': return { label: bi('等级变更', 'Tier Change'), cls: 'pill-sky' }
       case 'admin.quota_reset': return { label: bi('流量重置', 'Quota Reset'), cls: 'pill-emerald' }
       case 'turn.quota_exceeded': return { label: bi('中继达上限', 'TURN Limit'), cls: 'pill-rose' }
-      case 'traffic.throttled': return { label: bi('流量限流', 'Throttled'), cls: 'pill-rose' }
       default: return { label: type || 'event', cls: 'pill-subtle' }
     }
   }
@@ -1343,6 +1387,7 @@
       { id: 'bridge', label: bi('电脑桥接', 'Bridges') },
       { id: 'client', label: bi('控制终端', 'Clients') },
       { id: 'user', label: bi('账号登录', 'Auth') },
+      { id: 'turn', label: bi('中继配额', 'TURN') },
       { id: 'admin', label: bi('管理操作', 'Admin') },
     ]
 
@@ -1559,7 +1604,6 @@
             count: state.inviteQty,
             note: noteEl.value.trim(),
             tier,
-            grantAdmin: tier === 'admin',
           },
         })
         noteEl.value = ''
@@ -1601,7 +1645,7 @@
     // Keyboard toggle for user summary rows (Enter / Space)
     document.getElementById('dashboard-view').addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' && e.key !== ' ') return
-      if (e.target.closest('[data-stop-toggle], select, button, input, a')) return
+      if (e.target.closest('select, button, input, a')) return
       const row = e.target.closest('[data-action="toggle-user"]')
       if (!row) return
       e.preventDefault()
@@ -1614,7 +1658,6 @@
 
     // Delegated click handler for all dynamic actions (strict CSP compliant)
     document.getElementById('dashboard-view').addEventListener('click', async (e) => {
-      if (e.target.closest('[data-stop-toggle]')) return
       const target = e.target.closest('[data-action]')
       if (!target) return
       const action = target.dataset.action

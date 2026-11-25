@@ -10,14 +10,14 @@ import {
   decryptJson,
   encryptChunkedBytes,
   encryptJson,
-} from '../helpers/e2ee.js'
+} from '@allinone/shared/e2ee'
 import {
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
   createCtrlCodec,
   decodeBulkFrame,
   encodeBulkFrame,
-} from '../helpers/p2p-mux.js'
+} from '@allinone/shared/p2p-mux'
 import { ElectronWebRtcClient } from './peer-electron.js'
 import { createWeriftPeer } from './peer-werift.js'
 
@@ -134,6 +134,8 @@ export class P2PBridgeManager {
     this.revokedClients = new Map()
     /** @type {Map<string, number>} iv -> seenAt */
     this.seenReqIvs = new Map()
+    /** @type {Map<string, Promise<void>>} clientId -> serialized signal chain */
+    this._signalChains = new Map()
     this._eventSeq = 0
     this._streamSeq = 1
     this._eventQueue = Promise.resolve()
@@ -142,14 +144,6 @@ export class P2PBridgeManager {
 
   getEngineName() {
     return this.electronClient ? 'electron-chromium' : 'werift'
-  }
-
-  getActivePeerCount() {
-    let n = 0
-    for (const s of this.sessions.values()) {
-      if (s.peer?.isCtrlOpen?.()) n += 1
-    }
-    return n
   }
 
   pruneRevoked(now = Date.now()) {
@@ -235,7 +229,24 @@ export class P2PBridgeManager {
     this.sendSignal({ clientId, sessionId, e2ee: enc })
   }
 
-  async handleEncryptedSignal({ clientId, sessionId, e2ee }) {
+  handleEncryptedSignal(payload) {
+    if (this.disposed) return Promise.resolve()
+    const cid = String(payload?.clientId || '').trim()
+    if (!cid) return Promise.resolve()
+    const prev = this._signalChains.get(cid) || Promise.resolve()
+    const next = prev
+      .catch(() => {})
+      .then(() => this._processEncryptedSignal(payload))
+    this._signalChains.set(cid, next)
+    next.finally(() => {
+      if (this._signalChains.get(cid) === next) {
+        this._signalChains.delete(cid)
+      }
+    })
+    return next
+  }
+
+  async _processEncryptedSignal({ clientId, sessionId, e2ee }) {
     if (this.disposed) return
     const cid = String(clientId || '').trim()
     const sid = String(sessionId || '').trim()
@@ -403,7 +414,9 @@ export class P2PBridgeManager {
         const up = sess.activeUploads.get(streamId)
         if (up) {
           try { up.queue.fail(new Error('Upload cancelled by client')) } catch {}
-          sess.activeUploads.delete(streamId)
+          if (sess.activeUploads.get(streamId) === up) {
+            sess.activeUploads.delete(streamId)
+          }
         }
         return
       }
@@ -634,13 +647,22 @@ export class P2PBridgeManager {
       return
     }
 
+    const prevUpload = sess.activeUploads.get(streamId)
+    if (prevUpload) {
+      try { prevUpload.queue.fail(new Error('Upload superseded by new stream')) } catch {}
+    }
     const queue = createAsyncByteQueue()
-    sess.activeUploads.set(streamId, { transferId, queue, receivedBytes: 0 })
-    // Acknowledge readiness immediately so client can begin streaming binary slices
-    await this.sendBulkCtrl(sess, { action: 'upload.ready', transferId, streamId })
+    const entry = { transferId, queue, receivedBytes: 0 }
+    sess.activeUploads.set(streamId, entry)
 
     let localPath = ''
+    let ws = null
+    let wsClosed = false
+    let wsClosePromise = null
     try {
+      // Acknowledge readiness immediately so client can begin streaming binary slices
+      await this.sendBulkCtrl(sess, { action: 'upload.ready', transferId, streamId })
+
       mkdirSync(this.inboundDir, { recursive: true })
       try { chmodSync(this.inboundDir, 0o700) } catch {}
       const rawBase = basename(String(meta.filename || 'upload.bin'))
@@ -650,8 +672,14 @@ export class P2PBridgeManager {
         .slice(0, 100) || 'upload.bin'
       localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safeName}`)
 
-      const ws = createWriteStream(localPath, { mode: 0o600 })
+      ws = createWriteStream(localPath, { mode: 0o600 })
       let wsErr = null
+      wsClosePromise = new Promise((resolveClose) => {
+        ws.once('close', () => {
+          wsClosed = true
+          resolveClose()
+        })
+      })
       ws.on('error', (e) => { wsErr = e })
       const writePlain = (chunk) =>
         new Promise((resolveW, rejectW) => {
@@ -677,9 +705,16 @@ export class P2PBridgeManager {
 
       await new Promise((resolveEnd, rejectEnd) => {
         if (wsErr) return rejectEnd(wsErr)
-        ws.once('error', rejectEnd)
-        ws.end(() => resolveEnd())
+        const onErr = (e) => rejectEnd(e)
+        ws.once('error', onErr)
+        ws.end(() => {
+          ws.off('error', onErr)
+          resolveEnd()
+        })
       })
+      if (!wsClosed && wsClosePromise) {
+        await Promise.race([wsClosePromise, new Promise((r) => setTimeout(r, 2000))])
+      }
       try { chmodSync(localPath, 0o600) } catch {}
 
       const p2pToken = this.onRegisterP2pUpload?.({
@@ -701,6 +736,12 @@ export class P2PBridgeManager {
         size: dec.totalPlainBytes,
       })
     } catch (err) {
+      if (ws && !wsClosed) {
+        try { ws.destroy() } catch {}
+        if (wsClosePromise) {
+          await Promise.race([wsClosePromise, new Promise((r) => setTimeout(r, 2000))])
+        }
+      }
       if (localPath) await unlinkAsync(localPath).catch(() => {})
       if (!sess.closed) {
         await this.sendBulkCtrl(sess, {
@@ -711,7 +752,9 @@ export class P2PBridgeManager {
         }).catch(() => {})
       }
     } finally {
-      sess.activeUploads.delete(streamId)
+      if (sess.activeUploads.get(streamId) === entry) {
+        sess.activeUploads.delete(streamId)
+      }
     }
   }
 
@@ -724,7 +767,9 @@ export class P2PBridgeManager {
       up.receivedBytes += frame.payload.byteLength
       if (up.receivedBytes > MAX_INBOUND_UPLOAD_BYTES) {
         up.queue.fail(new Error('文件超过本机安全上限 (2GB)'))
-        sess.activeUploads.delete(frame.streamId)
+        if (sess.activeUploads.get(frame.streamId) === up) {
+          sess.activeUploads.delete(frame.streamId)
+        }
         return
       }
       up.queue.push(frame.payload)
@@ -763,6 +808,7 @@ export class P2PBridgeManager {
 
   async dispose() {
     this.disposed = true
+    this._signalChains.clear()
     for (const cid of [...this.sessions.keys()]) {
       await this.destroySession(cid)
     }

@@ -3,8 +3,6 @@ import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
-import { resolveImageSrc } from '../lib/imageUrls.js'
-import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
 function revokeAttachmentPreview(att) {
@@ -14,81 +12,25 @@ function revokeAttachmentPreview(att) {
   }
 }
 
-function ComposerAttachmentChip({ att, imageContext, onRemove }) {
+function ComposerAttachmentChip({ att, onRemove }) {
   const isImg = String(att?.mimeType || '').startsWith('image/')
-  const [previewFailed, setPreviewFailed] = useState(false)
-  const [decryptedSrc, setDecryptedSrc] = useState('')
   const [loadError, setLoadError] = useState(false)
 
   useEffect(() => {
-    setPreviewFailed(false)
-    setDecryptedSrc('')
     setLoadError(false)
-  }, [att?.id, att?.url, att?.localPreviewUrl])
+  }, [att?.id, att?.localPreviewUrl])
 
-  const effectiveAtt = previewFailed ? { ...att, localPreviewUrl: '' } : att
-  const needsE2ee = isImg && needsE2eeMediaLoad(effectiveAtt, imageContext)
-  const directSrc =
-    isImg && !needsE2ee
-      ? effectiveAtt.localPreviewUrl || resolveImageSrc({ url: effectiveAtt.url }, imageContext)
-      : ''
-  const e2eeKeysSig = imageContext?.e2eeKeys
-    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
-    : ''
+  const thumbSrc = isImg && !loadError ? String(att?.localPreviewUrl || '') : ''
 
-  useEffect(() => {
-    if (!needsE2ee) {
-      setDecryptedSrc('')
-      return
-    }
-    let cancelled = false
-    setLoadError(false)
-    loadE2eeImageUrl(effectiveAtt, imageContext)
-      .then((blobUrl) => {
-        if (cancelled) return
-        if (blobUrl) setDecryptedSrc(blobUrl)
-        else setLoadError(true)
-      })
-      .catch(() => {
-        if (!cancelled) setLoadError(true)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [
-    needsE2ee,
-    effectiveAtt?.url,
-    effectiveAtt?.e2ee?.iv,
-    effectiveAtt?.e2ee?.kid,
-    imageContext?.baseUrl,
-    imageContext?.roomId,
-    imageContext?.bridgeId,
-    imageContext?.e2eeKey,
-    imageContext?.e2eeKeyId,
-    e2eeKeysSig,
-  ])
-
-  const thumbSrc = needsE2ee ? decryptedSrc : directSrc
-
-  if (isImg && !loadError && (thumbSrc || needsE2ee)) {
+  if (isImg && thumbSrc) {
     return (
       <div className="relative flex h-14 w-14 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 shadow-2xs dark:border-slate-700 dark:bg-[#232630]">
-        {thumbSrc ? (
-          <img
-            src={thumbSrc}
-            alt={att.filename}
-            onError={() => {
-              if (!previewFailed && att.localPreviewUrl) {
-                setPreviewFailed(true)
-              } else {
-                setLoadError(true)
-              }
-            }}
-            className="h-full w-full object-cover"
-          />
-        ) : (
-          <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-        )}
+        <img
+          src={thumbSrc}
+          alt={att.filename}
+          onError={() => setLoadError(true)}
+          className="h-full w-full object-cover"
+        />
         <button
           type="button"
           onClick={onRemove}
@@ -124,7 +66,6 @@ export function Composer({
   modelPref,
   modelDisplayName,
   onOpenModelPicker,
-  imageContext,
   onUploadFile,
   onSend,
   onInterrupt,
@@ -267,20 +208,39 @@ export function Composer({
     setInlineError('')
 
     const restoreOnFailure = () => {
-      if (mountedRef.current && draftKeyRef.current === originDraftKey) {
+      const currentKey = draftKeyRef.current
+      const originScopePrefix = originDraftKey.includes('::__new__::')
+        ? `${originDraftKey.split('::__new__::')[0]}::`
+        : ''
+      const transitionedToCreatedSession = Boolean(
+        originScopePrefix &&
+          currentKey !== originDraftKey &&
+          currentKey.startsWith(originScopePrefix) &&
+          !currentKey.includes('::__new__::'),
+      )
+
+      if (mountedRef.current && (currentKey === originDraftKey || transitionedToCreatedSession)) {
+        if (transitionedToCreatedSession) {
+          clearDraft(originDraftKey)
+        }
         if (textRef.current === '' && attachmentsRef.current.length === 0) {
           textRef.current = rawText
           attachmentsRef.current = curAttachments
           setText(rawText)
           setAttachments(curAttachments)
+        } else {
+          for (const att of curAttachments) {
+            revokeAttachmentPreview(att)
+          }
         }
-        saveDraft(originDraftKey, { text: textRef.current, attachments: attachmentsRef.current })
+        saveDraft(currentKey, { text: textRef.current, attachments: attachmentsRef.current })
       } else {
         for (const att of curAttachments) {
           revokeAttachmentPreview(att)
         }
-        if (originDraftKey.includes('::__new__::')) {
+        if (transitionedToCreatedSession) {
           clearDraft(originDraftKey)
+          saveDraft(currentKey, { text: rawText, attachments: curAttachments })
         } else {
           saveDraft(originDraftKey, { text: rawText, attachments: curAttachments })
         }
@@ -343,14 +303,13 @@ export function Composer({
             </button>
           </div>
         )}
-        {/* Pending attachment chips (with E2EE-capable image thumbnails!) */}
+        {/* Pending attachment chips */}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 px-1">
             {attachments.map((att, idx) => (
               <ComposerAttachmentChip
                 key={att?.id || att?.url || `att-${idx}`}
                 att={att}
-                imageContext={imageContext}
                 onRemove={() => handleRemoveAttachment(att?.id)}
               />
             ))}

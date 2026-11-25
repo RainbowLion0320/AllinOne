@@ -107,19 +107,46 @@ export function createTurnLogMeter({
   const cleanPath = String(logPath || '').trim()
   let offset = 0
   let currentIno = null
+  let hadInitialStat = false
   let remainder = ''
   let watcher = null
   let timer = null
   let reading = false
+  let started = false
   let stopped = false
+
+  function closeWatcher() {
+    if (watcher) {
+      try { watcher.close() } catch {}
+      watcher = null
+    }
+  }
+
+  function attachWatcher() {
+    closeWatcher()
+    if (!started || stopped || !cleanPath) return
+    try {
+      watcher = watch(cleanPath, () => {
+        pollOnce()
+      })
+      watcher.on('error', () => {
+        closeWatcher()
+      })
+      watcher.unref?.()
+    } catch {
+      watcher = null
+    }
+  }
 
   function initCursor() {
     if (!cleanPath) return
     try {
-      const st = statSync(cleanPath)
+      const st = statSync(cleanPath, { bigint: true })
+      hadInitialStat = true
       currentIno = st.ino
-      offset = startFromBeginning ? 0 : st.size
+      offset = startFromBeginning ? 0 : Number(st.size)
     } catch {
+      hadInitialStat = false
       currentIno = null
       offset = 0
     }
@@ -146,22 +173,34 @@ export function createTurnLogMeter({
     reading = true
     let fd = null
     try {
-      const st = statSync(cleanPath)
-      if (currentIno !== null && (st.ino !== currentIno || st.size < offset)) {
-        // Log rotated or truncated — reset cleanly to start of new file
+      const st = statSync(cleanPath, { bigint: true })
+      const size = Number(st.size)
+      if (currentIno === null) {
+        currentIno = st.ino
+        offset = !hadInitialStat || startFromBeginning ? 0 : size
+        remainder = ''
+        hadInitialStat = true
+        if (started && !watcher) attachWatcher()
+      } else if (st.ino !== currentIno) {
+        // Log rotated via `create` (new inode) — reset cleanly and re-attach watcher to new file
         currentIno = st.ino
         offset = 0
         remainder = ''
-      } else if (currentIno === null) {
-        currentIno = st.ino
-        offset = startFromBeginning ? 0 : st.size
+        if (started) attachWatcher()
+      } else if (size < offset) {
+        // Log truncated in place (`copytruncate`) — reset cleanly to start of file
+        offset = 0
+        remainder = ''
+        if (started && !watcher) attachWatcher()
+      } else if (started && !watcher) {
+        attachWatcher()
       }
-      if (st.size <= offset) return
+      if (size <= offset) return
 
       fd = openSync(cleanPath, 'r')
       const MAX_BATCH = 256 * 1024
-      while (offset < st.size) {
-        const toRead = Math.min(MAX_BATCH, st.size - offset)
+      while (offset < size) {
+        const toRead = Math.min(MAX_BATCH, size - offset)
         const buf = Buffer.allocUnsafe(toRead)
         const bytesRead = readSync(fd, buf, 0, toRead, offset)
         if (bytesRead <= 0) break
@@ -180,20 +219,13 @@ export function createTurnLogMeter({
 
   function start() {
     if (!cleanPath || stopped) return
+    started = true
     initCursor()
+    if (currentIno !== null) {
+      attachWatcher()
+    }
     if (startFromBeginning) {
       pollOnce()
-    }
-    try {
-      watcher = watch(cleanPath, () => {
-        pollOnce()
-      })
-      watcher.on('error', () => {
-        try { watcher?.close?.() } catch {}
-        watcher = null
-      })
-    } catch {
-      watcher = null
     }
     timer = setInterval(pollOnce, Math.max(500, Number(pollIntervalMs) || 3_000))
     timer.unref?.()
@@ -201,14 +233,12 @@ export function createTurnLogMeter({
 
   function stop() {
     stopped = true
+    started = false
     if (timer) {
       clearInterval(timer)
       timer = null
     }
-    if (watcher) {
-      try { watcher.close() } catch {}
-      watcher = null
-    }
+    closeWatcher()
   }
 
   return { start, stop, pollOnce }

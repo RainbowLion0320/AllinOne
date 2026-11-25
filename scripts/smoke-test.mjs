@@ -81,19 +81,15 @@ import {
 } from '../packages/dsh-mobile-hub/src/helpers/interactive-schema.js'
 import { EVENTS, RPC, parseCompositeId, toEpochMs } from '../packages/shared/src/protocol.js'
 import {
-  E2EE_METHOD_MARKER,
   base64UrlToBytes,
-  bytesToBase64,
   computeE2eeKeyId,
   computeGrantPubKeyFp,
   decryptAutoStream,
-  decryptBytes,
   decryptGrantPayload,
   decryptJson,
   deriveGrantSas,
   encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
-  encryptBytes,
   encryptChunkedBytes,
   encryptGrantPayload,
   encryptJson,
@@ -112,7 +108,6 @@ import {
   getDeviceDisplayName,
   loadDeviceState,
   removeDevice,
-  renameDevice,
   saveDeviceState,
   selectDevice,
   upsertDevice,
@@ -120,6 +115,7 @@ import {
 } from '../packages/mobile-app/src/lib/deviceStore.js'
 import {
   clearSessionCache,
+  formatBytesCompact,
   getSessionCacheStats,
   loadCachedSession,
   reconcileCachedWithFreshPage,
@@ -584,18 +580,6 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
     return peer.sendEncryptedRpc(method, params)
   }
 
-  const sendLegacyRelayRpc = (frame) =>
-    new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        relayPending.delete(frame.id)
-        reject(new Error(`Relay RPC timeout: ${frame.id}`))
-      }, 5_000)
-      relayPending.set(frame.id, {
-        resolve: (m) => { clearTimeout(timer); resolve(m) },
-      })
-      ws.send(JSON.stringify(frame))
-    })
-
   const closeAll = async () => {
     for (const p of peers.values()) await p.close()
     peers.clear()
@@ -609,7 +593,6 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
     p2pEvents,
     connectP2p,
     sendEncryptedRpc,
-    sendLegacyRelayRpc,
     closeAll,
     getClosedCode: () => closedCode,
   }
@@ -936,20 +919,8 @@ async function main() {
       assert.equal(r.status, 404, `Removed v0.5 data-plane endpoint ${method} ${path} must return 404`)
     }
 
-    // Legacy WS data-plane rpc.req must be explicitly rejected with P2P_REQUIRED
-    const legacyRpcCheckCli = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'legacy-rpc-check' })
-    const legacyRpcRes = await legacyRpcCheckCli.sendLegacyRelayRpc({
-      type: 'rpc.req',
-      id: 'legacy-rpc-1',
-      method: E2EE_METHOD_MARKER,
-      bridgeId: smokeDev.bridgeId,
-    })
-    assert.equal(legacyRpcRes.ok, false)
-    assert.equal(legacyRpcRes.error?.code, 'P2P_REQUIRED', 'Server must reject legacy WS rpc.req with P2P_REQUIRED')
-    await legacyRpcCheckCli.closeAll()
-
     const bundlePath = join(process.cwd(), 'packages/mobile-app/public/downloads/allinone-bridge.mjs')
-    console.log('[smoke] 6/6 Multi-tenant isolation, deleted legacy/upload routes & P2P_REQUIRED enforcement OK')
+    console.log('[smoke] 6/6 Multi-tenant isolation & deleted v0.5 upload/media routes OK')
 
     // 7. Multi-device switching, /api/auth/me status probing, strict bridgeId routing, & scoped cache isolation
     const meA = await (await fetch(`${httpBase}/api/auth/me`, {
@@ -1033,9 +1004,8 @@ async function main() {
     assert.equal(dState.devices.length, 1, 'Legacy owner and rm_* entries must be purged automatically on load')
     assert.equal(dState.devices[0].roomId, friendA.roomId)
 
-    // Rename Account A and add Account B -> both coexist
+    // Add Account B -> both coexist cleanly
     const devAId = dState.devices[0].id
-    dState = renameDevice(dState, devAId, '公司 Mac')
     const addedB = upsertDevice(dState, {
       baseUrl: httpBase,
       token: friendB.token,
@@ -1043,15 +1013,14 @@ async function main() {
       username: 'friend_b',
       label: '家里 Windows',
       bridges: [],
-      authMode: 'account',
     })
     assert.equal(addedB.isNew, true)
     dState = addedB.state
     assert.equal(dState.devices.length, 2, 'Adding 2nd account must preserve 1st account')
     assert.equal(getActiveDevice(dState).id, addedB.device.id)
-    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac')
+    assert.equal(getDeviceDisplayName(dState.devices[0]), meA.bridges[0].hostname)
 
-    // Re-logging into Account A refreshes token in-place and preserves customName
+    // Re-logging into Account A refreshes token in-place and preserves lastHostname
     const repairedA = upsertDevice(dState, {
       baseUrl: httpBase,
       token: `${friendA.token}-refreshed`,
@@ -1059,12 +1028,11 @@ async function main() {
       username: 'friend_a',
       label: 'Friend-A-PC',
       bridges: meA.bridges,
-      authMode: 'account',
     })
     assert.equal(repairedA.isNew, false)
     dState = repairedA.state
     assert.equal(dState.devices.length, 2)
-    assert.equal(getDeviceDisplayName(dState.devices[0]), '公司 Mac', 'Re-login must keep custom nickname')
+    assert.equal(getDeviceDisplayName(dState.devices[0]), meA.bridges[0].hostname, 'Re-login must keep device display name')
     assert.equal(dState.devices[0].token, `${friendA.token}-refreshed`)
 
     // Switch back to Account B and verify save/reload persistence
@@ -2295,8 +2263,10 @@ async function main() {
       assert.equal(translate('en', 'time.minsAgo', { n: 5 }), '5m ago')
       assert.equal(bi('zh', '设置', 'Settings'), '设置')
       assert.equal(bi('en', '设置', 'Settings'), 'Settings')
-      assert.equal(getDeviceDisplayName(null, null, 0, 'en'), 'No Computer')
-      assert.equal(getDeviceDisplayName(null, null, 0, 'zh'), '未选择电脑')
+      assert.equal(getDeviceDisplayName(null, null, 'en'), 'No Computer')
+      assert.equal(getDeviceDisplayName(null, null, 'zh'), '未选择电脑')
+      assert.equal(formatBytesCompact(1024 * 1024 * 1024), '1 GB')
+      assert.equal(formatBytesCompact(51200 * 1024 * 1024), '50 GB')
       // Restore cache to default zh for clean test end
       saveLang('zh', langStorage)
     }
@@ -4685,13 +4655,14 @@ async function main() {
       assert.equal(afterDeskCfg.e2eeKey, deskKey2)
       assert.equal(afterDeskCfg.autoStartDisabled, undefined, 'setE2eeKey must clear autoStartDisabled when bridge is enabled')
 
-      // 25.4 Setup scripts LF/UTF-8 & Node 20+ check + unused icon.svg removed
+      // 25.4 Setup scripts LF/UTF-8 & Node 22+ check + sandbox-preview.html present + unused icon.svg removed
       const distSetupSh = readFileSync(join(process.cwd(), 'packages/mobile-app/dist/setup.sh'))
       assert.equal(distSetupSh.includes(0x0d), false, 'dist/setup.sh must have zero CR (\\r) bytes')
-      assert.match(distSetupSh.toString('utf8'), /-lt 20/, 'setup.sh must enforce Node.js v20+')
+      assert.match(distSetupSh.toString('utf8'), /-lt 22/, 'setup.sh must enforce Node.js v22+')
       const distSetupPs1 = readFileSync(join(process.cwd(), 'packages/mobile-app/dist/setup.ps1'), 'utf8')
       assert.match(distSetupPs1, /UTF8Encoding/, 'setup.ps1 must write Desktop .cmd using UTF-8 (non-ASCII safe)')
-      assert.match(distSetupPs1, /-lt 20/, 'setup.ps1 must enforce Node.js v20+')
+      assert.match(distSetupPs1, /-lt 22/, 'setup.ps1 must enforce Node.js v22+')
+      assert.equal(existsSync(join(process.cwd(), 'packages/mobile-app/dist/sandbox-preview.html')), true, 'dist/sandbox-preview.html must exist for HTML preview')
       assert.equal(existsSync(join(process.cwd(), 'packages/mobile-app/dist/icon.svg')), false, 'Unused icon.svg must not exist in dist/')
 
       // 25.5 Mobile upsertDevice loginEmail2fa preservation & sessionCache unbridged scope safety
@@ -5499,7 +5470,7 @@ async function main() {
         await docOrch.dispose()
       }
     }
-    console.log('[smoke] 32/32 Deliverable document E2EE download (HTML/PDF/Word/Excel/PPT, 10MB cap, security guards & extractor) OK')
+    console.log('[smoke] 32/32 Deliverable document E2EE download (HTML/PDF/Word/Excel/PPT, P2P bulk stream, security guards & extractor) OK')
 
     // 33. Built-in Stateless RFC 5389 STUN Server (UDP) & Pure Control Plane Mode (v1.0.0)
     {
@@ -5576,7 +5547,7 @@ async function main() {
         assert.equal(sOv.server.stun.enabled, true)
         assert.equal(sOv.server.stun.port, stunPort)
         assert.ok(sOv.server.stun.requests >= 1, 'Admin overview must record STUN binding hit count')
-        assert.equal(sOv.server.storage.uploadFileCount, 0)
+        assert.equal(sOv.server.storage, undefined, 'Obsolete v0.5 server.storage field must be removed')
       } finally {
         await stunRelay.close()
       }
@@ -6009,6 +5980,14 @@ async function main() {
         })).json()
         assert.equal(qAdmin.ok, true)
 
+        // Strict tier validation on POST /api/admin/invites (invalid tier -> HTTP 400)
+        const badInv = await fetch(`${qBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+          body: JSON.stringify({ count: 1, tier: 'enterprise' }),
+        })
+        assert.equal(badInv.status, 400, 'Invalid tier on POST /api/admin/invites must return 400')
+
         const invRes = await (await fetch(`${qBase}/api/admin/invites`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
@@ -6160,6 +6139,26 @@ async function main() {
           assert.equal(resetMsg.quotaExceeded, false)
           assert.equal(resetMsg.turnQuota.usedBytes, 0)
           assert.equal(resetMsg.iceServers.length, 3, 'Resetting monthly TURN usage must restore TURN credentials')
+
+          // Promoting user to admin via set-tier must unlock /api/admin/overview IMMEDIATELY on their existing JWT (no re-login!)
+          const promoUpdP = waitNextIceUpdate(5000)
+          const promoRes = await (await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'admin' }),
+          })).json()
+          assert.equal(promoRes.ok, true)
+          assert.equal(promoRes.tier, 'admin')
+          await promoUpdP
+          const promotedOv = await fetch(`${qBase}/api/admin/overview`, {
+            headers: { Authorization: `Bearer ${qFree.token}` },
+          })
+          assert.equal(promotedOv.status, 200, 'Newly promoted admin must access /api/admin/overview immediately without re-login')
+          const promotedMe = await (await fetch(`${qBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${qFree.token}` },
+          })).json()
+          assert.equal(promotedMe.role, 'admin')
+          assert.equal(promotedMe.user.role, 'admin', '/api/auth/me user.role must match live role')
         } finally {
           await qCli.closeAll()
         }

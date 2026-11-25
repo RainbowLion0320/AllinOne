@@ -182,12 +182,13 @@ export function DeviceSwitcherModal({
           const result = await probeDeviceStatus(d, 5000)
           setProbes((prev) => ({ ...prev, [d.id]: result }))
           const firstOnline = result.bridges.find((b) => b.online) || result.bridges[0] || null
-          if (firstOnline || result.label || result.username || result.email) {
+          if (firstOnline || result.label || result.username || result.email || result.role || result.tier) {
             onSyncDeviceMeta?.(d.id, {
               ...(result.label ? { label: result.label } : {}),
               ...(result.username ? { username: result.username } : {}),
               ...(result.email !== undefined ? { email: result.email } : {}),
               ...(result.role ? { role: result.role } : {}),
+              ...(result.tier ? { tier: result.tier } : {}),
               ...(firstOnline?.hostname ? { lastHostname: firstOnline.hostname } : {}),
               ...(firstOnline?.platform ? { lastPlatform: firstOnline.platform } : {}),
             })
@@ -847,7 +848,7 @@ export function DeviceSwitcherModal({
           )}
 
           {/* Signed-in Controlling / Monitoring Clients Security Audit Section */}
-          {clientSessions?.supported !== false && (sessionList.length > 0 || effectiveOnlineClients > 0) && (
+          {(sessionList.length > 0 || effectiveOnlineClients > 0) && (
             <div className="space-y-2 pt-1">
               <div className="flex items-center justify-between gap-2 px-1">
                 <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
@@ -907,6 +908,7 @@ export function DeviceSwitcherModal({
                 </div>
               )}
 
+              {sessionList.length > 0 && (
               <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#171920]">
                 {sessionList.map((s, idx) => {
                   const rowKey = s.sid || s.clientId || `sess-${idx}`
@@ -993,6 +995,7 @@ export function DeviceSwitcherModal({
                   )
                 })}
               </div>
+              )}
             </div>
           )}
 
@@ -1012,7 +1015,7 @@ export function DeviceSwitcherModal({
                   null
 
                 const status = probe ? probe.status : 'probing'
-                const displayName = getDeviceDisplayName(device, primaryBridge, 1, lang)
+                const displayName = getDeviceDisplayName(device, primaryBridge, lang)
                 const platformLabel = formatPlatformLabel(primaryBridge?.platform || device.lastPlatform)
                 const isConfirmingDelete = confirmDeleteId === device.id
 

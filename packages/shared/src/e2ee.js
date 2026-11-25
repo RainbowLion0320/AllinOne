@@ -18,8 +18,6 @@ export const E2EE_KEY_BYTES = 32
 export const E2EE_IV_BYTES = 12
 export const E2EE_CHUNK_SIZE = 4 * 1024 * 1024
 export const E2EE_CHUNKED_THRESHOLD = 32 * 1024 * 1024
-export const E2EE_METHOD_MARKER = '__e2ee__'
-export const E2EE_EVENT_MARKER = '__e2ee__'
 export const E2EE_URI_PREFIX = 'allinone-e2ee://v1'
 export const E2EE_GRANT_URI_PREFIX = 'allinone-e2ee-grant://v1'
 
@@ -565,50 +563,70 @@ export async function decryptAutoStream(
 
   // Peek first 4 bytes from stream to detect AIO2 vs v1 cleanly
   const iter = iterateByteSource(streamOrBytes)[Symbol.asyncIterator]()
-  const preQueue = new ByteQueue()
-  let done = false
-  while (preQueue.byteLength < 4) {
-    const step = await iter.next()
-    if (step.done) {
-      done = true
-      break
-    }
-    preQueue.push(step.value)
+  let iterDone = false
+  let iterClosed = false
+  const closeIter = async () => {
+    if (iterDone || iterClosed) return
+    iterClosed = true
+    try {
+      await iter.return?.()
+    } catch {}
   }
-  const head4 = preQueue.peek(4)
-  const replayStream = (async function* () {
-    const buffered = preQueue.shift(preQueue.byteLength)
-    if (buffered && buffered.byteLength > 0) yield buffered
-    if (done) return
-    while (true) {
+
+  try {
+    const preQueue = new ByteQueue()
+    while (preQueue.byteLength < 4) {
       const step = await iter.next()
-      if (step.done) break
-      yield step.value
+      if (step.done) {
+        iterDone = true
+        break
+      }
+      preQueue.push(step.value)
     }
-  })()
+    const head4 = preQueue.peek(4)
+    const replayStream = (async function* () {
+      try {
+        const buffered = preQueue.shift(preQueue.byteLength)
+        if (buffered && buffered.byteLength > 0) yield buffered
+        if (iterDone) return
+        while (true) {
+          const step = await iter.next()
+          if (step.done) {
+            iterDone = true
+            break
+          }
+          yield step.value
+        }
+      } finally {
+        await closeIter()
+      }
+    })()
 
-  if (head4 && isChunkedE2eeHeader(head4)) {
-    return decryptChunkedStream(rawKeyStr, replayStream, { iv, kid, kind, roomId, onPlainChunk })
-  }
+    if (head4 && isChunkedE2eeHeader(head4)) {
+      return await decryptChunkedStream(rawKeyStr, replayStream, { iv, kid, kind, roomId, onPlainChunk })
+    }
 
-  const parts = []
-  let total = 0
-  for await (const c of replayStream) {
-    parts.push(c)
-    total += c.byteLength
+    const parts = []
+    let total = 0
+    for await (const c of replayStream) {
+      parts.push(c)
+      total += c.byteLength
+    }
+    const full = new Uint8Array(total)
+    let pos = 0
+    for (const c of parts) {
+      full.set(c, pos)
+      pos += c.byteLength
+    }
+    const plain = await decryptBytes(rawKeyStr, full, { iv, kid, kind, roomId })
+    if (onPlainChunk) {
+      await onPlainChunk(plain)
+      return { totalPlainBytes: plain.byteLength }
+    }
+    return { totalPlainBytes: plain.byteLength, chunks: [plain] }
+  } finally {
+    await closeIter()
   }
-  const full = new Uint8Array(total)
-  let pos = 0
-  for (const c of parts) {
-    full.set(c, pos)
-    pos += c.byteLength
-  }
-  const plain = await decryptBytes(rawKeyStr, full, { iv, kid, kind, roomId })
-  if (onPlainChunk) {
-    await onPlainChunk(plain)
-    return { totalPlainBytes: plain.byteLength }
-  }
-  return { totalPlainBytes: plain.byteLength, chunks: [plain] }
 }
 
 export async function encryptJson(rawKeyStr, data, { kind = 'msg', roomId = '' } = {}) {

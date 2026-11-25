@@ -1,6 +1,4 @@
 import os from 'node:os'
-import { existsSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
 import { APP_LIST } from '@allinone/shared'
 
 function normalizeApps(rawApps) {
@@ -30,7 +28,7 @@ function normalizePlatformBucket(platform) {
 }
 
 /**
- * Compute an on-demand server resource & storage snapshot.
+ * Compute an on-demand server resource snapshot.
  * Zero background polling timers — only runs when an admin opens or refreshes `/admin`.
  */
 export function collectServerHealth({
@@ -39,7 +37,7 @@ export function collectServerHealth({
   turn = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '1.0.5',
+  version = '1.0.6',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -78,10 +76,6 @@ export function collectServerHealth({
     },
     stun: stun || { enabled: false, port: 0, requests: 0 },
     turn: turn || { enabled: false, host: '', port: 0 },
-    storage: {
-      uploadFileCount: 0,
-      uploadTotalBytes: 0,
-    },
     features: {
       emailEnabled: Boolean(mailer?.isConfigured?.()),
       emailProvider: mailer?.getProvider?.() || 'none',
@@ -156,7 +150,6 @@ export function buildAdminOverview({
   }
 
   const userStatusDist = { active: 0, bridgeOnly: 0, clientOnly: 0, offline: 0 }
-  const tierDistribution = { free: 0, pro: 0, ultra: 0, admin: 0 }
   let totalBoundDevices = 0
   let recent24hUsers = 0
   let totalTurnUsedBytes = 0
@@ -165,9 +158,7 @@ export function buildAdminOverview({
     const roomBridges = bridgesByRoom.get(u.userId) || []
     const roomClients = clientsByRoom.get(u.userId) || []
     const rStats = hub.getRoomStats(u.userId)
-    const plan = u.role === 'admin' ? 'free' : (u.plan || 'free')
-    const tier = u.tier || (u.role === 'admin' ? 'admin' : plan)
-    if (tierDistribution[tier] !== undefined) tierDistribution[tier] += 1
+    const tier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
     const turnQuota = typeof getTurnQuota === 'function' ? getTurnQuota(u.userId) : null
     totalTurnUsedBytes += Number(turnQuota?.usedBytes ?? u.turnUsage?.bytes ?? 0)
 
@@ -287,7 +278,6 @@ export function buildAdminOverview({
       email: u.email || '',
       emailVerified: Boolean(u.emailVerified),
       role: u.role,
-      plan,
       tier,
       turnQuota,
       isCurrentAdmin: currentAdminRoom === u.userId,
@@ -366,11 +356,9 @@ export function buildAdminOverview({
       totalTurnUsedBytes,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
-      tierDistribution,
     },
     distributions: {
       userStatus: userStatusDist,
-      userTiers: tierDistribution,
       apps: appStats,
       bridgePlatforms,
       clientKinds,

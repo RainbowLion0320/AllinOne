@@ -52,7 +52,7 @@ function openDb() {
   return dbPromise
 }
 
-export function makeScopedCacheKey(sessionId, scope = '') {
+function makeScopedCacheKey(sessionId, scope = '') {
   const sid = String(sessionId || '')
   const sc = String(scope || '').trim()
   return sc ? `${sc}::${sid}` : sid
@@ -141,7 +141,7 @@ export async function loadCachedSession(sessionId, scope = '') {
   return record
 }
 
-export async function deleteCachedSession(sessionId, scope = '') {
+async function deleteCachedSession(sessionId, scope = '') {
   if (!sessionId) return
   const cacheKey = makeScopedCacheKey(sessionId, scope)
   memoryFallback.delete(cacheKey)
@@ -376,10 +376,22 @@ export async function clearSessionCache(scopeOrPrefix = '', { prefix = false } =
 }
 
 export function formatBytesCompact(bytes) {
-  const n = Number(bytes || 0)
-  if (n < 1024) return `${n} B`
+  const n = Math.max(0, Number(bytes) || 0)
+  if (!Number.isFinite(n)) return '0 B'
+  if (n < 1024) return `${Math.round(n)} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`
+  const gbUnit = 1024 * 1024 * 1024
+  if (n < gbUnit) {
+    const mb = n / (1024 * 1024)
+    return `${mb >= 100 ? mb.toFixed(1).replace(/\.0$/, '') : mb.toFixed(2).replace(/\.?0+$/, '')} MB`
+  }
+  const tbUnit = gbUnit * 1024
+  if (n < tbUnit) {
+    const gb = n / gbUnit
+    return `${gb >= 10 ? gb.toFixed(1).replace(/\.0$/, '') : gb.toFixed(2).replace(/\.?0+$/, '')} GB`
+  }
+  const tb = n / tbUnit
+  return `${tb >= 10 ? tb.toFixed(1).replace(/\.0$/, '') : tb.toFixed(2).replace(/\.?0+$/, '')} TB`
 }
 
 /**

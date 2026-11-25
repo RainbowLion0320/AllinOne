@@ -48,7 +48,7 @@ const DELIVERABLE_META = {
   zip: { kind: 'archive', badge: 'ZIP', previewable: false, tone: 'violet' },
 }
 
-export function cleanFileTarget(raw) {
+function cleanFileTarget(raw) {
   let s = String(raw || '').trim()
   if (!s) return ''
   if (
@@ -64,11 +64,11 @@ export function cleanFileTarget(raw) {
   return s
 }
 
-export function isRemoteHttpUrl(raw) {
+function isRemoteHttpUrl(raw) {
   return /^(?:https?:\/\/|mailto:|tel:|data:|blob:|[a-z]:\/\/)/i.test(String(raw || '').trim())
 }
 
-export function getDeliverableExt(raw) {
+function getDeliverableExt(raw) {
   const clean = stripQueryHash(cleanFileTarget(raw))
   const m = clean.match(/\.([a-z0-9]+)$/i)
   return m ? m[1].toLowerCase() : ''
@@ -107,7 +107,7 @@ export function getDeliverableName(raw, fallback = 'document') {
   }
 }
 
-export function formatShortPath(raw) {
+function formatShortPath(raw) {
   const clean = stripQueryHash(cleanFileTarget(raw))
     .replace(/^file:\/\/(?:localhost)?/i, '')
   let decoded = clean

@@ -51,7 +51,7 @@
   </tr>
 </table>
 
-> All in One runs a **Pure Control Plane + 100% Direct WebRTC P2P (`AIO-P2P v1`)** architecture: your server handles only authentication, device presence, encrypted signaling, and a built-in stateless STUN server (`UDP 3478`). **Every chat message, tool call, image, and multi-GB file flows peer-to-peer between your phone and computer — 0 bytes relayed through your server** — while preserving your local workspaces, session history, and vendor prompt caches.
+> All in One runs a **Pure Control Plane + Direct WebRTC P2P-First (`AIO-P2P v1`) + Optional Encrypted TURN Fallback** architecture: your server handles only authentication, device presence, encrypted signaling, and a built-in stateless STUN server (`UDP 3478`), with zero control-plane payload relay or temporary file storage. Under typical networks, phone and computer connect via **`⚡ P2P` direct peer-to-peer (0 bytes through your server, permanently unlimited)**; behind strict double-symmetric NATs, connections seamlessly fall back to encrypted **`⚡ Relay`** (optional self-hosted `coturn` or tiered Cloudflare Realtime TURN — still strictly DTLS + AES-256-GCM ciphertext-only) while preserving your local workspaces, session history, and vendor prompt caches.
 
 ---
 
@@ -64,8 +64,8 @@
       <p>Control your local <strong>Codex</strong>, <strong>Claude Code / Desktop</strong>, <strong>Antigravity</strong>, and <strong>DeepSeek Harness</strong> sessions grouped by project or time from a single unified UI.</p>
     </td>
     <td width="50%" valign="top">
-      <h4>⚡ 100% Direct WebRTC P2P Data Plane</h4>
-      <p>Dual-layered <code>AES-256-GCM</code> + DTLS DataChannels connect phone and PC directly with <strong>0 bytes of server bandwidth</strong>; includes a built-in zero-dep RFC 5389 STUN server on <code>UDP 3478</code> — no traffic caps or tier quotas.</p>
+      <h4>⚡ Direct WebRTC P2P First + Optional Encrypted TURN</h4>
+      <p>Defaults to <strong><code>⚡ P2P</code> direct DataChannels</strong> (<code>AES-256-GCM</code> + DTLS, <strong>0 bytes of server traffic, permanently unlimited</strong>) with built-in RFC 5389 STUN (<code>UDP 3478</code>); automatically falls back to encrypted <strong><code>⚡ Relay</code></strong> on double-symmetric NATs (optional self-hosted <code>coturn</code> with 4-tier monthly quotas or tiered Cloudflare Realtime TURN's free 1 TB/mo pool) with automatic <strong>Relay Data-Saver</strong> (tap-to-load images).</p>
     </td>
   </tr>
   <tr>
@@ -85,7 +85,7 @@
     </td>
     <td width="50%" valign="top">
       <h4>🐳 Featherweight Self-Hosting, MIT Open Source</h4>
-      <p>With zero payload relay or temp file storage, even a tiny 1-vCPU VPS runs effortlessly via one <code>docker compose</code> command (auto HTTPS + built-in STUN) plus an on-demand <code>/admin</code> dashboard.</p>
+      <p>With zero control-plane payload relay or temp file storage, even a tiny 1-vCPU VPS runs effortlessly via one <code>docker compose</code> command (auto HTTPS + built-in STUN + optional <code>coturn</code> / Cloudflare TURN) plus an on-demand <code>/admin</code> dashboard.</p>
     </td>
   </tr>
 </table>
@@ -168,11 +168,11 @@ All in One is built around **6 layers of zero-knowledge defense-in-depth** — e
 | Layer | Mechanism | Guarantee |
 | :--- | :--- | :--- |
 | **1. Mandatory E2EE** | `AES-256-GCM` + 256-bit room key + AAD bound to room & message type | All chats, tool calls, attachments, local images & quotas are encrypted client-side; bridges reject plaintext RPCs with anti-replay IV tracking |
-| **2. Pure Control Plane (0 B Relayed)** | No data-plane relay or server file storage — only auth, encrypted WebRTC signaling & stateless STUN (`UDP 3478`) | Chats, code, images & large files travel 100% peer-to-peer over WebRTC DataChannels (DTLS + AES-256-GCM) |
+| **2. Pure Control Plane + P2P First / Encrypted TURN** | No control-plane data relay or `/api/uploads` storage — only auth, encrypted WebRTC signaling, stateless STUN (`UDP 3478`) & optional short-lived TURN credentials | Direct **`⚡ P2P`** carries 0 server traffic (permanently unlimited); double-symmetric NATs optionally fall back to encrypted **`⚡ Relay`** (self-hosted `coturn` 4-tier monthly quotas `free` 1 GB / `pro` 10 GB / `ultra` 50 GB / `admin` 50 GB, or tiered Cloudflare TURN) — still strictly DTLS + AES-256-GCM ciphertext-only with Relay Data-Saver tap-to-load images |
 | **3. Zero-Knowledge Device Grant** | Offline QR scan **or** `ECDH P-256` + `HKDF-SHA256` + **6-digit SAS** | Remote key sync derives an independent 6-digit verification code on both devices to prevent MITM attacks |
 | **4. Zero Open Inbound Ports** | PC bridges initiate **outbound WSS** control + **STUN UDP traversal** only | No router port forwarding, no public SSH/daemon exposure on your home or office machine |
 | **5. OS Hardware Key Storage** | macOS Keychain / Windows DPAPI (Electron `safeStorage`) | 256-bit E2EE keys are encrypted by your OS credential vault instead of plaintext files |
-| **6. Account & Instant P2P Revocation** | Single-use invites + optional Email 2FA + one-time WS tickets + live `client.revoked` push | Revoking any lost device immediately instructs PC bridges to tear down its P2P DataChannels in milliseconds (verified by 34 automated tests) |
+| **6. Account & Instant P2P Revocation** | Single-use invites + optional Email 2FA + one-time WS tickets + live `client.revoked` push | Revoking any lost device immediately instructs PC bridges to tear down its P2P DataChannels in milliseconds (verified by 38 automated security & P2P/TURN test suites) |
 
 ### Architecture
 
@@ -184,7 +184,8 @@ flowchart LR
   end
 
   subgraph Control["Pure Control Plane Server (HTTPS / WSS + Built-in STUN UDP 3478)"]
-    R["@allinone/relay-server<br/>Auth · Presence · Encrypted Signaling · Stateless STUN<br/>(0 Bytes of Payload Relayed)"]
+    R["@allinone/relay-server<br/>Auth · Presence · Encrypted Signaling · Stateless STUN<br/>Dynamic TURN Credentials & Quota Meter · Cloudflare TURN Routing"]
+    T["Optional Encrypted TURN Fallback (⚡ Relay)<br/>Self-Hosted coturn / Cloudflare Realtime TURN<br/>(DTLS + AES-256-GCM Ciphertext Only)"]
   end
 
   subgraph PCs["Your Computers (Outbound WSS + WebRTC NAT Traversal · Zero Open Ports)"]
@@ -196,8 +197,10 @@ flowchart LR
   M -.->|"Auth / Encrypted SDP Signaling / STUN only"| R
   D -.->|"Auth / Encrypted SDP Signaling / STUN only"| R
   R -.->|"Control Signaling / Instant Revocation only"| B1
-  M <==>|"100% Direct P2P (DTLS + AES-256-GCM)<br/>aio-ctrl (RPC/Stream) + aio-bulk (Files/Images)"| B1
-  D <==>|"100% Direct P2P (DTLS + AES-256-GCM)"| B1
+  M <==>|"Preferred ⚡ P2P Direct (DTLS + AES-256-GCM · 0 Traffic, Unlimited)<br/>aio-ctrl (RPC/Stream) + aio-bulk (Files/Images)"| B1
+  D <==>|"Preferred ⚡ P2P Direct (DTLS + AES-256-GCM)"| B1
+  M <-.->|"Double-Symmetric NAT Fallback ⚡ Relay (Data-Saver Images)"| T
+  T <-.->|"Double-Encrypted Ciphertext Only"| B1
 ```
 
 ---
@@ -212,7 +215,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 
 The interactive wizard finishes everything in under a minute:
 - **3 Deployment Modes**: ① Custom Domain + automatic Let's Encrypt HTTPS via Caddy (Recommended) · ② **Bare Public IP + trusted Let's Encrypt IP HTTPS** (no domain required) · ③ Control Plane Container Only (binds `127.0.0.1:8787` for existing Nginx / Caddy / Cloudflare Tunnel setups).
-- **Built-In Stateless STUN (`UDP 3478`)**: The container exposes **`UDP 3478`** for zero-dependency RFC 5389 NAT discovery (open `UDP 3478` in your cloud firewall / security group). Zero data-plane relay traffic means even a 1-vCPU VPS stays idle under heavy file transfers.
+- **Built-In Stateless STUN (`UDP 3478`) + Optional Encrypted TURN**: The container exposes **`UDP 3478`** for zero-dependency RFC 5389 NAT discovery (open `UDP 3478` in your cloud firewall / security group). Direct **`⚡ P2P`** stays at 0 server traffic permanently; for strict double-symmetric NATs, optionally enable self-hosted `coturn` (with 4-tier monthly quotas) or Cloudflare Realtime TURN's free 1 TB/mo pool via `.env`.
 - **Secure Defaults**: Automatically generates a 256-bit `JWT_SECRET` (`chmod 600 .env`) with an optional Email 2FA / SMTP wizard (Gmail, QQ Mail, 163 Mail, or custom SMTP).
 - **Ready to Sign Up**: Runs a health check, automatically issues your first single-use admin invite code + clickable registration link, and supports zero-downtime upgrades via `--upgrade`.
 
@@ -272,13 +275,44 @@ SMTP_FROM=All in One <your-email@gmail.com>
 </details>
 
 <details>
+<summary>Optional: Configure encrypted TURN fallback (self-hosted coturn 4-tier quotas / Cloudflare Realtime TURN 1 TB free pool)</summary>
+
+Direct **`⚡ P2P`** connections always use **0 server traffic and are permanently unlimited**. Encrypted **`⚡ Relay`** is only engaged when both peers sit behind strict symmetric NATs — TURN nodes only ever see DTLS + `AES-256-GCM` ciphertext, and clients automatically enable **Relay Data-Saver** (tap-to-load images).
+
+1. **Self-hosted `coturn` dynamic credentials & 4-tier monthly quotas** (add to `deploy/.env`; if co-hosting `coturn` on host `UDP 3478`, set `STUN_PORT=off` and comment out the `3478/udp` mapping in `docker-compose.yml`):
+   ```env
+   STUN_PORT=off
+   TURN_HOST=ai.yourdomain.com
+   TURN_PORT=3478
+   TURN_SECRET=strong-random-secret-matching-coturn-static-auth-secret
+   TURN_TTL_SEC=600
+   # Optional: bind-mount /var/log/coturn/turn.log:ro to enforce per-user monthly quotas
+   TURN_LOG_FILE=/var/log/coturn/turn.log
+   TURN_QUOTA_FREE_MB=1024      # free: 1 GB/month (0 = unlimited)
+   TURN_QUOTA_PRO_MB=10240      # pro: 10 GB/month
+   TURN_QUOTA_ULTRA_MB=51200    # ultra / admin: 50 GB/month (admin strictly matches ultra)
+   ```
+2. **Optional tiered Cloudflare Realtime TURN (1 TB/month free pool)**:
+   ```env
+   CF_TURN_TOKEN_ID=your-cloudflare-turn-token-id
+   CF_TURN_API_TOKEN=your-cloudflare-turn-api-token
+   CF_TURN_TIERS=free           # defaults to routing free tier to Cloudflare 1 TB pool; pro/ultra/admin use self-hosted coturn
+   CF_TURN_TTL_SEC=3600
+   ```
+   > If the Cloudflare API is unconfigured or temporarily unreachable, the control plane gracefully falls back to self-hosted `coturn` / STUN without blocking connections.
+
+</details>
+
+<details>
 <summary>Common admin CLI commands</summary>
 
 ```bash
-npm run admin -- invite create --count 3 --note "for friend"
+npm run admin -- invite create --count 3 --tier free --note "for friend"   # --tier: free|pro|ultra|admin
+npm run admin -- invite create --count 1 --tier pro --note "pro member"
 npm run admin -- invite list
 npm run admin -- invite revoke INV-XXXX-XXXX
 npm run admin -- users
+npm run admin -- user tier <username-or-id> <free|pro|ultra|admin>
 ```
 
 </details>
@@ -344,14 +378,14 @@ You can also run **Actions → Build Desktop Installers → Run workflow** on yo
 ```text
 AllinOne/
 ├── packages/
-│   ├── shared/          # Shared protocol, AES-256-GCM / ECDH E2EE & offline QR SVG
-│   ├── relay-server/    # Blind relay gateway, accounts/invites, email 2FA, /admin & static hosting
-│   ├── dsh-mobile-hub/  # 4 AI agent adapters, weekly quota collector, CLI autofix & portable bridge
-│   ├── mobile-app/      # React + Tailwind + Vite PWA frontend
-│   └── desktop-app/     # Electron desktop app, OS keychain storage & DMG/NSIS packaging
-├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf
-├── scripts/             # Portable bridge bundler & 30-step E2E smoke + security test suite
-└── .github/workflows/   # CI checks & multi-platform release workflows
+│   ├── shared/          # Shared protocol, AES-256-GCM / ECDH E2EE, P2P mux (p2p-mux.js) & offline QR SVG
+│   ├── relay-server/    # Pure Control Plane, built-in STUN, dynamic TURN / 4-tier quota meter, Cloudflare TURN, /admin & static hosting
+│   ├── dsh-mobile-hub/  # 4 AI agent adapters, WebRTC P2P (werift), weekly quota collector, CLI autofix & portable bridge
+│   ├── mobile-app/      # React + Tailwind + Vite PWA frontend (WebRTC P2P & Relay Data-Saver)
+│   └── desktop-app/     # Electron desktop app, native libwebrtc worker (webrtc-proxy.js), OS keychain & DMG/NSIS packaging
+├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf / install.sh
+├── scripts/             # Portable bridge bundler & 38-suite E2E smoke + security test suite
+└── .github/workflows/   # CI checks, GHCR Docker publish & multi-platform release workflows
 ```
 
 Run the full end-to-end smoke & security test suite:

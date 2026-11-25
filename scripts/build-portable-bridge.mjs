@@ -1,6 +1,7 @@
 /**
- * Bundles `packages/dsh-mobile-hub/portable-cli.js` (+ `ws`) into a single self-contained
- * zero-install Node.js file at `packages/mobile-app/public/downloads/allinone-bridge.mjs`.
+ * Bundles `packages/dsh-mobile-hub/portable-cli.js` (+ `ws`, `werift`, and `@allinone/shared`)
+ * into a single self-contained zero-install Node.js file at
+ * `packages/mobile-app/public/downloads/allinone-bridge.mjs`.
  *
  * Optionally reads `PUBLIC_RELAY_URL` / `ALLINONE_SERVER` from environment or local `.env.local`
  * (gitignored) so self-hosted builds bake their own default server URL without touching Git source.
@@ -68,7 +69,7 @@ await esbuild.build({
   bundle: true,
   platform: 'node',
   format: 'esm',
-  target: 'node20',
+  target: 'node22',
   minify: true,
   sourcemap: false,
   legalComments: 'none',

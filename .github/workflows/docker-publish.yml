@@ -3,6 +3,8 @@ name: Publish Relay Docker Image
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
     paths:
       - "deploy/Dockerfile"
       - "packages/shared/**"
@@ -53,7 +55,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/allinone-relay
           labels: |
             org.opencontainers.image.title=All in One Relay Server
-            org.opencontainers.image.description=Zero-knowledge E2EE relay server for Codex, Claude Code, Antigravity, and DeepSeek Harness
+            org.opencontainers.image.description=Zero-knowledge E2EE pure control-plane & WebRTC P2P/TURN signaling server for Codex, Claude Code, Antigravity, and DeepSeek Harness
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=MIT
           tags: |

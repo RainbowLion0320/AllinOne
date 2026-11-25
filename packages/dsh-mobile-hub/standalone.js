@@ -10,7 +10,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
-import { normalizeE2eeKey } from './src/helpers/e2ee.js'
+import { normalizeE2eeKey } from '@allinone/shared/e2ee'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
@@ -62,10 +62,6 @@ export function startStandaloneBridge(options = {}) {
   const orchestrator = new MultiAppOrchestrator({
     ctx: null,
     config: {
-      relayUrl,
-      secret,
-      roomId,
-      e2eeKey,
       cwd,
       ...(options.inboundDir ? { inboundDir: options.inboundDir } : {}),
     },

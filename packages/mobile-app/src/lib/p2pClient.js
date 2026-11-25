@@ -22,6 +22,7 @@ const L = (zh, en) => bi(getCurrentLang(), zh, en)
 
 const P2P_CONNECT_TIMEOUT_MS = 15_000
 const P2P_KEEPALIVE_MS = 20_000
+const P2P_KEEPALIVE_TIMEOUT_MS = 45_000
 const MAX_P2P_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local disk safety cap (0 bytes via server)
 
 function createAsyncByteQueue() {
@@ -137,11 +138,14 @@ export class P2PPeerSession {
     this.remoteIceQueue = []
     this.remoteDescSet = false
 
+    this._readyChecking = false
     this._readyPromise = null
     this._readyResolve = null
     this._readyReject = null
     this._connectTimer = null
     this._keepaliveTimer = null
+    this._transportRecheckTimer = null
+    this._lastPongAt = 0
 
     this._reqSeq = 1
     this._uploadStreamSeq = 1
@@ -188,11 +192,16 @@ export class P2PPeerSession {
         }
       })
       if (!selectedPair) {
+        let nominatedPair = null
         stats.forEach((rep) => {
-          if (rep.type === 'candidate-pair' && (rep.selected || (rep.nominated && rep.state === 'succeeded'))) {
+          if (rep.type !== 'candidate-pair') return
+          if (rep.selected) {
             selectedPair = rep
+          } else if (!selectedPair && rep.nominated && rep.state === 'succeeded') {
+            nominatedPair = nominatedPair || rep
           }
         })
+        if (!selectedPair) selectedPair = nominatedPair
       }
       if (!selectedPair) return
       const localCand = selectedPair.localCandidateId ? stats.get(selectedPair.localCandidateId) : null
@@ -270,6 +279,14 @@ export class P2PPeerSession {
       const finalize = () => {
         if (this.closed || this.state === 'connected') return
         this._setState('connected', '', true)
+        if (!this.transportType && !this._transportRecheckTimer) {
+          this._transportRecheckTimer = setTimeout(() => {
+            this._transportRecheckTimer = null
+            if (!this.closed && !this.transportType) {
+              void this._detectIceTransport()
+            }
+          }, 1000)
+        }
         if (this._readyResolve) {
           const res = this._readyResolve
           this._readyResolve = null
@@ -289,10 +306,18 @@ export class P2PPeerSession {
 
   _startKeepalive() {
     this._stopKeepalive()
+    this._lastPongAt = Date.now()
     this._keepaliveTimer = setInterval(() => {
-      if (this.isOpen()) {
-        this._sendCtrlJson({ type: 'ping', ts: Date.now() })
+      if (!this.isOpen()) return
+      const now = Date.now()
+      if (this._lastPongAt > 0 && now - this._lastPongAt > P2P_KEEPALIVE_TIMEOUT_MS) {
+        this._failAndTeardown(
+          new Error(L('P2P 直连心跳超时，请重试连接', 'P2P keepalive timed out. Please reconnect.')),
+          'failed',
+        )
+        return
       }
+      this._sendCtrlJson({ type: 'ping', ts: now })
     }, P2P_KEEPALIVE_MS)
   }
 
@@ -310,6 +335,10 @@ export class P2PPeerSession {
     if (this._connectTimer) {
       clearTimeout(this._connectTimer)
       this._connectTimer = null
+    }
+    if (this._transportRecheckTimer) {
+      clearTimeout(this._transportRecheckTimer)
+      this._transportRecheckTimer = null
     }
     this._stopKeepalive()
     this.ctrlCodec.clear()
@@ -452,7 +481,9 @@ export class P2PPeerSession {
     pc.onconnectionstatechange = () => {
       if (this.closed || !this.pc) return
       const st = this.pc.connectionState
-      if (st === 'failed') {
+      if (st === 'connected') {
+        void this._detectIceTransport()
+      } else if (st === 'failed') {
         this._failAndTeardown(makeUnreachableError('ICE failed'), 'failed')
       } else if (st === 'closed') {
         this._failAndTeardown(new Error(L('P2P 连接已关闭', 'P2P connection closed')), 'failed')
@@ -461,7 +492,10 @@ export class P2PPeerSession {
 
     pc.oniceconnectionstatechange = () => {
       if (this.closed || !this.pc) return
-      if (this.pc.iceConnectionState === 'failed') {
+      const st = this.pc.iceConnectionState
+      if (st === 'connected' || st === 'completed') {
+        void this._detectIceTransport()
+      } else if (st === 'failed') {
         this._failAndTeardown(makeUnreachableError('ICE failed'), 'failed')
       }
     }
@@ -552,6 +586,7 @@ export class P2PPeerSession {
 
   _handleCtrlMessage(msg) {
     if (!msg || typeof msg !== 'object') return
+    this._lastPongAt = Date.now()
 
     if (msg.type === 'pong') return
     if (msg.type === 'ping') {
@@ -700,6 +735,7 @@ export class P2PPeerSession {
   }
 
   _handleBulkBytes(u8) {
+    this._lastPongAt = Date.now()
     const frame = decodeBulkFrame(u8)
     if (!frame) return
     const dl = this._activeDownloads.get(frame.streamId)
@@ -780,6 +816,7 @@ export class P2PPeerSession {
       headerResolve = res
       headerReject = rej
     })
+    headerPromise.catch(() => {})
 
     const dl = {
       queue,
@@ -870,6 +907,7 @@ export class P2PPeerSession {
       readyResolve = res
       readyReject = rej
     })
+    readyPromise.catch(() => {})
     const donePromise = new Promise((res, rej) => {
       doneResolve = res
       doneReject = rej

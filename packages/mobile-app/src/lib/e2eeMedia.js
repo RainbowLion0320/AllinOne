@@ -9,9 +9,61 @@ const L = (zh, en) => bi(getCurrentLang(), zh, en)
 const MAX_BLOB_CACHE = 48
 /** @type {Map<string, { url: string, ts: number }>} */
 const blobUrlCache = new Map()
-/** @type {Map<string, Promise<string>>} */
+/** @type {Map<string, { promise: Promise<string>, controller: AbortController | null, waiters: number }>} */
 const inflightLoads = new Map()
 let cacheEpoch = 0
+
+function makeAbortError() {
+  const err = new Error('Image load aborted')
+  err.name = 'AbortError'
+  return err
+}
+
+function attachSignal(entry, signal) {
+  if (!signal) {
+    entry.waiters += 1
+    return entry.promise.finally(() => {
+      entry.waiters = Math.max(0, entry.waiters - 1)
+    })
+  }
+  if (signal.aborted) {
+    return Promise.reject(makeAbortError())
+  }
+  entry.waiters += 1
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort)
+    }
+    const onAbort = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      entry.waiters = Math.max(0, entry.waiters - 1)
+      if (entry.waiters === 0) {
+        try { entry.controller?.abort() } catch {}
+      }
+      reject(makeAbortError())
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    entry.promise.then(
+      (url) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        entry.waiters = Math.max(0, entry.waiters - 1)
+        resolve(url)
+      },
+      (err) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        entry.waiters = Math.max(0, entry.waiters - 1)
+        reject(err)
+      },
+    )
+  })
+}
 
 function cacheBlobUrl(cacheKey, url) {
   const existing = blobUrlCache.get(cacheKey)
@@ -39,6 +91,9 @@ export function clearE2eeMediaCache() {
     }
   }
   blobUrlCache.clear()
+  for (const entry of inflightLoads.values()) {
+    try { entry?.controller?.abort() } catch {}
+  }
   inflightLoads.clear()
   clearE2eeDeliverableCache()
 }
@@ -72,7 +127,7 @@ export function getCachedE2eeImageUrl(item, imageContext = {}) {
 
   const bridgeId = String(imageContext?.bridgeId || '').trim()
   const cwd = String(imageContext?.cwd || '').trim()
-  const e2eeKeyId = String(item?.e2ee?.kid || imageContext?.e2eeKeyId || '').trim()
+  const e2eeKeyId = String(imageContext?.e2eeKeyId || '').trim()
   const cacheKey = `${imageContext?.roomId || ''}|${bridgeId}|${e2eeKeyId}|${cwd}|${target}`
   const hit = blobUrlCache.get(cacheKey)
   return hit?.url || ''
@@ -82,7 +137,10 @@ export function getCachedE2eeImageUrl(item, imageContext = {}) {
  * Load an E2EE-protected local PC image over direct WebRTC P2P (`RPC.FILE_READ` + `aio-bulk` for >128KB)
  * and return a local `blob:` URL cached in memory. Server sees zero image bytes or paths.
  */
-export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh = false } = {}) {
+export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh = false, signal = null } = {}) {
+  if (signal?.aborted) {
+    throw makeAbortError()
+  }
   if (typeof item === 'object' && item?.localPreviewUrl) {
     return item.localPreviewUrl
   }
@@ -98,7 +156,7 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
 
   const bridgeId = String(imageContext?.bridgeId || '').trim()
   const cwd = String(imageContext?.cwd || '').trim()
-  const e2eeKeyId = String(item?.e2ee?.kid || imageContext?.e2eeKeyId || '').trim()
+  const e2eeKeyId = String(imageContext?.e2eeKeyId || '').trim()
   const cacheKey = `${imageContext?.roomId || ''}|${bridgeId}|${e2eeKeyId}|${cwd}|${target}`
 
   if (!forceRefresh) {
@@ -109,11 +167,21 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
       return hit.url
     }
     const pending = inflightLoads.get(cacheKey)
-    if (pending) return pending
+    if (pending) return attachSignal(pending, signal)
   }
 
   const epoch = cacheEpoch
-  const job = (async () => {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const internalSignal = controller?.signal || null
+
+  const entry = {
+    promise: null,
+    controller,
+    waiters: 0,
+  }
+
+  entry.promise = (async () => {
+    if (internalSignal?.aborted) throw makeAbortError()
     const client = imageContext?.client
     if (!client) throw new Error(L('未连接到电脑端', 'Not connected to computer'))
     const result = await client.rpc(
@@ -122,6 +190,7 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
       120_000,
       bridgeId ? { bridgeId } : {},
     )
+    if (internalSignal?.aborted) throw makeAbortError()
     if (!String(result?.mimeType || '').startsWith('image/')) {
       throw new Error(L('仅支持预览图片文件', 'Only image files can be previewed'))
     }
@@ -131,6 +200,7 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
         mimeType: result.mimeType,
         size: Number(result.size || 0),
         bridgeId,
+        signal: internalSignal,
       })
       blob = dl.blob
     } else if (result?.dataBase64) {
@@ -139,6 +209,7 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
     } else {
       throw new Error(L('仅支持预览图片文件', 'Only image files can be previewed'))
     }
+    if (internalSignal?.aborted) throw makeAbortError()
     const url = URL.createObjectURL(blob)
     if (epoch !== cacheEpoch) {
       try { URL.revokeObjectURL(url) } catch {}
@@ -148,12 +219,15 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
     return url
   })()
 
-  inflightLoads.set(cacheKey, job)
-  try {
-    return await job
-  } finally {
-    if (inflightLoads.get(cacheKey) === job) {
+  // Prevent unhandled rejection if all callers abort before the underlying promise settles
+  entry.promise.catch(() => {})
+
+  inflightLoads.set(cacheKey, entry)
+  entry.promise.finally(() => {
+    if (inflightLoads.get(cacheKey) === entry) {
       inflightLoads.delete(cacheKey)
     }
-  }
+  })
+
+  return attachSignal(entry, signal)
 }

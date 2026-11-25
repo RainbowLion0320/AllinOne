@@ -54,23 +54,23 @@ function getFlag(name, fallback = '') {
 }
 
 const TIER_LABELS = {
-  free: '普通用户 (1GB/月 · 500MB/日)',
-  pro: 'Pro (5GB/月 · 10倍日额)',
-  ultra: 'Ultra (不限流)',
-  admin: '管理员 (Admin · 不限流)',
+  free: 'Free (1 GB/月 · P2P 无限)',
+  pro: 'Pro (10 GB/月 · P2P 无限)',
+  ultra: 'Ultra (50 GB/月 · P2P 无限)',
+  admin: 'Admin (50 GB/月 · 管理员)',
 }
 
 if (cmd === 'invite' && sub === 'create') {
   const count = Number(getFlag('--count', getFlag('-n', '1'))) || 1
   const note = getFlag('--note', '')
-  const rawTier = String(getFlag('--tier', getFlag('--plan', '')) || '').trim().toLowerCase()
+  const rawTier = String(getFlag('--tier', '') || '').trim().toLowerCase()
   if (rawTier && !VALID_TIERS.has(rawTier)) {
     console.error(`无效的用户等级 "${rawTier}"，仅支持: free | pro | ultra | admin`)
     process.exit(1)
   }
-  const grantAdmin = args.includes('--admin') || rawTier === 'admin'
-  const created = store.createInvites({ count, note, createdBy: 'cli', grantAdmin, tier: rawTier })
-  const tierLabel = TIER_LABELS[created[0]?.tier || 'free'] || '普通用户'
+  const effectiveTier = args.includes('--admin') ? 'admin' : rawTier || 'free'
+  const created = store.createInvites({ count, note, createdBy: 'cli', tier: effectiveTier })
+  const tierLabel = TIER_LABELS[created[0]?.tier || 'free'] || 'Free'
   console.log(`\n✓ 已生成 ${created.length} 个一次性邀请码 [${tierLabel}]：\n`)
   for (const inv of created) {
     const link = publicUrl ? `  ->  ${publicUrl}/?invite=${encodeURIComponent(inv.code)}` : ''

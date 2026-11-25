@@ -207,7 +207,7 @@ function mergeUniqueImages(listA = [], listB = []) {
   const out = []
   for (const img of [...listA, ...listB]) {
     if (!img) continue
-    const key = normalizeImageKey(img.url || img.path || img.raw || '')
+    const key = normalizeImageKey(img.url || img.path || img.raw || img.localPreviewUrl || img.id || '')
     if (!key || seen.has(key)) continue
     seen.add(key)
     out.push(img)

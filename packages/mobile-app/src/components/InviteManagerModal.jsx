@@ -23,6 +23,7 @@ import {
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { RELEASES_URL, copyTextToClipboard, resolveApkUrl } from '../lib/clientHelpers.js'
+import { formatBytesCompact } from '../lib/sessionCache.js'
 
 function formatTimeShort(ts) {
   if (!ts) return ''
@@ -36,15 +37,6 @@ function formatTimeShort(ts) {
   } catch {
     return ''
   }
-}
-
-function formatQuotaBytes(raw) {
-  const n = Math.max(0, Number(raw) || 0)
-  if (n < 1024) return `${Math.round(n)} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(n >= 100 * 1024 * 1024 ? 0 : 1)} MB`
-  const gb = n / (1024 * 1024 * 1024)
-  return `${Number.isInteger(gb) ? gb : gb.toFixed(gb >= 10 ? 1 : 2)} GB`
 }
 
 const TIER_BADGE_MAP = {
@@ -155,7 +147,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
     setCreating(true)
     setError('')
     try {
-      await adminCreateInvites(baseUrl, token, { count, note, tier, grantAdmin: tier === 'admin' })
+      await adminCreateInvites(baseUrl, token, { count, note, tier })
       setNote('')
       setTier('free')
       setFilter('active')
@@ -279,10 +271,13 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                   const userTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
                   const isSelf = Boolean(currentAdminRoom && currentAdminRoom === u.userId)
                   const q = u.turnQuota || null
+                  const isCloudflare = q?.provider === 'cloudflare'
                   const quotaText = q
-                    ? q.unlimited
-                      ? `${formatQuotaBytes(q.usedBytes)} / ${bi('不限', 'Unlimited')}`
-                      : `${formatQuotaBytes(q.usedBytes)} / ${formatQuotaBytes(q.quotaBytes)}`
+                    ? isCloudflare
+                      ? bi('CF 1TB 公益池', 'CF 1TB Pool')
+                      : q.unlimited
+                        ? `${formatBytesCompact(q.usedBytes)} / ${bi('不限', 'Unlimited')}`
+                        : `${formatBytesCompact(q.usedBytes)} / ${formatBytesCompact(q.quotaBytes)}`
                     : ''
                   const isBusy = busyUserId === u.userId
                   return (
@@ -299,14 +294,22 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         <div className="truncate text-[10px] text-slate-400">
                           {bi(`${u.deviceCount} 台电脑`, `${u.deviceCount} PC${u.deviceCount === 1 ? '' : 's'}`)}
                           {quotaText && (
-                            <span className={q?.exceeded ? ' font-semibold text-rose-500 dark:text-rose-400' : ''}>
+                            <span
+                              className={
+                                isCloudflare
+                                  ? ' font-medium text-sky-600 dark:text-sky-400'
+                                  : q?.exceeded
+                                    ? ' font-semibold text-rose-500 dark:text-rose-400'
+                                    : ''
+                              }
+                            >
                               {` · ${bi('中继', 'Relay')} ${quotaText}`}
                             </span>
                           )}
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
-                        {q && q.usedBytes > 0 && (
+                        {q && !isCloudflare && q.usedBytes > 0 && (
                           <button
                             type="button"
                             disabled={isBusy}
@@ -463,7 +466,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                           {inv.code}
                         </span>
                         {(() => {
-                          const invTier = String(inv.tier || (inv.grantAdmin ? 'admin' : 'free')).toLowerCase()
+                          const invTier = String(inv.tier || 'free').toLowerCase()
                           const badge = TIER_BADGE_MAP[invTier] || TIER_BADGE_MAP.free
                           return (
                             <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${badge.cls}`}>

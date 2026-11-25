@@ -182,13 +182,16 @@ const bridgeManager = new DesktopBridgeManager({
 function disposeBridgeOnce() {
   if (isDisposed) return Promise.resolve()
   if (!disposePromise) {
-    disposePromise = Promise.resolve()
-      .then(() => bridgeManager.dispose())
-      .then(() => webrtcProxy.dispose())
-      .catch(() => {})
-      .finally(() => {
-        isDisposed = true
-      })
+    disposePromise = (async () => {
+      try {
+        await bridgeManager.dispose()
+      } catch {}
+      try {
+        await webrtcProxy.dispose()
+      } catch {}
+    })().finally(() => {
+      isDisposed = true
+    })
   }
   return disposePromise
 }
@@ -722,12 +725,23 @@ function registerIpc() {
     if (!existsSync(resolved)) {
       return { ok: false, error: `找不到本机文件：${resolved}` }
     }
-    const realPath = realpathSync(resolved)
+    let realPath = ''
+    try {
+      realPath = realpathSync(resolved)
+    } catch (err) {
+      return { ok: false, error: `无法访问本机文件：${String(err?.message || err)}` }
+    }
     const realExt = extname(realPath).toLowerCase()
     if (!SAFE_DELIVERABLE_EXTS.has(realExt)) {
       return { ok: false, error: `符号链接目标格式不受支持（${realExt || '未知格式'}）` }
     }
-    if (!statSync(realPath).isFile()) {
+    let isFile = false
+    try {
+      isFile = statSync(realPath).isFile()
+    } catch (err) {
+      return { ok: false, error: `无法读取文件信息：${String(err?.message || err)}` }
+    }
+    if (!isFile) {
       return { ok: false, error: '目标路径不是文件' }
     }
     return { ok: true, realPath }

@@ -31,11 +31,14 @@ jobs:
       - name: Build portable bridge & frontend
         run: npm run build
 
-      - name: Verify portable bridge & setup scripts
+      - name: Verify portable bridge, static assets & setup scripts
         run: |
           test -s packages/mobile-app/dist/downloads/allinone-bridge.mjs
           test -s packages/mobile-app/dist/setup.sh
+          test -s packages/mobile-app/dist/setup.ps1
+          test -s packages/mobile-app/dist/sandbox-preview.html
           test -s deploy/install.sh
+          bash -n packages/mobile-app/dist/setup.sh
           bash -n deploy/install.sh
           node -e "const fs = require('fs'); for (const p of ['packages/mobile-app/dist/setup.sh', 'deploy/install.sh']) { if (fs.readFileSync(p).includes(13)) { console.error(p + ' contains CR bytes'); process.exit(1); } }"
 
@@ -53,4 +56,4 @@ jobs:
         run: docker build -f deploy/Dockerfile -t allinone-relay:ci .
 
       - name: Verify built assets exist in image
-        run: docker run --rm --entrypoint sh allinone-relay:ci -c "test -s /app/packages/mobile-app/dist/downloads/allinone-bridge.mjs && test -s /app/packages/mobile-app/dist/index.html && test -s /app/packages/mobile-app/dist/setup.sh"
+        run: docker run --rm --entrypoint sh allinone-relay:ci -c "test -s /app/packages/mobile-app/dist/downloads/allinone-bridge.mjs && test -s /app/packages/mobile-app/dist/index.html && test -s /app/packages/mobile-app/dist/sandbox-preview.html && test -s /app/packages/mobile-app/dist/setup.sh && test -s /app/packages/mobile-app/dist/setup.ps1"

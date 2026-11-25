@@ -349,7 +349,8 @@ export async function autoCompleteHalfInstalledClis({
   force = false,
   cooldownMs = FAILURE_COOLDOWN_MS,
 } = {}) {
-  if (String(process.env.ALLINONE_NO_AUTOFIX || '').trim() === '1') {
+  const noAutofix = String(process.env.ALLINONE_NO_AUTOFIX || '').trim()
+  if (noAutofix === '1' || noAutofix.toLowerCase() === 'true') {
     return { skipped: true, reason: 'disabled', installed: [], failed: [] }
   }
   if (activeRunPromise) {

@@ -11,14 +11,14 @@ function getDefaultStorage() {
   return null
 }
 
-export function normalizeDeviceBaseUrl(input) {
+function normalizeDeviceBaseUrl(input) {
   const trimmed = String(input || '').trim().replace(/\/+$/, '')
   if (!trimmed) return ''
   if (!/^https?:\/\//i.test(trimmed)) return `https://${trimmed}`
   return trimmed
 }
 
-export function makeDeviceId(baseUrl, roomId) {
+function makeDeviceId(baseUrl, roomId) {
   const cleanBase = normalizeDeviceBaseUrl(baseUrl)
   const cleanRoom = String(roomId || '').trim()
   return `${cleanBase}::${cleanRoom}`
@@ -74,24 +74,21 @@ function sanitizeDevice(raw) {
     baseUrl,
     token,
     roomId,
-    authMode: 'account',
     username: String(raw.username || '').trim().slice(0, 32),
     email: String(raw.email || '').trim().slice(0, 254),
     loginEmail2fa: Boolean(raw.loginEmail2fa),
     role,
     tier,
-    customName: String(raw.customName || '').trim().slice(0, 40),
     label: String(raw.label || '').trim().slice(0, 64),
     lastHostname: String(raw.lastHostname || firstBridge?.hostname || '').trim().slice(0, 64),
     lastPlatform: String(raw.lastPlatform || firstBridge?.platform || '').trim().slice(0, 32),
     selectedBridgeId: String(raw.selectedBridgeId || firstBridge?.bridgeId || '').trim().slice(0, 64),
     e2eeKeys: sanitizeE2eeKeysMap(raw.e2eeKeys),
-    addedAt: Number.isFinite(raw.addedAt) ? raw.addedAt : now,
     lastUsedAt: Number.isFinite(raw.lastUsedAt) ? raw.lastUsedAt : now,
   }
 }
 
-export function createEmptyDeviceState() {
+function createEmptyDeviceState() {
   return { version: 2, activeDeviceId: null, devices: [] }
 }
 
@@ -162,7 +159,6 @@ export function upsertDevice(state, payload) {
       baseUrl: incoming.baseUrl,
       token: incoming.token,
       roomId: incoming.roomId,
-      authMode: incoming.authMode,
       username: incoming.username || existing.username || '',
       email: incoming.email !== undefined && incoming.email !== '' ? incoming.email : existing.email || '',
       loginEmail2fa:
@@ -196,7 +192,6 @@ export function upsertDevice(state, payload) {
 
   const created = {
     ...incoming,
-    addedAt: now,
     lastUsedAt: now,
   }
   return {
@@ -239,13 +234,6 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
   const next = { ...cur }
   let changed = false
 
-  if (patch.customName !== undefined) {
-    const val = String(patch.customName || '').trim().slice(0, 40)
-    if (val !== cur.customName) {
-      next.customName = val
-      changed = true
-    }
-  }
   if (patch.token !== undefined) {
     const val = String(patch.token || '').trim()
     if (val && val !== cur.token) {
@@ -336,10 +324,6 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
   }
 }
 
-export function renameDevice(state, deviceId, customName) {
-  return updateDeviceMeta(state, deviceId, { customName })
-}
-
 export function upsertDeviceE2eeKey(state, deviceId, keyId, key) {
   if (!state || !Array.isArray(state.devices) || !deviceId || !keyId || !key) return state
   const target = state.devices.find((d) => d.id === deviceId)
@@ -374,12 +358,11 @@ export function removeDevice(state, deviceId) {
   }
 }
 
-export function getDeviceDisplayName(device, activeBridge = null, _onlineBridgeCount = 0, lang = getCurrentLang()) {
+export function getDeviceDisplayName(device, activeBridge = null, lang = getCurrentLang()) {
   if (!device) return bi(lang, '未选择电脑', 'No Computer')
   if (activeBridge) {
     return activeBridge.label || activeBridge.hostname || activeBridge.bridgeId
   }
-  if (device.customName) return device.customName
   if (device.lastHostname) return device.lastHostname
   return device.username ? `@${device.username}` : device.label || bi(lang, '我的账号', 'My Account')
 }

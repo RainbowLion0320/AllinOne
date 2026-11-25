@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-hub",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -23,6 +23,7 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@allinone/shared": "*",
     "werift": "^0.28.0",
     "ws": "^8.18.0"
   }

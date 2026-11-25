@@ -1,11 +1,11 @@
 import { createHmac } from 'node:crypto'
 import http from 'node:http'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
-import { createAccountStore, validateEmail, validatePassword } from './accounts.js'
+import { createAccountStore, VALID_TIERS, validateEmail, validatePassword } from './accounts.js'
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
@@ -35,9 +35,9 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '1.0.5')
+    return String(pkg?.version || '1.0.6')
   } catch {
-    return '1.0.5'
+    return '1.0.6'
   }
 })()
 
@@ -322,9 +322,12 @@ export function createRelayServer(options = {}) {
     const cfActive = Boolean(cfTurn.appliesToTier(tier) && cfTurn.getIceEntry())
     return {
       ...snap,
+      ...(cfActive ? { exceeded: false } : {}),
       provider: cfActive ? 'cloudflare' : turnSecret ? 'self-hosted' : 'none',
     }
   }
+
+  let lastRequestHost = ''
 
   function extractPublicHostname(req = null) {
     if (turnHostExplicit) return turnHostExplicit
@@ -335,10 +338,14 @@ export function createRelayServer(options = {}) {
     }
     if (req?.headers?.host) {
       try {
-        return new URL(`http://${req.headers.host}`).hostname
+        const parsed = new URL(`http://${req.headers.host}`).hostname
+        if (parsed) {
+          lastRequestHost = parsed
+          return parsed
+        }
       } catch {}
     }
-    return ''
+    return lastRequestHost
   }
 
   function resolveIceServers(req = null, scopeId = '') {
@@ -523,15 +530,11 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  const activeTurnTtlSec =
-    turnSecret && cfTurn.enabled
-      ? Math.min(turnTtlSec, cfTurn.ttlSec)
-      : cfTurn.enabled
-        ? cfTurn.ttlSec
-        : turnSecret
-          ? turnTtlSec
-          : 0
-  const iceRefreshMs = activeTurnTtlSec > 0 ? Math.max(60_000, Math.floor(activeTurnTtlSec * 0.75) * 1000) : 0
+  const iceRefreshSec = Math.min(
+    turnSecret ? turnTtlSec * 0.75 : Infinity,
+    cfTurn.enabled ? cfTurn.ttlSec * 0.45 : Infinity,
+  )
+  const iceRefreshMs = Number.isFinite(iceRefreshSec) ? Math.max(60_000, Math.floor(iceRefreshSec * 1000)) : 0
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
     getIceServers: (req, roomId) => resolveIceServers(req, roomId),
@@ -631,18 +634,10 @@ export function createRelayServer(options = {}) {
     return accounts.verifyDeviceBridge(requestedRoom, secret)
   }
 
-  function authenticateBridge(req, urlObj) {
-    return authenticateBridgeInfo(req, urlObj)?.roomId || null
-  }
-
   function requireAdmin(req, res) {
     const payload = auth.verifySessionToken(extractBearer(req))
     if (!payload) {
       sendJson(res, 401, { ok: false, error: '未登录或登录已失效' })
-      return null
-    }
-    if (!auth.isAdminPayload(payload)) {
-      sendJson(res, 403, { ok: false, error: '仅管理员可访问监控面板' })
       return null
     }
     const acct = accounts.getUserById(payload.room)
@@ -1376,6 +1371,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 404, { ok: false, error: '找不到目标电脑或名称为空' })
           return
         }
+        hub.updateBridgeLabel(payload.room, updated.bridgeId, updated.label)
         hub.broadcastRoomDevices(payload.room)
         sendJson(res, 200, {
           ok: true,
@@ -1524,13 +1520,16 @@ export function createRelayServer(options = {}) {
       if (!payload) return
       try {
         const body = await readJsonBody(req)
+        const rawTier = body.tier === undefined || body.tier === null ? '' : String(body.tier).trim().toLowerCase()
+        if (rawTier && !VALID_TIERS.has(rawTier)) {
+          sendJson(res, 400, { ok: false, error: '无效的用户等级，仅支持 free / pro / ultra / admin' })
+          return
+        }
         const created = accounts.createInvites({
           count: body.count ?? 1,
           note: body.note || '',
           createdBy: payload.uname || payload.sub || 'admin',
-          grantAdmin: Boolean(body.grantAdmin),
-          plan: body.plan || '',
-          tier: body.tier || '',
+          tier: rawTier || 'free',
         })
         const createdTier = created[0]?.tier || 'free'
         hub.recordActivity({
@@ -2009,7 +2008,7 @@ export function createRelayServer(options = {}) {
       const clientSessions = getMergedClientSessions(payload.room, { currentSid: payload.sid || '' })
       sendJson(res, 200, {
         ok: true,
-        user: payload,
+        user: { ...payload, role: acctUser.role, tier: acctUser.tier },
         roomId: payload.room,
         username: acctUser.username,
         email: acctUser.email || '',
@@ -2121,34 +2120,39 @@ export function createRelayServer(options = {}) {
             return
           }
 
-          if (req.method === 'HEAD') {
-            const st = statSync(target)
-            const staticHeaders = {
-              'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-              'Content-Length': st.size,
-              'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
-            }
-            if (ext === '.html') {
-              staticHeaders['Content-Security-Policy'] =
-                basename(target) === 'sandbox-preview.html' ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
-            }
-            res.writeHead(200, staticHeaders)
-            res.end()
-            return
-          }
-
-          const data = readFileSync(target)
+          const st = statSync(target)
           const staticHeaders = {
             'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-            'Content-Length': data.length,
+            'Content-Length': st.size,
             'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
           }
           if (ext === '.html') {
             staticHeaders['Content-Security-Policy'] =
               basename(target) === 'sandbox-preview.html' ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
           }
-          res.writeHead(200, staticHeaders)
-          res.end(data)
+          if (req.method === 'HEAD') {
+            res.writeHead(200, staticHeaders)
+            res.end()
+            return
+          }
+
+          const stream = createReadStream(target)
+          stream.on('open', () => {
+            if (!res.headersSent) {
+              res.writeHead(200, staticHeaders)
+            }
+            stream.pipe(res)
+          })
+          stream.on('error', () => {
+            if (!res.headersSent) {
+              sendJson(res, 404, { ok: false, error: 'Not Found' })
+            } else {
+              try { res.destroy() } catch {}
+            }
+          })
+          res.on('close', () => {
+            if (!stream.destroyed) stream.destroy()
+          })
           return
         } catch {
           sendJson(res, 404, { ok: false, error: 'Not Found' })

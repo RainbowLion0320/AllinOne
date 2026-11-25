@@ -14,7 +14,8 @@ COPY packages/shared/package.json ./packages/shared/
 COPY packages/dsh-mobile-hub/package.json ./packages/dsh-mobile-hub/
 COPY packages/mobile-app/package.json ./packages/mobile-app/
 
-RUN npm ci --include-workspace-root=false \
+# Include root devDependencies (esbuild) explicitly rather than relying on transitive vite hoisting
+RUN npm ci --include-workspace-root=true \
     --workspace=@allinone/shared \
     --workspace=dsh-mobile-hub \
     --workspace=@allinone/mobile-app
@@ -49,10 +50,11 @@ COPY --from=builder /app/packages/shared ./packages/shared
 COPY packages/relay-server ./packages/relay-server
 COPY --from=builder /app/packages/mobile-app/dist ./packages/mobile-app/dist
 
-RUN mkdir -p /app/packages/relay-server/data/uploads && chown -R node:node /app/packages/relay-server/data
+RUN mkdir -p /app/packages/relay-server/data && chown -R node:node /app/packages/relay-server/data
 USER node
 
 EXPOSE 8787
+EXPOSE 3478/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8787) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 

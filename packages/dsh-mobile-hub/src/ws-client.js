@@ -6,7 +6,7 @@ import {
   E2EE_VERSION,
   computeE2eeKeyId,
   normalizeE2eeKey,
-} from './helpers/e2ee.js'
+} from '@allinone/shared/e2ee'
 import { P2PBridgeManager } from './p2p/manager.js'
 
 /**
@@ -85,10 +85,6 @@ export class RelayBridgeLink {
       inboundDir: resolvedInboundDir,
       log: this.log,
     })
-  }
-
-  getAadRoomId() {
-    return this.roomId
   }
 
   async sendBridgeMeta() {
@@ -211,6 +207,7 @@ export class RelayBridgeLink {
         this.ws = null
         try { ws.terminate() } catch {}
         if (this.stopped) return
+        void this.p2p?.dispose?.().catch(() => {})
         const detail = 'HTTP 401 Unauthorized'
         this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
         this.emitState('unauthorized', detail)
@@ -303,6 +300,7 @@ export class RelayBridgeLink {
       this.ws = null
       if (this.stopped) return
       if (code === 4401) {
+        void this.p2p?.dispose?.().catch(() => {})
         const detail = reason || 'Device unbound or credential revoked'
         this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
         this.emitState('unauthorized', detail)

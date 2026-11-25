@@ -4,11 +4,15 @@ Because **All in One** allows remote control of AI coding agents running on your
 
 ## 1. Trust Boundary & Zero-Knowledge End-to-End Encryption (E2EE)
 
-- **Zero-Knowledge E2EE (AES-256-GCM) + Pure WebRTC P2P (`AIO-P2P v1`)**:
+- **Zero-Knowledge E2EE (AES-256-GCM) + WebRTC P2P-First (`AIO-P2P v1`) & Optional Encrypted TURN Fallback**:
   - Each computer bridge automatically generates a random **256-bit room key** locally (protected on Desktop via macOS Keychain / Windows DPAPI `safeStorage`, and `0600` config permissions on CLI). The raw key is **never sent to or stored on the server**.
-  - The server operates strictly as a **Pure Control Plane + Stateless RFC 5389 STUN (`UDP 3478`)**: it handles authentication, device presence, and unicast E2EE WebRTC signaling (`p2p.signal`), and carries **zero bytes** of chat, RPC, image, or file payloads (no `/api/uploads` storage and no server data-plane relay fallback).
-  - All direct P2P WebRTC DataChannels (`aio-ctrl` and `aio-bulk`) layer mandatory application-level **AES-256-GCM** encryption on top of WebRTC DTLS — using fresh 96-bit random IVs, 128-bit auth tags, AAD context binding (`version | kind | roomId | keyId`), request/response correlation IDs, 10-minute IV replay protection, and AIO2 4 MB chunked streaming encryption for large files.
-  - Revoking a device session immediately sends a `client.revoked` control message to every online PC bridge in the account room, tearing down the revoked device's direct P2P DataChannels within milliseconds and blacklisting its `clientId`.
+  - The HTTP/WebSocket server operates strictly as a **Pure Control Plane + Stateless RFC 5389 STUN (`UDP 3478`)**: it handles authentication, device presence, and unicast E2EE WebRTC signaling (`p2p.signal`), and carries **zero bytes** of chat, RPC, image, or file payloads (no `/api/uploads` storage and no HTTP/WebSocket data-plane relay).
+  - All WebRTC DataChannels (`aio-ctrl` and `aio-bulk`) layer mandatory application-level **AES-256-GCM** encryption on top of WebRTC DTLS — using fresh 96-bit random IVs, 128-bit auth tags, AAD context binding (`version | kind | roomId | keyId`), request/response correlation IDs, 10-minute IV replay protection, and AIO2 4 MB chunked streaming encryption for large files.
+  - **Optional Encrypted TURN Fallback (`⚡ Relay`) & Per-User Quota Metering**:
+    - Direct peer-to-peer WebRTC (`⚡ P2P`) is always preferred (0 bytes through server/TURN, permanently unlimited). For restrictive double-symmetric NATs where UDP hole punching cannot succeed, operators may optionally enable self-hosted `coturn` (via short-lived RFC HMAC-SHA1 credentials derived from `TURN_SECRET`; the shared secret is never exposed to clients) and/or tiered **Cloudflare Realtime TURN** (`CF_TURN_*`, e.g., routing `free` accounts onto Cloudflare's 1 TB/month pool while `pro`/`ultra`/`admin` use self-hosted `coturn`).
+    - **Ciphertext-only guarantee over TURN**: Even when packets traverse a self-hosted or Cloudflare TURN relay, they remain strictly **DTLS + AES-256-GCM double-encrypted** using the client-only 256-bit room key. Neither the control-plane server nor any TURN relay ever possesses the E2EE key or can inspect, modify, or forge chat messages, source code, tool calls, or files.
+    - **Per-user monthly TURN quota enforcement & Relay Data-Saver**: When `TURN_LOG_FILE` is configured, `turn-meter.js` incrementally parses `coturn` session usage logs to meter per-user monthly TURN bytes across 4 tiers (`free` 1 GB / `pro` 10 GB / `ultra` 50 GB / `admin` 50 GB by default, where `admin` strictly matches `ultra`; `0` = unlimited). Once a user reaches their monthly TURN cap, the server simply omits TURN credentials (direct P2P remains permanently unlimited). Over relayed connections, clients also engage **Relay Data-Saver** (tap-to-load images) to minimize relayed bandwidth.
+  - Revoking a device session immediately sends a `client.revoked` control message to every online PC bridge in the account room, tearing down the revoked device's WebRTC DataChannels within milliseconds and blacklisting its `clientId`.
   - New mobile/web clients sync the 256-bit key locally via an offline SVG QR code (`allinone-e2ee://v1?...`) or `ECDH P-256` + 6-digit SAS verification; key rotation on the Desktop App immediately revokes lost devices without affecting local chat history.
 - **Transport encryption (TLS)**: All production deployments must still terminate **HTTPS / WSS** (e.g., via Caddy or Nginx in `deploy/`) to protect authentication flows, metadata, and transport integrity.
 - **Account & Credential Storage**:
@@ -45,7 +49,8 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 - [ ] Set a strong random `JWT_SECRET` (>= 32 hex chars, e.g., `openssl rand -hex 32`) in `.env` (never commit `.env` to Git).
 - [ ] Set `PUBLIC_RELAY_URL` to your exact HTTPS origin.
 - [ ] Keep `capacitor.config.json` with `"cleartext": false` and `"allowMixedContent": false` for production mobile builds.
-- [ ] Periodically review registered users and revoke unused invite codes via `npm run admin -- invite list` / `npm run admin -- users`.
+- [ ] If enabling self-hosted `coturn` or Cloudflare TURN, keep `TURN_SECRET` / `CF_TURN_API_TOKEN` exclusively in `0600` `.env`, and configure `coturn` `denied-peer-ip` rules to block loopback and private RFC 1918/link-local ranges (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`).
+- [ ] Periodically review registered users, tiers, and unused invite codes via `npm run admin -- invite list` / `npm run admin -- users`.
 
 ## 5. Reporting a Vulnerability
 

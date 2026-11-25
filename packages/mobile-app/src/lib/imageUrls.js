@@ -56,10 +56,6 @@ export function resolveImageSrc(item) {
   return ''
 }
 
-export function isRelayUploadTarget() {
-  return false
-}
-
 /**
  * Scan markdown `![alt](dest)` and `[label](dest)` supporting nested balanced parentheses
  * such as `C:/Users/Administrator/Pictures/Screenshots/屏幕截图(1).png` and `<dest>`.
@@ -172,7 +168,7 @@ export function extractImageRefsFromText(text) {
     const key = normalizeImageKey(clean)
     if (!key || seen.has(key)) return
     seen.add(key)
-    const isUrlRef = /^https?:\/\/|^data:|^blob:|^\/api\//i.test(clean) || isRelayUploadTarget(clean)
+    const isUrlRef = /^https?:\/\/|^data:|^blob:/i.test(clean)
     out.push({
       path: isUrlRef ? undefined : clean,
       url: isUrlRef ? clean : undefined,

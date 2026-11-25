@@ -348,13 +348,18 @@ export function E2eeSyncModal({
     return () => unsub?.()
   }, [open, client, tab, roomId, bridgeE2ee?.keyId, isDesktopApp, onImportKeyring, onImportKey, onClose, bi])
 
+  const isBridgeLockedRef = useRef(isBridgeLocked)
+  isBridgeLockedRef.current = isBridgeLocked
+
   // When a locked device opens the QR scanner, nudge any online unlocked device (e.g. PC) to surface its QR button
   useEffect(() => {
     if (!open || !scannerOpen || canShowMyKey || !client) return
     const wantedKeyId = String(bridgeE2ee?.keyId || '').trim().toLowerCase()
     client.sendQrNudge?.({ wantedKeyId, action: 'scanning' })
     return () => {
-      client.sendQrNudge?.({ wantedKeyId, action: 'done' })
+      if (!isBridgeLockedRef.current) {
+        client.sendQrNudge?.({ wantedKeyId, action: 'done' })
+      }
     }
   }, [open, scannerOpen, canShowMyKey, client, bridgeE2ee?.keyId])
 

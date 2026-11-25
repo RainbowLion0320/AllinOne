@@ -13,8 +13,24 @@ services:
     environment:
       PORT: 8787
       HOST: 0.0.0.0
+      # 内置无状态 STUN (RFC 5389) 端口：默认 3478；同机部署 coturn 时请设为 off 并注释下方 UDP 端口映射
+      # 如需自定义 STUN 端口，请同时将 STUN_PORT 与 STUN_HOST_PORT 设为同一数字端口
       STUN_PORT: ${STUN_PORT:-3478}
       ICE_SERVERS: ${ICE_SERVERS:-}
+      # 可选：自建 coturn 动态中继（HMAC-SHA1 短期凭证，应对双对称 NAT）与 4 档月配额（0=不限，admin 同 ultra）
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_PORT: ${TURN_PORT:-3478}
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_TTL_SEC: ${TURN_TTL_SEC:-600}
+      TURN_LOG_FILE: ${TURN_LOG_FILE:-}
+      TURN_QUOTA_FREE_MB: ${TURN_QUOTA_FREE_MB:-1024}
+      TURN_QUOTA_PRO_MB: ${TURN_QUOTA_PRO_MB:-10240}
+      TURN_QUOTA_ULTRA_MB: ${TURN_QUOTA_ULTRA_MB:-51200}
+      # 可选：分层 Cloudflare Realtime TURN（每月免费 1 TB 流量池；默认仅作用于 free 档，pro/ultra/admin 走自建 coturn）
+      CF_TURN_TOKEN_ID: ${CF_TURN_TOKEN_ID:-}
+      CF_TURN_API_TOKEN: ${CF_TURN_API_TOKEN:-}
+      CF_TURN_TIERS: ${CF_TURN_TIERS:-free}
+      CF_TURN_TTL_SEC: ${CF_TURN_TTL_SEC:-3600}
       # 请在同目录创建 .env 文件或直接替换下面的密钥（勿提交到 Git）
       JWT_SECRET: ${JWT_SECRET:?请设置至少 16 位随机 JWT_SECRET（可用 openssl rand -hex 32 生成）}
       ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
@@ -30,9 +46,13 @@ services:
       RESEND_FROM: ${RESEND_FROM:-}
     volumes:
       - relay_data:/app/packages/relay-server/data
+      # 若启用自建 coturn 按用户配额计量（TURN_LOG_FILE=/var/log/coturn/turn.log），取消下方只读挂载注释：
+      # - /var/log/coturn/turn.log:/var/log/coturn/turn.log:ro
     ports:
       - "127.0.0.1:8787:8787"
-      - "${STUN_PORT:-3478}:3478/udp"
+      # 内置无状态 STUN；若同机运行 coturn 占用 UDP 3478，请注释本行并在 .env 中设 STUN_PORT=off
+      # 若改用自定义 STUN 端口，请将 STUN_HOST_PORT 与 STUN_PORT 设为同一数字端口（保持容器内外一致，且 STUN_PORT=off 不会破坏 YAML）
+      - "${STUN_HOST_PORT:-3478}:${STUN_HOST_PORT:-3478}/udp"
 
   # 推荐：使用 Caddy 自动申请和续期 Let's Encrypt HTTPS/WSS 证书
   # 使用前先修改 deploy/Caddyfile 里的域名，并确保域名 DNS A 记录已指向本机

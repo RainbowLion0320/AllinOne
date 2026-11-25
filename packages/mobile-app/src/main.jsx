@@ -43,7 +43,6 @@ class AppErrorBoundary extends React.Component {
               onClick={() => {
                 try {
                   localStorage.removeItem('allinone_devices_v2')
-                  localStorage.removeItem('allinone_dsh_auth_v1')
                 } catch {}
                 window.location.reload()
               }}

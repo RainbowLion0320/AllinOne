@@ -3,9 +3,9 @@
  * Purely client-side (memory + localStorage), never synced to the relay server.
  */
 
-export const DRAFTS_STORAGE_KEY = 'allinone_composer_drafts_v1'
-export const LAST_SESSION_STORAGE_KEY = 'allinone_last_session_v1'
-export const LAST_WORKSPACE_STORAGE_KEY = 'allinone_last_workspace_v1'
+const DRAFTS_STORAGE_KEY = 'allinone_composer_drafts_v1'
+const LAST_SESSION_STORAGE_KEY = 'allinone_last_session_v1'
+const LAST_WORKSPACE_STORAGE_KEY = 'allinone_last_workspace_v1'
 const MAX_DRAFTS = 60
 const MAX_TEXT_CHARS = 32_000
 

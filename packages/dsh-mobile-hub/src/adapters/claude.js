@@ -1790,6 +1790,7 @@ export class ClaudeAdapter {
       let stderrBuf = ''
       let finalText = ''
       let seenResult = false
+      let settled = false
       const emittedTextByMsg = new Map()
       const emittedThinkByMsg = new Map()
       let lastTextMsgId = null
@@ -1954,6 +1955,8 @@ export class ClaudeAdapter {
       })
 
       proc.on('error', (err) => {
+        if (settled) return
+        settled = true
         if (this.activeProcs.get(sessionId) === state) {
           this.activeProcs.delete(sessionId)
         }
@@ -1968,6 +1971,8 @@ export class ClaudeAdapter {
       })
 
       proc.on('close', (code) => {
+        if (settled) return
+        settled = true
         if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
         if (this.activeProcs.get(sessionId) === state) {
           this.activeProcs.delete(sessionId)

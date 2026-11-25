@@ -18,11 +18,11 @@ npm run test:smoke
 
 ## Workspace Overview
 
-- `packages/shared` — Shared RPC/event protocol, path/ID validation, AES-256-GCM E2EE, and offline QR SVG generator (`protocol.js`, `e2ee.js`, `qr-svg.js`)
-- `packages/relay-server` — HTTP/WS relay gateway, account/invite store, room isolation, and admin CLI
-- `packages/dsh-mobile-hub` — Local bridge orchestrator, agent adapters (`codex`, `claude`, `antigravity`, `dsh`), auto-installed `allinone-dsh-ipc` local IPC plugin, and portable CLI
-- `packages/mobile-app` — React + Tailwind + Vite PWA frontend (also bundled into the Electron desktop app)
-- `packages/desktop-app` — Electron desktop wrapper with embedded bridge manager, system tray, and DMG/NSIS packaging
+- `packages/shared` — Shared RPC/event protocol, path/ID validation, AES-256-GCM / ECDH E2EE, `AIO-P2P v1` DataChannel multiplexer, and offline QR SVG generator (`protocol.js`, `e2ee.js`, `p2p-mux.js`, `qr-svg.js`)
+- `packages/relay-server` — Pure Control Plane HTTP/WS signaling server, built-in stateless STUN (`stun-server.js`), dynamic TURN credentials & 4-tier monthly quota meter (`turn-meter.js`), tiered Cloudflare Realtime TURN provider (`cf-turn.js`), account/invite/2FA store, on-demand `/admin` monitoring dashboard, and admin CLI
+- `packages/dsh-mobile-hub` — Local bridge orchestrator, WebRTC P2P (`werift`) client, agent adapters (`codex`, `claude`, `antigravity`, `dsh`), auto-installed `allinone-dsh-ipc` local IPC plugin, and portable CLI
+- `packages/mobile-app` — React + Tailwind + Vite PWA frontend with WebRTC P2P transport & Relay Data-Saver (also bundled into the Electron desktop app)
+- `packages/desktop-app` — Electron desktop wrapper with embedded bridge manager, native Chromium `libwebrtc` worker (`webrtc-proxy.js`), OS keychain storage, system tray, and DMG/NSIS packaging
 
 ## Useful Commands
 

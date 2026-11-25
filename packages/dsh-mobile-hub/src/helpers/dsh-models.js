@@ -15,9 +15,9 @@ function unquote(val) {
  * Extracts ONLY model IDs, display names, provider names, and reasoningEfforts rules.
  * Never reads or returns API keys/tokens/headers.
  */
-export function parseDshConfiguredModels() {
-  const dshHome = String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
-  const patchPath = join(dshHome, 'profiles', 'desktop', 'cordis.patch.yml')
+export function parseDshConfiguredModels(dshHome = '') {
+  const resolvedDshHome = String(dshHome || process.env.DSH_HOME || '').trim() || join(homedir(), '.dsh')
+  const patchPath = join(resolvedDshHome, 'profiles', 'desktop', 'cordis.patch.yml')
 
   const result = {
     defaultProvider: 'deepseek',

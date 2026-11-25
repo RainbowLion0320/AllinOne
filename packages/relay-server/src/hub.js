@@ -735,7 +735,27 @@ export class RelayHub {
     }
 
     if (msg.type === 'bridge.meta') {
-      const nextMeta = { ...activeBridge.meta, ...(msg.meta || {}) }
+      const incoming = msg.meta && typeof msg.meta === 'object' ? msg.meta : {}
+      const safePatch = {}
+      if (typeof incoming.hostname === 'string' && incoming.hostname.trim()) {
+        safePatch.hostname = incoming.hostname.trim().slice(0, 64)
+      }
+      if (typeof incoming.platform === 'string' && incoming.platform.trim()) {
+        safePatch.platform = incoming.platform.trim().slice(0, 32)
+      }
+      if (typeof incoming.mode === 'string' && incoming.mode.trim()) {
+        safePatch.mode = incoming.mode.trim().slice(0, 32)
+      }
+      if (typeof incoming.p2pEngine === 'string') {
+        safePatch.p2pEngine = incoming.p2pEngine.trim().slice(0, 32)
+      }
+      if (Array.isArray(incoming.apps)) {
+        safePatch.apps = incoming.apps
+      }
+      if ('e2ee' in incoming) {
+        safePatch.e2ee = incoming.e2ee && typeof incoming.e2ee === 'object' ? incoming.e2ee : null
+      }
+      const nextMeta = { ...activeBridge.meta, ...safePatch }
       if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
         this.log.warn?.(`[control] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
         try {
@@ -824,20 +844,6 @@ export class RelayHub {
         sessionId,
         e2ee: msg.e2ee,
         ts: Date.now(),
-      })
-      return
-    }
-
-    // Explicitly reject legacy data-plane RPC forwarding through the Control Server
-    if (msg.type === 'rpc.req') {
-      this.sendToClient(clientId, {
-        type: 'rpc.res',
-        id: String(msg.id || ''),
-        ok: false,
-        error: {
-          code: 'P2P_REQUIRED',
-          message: 'v1.0 控制节点不转发业务数据，请升级客户端走端到端 P2P 直连。',
-        },
       })
       return
     }
@@ -1006,6 +1012,7 @@ export class RelayHub {
         return
       }
       if (action === 'scanning') client.lastQrNudgeAt = now
+      else client.lastQrNudgeAt = 0
       this.pushRoomGrantEvent(
         roomId,
         EVENTS.E2EE_QR_NUDGE,
@@ -1055,6 +1062,17 @@ export class RelayHub {
     } catch {
       return false
     }
+  }
+
+  updateBridgeLabel(roomId, bridgeId, newLabel) {
+    const rid = String(roomId || '').trim()
+    const bid = String(bridgeId || '').trim()
+    const clean = String(newLabel || '').trim().slice(0, 64)
+    if (!rid || !bid || !clean) return false
+    const entry = this.bridges.get(this.bridgeKey(rid, bid))
+    if (!entry) return false
+    entry.meta = { ...entry.meta, label: clean }
+    return true
   }
 
   broadcastRoomDevices(roomId) {

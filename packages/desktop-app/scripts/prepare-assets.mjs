@@ -213,7 +213,7 @@ function stageRendererAndBridge() {
   mkdirSync(RENDERER_DIR, { recursive: true })
 
   // Copy ONLY clean UI runtime files (skip PWA-only manifest/icons, SW precache, APKs, or installer downloads)
-  const copyItems = ['index.html', 'icon-192.png', 'assets']
+  const copyItems = ['index.html', 'sandbox-preview.html', 'icon-192.png', 'assets']
   for (const item of copyItems) {
     const src = join(MOBILE_DIST, item)
     if (existsSync(src)) {

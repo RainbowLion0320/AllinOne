@@ -19,11 +19,11 @@ import { useI18n } from '../lib/i18n.jsx'
 import {
   canNativeShareFiles,
   fetchE2eeDeliverableFile,
-  formatFileSize,
   getCachedDeliverableFile,
   shareDeliverableFile,
   triggerDeliverableDownload,
 } from '../lib/e2eeFiles.js'
+import { formatBytesCompact } from '../lib/sessionCache.js'
 
 const TONE_STYLES = {
   amber: {
@@ -144,7 +144,7 @@ function DeliverableCard({ file, imageContext }) {
     }
   }
 
-  const sizeLabel = formatFileSize(sizeBytes)
+  const sizeLabel = sizeBytes > 0 ? formatBytesCompact(sizeBytes) : ''
 
   return (
     <div className="rounded-2xl border border-slate-200/85 bg-white/95 p-2.5 shadow-2xs transition hover:border-slate-300/90 dark:border-slate-700/80 dark:bg-[#1E212B]/95 dark:hover:border-slate-600/80">

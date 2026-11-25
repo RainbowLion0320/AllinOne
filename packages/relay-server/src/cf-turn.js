@@ -3,6 +3,7 @@ const DEFAULT_CF_TURN_TTL_SEC = 3600
 const MIN_CF_TURN_TTL_SEC = 300
 const MAX_CF_TURN_TTL_SEC = 86400
 const FETCH_TIMEOUT_MS = 6000
+const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000, 120_000]
 const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
 
 export function parseCfTurnTiers(raw) {
@@ -65,8 +66,8 @@ export function normalizeCloudflareIceResponse(data) {
 /**
  * Zero-dependency cached credential provider for Cloudflare Realtime TURN (1 TB/month free tier).
  *
- * - Keeps credentials warm in memory via a background timer (~50% of TTL) so `getTurnServers()`
- *   is O(1) synchronous and adds 0ms latency to WebSocket connects and `/api/auth/me`.
+ * - Keeps credentials warm in memory via a background timer (~40% of TTL with exponential retry backoff)
+ *   so `getIceEntry()` is O(1) synchronous and adds 0ms latency to WebSocket connects and `/api/auth/me`.
  * - Gracefully returns `null` when unconfigured or temporarily unreachable so the relay server
  *   seamlessly falls back to self-hosted `coturn` or STUN without blocking connections.
  */
@@ -86,8 +87,28 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
   let cached = null // { stunServers, turnServers, fetchedAt, expiresAt }
   let inflight = null
   let refreshTimer = null
+  let retryTimer = null
+  let retryAttempt = 0
   let stopped = false
   let lastError = ''
+
+  function clearRetryTimer() {
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
+  }
+
+  function scheduleRetry() {
+    if (!enabled || stopped || retryTimer) return
+    const delayMs = RETRY_BACKOFF_MS[Math.min(retryAttempt, RETRY_BACKOFF_MS.length - 1)]
+    retryAttempt = Math.min(retryAttempt + 1, RETRY_BACKOFF_MS.length - 1)
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      void refresh()
+    }, delayMs)
+    retryTimer.unref?.()
+  }
 
   async function refresh() {
     if (!enabled || stopped) return null
@@ -123,10 +144,13 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
           expiresAt: now + ttlSec * 1000,
         }
         lastError = ''
+        retryAttempt = 0
+        clearRetryTimer()
         return cached
       } catch (err) {
         lastError = String(err?.message || err)
         log.warn?.(`[cf-turn] Failed to refresh Cloudflare TURN credentials: ${lastError}`)
+        scheduleRetry()
         return null
       } finally {
         if (timer) clearTimeout(timer)
@@ -140,7 +164,7 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
   function start() {
     if (!enabled || stopped) return
     stopTimer()
-    const intervalMs = Math.max(60_000, Math.floor(ttlSec * 0.5 * 1000))
+    const intervalMs = Math.max(30_000, Math.floor(ttlSec * 0.4 * 1000))
     refreshTimer = setInterval(() => {
       void refresh()
     }, intervalMs)
@@ -157,6 +181,7 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
   function stop() {
     stopped = true
     stopTimer()
+    clearRetryTimer()
   }
 
   function appliesToTier(tier) {
@@ -167,16 +192,16 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
 
   /**
    * Synchronously return cached Cloudflare TURN servers if valid (>60s remaining),
-   * triggering a background refresh when approaching expiry. Returns `null` if unavailable.
+   * triggering a background refresh when approaching 40% TTL or expiry. Returns `null` if unavailable.
    */
   function getIceEntry() {
     if (!enabled) return null
     const now = Date.now()
     if (!cached || now >= cached.expiresAt - 60_000) {
-      void refresh()
+      if (!retryTimer) void refresh()
       if (!cached || now >= cached.expiresAt - 10_000) return null
-    } else if (now >= cached.fetchedAt + Math.floor(ttlSec * 0.65 * 1000)) {
-      void refresh()
+    } else if (now >= cached.fetchedAt + Math.floor(ttlSec * 0.4 * 1000)) {
+      if (!retryTimer) void refresh()
     }
     return cached
   }

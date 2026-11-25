@@ -55,14 +55,6 @@ export function getCachedDeliverableFile(rawPath, context = {}) {
   return deliverableCache.get(key) || null
 }
 
-export function formatFileSize(bytes) {
-  const n = Number(bytes || 0)
-  if (!Number.isFinite(n) || n <= 0) return ''
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`
-}
-
 /**
  * On-demand E2EE fetch of a local PC deliverable file over WS RPC.FILE_READ (`mode: 'document'`).
  * Never invoked automatically; deduplicates concurrent clicks and caches decrypted Blob in memory.

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronLeft,
   ChevronRight,
@@ -35,13 +35,13 @@ function clamp(val, min, max) {
  *  - Rotate 90°, Fit-to-screen, 1:1 native pixel size, swipe/arrow multi-image nav
  *  - Zero-Knowledge E2EE media decryption & original image download
  */
-export function ImageLightbox({ state, imageContext = null, onClose }) {
+export function ImageLightbox({ state, imageContext = null, onMediaCached = null, onClose }) {
   const { bi } = useI18n()
   const [index, setIndex] = useState(() => state?.index || 0)
   const [resolvedMap, setResolvedMap] = useState({})
   const [errorMap, setErrorMap] = useState({})
   const [failedSrcMap, setFailedSrcMap] = useState({})
-  const [retryNonce, setRetryNonce] = useState(0)
+  const [retryNonceMap, setRetryNonceMap] = useState({})
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 })
 
   // Lightweight UI state mirrored from transformRef for toolbar display & cursor
@@ -219,7 +219,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       setResolvedMap({})
       setErrorMap({})
       setFailedSrcMap({})
-      setRetryNonce(0)
+      setRetryNonceMap({})
       setNaturalSize({ width: 0, height: 0 })
       pointersRef.current.clear()
       gestureRef.current.mode = 'idle'
@@ -229,7 +229,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       setResolvedMap({})
       setErrorMap({})
       setFailedSrcMap({})
-      setRetryNonce(0)
+      setRetryNonceMap({})
     }
   }, [state, resetView])
 
@@ -244,36 +244,48 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
   }, [state, applyTransform])
 
   const current = state?.images?.[index] || state?.images?.[0] || null
-  const currentInitialSrc = failedSrcMap[index] ? '' : (current?.src || '')
-  const effectiveCurrentItem =
-    failedSrcMap[index] && current?.item && typeof current.item === 'object'
-      ? { ...current.item, localPreviewUrl: '' }
-      : current?.item
+  const isSrcFailed = Boolean(failedSrcMap[index])
+  const currentInitialSrc = isSrcFailed ? '' : (current?.src || '')
+  const currentItem = current?.item ?? null
+  const effectiveCurrentItem = useMemo(
+    () =>
+      isSrcFailed && currentItem && typeof currentItem === 'object'
+        ? { ...currentItem, localPreviewUrl: '' }
+        : currentItem,
+    [isSrcFailed, currentItem],
+  )
   const currentNeedsE2ee = Boolean(
     current &&
       !currentInitialSrc &&
       effectiveCurrentItem &&
       imageContext &&
-      needsE2eeMediaLoad(effectiveCurrentItem, imageContext),
+      needsE2eeMediaLoad(effectiveCurrentItem),
   )
-  const e2eeKeysSig = imageContext?.e2eeKeys
-    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
-    : ''
+  const currentRetryNonce = retryNonceMap[index] || 0
+  const imageContextRef = useRef(imageContext)
+  imageContextRef.current = imageContext
+  const onMediaCachedRef = useRef(onMediaCached)
+  onMediaCachedRef.current = onMediaCached
 
   useEffect(() => {
     if (!state || !currentNeedsE2ee || !effectiveCurrentItem || resolvedMap[index] || errorMap[index]) return
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
     let cancelled = false
-    loadE2eeImageUrl(effectiveCurrentItem, imageContext, { forceRefresh: retryNonce > 0 })
+    loadE2eeImageUrl(effectiveCurrentItem, imageContextRef.current, {
+      forceRefresh: currentRetryNonce > 0,
+      signal: controller?.signal || null,
+    })
       .then((blobUrl) => {
         if (cancelled) return
         if (blobUrl) {
           setResolvedMap((prev) => ({ ...prev, [index]: blobUrl }))
+          onMediaCachedRef.current?.()
         } else {
           setErrorMap((prev) => ({ ...prev, [index]: bi('无法加载图片', 'Failed to load image') }))
         }
       })
       .catch((err) => {
-        if (!cancelled) {
+        if (!cancelled && err?.name !== 'AbortError') {
           setErrorMap((prev) => ({
             ...prev,
             [index]: String(err?.message || err || bi('端到端解密图片失败', 'Failed to decrypt image')),
@@ -282,17 +294,21 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       })
     return () => {
       cancelled = true
+      try { controller?.abort() } catch {}
     }
   }, [
     state,
     currentNeedsE2ee,
     effectiveCurrentItem,
-    imageContext,
-    e2eeKeysSig,
+    imageContext?.client,
+    imageContext?.roomId,
+    imageContext?.bridgeId,
+    imageContext?.cwd,
+    imageContext?.e2eeKeyId,
     index,
     resolvedMap,
     errorMap,
-    retryNonce,
+    currentRetryNonce,
     bi,
   ])
 
@@ -358,16 +374,17 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
 
   // Pointer handlers: multi-touch pinch + pan, mouse drag-to-pan, double-tap/double-click zoom
   const handlePointerDown = (e) => {
-    if (!imgRef.current) return
     // Ignore non-primary mouse buttons (e.g. right-click context menu)
     if (e.pointerType === 'mouse' && e.button !== 0) return
 
     const stage = stageRef.current
     const clickedBackdrop = e.target === stage
+    const hasImg = Boolean(imgRef.current)
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY, target: e.target })
     const g = gestureRef.current
 
     if (pointersRef.current.size === 2) {
+      if (!hasImg) return
       const [p1, p2] = [...pointersRef.current.values()]
       g.mode = 'pinch'
       g.moved = true
@@ -391,7 +408,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       g.moved = false
       g.downOnBackdrop = clickedBackdrop
 
-      if (canPanNow() && !clickedBackdrop) {
+      if (hasImg && canPanNow() && !clickedBackdrop) {
         g.mode = 'pan'
         setIsDragging(true)
         try {
@@ -415,6 +432,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
     const g = gestureRef.current
 
     if (pointersRef.current.size === 2) {
+      if (g.mode !== 'pinch' || !imgRef.current) return
       const [p1, p2] = [...pointersRef.current.values()]
       const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1
       const midX = (p1.x + p2.x) / 2
@@ -441,7 +459,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY)
       if (totalDist > 5) g.moved = true
 
-      if (g.mode === 'pan') {
+      if (g.mode === 'pan' && imgRef.current) {
         const cur = transformRef.current
         applyTransform({ scale: cur.scale, x: cur.x + dx, y: cur.y + dy, rotate: cur.rotate }, { animate: false })
       }
@@ -469,7 +487,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
       g.lastY = remaining.y
       g.startX = remaining.x
       g.startY = remaining.y
-      g.mode = canPanNow() ? 'pan' : 'idle'
+      g.mode = imgRef.current && canPanNow() ? 'pan' : 'idle'
       setIsDragging(g.mode === 'pan')
       return
     }
@@ -493,7 +511,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
     }
 
     // Touch double-tap on image smoothly toggles Fit <-> 2.5x anchored at tapped point
-    if (e.pointerType !== 'mouse' && downInfo?.target === imgRef.current) {
+    if (e.pointerType !== 'mouse' && imgRef.current && downInfo?.target === imgRef.current) {
       const now = Date.now()
       const dt = now - g.lastTapAt
       const dist = Math.hypot(e.clientX - g.lastTapX, e.clientY - g.lastTapY)
@@ -533,8 +551,8 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
 
   const rawActiveSrc = resolvedMap[index] || currentInitialSrc || ''
   const activeSrc =
-    retryNonce > 0 && rawActiveSrc && !rawActiveSrc.startsWith('data:') && !rawActiveSrc.startsWith('blob:')
-      ? `${rawActiveSrc}${rawActiveSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
+    currentRetryNonce > 0 && rawActiveSrc && !rawActiveSrc.startsWith('data:') && !rawActiveSrc.startsWith('blob:')
+      ? `${rawActiveSrc}${rawActiveSrc.includes('?') ? '&' : '?'}_r=${currentRetryNonce}`
       : rawActiveSrc
   const currentError = errorMap[index] || ''
   const downloadHref = activeSrc || ''
@@ -559,7 +577,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
         return next
       })
     }
-    setRetryNonce((n) => n + 1)
+    setRetryNonceMap((prev) => ({ ...prev, [index]: (prev[index] || 0) + 1 }))
   }
 
   const canShowOneToOne =
@@ -664,7 +682,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
                 if (!failedSrcMap[index] && current.src && current.item && imageContext) {
                   const withoutPreview =
                     typeof current.item === 'object' ? { ...current.item, localPreviewUrl: '' } : current.item
-                  if (needsE2eeMediaLoad(withoutPreview, imageContext)) {
+                  if (needsE2eeMediaLoad(withoutPreview)) {
                     setFailedSrcMap((prev) => ({ ...prev, [index]: true }))
                     return
                   }
@@ -700,7 +718,7 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
             </button>
           </div>
         ) : (
-          <div className="m-auto flex flex-col items-center gap-2 text-xs text-white/70">
+          <div className="pointer-events-none m-auto flex flex-col items-center gap-2 text-xs text-white/70">
             <Loader2 className="h-6 w-6 animate-spin text-[#4D6BFE]" />
             <span>{bi('正在端到端解密图片...', 'Decrypting image end-to-end...')}</span>
           </div>

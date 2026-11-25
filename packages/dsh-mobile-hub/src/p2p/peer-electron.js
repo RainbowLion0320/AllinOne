@@ -192,8 +192,23 @@ export class ElectronWebRtcClient {
     let ctrlOpen = false
     let bulkOpen = false
     let closed = false
+    let proxyNotifiedClosed = false
     let bulkBuffered = 0
     const drainWaiters = []
+    const socketDrainWaiters = []
+
+    const makeAbortError = () => {
+      const err = new Error('Transfer aborted')
+      err.name = 'AbortError'
+      return err
+    }
+
+    const assertBulkReady = (signal) => {
+      if (signal?.aborted) throw makeAbortError()
+      if (closed || !bulkOpen || !this.socket || this.socket.destroyed) {
+        throw new Error('Bulk DataChannel is not open')
+      }
+    }
 
     const flushDrainWaiters = () => {
       if (bulkBuffered > 512 * 1024) return
@@ -203,17 +218,35 @@ export class ElectronWebRtcClient {
       }
     }
 
+    const rejectAllWaiters = (err) => {
+      while (drainWaiters.length > 0) {
+        drainWaiters.shift().reject(err)
+      }
+      while (socketDrainWaiters.length > 0) {
+        socketDrainWaiters.shift()(err)
+      }
+    }
+
+    const notifyProxyClose = () => {
+      if (proxyNotifiedClosed) return
+      proxyNotifiedClosed = true
+      if (this.socket && !this.socket.destroyed) {
+        try {
+          this.socket.write(encodeJsonFrame({ type: 'peer.close', peerId }))
+        } catch {}
+      }
+    }
+
     const peer = {
       engine: 'electron-chromium',
       _fireClosed: () => {
+        notifyProxyClose()
         if (closed) return
         closed = true
         ctrlOpen = false
         bulkOpen = false
         this.peers.delete(peerId)
-        while (drainWaiters.length > 0) {
-          drainWaiters.shift().reject(new Error('WebRTC peer closed'))
-        }
+        rejectAllWaiters(new Error('WebRTC peer closed'))
         try { opts.onClose?.() } catch {}
       },
       _onControl: (msg) => {
@@ -237,7 +270,10 @@ export class ElectronWebRtcClient {
             peer._fireClosed()
           } else if (msg.role === 'bulk') {
             bulkOpen = false
+            rejectAllWaiters(new Error('Bulk DataChannel closed'))
           }
+        } else if (msg.type === 'dc.error') {
+          peer._fireClosed()
         } else if (msg.type === 'dc.text' && msg.role === 'ctrl') {
           try { opts.onCtrlMessage?.(String(msg.data || '')) } catch {}
         } else if (msg.type === 'dc.buffered' && msg.role === 'bulk') {
@@ -278,44 +314,113 @@ export class ElectronWebRtcClient {
         }
       },
       sendBulk: async (bytes, { signal = null } = {}) => {
-        if (closed || !bulkOpen || !this.socket || this.socket.destroyed) {
-          throw new Error('Bulk DataChannel is not open')
-        }
-        if (signal?.aborted) {
-          const err = new Error('Transfer aborted')
-          err.name = 'AbortError'
-          throw err
-        }
-        if (bulkBuffered >= 2 * 1024 * 1024) {
+        assertBulkReady(signal)
+        while (bulkBuffered >= 2 * 1024 * 1024) {
           await new Promise((resolveWait, rejectWait) => {
-            const entry = { resolve: resolveWait, reject: rejectWait }
-            drainWaiters.push(entry)
-            const t = setTimeout(() => {
-              const i = drainWaiters.indexOf(entry)
-              if (i !== -1) drainWaiters.splice(i, 1)
-              bulkBuffered = 0
+            let done = false
+            const cleanup = () => {
+              clearTimeout(timer)
+              const idx = drainWaiters.indexOf(entry)
+              if (idx !== -1) drainWaiters.splice(idx, 1)
+              if (signal) signal.removeEventListener('abort', onAbort)
+            }
+            const finishResolve = () => {
+              if (done) return
+              done = true
+              cleanup()
               resolveWait()
-            }, 2_000)
-            entry.resolve = () => { clearTimeout(t); resolveWait() }
-            entry.reject = (e) => { clearTimeout(t); rejectWait(e) }
+            }
+            const finishReject = (err) => {
+              if (done) return
+              done = true
+              cleanup()
+              rejectWait(err)
+            }
+            const onAbort = () => finishReject(makeAbortError())
+            const timer = setTimeout(() => {
+              finishReject(new Error('Bulk DataChannel backpressure stall timeout'))
+            }, 15_000)
+            timer.unref?.()
+            const entry = { resolve: finishResolve, reject: finishReject }
+            drainWaiters.push(entry)
+            if (signal) {
+              if (signal.aborted) {
+                onAbort()
+                return
+              }
+              signal.addEventListener('abort', onAbort, { once: true })
+            }
           })
+          assertBulkReady(signal)
         }
+        const sock = this.socket
         const raw = Buffer.isBuffer(bytes)
           ? bytes
           : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
         const frame = encodeBinFrame(peerId, 'bulk', raw)
-        const ok = this.socket.write(frame)
+        const ok = sock.write(frame)
         if (!ok) {
-          await new Promise((resolveDrain) => this.socket.once('drain', resolveDrain))
+          await new Promise((resolveDrain, rejectDrain) => {
+            let done = false
+            const cleanup = () => {
+              sock.off('drain', onDrain)
+              sock.off('close', onClose)
+              sock.off('error', onError)
+              const idx = socketDrainWaiters.indexOf(onPeerClosed)
+              if (idx !== -1) socketDrainWaiters.splice(idx, 1)
+              if (signal) signal.removeEventListener('abort', onAbort)
+            }
+            const onDrain = () => {
+              if (done) return
+              done = true
+              cleanup()
+              resolveDrain()
+            }
+            const onClose = () => {
+              if (done) return
+              done = true
+              cleanup()
+              rejectDrain(new Error('Electron WebRTC proxy closed'))
+            }
+            const onError = (err) => {
+              if (done) return
+              done = true
+              cleanup()
+              rejectDrain(err || new Error('Electron WebRTC proxy socket error'))
+            }
+            const onPeerClosed = (err) => {
+              if (done) return
+              done = true
+              cleanup()
+              rejectDrain(err || new Error('WebRTC peer closed'))
+            }
+            const onAbort = () => {
+              if (done) return
+              done = true
+              cleanup()
+              rejectDrain(makeAbortError())
+            }
+            if (sock.destroyed || closed || !bulkOpen) {
+              onClose()
+              return
+            }
+            if (signal?.aborted) {
+              onAbort()
+              return
+            }
+            socketDrainWaiters.push(onPeerClosed)
+            sock.once('drain', onDrain)
+            sock.once('close', onClose)
+            sock.once('error', onError)
+            if (signal) signal.addEventListener('abort', onAbort, { once: true })
+          })
+          assertBulkReady(signal)
         }
       },
       close: async () => {
+        notifyProxyClose()
         if (closed) return
-        const wasOpen = Boolean(this.socket && !this.socket.destroyed)
         peer._fireClosed()
-        if (wasOpen) {
-          try { this.socket.write(encodeJsonFrame({ type: 'peer.close', peerId })) } catch {}
-        }
       },
     }
 

@@ -1,7 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
-const MEDIA_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes (read-only encrypted upload download scope)
 const WS_TICKET_TTL_MS = 30 * 1000 // 30 seconds (strictly single-use)
 const MAX_WS_TICKETS = 2000
 const MAX_WS_TICKETS_PER_ROOM = 20
@@ -17,7 +16,7 @@ export function safeEqual(a, b) {
 
 /**
  * Account-based HMAC-SHA256 bearer token manager for multi-tenant All in One clients.
- * Strictly requires `usr_*` account rooms, explicit scopes (`session` / `media`),
+ * Strictly requires `usr_*` account rooms, explicit `session` scope,
  * revocable `tokenVersion` (`tv`), per-device `sid`, and single-use `ws-ticket` handshakes.
  */
 export function createAuthManager({
@@ -239,41 +238,9 @@ export function createAuthManager({
     })
   }
 
-  function isAdminPayload(payload) {
-    return Boolean(payload && payload.role === 'admin' && String(payload.room || '').startsWith('usr_'))
-  }
-
   function verifySessionToken(token) {
     const payload = verifyRawToken(token)
     if (!payload || payload.scope !== 'session') return null
-    if (!isSessionActive(payload)) return null
-    return payload
-  }
-
-  function signMediaToken(sessionPayload) {
-    const room = String(sessionPayload?.room || '').trim()
-    const sid = String(sessionPayload?.sid || '').trim()
-    if (!room.startsWith('usr_') || !sid) {
-      throw new Error('Invalid session payload for media token')
-    }
-    const tv = Number.isFinite(Number(sessionPayload?.tv)) ? Number(sessionPayload.tv) : 0
-    const now = Date.now()
-    const exp = now + MEDIA_TOKEN_TTL_MS
-    const mediaToken = signRawPayload({
-      sub: sessionPayload.sub || room,
-      room,
-      sid,
-      tv,
-      scope: 'media',
-      iat: now,
-      exp,
-    })
-    return { mediaToken, expiresAt: exp }
-  }
-
-  function verifyMediaToken(token) {
-    const payload = verifyRawToken(token)
-    if (!payload || payload.scope !== 'media') return null
     if (!isSessionActive(payload)) return null
     return payload
   }
@@ -344,9 +311,6 @@ export function createAuthManager({
     generateSessionId,
     signSessionToken,
     verifySessionToken,
-    isAdminPayload,
-    signMediaToken,
-    verifyMediaToken,
     issueWsTicket,
     consumeWsTicket,
     verifyAdminBootstrapToken,

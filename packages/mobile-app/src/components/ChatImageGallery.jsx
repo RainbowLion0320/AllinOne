@@ -17,7 +17,7 @@ import { useI18n } from '../lib/i18n.jsx'
  * browsers & Android WebView load images reliably every single time.
  * Supports Zero-Knowledge E2EE image decryption over direct WebRTC P2P (`RPC.FILE_READ` + `aio-bulk`).
  */
-export function ChatImageCard({
+function ChatImageCard({
   item,
   imageContext,
   onOpen,
@@ -30,6 +30,8 @@ export function ChatImageCard({
   const [previewFailed, setPreviewFailed] = useState(false)
   const [manualLoadAllowed, setManualLoadAllowed] = useState(false)
   const imgRef = useRef(null)
+  const imageContextRef = useRef(imageContext)
+  imageContextRef.current = imageContext
 
   useEffect(() => {
     setPreviewFailed(false)
@@ -41,33 +43,39 @@ export function ChatImageCard({
       ? { ...item, localPreviewUrl: '' }
       : item
 
-  const needsE2ee = needsE2eeMediaLoad(effectiveItem, imageContext)
+  const isOnline = imageContext?.connState === 'connected' && Boolean(imageContext?.bridgeOnline)
+  const p2pState = imageContext?.p2pState || 'idle'
+  const p2pTransport = imageContext?.p2pTransport || ''
+
+  const needsE2ee = needsE2eeMediaLoad(effectiveItem)
   const cachedE2eeSrc = needsE2ee ? getCachedE2eeImageUrl(effectiveItem, imageContext) : ''
   const waitingForTransport = Boolean(
     needsE2ee &&
       !cachedE2eeSrc &&
-      !manualLoadAllowed &&
-      imageContext?.relayDataSaver &&
-      (imageContext?.p2pState === 'idle' || imageContext?.p2pState === 'connecting'),
+      isOnline &&
+      (p2pState === 'idle' || p2pState === 'connecting'),
+  )
+  const transportUnavailable = Boolean(
+    needsE2ee &&
+      !cachedE2eeSrc &&
+      (!isOnline || p2pState === 'failed'),
   )
   const deferForRelay = Boolean(
     needsE2ee &&
       !cachedE2eeSrc &&
       !manualLoadAllowed &&
+      isOnline &&
+      p2pState === 'connected' &&
       imageContext?.relayDataSaver &&
-      imageContext?.p2pTransport === 'relay',
+      p2pTransport === 'relay',
   )
   const directSrc = needsE2ee
     ? ''
-    : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem, imageContext)
+    : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem)
   const baseSrc = needsE2ee ? (e2eeSrc || cachedE2eeSrc) : directSrc
   const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
-
-  const e2eeKeysSig = imageContext?.e2eeKeys
-    ? Object.keys(imageContext.e2eeKeys).sort().join(',')
-    : ''
 
   const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
   const rawHint = item?.path || item?.raw || ''
@@ -77,14 +85,26 @@ export function ChatImageCard({
       setE2eeSrc('')
       return
     }
-    if (deferForRelay || waitingForTransport) {
+    if (cachedE2eeSrc && retryNonce === 0) {
+      setE2eeSrc(cachedE2eeSrc)
+      return
+    }
+    if (deferForRelay) {
+      setE2eeSrc('')
+      return
+    }
+    if (!isOnline || p2pState !== 'connected') {
       setE2eeSrc('')
       if (waitingForTransport) setStatus('loading')
       return
     }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
     let cancelled = false
     setStatus('loading')
-    loadE2eeImageUrl(effectiveItem, imageContext, { forceRefresh: retryNonce > 0 })
+    loadE2eeImageUrl(effectiveItem, imageContextRef.current, {
+      forceRefresh: retryNonce > 0,
+      signal: controller?.signal || null,
+    })
       .then((blobUrl) => {
         if (cancelled) return
         if (!blobUrl) {
@@ -93,33 +113,31 @@ export function ChatImageCard({
         }
         setE2eeSrc(blobUrl)
       })
-      .catch(() => {
-        if (!cancelled) {
-          setE2eeSrc('')
-          setStatus('error')
-        }
+      .catch((err) => {
+        if (cancelled || err?.name === 'AbortError') return
+        setE2eeSrc('')
+        setStatus('error')
       })
     return () => {
       cancelled = true
+      try { controller?.abort() } catch {}
     }
   }, [
     needsE2ee,
+    cachedE2eeSrc,
     deferForRelay,
     waitingForTransport,
+    isOnline,
+    p2pState,
     previewFailed,
     effectiveItem?.path,
     effectiveItem?.url,
     effectiveItem?.raw,
-    effectiveItem?.e2ee?.iv,
-    effectiveItem?.e2ee?.kid,
-    imageContext?.baseUrl,
     imageContext?.roomId,
     imageContext?.bridgeId,
     imageContext?.cwd,
-    imageContext?.p2pState,
-    imageContext?.e2eeKey,
     imageContext?.e2eeKeyId,
-    e2eeKeysSig,
+    imageContext?.client,
     retryNonce,
   ])
 
@@ -139,6 +157,19 @@ export function ChatImageCard({
   }, [src, needsE2ee])
 
   if (!needsE2ee && !directSrc) return null
+
+  const handleRetryTransport = () => {
+    setManualLoadAllowed(true)
+    if (isOnline && p2pState === 'failed' && imageContext?.client?.retryP2p) {
+      setStatus('loading')
+      void imageContext.client.retryP2p(imageContext.bridgeId || '').catch(() => {
+        setStatus('error')
+      })
+      return
+    }
+    setStatus('loading')
+    setRetryNonce((n) => n + 1)
+  }
 
   return (
     <div
@@ -166,6 +197,41 @@ export function ChatImageCard({
             <span>{bi('中继省流 · 点击加载原图', 'Relay Saver · Tap to load')}</span>
           </div>
         </button>
+      ) : transportUnavailable ? (
+        isOnline && p2pState === 'failed' ? (
+          <button
+            type="button"
+            onClick={handleRetryTransport}
+            className="flex w-full flex-col items-center justify-center gap-2 px-4 py-5 text-center transition hover:bg-slate-200/50 active:scale-[0.99] dark:hover:bg-[#232734]"
+          >
+            <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-500/12 text-amber-600 dark:text-amber-400">
+              <ImageOff className="h-5 w-5" />
+            </div>
+            <div className="max-w-full truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
+              {label}
+            </div>
+            <div className="inline-flex items-center gap-1 rounded-full bg-amber-500/12 px-2.5 py-0.5 text-[10.5px] font-semibold text-amber-700 dark:text-amber-300">
+              <RefreshCw className="h-2.5 w-2.5" />
+              <span>{bi('P2P 已暂停 · 点击重试加载', 'P2P paused · Tap to retry')}</span>
+            </div>
+          </button>
+        ) : (
+          <div className="flex w-full flex-col items-center justify-center gap-2 px-4 py-5 text-center">
+            <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-200/80 text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+              <ImageOff className="h-5 w-5" />
+            </div>
+            <div className="max-w-full truncate text-xs font-semibold text-slate-700 dark:text-slate-200">
+              {label}
+            </div>
+            <div className="inline-flex items-center gap-1 rounded-full bg-slate-200/75 px-2.5 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+              <span>
+                {imageContext?.connState === 'connected' && !imageContext?.bridgeOnline
+                  ? bi('电脑离线 · 暂无法加载', 'Computer offline · Paused')
+                  : bi('连接已断开 · 暂无法加载', 'Disconnected · Paused')}
+              </span>
+            </div>
+          </div>
+        )
       ) : status === 'error' ? (
         <div className="flex flex-col items-start gap-2 p-3 text-xs text-slate-500 dark:text-slate-400">
           <div className="flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-200">
@@ -179,10 +245,7 @@ export function ChatImageCard({
           )}
           <button
             type="button"
-            onClick={() => {
-              setStatus('loading')
-              setRetryNonce((n) => n + 1)
-            }}
+            onClick={handleRetryTransport}
             className="inline-flex items-center gap-1 rounded-lg bg-white px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE] shadow-2xs active:scale-95 dark:bg-[#252936]"
           >
             <RefreshCw className="h-3 w-3" />
@@ -245,10 +308,10 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
   if (!Array.isArray(images) || images.length === 0) return null
 
   const resolvedList = images.map((item) => {
-    const needsE2ee = needsE2eeMediaLoad(item, imageContext)
+    const needsE2ee = needsE2eeMediaLoad(item)
     const src = needsE2ee
-      ? ''
-      : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item, imageContext)
+      ? getCachedE2eeImageUrl(item, imageContext)
+      : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item)
     const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
     return {
       item,
@@ -262,7 +325,7 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
     <div className={`mt-2.5 flex flex-wrap gap-2 ${compact ? 'justify-end' : ''}`}>
       {resolvedList.map((entry, idx) => (
         <ChatImageCard
-          key={`${entry.rawPath || entry.src || idx}-${idx}`}
+          key={`${entry.rawPath || entry.src || entry.item?.id || idx}-${idx}`}
           item={entry.item}
           imageContext={imageContext}
           compact={compact || images.length > 1}

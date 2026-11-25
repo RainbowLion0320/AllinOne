@@ -101,8 +101,6 @@ export const EVENTS = Object.freeze({
 })
 
 export const P2P_PROTOCOL_VERSION = 1
-export const P2P_CTRL_CHANNEL = 'aio-ctrl'
-export const P2P_BULK_CHANNEL = 'aio-bulk'
 
 /**
  * Build a unified composite key `<app>:<nativeId>`.

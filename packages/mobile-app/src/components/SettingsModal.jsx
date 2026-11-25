@@ -135,7 +135,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '1.0.5'
+    '1.0.6'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -348,11 +348,13 @@ export function SettingsModal({
                     <div className="flex min-w-0 items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
                       <Zap
                         className={`h-3.5 w-3.5 shrink-0 ${
-                          turnQuota.exceeded
-                            ? 'text-rose-500'
-                            : turnQuota.pct >= 85
-                              ? 'text-amber-500'
-                              : 'text-sky-500'
+                          turnQuota.provider === 'cloudflare'
+                            ? 'text-sky-500'
+                            : turnQuota.exceeded
+                              ? 'text-rose-500'
+                              : turnQuota.pct >= 85
+                                ? 'text-amber-500'
+                                : 'text-sky-500'
                         }`}
                       />
                       <span className="truncate">{bi('本月加密中继', 'Monthly Relay')}</span>
@@ -364,15 +366,17 @@ export function SettingsModal({
                     </div>
                     <span
                       className={`shrink-0 font-mono text-[11px] font-semibold ${
-                        turnQuota.exceeded
-                          ? 'text-rose-500 dark:text-rose-400'
-                          : turnQuota.pct >= 85
-                            ? 'text-amber-600 dark:text-amber-400'
-                            : 'text-slate-600 dark:text-slate-300'
+                        turnQuota.provider === 'cloudflare'
+                          ? 'text-sky-600 dark:text-sky-400'
+                          : turnQuota.exceeded
+                            ? 'text-rose-500 dark:text-rose-400'
+                            : turnQuota.pct >= 85
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-slate-600 dark:text-slate-300'
                       }`}
                     >
                       {turnQuota.provider === 'cloudflare'
-                        ? bi('公益中继池', 'CF 1TB Pool')
+                        ? bi('CF 1TB 公益池', 'CF 1TB Pool')
                         : turnQuota.unlimited
                           ? `${formatBytesCompact(turnQuota.usedBytes)} / ${bi('不限', 'Unlimited')}`
                           : `${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}`}

@@ -745,7 +745,7 @@ export class DshAdapter {
   }
 
   async listModels() {
-    const parsed = parseDshConfiguredModels()
+    const parsed = parseDshConfiguredModels(this.dshHome)
     return {
       app: APPS.DSH,
       defaultProvider: parsed.defaultProvider,
@@ -759,7 +759,7 @@ export class DshAdapter {
 
   async applyModelSelection(agent, sessionId, { provider, model, reasoningEffort } = {}) {
     if (!model && !reasoningEffort) return
-    const parsed = parseDshConfiguredModels()
+    const parsed = parseDshConfiguredModels(this.dshHome)
     const matched = parsed.models.find((m) => m.id === model && (!provider || m.provider === provider))
     const resolvedProvider = provider || matched?.provider || parsed.defaultProvider
     const normalizedEffort = reasoningEffort === 'off' ? null : reasoningEffort || null
@@ -1015,18 +1015,10 @@ export class DshAdapter {
       const ipc = await this.ipcClient.checkHealth()
       if (ipc) {
         try {
-          const remote = await this.ipcClient.call('readSession', {
+          return await this.ipcClient.call('readSession', {
             sessionId,
             options: { limit, cursor },
           })
-          // Defense-in-depth: filter synthetic system-reminder bubbles even if the running DSH process
-          // still has an older plugin loaded in memory before restart.
-          if (remote && Array.isArray(remote.messages)) {
-            remote.messages = remote.messages.filter(
-              (m) => !(m?.role === 'user' && isDshInternalSystemUserMessage(null, m.text)),
-            )
-          }
-          return remote
         } catch {}
       }
     }
@@ -1394,15 +1386,16 @@ export class DshAdapter {
         aborted: turnState.aborted,
       }
     } catch (err) {
-      if (err?.code !== 'SESSION_BUSY' && !err?._streamErrorEmitted) {
-        if (err && typeof err === 'object') err._streamErrorEmitted = true
+      const errObj = err && typeof err === 'object' ? err : new Error(String(err))
+      if (errObj.code !== 'SESSION_BUSY' && !errObj._streamErrorEmitted) {
+        try { errObj._streamErrorEmitted = true } catch {}
         this.emitEvent(EVENTS.STREAM_ERROR, {
           sessionId: realCompositeId,
           app: APPS.DSH,
-          message: String(err?.message || err),
+          message: String(errObj.message || errObj),
         })
       }
-      throw err
+      throw errObj
     } finally {
       if (pollTimer) clearInterval(pollTimer)
       if (this.activeTurns.get(lockedId) === turnState) {

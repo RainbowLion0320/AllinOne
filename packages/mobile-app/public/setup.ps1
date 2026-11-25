@@ -40,7 +40,7 @@ function Find-NodeExe {
 
 $NodeExe = Find-NodeExe
 if (-not $NodeExe) {
-    Write-Host '[!] Node.js v20+ (Node 22 LTS recommended) was not found on this PC.' -ForegroundColor Yellow
+    Write-Host '[!] Node.js v22+ (Node 22 LTS recommended) was not found on this PC.' -ForegroundColor Yellow
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Host '    You can install Node.js LTS automatically with:' -ForegroundColor White
@@ -54,7 +54,7 @@ if (-not $NodeExe) {
     }
     if (-not $NodeExe) {
         Write-Host ''
-        Write-Host 'Please install Node.js LTS (v20+, Node 22 LTS recommended) from https://nodejs.org/ and re-run this command.' -ForegroundColor Red
+        Write-Host 'Please install Node.js LTS (v22+) from https://nodejs.org/ and re-run this command.' -ForegroundColor Red
         return
     }
 }
@@ -62,8 +62,8 @@ if (-not $NodeExe) {
 $nodeVerText = (& $NodeExe -v).Trim()
 $nodeMajor = 0
 if ($nodeVerText -match '^v(\d+)') { $nodeMajor = [int]$Matches[1] }
-if ($nodeMajor -lt 20) {
-    Write-Host "[!] Found Node.js $nodeVerText, but Node.js v20+ (Node 22 LTS recommended) is required. Please upgrade at https://nodejs.org/" -ForegroundColor Red
+if ($nodeMajor -lt 22) {
+    Write-Host "[!] Found Node.js $nodeVerText, but Node.js v22+ (Node 22 LTS recommended) is required. Please upgrade at https://nodejs.org/" -ForegroundColor Red
     return
 }
 Write-Host "[1/3] Node.js ready: $nodeVerText ($NodeExe)" -ForegroundColor Green

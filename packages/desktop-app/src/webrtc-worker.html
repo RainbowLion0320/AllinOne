@@ -10,19 +10,85 @@
   const api = window.allinoneWebrtcWorker
   if (!api) return
 
-  /** @type {Map<string, { pc: RTCPeerConnection, ctrl: RTCDataChannel | null, bulk: RTCDataChannel | null, pendingIce: any[] }>} */
+  /** @type {Map<string, { pc: RTCPeerConnection, ctrl: RTCDataChannel | null, bulk: RTCDataChannel | null, pendingIce: any[], localIceQueue: any[], answerSent: boolean, lastTransport: string, transportRetryTimer: any, blobQueue: Promise<void>, pendingBlobs: number }>} */
   const peers = new Map()
+
+  const detachChannelHandlers = (dc) => {
+    if (!dc) return
+    dc.onopen = null
+    dc.onclose = null
+    dc.onerror = null
+    dc.onmessage = null
+    dc.onbufferedamountlow = null
+  }
 
   const closePeer = (peerId) => {
     const entry = peers.get(peerId)
     if (!entry) return
     peers.delete(peerId)
+    if (entry.transportRetryTimer) {
+      clearTimeout(entry.transportRetryTimer)
+      entry.transportRetryTimer = null
+    }
+    detachChannelHandlers(entry.ctrl)
+    detachChannelHandlers(entry.bulk)
+    if (entry.pc) {
+      entry.pc.onicecandidate = null
+      entry.pc.onconnectionstatechange = null
+      entry.pc.oniceconnectionstatechange = null
+      entry.pc.ondatachannel = null
+    }
     try { entry.ctrl?.close?.() } catch {}
     try { entry.bulk?.close?.() } catch {}
     try { entry.pc?.close?.() } catch {}
   }
 
+  const detectTransport = (peerId, entry, allowRetry = true) => {
+    if (peers.get(peerId) !== entry) return
+    if (!entry.pc || typeof entry.pc.getStats !== 'function') return
+    const scheduleRetry = () => {
+      if (!allowRetry || entry.transportRetryTimer || peers.get(peerId) !== entry) return
+      entry.transportRetryTimer = setTimeout(() => {
+        entry.transportRetryTimer = null
+        if (peers.get(peerId) !== entry) return
+        detectTransport(peerId, entry, false)
+      }, 300)
+    }
+    entry.pc.getStats().then((stats) => {
+      if (peers.get(peerId) !== entry) return
+      let pair = null
+      stats.forEach((rep) => {
+        if (rep.type === 'transport' && rep.selectedCandidatePairId) {
+          pair = stats.get(rep.selectedCandidatePairId) || pair
+        }
+      })
+      if (!pair) {
+        stats.forEach((rep) => {
+          if (rep.type === 'candidate-pair' && (rep.selected || (rep.nominated && rep.state === 'succeeded'))) {
+            pair = rep
+          }
+        })
+      }
+      if (!pair) {
+        scheduleRetry()
+        return
+      }
+      const lc = pair.localCandidateId ? stats.get(pair.localCandidateId) : null
+      const rc = pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null
+      if (!lc && !rc) {
+        scheduleRetry()
+        return
+      }
+      const nextTransport = (lc?.candidateType === 'relay' || rc?.candidateType === 'relay') ? 'relay' : 'direct'
+      if (nextTransport !== entry.lastTransport) {
+        entry.lastTransport = nextTransport
+        api.sendControl({ type: 'transport', peerId, transport: nextTransport })
+      }
+    }).catch(() => {})
+  }
+
   const wireDataChannel = (peerId, entry, dc) => {
+    if (peers.get(peerId) !== entry) return
     dc.binaryType = 'arraybuffer'
     const role = dc.label === 'aio-bulk' ? 'bulk' : dc.label === 'aio-ctrl' ? 'ctrl' : ''
     if (!role) return
@@ -31,52 +97,60 @@
 
     let openSent = false
     const notifyOpen = () => {
-      if (openSent) return
+      if (openSent || peers.get(peerId) !== entry) return
       openSent = true
       api.sendControl({ type: 'dc.open', peerId, role })
-      if (role === 'ctrl' && entry.pc && typeof entry.pc.getStats === 'function') {
-        entry.pc.getStats().then((stats) => {
-          let pair = null
-          stats.forEach((rep) => {
-            if (rep.type === 'transport' && rep.selectedCandidatePairId) {
-              pair = stats.get(rep.selectedCandidatePairId) || pair
-            }
-          })
-          if (!pair) {
-            stats.forEach((rep) => {
-              if (rep.type === 'candidate-pair' && (rep.selected || (rep.nominated && rep.state === 'succeeded'))) {
-                pair = rep
-              }
-            })
-          }
-          if (!pair) return
-          const lc = pair.localCandidateId ? stats.get(pair.localCandidateId) : null
-          const rc = pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null
-          const isRelay = lc?.candidateType === 'relay' || rc?.candidateType === 'relay'
-          api.sendControl({ type: 'transport', peerId, transport: isRelay ? 'relay' : 'direct' })
-        }).catch(() => {})
+      if (role === 'ctrl') {
+        detectTransport(peerId, entry, true)
       }
     }
     dc.onopen = notifyOpen
     dc.onclose = () => {
+      if (peers.get(peerId) !== entry) return
       api.sendControl({ type: 'dc.close', peerId, role })
+      if (role === 'ctrl') {
+        closePeer(peerId)
+      }
     }
     dc.onerror = (ev) => {
+      if (peers.get(peerId) !== entry) return
       api.sendControl({ type: 'dc.error', peerId, role, message: String(ev?.error?.message || ev?.message || 'dc error') })
     }
     dc.onmessage = (ev) => {
+      if (peers.get(peerId) !== entry) return
       if (typeof ev.data === 'string') {
         api.sendControl({ type: 'dc.text', peerId, role, data: ev.data })
       } else if (ev.data instanceof ArrayBuffer) {
-        api.sendBinary(peerId, role, new Uint8Array(ev.data))
+        const bytes = new Uint8Array(ev.data)
+        if (entry.pendingBlobs > 0) {
+          entry.blobQueue = entry.blobQueue.then(() => {
+            if (peers.get(peerId) === entry) {
+              api.sendBinary(peerId, role, bytes)
+            }
+          })
+        } else {
+          api.sendBinary(peerId, role, bytes)
+        }
       } else if (ev.data instanceof Blob) {
-        ev.data.arrayBuffer().then((ab) => api.sendBinary(peerId, role, new Uint8Array(ab))).catch(() => {})
+        const blob = ev.data
+        entry.pendingBlobs += 1
+        entry.blobQueue = entry.blobQueue.then(async () => {
+          try {
+            const ab = await blob.arrayBuffer()
+            if (peers.get(peerId) === entry) {
+              api.sendBinary(peerId, role, new Uint8Array(ab))
+            }
+          } catch {} finally {
+            entry.pendingBlobs = Math.max(0, entry.pendingBlobs - 1)
+          }
+        })
       }
     }
     try {
       dc.bufferedAmountLowThreshold = 512 * 1024
     } catch {}
     dc.onbufferedamountlow = () => {
+      if (peers.get(peerId) !== entry) return
       api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0 })
     }
     // Per W3C WebRTC spec, remote-created DataChannels delivered via ondatachannel
@@ -93,10 +167,22 @@
         closePeer(peerId)
         const iceServers = Array.isArray(cmd.iceServers) ? cmd.iceServers : []
         const pc = new RTCPeerConnection({ iceServers })
-        const entry = { pc, ctrl: null, bulk: null, pendingIce: [], localIceQueue: [], answerSent: false }
+        const entry = {
+          pc,
+          ctrl: null,
+          bulk: null,
+          pendingIce: [],
+          localIceQueue: [],
+          answerSent: false,
+          lastTransport: '',
+          transportRetryTimer: null,
+          blobQueue: Promise.resolve(),
+          pendingBlobs: 0,
+        }
         peers.set(peerId, entry)
 
         pc.onicecandidate = (ev) => {
+          if (peers.get(peerId) !== entry) return
           if (ev.candidate) {
             const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
             if (!entry.answerSent) {
@@ -107,27 +193,60 @@
           }
         }
         pc.onconnectionstatechange = () => {
-          api.sendControl({ type: 'state', peerId, state: pc.connectionState || pc.iceConnectionState || 'new' })
+          if (peers.get(peerId) !== entry) return
+          const st = pc.connectionState || pc.iceConnectionState || 'new'
+          api.sendControl({ type: 'state', peerId, state: st })
+          if (st === 'failed' || st === 'closed') {
+            closePeer(peerId)
+            return
+          }
+          detectTransport(peerId, entry, true)
         }
         pc.oniceconnectionstatechange = () => {
-          api.sendControl({ type: 'iceState', peerId, state: pc.iceConnectionState || 'new' })
+          if (peers.get(peerId) !== entry) return
+          const st = pc.iceConnectionState || 'new'
+          api.sendControl({ type: 'iceState', peerId, state: st })
+          if (st === 'failed' || st === 'closed') {
+            closePeer(peerId)
+            return
+          }
+          detectTransport(peerId, entry, true)
         }
         pc.ondatachannel = (ev) => {
+          if (peers.get(peerId) !== entry) return
           wireDataChannel(peerId, entry, ev.channel)
         }
 
         await pc.setRemoteDescription({ type: 'offer', sdp: String(cmd.sdp || '') })
+        if (peers.get(peerId) !== entry) {
+          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+          return
+        }
         for (const c of entry.pendingIce) {
+          if (peers.get(peerId) !== entry) break
           try { await pc.addIceCandidate(c) } catch {}
         }
         entry.pendingIce = []
+        if (peers.get(peerId) !== entry) {
+          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+          return
+        }
 
         const answer = await pc.createAnswer()
+        if (peers.get(peerId) !== entry) {
+          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+          return
+        }
         await pc.setLocalDescription(answer)
+        if (peers.get(peerId) !== entry) {
+          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+          return
+        }
         const finalSdp = pc.localDescription?.sdp || answer.sdp
         api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: finalSdp } })
         entry.answerSent = true
         for (const candidate of entry.localIceQueue) {
+          if (peers.get(peerId) !== entry) break
           api.sendControl({ type: 'ice', peerId, candidate })
         }
         entry.localIceQueue = []

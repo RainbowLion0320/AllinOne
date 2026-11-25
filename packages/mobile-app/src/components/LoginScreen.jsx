@@ -43,7 +43,6 @@ const LOGIN_INPUT_CLS =
 
 export function LoginScreen({
   onSuccess,
-  initialError = '',
   isAddingDevice = false,
   initialServerUrl = '',
   initialInviteCode = '',
@@ -82,12 +81,8 @@ export function LoginScreen({
   const [codeCooldown, setCodeCooldown] = useState(0)
 
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(initialError)
+  const [error, setError] = useState('')
   const [infoMsg, setInfoMsg] = useState('')
-
-  useEffect(() => {
-    if (initialError) setError(initialError)
-  }, [initialError])
 
   useEffect(() => {
     if (initialServerUrl) setServerUrl(initialServerUrl)
@@ -240,10 +235,10 @@ export function LoginScreen({
           email: result.email,
           loginEmail2fa: Boolean(result.loginEmail2fa),
           role: result.role,
+          tier: result.tier,
           label: result.label,
           devices: result.devices,
           bridges: result.bridges,
-          authMode: 'account',
         })
       } catch (err) {
         setError(String(err?.message || err))
@@ -296,10 +291,10 @@ export function LoginScreen({
           username: result.username,
           email: result.email,
           role: result.role,
+          tier: result.tier,
           label: result.label,
           devices: result.devices,
           bridges: result.bridges,
-          authMode: 'account',
         })
       } catch (err) {
         setError(String(err?.message || err))
