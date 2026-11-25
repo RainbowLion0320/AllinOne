@@ -279,10 +279,10 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         aria-label={bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`)}
                         className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-semibold outline-none disabled:opacity-60 ${tierBadgeCls}`}
                       >
-                        <option value="free">{bi('普通 · 1GB/月', 'Free · 1GB/mo')}</option>
-                        <option value="pro">{bi('Pro · 5GB/月', 'Pro · 5GB/mo')}</option>
-                        <option value="ultra">{bi('Ultra · 不限流', 'Ultra · Unlim')}</option>
-                        <option value="admin">{bi('管理员', 'Admin')}</option>
+                        <option value="free">Free</option>
+                        <option value="pro">Pro</option>
+                        <option value="ultra">Ultra</option>
+                        <option value="admin">Admin</option>
                       </select>
                     </div>
                   )

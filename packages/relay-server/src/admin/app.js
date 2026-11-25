@@ -906,10 +906,10 @@
       { id: 'bridge_only', label: bi('仅电脑在线', 'PC Only'), count: sum.bridgeOnlyUsers || 0 },
       { id: 'client_only', label: bi('仅终端在线', 'Client Only'), count: sum.clientOnlyUsers || 0 },
       { id: 'offline', label: bi('离线', 'Offline'), count: sum.offlineUsers || 0 },
-      { id: 'free', label: bi('普通', 'Free'), count: tierCounts.free || 0 },
+      { id: 'free', label: 'Free', count: tierCounts.free || 0 },
       { id: 'pro', label: 'Pro', count: tierCounts.pro || 0 },
       { id: 'ultra', label: 'Ultra', count: tierCounts.ultra || 0 },
-      { id: 'admin', label: bi('管理员', 'Admins'), count: tierCounts.admin || 0 },
+      { id: 'admin', label: 'Admin', count: tierCounts.admin || 0 },
     ]
 
     document.getElementById('user-filter-pills').innerHTML = pills.map((p) => `
@@ -948,12 +948,12 @@
         : `<span class="muted-text">—</span>`
 
       const tierControlHtml = u.isCurrentAdmin
-        ? `<span class="pill pill-brand" title="${esc(bi('当前管理员自身不可降级', 'Current admin cannot demote self'))}">${esc(bi('管理员', 'Admin'))}</span><span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>`
-        : `<select class="tier-inline-select tier-${esc(tm.id)}" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(tm.id)}" data-stop-toggle="1" aria-label="${esc(bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`))}" title="${esc(bi('点击快速调整用户类型', 'Click to change user tier'))}">
-            <option value="free" ${tm.id === 'free' ? 'selected' : ''}>${esc(bi('普通 · 1GB/月', 'Free · 1GB/mo'))}</option>
-            <option value="pro" ${tm.id === 'pro' ? 'selected' : ''}>${esc(bi('Pro · 5GB/月', 'Pro · 5GB/mo'))}</option>
-            <option value="ultra" ${tm.id === 'ultra' ? 'selected' : ''}>${esc(bi('Ultra · 不限流', 'Ultra · Unlim'))}</option>
-            <option value="admin" ${tm.id === 'admin' ? 'selected' : ''}>${esc(bi('管理员', 'Admin'))}</option>
+        ? `<span class="pill pill-brand" title="${esc(bi('当前管理员自身不可降级', 'Current admin cannot demote self'))}">Admin</span><span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>`
+        : `<select class="tier-inline-select tier-${esc(tm.id)}" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(tm.id)}" data-stop-toggle="1" aria-label="${esc(bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`))}" title="${esc(bi('点击切换用户类型', 'Change user tier'))}">
+            <option value="free" ${tm.id === 'free' ? 'selected' : ''}>Free</option>
+            <option value="pro" ${tm.id === 'pro' ? 'selected' : ''}>Pro</option>
+            <option value="ultra" ${tm.id === 'ultra' ? 'selected' : ''}>Ultra</option>
+            <option value="admin" ${tm.id === 'admin' ? 'selected' : ''}>Admin</option>
           </select>`
 
       return `
@@ -1080,10 +1080,10 @@
     const curTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
     const tr = u.stats?.traffic || {}
     const tierOptions = [
-      { id: 'free', label: bi('普通用户', 'Free'), sub: bi('1GB/月 · 500MB/日', '1GB/mo · 500MB/d') },
+      { id: 'free', label: 'Free', sub: bi('1GB/月 · 500MB/日', '1GB/mo · 500MB/d') },
       { id: 'pro', label: 'Pro', sub: bi('5GB/月 · 10倍日额', '5GB/mo · 10x daily') },
       { id: 'ultra', label: 'Ultra', sub: bi('不限流', 'Unlimited') },
-      { id: 'admin', label: bi('管理员', 'Admin'), sub: bi('不限流 · 后台权限', 'Unlim · Admin') },
+      { id: 'admin', label: 'Admin', sub: bi('不限流 · 后台权限', 'Unlim · Admin') },
     ]
     const monthPct = !tr.unlimited && tr.limitMonthBytes > 0
       ? Math.min(100, Math.round(((tr.bytesMonth || 0) / tr.limitMonthBytes) * 100))
