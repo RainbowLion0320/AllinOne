@@ -18,17 +18,26 @@ import {
   parseCoturnUsageLine,
   resolveTurnQuotaConfig,
 } from './turn-meter.js'
+import { createCloudflareTurnProvider, normalizeCloudflareIceResponse, parseCfTurnTiers } from './cf-turn.js'
 
-export { buildTurnQuotaSnapshot, getTurnQuotaBytesForTier, parseCoturnUsageLine, resolveTurnQuotaConfig }
+export {
+  buildTurnQuotaSnapshot,
+  createCloudflareTurnProvider,
+  getTurnQuotaBytesForTier,
+  normalizeCloudflareIceResponse,
+  parseCfTurnTiers,
+  parseCoturnUsageLine,
+  resolveTurnQuotaConfig,
+}
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '1.0.4')
+    return String(pkg?.version || '1.0.5')
   } catch {
-    return '1.0.4'
+    return '1.0.5'
   }
 })()
 
@@ -292,6 +301,7 @@ export function createRelayServer(options = {}) {
   const turnTtlSec = Math.max(120, Number(options.turnTtlSec ?? process.env.TURN_TTL_SEC ?? 600) || 600)
   const turnLogFile = String(options.turnLogFile ?? process.env.TURN_LOG_FILE ?? '').trim()
   const turnQuotaConfig = resolveTurnQuotaConfig(options, process.env)
+  const cfTurn = createCloudflareTurnProvider(options, process.env)
 
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
@@ -303,12 +313,17 @@ export function createRelayServer(options = {}) {
     if (!rid.startsWith('usr_')) return null
     const tier = accounts.getUserTier(rid)
     const usage = accounts.getTurnUsage(rid)
-    return buildTurnQuotaSnapshot({
+    const snap = buildTurnQuotaSnapshot({
       tier,
       month: usage.month,
       usedBytes: usage.bytes,
       config: turnQuotaConfig,
     })
+    const cfActive = Boolean(cfTurn.appliesToTier(tier) && cfTurn.getIceEntry())
+    return {
+      ...snap,
+      provider: cfActive ? 'cloudflare' : turnSecret ? 'self-hosted' : 'none',
+    }
   }
 
   function extractPublicHostname(req = null) {
@@ -341,11 +356,29 @@ export function createRelayServer(options = {}) {
 
     const publicHost = extractPublicHostname(req)
     const formattedHost = publicHost && publicHost.includes(':') ? `[${publicHost}]` : publicHost
+    const stunStats = stunServer?.getStats?.()
+    const quota = scopeId ? buildUserTurnQuota(scopeId) : null
+
+    // Mode 0: Tiered Cloudflare Realtime TURN (e.g. `free` tier -> Cloudflare 1 TB/mo free pool, 0 self-hosted VPS egress)
+    // Still puts our low-latency domestic STUN first when available so direct P2P stays fast & proxy-clean.
+    if (cfTurn.enabled && quota && cfTurn.appliesToTier(quota.tier)) {
+      const cfEntry = cfTurn.getIceEntry()
+      if (cfEntry && cfEntry.turnServers.length > 0) {
+        const servers = []
+        if (formattedHost && (turnSecret || (stunStats?.enabled && stunStats.port > 0))) {
+          const stunPortNum = turnSecret ? turnPort : stunStats.port
+          servers.push({ urls: `stun:${formattedHost}:${stunPortNum}` })
+        } else if (cfEntry.stunServers.length > 0) {
+          servers.push(...cfEntry.stunServers)
+        }
+        servers.push(...cfEntry.turnServers)
+        return servers
+      }
+    }
 
     // Mode 1: Hardened self-hosted coturn (handles BOTH STUN and TURN UDP+TCP cleanly with zero proxy-polluted public STUNs)
     if (turnSecret && formattedHost) {
       const servers = [{ urls: `stun:${formattedHost}:${turnPort}` }]
-      const quota = scopeId ? buildUserTurnQuota(scopeId) : null
       if (!quota || !quota.exceeded) {
         const creds = buildTurnCredentials({
           secret: turnSecret,
@@ -371,7 +404,6 @@ export function createRelayServer(options = {}) {
     }
 
     // Mode 2: Built-in stateless Node STUN (UDP 3478)
-    const stunStats = stunServer?.getStats?.()
     if (stunStats?.enabled && stunStats.port > 0 && formattedHost) {
       return [{ urls: `stun:${formattedHost}:${stunStats.port}` }]
     }
@@ -491,7 +523,15 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  const iceRefreshMs = turnSecret ? Math.max(60_000, Math.floor(turnTtlSec * 0.75) * 1000) : 0
+  const activeTurnTtlSec =
+    turnSecret && cfTurn.enabled
+      ? Math.min(turnTtlSec, cfTurn.ttlSec)
+      : cfTurn.enabled
+        ? cfTurn.ttlSec
+        : turnSecret
+          ? turnTtlSec
+          : 0
+  const iceRefreshMs = activeTurnTtlSec > 0 ? Math.max(60_000, Math.floor(activeTurnTtlSec * 0.75) * 1000) : 0
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
     getIceServers: (req, roomId) => resolveIceServers(req, roomId),
@@ -1544,11 +1584,12 @@ export function createRelayServer(options = {}) {
         mailer,
         stun: stunServer?.getStats?.() || null,
         turn: {
-          enabled: Boolean(turnSecret && extractPublicHostname(req)),
+          enabled: Boolean((turnSecret && extractPublicHostname(req)) || cfTurn.enabled),
           host: extractPublicHostname(req) || '',
           port: turnSecret ? turnPort : 0,
           ttlSec: turnTtlSec,
           meteringEnabled: Boolean(turnLogFile),
+          cloudflare: cfTurn.getStats(),
           quotas: {
             freeMb: turnQuotaConfig.freeMb,
             proMb: turnQuotaConfig.proMb,
@@ -2236,6 +2277,10 @@ export function createRelayServer(options = {}) {
         console.warn(`[stun] Could not bind UDP ${stunPort} (${err?.message || err}); continuing with public STUN fallbacks`)
       }
     }
+    if (cfTurn.enabled) {
+      await cfTurn.refresh()
+      cfTurn.start()
+    }
     return await new Promise((resolveStart) => {
       server.listen(port, host, () => {
         const addr = server.address()
@@ -2248,6 +2293,12 @@ export function createRelayServer(options = {}) {
         if (turnSecret && turnPublicHost) {
           console.log(
             `[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s, quotas: free=${turnQuotaConfig.freeMb}MB pro=${turnQuotaConfig.proMb}MB ultra/admin=${turnQuotaConfig.ultraMb}MB)`,
+          )
+        }
+        if (cfTurn.enabled) {
+          const cfSt = cfTurn.getStats()
+          console.log(
+            `[cf-turn] Tiered Cloudflare Realtime TURN enabled (tiers=${cfSt.tiers.join(',')}, ttl=${cfSt.ttlSec}s, status=${cfSt.ready ? 'ready' : 'warming'})`,
           )
         }
         if (turnMeter) {
@@ -2266,6 +2317,7 @@ export function createRelayServer(options = {}) {
   }
 
   const close = async () => {
+    cfTurn.stop()
     turnMeter?.stop?.()
     accounts.flush()
     hub.shutdown()
@@ -2279,7 +2331,7 @@ export function createRelayServer(options = {}) {
     })
   }
 
-  return { server, wss, hub, accounts, mailer, stunServer, turnMeter, recordTurnUsageBytes, start, close }
+  return { server, wss, hub, accounts, mailer, stunServer, turnMeter, cfTurn, recordTurnUsageBytes, start, close }
 }
 
 // Run directly when invoked as main script

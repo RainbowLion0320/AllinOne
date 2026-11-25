@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 import {
+  Image as ImageIcon,
   ImageOff,
   Loader2,
   Maximize2,
   RefreshCw,
+  Zap,
 } from 'lucide-react'
 import { getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
-import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
+import { getCachedE2eeImageUrl, loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 /**
@@ -26,10 +28,12 @@ export function ChatImageCard({
   const [retryNonce, setRetryNonce] = useState(0)
   const [e2eeSrc, setE2eeSrc] = useState('')
   const [previewFailed, setPreviewFailed] = useState(false)
+  const [manualLoadAllowed, setManualLoadAllowed] = useState(false)
   const imgRef = useRef(null)
 
   useEffect(() => {
     setPreviewFailed(false)
+    setManualLoadAllowed(false)
   }, [item?.localPreviewUrl, item?.url, item?.path])
 
   const effectiveItem =
@@ -38,10 +42,25 @@ export function ChatImageCard({
       : item
 
   const needsE2ee = needsE2eeMediaLoad(effectiveItem, imageContext)
+  const cachedE2eeSrc = needsE2ee ? getCachedE2eeImageUrl(effectiveItem, imageContext) : ''
+  const waitingForTransport = Boolean(
+    needsE2ee &&
+      !cachedE2eeSrc &&
+      !manualLoadAllowed &&
+      imageContext?.relayDataSaver &&
+      (imageContext?.p2pState === 'idle' || imageContext?.p2pState === 'connecting'),
+  )
+  const deferForRelay = Boolean(
+    needsE2ee &&
+      !cachedE2eeSrc &&
+      !manualLoadAllowed &&
+      imageContext?.relayDataSaver &&
+      imageContext?.p2pTransport === 'relay',
+  )
   const directSrc = needsE2ee
     ? ''
     : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem, imageContext)
-  const baseSrc = needsE2ee ? e2eeSrc : directSrc
+  const baseSrc = needsE2ee ? (e2eeSrc || cachedE2eeSrc) : directSrc
   const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
@@ -56,6 +75,11 @@ export function ChatImageCard({
   useEffect(() => {
     if (!needsE2ee) {
       setE2eeSrc('')
+      return
+    }
+    if (deferForRelay || waitingForTransport) {
+      setE2eeSrc('')
+      if (waitingForTransport) setStatus('loading')
       return
     }
     let cancelled = false
@@ -80,6 +104,8 @@ export function ChatImageCard({
     }
   }, [
     needsE2ee,
+    deferForRelay,
+    waitingForTransport,
     previewFailed,
     effectiveItem?.path,
     effectiveItem?.url,
@@ -120,7 +146,27 @@ export function ChatImageCard({
         compact ? 'w-[220px] max-w-full' : 'w-full max-w-[340px]'
       }`}
     >
-      {status === 'error' ? (
+      {deferForRelay ? (
+        <button
+          type="button"
+          onClick={() => {
+            setStatus('loading')
+            setManualLoadAllowed(true)
+          }}
+          className="flex w-full flex-col items-center justify-center gap-2 px-4 py-5 text-center transition hover:bg-slate-200/50 active:scale-[0.99] dark:hover:bg-[#232734]"
+        >
+          <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-500/12 text-sky-600 dark:text-sky-400">
+            <ImageIcon className="h-5 w-5" />
+          </div>
+          <div className="max-w-full truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
+            {label}
+          </div>
+          <div className="inline-flex items-center gap-1 rounded-full bg-sky-500/12 px-2.5 py-0.5 text-[10.5px] font-semibold text-sky-600 dark:text-sky-400">
+            <Zap className="h-2.5 w-2.5" />
+            <span>{bi('中继省流 · 点击加载原图', 'Relay Saver · Tap to load')}</span>
+          </div>
+        </button>
+      ) : status === 'error' ? (
         <div className="flex flex-col items-start gap-2 p-3 text-xs text-slate-500 dark:text-slate-400">
           <div className="flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-200">
             <ImageOff className="h-4 w-4 shrink-0 text-amber-500" />

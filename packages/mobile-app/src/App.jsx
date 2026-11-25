@@ -106,6 +106,7 @@ export function App() {
   const [pairError, setPairError] = useState('')
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
+  const [relayDataSaver, setRelayDataSaver] = useState(() => localStorage.getItem('allinone_relay_data_saver') !== '0')
   const [connState, setConnState] = useState('disconnected')
   const [connError, setConnError] = useState('')
   const [p2pState, setP2pState] = useState('idle')
@@ -488,6 +489,12 @@ export function App() {
     }
   }, [darkMode])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('allinone_relay_data_saver', relayDataSaver ? '1' : '0')
+    } catch {}
+  }, [relayDataSaver])
+
   const resetTransientWorkspace = useCallback(() => {
     deviceGenRef.current += 1
     openRequestSeqRef.current += 1
@@ -733,6 +740,8 @@ export function App() {
       bridgeId: activeBridgeId,
       client: clientRef.current,
       p2pState,
+      p2pTransport,
+      relayDataSaver,
       e2eeKey: activeBridgeE2ee.matchedKey,
       e2eeKeyId: activeBridgeE2ee.keyId,
       e2eeKeys: activeDevice?.e2eeKeys || {},
@@ -750,6 +759,8 @@ export function App() {
     activeSession?.cwd,
     activeBridgeId,
     p2pState,
+    p2pTransport,
+    relayDataSaver,
     activeBridgeE2ee.matchedKey,
     activeBridgeE2ee.keyId,
     desktopApi,
@@ -3105,6 +3116,8 @@ export function App() {
               keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
             }}
             turnQuota={turnQuota}
+            relayDataSaver={relayDataSaver}
+            onToggleRelayDataSaver={() => setRelayDataSaver((v) => !v)}
             onOpenE2eeSync={() =>
               setE2eeModal({
                 open: true,

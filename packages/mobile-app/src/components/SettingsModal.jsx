@@ -86,6 +86,8 @@ export function SettingsModal({
   onToggleLogin2fa = null,
   e2eeStatus = null,
   turnQuota = null,
+  relayDataSaver = true,
+  onToggleRelayDataSaver = null,
   onOpenE2eeSync = null,
   onRemoveDevice = null,
 }) {
@@ -133,7 +135,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '1.0.4'
+    '1.0.5'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -343,7 +345,7 @@ export function SettingsModal({
               {activeDevice && turnQuota && (
                 <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
                   <div className="flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
+                    <div className="flex min-w-0 items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
                       <Zap
                         className={`h-3.5 w-3.5 shrink-0 ${
                           turnQuota.exceeded
@@ -353,10 +355,15 @@ export function SettingsModal({
                               : 'text-sky-500'
                         }`}
                       />
-                      <span>{bi('本月加密中继', 'Monthly Relay')}</span>
+                      <span className="truncate">{bi('本月加密中继', 'Monthly Relay')}</span>
+                      {turnQuota.provider === 'cloudflare' && (
+                        <span className="shrink-0 rounded-md bg-sky-500/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-sky-600 dark:text-sky-400">
+                          CF Free
+                        </span>
+                      )}
                     </div>
                     <span
-                      className={`font-mono text-[11px] font-semibold ${
+                      className={`shrink-0 font-mono text-[11px] font-semibold ${
                         turnQuota.exceeded
                           ? 'text-rose-500 dark:text-rose-400'
                           : turnQuota.pct >= 85
@@ -364,12 +371,14 @@ export function SettingsModal({
                             : 'text-slate-600 dark:text-slate-300'
                       }`}
                     >
-                      {turnQuota.unlimited
-                        ? `${formatBytesCompact(turnQuota.usedBytes)} / ${bi('不限', 'Unlimited')}`
-                        : `${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}`}
+                      {turnQuota.provider === 'cloudflare'
+                        ? bi('公益中继池', 'CF 1TB Pool')
+                        : turnQuota.unlimited
+                          ? `${formatBytesCompact(turnQuota.usedBytes)} / ${bi('不限', 'Unlimited')}`
+                          : `${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}`}
                     </span>
                   </div>
-                  {!turnQuota.unlimited && (
+                  {!turnQuota.unlimited && turnQuota.provider !== 'cloudflare' && (
                     <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
                       <div
                         className={`h-full rounded-full transition-all ${
@@ -385,12 +394,33 @@ export function SettingsModal({
                   )}
                   <div className="mt-1 flex items-center justify-between text-[10.5px] text-slate-400">
                     <span>
-                      {turnQuota.exceeded
-                        ? bi('本月额度已用完，仅支持 P2P 直连', 'Monthly limit reached · Direct P2P only')
-                        : bi('P2P 直连永久无限 · 仅双对称 NAT 扣减', 'Direct P2P always free · Only double-NAT relay metered')}
+                      {turnQuota.provider === 'cloudflare'
+                        ? bi('当前使用免费公共中继 · P2P 直连优先', 'Using Cloudflare free relay · Direct P2P preferred')
+                        : turnQuota.exceeded
+                          ? bi('本月额度已用完，仅支持 P2P 直连', 'Monthly limit reached · Direct P2P only')
+                          : bi('P2P 直连永久无限 · 仅双对称 NAT 扣减', 'Direct P2P always free · Only double-NAT relay metered')}
                     </span>
                     {turnQuota.month && <span className="shrink-0 font-mono">{turnQuota.month}</span>}
                   </div>
+                </div>
+              )}
+
+              {activeDevice && onToggleRelayDataSaver && (
+                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">
+                      <Zap className="h-3.5 w-3.5 shrink-0 text-sky-500" />
+                      <span>{bi('中继自动省流', 'Relay Data Saver')}</span>
+                    </div>
+                    <div className="mt-0.5 pl-5.5 text-[10.5px] text-slate-400">
+                      {bi('走中继时图片点击再加载，P2P 直连自动显示', 'Tap to load images over relay; auto-loads over direct P2P')}
+                    </div>
+                  </div>
+                  <ToggleSwitch
+                    checked={Boolean(relayDataSaver)}
+                    onChange={onToggleRelayDataSaver}
+                    label={bi('切换中继自动省流', 'Toggle relay data saver')}
+                  />
                 </div>
               )}
 

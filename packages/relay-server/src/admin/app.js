@@ -544,7 +544,7 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.4'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.5'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
@@ -827,6 +827,7 @@
         </div>
         <div class="mini-chips">
           <span class="mini-chip">${esc(srv.turn?.enabled ? `STUN+TURN :${srv.turn.port || 3478}` : `STUN: ${srv.stun?.enabled ? `UDP ${srv.stun.port || 3478}` : bi('未开启', 'Off')}`)}</span>
+          ${srv.turn?.cloudflare?.enabled ? `<span class="mini-chip">CF TURN (${esc((srv.turn.cloudflare.tiers || []).join('/'))}): ${esc(srv.turn.cloudflare.ready ? bi('就绪', 'Ready') : bi('预热中', 'Warming'))}</span>` : ''}
           ${srv.turn?.quotas ? `<span class="mini-chip">Free ${esc(fmtBytes((srv.turn.quotas.freeMb || 0) * 1024 * 1024))} · Pro ${esc(fmtBytes((srv.turn.quotas.proMb || 0) * 1024 * 1024))} · Ultra/Admin ${esc(srv.turn.quotas.ultraMb > 0 ? fmtBytes(srv.turn.quotas.ultraMb * 1024 * 1024) : bi('无限', 'Unlim'))}</span>` : ''}
           <span class="mini-chip">${esc(bi('邮件服务', 'Mail'))}: ${esc(feat.emailEnabled ? feat.emailProvider.toUpperCase() : bi('未开启', 'Off'))}</span>
           <span class="mini-chip">${esc(bi('系统运行', 'Host Up'))}: ${esc(fmtUptime(host.uptimeSec || 0))}</span>

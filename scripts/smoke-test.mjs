@@ -21,7 +21,12 @@ import WebSocket from 'ws'
 import { RTCIceCandidate, RTCPeerConnection } from 'werift'
 import { DesktopWebRtcProxy } from '../packages/desktop-app/src/webrtc-proxy.js'
 import { ElectronWebRtcClient } from '../packages/dsh-mobile-hub/src/p2p/peer-electron.js'
-import { buildTurnCredentials, createRelayServer } from '../packages/relay-server/src/index.js'
+import {
+  buildTurnCredentials,
+  createRelayServer,
+  normalizeCloudflareIceResponse,
+  parseCfTurnTiers,
+} from '../packages/relay-server/src/index.js'
 import {
   buildTurnQuotaSnapshot,
   getTurnQuotaBytesForTier,
@@ -6162,7 +6167,201 @@ async function main() {
         await qRelay.close()
       }
     }
-    console.log('[smoke] 37/37 4-tier per-user TURN metering, quota gating & live ice.update enforcement OK')
+    console.log('[smoke] 37/38 4-tier per-user TURN metering, quota gating & live ice.update enforcement OK')
+
+    // 38. Tiered Cloudflare Realtime TURN (free -> CF 1TB pool + domestic STUN; pro/ultra/admin -> self-hosted coturn; graceful fallback)
+    {
+      // 38a. Parser & response normalizer unit checks
+      const defaultTiers = parseCfTurnTiers('')
+      assert.deepEqual([...defaultTiers], ['free'])
+      const customTiers = parseCfTurnTiers('free, pro, invalid')
+      assert.deepEqual([...customTiers].sort(), ['free', 'pro'])
+
+      const norm = normalizeCloudflareIceResponse({
+        iceServers: [
+          { urls: ['stun:stun.cloudflare.com:3478'] },
+          {
+            urls: [
+              'turn:turn.cloudflare.com:3478?transport=udp',
+              'turns:turn.cloudflare.com:443?transport=tcp',
+            ],
+            username: 'cf_u_1',
+            credential: 'cf_c_1',
+          },
+        ],
+      })
+      assert.equal(norm.stunServers.length, 1)
+      assert.equal(norm.turnServers.length, 1)
+      assert.equal(norm.turnServers[0].username, 'cf_u_1')
+
+      // 38b. Live mock Cloudflare Realtime TURN API + tiered routing + automatic fallback on CF outage
+      let cfFailMode = false
+      let cfHits = 0
+      const cfApiToken = 'cf-super-secret-api-token-xyz987'
+      const cfTokenId = 'cf-turn-key-id-001'
+      const mockCfServer = http.createServer((req, res) => {
+        cfHits += 1
+        assert.equal(req.method, 'POST')
+        assert.equal(req.url, `/v1/turn/keys/${cfTokenId}/credentials/generate-ice-servers`)
+        assert.equal(req.headers.authorization, `Bearer ${cfApiToken}`)
+        if (cfFailMode) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'simulated cf outage' }))
+          return
+        }
+        res.writeHead(201, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          iceServers: [
+            { urls: ['stun:stun.cloudflare.com:3478'] },
+            {
+              urls: [
+                'turn:turn.cloudflare.com:3478?transport=udp',
+                'turn:turn.cloudflare.com:443?transport=udp',
+                'turns:turn.cloudflare.com:443?transport=tcp',
+              ],
+              username: `cf_user_${cfHits}`,
+              credential: `cf_cred_${cfHits}`,
+            },
+          ],
+        }))
+      })
+      await new Promise((r) => mockCfServer.listen(0, '127.0.0.1', r))
+      const mockCfPort = mockCfServer.address().port
+
+      const cfDir = join(tmpDir, 'cf-turn-tiered')
+      mkdirSync(cfDir, { recursive: true })
+      const cfRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-cf-jwt-secret-123456',
+        adminBootstrapToken: 'CF-BOOT-1',
+        accountsFile: join(cfDir, 'accounts.json'),
+        publicRelayUrl: 'https://domestic.example.com',
+        stunEnabled: false,
+        turnSecret: 'smoke-domestic-turn-secret-12345',
+        turnHost: 'domestic.example.com',
+        turnPort: 3478,
+        turnTtlSec: 600,
+        cfTurnTokenId: cfTokenId,
+        cfTurnApiToken: cfApiToken,
+        cfTurnApiBase: `http://127.0.0.1:${mockCfPort}`,
+        cfTurnTiers: 'free',
+        cfTurnTtlSec: 3600,
+      })
+      const { port: cfPort } = await cfRelay.start()
+      const cfBase = `http://127.0.0.1:${cfPort}`
+      try {
+        assert.ok(cfHits >= 1, 'Cloudflare TURN provider must warm up cached credentials on startup')
+
+        const cfAdmin = await (await fetch(`${cfBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'cf_admin', password: 'CfPassword123!', inviteCode: 'CF-BOOT-1' }),
+        })).json()
+        assert.equal(cfAdmin.ok, true)
+
+        const invFree = await (await fetch(`${cfBase}/api/admin/invites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfAdmin.token}` },
+          body: JSON.stringify({ count: 1, tier: 'free' }),
+        })).json()
+        const cfFree = await (await fetch(`${cfBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'cf_free', password: 'CfPassword123!', inviteCode: invFree.invites[0].code }),
+        })).json()
+        assert.equal(cfFree.ok, true)
+
+        // Free user gets domestic STUN (fast CN P2P) + Cloudflare TURN (0 self-hosted VPS egress!)
+        const freeMe = await (await fetch(`${cfBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${cfFree.token}` },
+        })).json()
+        assert.equal(freeMe.turnQuota.provider, 'cloudflare')
+        assert.equal(freeMe.iceServers[0].urls, 'stun:domestic.example.com:3478', 'Must keep domestic STUN first for fast direct P2P')
+        assert.ok(JSON.stringify(freeMe.iceServers).includes('turn.cloudflare.com'), 'Free user must receive Cloudflare TURN')
+        assert.equal(JSON.stringify(freeMe.iceServers).includes('turn:domestic.example.com'), false, 'Free user must not burn domestic coturn when CF is ready')
+
+        // Admin (and Pro/Ultra) stay on dedicated low-latency domestic coturn
+        const adminMe = await (await fetch(`${cfBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${cfAdmin.token}` },
+        })).json()
+        assert.equal(adminMe.turnQuota.provider, 'self-hosted')
+        assert.ok(JSON.stringify(adminMe.iceServers).includes('turn:domestic.example.com:3478'))
+        assert.equal(JSON.stringify(adminMe.iceServers).includes('turn.cloudflare.com'), false)
+
+        // Upgrading free user -> pro immediately switches them to domestic low-latency coturn
+        await fetch(`${cfBase}/api/admin/users/set-tier`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfAdmin.token}` },
+          body: JSON.stringify({ userId: cfFree.roomId, tier: 'pro' }),
+        })
+        const proMe = await (await fetch(`${cfBase}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${cfFree.token}` },
+        })).json()
+        assert.equal(proMe.turnQuota.provider, 'self-hosted')
+        assert.ok(JSON.stringify(proMe.iceServers).includes('turn:domestic.example.com:3478'))
+
+        // Admin overview exposes Cloudflare ready status & tiers, NEVER leaking cfTurnApiToken
+        const ov = await (await fetch(`${cfBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${cfAdmin.token}` },
+        })).json()
+        assert.equal(ov.server.turn.cloudflare.enabled, true)
+        assert.equal(ov.server.turn.cloudflare.ready, true)
+        assert.deepEqual(ov.server.turn.cloudflare.tiers, ['free'])
+        assert.equal(JSON.stringify(ov).includes(cfApiToken), false, 'CF_TURN_API_TOKEN must NEVER leak in admin overview')
+
+        // Graceful fallback test: when Cloudflare is down at startup, Free tier seamlessly falls back to domestic coturn
+        cfFailMode = true
+        const cfFallbackDir = join(tmpDir, 'cf-turn-fallback')
+        mkdirSync(cfFallbackDir, { recursive: true })
+        const fbRelay = createRelayServer({
+          port: 0,
+          host: '127.0.0.1',
+          jwtSecret: 'smoke-cfb-jwt-secret-123456',
+          adminBootstrapToken: 'CFB-BOOT-1',
+          accountsFile: join(cfFallbackDir, 'accounts.json'),
+          publicRelayUrl: 'https://domestic.example.com',
+          stunEnabled: false,
+          turnSecret: 'smoke-domestic-turn-secret-12345',
+          turnHost: 'domestic.example.com',
+          turnPort: 3478,
+          cfTurnTokenId: cfTokenId,
+          cfTurnApiToken: cfApiToken,
+          cfTurnApiBase: `http://127.0.0.1:${mockCfPort}`,
+          cfTurnTiers: 'free',
+        })
+        const { port: fbPort } = await fbRelay.start()
+        const fbBase = `http://127.0.0.1:${fbPort}`
+        try {
+          const fbAdmin = await (await fetch(`${fbBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'fb_admin', password: 'FbPassword123!', inviteCode: 'CFB-BOOT-1' }),
+          })).json()
+          const fbInv = await (await fetch(`${fbBase}/api/admin/invites`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fbAdmin.token}` },
+            body: JSON.stringify({ count: 1, tier: 'free' }),
+          })).json()
+          const fbFree = await (await fetch(`${fbBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'fb_free', password: 'FbPassword123!', inviteCode: fbInv.invites[0].code }),
+          })).json()
+          const fbMe = await (await fetch(`${fbBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${fbFree.token}` },
+          })).json()
+          assert.equal(fbMe.turnQuota.provider, 'self-hosted', 'Outage on CF API must fall back to self-hosted coturn')
+          assert.ok(JSON.stringify(fbMe.iceServers).includes('turn:domestic.example.com:3478'))
+        } finally {
+          await fbRelay.close()
+        }
+      } finally {
+        await cfRelay.close()
+        await new Promise((r) => mockCfServer.close(r))
+      }
+    }
+    console.log('[smoke] 38/38 Tiered Cloudflare Realtime TURN (free -> CF 1TB pool + domestic STUN & automatic fallback) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

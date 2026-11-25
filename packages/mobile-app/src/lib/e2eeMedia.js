@@ -60,6 +60,24 @@ export function needsE2eeMediaLoad(item) {
   return false
 }
 
+export function getCachedE2eeImageUrl(item, imageContext = {}) {
+  if (!item) return ''
+  if (typeof item === 'object' && item?.localPreviewUrl) {
+    return item.localPreviewUrl
+  }
+  const rawUrl = typeof item === 'string' ? '' : String(item?.url || '').trim()
+  const rawPath = typeof item === 'string' ? String(item).trim() : String(item?.path || '').trim()
+  const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
+  if (!target || !needsE2eeMediaLoad(item)) return ''
+
+  const bridgeId = String(imageContext?.bridgeId || '').trim()
+  const cwd = String(imageContext?.cwd || '').trim()
+  const e2eeKeyId = String(item?.e2ee?.kid || imageContext?.e2eeKeyId || '').trim()
+  const cacheKey = `${imageContext?.roomId || ''}|${bridgeId}|${e2eeKeyId}|${cwd}|${target}`
+  const hit = blobUrlCache.get(cacheKey)
+  return hit?.url || ''
+}
+
 /**
  * Load an E2EE-protected local PC image over direct WebRTC P2P (`RPC.FILE_READ` + `aio-bulk` for >128KB)
  * and return a local `blob:` URL cached in memory. Server sees zero image bytes or paths.

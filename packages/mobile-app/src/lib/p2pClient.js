@@ -259,21 +259,31 @@ export class P2PPeerSession {
   }
 
   _checkChannelsReady() {
-    if (this.closed || this.state === 'connected') return
+    if (this.closed || this.state === 'connected' || this._readyChecking) return
     if (this.ctrlDc?.readyState === 'open' && this.bulkDc?.readyState === 'open') {
+      this._readyChecking = true
       if (this._connectTimer) {
         clearTimeout(this._connectTimer)
         this._connectTimer = null
       }
       this._startKeepalive()
-      this._setState('connected', '')
-      void this._detectIceTransport()
-      if (this._readyResolve) {
-        const res = this._readyResolve
-        this._readyResolve = null
-        this._readyReject = null
-        res(this)
+      const finalize = () => {
+        if (this.closed || this.state === 'connected') return
+        this._setState('connected', '', true)
+        if (this._readyResolve) {
+          const res = this._readyResolve
+          this._readyResolve = null
+          this._readyReject = null
+          res(this)
+        }
       }
+      // Detect direct vs TURN relay before signaling connected (~2ms locally) so Relay Data-Saver never races
+      Promise.race([
+        this._detectIceTransport(),
+        new Promise((r) => setTimeout(r, 250)),
+      ])
+        .catch(() => {})
+        .finally(finalize)
     }
   }
 
