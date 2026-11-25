@@ -16,6 +16,7 @@ import {
   adminCreateInvites,
   adminListInvites,
   adminRevokeInvite,
+  adminSetUserTier,
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
@@ -45,10 +46,24 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   const [error, setError] = useState('')
 
   const [count, setCount] = useState(1)
+  const [inviteTier, setInviteTier] = useState('free')
   const [note, setNote] = useState('')
   const [filter, setFilter] = useState('all') // 'all' | 'active' | 'used' | 'revoked'
   const [showUsers, setShowUsers] = useState(false)
+  const [updatingUserId, setUpdatingUserId] = useState('')
   const [copiedKey, setCopiedKey] = useState('')
+
+  const currentAdminRoom = useMemo(() => {
+    try {
+      const part = String(token || '').split('.')[1]
+      if (!part) return ''
+      const b64 = part.replace(/-/g, '+').replace(/_/g, '/')
+      const payload = JSON.parse(atob(b64))
+      return String(payload?.room || '')
+    } catch {
+      return ''
+    }
+  }, [token])
 
   const cleanBase = normalizeBaseUrl(baseUrl || DEFAULT_PROD_SERVER)
 
@@ -122,14 +137,31 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
     setCreating(true)
     setError('')
     try {
-      await adminCreateInvites(baseUrl, token, { count, note })
+      await adminCreateInvites(baseUrl, token, { count, note, tier: inviteTier, grantAdmin: inviteTier === 'admin' })
       setNote('')
+      setInviteTier('free')
       setFilter('active')
       await loadInvites()
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleSetUserTier = async (u, nextTier) => {
+    if (!baseUrl || !token || !u?.userId || updatingUserId) return
+    const curTier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
+    if (nextTier === curTier) return
+    setUpdatingUserId(u.userId)
+    setError('')
+    try {
+      await adminSetUserTier(baseUrl, token, { userId: u.userId, tier: nextTier })
+      await loadInvites()
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setUpdatingUserId('')
     }
   }
 
@@ -206,31 +238,55 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           </button>
         </div>
 
-        {/* Optional registered users panel */}
+        {/* Optional registered users panel with inline tier adjustment */}
         {showUsers && (
-          <div className="mx-4 mt-2.5 max-h-32 overflow-y-auto rounded-2xl border border-slate-200/80 bg-slate-50/80 p-2.5 text-xs dark:border-slate-800 dark:bg-[#14171F]">
+          <div className="mx-4 mt-2.5 max-h-56 overflow-y-auto rounded-2xl border border-slate-200/80 bg-slate-50/80 p-2.5 text-xs dark:border-slate-800 dark:bg-[#14171F]">
             {users.length === 0 ? (
               <div className="py-2 text-center text-slate-400">{bi('暂无注册用户', 'No registered users')}</div>
             ) : (
-              <div className="space-y-1.5">
-                {users.map((u) => (
-                  <div key={u.userId} className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="truncate font-semibold text-slate-800 dark:text-slate-100">@{u.username}</span>
-                      {u.email && (
-                        <span className="truncate text-[10.5px] text-slate-400">{u.email}</span>
-                      )}
-                      {u.role === 'admin' && (
-                        <span className="shrink-0 rounded bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#4D6BFE]">
-                          {t('common.admin')}
-                        </span>
-                      )}
+              <div className="space-y-2">
+                {users.map((u) => {
+                  const curTier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
+                  const isSelf = Boolean(currentAdminRoom && currentAdminRoom === u.userId)
+                  const tierBadgeCls =
+                    curTier === 'admin'
+                      ? 'border-[#4D6BFE]/40 bg-[#4D6BFE]/12 text-[#4D6BFE] dark:text-[#96AEFF]'
+                      : curTier === 'ultra'
+                        ? 'border-amber-400/40 bg-amber-500/12 text-amber-700 dark:text-amber-300'
+                        : curTier === 'pro'
+                          ? 'border-sky-400/40 bg-sky-500/12 text-sky-700 dark:text-sky-300'
+                          : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-300'
+                  return (
+                    <div key={u.userId} className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="truncate font-semibold text-slate-800 dark:text-slate-100">@{u.username}</span>
+                          {isSelf && (
+                            <span className="shrink-0 rounded bg-slate-200/70 px-1 py-0.5 text-[9.5px] text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                              {bi('当前', 'You')}
+                            </span>
+                          )}
+                        </div>
+                        <div className="truncate text-[10px] text-slate-400">
+                          {bi(`${u.deviceCount} 台电脑`, `${u.deviceCount} PC${u.deviceCount === 1 ? '' : 's'}`)}
+                          {u.email ? ` · ${u.email}` : ''}
+                        </div>
+                      </div>
+                      <select
+                        value={curTier}
+                        disabled={isSelf || updatingUserId === u.userId}
+                        onChange={(e) => handleSetUserTier(u, e.target.value)}
+                        aria-label={bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`)}
+                        className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-semibold outline-none disabled:opacity-60 ${tierBadgeCls}`}
+                      >
+                        <option value="free">{bi('普通 · 1GB/月', 'Free · 1GB/mo')}</option>
+                        <option value="pro">{bi('Pro · 5GB/月', 'Pro · 5GB/mo')}</option>
+                        <option value="ultra">{bi('Ultra · 不限流', 'Ultra · Unlim')}</option>
+                        <option value="admin">{bi('管理员', 'Admin')}</option>
+                      </select>
                     </div>
-                    <span className="shrink-0 text-[11px] text-slate-400">
-                      {bi(`${u.deviceCount} 台电脑`, `${u.deviceCount} PC${u.deviceCount === 1 ? '' : 's'}`)}
-                    </span>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
@@ -256,6 +312,20 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('用户类型', 'User Tier')}</span>
+            <select
+              value={inviteTier}
+              onChange={(e) => setInviteTier(e.target.value)}
+              className="rounded-xl border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-100"
+            >
+              <option value="free">{bi('普通用户 (1GB/月)', 'Free (1GB/mo)')}</option>
+              <option value="pro">{bi('Pro (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x)')}</option>
+              <option value="ultra">{bi('Ultra (不限流)', 'Ultra (Unlimited)')}</option>
+              <option value="admin">{bi('管理员 (不限流)', 'Admin (Unlimited)')}</option>
+            </select>
           </div>
 
           <div className="mt-2.5 flex items-center gap-2">
@@ -346,6 +416,19 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         >
                           {inv.code}
                         </span>
+                        {(inv.tier && inv.tier !== 'free') || inv.grantAdmin ? (
+                          <span
+                            className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                              inv.grantAdmin || inv.tier === 'admin'
+                                ? 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:text-[#96AEFF]'
+                                : inv.tier === 'ultra'
+                                  ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                                  : 'bg-sky-500/15 text-sky-600 dark:text-sky-300'
+                            }`}
+                          >
+                            {(inv.grantAdmin ? 'ADMIN' : String(inv.tier || '').toUpperCase())}
+                          </span>
+                        ) : null}
                         <span
                           className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
                             isActive

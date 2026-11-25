@@ -337,21 +337,39 @@ export async function adminListInvites(baseUrl, token) {
   }
 }
 
-export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false } = {}) {
+export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', grantAdmin = false, tier = 'free' } = {}) {
   const base = normalizeBaseUrl(baseUrl)
+  const cleanTier = String(tier || (grantAdmin ? 'admin' : 'free')).toLowerCase()
   const res = await fetch(`${base}/api/admin/invites`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ count, note, grantAdmin }),
+    body: JSON.stringify({ count, note, tier: cleanTier, grantAdmin: Boolean(grantAdmin || cleanTier === 'admin') }),
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
     throw new Error(data.error || L(`生成邀请码失败 (HTTP ${res.status})`, `Failed to create invite codes (HTTP ${res.status})`))
   }
   return Array.isArray(data.invites) ? data.invites : []
+}
+
+export async function adminSetUserTier(baseUrl, token, { userId, tier }) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/admin/users/set-tier`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ userId, tier }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`调整用户等级失败 (HTTP ${res.status})`, `Failed to update user tier (HTTP ${res.status})`))
+  }
+  return data
 }
 
 export async function adminRevokeInvite(baseUrl, token, { id }) {

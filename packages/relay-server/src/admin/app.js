@@ -906,6 +906,7 @@
       { id: 'bridge_only', label: bi('仅电脑在线', 'PC Only'), count: sum.bridgeOnlyUsers || 0 },
       { id: 'client_only', label: bi('仅终端在线', 'Client Only'), count: sum.clientOnlyUsers || 0 },
       { id: 'offline', label: bi('离线', 'Offline'), count: sum.offlineUsers || 0 },
+      { id: 'free', label: bi('普通', 'Free'), count: tierCounts.free || 0 },
       { id: 'pro', label: 'Pro', count: tierCounts.pro || 0 },
       { id: 'ultra', label: 'Ultra', count: tierCounts.ultra || 0 },
       { id: 'admin', label: bi('管理员', 'Admins'), count: tierCounts.admin || 0 },
@@ -946,9 +947,18 @@
           }).join('')
         : `<span class="muted-text">—</span>`
 
+      const tierControlHtml = u.isCurrentAdmin
+        ? `<span class="pill pill-brand" title="${esc(bi('当前管理员自身不可降级', 'Current admin cannot demote self'))}">${esc(bi('管理员', 'Admin'))}</span><span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>`
+        : `<select class="tier-inline-select tier-${esc(tm.id)}" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(tm.id)}" data-stop-toggle="1" aria-label="${esc(bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`))}" title="${esc(bi('点击快速调整用户类型', 'Click to change user tier'))}">
+            <option value="free" ${tm.id === 'free' ? 'selected' : ''}>${esc(bi('普通 · 1GB/月', 'Free · 1GB/mo'))}</option>
+            <option value="pro" ${tm.id === 'pro' ? 'selected' : ''}>${esc(bi('Pro · 5GB/月', 'Pro · 5GB/mo'))}</option>
+            <option value="ultra" ${tm.id === 'ultra' ? 'selected' : ''}>${esc(bi('Ultra · 不限流', 'Ultra · Unlim'))}</option>
+            <option value="admin" ${tm.id === 'admin' ? 'selected' : ''}>${esc(bi('管理员', 'Admin'))}</option>
+          </select>`
+
       return `
         <div class="user-row ${expanded ? 'expanded' : ''}">
-          <button type="button" class="user-summary" data-action="toggle-user" data-user-id="${esc(u.userId)}" aria-expanded="${expanded ? 'true' : 'false'}">
+          <div class="user-summary" role="button" tabindex="0" data-action="toggle-user" data-user-id="${esc(u.userId)}" aria-expanded="${expanded ? 'true' : 'false'}">
             <div class="user-ident">
               <div class="avatar">
                 ${esc(initial)}
@@ -957,8 +967,7 @@
               <div class="user-name-wrap">
                 <div class="user-name-line">
                   <span class="user-name">@${esc(u.username)}</span>
-                  <span class="pill ${tm.pillClass}">${esc(tm.label)}</span>
-                  ${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>` : ''}
+                  ${tierControlHtml}
                 </div>
                 <div class="user-sub">${esc(u.email || `${bi('注册于', 'Joined')} ${fmtDateShort(u.createdAt)}`)}</div>
               </div>
@@ -988,7 +997,7 @@
             </div>
 
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
-          </button>
+          </div>
 
           ${expanded ? renderUserDetail(u) : ''}
         </div>
@@ -1068,9 +1077,51 @@
 
     const revokeKey = `revoke-all:${u.userId}`
     const revokeArmed = state.confirmKey === revokeKey
+    const curTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
+    const tr = u.stats?.traffic || {}
+    const tierOptions = [
+      { id: 'free', label: bi('普通用户', 'Free'), sub: bi('1GB/月 · 500MB/日', '1GB/mo · 500MB/d') },
+      { id: 'pro', label: 'Pro', sub: bi('5GB/月 · 10倍日额', '5GB/mo · 10x daily') },
+      { id: 'ultra', label: 'Ultra', sub: bi('不限流', 'Unlimited') },
+      { id: 'admin', label: bi('管理员', 'Admin'), sub: bi('不限流 · 后台权限', 'Unlim · Admin') },
+    ]
+    const monthPct = !tr.unlimited && tr.limitMonthBytes > 0
+      ? Math.min(100, Math.round(((tr.bytesMonth || 0) / tr.limitMonthBytes) * 100))
+      : 0
 
     return `
       <div class="user-detail">
+        <div class="detail-tier-bar">
+          <div class="detail-tier-info">
+            <div class="detail-tier-title">
+              <span>${esc(bi('用户类型与流量配额', 'User Tier & Traffic Quota'))}</span>
+              ${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前管理员自身不可降级', 'Current admin locked'))}</span>` : ''}
+            </div>
+            <div class="detail-tier-usage">
+              <span>${esc(bi('本月', 'Month'))}: <strong>${esc(fmtBytes(tr.bytesMonth || 0))}</strong>${tr.unlimited ? ` (${esc(bi('不限流', 'Unlimited'))})` : tr.limitMonthBytes ? ` / ${esc(fmtBytes(tr.limitMonthBytes))} (${monthPct}%)` : ''}</span>
+              <span>·</span>
+              <span>${esc(bi('24h', '24h'))}: <strong>${esc(fmtBytes(tr.bytes24h || 0))}</strong>${!tr.unlimited && tr.limit24hBytes ? ` / ${esc(fmtBytes(tr.limit24hBytes))}` : ''}</span>
+              <span>·</span>
+              <span>10m: ${esc(fmtBytes(tr.bytes10m || 0))}</span>
+              ${tr.throttledCount ? `<span class="pill pill-rose">${esc(bi(`限流 ${tr.throttledCount} 次`, `Throttled ${tr.throttledCount}x`))}</span>` : ''}
+            </div>
+          </div>
+          <div class="tier-seg-group" role="group" aria-label="${esc(bi('切换用户类型', 'Switch user tier'))}">
+            ${tierOptions.map((opt) => `
+              <button type="button"
+                class="tier-seg-btn ${curTier === opt.id ? `active tier-${opt.id}` : ''}"
+                data-action="set-user-tier-btn"
+                data-user-id="${esc(u.userId)}"
+                data-tier="${esc(opt.id)}"
+                data-prev-tier="${esc(curTier)}"
+                ${u.isCurrentAdmin ? 'disabled' : ''}>
+                <span class="tier-seg-name">${esc(opt.label)}</span>
+                <span class="tier-seg-sub">${esc(opt.sub)}</span>
+              </button>
+            `).join('')}
+          </div>
+        </div>
+
         <div class="detail-columns">
           <div class="detail-box">
             <div class="detail-box-head">
@@ -1094,27 +1145,14 @@
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
             ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
             <span>${esc(bi('事件', 'Events'))}: ${esc(u.stats?.eventCount || 0)}</span>
-            <span>${esc(bi('本月流量', 'Month'))}: ${esc(fmtBytes(u.stats?.traffic?.bytesMonth || 0))}${u.stats?.traffic?.unlimited ? ` (${esc(bi('不限流', 'Unlimited'))})` : u.stats?.traffic?.limitMonthBytes ? ` / ${esc(fmtBytes(u.stats.traffic.limitMonthBytes))}` : ''}</span>
-            <span>${esc(bi('24h 流量', '24h'))}: ${esc(fmtBytes(u.stats?.traffic?.bytes24h || 0))}${!u.stats?.traffic?.unlimited && u.stats?.traffic?.limit24hBytes ? ` / ${esc(fmtBytes(u.stats.traffic.limit24hBytes))}` : ''} (${esc(bi('10m', '10m'))}: ${esc(fmtBytes(u.stats?.traffic?.bytes10m || 0))}${u.stats?.traffic?.throttledCount ? `, ${esc(bi(`限流 ${u.stats.traffic.throttledCount} 次`, `Throttled ${u.stats.traffic.throttledCount}x`))}` : ''})</span>
             ${u.stats?.lastRpcMethod ? `<span class="mono">${esc(bi('最近 RPC', 'Last RPC'))}: ${esc(u.stats.lastRpcMethod)} (${esc(fmtRelative(u.stats.lastRpcAt))})</span>` : ''}
           </div>
-          <div class="detail-footer-actions">
-            <label class="tier-switch-wrap">
-              <span>${esc(bi('用户等级', 'Tier'))}</span>
-              <select class="select-compact select-xs" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(u.tier || (u.role === 'admin' ? 'admin' : 'free'))}" ${u.isCurrentAdmin ? 'disabled' : ''}>
-                <option value="free" ${(u.tier || (u.role === 'admin' ? 'admin' : 'free')) === 'free' ? 'selected' : ''}>${esc(bi('普通用户 (1GB/月)', 'Free (1GB/mo)'))}</option>
-                <option value="pro" ${u.tier === 'pro' ? 'selected' : ''}>${esc(bi('Pro (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x)'))}</option>
-                <option value="ultra" ${u.tier === 'ultra' ? 'selected' : ''}>${esc(bi('Ultra (不限流)', 'Ultra (Unlimited)'))}</option>
-                <option value="admin" ${(u.tier || u.role) === 'admin' ? 'selected' : ''}>${esc(bi('管理员 (不限流)', 'Admin (Unlimited)'))}</option>
-              </select>
-            </label>
-            ${!u.isCurrentAdmin ? `
-              <button type="button" class="btn btn-xs ${revokeArmed ? 'btn-danger-confirm' : 'btn-danger-soft'}"
-                data-action="revoke-all" data-user-id="${esc(u.userId)}">
-                ${esc(revokeArmed ? bi('确认强制全端下线?', 'Confirm Force Sign-Out?') : bi('强制全端下线', 'Force Sign-Out All'))}
-              </button>
-            ` : ''}
-          </div>
+          ${!u.isCurrentAdmin ? `
+            <button type="button" class="btn btn-xs ${revokeArmed ? 'btn-danger-confirm' : 'btn-danger-soft'}"
+              data-action="revoke-all" data-user-id="${esc(u.userId)}">
+              ${esc(revokeArmed ? bi('确认强制全端下线?', 'Confirm Force Sign-Out?') : bi('强制全端下线', 'Force Sign-Out All'))}
+            </button>
+          ` : ''}
         </div>
       </div>
     `
@@ -1553,37 +1591,70 @@
       }
     })
 
-    // Delegated change handler for live user tier switching (strict CSP compliant)
-    document.getElementById('dashboard-view').addEventListener('change', async (e) => {
-      const target = e.target.closest('[data-action="set-user-tier"]')
-      if (!target) return
-      const userId = target.dataset.userId || ''
-      const prevTier = target.dataset.prevTier || 'free'
-      const nextTier = target.value || 'free'
-      if (!userId || nextTier === prevTier) return
-      target.disabled = true
+    async function applyUserTierChange(userId, nextTier, prevTier, controlEl) {
+      if (!userId || !nextTier || nextTier === prevTier) return
+      if (controlEl) controlEl.disabled = true
       try {
         const res = await apiFetch('/api/admin/users/set-tier', {
           method: 'POST',
           body: { userId, tier: nextTier },
         })
         const tm = tierMeta(res.tier)
-        showToast(bi(`已将 @${res.user?.username || userId} 设为 ${tm.label}`, `Updated @${res.user?.username || userId} to ${tm.label}`))
+        showToast(bi(`已将 @${res.user?.username || userId} 调整为「${tm.label}」`, `Updated @${res.user?.username || userId} to ${tm.label}`))
         await loadOverview({ force: true })
       } catch (err) {
-        target.value = prevTier
+        if (controlEl && controlEl.tagName === 'SELECT') {
+          controlEl.value = prevTier
+        }
         if (handleAuthError(err)) return
         showToast(String(err.message || err))
       } finally {
-        target.disabled = false
+        if (controlEl) controlEl.disabled = false
       }
+    }
+
+    // Delegated change handler for live user tier switching (strict CSP compliant)
+    document.getElementById('dashboard-view').addEventListener('change', async (e) => {
+      const target = e.target.closest('[data-action="set-user-tier"]')
+      if (!target) return
+      await applyUserTierChange(
+        target.dataset.userId || '',
+        target.value || 'free',
+        target.dataset.prevTier || 'free',
+        target,
+      )
+    })
+
+    // Keyboard toggle for user summary rows (Enter / Space)
+    document.getElementById('dashboard-view').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return
+      if (e.target.closest('[data-stop-toggle], select, button, input, a')) return
+      const row = e.target.closest('[data-action="toggle-user"]')
+      if (!row) return
+      e.preventDefault()
+      const uid = row.dataset.userId
+      if (!uid) return
+      if (state.expandedUsers.has(uid)) state.expandedUsers.delete(uid)
+      else state.expandedUsers.add(uid)
+      renderUsersSection(state.data)
     })
 
     // Delegated click handler for all dynamic actions (strict CSP compliant)
     document.getElementById('dashboard-view').addEventListener('click', async (e) => {
+      if (e.target.closest('[data-stop-toggle]')) return
       const target = e.target.closest('[data-action]')
       if (!target) return
       const action = target.dataset.action
+
+      if (action === 'set-user-tier-btn') {
+        await applyUserTierChange(
+          target.dataset.userId || '',
+          target.dataset.tier || 'free',
+          target.dataset.prevTier || 'free',
+          target,
+        )
+        return
+      }
 
       if (action === 'toggle-user') {
         const uid = target.dataset.userId
