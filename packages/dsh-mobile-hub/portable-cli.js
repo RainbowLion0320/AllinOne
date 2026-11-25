@@ -30,7 +30,7 @@ import {
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const BRIDGE_VERSION = '1.0.13'
+const BRIDGE_VERSION = '1.0.14'
 
 // Capture sensitive bootstrap env vars once at process startup, then scrub them from process.env
 // so spawned AI CLIs (codex/claude/agy) and user shell commands never inherit decrypted secrets
