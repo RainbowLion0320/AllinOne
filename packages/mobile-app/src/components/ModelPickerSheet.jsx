@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { Check, Loader2, Search, Sparkles, X } from 'lucide-react'
+import { Check, Loader2, Sparkles, X } from 'lucide-react'
 import { VendorBadge, formatEffortLabel } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 
@@ -19,7 +19,6 @@ export function ModelPickerSheet({
   const providers = catalog?.providers || []
 
   const [selectedProvider, setSelectedProvider] = useState('all')
-  const [search, setSearch] = useState('')
   const [pickedModel, setPickedModel] = useState('')
   const [pickedProvider, setPickedProvider] = useState('')
   const [pickedEffort, setPickedEffort] = useState('')
@@ -56,7 +55,6 @@ export function ModelPickerSheet({
       initializedKeyRef.current = initKey
       userPickedRef.current = false
       setSelectedProvider('all')
-      setSearch('')
     }
   }, [open, app, catalog, value?.model, value?.provider, value?.reasoningEffort])
 
@@ -81,17 +79,9 @@ export function ModelPickerSheet({
   }, [models, pickedModel, pickedProvider])
 
   const filteredModels = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return models.filter((m) => {
-      if (selectedProvider !== 'all' && m.provider !== selectedProvider) return false
-      if (!q) return true
-      return (
-        String(m.name || '').toLowerCase().includes(q) ||
-        String(m.id || '').toLowerCase().includes(q) ||
-        String(m.providerName || '').toLowerCase().includes(q)
-      )
-    })
-  }, [models, selectedProvider, search])
+    if (selectedProvider === 'all') return models
+    return models.filter((m) => m.provider === selectedProvider)
+  }, [models, selectedProvider])
 
   if (!open) return null
 
@@ -144,55 +134,40 @@ export function ModelPickerSheet({
           </button>
         </div>
 
-        {/* Provider filter & Search (when applicable) */}
-        {(providers.length > 1 || models.length > 8) && (
-          <div className="space-y-2 border-b border-slate-100 px-4 py-2.5 dark:border-slate-800/80">
-            {providers.length > 1 && (
-              <div className="no-scrollbar flex gap-1.5 overflow-x-auto">
-                <button
-                  type="button"
-                  onClick={() => setSelectedProvider('all')}
-                  className={`shrink-0 rounded-full px-3 py-1 text-[11.5px] font-medium transition ${
-                    selectedProvider === 'all'
-                      ? 'bg-[#4D6BFE] text-white'
-                      : 'bg-slate-100 text-slate-600 dark:bg-[#262934] dark:text-slate-300'
-                  }`}
-                >
-                  {t('common.all')} ({models.length})
-                </button>
-                {providers.map((p) => {
-                  const cnt = models.filter((m) => m.provider === p.id).length
-                  const active = selectedProvider === p.id
-                  return (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => setSelectedProvider(p.id)}
-                      className={`shrink-0 rounded-full px-3 py-1 text-[11.5px] font-medium transition ${
-                        active
-                          ? 'bg-[#4D6BFE] text-white'
-                          : 'bg-slate-100 text-slate-600 dark:bg-[#262934] dark:text-slate-300'
-                      }`}
-                    >
-                      {p.name} ({cnt})
-                    </button>
-                  )
-                })}
-              </div>
-            )}
-
-            {models.length > 8 && (
-              <div className="relative">
-                <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder={bi('搜索模型名称或 ID...', 'Search model name or ID...')}
-                  className="w-full rounded-xl border border-slate-200/80 bg-slate-50 py-1.5 pr-3 pl-8 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#14161C] dark:text-slate-100"
-                />
-              </div>
-            )}
+        {/* Provider filter (when multiple providers exist) */}
+        {providers.length > 1 && (
+          <div className="border-b border-slate-100 px-4 py-2.5 dark:border-slate-800/80">
+            <div className="no-scrollbar flex gap-1.5 overflow-x-auto">
+              <button
+                type="button"
+                onClick={() => setSelectedProvider('all')}
+                className={`shrink-0 rounded-full px-3 py-1 text-[11.5px] font-medium transition ${
+                  selectedProvider === 'all'
+                    ? 'bg-[#4D6BFE] text-white'
+                    : 'bg-slate-100 text-slate-600 dark:bg-[#262934] dark:text-slate-300'
+                }`}
+              >
+                {t('common.all')} ({models.length})
+              </button>
+              {providers.map((p) => {
+                const cnt = models.filter((m) => m.provider === p.id).length
+                const active = selectedProvider === p.id
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => setSelectedProvider(p.id)}
+                    className={`shrink-0 rounded-full px-3 py-1 text-[11.5px] font-medium transition ${
+                      active
+                        ? 'bg-[#4D6BFE] text-white'
+                        : 'bg-slate-100 text-slate-600 dark:bg-[#262934] dark:text-slate-300'
+                    }`}
+                  >
+                    {p.name} ({cnt})
+                  </button>
+                )
+              })}
+            </div>
           </div>
         )}
 
@@ -216,45 +191,30 @@ export function ModelPickerSheet({
                 const isDefault =
                   m.id === catalog?.defaultModel &&
                   (!catalog?.defaultProvider || !m.provider || m.provider === catalog.defaultProvider)
-                const effortHint =
-                  m.efforts?.length > 0
-                    ? `${formatEffortLabel(m.efforts[0], lang)}~${formatEffortLabel(m.efforts[m.efforts.length - 1], lang)}`
-                    : ''
-                const hasSubMeta = Boolean(m.providerName || (m.name && m.name !== m.id) || effortHint)
                 return (
                   <button
                     key={key}
                     type="button"
                     onClick={() => handleSelectModel(m)}
-                    className={`flex w-full items-center justify-between gap-2.5 rounded-2xl border px-3 py-2.5 text-left transition ${
+                    className={`flex w-full items-center justify-between gap-2.5 rounded-xl border px-3 py-2 text-left transition ${
                       isSelected
                         ? 'border-[#4D6BFE] bg-[#F1F5FF] dark:border-[#4D6BFE] dark:bg-[#252E4D]'
                         : 'border-transparent hover:bg-slate-100/70 dark:hover:bg-[#242733]'
                     }`}
                   >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate text-[13px] font-semibold text-slate-900 dark:text-white">
-                          {m.name || m.id}
+                    <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <span className="truncate text-[13.5px] font-semibold text-slate-900 dark:text-white">
+                        {m.name || m.id}
+                      </span>
+                      {isDefault && (
+                        <span className="shrink-0 rounded-md bg-[#4D6BFE]/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
+                          {t('common.default')}
                         </span>
-                        {isDefault && (
-                          <span className="shrink-0 rounded-md bg-[#4D6BFE]/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                            {t('common.default')}
-                          </span>
-                        )}
-                      </div>
-                      {hasSubMeta && (
-                        <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-slate-400">
-                          {m.providerName && (
-                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-                              {m.providerName}
-                            </span>
-                          )}
-                          {m.name && m.name !== m.id && (
-                            <span className="truncate font-mono">{m.id}</span>
-                          )}
-                          {effortHint && <span className="shrink-0">· {effortHint}</span>}
-                        </div>
+                      )}
+                      {providers.length > 1 && selectedProvider === 'all' && m.providerName && (
+                        <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                          {m.providerName}
+                        </span>
                       )}
                     </div>
 

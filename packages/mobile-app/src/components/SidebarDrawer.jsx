@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import {
   ChevronDown,
@@ -248,13 +248,26 @@ export function SidebarDrawer({
     else setUncontrolledFilterApp(next)
   }
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [search, setSearch] = useState('')
+  const searchInputRef = useRef(null)
   // Map of projectKey -> boolean (explicitly expanded or collapsed by user)
   const [expandedMap, setExpandedMap] = useState({})
 
   useEffect(() => {
     try { localStorage.setItem('allinone_group_mode', groupMode) } catch {}
   }, [groupMode])
+
+  useEffect(() => {
+    if (searchOpen) {
+      requestAnimationFrame(() => searchInputRef.current?.focus())
+    }
+  }, [searchOpen])
+
+  const closeSearch = () => {
+    setSearch('')
+    setSearchOpen(false)
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -318,12 +331,12 @@ export function SidebarDrawer({
       >
         {/* Top header (includes macOS traffic-light clearance & drag bar when running in Electron) */}
         <div
-          className={`app-drag flex items-center justify-between px-4 pb-2.5 ${
+          className={`app-drag flex items-center justify-between px-4 pb-2 ${
             isMacDesktop ? 'pt-9' : 'pt-safe'
           }`}
         >
           <div className="app-no-drag flex min-w-0 items-center gap-2.5">
-            <img src="./icon-192.png" alt="All in One" className="h-8 w-8 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
+            <img src="./icon-192.png" alt="All in One" className="h-7.5 w-7.5 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
             <div className="min-w-0">
               <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
                 All in One
@@ -352,17 +365,17 @@ export function SidebarDrawer({
         </div>
 
         {/* Active Computer Switcher Card */}
-        <div className="px-4 pb-2.5">
+        <div className="px-4 pb-2">
           <button
             type="button"
             onClick={() => {
               onClose()
               onOpenDeviceSwitcher?.()
             }}
-            className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-2 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
+            className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-1.5 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
           >
-            <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
-              <Monitor className="h-4 w-4" />
+            <div className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+              <Monitor className="h-3.5 w-3.5" />
               <span
                 className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-[#232631] ${
                   connState === 'unauthorized'
@@ -396,33 +409,66 @@ export function SidebarDrawer({
           </button>
         </div>
 
-        {/* New Chat primary pill button */}
-        <div className="px-4 pb-2.5">
-          <button
-            type="button"
-            onClick={() => {
-              onClose()
-              onNewChat('', filterApp !== 'all' ? filterApp : '')
-            }}
-            className="flex w-full items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 active:scale-[0.98]"
-          >
-            <Plus className="h-4 w-4 stroke-[2.5]" />
-            <span>{t('common.newChat')}</span>
-          </button>
-        </div>
-
-        {/* Search input */}
+        {/* Compact Primary Action Row: New Chat + Collapsible Search Toggle */}
         <div className="px-4 pb-2">
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={bi('搜索对话...', 'Search chats...')}
-              className="w-full rounded-xl border border-slate-200/80 bg-white py-2 pr-3 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#14161B] dark:text-slate-100"
-            />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                onClose()
+                onNewChat('', filterApp !== 'all' ? filterApp : '')
+              }}
+              className="flex h-10 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-2xl bg-[#4D6BFE] text-sm font-semibold text-white shadow-sm shadow-[#4D6BFE]/25 transition hover:bg-[#3F5EF5] active:scale-[0.98]"
+            >
+              <Plus className="h-4 w-4 stroke-[2.5]" />
+              <span>{t('common.newChat')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (searchOpen) closeSearch()
+                else setSearchOpen(true)
+              }}
+              title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+              aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+              aria-expanded={searchOpen}
+              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border transition active:scale-95 ${
+                searchOpen || search.trim().length > 0
+                  ? 'border-[#4D6BFE]/50 bg-[#4D6BFE]/12 text-[#4D6BFE] dark:border-[#4D6BFE]/60 dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
+                  : 'border-slate-200/80 bg-white text-slate-500 hover:border-[#4D6BFE]/40 hover:text-[#4D6BFE] dark:border-slate-700/80 dark:bg-[#232631] dark:text-slate-300 dark:hover:border-[#4D6BFE]/50'
+              }`}
+            >
+              <Search className="h-4 w-4" />
+            </button>
           </div>
+
+          {searchOpen && (
+            <div className="relative mt-2">
+              <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.stopPropagation()
+                    closeSearch()
+                  }
+                }}
+                placeholder={bi('搜索对话...', 'Search chats...')}
+                className="w-full rounded-xl border border-[#4D6BFE]/50 bg-white py-1.5 pr-8 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-[#4D6BFE]/50 dark:bg-[#14161B] dark:text-slate-100"
+              />
+              <button
+                type="button"
+                onClick={closeSearch}
+                aria-label={bi('清空并关闭搜索', 'Clear and close search')}
+                className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Vendor Icon & Border-Integrated Subscription Quota Filter Bar (5-column grid) */}
