@@ -1,6 +1,28 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
+import {
+  ArrowUp,
+  BookOpen,
+  ChevronDown,
+  Clock,
+  Eraser,
+  FileCode,
+  FileDiff,
+  FileSearch,
+  FoldVertical,
+  Globe,
+  ListTodo,
+  Loader2,
+  MessageSquarePlus,
+  MessageSquareText,
+  Paperclip,
+  SlidersHorizontal,
+  Sparkles,
+  Square,
+  Timer,
+  Users,
+  X,
+} from 'lucide-react'
 import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
@@ -8,32 +30,34 @@ import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 // Native slash commands inherited from each AI tool (forwarded directly on send)
 const NATIVE_SLASH_COMMANDS = {
   antigravity: [
-    { cmd: '/plan', zh: '计划模式 · 先规划步骤再执行', en: 'Plan step-by-step before executing' },
-    { cmd: '/goal', zh: '目标模式 · 持续推进直到完成', en: 'Autonomous long-running goal mode' },
-    { cmd: '/compact', zh: '压缩总结当前对话上下文', en: 'Compact & summarize conversation context' },
-    { cmd: '/grill-me', zh: '交互式访谈对齐方案细节', en: 'Interactive interview to align design' },
-    { cmd: '/boost', zh: '深度思考与多视角严格验证', en: 'Deep thinking & rigorous verification' },
-    { cmd: '/teamwork', zh: '多 Agent 协同处理复杂任务', en: 'Multi-agent teamwork mode' },
-    { cmd: '/schedule', zh: '设置定时或周期执行任务', en: 'Schedule recurring job or one-shot timer' },
-    { cmd: '/learn', zh: '固化经验偏好供后续复用', en: 'Persist learnings for future tasks' },
+    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 先规划步骤再执行', en: 'Plan step-by-step before executing' },
+    { cmd: '/goal', icon: Timer, zh: '目标模式 · 持续推进直到完成', en: 'Run until the goal is completely finished' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩总结当前对话上下文', en: 'Compact & summarize conversation context' },
+    { cmd: '/schedule', icon: Clock, zh: '设置定时或周期执行任务', en: 'Schedule recurring job or one-shot timer' },
+    { cmd: '/browser', icon: Globe, zh: '调用浏览器 Agent 处理网页任务', en: 'Invoke browser agent for web tasks' },
+    { cmd: '/btw', icon: MessageSquarePlus, zh: '顺便提问而不打断主对话', en: 'Ask a quick question without interrupting' },
+    { cmd: '/grill-me', icon: MessageSquareText, zh: '交互式访谈对齐方案细节', en: 'Interactive interview to align on a plan' },
+    { cmd: '/teamwork', icon: Users, zh: '多 Agent 协同处理复杂任务', en: 'Multi-agent teamwork for large projects' },
+    { cmd: '/boost', icon: Sparkles, zh: '深度思考与多视角严格验证', en: 'Deep thinking & rigorous verification' },
+    { cmd: '/learn', icon: BookOpen, zh: '固化经验偏好供后续复用', en: 'Persist learnings for future tasks' },
   ],
   codex: [
-    { cmd: '/plan', zh: '计划模式 · 先制定实施计划', en: 'Plan mode before executing changes' },
-    { cmd: '/goal', zh: '设定当前线程持续目标', en: 'Set an active goal for this thread' },
-    { cmd: '/compact', zh: '压缩当前对话上下文', en: 'Compact conversation context' },
-    { cmd: '/review', zh: '审查当前代码改动', en: 'Review workspace changes' },
-    { cmd: '/diff', zh: '查看当前工作区改动', en: 'Inspect current workspace diff' },
+    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 先制定实施计划', en: 'Plan mode before executing changes' },
+    { cmd: '/goal', icon: Timer, zh: '设定当前线程持续目标', en: 'Set an active goal for this thread' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/review', icon: FileSearch, zh: '审查当前代码改动', en: 'Review workspace changes' },
+    { cmd: '/diff', icon: FileDiff, zh: '查看当前工作区改动', en: 'Inspect current workspace diff' },
   ],
   claude: [
-    { cmd: '/plan', zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
-    { cmd: '/compact', zh: '压缩当前对话上下文', en: 'Compact conversation context' },
-    { cmd: '/review', zh: '代码审查与风险检查', en: 'Review code changes' },
-    { cmd: '/clear', zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
-    { cmd: '/init', zh: '初始化项目 CLAUDE.md 指引', en: 'Initialize project CLAUDE.md guide' },
+    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/review', icon: FileSearch, zh: '代码审查与风险检查', en: 'Review code changes' },
+    { cmd: '/clear', icon: Eraser, zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
+    { cmd: '/init', icon: FileCode, zh: '初始化项目 CLAUDE.md 指引', en: 'Initialize project CLAUDE.md guide' },
   ],
   dsh: [
-    { cmd: '/plan', zh: '计划模式', en: 'Plan mode' },
-    { cmd: '/compact', zh: '压缩对话上下文', en: 'Compact conversation context' },
+    { cmd: '/plan', icon: ListTodo, zh: '计划模式', en: 'Plan mode' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩对话上下文', en: 'Compact conversation context' },
   ],
 }
 
@@ -113,6 +137,7 @@ export function Composer({
   const [slashIdx, setSlashIdx] = useState(0)
   const fileRef = useRef(null)
   const textareaRef = useRef(null)
+  const slashListRef = useRef(null)
   const draftKeyRef = useRef(draftKey)
   const textRef = useRef(text)
   const attachmentsRef = useRef(attachments)
@@ -137,6 +162,12 @@ export function Composer({
   useEffect(() => {
     setSlashIdx(0)
   }, [slashQuery, activeApp])
+
+  useEffect(() => {
+    if (!showSlashMenu || !slashListRef.current) return
+    const activeEl = slashListRef.current.children?.[slashIdx]
+    activeEl?.scrollIntoView?.({ block: 'nearest' })
+  }, [showSlashMenu, slashIdx])
 
   const autoResize = (el) => {
     if (!el) return
@@ -398,12 +429,14 @@ export function Composer({
         {/* Native Slash Command Popup (floats above composer with zero layout shift) */}
         {showSlashMenu && (
           <div
+            ref={slashListRef}
             role="listbox"
             aria-label={bi('斜杠命令', 'Slash commands')}
-            className="absolute right-0 bottom-full left-0 z-30 mb-2 max-h-64 overflow-y-auto rounded-2xl border border-slate-200/90 bg-white/95 p-1 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#1E2028]/95"
+            className="absolute right-0 bottom-full left-0 z-30 mb-2 max-h-72 overflow-y-auto rounded-2xl border border-slate-200/90 bg-white p-1.5 shadow-xl dark:border-slate-700/80 dark:bg-[#1C1E26]"
           >
             {slashOptions.map((item, idx) => {
               const active = idx === slashIdx
+              const CmdIcon = item.icon
               return (
                 <button
                   key={item.cmd}
@@ -415,10 +448,17 @@ export function Composer({
                   onClick={() => applySlashCommand(item.cmd)}
                   className={`flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition ${
                     active
-                      ? 'bg-[#4D6BFE]/12 dark:bg-[#4D6BFE]/20'
+                      ? 'bg-[#4D6BFE]/12 dark:bg-[#4D6BFE]/22'
                       : 'hover:bg-slate-100/80 dark:hover:bg-slate-800/70'
                   }`}
                 >
+                  {CmdIcon && (
+                    <CmdIcon
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        active ? 'text-[#3552E8] dark:text-[#96AEFF]' : 'text-slate-400 dark:text-slate-400'
+                      }`}
+                    />
+                  )}
                   <span
                     className={`shrink-0 font-mono text-xs font-semibold ${
                       active ? 'text-[#3552E8] dark:text-[#96AEFF]' : 'text-slate-800 dark:text-slate-100'
