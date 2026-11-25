@@ -37,7 +37,7 @@ export function collectServerHealth({
   turn = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '1.0.8',
+  version = '1.0.9',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()

@@ -30,7 +30,7 @@ import {
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const BRIDGE_VERSION = '1.0.8'
+const BRIDGE_VERSION = '1.0.9'
 
 function normalizeServerUrl(raw) {
   const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
