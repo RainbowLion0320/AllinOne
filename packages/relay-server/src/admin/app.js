@@ -544,7 +544,7 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.1'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.2'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
