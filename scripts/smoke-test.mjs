@@ -3869,6 +3869,9 @@ async function main() {
       assert.equal(agyTracker.snapshot().steps[0].status, 'done')
       agyTracker.applyAntigravityAcpUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'default' }, 300)
       assert.equal(agyTracker.snapshot().mode, null)
+      agyTracker.applyAntigravityAcpUpdate({ sessionUpdate: 'plan', entries: [{ content: 'Design', status: 'completed' }, { content: 'UI', status: 'completed' }] }, 400)
+      agyTracker.applyAntigravityUserText('Thanks, next question', 500)
+      assert.equal(agyTracker.snapshot(), null)
 
       // Codex rollout plan/steps + ThreadGoal tracker
       const cdxRolloutPath = join(tmpDir, 'codex-plan-rollout.jsonl')

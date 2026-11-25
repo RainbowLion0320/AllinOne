@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertCircle,
@@ -182,18 +182,15 @@ function formatGoalStatusBadge(status, bi) {
 
 /**
  * Minimal, collapsible sticky Plan / Goal / Steps status bar pinned cleanly above the chat stream.
- * Renders NOTHING (`null`) when the current conversation has no active plan, goal, focus, or steps.
+ * Renders ONLY while a plan/goal/checklist is active or actionable, and auto-hides cleanly once finished.
  */
 export function TaskStateBar({ sessionId = '', taskState = null, running = false, imageContext }) {
   const { bi } = useI18n()
   const [expanded, setExpanded] = useState(false)
   const [planOpen, setPlanOpen] = useState(false)
-
-  // Always auto-collapse when switching conversations so chat viewport stays maximally clean
-  useEffect(() => {
-    setExpanded(false)
-    setPlanOpen(false)
-  }, [sessionId])
+  const [justCompleted, setJustCompleted] = useState(false)
+  const wasActionableRef = useRef(false)
+  const hideTimerRef = useRef(null)
 
   const mode = taskState?.mode === 'plan' || taskState?.mode === 'goal' ? taskState.mode : ''
   const focus = String(taskState?.focus || '').trim()
@@ -202,15 +199,77 @@ export function TaskStateBar({ sessionId = '', taskState = null, running = false
   const planDoc =
     taskState?.planDoc && (taskState.planDoc.path || taskState.planDoc.content) ? taskState.planDoc : null
 
-  if (!mode && !focus && !goal && steps.length === 0 && !planDoc) {
-    return null
-  }
-
   const totalSteps = steps.length
   const doneSteps = steps.filter((s) => s.status === 'done').length
   const failedSteps = steps.filter((s) => s.status === 'failed').length
+  const pendingOrRunningSteps = steps.filter((s) => s.status === 'pending' || s.status === 'in_progress').length
   const activeStep = steps.find((s) => s.status === 'in_progress') || null
   const allDone = totalSteps > 0 && steps.every((s) => s.status === 'done' || s.status === 'skipped')
+  const hasActiveGoal = Boolean(goal && goal.status !== 'complete')
+  const hasActivePlanMode = mode === 'plan' && !allDone
+  const hasActiveGoalMode = mode === 'goal' && (!goal || goal.status !== 'complete')
+  const isActionable =
+    pendingOrRunningSteps > 0 ||
+    failedSteps > 0 ||
+    hasActivePlanMode ||
+    hasActiveGoal ||
+    hasActiveGoalMode
+  const hasLiveFocusOnly = Boolean(running && totalSteps === 0 && focus)
+
+  // Always auto-collapse and reset completion flash when switching conversations
+  useEffect(() => {
+    setExpanded(false)
+    setPlanOpen(false)
+    setJustCompleted(false)
+    wasActionableRef.current = false
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+  }, [sessionId])
+
+  // Show a brief completion confirmation when transitioning live from active -> allDone, then auto-hide
+  useEffect(() => {
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+    if (isActionable) {
+      wasActionableRef.current = true
+      setJustCompleted(false)
+      return
+    }
+    if (allDone && wasActionableRef.current) {
+      setJustCompleted(true)
+      if (!running && !expanded && !planOpen) {
+        hideTimerRef.current = setTimeout(() => {
+          hideTimerRef.current = null
+          wasActionableRef.current = false
+          setJustCompleted(false)
+        }, 2500)
+      }
+      return
+    }
+    wasActionableRef.current = false
+    setJustCompleted(false)
+  }, [isActionable, allDone, running, expanded, planOpen])
+
+  useEffect(() => {
+    return () => {
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+    }
+  }, [])
+
+  const shouldShow =
+    isActionable ||
+    hasLiveFocusOnly ||
+    justCompleted ||
+    ((expanded || planOpen) && Boolean(mode || focus || goal || totalSteps > 0 || planDoc))
+
+  if (!shouldShow) {
+    return null
+  }
+
   const progressPct = totalSteps > 0 ? Math.round((doneSteps / totalSteps) * 100) : 0
 
   const summaryText = (() => {

@@ -254,6 +254,10 @@ export function createTaskStateTracker(initial = null) {
   const setSteps = (rawSteps, ts) => {
     const normalized = normalizeStepsList(rawSteps)
     state.steps = normalized
+    // Clear stale focus once every step in the checklist has finished
+    if (normalized.length > 0 && normalized.every((s) => s.status === 'done' || s.status === 'skipped')) {
+      state.focus = ''
+    }
     touch(ts)
     return true
   }
@@ -296,7 +300,7 @@ export function createTaskStateTracker(initial = null) {
     return true
   }
 
-  /** Antigravity user prompt cues (`/plan ...`, `/goal ...`). */
+  /** Antigravity user prompt cues (`/plan ...`, `/goal ...`), plus stale finished-checklist reset on new normal turns. */
   const applyAntigravityUserText = (rawText, ts) => {
     const text = String(rawText || '').trim()
     if (!text) return false
@@ -311,7 +315,22 @@ export function createTaskStateTracker(initial = null) {
       }
       return setMode('goal', ts)
     }
-    return false
+    // New normal user turn after a previous checklist already finished: drop completed steps & stale focus/planDoc
+    let changed = false
+    if (state.steps.length > 0 && state.steps.every((s) => s.status === 'done' || s.status === 'skipped')) {
+      state.steps = []
+      changed = true
+    }
+    if (state.focus) {
+      state.focus = ''
+      changed = true
+    }
+    if (state.mode !== 'plan' && state.planDoc) {
+      state.planDoc = null
+      changed = true
+    }
+    if (changed) touch(ts)
+    return changed
   }
 
   /** Antigravity tool call (`update_steps`, `update_focus`, artifact `write_file` / `edit_file`). */
