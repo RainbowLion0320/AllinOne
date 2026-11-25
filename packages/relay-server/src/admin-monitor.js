@@ -34,11 +34,11 @@ function normalizePlatformBucket(platform) {
  * Zero background polling timers — only runs when an admin opens or refreshes `/admin`.
  */
 export function collectServerHealth({
-  uploadDir,
   mailer = null,
+  stun = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '0.5.9',
+  version = '1.0.0',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -47,25 +47,9 @@ export function collectServerHealth({
   const cpus = os.cpus() || []
   const loadAvg = os.loadavg() || [0, 0, 0]
 
-  let uploadFileCount = 0
-  let uploadTotalBytes = 0
-  if (uploadDir && existsSync(uploadDir)) {
-    try {
-      for (const name of readdirSync(uploadDir)) {
-        if (!name.endsWith('.bin')) continue
-        try {
-          const st = statSync(join(uploadDir, name))
-          if (st.isFile()) {
-            uploadFileCount += 1
-            uploadTotalBytes += st.size
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
   return {
     version,
+    mode: 'p2p-only',
     startedAt,
     now: Date.now(),
     node: {
@@ -91,14 +75,16 @@ export function collectServerHealth({
       usedMemBytes: usedMem,
       memUsagePct: totalMem > 0 ? Number(((usedMem / totalMem) * 100).toFixed(1)) : 0,
     },
+    stun: stun || { enabled: false, port: 0, requests: 0 },
     storage: {
-      uploadFileCount,
-      uploadTotalBytes,
+      uploadFileCount: 0,
+      uploadTotalBytes: 0,
     },
     features: {
       emailEnabled: Boolean(mailer?.isConfigured?.()),
       emailProvider: mailer?.getProvider?.() || 'none',
       registerInviteGated: Boolean(registerInviteGated),
+      p2pOnly: true,
     },
   }
 }
@@ -121,9 +107,6 @@ export function buildAdminOverview({
   const allBridges = hub.getAllBridges()
   const allClients = hub.getAllClients()
   const metrics = hub.getMetricsSummary()
-  const trafficSummary = typeof hub.getTrafficSummary === 'function'
-    ? hub.getTrafficSummary()
-    : { monthKey: '', totalBytes10m: 0, totalBytes24h: 0, totalBytesMonth: 0, totalBytesLifetime: 0, totalThrottledCount: 0, limits: null }
 
   // Index username by roomId (`usr_*`) for enriching live connections & activity log
   const ownerNameByRoom = new Map()
@@ -372,18 +355,9 @@ export function buildAdminOverview({
       onlineBridges: metrics.onlineBridgeCount,
       totalBoundDevices,
       onlineClients: metrics.onlineClientCount,
-      pendingRpcs: metrics.pendingRpcCount,
-      totalRpcs: metrics.totalRpcs,
-      totalEvents: metrics.totalEvents,
+      totalSignals: metrics.totalSignals || 0,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
-      totalTraffic10mBytes: trafficSummary.totalBytes10m || 0,
-      totalTraffic24hBytes: trafficSummary.totalBytes24h || 0,
-      totalTrafficMonthBytes: trafficSummary.totalBytesMonth || 0,
-      trafficMonthKey: trafficSummary.monthKey || '',
-      totalTrafficLifetimeBytes: trafficSummary.totalBytesLifetime || 0,
-      totalThrottledCount: trafficSummary.totalThrottledCount || 0,
-      trafficLimits: trafficSummary.limits || null,
       tierDistribution,
     },
     distributions: {

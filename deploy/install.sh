@@ -329,6 +329,7 @@ services:
       - relay_data:/app/packages/relay-server/data
     ports:
       - "127.0.0.1:8787:8787"
+      - "3478:3478/udp"
 
   caddy:
     image: caddy:2-alpine
@@ -377,6 +378,7 @@ services:
       - relay_data:/app/packages/relay-server/data
     ports:
       - "127.0.0.1:${port}:8787"
+      - "3478:3478/udp"
 
 volumes:
   relay_data:

@@ -283,7 +283,7 @@
     if (sortSel && sortSel.options.length >= 4) {
       sortSel.options[0].textContent = bi('在线优先', 'Online First')
       sortSel.options[1].textContent = bi('最近活跃', 'Recent Activity')
-      sortSel.options[2].textContent = bi('请求最多', 'Most RPCs')
+      sortSel.options[2].textContent = bi('信令最多', 'Most Signals')
       sortSel.options[3].textContent = bi('最新注册', 'Newest')
     }
 
@@ -294,12 +294,10 @@
     setText('invites-title', '一次性注册邀请码', 'Single-Use Invite Codes')
     setText('invites-subtitle', '一码一人，注册成功后立即核销', 'One code per user, burned immediately on registration')
     setPh('invite-note', '备注（如：给朋友 / 测试账号）', 'Note (optional)')
-    const invTierSel = document.getElementById('invite-tier')
-    if (invTierSel && invTierSel.options.length >= 4) {
-      invTierSel.options[0].textContent = bi('普通用户 (1GB/月 · 500MB/日)', 'Free (1GB/mo · 500MB/day)')
-      invTierSel.options[1].textContent = bi('Pro 用户 (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x Daily)')
-      invTierSel.options[2].textContent = bi('Ultra 用户 (不限流)', 'Ultra (Unlimited)')
-      invTierSel.options[3].textContent = bi('管理员 (Admin · 不限流)', 'Admin (Unlimited)')
+    const invRoleSel = document.getElementById('invite-role')
+    if (invRoleSel && invRoleSel.options.length >= 2) {
+      invRoleSel.options[0].textContent = bi('普通用户 (P2P 直连)', 'Standard User (Direct P2P)')
+      invRoleSel.options[1].textContent = bi('管理员 (Admin)', 'Administrator')
     }
     setText('btn-create-invite', '生成邀请码', 'Generate')
     setText('activity-title', '近期运行事件（纯内存环形缓存）', 'Recent Activity (In-Memory Ring Buffer)')
@@ -546,19 +544,20 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '0.5.9'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.0'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
-      const hostName = srv.host?.hostname || 'relay'
+      const hostName = srv.host?.hostname || 'control'
       const up = fmtUptime(srv.node?.uptimeSec || 0)
       const rss = fmtBytes(srv.node?.rssBytes || 0)
-      const traffic24h = fmtBytes(sum.totalTraffic24hBytes || 0)
-      const trafficMonth = fmtBytes(sum.totalTrafficMonthBytes || 0)
-      const throttled = Number(sum.totalThrottledCount || 0)
+      const stun = srv.stun || {}
+      const stunText = stun.enabled
+        ? `STUN UDP :${stun.port || 3478} (${stun.requests || 0})`
+        : bi('STUN 关', 'STUN Off')
       subEl.textContent = bi(
-        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · 24h ${traffic24h} / 本月 ${trafficMonth}${throttled > 0 ? ` · 限流 ${throttled}` : ''}`,
-        `Host ${hostName} · Up ${up} · RSS ${rss} · 24h ${traffic24h} / Mo ${trafficMonth}${throttled > 0 ? ` · Throttled ${throttled}` : ''}`,
+        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · ${stunText} · 纯控制面 (0 字节中转)`,
+        `Host ${hostName} · Up ${up} · RSS ${rss} · ${stunText} · Pure Control Plane (0 B relayed)`,
       )
     }
 
@@ -632,15 +631,15 @@
       },
       {
         accent: '#7c5cff',
-        label: bi('启动至今中转 RPC', 'Relayed RPCs'),
-        pill: (sum.pendingRpcs || 0) > 0
-          ? `<span class="pill pill-amber"><span class="dot dot-amber"></span>${bi(`${sum.pendingRpcs} 执行中`, `${sum.pendingRpcs} in-flight`)}</span>`
-          : `<span class="pill pill-subtle">${bi('队列空闲', '0 pending')}</span>`,
-        value: sum.totalRpcs || 0,
+        label: bi('P2P 加密信令 / 内置 STUN', 'P2P Signals / STUN'),
+        pill: d.server?.stun?.enabled
+          ? `<span class="pill pill-emerald"><span class="dot dot-emerald"></span>STUN :${esc(d.server.stun.port || 3478)}</span>`
+          : `<span class="pill pill-subtle">${bi('STUN 关', 'STUN Off')}</span>`,
+        value: sum.totalSignals || 0,
         total: '',
         meta: bi(
-          `推送事件 ${sum.totalEvents || 0} 条 · 桥接累计 ${sum.totalBridgeConnects || 0} 次`,
-          `${sum.totalEvents || 0} events pushed · ${sum.totalBridgeConnects || 0} bridge joins`,
+          `STUN 穿透 ${d.server?.stun?.requests || 0} 次 · 桥接累计 ${sum.totalBridgeConnects || 0} 次 · 0 字节中转`,
+          `${d.server?.stun?.requests || 0} STUN hits · ${sum.totalBridgeConnects || 0} bridge joins · 0 B relayed`,
         ),
       },
     ]
@@ -822,7 +821,8 @@
           </div>
         </div>
         <div class="mini-chips">
-          <span class="mini-chip">${esc(bi('临时上传', 'Uploads'))}: ${esc(storage.uploadFileCount || 0)} (${esc(fmtBytes(storage.uploadTotalBytes))})</span>
+          <span class="mini-chip">STUN: ${esc(srv.stun?.enabled ? `UDP ${srv.stun.port || 3478} (${srv.stun.requests || 0})` : bi('未开启', 'Off'))}</span>
+          <span class="mini-chip">${esc(bi('数据面', 'Data Plane'))}: ${esc(bi('100% P2P 直连', '100% Direct P2P'))}</span>
           <span class="mini-chip">${esc(bi('邮件服务', 'Mail'))}: ${esc(feat.emailEnabled ? feat.emailProvider.toUpperCase() : bi('未开启', 'Off'))}</span>
           <span class="mini-chip">${esc(bi('系统运行', 'Host Up'))}: ${esc(fmtUptime(host.uptimeSec || 0))}</span>
         </div>
@@ -835,22 +835,18 @@
   function getFilteredUsers(users) {
     const q = state.userSearch.trim().toLowerCase()
     const filtered = users.filter((u) => {
-      const tier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
       if (state.userFilter === 'online' && u.status === 'offline') return false
       if (state.userFilter === 'active' && u.status !== 'active') return false
       if (state.userFilter === 'bridge_only' && u.status !== 'bridge_only') return false
       if (state.userFilter === 'client_only' && u.status !== 'client_only') return false
       if (state.userFilter === 'offline' && u.status !== 'offline') return false
-      if (state.userFilter === 'free' && tier !== 'free') return false
-      if (state.userFilter === 'pro' && tier !== 'pro') return false
-      if (state.userFilter === 'ultra' && tier !== 'ultra') return false
-      if (state.userFilter === 'admin' && tier !== 'admin') return false
+      if (state.userFilter === 'admin' && u.role !== 'admin') return false
       if (!q) return true
       const hay = [
         u.username,
         u.email,
         u.userId,
-        tier,
+        u.role,
         ...(u.devices || []).flatMap((d) => [d.label, d.hostname, d.bridgeId, d.ip, d.platform]),
         ...(u.sessions || []).flatMap((s) => [s.deviceName, s.ip]),
       ]
@@ -863,7 +859,7 @@
     const statusRank = { active: 3, bridge_only: 2, client_only: 1, offline: 0 }
     filtered.sort((a, b) => {
       if (state.userSort === 'recent') return (b.lastActivityAt || 0) - (a.lastActivityAt || 0)
-      if (state.userSort === 'rpcs') return (b.stats?.rpcCount || 0) - (a.stats?.rpcCount || 0)
+      if (state.userSort === 'signals') return (b.stats?.signalCount || 0) - (a.stats?.signalCount || 0)
       if (state.userSort === 'newest') return (b.createdAt || 0) - (a.createdAt || 0)
       return (
         statusRank[b.status] - statusRank[a.status] ||
@@ -893,12 +889,7 @@
       expandBtn.textContent = allOpen ? bi('收起全部', 'Collapse All') : bi('展开全部', 'Expand All')
     }
 
-    const tierCounts = sum.tierDistribution || {
-      free: allUsers.filter((u) => (u.tier || (u.role === 'admin' ? 'admin' : 'free')) === 'free').length,
-      pro: allUsers.filter((u) => u.tier === 'pro').length,
-      ultra: allUsers.filter((u) => u.tier === 'ultra').length,
-      admin: allUsers.filter((u) => (u.tier || u.role) === 'admin').length,
-    }
+    const adminCount = allUsers.filter((u) => u.role === 'admin').length
     const pills = [
       { id: 'all', label: bi('全部', 'All'), count: allUsers.length },
       { id: 'online', label: bi('当前在线', 'Online'), count: sum.onlineUsers || 0 },
@@ -906,10 +897,7 @@
       { id: 'bridge_only', label: bi('仅电脑在线', 'PC Only'), count: sum.bridgeOnlyUsers || 0 },
       { id: 'client_only', label: bi('仅终端在线', 'Client Only'), count: sum.clientOnlyUsers || 0 },
       { id: 'offline', label: bi('离线', 'Offline'), count: sum.offlineUsers || 0 },
-      { id: 'free', label: 'Free', count: tierCounts.free || 0 },
-      { id: 'pro', label: 'Pro', count: tierCounts.pro || 0 },
-      { id: 'ultra', label: 'Ultra', count: tierCounts.ultra || 0 },
-      { id: 'admin', label: 'Admin', count: tierCounts.admin || 0 },
+      { id: 'admin', label: 'Admin', count: adminCount },
     ]
 
     document.getElementById('user-filter-pills').innerHTML = pills.map((p) => `
@@ -928,18 +916,7 @@
     listEl.innerHTML = filtered.map((u) => {
       const expanded = state.expandedUsers.has(u.userId)
       const sm = statusMeta(u.status)
-      const tm = tierMeta(u.tier, u.role)
-      const tr = u.stats?.traffic || {}
       const initial = (u.username || '?').slice(0, 1).toUpperCase()
-      const trafficSummaryText = tr.unlimited || tm.id === 'ultra' || tm.id === 'admin'
-        ? bi(
-            `24h ${fmtBytes(tr.bytes24h || 0)} · 不限流`,
-            `24h ${fmtBytes(tr.bytes24h || 0)} · Unlimited`,
-          )
-        : bi(
-            `本月 ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · 限流${tr.throttledCount}` : ''}`,
-            `Mo ${fmtBytes(tr.bytesMonth || 0)}${tr.limitMonthBytes ? `/${fmtBytes(tr.limitMonthBytes)}` : ''} · 24h ${fmtBytes(tr.bytes24h || 0)}${tr.throttledCount ? ` · Limited ${tr.throttledCount}` : ''}`,
-          )
       const appTags = (u.apps || []).length > 0
         ? u.apps.map((a) => {
             const meta = APP_COLORS[a.app] || { badge: a.app.toUpperCase(), color: '#94a3b8', bg: 'rgba(148,163,184,0.14)' }
@@ -947,14 +924,9 @@
           }).join('')
         : `<span class="muted-text">—</span>`
 
-      const tierControlHtml = u.isCurrentAdmin
-        ? `<span class="pill pill-brand" title="${esc(bi('当前管理员自身不可降级', 'Current admin cannot demote self'))}">Admin</span><span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>`
-        : `<select class="tier-inline-select tier-${esc(tm.id)}" data-action="set-user-tier" data-user-id="${esc(u.userId)}" data-prev-tier="${esc(tm.id)}" data-stop-toggle="1" aria-label="${esc(bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`))}" title="${esc(bi('点击切换用户类型', 'Change user tier'))}">
-            <option value="free" ${tm.id === 'free' ? 'selected' : ''}>Free</option>
-            <option value="pro" ${tm.id === 'pro' ? 'selected' : ''}>Pro</option>
-            <option value="ultra" ${tm.id === 'ultra' ? 'selected' : ''}>Ultra</option>
-            <option value="admin" ${tm.id === 'admin' ? 'selected' : ''}>Admin</option>
-          </select>`
+      const roleBadgeHtml = u.role === 'admin'
+        ? `<span class="pill pill-brand">Admin</span>${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前', 'You'))}</span>` : ''}`
+        : ''
 
       return `
         <div class="user-row ${expanded ? 'expanded' : ''}">
@@ -967,7 +939,7 @@
               <div class="user-name-wrap">
                 <div class="user-name-line">
                   <span class="user-name">@${esc(u.username)}</span>
-                  ${tierControlHtml}
+                  ${roleBadgeHtml}
                 </div>
                 <div class="user-sub">${esc(u.email || `${bi('注册于', 'Joined')} ${fmtDateShort(u.createdAt)}`)}</div>
               </div>
@@ -993,7 +965,7 @@
 
             <div class="user-activity">
               <div>${esc(fmtRelative(u.lastActivityAt))}</div>
-              <div class="user-activity-sub">${esc(`${u.stats?.rpcCount || 0} RPC · ${trafficSummaryText}`)}</div>
+              <div class="user-activity-sub">${esc(bi(`${u.stats?.signalCount || 0} 次 P2P 信令 · 0 B 中转`, `${u.stats?.signalCount || 0} P2P signals · 0 B relayed`))}</div>
             </div>
 
             <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
@@ -1077,51 +1049,9 @@
 
     const revokeKey = `revoke-all:${u.userId}`
     const revokeArmed = state.confirmKey === revokeKey
-    const curTier = String(u.tier || (u.role === 'admin' ? 'admin' : 'free')).toLowerCase()
-    const tr = u.stats?.traffic || {}
-    const tierOptions = [
-      { id: 'free', label: 'Free', sub: bi('1GB/月 · 单文件15MB', '1GB/mo · 15MB file') },
-      { id: 'pro', label: 'Pro', sub: bi('5GB/月 · 单文件100MB', '5GB/mo · 100MB file') },
-      { id: 'ultra', label: 'Ultra', sub: bi('不限流 · 单文件1GB', 'Unlim · 1GB file') },
-      { id: 'admin', label: 'Admin', sub: bi('不限流 · 单文件1GB', 'Unlim · 1GB file') },
-    ]
-    const monthPct = !tr.unlimited && tr.limitMonthBytes > 0
-      ? Math.min(100, Math.round(((tr.bytesMonth || 0) / tr.limitMonthBytes) * 100))
-      : 0
 
     return `
       <div class="user-detail">
-        <div class="detail-tier-bar">
-          <div class="detail-tier-info">
-            <div class="detail-tier-title">
-              <span>${esc(bi('用户类型与流量配额', 'User Tier & Traffic Quota'))}</span>
-              ${u.isCurrentAdmin ? `<span class="pill pill-subtle">${esc(bi('当前管理员自身不可降级', 'Current admin locked'))}</span>` : ''}
-            </div>
-            <div class="detail-tier-usage">
-              <span>${esc(bi('本月', 'Month'))}: <strong>${esc(fmtBytes(tr.bytesMonth || 0))}</strong>${tr.unlimited ? ` (${esc(bi('不限流', 'Unlimited'))})` : tr.limitMonthBytes ? ` / ${esc(fmtBytes(tr.limitMonthBytes))} (${monthPct}%)` : ''}</span>
-              <span>·</span>
-              <span>${esc(bi('24h', '24h'))}: <strong>${esc(fmtBytes(tr.bytes24h || 0))}</strong>${!tr.unlimited && tr.limit24hBytes ? ` / ${esc(fmtBytes(tr.limit24hBytes))}` : ''}</span>
-              <span>·</span>
-              <span>10m: ${esc(fmtBytes(tr.bytes10m || 0))}</span>
-              ${tr.throttledCount ? `<span class="pill pill-rose">${esc(bi(`限流 ${tr.throttledCount} 次`, `Throttled ${tr.throttledCount}x`))}</span>` : ''}
-            </div>
-          </div>
-          <div class="tier-seg-group" role="group" aria-label="${esc(bi('切换用户类型', 'Switch user tier'))}">
-            ${tierOptions.map((opt) => `
-              <button type="button"
-                class="tier-seg-btn ${curTier === opt.id ? `active tier-${opt.id}` : ''}"
-                data-action="set-user-tier-btn"
-                data-user-id="${esc(u.userId)}"
-                data-tier="${esc(opt.id)}"
-                data-prev-tier="${esc(curTier)}"
-                ${u.isCurrentAdmin ? 'disabled' : ''}>
-                <span class="tier-seg-name">${esc(opt.label)}</span>
-                <span class="tier-seg-sub">${esc(opt.sub)}</span>
-              </button>
-            `).join('')}
-          </div>
-        </div>
-
         <div class="detail-columns">
           <div class="detail-box">
             <div class="detail-box-head">
@@ -1144,8 +1074,7 @@
             <span>${esc(bi('注册时间', 'Registered'))}: ${esc(fmtDateShort(u.createdAt))}</span>
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
             ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
-            <span>${esc(bi('事件', 'Events'))}: ${esc(u.stats?.eventCount || 0)}</span>
-            ${u.stats?.lastRpcMethod ? `<span class="mono">${esc(bi('最近 RPC', 'Last RPC'))}: ${esc(u.stats.lastRpcMethod)} (${esc(fmtRelative(u.stats.lastRpcAt))})</span>` : ''}
+            <span>${esc(bi('P2P 信令', 'P2P Signals'))}: ${esc(u.stats?.signalCount || 0)}</span>
           </div>
           ${!u.isCurrentAdmin ? `
             <button type="button" class="btn btn-xs ${revokeArmed ? 'btn-danger-confirm' : 'btn-danger-soft'}"
@@ -1306,13 +1235,12 @@
           ? `<span class="pill pill-subtle">${esc(bi('已使用', 'Used'))}</span>`
           : `<span class="pill pill-rose">${esc(bi('已作废', 'Revoked'))}</span>`
       const regUrl = `${RELAY_BASE_URL}/?invite=${encodeURIComponent(inv.code)}`
-      const invTm = tierMeta(inv.tier || (inv.grantAdmin ? 'admin' : inv.plan || 'free'))
       return `
         <div class="invite-card ${isActive ? 'active' : 'inactive'}">
           <div class="invite-code-row">
             <span class="invite-code mono ${inv.status === 'revoked' ? 'revoked' : ''}">${esc(inv.code)}</span>
             <div class="inline-pills">
-              ${invTm.id !== 'free' ? `<span class="pill ${invTm.pillClass}">${esc(invTm.short)}</span>` : ''}
+              ${inv.grantAdmin ? `<span class="pill pill-brand">ADMIN</span>` : ''}
               ${badge}
             </div>
           </div>
@@ -1564,8 +1492,8 @@
       e.preventDefault()
       const btn = document.getElementById('btn-create-invite')
       const noteEl = document.getElementById('invite-note')
-      const tierEl = document.getElementById('invite-tier')
-      const chosenTier = tierEl ? tierEl.value : 'free'
+      const roleEl = document.getElementById('invite-role')
+      const grantAdmin = roleEl ? roleEl.value === 'admin' : false
       btn.disabled = true
       try {
         const res = await apiFetch('/api/admin/invites', {
@@ -1573,15 +1501,13 @@
           body: {
             count: state.inviteQty,
             note: noteEl.value.trim(),
-            tier: chosenTier,
-            grantAdmin: chosenTier === 'admin',
+            grantAdmin,
           },
         })
         noteEl.value = ''
-        if (tierEl) tierEl.value = 'free'
+        if (roleEl) roleEl.value = 'user'
         state.inviteFilter = 'active'
-        const tm = tierMeta(chosenTier)
-        showToast(bi(`已生成 ${res.invites.length} 个 [${tm.label}] 邀请码`, `Generated ${res.invites.length} [${tm.label}] invite(s)`))
+        showToast(bi(`已生成 ${res.invites.length} 个邀请码`, `Generated ${res.invites.length} invite(s)`))
         await loadOverview({ force: true })
       } catch (err) {
         if (handleAuthError(err)) return
@@ -1589,40 +1515,6 @@
       } finally {
         btn.disabled = false
       }
-    })
-
-    async function applyUserTierChange(userId, nextTier, prevTier, controlEl) {
-      if (!userId || !nextTier || nextTier === prevTier) return
-      if (controlEl) controlEl.disabled = true
-      try {
-        const res = await apiFetch('/api/admin/users/set-tier', {
-          method: 'POST',
-          body: { userId, tier: nextTier },
-        })
-        const tm = tierMeta(res.tier)
-        showToast(bi(`已将 @${res.user?.username || userId} 调整为「${tm.label}」`, `Updated @${res.user?.username || userId} to ${tm.label}`))
-        await loadOverview({ force: true })
-      } catch (err) {
-        if (controlEl && controlEl.tagName === 'SELECT') {
-          controlEl.value = prevTier
-        }
-        if (handleAuthError(err)) return
-        showToast(String(err.message || err))
-      } finally {
-        if (controlEl) controlEl.disabled = false
-      }
-    }
-
-    // Delegated change handler for live user tier switching (strict CSP compliant)
-    document.getElementById('dashboard-view').addEventListener('change', async (e) => {
-      const target = e.target.closest('[data-action="set-user-tier"]')
-      if (!target) return
-      await applyUserTierChange(
-        target.dataset.userId || '',
-        target.value || 'free',
-        target.dataset.prevTier || 'free',
-        target,
-      )
     })
 
     // Keyboard toggle for user summary rows (Enter / Space)
@@ -1645,16 +1537,6 @@
       const target = e.target.closest('[data-action]')
       if (!target) return
       const action = target.dataset.action
-
-      if (action === 'set-user-tier-btn') {
-        await applyUserTierChange(
-          target.dataset.userId || '',
-          target.dataset.tier || 'free',
-          target.dataset.prevTier || 'free',
-          target,
-        )
-        return
-      }
 
       if (action === 'toggle-user') {
         const uid = target.dataset.userId

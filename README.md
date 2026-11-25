@@ -51,7 +51,7 @@
   </tr>
 </table>
 
-> All in One 在你自己的服务器上运行一个轻量盲中转，直接调用本机各 AI 工具的官方接口，**100% 延续原有项目工作区、本地历史会话与官方 Prompt Cache**。同一账号登录多台电脑与手机后，自动发现并随时切换操控。
+> All in One 采用 **纯控制面 + 100% WebRTC P2P 直连（`AIO-P2P v1`）** 架构：服务器仅负责账号认证、设备发现、加密信令交换与内置无状态 STUN（`UDP 3478`），**所有对话、代码、图片与 GB 级大文件均在手机与电脑之间端到端直传，0 字节流经服务器**，同时 100% 延续原有项目工作区、本地历史会话与官方 Prompt Cache。
 
 ---
 
@@ -64,28 +64,28 @@
       <p>统一管理本机的 <strong>Codex</strong>、<strong>Claude Code / Desktop</strong>、<strong>Antigravity</strong> 与 <strong>DeepSeek Harness</strong>，按项目或时间分组，一个入口续聊所有对话。</p>
     </td>
     <td width="50%" valign="top">
-      <h4>🔒 强制零知识端到端加密（E2EE）</h4>
-      <p>所有对话、代码、附件与图片均经 <code>AES-256-GCM</code> 端到端加密后由中转盲转发；支持离线二维码扫码与 <strong>ECDH P-256 + 6 位安全码</strong>免扫码授权。</p>
+      <h4>⚡ 100% WebRTC P2P 端到端直连</h4>
+      <p>手机与电脑通过 <code>AES-256-GCM</code> + DTLS 双层加密直连，对话、代码、图片与大文件 <strong>0 字节经过服务器</strong>；服务器内置无状态 RFC 5389 STUN（<code>UDP 3478</code>），无带宽焦虑、无需限流套餐。</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <h4>⚡ 交互式问答卡片与双向同步</h4>
-      <p>手机端原生渲染工具提问与审批卡片，支持 <strong>Codex</strong> 异步问答与运行中转向（<code>turn/steer</code>），以及 <strong>DSH</strong> 桌面端回答后双向静默消卡。</p>
+      <h4>🔒 强制零知识端到端加密（E2EE）</h4>
+      <p>包括 WebRTC 信令、RPC 指令、流式输出与二进制文件均使用本机 256-bit 房间密钥端到端加解密；支持离线二维码扫码与 <strong>ECDH P-256 + 6 位安全码</strong>免扫码授权。</p>
     </td>
     <td width="50%" valign="top">
-      <h4>📊 订阅周额度一眼掌握</h4>
-      <p>侧边栏图标边框集成顺时针进度环，实时展示 Codex / Claude / Antigravity（Gemini）剩余周额度与重置时间（全程经 E2EE 密文传输）。</p>
+      <h4>📊 交互式问答、双向同步与周额度环</h4>
+      <p>原生渲染工具提问与审批卡片（支持 Codex <code>turn/steer</code> 与 DSH 双向消卡），侧边栏图标边框集成顺时针进度环实时展示 Codex / Claude / Antigravity 剩余周额度。</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h4>📱 全平台多设备无缝切换</h4>
-      <p>提供 macOS / Windows 桌面端（内置托盘后台桥接）、Linux 一行接入脚本、iOS / Android 网页 PWA 与 Android 原生壳 APK，自动发现名下所有在线电脑。</p>
+      <p>提供 macOS / Windows 桌面端（原生 Chromium <code>libwebrtc</code> 引擎 + 托盘常驻）、Linux 纯 JS 一行接入脚本、iOS / Android 网页 PWA 与 Android 原生壳 APK。</p>
     </td>
     <td width="50%" valign="top">
-      <h4>🐳 轻量自建，零厂商锁定</h4>
-      <p>单条 <code>docker compose</code> 命令即可在自有 VPS 启动（内置 Caddy 自动 HTTPS），附带零额外负载的 <code>/admin</code> 实时监控看板，MIT 协议完全开源可审计。</p>
+      <h4>🐳 极轻自建，1 核 1G 即可稳跑</h4>
+      <p>服务器无任何业务流量与临时文件存储，单条 <code>docker compose</code> 命令即可在自有 VPS 启动（自动 HTTPS + 内置 STUN），附带零空载 <code>/admin</code> 监控看板，MIT 完全开源。</p>
     </td>
   </tr>
 </table>
@@ -168,11 +168,11 @@ All in One 从协议层设计为 **六道零知识纵深防御**，即使中转�
 | 防线 | 核心机制 | 安全保障 |
 | :--- | :--- | :--- |
 | **1. 强制端到端加密** | `AES-256-GCM` + 256-bit 房间密钥 + AAD 绑定房间与消息类型 | 所有对话、工具调用、附件、本地图片与额度均在端侧加解密；桥接端强制拒绝明文 RPC，防重放窗口 + 随机 IV |
-| **2. 零知识盲中转** | 中转服务器不持有任何房间密钥，临时加密附件下载即焚 | 中转仅负责路由不透明密文；服务端日志与内存均无明文内容 |
-| **3. 零知识设备授权** | 离线二维码扫码 **或** `ECDH P-256` + `HKDF-SHA256` + **6 位安全码（SAS）** | 异地免扫码同步密钥时，双方独立派生 6 位安全码防中间人攻击，中转全程盲转发 |
-| **4. 零公网开端口** | 电脑桥接仅发起**出站 WSS** 连接，拒绝公网直连本机 | 无需配置路由器端口转发或内网穿透，本机零暴露公网端口 |
+| **2. 纯控制面 + 零中转数据面** | 服务器彻底移除数据中转与文件暂存，仅提供账号鉴权、加密信令与内置无状态 STUN（`UDP 3478`） | 聊天、代码、图片与大文件 100% 走 WebRTC P2P 直连（DTLS + AES-256-GCM 双层加密），服务端 0 字节业务流量 |
+| **3. 零知识设备授权** | 离线二维码扫码 **或** `ECDH P-256` + `HKDF-SHA256` + **6 位安全码（SAS）** | 异地免扫码同步密钥时，双方独立派生 6 位安全码防中间人攻击，控制面全程盲转发 |
+| **4. 零公网开端口** | 电脑端仅发起**出站 WSS** 控制连接与 **STUN UDP 打洞**，拒绝公网直连本机监听端口 | 无需配置路由器端口转发或内网穿透，本机零暴露公网端口 |
 | **5. 本机硬件级密钥保护** | macOS Keychain / Windows DPAPI（Electron `safeStorage`） | 256-bit 密钥加密存储于系统保险库，不以明文落盘 |
-| **6. 账号与设备治理** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + 实时设备踢下线 | 账号间严格多租户房间隔离，支持在客户端随时踢出异常终端并使旧 Token 立即失效（30 项自动化安全与冒烟测试持续覆盖） |
+| **6. 账号与毫秒级设备吊销** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + `client.revoked` 实时踢出 | 踢出异常终端时控制面毫秒级通知 PC 桥接器立刻销毁对应 WebRTC P2P 通道（34 项自动化安全与 P2P 冒烟测试持续覆盖） |
 
 ### 架构概览
 
@@ -180,22 +180,24 @@ All in One 从协议层设计为 **六道零知识纵深防御**，即使中转�
 flowchart LR
   subgraph Clients["客户端（同一账号 · 持有 256-bit E2EE 密钥）"]
     M["手机端 PWA / Android APK"]
-    D["All in One 桌面端<br/>(Electron UI + 内置托盘桥接)"]
+    D["All in One 桌面端<br/>(Electron UI + 原生 libwebrtc 引擎)"]
   end
 
-  subgraph Server["中转服务器 (HTTPS / WSS · 零知识盲转发)"]
-    R["@allinone/relay-server<br/>账号邀请码 · 多租户隔离 · 密文路由"]
+  subgraph Control["纯控制面服务器 (HTTPS / WSS + 内置 STUN UDP 3478)"]
+    R["@allinone/relay-server<br/>账号鉴权 · 设备发现 · 加密信令 · 无状态 STUN<br/>(0 字节业务数据中转)"]
   end
 
-  subgraph PCs["名下电脑 (仅出站 WSS · 零开端口)"]
+  subgraph PCs["名下电脑 (出站 WSS + WebRTC NAT 穿透 · 零开端口)"]
     B1["macOS / Windows / Linux 桥接器"]
     A1["Codex · Claude · Antigravity · DSH"]
     B1 <-->|"本地官方接口"| A1
   end
 
-  M <-->|"TLS + AES-256-GCM 密文"| R
-  D <-->|"TLS + AES-256-GCM 密文"| R
-  R <-->|"出站 WSS + 密文"| B1
+  M -.->|"仅认证 / 加密 SDP 信令 / STUN"| R
+  D -.->|"仅认证 / 加密 SDP 信令 / STUN"| R
+  R -.->|"仅控制信令 / 毫秒级吊销"| B1
+  M <==>|"100% P2P 直连 (DTLS + AES-256-GCM)<br/>aio-ctrl (RPC/流式) + aio-bulk (文件/图片)"| B1
+  D <==>|"100% P2P 直连 (DTLS + AES-256-GCM)"| B1
 ```
 
 ---
@@ -209,7 +211,8 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 ```
 
 脚本会引导你 1 分钟内完成全部配置：
-- **三种接入模式任选**：① 自有域名 + Caddy 自动申请免费 Let's Encrypt HTTPS 证书（推荐） · ② **纯公网 IP + Let's Encrypt 正规 HTTPS 证书**（免域名） · ③ 仅启动中转容器（不占 80/443，适配已有 Nginx / 宝塔 / 1Panel / Cloudflare Tunnel）。
+- **三种接入模式任选**：① 自有域名 + Caddy 自动申请免费 Let's Encrypt HTTPS 证书（推荐） · ② **纯公网 IP + Let's Encrypt 正规 HTTPS 证书**（免域名） · ③ 仅启动控制面容器（不占 80/443，适配已有 Nginx / 宝塔 / 1Panel / Cloudflare Tunnel）。
+- **内置无状态 STUN 穿透**：容器默认映射 **`UDP 3478`** 端口提供自建 RFC 5389 STUN 服务（请在云厂商防火墙/安全组放行 `UDP 3478`），0 流量中转、1 核 1G VPS 即可轻松承载数百在线设备。
 - **零手动填密钥**：自动生成 256-bit 随机 `JWT_SECRET`（权限 `600`），可选引导配置免费邮箱 2FA（QQ / 163 / Gmail SMTP）。
 - **开箱即出邀请码**：健康检查通过后自动生成首个管理员一次性邀请码与注册链接，后续只需追加 `--upgrade` 即可无损升级镜像。
 

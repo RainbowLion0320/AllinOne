@@ -214,11 +214,12 @@ function resolveBridgeScriptPath(isPackaged) {
 }
 
 export class DesktopBridgeManager extends EventEmitter {
-  constructor({ isPackaged = false, getAutoLaunch = () => false, secretStore = null } = {}) {
+  constructor({ isPackaged = false, getAutoLaunch = () => false, secretStore = null, getWebRtcProxyInfo = null } = {}) {
     super()
     this.isPackaged = isPackaged
     this.getAutoLaunch = getAutoLaunch
     this.secretStore = secretStore
+    this.getWebRtcProxyInfo = typeof getWebRtcProxyInfo === 'function' ? getWebRtcProxyInfo : null
     this.stateDir = join(os.homedir(), '.allinone-bridge')
     this.configPath = join(this.stateDir, 'config.json')
     this.logPath = join(this.stateDir, 'desktop-bridge.log')
@@ -584,6 +585,7 @@ export class DesktopBridgeManager extends EventEmitter {
     this.emitStatus()
     this.appendLog(`Starting embedded bridge: script=${scriptPath} server=${serverUrl} bridgeId=${cfg.bridgeId || label}`)
 
+    const webrtcProxyInfo = this.getWebRtcProxyInfo?.() || null
     const child = spawn(
       process.execPath,
       [
@@ -603,6 +605,12 @@ export class DesktopBridgeManager extends EventEmitter {
           ALLINONE_PC_NAME: label,
           ...(cfg.bridgeSecret ? { ALLINONE_BRIDGE_SECRET: cfg.bridgeSecret } : {}),
           ...(cfg.e2eeKey ? { ALLINONE_E2EE_KEY: cfg.e2eeKey } : {}),
+          ...(webrtcProxyInfo?.port && webrtcProxyInfo?.token
+            ? {
+                ALLINONE_WEBRTC_PROXY_PORT: String(webrtcProxyInfo.port),
+                ALLINONE_WEBRTC_PROXY_TOKEN: String(webrtcProxyInfo.token),
+              }
+            : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,

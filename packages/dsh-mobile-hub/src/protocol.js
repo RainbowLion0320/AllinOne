@@ -50,7 +50,13 @@ export const EVENTS = Object.freeze({
   APPROVAL_REQUEST: 'approval.request',
   APPROVAL_RESOLVED: 'approval.resolved',
   DISPATCH_UPDATED: 'dispatch.updated',
+  P2P_SIGNAL: 'p2p.signal',
+  CLIENT_REVOKED: 'client.revoked',
 })
+
+export const P2P_PROTOCOL_VERSION = 1
+export const P2P_CTRL_CHANNEL = 'aio-ctrl'
+export const P2P_BULK_CHANNEL = 'aio-bulk'
 
 export function makeCompositeId(app, sessionId) {
   return `${app}:${sessionId}`

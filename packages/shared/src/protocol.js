@@ -96,7 +96,13 @@ export const EVENTS = Object.freeze({
   E2EE_GRANT_REJECT: 'e2ee.grant.reject',
   E2EE_GRANT_CANCEL: 'e2ee.grant.cancel',
   E2EE_QR_NUDGE: 'e2ee.qr.nudge',
+  P2P_SIGNAL: 'p2p.signal',
+  CLIENT_REVOKED: 'client.revoked',
 })
+
+export const P2P_PROTOCOL_VERSION = 1
+export const P2P_CTRL_CHANNEL = 'aio-ctrl'
+export const P2P_BULK_CHANNEL = 'aio-bulk'
 
 /**
  * Build a unified composite key `<app>:<nativeId>`.

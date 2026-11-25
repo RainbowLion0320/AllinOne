@@ -250,7 +250,7 @@ function DeliverableCard({ file, imageContext }) {
                 disabled={Boolean(busyAction)}
                 onClick={() => void handleFetchAndRun('download')}
                 className="inline-flex items-center gap-1 rounded-xl bg-[#4D6BFE] px-2.5 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-[#3B59F0] active:scale-95 disabled:opacity-55"
-                title={bi('端到端加密下载（上限 10MB）', 'Encrypted download (max 10MB)')}
+                title={bi('P2P 端到端加密直连下载（0 服务器中转）', 'Direct P2P encrypted download (0 server relay)')}
               >
                 {busyAction === 'download' ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />

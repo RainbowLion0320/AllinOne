@@ -13,7 +13,6 @@ import {
   RotateCw,
   X,
 } from 'lucide-react'
-import { isRelayUploadTarget } from '../lib/imageUrls.js'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
 
@@ -263,18 +262,6 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
 
   useEffect(() => {
     if (!state || !currentNeedsE2ee || !effectiveCurrentItem || resolvedMap[index] || errorMap[index]) return
-    const targetUrl = typeof effectiveCurrentItem === 'string'
-      ? effectiveCurrentItem.trim()
-      : String(effectiveCurrentItem?.url || effectiveCurrentItem?.path || '').trim()
-    if (
-      isRelayUploadTarget(targetUrl) &&
-      typeof effectiveCurrentItem === 'object' &&
-      effectiveCurrentItem?.e2ee?.iv &&
-      imageContext?.baseUrl &&
-      !imageContext?.mediaToken
-    ) {
-      return
-    }
     let cancelled = false
     loadE2eeImageUrl(effectiveCurrentItem, imageContext, { forceRefresh: retryNonce > 0 })
       .then((blobUrl) => {
@@ -301,7 +288,6 @@ export function ImageLightbox({ state, imageContext = null, onClose }) {
     currentNeedsE2ee,
     effectiveCurrentItem,
     imageContext,
-    imageContext?.mediaToken,
     e2eeKeysSig,
     index,
     resolvedMap,

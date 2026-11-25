@@ -1,6 +1,6 @@
 {
   "name": "@allinone/shared",
-  "version": "0.5.9",
+  "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/protocol.js",
     "./e2ee": "./src/e2ee.js",
-    "./qr-svg": "./src/qr-svg.js"
+    "./qr-svg": "./src/qr-svg.js",
+    "./p2p-mux": "./src/p2p-mux.js"
   }
 }

@@ -100,7 +100,7 @@
             <div class="topbar-title-wrap">
               <div class="topbar-title-row">
                 <span class="topbar-title" id="tb-title">All in One 监控看板</span>
-                <span class="pill pill-subtle mono" id="tb-version">v0.5.9</span>
+                <span class="pill pill-subtle mono" id="tb-version">v1.0.0</span>
                 <span class="pill pill-emerald" id="tb-idle-badge">按需 · 0 空载</span>
               </div>
               <div class="topbar-sub" id="tb-subtitle">—</div>
@@ -177,7 +177,7 @@
                 <select id="user-sort" class="select-compact" aria-label="排序方式">
                   <option value="status">在线优先</option>
                   <option value="recent">最近活跃</option>
-                  <option value="rpcs">请求最多</option>
+                  <option value="signals">信令最多</option>
                   <option value="newest">最新注册</option>
                 </select>
                 <button type="button" id="btn-expand-all" class="btn btn-ghost btn-sm">展开全部</button>
@@ -229,11 +229,9 @@
                 <button type="button" class="qty-btn" data-qty="10">10</button>
               </div>
               <input id="invite-note" type="text" maxlength="60" placeholder="备注（如：给朋友 / 测试账号）" class="invite-note-input" />
-              <select id="invite-tier" class="select-compact" aria-label="邀请用户等级">
-                <option value="free">普通用户 (1GB/月 · 500MB/日)</option>
-                <option value="pro">Pro 用户 (5GB/月 · 10倍日额)</option>
-                <option value="ultra">Ultra 用户 (不限流)</option>
-                <option value="admin">管理员 (Admin · 不限流)</option>
+              <select id="invite-role" class="select-compact" aria-label="邀请角色">
+                <option value="user">普通用户 (P2P 直连)</option>
+                <option value="admin">管理员 (Admin)</option>
               </select>
               <button type="submit" id="btn-create-invite" class="btn btn-primary btn-sm">生成邀请码</button>
             </form>

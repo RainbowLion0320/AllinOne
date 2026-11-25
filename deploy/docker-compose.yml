@@ -13,6 +13,8 @@ services:
     environment:
       PORT: 8787
       HOST: 0.0.0.0
+      STUN_PORT: ${STUN_PORT:-3478}
+      ICE_SERVERS: ${ICE_SERVERS:-}
       # 请在同目录创建 .env 文件或直接替换下面的密钥（勿提交到 Git）
       JWT_SECRET: ${JWT_SECRET:?请设置至少 16 位随机 JWT_SECRET（可用 openssl rand -hex 32 生成）}
       ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
@@ -30,6 +32,7 @@ services:
       - relay_data:/app/packages/relay-server/data
     ports:
       - "127.0.0.1:8787:8787"
+      - "${STUN_PORT:-3478}:3478/udp"
 
   # 推荐：使用 Caddy 自动申请和续期 Let's Encrypt HTTPS/WSS 证书
   # 使用前先修改 deploy/Caddyfile 里的域名，并确保域名 DNS A 记录已指向本机

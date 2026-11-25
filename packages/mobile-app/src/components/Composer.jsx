@@ -3,7 +3,7 @@ import { APP_META } from '@allinone/shared'
 import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
 import { VendorIcon, formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
-import { isRelayUploadTarget, resolveImageSrc } from '../lib/imageUrls.js'
+import { resolveImageSrc } from '../lib/imageUrls.js'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
@@ -41,10 +41,6 @@ function ComposerAttachmentChip({ att, imageContext, onRemove }) {
       setDecryptedSrc('')
       return
     }
-    const targetUrl = String(effectiveAtt?.url || '').trim()
-    if (isRelayUploadTarget(targetUrl) && effectiveAtt?.e2ee?.iv && imageContext?.baseUrl && !imageContext?.mediaToken) {
-      return
-    }
     let cancelled = false
     setLoadError(false)
     loadE2eeImageUrl(effectiveAtt, imageContext)
@@ -67,7 +63,6 @@ function ComposerAttachmentChip({ att, imageContext, onRemove }) {
     imageContext?.baseUrl,
     imageContext?.roomId,
     imageContext?.bridgeId,
-    imageContext?.mediaToken,
     imageContext?.e2eeKey,
     imageContext?.e2eeKeyId,
     e2eeKeysSig,

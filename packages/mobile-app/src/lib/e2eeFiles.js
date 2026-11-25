@@ -103,10 +103,10 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
     const filename = String(result?.filename || getDeliverableName(target, 'download'))
     let blob
     let size = Number(result?.size || 0)
-    if (result?.transferMode === 'upload' && result?.uploadUrl && result?.e2ee?.iv) {
-      const dl = await client.downloadEncryptedUpload(result.uploadUrl, result.e2ee, {
+    if (result?.transferMode === 'p2p-bulk' && result?.streamId) {
+      const dl = await client.downloadP2pBulk(result.streamId, {
         mimeType,
-        consume: true,
+        size,
         bridgeId,
       })
       blob = dl.blob

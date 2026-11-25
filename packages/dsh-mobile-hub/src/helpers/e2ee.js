@@ -355,7 +355,7 @@ async function* iterateByteSource(source) {
 export async function encryptChunkedBytes(
   rawKeyStr,
   source,
-  { kind = 'upload', roomId = '', chunkSize = E2EE_CHUNK_SIZE, onChunk = null } = {},
+  { kind = 'upload', roomId = '', chunkSize = E2EE_CHUNK_SIZE, onChunk = null, onHeader = null } = {},
 ) {
   const { cryptoKey, keyId } = await importCachedKey(rawKeyStr)
   const cleanChunkSize = Math.max(1024, Math.min(16 * 1024 * 1024, Math.floor(Number(chunkSize) || E2EE_CHUNK_SIZE)))
@@ -379,6 +379,10 @@ export async function encryptChunkedBytes(
   const totalChunks = Math.max(1, Math.ceil(totalSize / cleanChunkSize))
   const baseIv = new Uint8Array(E2EE_IV_BYTES)
   globalThis.crypto.getRandomValues(baseIv)
+  const ivStr = bytesToBase64Url(baseIv)
+  if (onHeader) {
+    await onHeader({ v: E2EE_CHUNKED_VERSION, kid: keyId, iv: ivStr, chunked: true, totalChunks })
+  }
 
   const header = new Uint8Array(AIO2_HEADER_BYTES)
   header.set(AIO2_MAGIC, 0)

@@ -1,24 +1,19 @@
 import { randomUUID } from 'node:crypto'
-import { EVENTS } from '@allinone/shared'
-import { E2EE_EVENT_MARKER, E2EE_METHOD_MARKER } from '@allinone/shared/e2ee'
+import { EVENTS, P2P_PROTOCOL_VERSION } from '@allinone/shared'
 
-const EVENT_BUFFER_SIZE = 200
-const DEFAULT_RPC_TIMEOUT_MS = 300_000
 const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
-const ROOM_EVENTS_MAX = 2000
-const MAX_CACHED_EVENT_BYTES = 512 * 1024
-const MAX_PENDING_RPC_PER_ROOM = 200
 const E2EE_GRANT_TTL_MS = 120_000
 const E2EE_GRANT_MAX_PER_ROOM = 8
 const E2EE_GRANT_SWEEP_MS = 15_000
 const WS_HEARTBEAT_INTERVAL_MS = 30_000
 const MAX_CLIENTS_PER_ROOM = 30
 const MAX_BRIDGES_PER_ROOM = 16
+const MAX_P2P_SIGNAL_BYTES = 64 * 1024
+const SAFE_SIGNAL_ID_RE = /^[a-zA-Z0-9_-]{8,64}$/
 
 /**
  * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
- * Handles both explicit labels from v0.3.9+ clients and raw legacy `Mozilla/5.0 ...` strings.
  */
 export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind = '') {
   const dev = String(rawDev || '').trim()
@@ -27,7 +22,6 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
     ? explicitKind
     : ''
 
-  // If caller already sent a clean explicit label (not raw Mozilla/5.0 UA or generic 'mobile')
   const looksLikeRawUa = /^Mozilla\//i.test(dev) || /AppleWebKit|Gecko\//i.test(dev)
   if (dev && !looksLikeRawUa && dev.toLowerCase() !== 'mobile') {
     let kind = cleanKind
@@ -63,7 +57,6 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
     }
   }
 
-  // Android WebView (Capacitor native APK) typically has `; wv)` in UA
   if (isAndroid && (/; wv\)/i.test(probe) || cleanKind === 'mobile')) {
     return { deviceName: 'Android App', clientKind: 'mobile' }
   }
@@ -94,64 +87,57 @@ export function parseClientDeviceInfo(rawDev = '', userAgent = '', explicitKind 
   }
 }
 
+function isValidE2eeEnvelope(env) {
+  if (!env || typeof env !== 'object') return false
+  if (env.v !== 1) return false
+  const kid = String(env.kid || '').trim()
+  const iv = String(env.iv || '').trim()
+  const ct = String(env.ct || '').trim()
+  return Boolean(kid && iv && ct)
+}
+
 /**
- * Strictly account-isolated, zero-knowledge E2EE WebSocket hub connecting:
- *  - PC Bridges (each bound to a single account `roomId`: `'usr_<id>'`, mandatory E2EE)
- *  - Mobile/Desktop/Web clients (each JWT-bound to a single account `roomId`)
+ * Pure Control-Plane Hub (v1.0 — Zero Data-Plane Relay):
+ *  - Account-isolated room presence (online PC bridges & controlling terminals)
+ *  - Zero-knowledge E2EE device key grant signaling (`e2ee.grant.*`, `e2ee.qr.nudge`)
+ *  - Strictly unicast, E2EE-wrapped WebRTC P2P signaling (`p2p.signal`)
+ *  - Instant device revocation broadcasts (`client.revoked`) so PC bridges kill kicked P2P peers in < 200ms
  *
- * Guarantees Account A can NEVER see Account B's bridges, events, RPCs, or files,
- * and Relay NEVER forwards plaintext RPCs or bridge events.
+ * NEVER relays chats, RPC payloads, images, or file bytes.
  */
 export class RelayHub {
-  constructor({ log = console, getRoomDevices = null, trafficGuard = null, isAdminRoom = null, getRoomTier = null } = {}) {
+  constructor({ log = console, getRoomDevices = null, getIceServers = null } = {}) {
     this.log = log
     this.getRoomDevices = typeof getRoomDevices === 'function' ? getRoomDevices : null
-    this.trafficGuard = trafficGuard || null
-    this.isAdminRoom = typeof isAdminRoom === 'function' ? isAdminRoom : () => false
-    this.getRoomTier = typeof getRoomTier === 'function'
-      ? getRoomTier
-      : (rid) => (this.isAdminRoom(rid) ? 'admin' : 'free')
-    /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number }>} */
+    this.getIceServers = typeof getIceServers === 'function' ? getIceServers : () => []
+    /** @type {Map<string, { roomId: string, bridgeId: string, ws: import('ws').WebSocket, meta: any, connectedAt: number, lastSeen: number, isAlive: boolean }>} */
     this.bridges = new Map() // key = `${roomId}::${bridgeId}`
-    /** @type {Map<string, { roomId: string, ws: import('ws').WebSocket, user: any, connectedAt: number }>} */
-    this.clients = new Map()
-    /** @type {Map<string, Set<string>>} Secondary index for O(1) per-room event fan-out */
-    this.roomClients = new Map()
     /** @type {Map<string, any>} */
-    this.pendingRpc = new Map()
-    /** @type {Map<string, { seq: number, buffer: any[] }>} */
-    this.roomEvents = new Map()
-    /** @type {Map<string, { rpcCount: number, eventCount: number, lastActivityAt: number, lastRpcMethod: string, lastRpcAt: number }>} */
+    this.clients = new Map()
+    /** @type {Map<string, Set<string>>} O(1) room -> clientIds index */
+    this.roomClients = new Map()
+    /** @type {Map<string, { signalCount: number, lastActivityAt: number }>} */
     this.roomStats = new Map()
     this.globalStats = {
       startedAt: Date.now(),
-      totalRpcs: 0,
-      totalEvents: 0,
+      totalSignals: 0,
       totalBridgeConnects: 0,
       totalClientConnects: 0,
     }
-    /** @type {Array<{ id: number, ts: number, type: string, roomId: string, label: string, detail: string, ip: string }>} */
     this.activityLog = []
     this._activitySeq = 0
-    /**
-     * Ephemeral, strictly room-scoped zero-knowledge E2EE device key-grant requests.
-     * Stores ONLY ephemeral P-256 public keys & metadata for up to 120s (never plaintext secrets).
-     * @type {Map<string, any>}
-     */
     this.e2eeGrants = new Map()
 
-    // Periodic sweep so expired E2EE grant requests actively emit E2EE_GRANT_CANCEL (reason: 'expired')
     this._grantSweepTimer = setInterval(() => {
       if (this.e2eeGrants.size > 0) this.pruneExpiredGrants()
     }, E2EE_GRANT_SWEEP_MS)
     this._grantSweepTimer.unref()
 
-    // Server-side WS ping/pong liveness heartbeat (reaps half-open/dead TCP sockets)
     this._heartbeatTimer = setInterval(() => {
       for (const entry of this.bridges.values()) {
         if (entry.ws.readyState !== 1) continue
         if (entry.isAlive === false) {
-          this.log.warn?.(`[relay] Bridge heartbeat timeout: room=${entry.roomId} id=${entry.bridgeId}`)
+          this.log.warn?.(`[control] Bridge heartbeat timeout: room=${entry.roomId} id=${entry.bridgeId}`)
           try { entry.ws.terminate() } catch {}
           continue
         }
@@ -161,7 +147,7 @@ export class RelayHub {
       for (const [cid, entry] of this.clients.entries()) {
         if (entry.ws.readyState !== 1) continue
         if (entry.isAlive === false) {
-          this.log.warn?.(`[relay] Client heartbeat timeout: room=${entry.roomId} client=${cid}`)
+          this.log.warn?.(`[control] Client heartbeat timeout: room=${entry.roomId} client=${cid}`)
           try { entry.ws.terminate() } catch {}
           continue
         }
@@ -224,9 +210,7 @@ export class RelayHub {
     const set = this.roomClients.get(roomId)
     if (!set) return
     set.delete(clientId)
-    if (set.size === 0) {
-      this.roomClients.delete(roomId)
-    }
+    if (set.size === 0) this.roomClients.delete(roomId)
   }
 
   _getRoomClientEntries(roomId) {
@@ -280,31 +264,23 @@ export class RelayHub {
     }
   }
 
-  failPendingRpcsForBridgeWs(bridgeWs, bridgeKey = '') {
-    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-      const match = pending.bridgeWs
-        ? pending.bridgeWs === bridgeWs
-        : Boolean(bridgeKey && pending.bridgeKey === bridgeKey)
-      if (match) {
-        clearTimeout(pending.timer)
-        this.pendingRpc.delete(relayReqId)
-        this.sendToClient(pending.clientId, {
-          type: 'rpc.res',
-          id: pending.clientReqId,
-          ok: false,
-          error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
-        })
-      }
-    }
-  }
-
-  clearPendingRpcsForClient(clientId) {
-    if (!clientId) return
-    for (const [relayReqId, pending] of this.pendingRpc.entries()) {
-      if (pending.clientId === clientId) {
-        clearTimeout(pending.timer)
-        this.pendingRpc.delete(relayReqId)
-      }
+  /**
+   * Immediately notify all online PC bridges in `roomId` to tear down active P2P DataChannels
+   * for revoked/kicked `clientIds`.
+   */
+  notifyBridgesClientRevoked(roomId, clientIds, reason = 'revoked') {
+    const rid = String(roomId || '').trim()
+    const ids = Array.isArray(clientIds) ? clientIds.map((x) => String(x || '').trim()).filter(Boolean) : []
+    if (!rid || ids.length === 0) return
+    const frame = JSON.stringify({
+      type: EVENTS.CLIENT_REVOKED,
+      clientIds: ids,
+      reason: String(reason || 'revoked'),
+      ts: Date.now(),
+    })
+    for (const b of this.bridges.values()) {
+      if (b.roomId !== rid || b.ws.readyState !== 1) continue
+      try { b.ws.send(frame) } catch {}
     }
   }
 
@@ -316,7 +292,7 @@ export class RelayHub {
         const oldestKey = this.roomStats.keys().next().value
         if (oldestKey) this.roomStats.delete(oldestKey)
       }
-      st = { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
+      st = { signalCount: 0, lastActivityAt: 0 }
       this.roomStats.set(rid, st)
     }
     return st
@@ -325,101 +301,7 @@ export class RelayHub {
   getRoomStats(roomId) {
     const rid = String(roomId || '').trim()
     const st = this.roomStats.get(rid)
-    const base = st
-      ? { ...st }
-      : { rpcCount: 0, eventCount: 0, lastActivityAt: 0, lastRpcMethod: '', lastRpcAt: 0 }
-    if (this.trafficGuard) {
-      let tier = 'free'
-      try {
-        tier = String(this.getRoomTier(rid) || 'free')
-      } catch {}
-      base.traffic = this.trafficGuard.getRoomUsage(rid, tier)
-    }
-    return base
-  }
-
-  getRoomFileLimits(roomId) {
-    const rid = String(roomId || '').trim()
-    let tier = 'free'
-    try {
-      tier = String(this.getRoomTier(rid) || 'free')
-    } catch {}
-    if (this.trafficGuard && typeof this.trafficGuard.getLimitsForTier === 'function') {
-      const lim = this.trafficGuard.getLimitsForTier(tier)
-      return {
-        tier: lim.tier,
-        maxUploadBytes: lim.maxUploadBytes,
-        maxImageBytes: lim.maxImageBytes,
-        maxDocumentBytes: lim.maxDocumentBytes,
-      }
-    }
-    return {
-      tier,
-      maxUploadBytes: 15 * 1024 * 1024,
-      maxImageBytes: 15 * 1024 * 1024,
-      maxDocumentBytes: 10 * 1024 * 1024,
-    }
-  }
-
-  notifyRoomTierChanged(roomId) {
-    const rid = String(roomId || '').trim()
-    if (!rid) return
-    const info = this.getRoomFileLimits(rid)
-    const msg = {
-      type: 'tier.update',
-      roomId: rid,
-      tier: info.tier,
-      fileLimits: {
-        maxUploadBytes: info.maxUploadBytes,
-        maxImageBytes: info.maxImageBytes,
-        maxDocumentBytes: info.maxDocumentBytes,
-      },
-      ts: Date.now(),
-    }
-    for (const b of this.bridges.values()) {
-      if (b.roomId === rid && b.ws.readyState === 1) {
-        this.sendRaw(b.ws, msg)
-      }
-    }
-    for (const [, c] of this._getRoomClientEntries(rid)) {
-      if (c.ws.readyState === 1) {
-        this.sendRaw(c.ws, msg)
-      }
-    }
-  }
-
-  getTrafficSummary() {
-    if (!this.trafficGuard) {
-      return {
-        monthKey: '',
-        totalBytes10m: 0,
-        totalBytes24h: 0,
-        totalBytesMonth: 0,
-        totalBytesLifetime: 0,
-        totalThrottledCount: 0,
-        limits: { burst10mBytes: 0, daily24hBytes: 0, monthlyBytes: 0, proMonthlyBytes: 0, uploadPerMin: 0, adminExempt: true },
-      }
-    }
-    return this.trafficGuard.getGlobalSummary()
-  }
-
-  checkRoomTraffic(roomId, bytes, { sourceLabel = '', ip = '' } = {}) {
-    if (!this.trafficGuard || !roomId) return { allowed: true, hardKick: false }
-    let tier = 'free'
-    try {
-      tier = String(this.getRoomTier(roomId) || 'free')
-    } catch {}
-    const res = this.trafficGuard.consumeBytes(roomId, bytes, { tier })
-    if (!res.allowed) {
-      this.recordActivity({
-        type: 'traffic.throttled',
-        roomId,
-        label: sourceLabel || 'ws',
-        detail: `${res.code || 'TRAFFIC_QUOTA_EXCEEDED'}${res.quotaWindow ? `/${res.quotaWindow}` : ''} [${tier}] (${Math.round((Number(bytes) || 0) / 1024)}KB)`,
-        ip,
-      })
-    }
-    return res
+    return st ? { ...st } : { signalCount: 0, lastActivityAt: 0 }
   }
 
   recordActivity({ type, roomId = '', label = '', detail = '', ip = '' } = {}) {
@@ -454,7 +336,8 @@ export class RelayHub {
         online: b.ws.readyState === 1,
         hostname: b.meta?.hostname || b.bridgeId,
         platform: b.meta?.platform || 'unknown',
-        mode: b.meta?.mode || 'dsh-plugin',
+        mode: b.meta?.mode || 'desktop',
+        p2pEngine: b.meta?.p2pEngine || '',
         ip: b.meta?.ip || '',
         apps: Array.isArray(b.meta?.apps) ? b.meta.apps : [],
         e2ee: b.meta?.e2ee || null,
@@ -491,7 +374,6 @@ export class RelayHub {
     }
     return {
       ...this.globalStats,
-      pendingRpcCount: this.pendingRpc.size,
       onlineBridgeCount: this.getOnlineBridgeCount(),
       onlineClientCount: onlineClients,
     }
@@ -508,25 +390,6 @@ export class RelayHub {
 
   bridgeKey(roomId, bridgeId) {
     return `${String(roomId || '').trim()}::${bridgeId || 'home-pc'}`
-  }
-
-  getRoomEventState(roomId) {
-    const rid = String(roomId || '').trim()
-    let st = this.roomEvents.get(rid)
-    if (st) {
-      // Refresh LRU position
-      this.roomEvents.delete(rid)
-      this.roomEvents.set(rid, st)
-      return st
-    }
-    while (this.roomEvents.size >= ROOM_EVENTS_MAX) {
-      const oldestKey = this.roomEvents.keys().next().value
-      if (!oldestKey) break
-      this.roomEvents.delete(oldestKey)
-    }
-    st = { seq: 0, buffer: [] }
-    this.roomEvents.set(rid, st)
-    return st
   }
 
   getOnlineBridgeCount() {
@@ -551,6 +414,7 @@ export class RelayHub {
         hostname: b.meta?.hostname || b.bridgeId,
         platform: b.meta?.platform || 'unknown',
         mode: b.meta?.mode || 'desktop',
+        p2pEngine: b.meta?.p2pEngine || '',
         apps: b.meta?.apps || [],
         e2ee: b.meta?.e2ee || null,
         connectedAt: b.connectedAt,
@@ -574,10 +438,10 @@ export class RelayHub {
     return null
   }
 
-  registerBridge(ws, meta = {}) {
+  registerBridge(ws, meta = {}, { req = null } = {}) {
     ws.on('error', (err) => {
       this.log.warn?.(
-        `[relay] Bridge WS error (room=${String(meta?.roomId || '').trim()}, id=${String(meta?.bridgeId || '').trim()}): ${err?.message || err}`,
+        `[control] Bridge WS error (room=${String(meta?.roomId || '').trim()}, id=${String(meta?.bridgeId || '').trim()}): ${err?.message || err}`,
       )
       try { ws.terminate() } catch {}
     })
@@ -600,18 +464,14 @@ export class RelayHub {
       }
     }
     if (existing && existing.ws !== ws) {
-      this.failPendingRpcsForBridgeWs(existing.ws, key)
-      try {
-        existing.ws.close(4001, 'Replaced by newer bridge connection')
-      } catch {}
+      try { existing.ws.close(4001, 'Replaced by newer bridge connection') } catch {}
     }
 
     const now = Date.now()
     const entry = { roomId, bridgeId, ws, meta, connectedAt: now, lastSeen: now, isAlive: true }
     this.bridges.set(key, entry)
     this.globalStats.totalBridgeConnects += 1
-    const rStats = this.getOrCreateRoomStats(roomId)
-    rStats.lastActivityAt = now
+    this.getOrCreateRoomStats(roomId).lastActivityAt = now
     this.recordActivity({
       type: 'bridge.online',
       roomId,
@@ -620,25 +480,21 @@ export class RelayHub {
       ip: meta.ip || '',
     })
     this.log.info(
-      `[relay] Bridge connected: room=${roomId} id=${bridgeId} (${meta.hostname || 'unknown'}, mode=${meta.mode || 'unknown'})`,
+      `[control] Bridge connected: room=${roomId} id=${bridgeId} (${meta.hostname || 'unknown'}, mode=${meta.mode || 'unknown'})`,
     )
 
     const bridges = this.getBridgeList(roomId)
     const devices = this.resolveRoomDevices(roomId, bridges)
-    const tierInfo = this.getRoomFileLimits(roomId)
     this.sendRaw(ws, {
       type: 'bridge.welcome',
+      protocolVersion: P2P_PROTOCOL_VERSION,
+      mode: 'p2p-only',
       roomId,
       bridgeId,
-      tier: tierInfo.tier,
-      fileLimits: {
-        maxUploadBytes: tierInfo.maxUploadBytes,
-        maxImageBytes: tierInfo.maxImageBytes,
-        maxDocumentBytes: tierInfo.maxDocumentBytes,
-      },
+      iceServers: this.getIceServers(req),
       ts: now,
     })
-    this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
+    this.broadcastControlEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
       bridgeId,
       online: true,
       bridges,
@@ -654,6 +510,7 @@ export class RelayHub {
       entry.isAlive = true
       entry.lastSeen = Date.now()
       const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
+      if (rawBytes > MAX_P2P_SIGNAL_BYTES + 4096) return
       let msg
       try {
         msg = JSON.parse(String(raw))
@@ -664,7 +521,6 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
-      this.failPendingRpcsForBridgeWs(ws, key)
       if (this.bridges.get(key)?.ws === ws) {
         this.bridges.delete(key)
         this.recordActivity({
@@ -674,14 +530,14 @@ export class RelayHub {
           detail: entry.meta?.platform || '',
           ip: entry.meta?.ip || '',
         })
-        this.log.info(`[relay] Bridge disconnected: room=${roomId} id=${bridgeId}`)
-        const bridges = this.getBridgeList(roomId)
-        const devices = this.resolveRoomDevices(roomId, bridges)
-        this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
+        this.log.info(`[control] Bridge disconnected: room=${roomId} id=${bridgeId}`)
+        const bridgesAfter = this.getBridgeList(roomId)
+        const devicesAfter = this.resolveRoomDevices(roomId, bridgesAfter)
+        this.broadcastControlEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
           bridgeId,
           online: false,
-          bridges,
-          ...(devices ? { devices } : {}),
+          bridges: bridgesAfter,
+          ...(devicesAfter ? { devices: devicesAfter } : {}),
         })
       }
     })
@@ -725,18 +581,16 @@ export class RelayHub {
     })
     for (const [, client] of entries) {
       if (client.ws.readyState === 1) {
-        try {
-          client.ws.send(frame)
-        } catch {}
+        try { client.ws.send(frame) } catch {}
       }
     }
   }
 
-  registerClient(ws, user, { lastSeq = 0, ip = '', userAgent = '' } = {}) {
+  registerClient(ws, user, { ip = '', userAgent = '', req = null } = {}) {
     const clientId = randomUUID()
     ws.on('error', (err) => {
       this.log.warn?.(
-        `[relay] Client WS error (room=${String(user?.room || '').trim()}, client=${clientId}): ${err?.message || err}`,
+        `[control] Client WS error (room=${String(user?.room || '').trim()}, client=${clientId}): ${err?.message || err}`,
       )
       try { ws.terminate() } catch {}
     })
@@ -770,8 +624,7 @@ export class RelayHub {
     this.clients.set(clientId, entry)
     this._indexRoomClient(roomId, clientId)
     this.globalStats.totalClientConnects += 1
-    const rStats = this.getOrCreateRoomStats(roomId)
-    rStats.lastActivityAt = now
+    this.getOrCreateRoomStats(roomId).lastActivityAt = now
     this.recordActivity({
       type: 'client.online',
       roomId,
@@ -779,46 +632,29 @@ export class RelayHub {
       detail: parsed.clientKind,
       ip: entry.ip,
     })
-    this.log.info(`[relay] Mobile client connected: ${clientId} (room=${roomId}, dev=${parsed.deviceName}, ip=${entry.ip || 'unknown'})`)
-
-    const evState = this.getRoomEventState(roomId)
+    this.log.info(`[control] Client connected: ${clientId} (room=${roomId}, dev=${parsed.deviceName}, ip=${entry.ip || 'unknown'})`)
 
     const bridges = this.getBridgeList(roomId)
     const devices = this.resolveRoomDevices(roomId, bridges)
     const clients = this.getClientList(roomId)
     const pendingGrants = this.getPendingGrantsForClient(roomId, clientId)
-    const tierInfo = this.getRoomFileLimits(roomId)
     this.sendRaw(ws, {
       type: 'hello',
+      protocolVersion: P2P_PROTOCOL_VERSION,
+      mode: 'p2p-only',
       clientId,
       sid: entry.sid,
       roomId,
-      tier: tierInfo.tier,
-      fileLimits: {
-        maxUploadBytes: tierInfo.maxUploadBytes,
-        maxImageBytes: tierInfo.maxImageBytes,
-        maxDocumentBytes: tierInfo.maxDocumentBytes,
-      },
-      seq: evState.seq,
+      iceServers: this.getIceServers(req),
       bridges,
       ...(devices ? { devices } : {}),
       clients,
       onlineClientCount: clients.length,
       pendingGrants,
-      ts: Date.now(),
+      ts: now,
     })
 
-    // Notify sibling clients in this room immediately that another controlling client connected
     this.broadcastRoomClients(roomId)
-
-    if (Number.isFinite(lastSeq) && lastSeq > 0 && lastSeq < evState.seq) {
-      for (const item of evState.buffer) {
-        if (item.seq <= lastSeq) continue
-        // Skip superseded status snapshots since `hello` already delivered fresh bridges/devices/clients
-        if (item.event === EVENTS.BRIDGE_STATUS || item.event === EVENTS.CLIENTS_STATUS) continue
-        this.sendRaw(ws, { type: 'event', ...item })
-      }
-    }
 
     ws.on('pong', () => {
       entry.isAlive = true
@@ -829,6 +665,7 @@ export class RelayHub {
       entry.isAlive = true
       entry.lastSeenAt = Date.now()
       const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
+      if (rawBytes > MAX_P2P_SIGNAL_BYTES + 4096) return
       let msg
       try {
         msg = JSON.parse(String(raw))
@@ -839,12 +676,11 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
-      this.clearPendingRpcsForClient(clientId)
       this.cancelClientGrants(clientId, 'disconnected')
       const hadQrNudge = Boolean(entry.lastQrNudgeAt)
       const existed = this.clients.delete(clientId)
       this._unindexRoomClient(roomId, clientId)
-      this.log.info(`[relay] Mobile client disconnected: ${clientId} (room=${roomId})`)
+      this.log.info(`[control] Client disconnected: ${clientId} (room=${roomId})`)
       if (existed) {
         if (hadQrNudge) {
           this.pushRoomGrantEvent(
@@ -880,16 +716,16 @@ export class RelayHub {
     if (msg.type === 'bridge.meta') {
       const nextMeta = { ...activeBridge.meta, ...(msg.meta || {}) }
       if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
-        this.log.warn?.(`[relay] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
+        this.log.warn?.(`[control] Closing non-E2EE bridge: room=${roomId} id=${bridgeId}`)
         try {
-          activeBridge.ws.close(4008, 'E2EE required — upgrade bridge/desktop app to v0.4.4+')
+          activeBridge.ws.close(4008, 'E2EE required')
         } catch {}
         return
       }
       activeBridge.meta = nextMeta
       const bridges = this.getBridgeList(roomId)
       const devices = this.resolveRoomDevices(roomId, bridges)
-      this.broadcastEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
+      this.broadcastControlEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
         bridgeId,
         online: true,
         bridges,
@@ -898,74 +734,33 @@ export class RelayHub {
       return
     }
 
-    if (msg.type === 'rpc.res') {
-      const pending = this.pendingRpc.get(msg.id)
-      if (!pending || pending.roomId !== roomId) return
-      if (ws && pending.bridgeWs && pending.bridgeWs !== ws) return
-      clearTimeout(pending.timer)
-      this.pendingRpc.delete(msg.id)
-      if (msg.e2ee) {
-        const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
-          sourceLabel: `bridge:${bridgeId}`,
-          ip: activeBridge.meta?.ip || '',
-        })
-        if (!trafficRes.allowed) {
-          this.sendToClient(pending.clientId, {
-            type: 'rpc.res',
-            id: pending.clientReqId,
-            ok: false,
-            error: {
-              code: trafficRes.code || 'TRAFFIC_QUOTA_EXCEEDED',
-              message: trafficRes.message || '当前账号传输流量已达上限，请稍后再试',
-            },
-          })
-          if (trafficRes.hardKick) {
-            try { activeBridge.ws.close(4009, 'Traffic quota exceeded') } catch {}
-          }
-          return
-        }
-        this.sendToClient(pending.clientId, {
-          type: 'rpc.res',
-          id: pending.clientReqId,
-          ok: true,
-          e2ee: msg.e2ee,
-        })
-      } else if (msg.ok === false && msg.error) {
-        // Structured protocol errors (e.g. E2EE_KEY_MISMATCH / E2EE_REPLAY_DETECTED) carry no plaintext payload
-        this.sendToClient(pending.clientId, {
-          type: 'rpc.res',
-          id: pending.clientReqId,
-          ok: false,
-          error: msg.error,
-        })
-      } else {
-        this.sendToClient(pending.clientId, {
-          type: 'rpc.res',
-          id: pending.clientReqId,
-          ok: false,
-          error: {
-            code: 'E2EE_KEY_REQUIRED',
-            message: '中转服务已强制端到端加密，拒绝明文响应',
-          },
-        })
+    // Strictly unicast E2EE WebRTC P2P signaling (Bridge -> target Client in the SAME room)
+    if (msg.type === EVENTS.P2P_SIGNAL) {
+      if (rawBytes > MAX_P2P_SIGNAL_BYTES) return
+      const targetClientId = String(msg.clientId || '').trim()
+      const sessionId = String(msg.sessionId || '').trim()
+      if (!targetClientId || !SAFE_SIGNAL_ID_RE.test(sessionId) || !isValidE2eeEnvelope(msg.e2ee)) {
+        return
       }
+      const targetClient = this.clients.get(targetClientId)
+      if (!targetClient || targetClient.roomId !== roomId || targetClient.ws.readyState !== 1) {
+        return
+      }
+      this.globalStats.totalSignals += 1
+      const rStats = this.getOrCreateRoomStats(roomId)
+      rStats.signalCount += 1
+      rStats.lastActivityAt = Date.now()
+      this.sendRaw(targetClient.ws, {
+        type: EVENTS.P2P_SIGNAL,
+        bridgeId,
+        sessionId,
+        e2ee: msg.e2ee,
+        ts: Date.now(),
+      })
       return
     }
 
-    if (msg.type === 'event') {
-      if (!msg.e2ee) return
-      const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
-        sourceLabel: `bridge:${bridgeId}`,
-        ip: activeBridge.meta?.ip || '',
-      })
-      if (!trafficRes.allowed) {
-        if (trafficRes.hardKick) {
-          try { activeBridge.ws.close(4009, 'Traffic quota exceeded') } catch {}
-        }
-        return
-      }
-      this.broadcastEvent(roomId, bridgeId, E2EE_EVENT_MARKER, null, msg.e2ee)
-    }
+    // Reject any legacy data-plane frames cleanly (zero relay data plane in v1.0)
   }
 
   handleClientMessage(clientId, msg, rawBytes = 0) {
@@ -979,28 +774,51 @@ export class RelayHub {
       return
     }
 
-    if (rawBytes > 0) {
-      const trafficRes = this.checkRoomTraffic(roomId, rawBytes, {
-        sourceLabel: client.deviceName || 'client',
-        ip: client.ip || '',
-      })
-      if (!trafficRes.allowed) {
-        if (msg.type === 'rpc.req' && msg.id) {
-          this.sendToClient(clientId, {
-            type: 'rpc.res',
-            id: String(msg.id),
-            ok: false,
-            error: {
-              code: trafficRes.code || 'TRAFFIC_QUOTA_EXCEEDED',
-              message: trafficRes.message || '当前账号传输流量已达上限，请稍后再试',
-            },
-          })
-        }
-        if (trafficRes.hardKick) {
-          try { client.ws.close(4009, 'Traffic quota exceeded') } catch {}
-        }
+    // Strictly unicast E2EE WebRTC P2P signaling (Client -> target Bridge in the SAME room)
+    if (msg.type === EVENTS.P2P_SIGNAL) {
+      if (rawBytes > MAX_P2P_SIGNAL_BYTES) return
+      const requestedBridgeId = String(msg.bridgeId || '').trim()
+      const sessionId = String(msg.sessionId || '').trim()
+      if (!SAFE_SIGNAL_ID_RE.test(sessionId) || !isValidE2eeEnvelope(msg.e2ee)) return
+      const bridge = this.getPrimaryBridge(roomId, requestedBridgeId)
+      if (!bridge) {
+        this.sendToClient(clientId, {
+          type: 'p2p.signal.error',
+          bridgeId: requestedBridgeId,
+          sessionId,
+          code: 'BRIDGE_OFFLINE',
+          message: requestedBridgeId
+            ? `目标电脑（${requestedBridgeId}）当前未在线，请确认该电脑已开机并启动桥接。`
+            : '你的电脑端桥接服务未在线，请确认电脑已开机并启动 All in One。',
+        })
         return
       }
+      this.globalStats.totalSignals += 1
+      const rStats = this.getOrCreateRoomStats(roomId)
+      rStats.signalCount += 1
+      rStats.lastActivityAt = Date.now()
+      this.sendRaw(bridge.ws, {
+        type: EVENTS.P2P_SIGNAL,
+        clientId,
+        sessionId,
+        e2ee: msg.e2ee,
+        ts: Date.now(),
+      })
+      return
+    }
+
+    // Explicitly reject legacy data-plane RPC forwarding through the Control Server
+    if (msg.type === 'rpc.req') {
+      this.sendToClient(clientId, {
+        type: 'rpc.res',
+        id: String(msg.id || ''),
+        ok: false,
+        error: {
+          code: 'P2P_REQUIRED',
+          message: 'v1.0 控制节点不转发业务数据，请升级客户端走端到端 P2P 直连。',
+        },
+      })
+      return
     }
 
     // Zero-knowledge device-to-device E2EE key grant signaling (strictly same-room, blind courier)
@@ -1013,7 +831,6 @@ export class RelayHub {
       const now = Date.now()
       this.pruneExpiredGrants(now)
       if (this.e2eeGrants.has(reqId)) return
-      // Enforce per-room cap (evict oldest pending request in this room if needed)
       const roomGrants = [...this.e2eeGrants.values()]
         .filter((g) => g.roomId === roomId)
         .sort((a, b) => a.createdAt - b.createdAt)
@@ -1111,7 +928,6 @@ export class RelayHub {
       }
       const requester = this.clients.get(grant.requesterClientId)
       if (!requester || requester.ws?.readyState !== 1) return
-      // Strictly single-use: burn request immediately before delivery
       this.e2eeGrants.delete(reqId)
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
@@ -1160,8 +976,6 @@ export class RelayHub {
       return
     }
 
-    // Ephemeral same-room UI nudge when a locked/scanning device wants an unlocked device (e.g. PC) to show its QR code.
-    // Strictly carries non-secret metadata only (no keys, no credentials); rate-limited per client.
     if (msg.type === 'e2ee.qr.nudge') {
       const action = msg.action === 'done' ? 'done' : 'scanning'
       const wantedKeyId = String(msg.wantedKeyId || '').trim().toLowerCase()
@@ -1184,148 +998,24 @@ export class RelayHub {
         },
         clientId,
       )
-      return
-    }
-
-    if (msg.type === 'rpc.req') {
-      const clientReqId = String(msg.id || randomUUID())
-      const requestedBridgeId = String(msg.bridgeId || '').trim()
-      const bridge = this.getPrimaryBridge(roomId, requestedBridgeId)
-      if (!bridge) {
-        this.sendToClient(clientId, {
-          type: 'rpc.res',
-          id: clientReqId,
-          ok: false,
-          error: {
-            code: 'BRIDGE_OFFLINE',
-            message: requestedBridgeId
-              ? `目标电脑（${requestedBridgeId}）当前未在线，请确认该电脑已开机并启动桥接，或切换其他电脑。`
-              : '你的电脑端桥接服务未在线，请确认电脑已开机并启动 All in One 电脑端桥接。',
-          },
-        })
-        return
-      }
-
-      if (!msg.e2ee) {
-        this.sendToClient(clientId, {
-          type: 'rpc.res',
-          id: clientReqId,
-          ok: false,
-          error: {
-            code: 'E2EE_KEY_REQUIRED',
-            keyId: bridge.meta?.e2ee?.keyId || '',
-            message: '中转服务已强制开启端到端加密，请先同步电脑端密钥',
-          },
-        })
-        return
-      }
-
-      let roomPendingCount = 0
-      for (const p of this.pendingRpc.values()) {
-        if (p.roomId === roomId) roomPendingCount += 1
-      }
-      if (roomPendingCount >= MAX_PENDING_RPC_PER_ROOM) {
-        this.sendToClient(clientId, {
-          type: 'rpc.res',
-          id: clientReqId,
-          ok: false,
-          error: {
-            code: 'TOO_MANY_PENDING_RPCS',
-            message: '当前并发请求过多，请稍后重试',
-          },
-        })
-        return
-      }
-
-      const relayReqId = randomUUID()
-      const timeoutMs = Number.isFinite(msg.timeoutMs)
-        ? Math.min(Math.max(5_000, msg.timeoutMs), 600_000)
-        : DEFAULT_RPC_TIMEOUT_MS
-
-      const timer = setTimeout(() => {
-        if (!this.pendingRpc.has(relayReqId)) return
-        this.pendingRpc.delete(relayReqId)
-        this.sendToClient(clientId, {
-          type: 'rpc.res',
-          id: clientReqId,
-          ok: false,
-          error: { code: 'RPC_TIMEOUT', message: `请求超时（${Math.round(timeoutMs / 1000)}s）` },
-        })
-      }, timeoutMs)
-
-      this.pendingRpc.set(relayReqId, {
-        clientId,
-        clientReqId,
-        timer,
-        roomId,
-        bridgeKey: this.bridgeKey(roomId, bridge.bridgeId),
-        bridgeWs: bridge.ws,
-      })
-
-      const rpcNow = Date.now()
-      this.globalStats.totalRpcs += 1
-      const rStats = this.getOrCreateRoomStats(roomId)
-      rStats.rpcCount += 1
-      rStats.lastRpcMethod = E2EE_METHOD_MARKER
-      rStats.lastRpcAt = rpcNow
-      rStats.lastActivityAt = rpcNow
-
-      const sent = this.sendRaw(bridge.ws, {
-        type: 'rpc.req',
-        id: relayReqId,
-        method: E2EE_METHOD_MARKER,
-        e2ee: msg.e2ee,
-      })
-      if (!sent) {
-        clearTimeout(timer)
-        this.pendingRpc.delete(relayReqId)
-        this.sendToClient(clientId, {
-          type: 'rpc.res',
-          id: clientReqId,
-          ok: false,
-          error: { code: 'BRIDGE_DISCONNECTED', message: '电脑端连接已断开，请稍后重试' },
-        })
-      }
     }
   }
 
-  broadcastEvent(roomId, bridgeId, event, payload, e2ee = null) {
+  broadcastControlEvent(roomId, bridgeId, event, payload) {
     const rid = String(roomId || '').trim()
     if (!rid) return
-    const evState = this.getRoomEventState(rid)
     const now = Date.now()
-    evState.seq += 1
-    this.globalStats.totalEvents += 1
-    const rStats = this.getOrCreateRoomStats(rid)
-    rStats.eventCount += 1
-    rStats.lastActivityAt = now
-    const envelope = e2ee
-      ? {
-          seq: evState.seq,
-          ts: now,
-          bridgeId,
-          event: E2EE_EVENT_MARKER,
-          e2ee,
-        }
-      : {
-          seq: evState.seq,
-          ts: now,
-          bridgeId,
-          event,
-          payload,
-        }
-    const frame = JSON.stringify({ type: 'event', ...envelope })
-    if (Buffer.byteLength(frame, 'utf8') <= MAX_CACHED_EVENT_BYTES) {
-      evState.buffer.push(envelope)
-      if (evState.buffer.length > EVENT_BUFFER_SIZE) {
-        evState.buffer.shift()
-      }
-    }
+    this.getOrCreateRoomStats(rid).lastActivityAt = now
+    const frame = JSON.stringify({
+      type: 'event',
+      ts: now,
+      bridgeId,
+      event,
+      payload,
+    })
     for (const [, client] of this._getRoomClientEntries(rid)) {
       if (client.ws.readyState === 1) {
-        try {
-          client.ws.send(frame)
-        } catch {}
+        try { client.ws.send(frame) } catch {}
       }
     }
   }
@@ -1351,7 +1041,7 @@ export class RelayHub {
     if (!rid) return
     const bridges = this.getBridgeList(rid)
     const devices = this.resolveRoomDevices(rid, bridges)
-    this.broadcastEvent(rid, '', EVENTS.BRIDGE_STATUS, {
+    this.broadcastControlEvent(rid, '', EVENTS.BRIDGE_STATUS, {
       bridgeId: '',
       online: bridges.some((b) => b.online),
       bridges,
@@ -1367,7 +1057,6 @@ export class RelayHub {
     const entry = this.bridges.get(key)
     if (!entry) return false
     this.bridges.delete(key)
-    this.failPendingRpcsForBridgeWs(entry.ws, key)
     this.recordActivity({
       type: 'bridge.offline',
       roomId: rid,
@@ -1375,13 +1064,11 @@ export class RelayHub {
       detail: entry.meta?.platform || '',
       ip: entry.meta?.ip || '',
     })
-    this.log.info(`[relay] Bridge disconnected: room=${rid} id=${bid}`)
-    try {
-      entry.ws.close(code, reason)
-    } catch {}
+    this.log.info(`[control] Bridge disconnected: room=${rid} id=${bid}`)
+    try { entry.ws.close(code, reason) } catch {}
     const bridges = this.getBridgeList(rid)
     const devices = this.resolveRoomDevices(rid, bridges)
-    this.broadcastEvent(rid, bid, EVENTS.BRIDGE_STATUS, {
+    this.broadcastControlEvent(rid, bid, EVENTS.BRIDGE_STATUS, {
       bridgeId: bid,
       online: false,
       bridges,
@@ -1392,16 +1079,23 @@ export class RelayHub {
 
   _dropClients(targets, code = 4401, reason = 'Session revoked', grantReason = 'revoked') {
     if (!targets.length) return 0
+    /** @type {Map<string, string[]>} */
+    const revokedByRoom = new Map()
     for (const [cid, client] of targets) {
       this.clients.delete(cid)
       this._unindexRoomClient(client.roomId, cid)
-      try {
-        client.ws.close(code, reason)
-      } catch {}
+      if (grantReason === 'revoked') {
+        const list = revokedByRoom.get(client.roomId) || []
+        list.push(cid)
+        revokedByRoom.set(client.roomId, list)
+      }
+      try { client.ws.close(code, reason) } catch {}
     }
     for (const [cid] of targets) {
       this.cancelClientGrants(cid, grantReason)
-      this.clearPendingRpcsForClient(cid)
+    }
+    for (const [rid, ids] of revokedByRoom.entries()) {
+      this.notifyBridgesClientRevoked(rid, ids, reason)
     }
     return targets.length
   }
@@ -1417,9 +1111,9 @@ export class RelayHub {
       const matchSid = targetSid && client.sid && client.sid === targetSid
       if (matchCid || matchSid) targets.push([cid, client])
     }
-    const disconnected = this._dropClients(targets, code, reason)
+    const disconnected = this._dropClients(targets, code, reason, 'revoked')
     if (disconnected > 0) {
-      this.log.info(`[relay] Kicked ${disconnected} client connection(s) in room=${rid}`)
+      this.log.info(`[control] Kicked ${disconnected} client connection(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
     }
     return disconnected
@@ -1438,9 +1132,9 @@ export class RelayHub {
       }
       targets.push([cid, client])
     }
-    const disconnected = this._dropClients(targets, code, reason)
+    const disconnected = this._dropClients(targets, code, reason, 'revoked')
     if (disconnected > 0) {
-      this.log.info(`[relay] Kicked ${disconnected} other client(s) in room=${rid}`)
+      this.log.info(`[control] Kicked ${disconnected} other client(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
     }
     return disconnected
@@ -1450,13 +1144,9 @@ export class RelayHub {
     const rid = String(roomId || '').trim()
     if (!rid) return 0
     const targets = this._getRoomClientEntries(rid)
-    const disconnected = this._dropClients(targets, code, reason)
-    const evState = this.roomEvents.get(rid)
-    if (evState) {
-      evState.buffer = []
-    }
+    const disconnected = this._dropClients(targets, code, reason, 'revoked')
     if (disconnected > 0) {
-      this.log.info(`[relay] Revoked and disconnected ${disconnected} client(s) in room=${rid}`)
+      this.log.info(`[control] Revoked and disconnected ${disconnected} client(s) in room=${rid}`)
     }
     return disconnected
   }
@@ -1470,10 +1160,6 @@ export class RelayHub {
       clearInterval(this._heartbeatTimer)
       this._heartbeatTimer = null
     }
-    for (const pending of this.pendingRpc.values()) {
-      clearTimeout(pending.timer)
-    }
-    this.pendingRpc.clear()
     for (const b of this.bridges.values()) {
       try { b.ws.close(1001, 'Server shutting down') } catch {}
     }

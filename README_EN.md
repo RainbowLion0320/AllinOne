@@ -51,7 +51,7 @@
   </tr>
 </table>
 
-> All in One runs a lightweight zero-knowledge relay on your own server and talks directly to each agent's official local interface, **preserving your local workspaces, session history, and vendor prompt caches**. Sign in with the same account on your phones and computers to discover and switch between all online machines automatically.
+> All in One runs a **Pure Control Plane + 100% Direct WebRTC P2P (`AIO-P2P v1`)** architecture: your server handles only authentication, device presence, encrypted signaling, and a built-in stateless STUN server (`UDP 3478`). **Every chat message, tool call, image, and multi-GB file flows peer-to-peer between your phone and computer — 0 bytes relayed through your server** — while preserving your local workspaces, session history, and vendor prompt caches.
 
 ---
 
@@ -64,28 +64,28 @@
       <p>Control your local <strong>Codex</strong>, <strong>Claude Code / Desktop</strong>, <strong>Antigravity</strong>, and <strong>DeepSeek Harness</strong> sessions grouped by project or time from a single unified UI.</p>
     </td>
     <td width="50%" valign="top">
-      <h4>🔒 Mandatory Zero-Knowledge E2EE</h4>
-      <p>Every prompt, code reply, attachment, and local image is encrypted end-to-end with <code>AES-256-GCM</code> before reaching the relay; sync new devices via offline QR or <strong>ECDH P-256 + 6-digit SAS</strong>.</p>
+      <h4>⚡ 100% Direct WebRTC P2P Data Plane</h4>
+      <p>Dual-layered <code>AES-256-GCM</code> + DTLS DataChannels connect phone and PC directly with <strong>0 bytes of server bandwidth</strong>; includes a built-in zero-dep RFC 5389 STUN server on <code>UDP 3478</code> — no traffic caps or tier quotas.</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <h4>⚡ Interactive Q&amp;A &amp; Bidirectional Sync</h4>
-      <p>Answer agent questions and approvals directly on mobile — including <strong>Codex</strong> async questions &amp; mid-turn <code>turn/steer</code>, plus automatic card dismissal on <strong>DSH</strong> Desktop when answered remotely.</p>
+      <h4>🔒 Mandatory Zero-Knowledge E2EE</h4>
+      <p>WebRTC signaling, RPCs, streaming output, and bulk files are all encrypted with your local 256-bit room key; sync new devices via offline QR or <strong>ECDH P-256 + 6-digit SAS</strong>.</p>
     </td>
     <td width="50%" valign="top">
-      <h4>📊 Live Weekly Subscription Quota Rings</h4>
-      <p>Border-integrated clockwise progress rings in the sidebar show remaining weekly quota and reset times for Codex, Claude, and Antigravity (Gemini) — synced strictly over E2EE.</p>
+      <h4>📊 Interactive Q&amp;A, Sync &amp; Weekly Quotas</h4>
+      <p>Resolve agent prompts on mobile (including Codex <code>turn/steer</code> and bidirectional DSH dismissal) and monitor Codex / Claude / Antigravity weekly quotas via border-integrated progress rings.</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h4>📱 Cross-Platform Multi-Machine Control</h4>
-      <p>Native macOS / Windows desktop apps (with embedded tray bridge), one-line Linux CLI setup, iOS / Android PWA, and Android APK — seamlessly switch across all computers under your account.</p>
+      <p>Native macOS / Windows desktop apps (using built-in Chromium <code>libwebrtc</code> + tray bridge), pure-JS Linux one-line CLI, iOS / Android PWA, and Android APK.</p>
     </td>
     <td width="50%" valign="top">
-      <h4>🐳 Lightweight Self-Hosting, MIT Open Source</h4>
-      <p>Spin up your own private relay with one <code>docker compose</code> command (automatic HTTPS via Caddy), complete with an on-demand <code>/admin</code> dashboard and zero vendor lock-in.</p>
+      <h4>🐳 Featherweight Self-Hosting, MIT Open Source</h4>
+      <p>With zero payload relay or temp file storage, even a tiny 1-vCPU VPS runs effortlessly via one <code>docker compose</code> command (auto HTTPS + built-in STUN) plus an on-demand <code>/admin</code> dashboard.</p>
     </td>
   </tr>
 </table>
@@ -168,11 +168,11 @@ All in One is built around **6 layers of zero-knowledge defense-in-depth** — e
 | Layer | Mechanism | Guarantee |
 | :--- | :--- | :--- |
 | **1. Mandatory E2EE** | `AES-256-GCM` + 256-bit room key + AAD bound to room & message type | All chats, tool calls, attachments, local images & quotas are encrypted client-side; bridges reject plaintext RPCs with anti-replay IV tracking |
-| **2. Zero-Knowledge Blind Relay** | Relay holds zero encryption keys; temporary encrypted uploads burn on fetch | The server only routes opaque ciphertext — no plaintext in memory, disk, or logs |
+| **2. Pure Control Plane (0 B Relayed)** | No data-plane relay or server file storage — only auth, encrypted WebRTC signaling & stateless STUN (`UDP 3478`) | Chats, code, images & large files travel 100% peer-to-peer over WebRTC DataChannels (DTLS + AES-256-GCM) |
 | **3. Zero-Knowledge Device Grant** | Offline QR scan **or** `ECDH P-256` + `HKDF-SHA256` + **6-digit SAS** | Remote key sync derives an independent 6-digit verification code on both devices to prevent MITM attacks |
-| **4. Zero Open Inbound Ports** | PC bridges initiate **outbound WSS** only | No router port forwarding, no public SSH/daemon exposure on your home or office machine |
+| **4. Zero Open Inbound Ports** | PC bridges initiate **outbound WSS** control + **STUN UDP traversal** only | No router port forwarding, no public SSH/daemon exposure on your home or office machine |
 | **5. OS Hardware Key Storage** | macOS Keychain / Windows DPAPI (Electron `safeStorage`) | 256-bit E2EE keys are encrypted by your OS credential vault instead of plaintext files |
-| **6. Account & Device Governance** | Single-use invites + optional Email 2FA + one-time WS tickets + live device kick | Strict per-account room isolation; revoke any lost device in real time (verified by 30 automated smoke & security tests) |
+| **6. Account & Instant P2P Revocation** | Single-use invites + optional Email 2FA + one-time WS tickets + live `client.revoked` push | Revoking any lost device immediately instructs PC bridges to tear down its P2P DataChannels in milliseconds (verified by 34 automated tests) |
 
 ### Architecture
 
@@ -180,22 +180,24 @@ All in One is built around **6 layers of zero-knowledge defense-in-depth** — e
 flowchart LR
   subgraph Clients["Clients (Same Account · Holds 256-bit E2EE Key)"]
     M["Mobile PWA / Android APK"]
-    D["All in One Desktop<br/>(Electron UI + Embedded Tray Bridge)"]
+    D["All in One Desktop<br/>(Electron UI + Native libwebrtc Engine)"]
   end
 
-  subgraph Server["Relay Server (HTTPS / WSS · Zero-Knowledge Blind Forwarding)"]
-    R["@allinone/relay-server<br/>Accounts & Invites · Tenant Isolation · Ciphertext Router"]
+  subgraph Control["Pure Control Plane Server (HTTPS / WSS + Built-in STUN UDP 3478)"]
+    R["@allinone/relay-server<br/>Auth · Presence · Encrypted Signaling · Stateless STUN<br/>(0 Bytes of Payload Relayed)"]
   end
 
-  subgraph PCs["Your Computers (Outbound WSS Only · Zero Open Ports)"]
+  subgraph PCs["Your Computers (Outbound WSS + WebRTC NAT Traversal · Zero Open Ports)"]
     B1["macOS / Windows / Linux Bridge"]
     A1["Codex · Claude · Antigravity · DSH"]
     B1 <-->|"Local Official Interface"| A1
   end
 
-  M <-->|"TLS + AES-256-GCM Ciphertext"| R
-  D <-->|"TLS + AES-256-GCM Ciphertext"| R
-  R <-->|"Outbound WSS + Ciphertext"| B1
+  M -.->|"Auth / Encrypted SDP Signaling / STUN only"| R
+  D -.->|"Auth / Encrypted SDP Signaling / STUN only"| R
+  R -.->|"Control Signaling / Instant Revocation only"| B1
+  M <==>|"100% Direct P2P (DTLS + AES-256-GCM)<br/>aio-ctrl (RPC/Stream) + aio-bulk (Files/Images)"| B1
+  D <==>|"100% Direct P2P (DTLS + AES-256-GCM)"| B1
 ```
 
 ---
@@ -209,7 +211,8 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 ```
 
 The interactive wizard finishes everything in under a minute:
-- **3 Deployment Modes**: ① Custom Domain + automatic Let's Encrypt HTTPS via Caddy (Recommended) · ② **Bare Public IP + trusted Let's Encrypt IP HTTPS** (no domain required) · ③ Relay Container Only (binds `127.0.0.1:8787` for existing Nginx / Caddy / Cloudflare Tunnel setups).
+- **3 Deployment Modes**: ① Custom Domain + automatic Let's Encrypt HTTPS via Caddy (Recommended) · ② **Bare Public IP + trusted Let's Encrypt IP HTTPS** (no domain required) · ③ Control Plane Container Only (binds `127.0.0.1:8787` for existing Nginx / Caddy / Cloudflare Tunnel setups).
+- **Built-In Stateless STUN (`UDP 3478`)**: The container exposes **`UDP 3478`** for zero-dependency RFC 5389 NAT discovery (open `UDP 3478` in your cloud firewall / security group). Zero data-plane relay traffic means even a 1-vCPU VPS stays idle under heavy file transfers.
 - **Secure Defaults**: Automatically generates a 256-bit `JWT_SECRET` (`chmod 600 .env`) with an optional Email 2FA / SMTP wizard (Gmail, QQ Mail, 163 Mail, or custom SMTP).
 - **Ready to Sign Up**: Runs a health check, automatically issues your first single-use admin invite code + clickable registration link, and supports zero-downtime upgrades via `--upgrade`.
 

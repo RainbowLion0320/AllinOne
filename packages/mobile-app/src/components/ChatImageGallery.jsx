@@ -5,7 +5,7 @@ import {
   Maximize2,
   RefreshCw,
 } from 'lucide-react'
-import { getImageLabel, isRelayUploadTarget, resolveImageSrc } from '../lib/imageUrls.js'
+import { getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
 
@@ -13,8 +13,7 @@ import { useI18n } from '../lib/i18n.jsx'
  * Sleek inline image preview card rendered inside chat messages.
  * Always keeps <img> eagerly mounted (never display:none with loading="lazy") so mobile
  * browsers & Android WebView load images reliably every single time.
- * Supports Zero-Knowledge E2EE image decryption (local PC images via encrypted RPC.FILE_READ
- * and encrypted relay uploads via Web Crypto AES-256-GCM).
+ * Supports Zero-Knowledge E2EE image decryption over direct WebRTC P2P (`RPC.FILE_READ` + `aio-bulk`).
  */
 export function ChatImageCard({
   item,
@@ -47,12 +46,6 @@ export function ChatImageCard({
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
 
-  const rawTarget = typeof effectiveItem === 'string'
-    ? effectiveItem.trim()
-    : String(effectiveItem?.url || effectiveItem?.path || '').trim()
-  const waitingForMediaToken = Boolean(
-    isRelayUploadTarget(rawTarget) && imageContext?.baseUrl && !imageContext?.mediaToken,
-  )
   const e2eeKeysSig = imageContext?.e2eeKeys
     ? Object.keys(imageContext.e2eeKeys).sort().join(',')
     : ''
@@ -63,10 +56,6 @@ export function ChatImageCard({
   useEffect(() => {
     if (!needsE2ee) {
       setE2eeSrc('')
-      return
-    }
-    if (waitingForMediaToken && typeof effectiveItem === 'object' && effectiveItem?.e2ee?.iv) {
-      setStatus('loading')
       return
     }
     let cancelled = false
@@ -92,7 +81,6 @@ export function ChatImageCard({
   }, [
     needsE2ee,
     previewFailed,
-    waitingForMediaToken,
     effectiveItem?.path,
     effectiveItem?.url,
     effectiveItem?.raw,
@@ -102,7 +90,7 @@ export function ChatImageCard({
     imageContext?.roomId,
     imageContext?.bridgeId,
     imageContext?.cwd,
-    imageContext?.mediaToken,
+    imageContext?.p2pState,
     imageContext?.e2eeKey,
     imageContext?.e2eeKeyId,
     e2eeKeysSig,
@@ -112,7 +100,7 @@ export function ChatImageCard({
   useEffect(() => {
     if (!src) {
       if (!needsE2ee) {
-        setStatus(waitingForMediaToken ? 'loading' : 'error')
+        setStatus('error')
       }
       return
     }
@@ -122,9 +110,9 @@ export function ChatImageCard({
     } else {
       setStatus('loading')
     }
-  }, [src, needsE2ee, waitingForMediaToken])
+  }, [src, needsE2ee])
 
-  if (!needsE2ee && !directSrc && !waitingForMediaToken) return null
+  if (!needsE2ee && !directSrc) return null
 
   return (
     <div

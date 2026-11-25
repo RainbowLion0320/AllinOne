@@ -1,25 +1,23 @@
 import os from 'node:os'
+import { join } from 'node:path'
 import WebSocket from 'ws'
+import { EVENTS } from './protocol.js'
 import {
-  E2EE_EVENT_MARKER,
-  E2EE_IV_BYTES,
   E2EE_VERSION,
-  base64UrlToBytes,
-  bytesToBase64Url,
   computeE2eeKeyId,
-  decryptJson,
-  encryptJson,
   normalizeE2eeKey,
 } from './helpers/e2ee.js'
-
-const REPLAY_WINDOW_MS = 10 * 60 * 1000 // 10 minutes
-const MAX_SEEN_IVS = 4000
+import { P2PBridgeManager } from './p2p/manager.js'
 
 /**
- * Resilient outbound WebSocket client connecting home PC -> Relay Server.
- * Mandatory Zero-Knowledge AES-256-GCM End-to-End Encryption (E2EE):
- * every RPC request/response and streaming event is end-to-end encrypted
- * before touching the Relay Server, and unencrypted RPCs are strictly rejected.
+ * Pure Control-Plane WebSocket link (PC Bridge <-> Control Server) + Pure WebRTC P2P Data Plane (`P2PBridgeManager`).
+ *
+ * Control WS handles ONLY:
+ *  - Device presence (`bridge.meta`)
+ *  - E2EE-wrapped WebRTC signaling (`p2p.signal`)
+ *  - Instant device kick notifications (`client.revoked`)
+ *
+ * ALL RPCs, streaming chat events, images, and files run directly Peer-to-Peer over `P2PBridgeManager`.
  */
 export class RelayBridgeLink {
   constructor({
@@ -29,10 +27,11 @@ export class RelayBridgeLink {
     bridgeId = 'home-pc',
     mode = 'desktop',
     e2eeKey = '',
+    inboundDir = '',
     log = console,
     onRpc,
+    onRegisterP2pUpload,
     onState,
-    onTierUpdate,
   }) {
     const cleanRoomId = String(roomId || '').trim()
     if (!cleanRoomId.startsWith('usr_')) {
@@ -56,14 +55,9 @@ export class RelayBridgeLink {
     this.e2eeReady.catch((err) => {
       this.log.error?.(`mobile-hub: failed computing E2EE keyId: ${String(err?.message || err)}`)
     })
-    this.seenReqIvs = new Map()
-    this._eventQueue = Promise.resolve()
     this.log = log
     this.onRpc = onRpc
     this.onState = onState
-    this.onTierUpdate = onTierUpdate
-    this.tier = 'free'
-    this.fileLimits = null
     this.ws = null
     this.stopped = false
     this.attempt = 0
@@ -71,6 +65,26 @@ export class RelayBridgeLink {
     this.heartbeatTimer = null
     this.lastPongAt = 0
     this.metaApps = []
+    this.iceServers = []
+
+    const resolvedInboundDir = inboundDir || join(
+      String(process.env.DSH_HOME ?? '').trim() || join(os.homedir(), '.dsh'),
+      'allinone-uploads',
+    )
+
+    this.p2p = new P2PBridgeManager({
+      roomId: this.roomId,
+      e2eeKey: this.e2eeKey,
+      getE2eeKeyId: async () => this.e2eeKeyId || (await this.e2eeReady),
+      getIceServers: () => this.iceServers,
+      sendSignal: ({ clientId, sessionId, e2ee }) => {
+        this.send({ type: EVENTS.P2P_SIGNAL, clientId, sessionId, e2ee })
+      },
+      onRpc: (method, params, ctx) => this.onRpc(method, params, ctx),
+      onRegisterP2pUpload,
+      inboundDir: resolvedInboundDir,
+      log: this.log,
+    })
   }
 
   getAadRoomId() {
@@ -83,13 +97,14 @@ export class RelayBridgeLink {
     }
     const meta = {
       ...(this.metaApps.length > 0 ? { apps: this.metaApps } : {}),
+      p2pEngine: this.p2p.getEngineName(),
       e2ee: { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId },
     }
     this.send({ type: 'bridge.meta', meta })
   }
 
   setAppsMeta(apps) {
-    // Strip E2EE-only subscription quota details before sending plaintext bridge.meta to Relay Server
+    // Strip E2EE-only subscription quota details before sending plaintext bridge.meta to Control Server
     this.metaApps = Array.isArray(apps)
       ? apps.map((item) => {
           if (!item || typeof item !== 'object') return item
@@ -122,12 +137,12 @@ export class RelayBridgeLink {
     }
     this.clearHeartbeat()
     if (this.ws) {
-      try {
-        this.ws.close(1000, 'Bridge stopping')
-      } catch {}
+      try { this.ws.close(1000, 'Bridge stopping') } catch {}
       this.ws = null
     }
+    const disposePromise = this.p2p?.dispose?.().catch(() => {}) || Promise.resolve()
     this.emitState('stopped', 'Bridge stopped')
+    return disposePromise
   }
 
   emitState(state, detail = '') {
@@ -145,18 +160,6 @@ export class RelayBridgeLink {
     u.searchParams.set('roomId', this.roomId)
     if (this.e2eeKeyId) u.searchParams.set('e2eeKeyId', this.e2eeKeyId)
     return u.toString()
-  }
-
-  pruneSeenIvs(now) {
-    if (this.seenReqIvs.size < MAX_SEEN_IVS) return
-    for (const [iv, seenAt] of this.seenReqIvs.entries()) {
-      if (now - seenAt > REPLAY_WINDOW_MS) this.seenReqIvs.delete(iv)
-    }
-    while (this.seenReqIvs.size >= MAX_SEEN_IVS) {
-      const oldest = this.seenReqIvs.keys().next().value
-      if (!oldest) break
-      this.seenReqIvs.delete(oldest)
-    }
   }
 
   connect() {
@@ -181,7 +184,7 @@ export class RelayBridgeLink {
         handshakeTimeout: 15_000,
       })
     } catch (err) {
-      this.log.error?.(`mobile-hub: invalid relayUrl ${this.relayUrl}: ${String(err)}`)
+      this.log.error?.(`mobile-hub: invalid control URL ${this.relayUrl}: ${String(err)}`)
       this.emitState('error', String(err))
       this.scheduleReconnect()
       return
@@ -209,7 +212,7 @@ export class RelayBridgeLink {
         try { ws.terminate() } catch {}
         if (this.stopped) return
         const detail = 'HTTP 401 Unauthorized'
-        this.log.warn?.(`mobile-hub: relay rejected bridge (${detail})`)
+        this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
         this.emitState('unauthorized', detail)
         return
       }
@@ -218,7 +221,7 @@ export class RelayBridgeLink {
       this.ws = null
       try { ws.terminate() } catch {}
       if (this.stopped) return
-      this.log.warn?.(`mobile-hub: relay ${detail}`)
+      this.log.warn?.(`mobile-hub: control server ${detail}`)
       this.emitState('error', detail)
       this.emitState('disconnected', detail)
       this.scheduleReconnect()
@@ -233,14 +236,14 @@ export class RelayBridgeLink {
         this.attempt = 0
         this.lastPongAt = Date.now()
         this.log.info?.(
-          `mobile-hub: connected to relay ${this.relayUrl} as "${this.bridgeId}" (E2EE AES-256-GCM)`,
+          `mobile-hub: connected to control server ${this.relayUrl} as "${this.bridgeId}" (P2P ${this.p2p.getEngineName()} + E2EE AES-256-GCM)`,
         )
         this.emitState('connected', this.relayUrl)
         await this.sendBridgeMeta()
         if (this.ws !== ws || this.stopped) return
         this.startHeartbeat()
       } catch (err) {
-        this.log.warn?.(`mobile-hub: relay open handler error: ${String(err?.message || err)}`)
+        this.log.warn?.(`mobile-hub: control open handler error: ${String(err?.message || err)}`)
       }
     })
 
@@ -258,22 +261,27 @@ export class RelayBridgeLink {
         return
       }
 
-      if (msg.type === 'bridge.welcome' || msg.type === 'tier.update') {
-        if (msg.tier) this.tier = String(msg.tier)
-        if (msg.fileLimits && typeof msg.fileLimits === 'object') {
-          this.fileLimits = msg.fileLimits
+      if (msg.type === 'bridge.welcome') {
+        if (Array.isArray(msg.iceServers)) {
+          this.iceServers = msg.iceServers
         }
-        try {
-          this.onTierUpdate?.({ tier: this.tier, fileLimits: this.fileLimits })
-        } catch {}
         return
       }
 
-      if (msg.type === 'rpc.req') {
+      if (msg.type === EVENTS.CLIENT_REVOKED) {
+        this.p2p.revokeClients(msg.clientIds || [])
+        return
+      }
+
+      if (msg.type === EVENTS.P2P_SIGNAL) {
         try {
-          await this.handleEncryptedRpc(msg.id, msg)
+          await this.p2p.handleEncryptedSignal({
+            clientId: msg.clientId,
+            sessionId: msg.sessionId,
+            e2ee: msg.e2ee,
+          })
         } catch (err) {
-          this.log.warn?.(`mobile-hub: unhandled rpc.req(${msg.id}) error: ${String(err?.message || err)}`)
+          this.log.warn?.(`mobile-hub: p2p.signal error: ${String(err?.message || err)}`)
         }
       }
     })
@@ -286,148 +294,21 @@ export class RelayBridgeLink {
       if (this.stopped) return
       if (code === 4401) {
         const detail = reason || 'Device unbound or credential revoked'
-        this.log.warn?.(`mobile-hub: relay rejected bridge (${detail})`)
+        this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
         this.emitState('unauthorized', detail)
         return
       }
       const detail = `closed code=${code}${reason ? ` (${reason})` : ''}`
-      this.log.warn?.(`mobile-hub: relay ${detail}`)
+      this.log.warn?.(`mobile-hub: control server ${detail}`)
       this.emitState('disconnected', detail)
       this.scheduleReconnect()
     })
 
     ws.on('error', (err) => {
       if (this.ws !== ws || authRejected) return
-      this.log.warn?.(`mobile-hub: relay socket error: ${String(err?.message || err)}`)
+      this.log.warn?.(`mobile-hub: control socket error: ${String(err?.message || err)}`)
       this.emitState('error', String(err?.message || err))
     })
-  }
-
-  async handleEncryptedRpc(id, msg) {
-    if (!this.e2eeKeyId) await this.e2eeReady
-    const aadRoom = this.getAadRoomId()
-
-    // Strictly reject unencrypted RPCs (including any relay-initiated plaintext calls)
-    if (!msg.e2ee) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_KEY_REQUIRED',
-          keyId: this.e2eeKeyId,
-          message: '该电脑已开启端到端加密，请先扫描电脑端二维码同步端到端密钥',
-        },
-      })
-      return
-    }
-
-    if (msg.e2ee.kid && msg.e2ee.kid !== this.e2eeKeyId) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_KEY_MISMATCH',
-          keyId: this.e2eeKeyId,
-          message: '端到端密钥不匹配，请重新扫描电脑端二维码同步最新密钥',
-        },
-      })
-      return
-    }
-
-    let decrypted
-    try {
-      decrypted = await decryptJson(this.e2eeKey, msg.e2ee, { kind: 'rpc.req', roomId: aadRoom })
-    } catch (err) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: err?.code || 'E2EE_DECRYPT_FAILED',
-          keyId: this.e2eeKeyId,
-          message: String(err?.message || '端到端解密失败'),
-        },
-      })
-      return
-    }
-
-    const now = Date.now()
-    const ivBytes = base64UrlToBytes(msg.e2ee.iv)
-    const ivKey = ivBytes && ivBytes.byteLength === E2EE_IV_BYTES ? bytesToBase64Url(ivBytes) : ''
-    if (!ivKey) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_DECRYPT_FAILED',
-          keyId: this.e2eeKeyId,
-          message: '端到端密文 IV 无效',
-        },
-      })
-      return
-    }
-    this.pruneSeenIvs(now)
-    const prevSeen = this.seenReqIvs.get(ivKey)
-    if (prevSeen && now - prevSeen <= REPLAY_WINDOW_MS) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_REPLAY_DETECTED',
-          message: '检测到重复的加密请求，已拒绝执行',
-        },
-      })
-      return
-    }
-    if (!Number.isFinite(decrypted?.ts) || Math.abs(now - decrypted.ts) > REPLAY_WINDOW_MS) {
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_STALE_TIMESTAMP',
-          message: '加密请求时间偏差过大，请校准本机与手机系统时间后重试',
-        },
-      })
-      return
-    }
-    this.seenReqIvs.set(ivKey, now)
-
-    const cid = String(decrypted?.cid || '')
-    let innerRes
-    try {
-      const result = await this.onRpc(decrypted.method, decrypted.params || {})
-      innerRes = { ok: true, cid, result }
-    } catch (err) {
-      innerRes = {
-        ok: false,
-        cid,
-        error: {
-          code: err?.code || 'RPC_ERROR',
-          message: String(err?.message || err),
-        },
-      }
-    }
-
-    try {
-      const enc = await encryptJson(this.e2eeKey, innerRes, { kind: 'rpc.res', roomId: aadRoom })
-      this.send({ type: 'rpc.res', id, ok: true, e2ee: enc })
-    } catch (err) {
-      this.log.warn?.(`mobile-hub: failed encrypting rpc.res: ${String(err?.message || err)}`)
-      this.send({
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: {
-          code: 'E2EE_ENCRYPT_FAILED',
-          message: '端到端响应加密失败',
-        },
-      })
-    }
   }
 
   startHeartbeat() {
@@ -435,7 +316,7 @@ export class RelayBridgeLink {
     this.heartbeatTimer = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
       if (Date.now() - this.lastPongAt > 65_000) {
-        this.log.warn?.('mobile-hub: relay heartbeat timed out, reconnecting')
+        this.log.warn?.('mobile-hub: control heartbeat timed out, reconnecting')
         try { this.ws.terminate() } catch {}
         return
       }
@@ -472,18 +353,11 @@ export class RelayBridgeLink {
     }
   }
 
+  /**
+   * Push streaming AI events directly to connected P2P peers (0 bytes through Control Server!).
+   */
   pushEvent(event, payload) {
-    const aadRoom = this.getAadRoomId()
-    // Preserve strict FIFO ordering across async AES-GCM encryptions for streaming deltas
-    this._eventQueue = this._eventQueue
-      .then(async () => {
-        if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN) return
-        if (!this.e2eeKeyId) await this.e2eeReady
-        const enc = await encryptJson(this.e2eeKey, { event, payload }, { kind: 'event', roomId: aadRoom })
-        this.send({ type: 'event', event: E2EE_EVENT_MARKER, e2ee: enc })
-      })
-      .catch((err) => {
-        this.log.warn?.(`mobile-hub: failed encrypting event ${event}: ${String(err?.message || err)}`)
-      })
+    if (this.stopped) return
+    this.p2p.broadcastEvent(event, payload)
   }
 }

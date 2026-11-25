@@ -1,25 +1,24 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { open as openAsync, readFile as readFileAsync, unlink as unlinkAsync } from 'node:fs/promises'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs'
+import { readFile as readFileAsync } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
-import {
-  E2EE_CHUNKED_THRESHOLD,
-  decryptAutoStream,
-  encryptBytes,
-  encryptChunkedBytes,
-  normalizeE2eeKey,
-} from './helpers/e2ee.js'
+import { normalizeE2eeKey } from './helpers/e2ee.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
 
+const P2P_UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes
+const P2P_INLINE_MAX_BYTES = 128 * 1024 // Files > 128 KB stream directly over `aio-bulk`
+const MAX_P2P_DOCUMENT_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local safety cap
+const MAX_P2P_IMAGE_BYTES = 100 * 1024 * 1024 // 100 MB image cap
+
 /**
  * Central multi-app orchestrator powering BOTH:
- *   1) Mobile App RPC requests over Relay Server
+ *   1) Direct WebRTC P2P RPC requests from Mobile / Web / Desktop clients
  *   2) DeepSeek Harness Master Dispatch Tools (`allinone_*`)
  */
 export class MultiAppOrchestrator {
@@ -28,8 +27,6 @@ export class MultiAppOrchestrator {
     this.config = config
     this.log = log
     this.onEvent = onEvent || (() => {})
-    this.relayHttpBase = this.deriveHttpBase(config.relayUrl)
-    this.bridgeSecret = config.secret || ''
     this.roomId = config.roomId || ''
     this.e2eeKey = normalizeE2eeKey(config.e2eeKey || '')
     this.inboundDir = config.inboundDir || join(
@@ -41,14 +38,10 @@ export class MultiAppOrchestrator {
     this.pendingApprovals = new Map()
     /** @type {Map<string, any>} */
     this.dispatches = new Map()
+    /** @type {Map<string, { clientId: string, localPath: string, filename: string, mimeType: string, size: number, createdAt: number }>} */
+    this.p2pUploads = new Map()
     this._lastInboundPruneAt = 0
     this._activeDocReads = 0
-    this.tier = 'free'
-    this.fileLimits = {
-      maxUploadBytes: 15 * 1024 * 1024,
-      maxImageBytes: 15 * 1024 * 1024,
-      maxDocumentBytes: 10 * 1024 * 1024,
-    }
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -73,149 +66,30 @@ export class MultiAppOrchestrator {
     }
   }
 
-  deriveHttpBase(wsUrl) {
-    if (!wsUrl) return ''
-    try {
-      const u = new URL(wsUrl)
-      u.protocol = (u.protocol === 'wss:' || u.protocol === 'https:') ? 'https:' : 'http:'
-      u.pathname = u.pathname.replace(/\/ws\/bridge\/?$/, '')
-      u.search = ''
-      return u.toString().replace(/\/$/, '')
-    } catch {
-      return ''
+  /**
+   * Register a verified P2P uploaded file inside `inboundDir` and return an opaque token.
+   * Ensures callers can NEVER inject arbitrary local file paths in `RPC.SESSION_SEND`.
+   */
+  registerP2pUpload({ clientId = '', localPath, filename, mimeType = 'application/octet-stream', size = 0 } = {}) {
+    const now = Date.now()
+    for (const [tok, rec] of this.p2pUploads.entries()) {
+      if (now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS) this.p2pUploads.delete(tok)
     }
-  }
-
-  setTierLimits({ tier = '', fileLimits = null } = {}) {
-    if (tier) this.tier = String(tier).trim().toLowerCase() || 'free'
-    if (fileLimits && typeof fileLimits === 'object') {
-      const nextUpload = Number(fileLimits.maxUploadBytes)
-      const nextImg = Number(fileLimits.maxImageBytes)
-      const nextDoc = Number(fileLimits.maxDocumentBytes)
-      this.fileLimits = {
-        maxUploadBytes: Number.isFinite(nextUpload) && nextUpload > 0 ? nextUpload : this.fileLimits.maxUploadBytes,
-        maxImageBytes: Number.isFinite(nextImg) && nextImg > 0 ? nextImg : this.fileLimits.maxImageBytes,
-        maxDocumentBytes: Number.isFinite(nextDoc) && nextDoc > 0 ? nextDoc : this.fileLimits.maxDocumentBytes,
-      }
+    const cleanPath = resolve(String(localPath || ''))
+    const baseDir = resolve(this.inboundDir)
+    if (!cleanPath.startsWith(`${baseDir}${sep}`)) {
+      throw new Error('Rejected P2P upload path outside inbound directory')
     }
-  }
-
-  formatLimitLabel(bytes) {
-    const n = Number(bytes || 0)
-    if (n >= 1024 * 1024 * 1024) {
-      const gb = n / (1024 * 1024 * 1024)
-      return Number.isInteger(gb) ? `${gb}GB` : `${gb.toFixed(1)}GB`
-    }
-    return `${Math.max(1, Math.round(n / (1024 * 1024)))}MB`
-  }
-
-  async uploadLocalFileEncrypted(realPath, fileSize) {
-    if (!this.relayHttpBase || !this.bridgeSecret || !this.e2eeKey) {
-      throw new Error('当前桥接未配置中转上传通道，无法传输大文件')
-    }
-    const headers = {
-      'Content-Type': 'application/octet-stream',
-      'X-Allinone-Encrypted': '1',
-      'X-Bridge-Secret': this.bridgeSecret,
-      ...(this.roomId ? { 'X-Room-Id': this.roomId } : {}),
-    }
-    const timeoutMs = Math.max(60_000, Math.min(600_000, Math.ceil(fileSize / (256 * 1024)) * 1000))
-
-    let encMeta
-    let res
-    if (fileSize <= E2EE_CHUNKED_THRESHOLD) {
-      const plainBuf = await readFileAsync(realPath)
-      const enc = await encryptBytes(this.e2eeKey, plainBuf, {
-        kind: 'upload',
-        roomId: this.roomId,
-      })
-      encMeta = { v: enc.v, kid: enc.kid, iv: enc.iv, chunked: false }
-      res = await fetch(`${this.relayHttpBase}/api/uploads`, {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Length': String(enc.ciphertext.byteLength),
-        },
-        body: enc.ciphertext,
-        redirect: 'error',
-        signal: AbortSignal.timeout(timeoutMs),
-      })
-    } else {
-      const { readable, writable } = new TransformStream()
-      const writer = writable.getWriter()
-      const encPromise = (async () => {
-        const fh = await openAsync(realPath, 'r')
-        try {
-          return await encryptChunkedBytes(
-            this.e2eeKey,
-            {
-              totalSize: fileSize,
-              readSlice: async (offset, len) => {
-                const b = Buffer.allocUnsafe(len)
-                let pos = 0
-                while (pos < len) {
-                  const { bytesRead } = await fh.read(b, pos, len - pos, offset + pos)
-                  if (bytesRead <= 0) break
-                  pos += bytesRead
-                }
-                return new Uint8Array(b.buffer, b.byteOffset, pos)
-              },
-            },
-            {
-              kind: 'upload',
-              roomId: this.roomId,
-              onChunk: async (chunk) => {
-                await writer.write(chunk)
-              },
-            },
-          )
-        } finally {
-          await fh.close().catch(() => {})
-        }
-      })()
-        .then(async (meta) => {
-          await writer.close()
-          return meta
-        })
-        .catch(async (err) => {
-          await writer.abort(err).catch(() => {})
-          throw err
-        })
-
-      const fetchPromise = fetch(`${this.relayHttpBase}/api/uploads`, {
-        method: 'POST',
-        headers,
-        body: readable,
-        duplex: 'half',
-        redirect: 'error',
-        signal: AbortSignal.timeout(timeoutMs),
-      })
-
-      const [encSettled, fetchSettled] = await Promise.allSettled([encPromise, fetchPromise])
-      if (fetchSettled.status === 'rejected') {
-        throw fetchSettled.reason
-      }
-      if (encSettled.status === 'rejected') {
-        try { await fetchSettled.value.body?.cancel?.() } catch {}
-        throw encSettled.reason
-      }
-      encMeta = {
-        v: encSettled.value.v,
-        kid: encSettled.value.kid,
-        iv: encSettled.value.iv,
-        chunked: true,
-      }
-      res = fetchSettled.value
-    }
-
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || !data?.ok || !data?.upload?.url) {
-      throw new Error(data?.error || `中转上传大文件失败 (HTTP ${res.status})`)
-    }
-    return {
-      uploadUrl: data.upload.url,
-      e2ee: encMeta,
-    }
+    const token = `p2p_${randomUUID().replace(/-/g, '')}`
+    this.p2pUploads.set(token, {
+      clientId: String(clientId || ''),
+      localPath: cleanPath,
+      filename: String(filename || basename(cleanPath)),
+      mimeType: String(mimeType || 'application/octet-stream'),
+      size: Number(size || 0),
+      createdAt: now,
+    })
+    return token
   }
 
   getAdapter(app) {
@@ -348,11 +222,7 @@ export class MultiAppOrchestrator {
   }
 
   /**
-   * Download any relay-hosted attachments to local PC disk before handing them to local agents.
-   * Security:
-   *  - NEVER trusts caller-supplied `att.localPath` (prevents arbitrary local file injection).
-   *  - Strictly validates `att.url` matches `/api/uploads/<uuid>` and ALWAYS fetches from `this.relayHttpBase`
-   *    with `redirect: 'error'` so `X-Bridge-Secret` can NEVER be leaked to third-party hosts (SSRF defense).
+   * Prune expired inbound P2P attachment files from local PC disk.
    */
   pruneInboundDir(maxAgeMs = 24 * 60 * 60 * 1000) {
     const now = Date.now()
@@ -372,138 +242,52 @@ export class MultiAppOrchestrator {
     } catch {}
   }
 
-  async materializeAttachments(attachments = []) {
+  /**
+   * Resolve P2P-uploaded attachments strictly from our verified `p2pUploads` registry.
+   * Security: NEVER trusts caller-supplied `localPath` or arbitrary URLs, and enforces
+   * single-use + uploading-client ownership (`clientId`) when present.
+   */
+  async materializeAttachments(attachments = [], { clientId = '' } = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return []
-    const RELAY_UPLOAD_PATH_RE = /^\/api\/uploads\/[a-f0-9-]{8,64}$/i
-    const maxPlainBytes = Math.max(1024 * 1024, Number(this.fileLimits?.maxUploadBytes) || 15 * 1024 * 1024)
-    const maxDownloadBytes = maxPlainBytes + 64 * 1024
-    const maxLabel = this.formatLimitLabel(maxPlainBytes)
-    mkdirSync(this.inboundDir, { recursive: true })
-    try { chmodSync(this.inboundDir, 0o700) } catch {}
     this.pruneInboundDir()
+    const now = Date.now()
+    const callerClientId = String(clientId || '').trim()
     const out = []
 
     for (const att of attachments.slice(0, 12)) {
       if (!att || typeof att !== 'object') continue
-      const rawUrl = String(att.url || '').trim()
-      if (!rawUrl || !this.relayHttpBase) continue
-      if (!RELAY_UPLOAD_PATH_RE.test(rawUrl)) {
-        this.log.warn?.(`mobile-hub: rejected untrusted attachment URL: ${rawUrl.slice(0, 120)}`)
+      const token = String(att.p2pToken || '').trim()
+      if (!token || !token.startsWith('p2p_')) {
+        this.log.warn?.('mobile-hub: rejected untrusted attachment without valid p2pToken')
         continue
       }
-      if (!this.e2eeKey || !att.e2ee?.iv) {
-        this.log.warn?.(`mobile-hub: rejected unencrypted attachment: ${String(att.filename || '').slice(0, 64)}`)
+      const rec = this.p2pUploads.get(token)
+      if (!rec || now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS || !existsSync(rec.localPath)) {
+        this.p2pUploads.delete(token)
+        this.log.warn?.('mobile-hub: rejected expired or unknown p2pToken')
         continue
       }
-      let localPath = ''
-      try {
-        const isImage = String(att.mimeType || '').toLowerCase().startsWith('image/')
-        // Ephemeral cleanup: consume non-image uploads on relay immediately after PC downloads them
-        const fullUrl = `${this.relayHttpBase}${rawUrl}${isImage ? '' : '?consume=1'}`
-        const headers = { 'X-Bridge-Secret': this.bridgeSecret }
-        if (this.roomId) headers['X-Room-Id'] = this.roomId
-        const timeoutMs = Math.max(45_000, Math.min(600_000, Math.ceil(maxPlainBytes / (256 * 1024)) * 1000))
-        const res = await fetch(fullUrl, { headers, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const declaredLen = Number(res.headers.get('content-length') || 0)
-        if (declaredLen > maxDownloadBytes) {
-          throw new Error(`Attachment exceeds ${maxLabel} limit`)
-        }
-        const rawBase = basename(String(att.filename || 'upload.bin'))
-        const safe = rawBase
-          .replace(/[^a-zA-Z0-9._\u4e00-\u9fa5-]/g, '_')
-          .replace(/^\.+/, '')
-          .slice(0, 100) || 'upload.bin'
-        localPath = join(this.inboundDir, `${Date.now()}-${randomUUID().slice(0, 8)}-${safe}`)
-
-        // Stream-decrypt directly to disk with bounded byte counter (constant ~16MB RAM even for 1GB files)
-        let receivedCipherBytes = 0
-        const boundedSource = (async function* () {
-          if (!res.body) return
-          const reader = res.body.getReader()
-          try {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              if (!value || value.byteLength === 0) continue
-              receivedCipherBytes += value.byteLength
-              if (receivedCipherBytes > maxDownloadBytes) {
-                throw new Error(`Attachment exceeds ${maxLabel} limit`)
-              }
-              yield value
-            }
-          } finally {
-            try { reader.releaseLock() } catch {}
-          }
-        })()
-
-        const ws = createWriteStream(localPath, { mode: 0o600 })
-        let wsError = null
-        ws.on('error', (err) => { wsError = err })
-        const writeChunk = (chunk) =>
-          new Promise((resolveWrite, rejectWrite) => {
-            if (wsError) return rejectWrite(wsError)
-            const ok = ws.write(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
-            if (ok) return resolveWrite()
-            const onDrain = () => {
-              ws.off('error', onErr)
-              resolveWrite()
-            }
-            const onErr = (err) => {
-              ws.off('drain', onDrain)
-              rejectWrite(err)
-            }
-            ws.once('drain', onDrain)
-            ws.once('error', onErr)
-          })
-
-        let totalPlainBytes = 0
-        try {
-          const dec = await decryptAutoStream(this.e2eeKey, boundedSource, {
-            iv: att.e2ee.iv,
-            kid: att.e2ee.kid || '',
-            kind: 'upload',
-            roomId: this.roomId,
-            chunked: Boolean(att.e2ee.chunked),
-            onPlainChunk: async (plainChunk) => {
-              await writeChunk(plainChunk)
-            },
-          })
-          totalPlainBytes = dec.totalPlainBytes
-          if (receivedCipherBytes === 0) {
-            throw new Error('Attachment size invalid (empty)')
-          }
-          await new Promise((resolveEnd, rejectEnd) => {
-            if (wsError) return rejectEnd(wsError)
-            ws.once('error', rejectEnd)
-            ws.end(() => resolveEnd())
-          })
-        } catch (streamErr) {
-          try { ws.destroy() } catch {}
-          await unlinkAsync(localPath).catch(() => {})
-          throw streamErr
-        }
-        try { chmodSync(localPath, 0o600) } catch {}
-        out.push({
-          id: att.id,
-          filename: safe,
-          mimeType: att.mimeType || 'application/octet-stream',
-          size: totalPlainBytes,
-          url: rawUrl,
-          localPath,
-        })
-      } catch (err) {
-        if (localPath) await unlinkAsync(localPath).catch(() => {})
-        this.log.warn?.(`mobile-hub: failed downloading attachment ${att.filename}: ${String(err)}`)
+      if (rec.clientId && callerClientId && rec.clientId !== callerClientId) {
+        this.log.warn?.('mobile-hub: rejected cross-client p2pToken attempt')
+        continue
       }
+      // Single-use token burn on materialization
+      this.p2pUploads.delete(token)
+      out.push({
+        id: att.id || token,
+        filename: rec.filename,
+        mimeType: rec.mimeType,
+        size: rec.size,
+        localPath: rec.localPath,
+      })
     }
     return out
   }
 
-  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, model, provider, reasoningEffort } = {}) {
+  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, model, provider, reasoningEffort, _clientId = '' } = {}) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
-    const materialized = await this.materializeAttachments(attachments)
+    const materialized = await this.materializeAttachments(attachments, { clientId: _clientId })
     const adapter = this.getAdapter(parsed.app)
     const result = await adapter.sendMessage(parsed.sessionId, {
       text,
@@ -720,11 +504,8 @@ export class MultiAppOrchestrator {
     }
     const isDocumentMode = String(mode || '').trim().toLowerCase() === 'document'
     const ALLOWED_MIMES = isDocumentMode ? DOCUMENT_MIMES : IMAGE_MIMES
-    const INLINE_WS_MAX_BYTES = isDocumentMode ? 10 * 1024 * 1024 : 15 * 1024 * 1024
-    const MAX_BYTES = isDocumentMode
-      ? Math.max(1024 * 1024, Number(this.fileLimits?.maxDocumentBytes) || 10 * 1024 * 1024)
-      : Math.max(1024 * 1024, Number(this.fileLimits?.maxImageBytes) || 15 * 1024 * 1024)
-    const MAX_CONCURRENT_DOC_READS = 2
+    const MAX_BYTES = isDocumentMode ? MAX_P2P_DOCUMENT_BYTES : MAX_P2P_IMAGE_BYTES
+    const MAX_CONCURRENT_DOC_READS = 4
 
     let p = String(rawPath || '').trim()
     if (!p) throw new Error(isDocumentMode ? '缺少文件路径' : '缺少图片路径')
@@ -897,37 +678,26 @@ export class MultiAppOrchestrator {
     }
     if (st.size > MAX_BYTES) {
       const actualMb = (st.size / 1024 / 1024).toFixed(1)
-      const limitLabel = this.formatLimitLabel(MAX_BYTES)
+      const limitLabel = isDocumentMode ? '2GB' : '100MB'
       throw new Error(
         isDocumentMode
-          ? `文件大小超出限制（${actualMb}MB / 当前等级最大 ${limitLabel}），请在电脑端直接查看`
-          : `图片文件大小超出限制（${actualMb}MB / 当前等级最大 ${limitLabel}）`,
+          ? `文件大小超出本机安全限制（${actualMb}MB / 最大 ${limitLabel}）`
+          : `图片文件大小超出限制（${actualMb}MB / 最大 ${limitLabel}）`,
       )
     }
 
-    // Large files (> 10MB doc / > 15MB image) stream over zero-knowledge E2EE /api/uploads
-    // instead of Base64-inflating WebSocket frames (prevents WS 32MB limit & memory spikes).
-    if (st.size > INLINE_WS_MAX_BYTES) {
-      if (this._activeDocReads >= MAX_CONCURRENT_DOC_READS) {
-        throw new Error('当前有其他大文件正在传输，请稍后再试')
-      }
-      this._activeDocReads += 1
-      try {
-        const uploaded = await this.uploadLocalFileEncrypted(realPath, st.size)
-        return {
-          ok: true,
-          kind: isDocumentMode ? 'document' : 'image',
-          transferMode: 'upload',
-          uploadUrl: uploaded.uploadUrl,
-          e2ee: uploaded.e2ee,
-          filename: basename(realPath),
-          mimeType: realMimeType,
-          size: st.size,
-          mtimeMs: st.mtimeMs,
-          path: realPath,
-        }
-      } finally {
-        this._activeDocReads = Math.max(0, this._activeDocReads - 1)
+    // Files > 128 KB stream directly peer-to-peer over `aio-bulk` (AIO2 4MB chunked E2EE + 64KB SCTP slices)
+    if (st.size > P2P_INLINE_MAX_BYTES) {
+      return {
+        ok: true,
+        kind: isDocumentMode ? 'document' : 'image',
+        transferMode: 'p2p-bulk',
+        _localRealPath: realPath,
+        filename: basename(realPath),
+        mimeType: realMimeType,
+        size: st.size,
+        mtimeMs: st.mtimeMs,
+        path: realPath,
       }
     }
 
@@ -958,8 +728,8 @@ export class MultiAppOrchestrator {
     }
   }
 
-  /** Unified RPC handler for incoming requests from Relay Server. */
-  async handleRpc(method, params = {}) {
+  /** Unified RPC handler for incoming direct P2P requests. */
+  async handleRpc(method, params = {}, ctx = {}) {
     switch (method) {
       case RPC.BRIDGE_PING:
         return { ok: true, ts: Date.now() }
@@ -980,10 +750,11 @@ export class MultiAppOrchestrator {
       case RPC.SESSION_SEND: {
         const targetId = params.id || makeCompositeId(params.app || APPS.DSH, params.sessionId)
         const parsed = parseCompositeId(targetId)
+        const sendParams = ctx?.clientId ? { ...params, _clientId: ctx.clientId } : params
         if (params.wait === true) {
-          return await this.sendMessage(params)
+          return await this.sendMessage(sendParams)
         }
-        void this.sendMessage(params).catch((err) => {
+        void this.sendMessage(sendParams).catch((err) => {
           const msg = String(err?.message || err)
           this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)
           // Never duplicate adapter-emitted STREAM_ERROR or kill an active stream UI spinner on SESSION_BUSY

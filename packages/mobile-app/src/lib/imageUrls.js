@@ -37,7 +37,7 @@ export function normalizeImageKey(ref) {
     .toLowerCase()
 }
 
-export function resolveImageSrc(item, { baseUrl = '', mediaToken = '' } = {}) {
+export function resolveImageSrc(item) {
   const rawUrl = typeof item === 'string' ? '' : String(item?.url || '').trim()
   const rawPath = typeof item === 'string' ? String(item).trim() : String(item?.path || '').trim()
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
@@ -47,52 +47,16 @@ export function resolveImageSrc(item, { baseUrl = '', mediaToken = '' } = {}) {
     return target
   }
 
-  const cleanBase = String(baseUrl || '').replace(/\/+$/, '')
-
-  // Relay-hosted encrypted uploaded attachment (downloaded via read-only media token `mt`, then decrypted locally)
-  if (target.startsWith('/api/uploads/')) {
-    if (!cleanBase || !mediaToken) return ''
-    const sep = target.includes('?') ? '&' : '?'
-    return `${cleanBase}${target}${sep}mt=${encodeURIComponent(mediaToken)}`
-  }
-
-  // Subpath-mounted relay upload path such as `/dsh/api/uploads/<id>`
-  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(target)) {
-    if (!cleanBase || !mediaToken) return ''
-    try {
-      const origin = new URL(cleanBase).origin
-      const sep = target.includes('?') ? '&' : '?'
-      return `${origin}${target}${sep}mt=${encodeURIComponent(mediaToken)}`
-    } catch {
-      return ''
-    }
-  }
-
-  // External or direct HTTP(S) URL
+  // External direct HTTP(S) URL
   if (/^https?:\/\//i.test(target)) {
-    if (
-      cleanBase &&
-      target.startsWith(cleanBase) &&
-      target.includes('/api/uploads/') &&
-      !target.includes('mt=')
-    ) {
-      if (!mediaToken) return ''
-      const sep = target.includes('?') ? '&' : '?'
-      return `${target}${sep}mt=${encodeURIComponent(mediaToken)}`
-    }
     return target
   }
 
-  // Local PC file paths are exclusively loaded via E2EE RPC.FILE_READ (see e2eeMedia.js)
+  // Local PC file paths are exclusively loaded via P2P E2EE RPC.FILE_READ (see e2eeMedia.js)
   return ''
 }
 
-export function isRelayUploadTarget(target) {
-  const s = String(target || '').trim()
-  if (!s) return false
-  if (s.startsWith('/api/uploads/')) return true
-  if (/^\/[^?#]*\/api\/uploads\/[^/?#]+/i.test(s)) return true
-  if (/^https?:\/\/[^?#]+\/api\/uploads\/[^/?#]+/i.test(s)) return true
+export function isRelayUploadTarget() {
   return false
 }
 

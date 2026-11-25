@@ -81,9 +81,10 @@ export function startStandaloneBridge(options = {}) {
       bridgeId,
       mode,
       e2eeKey,
+      inboundDir: orchestrator.inboundDir,
       log,
-      onRpc: (method, params) => orchestrator.handleRpc(method, params),
-      onTierUpdate: (info) => orchestrator.setTierLimits(info),
+      onRpc: (method, params, ctx) => orchestrator.handleRpc(method, params, ctx),
+      onRegisterP2pUpload: (info) => orchestrator.registerP2pUpload(info),
       onState: (state, detail) => {
         options.onState?.(state, detail)
         if (!options.quiet) {
@@ -112,7 +113,7 @@ export function startStandaloneBridge(options = {}) {
     })
 
   const stop = async () => {
-    link.stop()
+    await link.stop()
     await orchestrator.dispose()
   }
 

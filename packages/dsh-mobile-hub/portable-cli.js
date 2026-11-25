@@ -30,7 +30,7 @@ import {
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const BRIDGE_VERSION = '0.5.9'
+const BRIDGE_VERSION = '1.0.0'
 
 function normalizeServerUrl(raw) {
   const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
@@ -675,9 +675,10 @@ async function main() {
     bridgeId: cfg.bridgeId,
     mode: 'portable',
     e2eeKey: activeE2eeKey,
+    inboundDir: orchestrator.inboundDir,
     log: quietLog,
-    onRpc: (method, params) => orchestrator.handleRpc(method, params),
-    onTierUpdate: (info) => orchestrator.setTierLimits(info),
+    onRpc: (method, params, ctx) => orchestrator.handleRpc(method, params, ctx),
+    onRegisterP2pUpload: (info) => orchestrator.registerP2pUpload(info),
     onState: (state, detail) => {
       if (state === 'connected') {
         if (!connectedOnce) {

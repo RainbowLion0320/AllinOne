@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>All in One WebRTC Worker</title>
+</head>
+<body>
+<script>
+(() => {
+  const api = window.allinoneWebrtcWorker
+  if (!api) return
+
+  /** @type {Map<string, { pc: RTCPeerConnection, ctrl: RTCDataChannel | null, bulk: RTCDataChannel | null, pendingIce: any[] }>} */
+  const peers = new Map()
+
+  const closePeer = (peerId) => {
+    const entry = peers.get(peerId)
+    if (!entry) return
+    peers.delete(peerId)
+    try { entry.ctrl?.close?.() } catch {}
+    try { entry.bulk?.close?.() } catch {}
+    try { entry.pc?.close?.() } catch {}
+  }
+
+  const wireDataChannel = (peerId, entry, dc) => {
+    dc.binaryType = 'arraybuffer'
+    const role = dc.label === 'aio-bulk' ? 'bulk' : dc.label === 'aio-ctrl' ? 'ctrl' : ''
+    if (!role) return
+    if (role === 'ctrl') entry.ctrl = dc
+    else entry.bulk = dc
+
+    dc.onopen = () => {
+      api.sendControl({ type: 'dc.open', peerId, role })
+    }
+    dc.onclose = () => {
+      api.sendControl({ type: 'dc.close', peerId, role })
+    }
+    dc.onerror = (ev) => {
+      api.sendControl({ type: 'dc.error', peerId, role, message: String(ev?.error?.message || ev?.message || 'dc error') })
+    }
+    dc.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        api.sendControl({ type: 'dc.text', peerId, role, data: ev.data })
+      } else if (ev.data instanceof ArrayBuffer) {
+        api.sendBinary(peerId, role, new Uint8Array(ev.data))
+      } else if (ev.data instanceof Blob) {
+        ev.data.arrayBuffer().then((ab) => api.sendBinary(peerId, role, new Uint8Array(ab))).catch(() => {})
+      }
+    }
+    try {
+      dc.bufferedAmountLowThreshold = 512 * 1024
+    } catch {}
+    dc.onbufferedamountlow = () => {
+      api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0 })
+    }
+  }
+
+  api.onCommand(async (cmd) => {
+    const { type, peerId, reqId } = cmd || {}
+    try {
+      if (type === 'peer.offer') {
+        closePeer(peerId)
+        const iceServers = Array.isArray(cmd.iceServers) ? cmd.iceServers : []
+        const pc = new RTCPeerConnection({ iceServers })
+        const entry = { pc, ctrl: null, bulk: null, pendingIce: [] }
+        peers.set(peerId, entry)
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) {
+            api.sendControl({ type: 'ice', peerId, candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate })
+          }
+        }
+        pc.onconnectionstatechange = () => {
+          api.sendControl({ type: 'state', peerId, state: pc.connectionState || pc.iceConnectionState || 'new' })
+        }
+        pc.oniceconnectionstatechange = () => {
+          api.sendControl({ type: 'iceState', peerId, state: pc.iceConnectionState || 'new' })
+        }
+        pc.ondatachannel = (ev) => {
+          wireDataChannel(peerId, entry, ev.channel)
+        }
+
+        await pc.setRemoteDescription({ type: 'offer', sdp: String(cmd.sdp || '') })
+        for (const c of entry.pendingIce) {
+          try { await pc.addIceCandidate(c) } catch {}
+        }
+        entry.pendingIce = []
+
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: answer.sdp } })
+        return
+      }
+
+      if (type === 'peer.ice') {
+        const entry = peers.get(peerId)
+        if (!entry) return
+        if (!entry.pc.remoteDescription) {
+          entry.pendingIce.push(cmd.candidate)
+        } else {
+          await entry.pc.addIceCandidate(cmd.candidate).catch(() => {})
+        }
+        return
+      }
+
+      if (type === 'dc.sendText') {
+        const entry = peers.get(peerId)
+        const dc = cmd.role === 'bulk' ? entry?.bulk : entry?.ctrl
+        if (dc && dc.readyState === 'open') {
+          dc.send(String(cmd.data || ''))
+        }
+        return
+      }
+
+      if (type === 'peer.close') {
+        closePeer(peerId)
+        return
+      }
+
+      if (type === 'peer.closeAll') {
+        for (const id of [...peers.keys()]) closePeer(id)
+        return
+      }
+    } catch (err) {
+      if (reqId) {
+        api.sendControl({ type: 'res', reqId, ok: false, error: String(err?.message || err) })
+      }
+    }
+  })
+
+  api.onBinary((peerId, role, bytes) => {
+    const entry = peers.get(peerId)
+    const dc = role === 'bulk' ? entry?.bulk : entry?.ctrl
+    if (!dc || dc.readyState !== 'open') return
+    try {
+      dc.send(bytes)
+      const buffered = dc.bufferedAmount || 0
+      if (buffered >= 512 * 1024) {
+        api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: buffered })
+      }
+    } catch (err) {
+      api.sendControl({ type: 'dc.error', peerId, role, message: String(err?.message || err) })
+    }
+  })
+
+  api.sendControl({ type: 'worker.ready' })
+})()
+</script>
+</body>
+</html>

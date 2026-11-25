@@ -26,6 +26,7 @@ import { dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
 import { DesktopUpdater } from './updater.js'
+import { DesktopWebRtcProxy } from './webrtc-proxy.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const APP_ROOT = resolve(__dirname, '..')
@@ -165,10 +166,17 @@ const desktopSecretStore = {
   },
 }
 
+const webrtcProxy = new DesktopWebRtcProxy({
+  BrowserWindow,
+  ipcMain,
+  srcDir: __dirname,
+})
+
 const bridgeManager = new DesktopBridgeManager({
   isPackaged: app.isPackaged,
   getAutoLaunch: getAutoLaunchEnabled,
   secretStore: desktopSecretStore,
+  getWebRtcProxyInfo: () => (webrtcProxy.port > 0 ? { port: webrtcProxy.port, token: webrtcProxy.token } : null),
 })
 
 function disposeBridgeOnce() {
@@ -176,6 +184,7 @@ function disposeBridgeOnce() {
   if (!disposePromise) {
     disposePromise = Promise.resolve()
       .then(() => bridgeManager.dispose())
+      .then(() => webrtcProxy.dispose())
       .catch(() => {})
       .finally(() => {
         isDisposed = true
@@ -810,6 +819,13 @@ if (!gotLock) {
       } catch {}
     }
     createMainWindow({ showOnReady: !openedAsHidden })
+
+    // Start local loopback WebRTC proxy (lazy worker window, 0MB idle RAM) before starting embedded bridge
+    try {
+      await webrtcProxy.start()
+    } catch (err) {
+      console.warn('[desktop] WebRTC proxy failed to start (will fall back to werift):', err?.message || err)
+    }
 
     // Immediately resume background bridge if this PC already has an account binding
     void bridgeManager.startFromSavedConfigIfPresent()

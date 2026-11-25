@@ -16,7 +16,6 @@ import {
   adminCreateInvites,
   adminListInvites,
   adminRevokeInvite,
-  adminSetUserTier,
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
@@ -46,11 +45,10 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   const [error, setError] = useState('')
 
   const [count, setCount] = useState(1)
-  const [inviteTier, setInviteTier] = useState('free')
+  const [grantAdmin, setGrantAdmin] = useState(false)
   const [note, setNote] = useState('')
   const [filter, setFilter] = useState('all') // 'all' | 'active' | 'used' | 'revoked'
   const [showUsers, setShowUsers] = useState(false)
-  const [updatingUserId, setUpdatingUserId] = useState('')
   const [copiedKey, setCopiedKey] = useState('')
 
   const currentAdminRoom = useMemo(() => {
@@ -137,31 +135,15 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
     setCreating(true)
     setError('')
     try {
-      await adminCreateInvites(baseUrl, token, { count, note, tier: inviteTier, grantAdmin: inviteTier === 'admin' })
+      await adminCreateInvites(baseUrl, token, { count, note, grantAdmin })
       setNote('')
-      setInviteTier('free')
+      setGrantAdmin(false)
       setFilter('active')
       await loadInvites()
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
       setCreating(false)
-    }
-  }
-
-  const handleSetUserTier = async (u, nextTier) => {
-    if (!baseUrl || !token || !u?.userId || updatingUserId) return
-    const curTier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
-    if (nextTier === curTier) return
-    setUpdatingUserId(u.userId)
-    setError('')
-    try {
-      await adminSetUserTier(baseUrl, token, { userId: u.userId, tier: nextTier })
-      await loadInvites()
-    } catch (err) {
-      setError(String(err?.message || err))
-    } finally {
-      setUpdatingUserId('')
     }
   }
 
@@ -238,7 +220,7 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           </button>
         </div>
 
-        {/* Optional registered users panel with inline tier adjustment */}
+        {/* Optional registered users panel */}
         {showUsers && (
           <div className="mx-4 mt-2.5 max-h-56 overflow-y-auto rounded-2xl border border-slate-200/80 bg-slate-50/80 p-2.5 text-xs dark:border-slate-800 dark:bg-[#14171F]">
             {users.length === 0 ? (
@@ -246,16 +228,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
             ) : (
               <div className="space-y-2">
                 {users.map((u) => {
-                  const curTier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
+                  const isAdm = u.role === 'admin'
                   const isSelf = Boolean(currentAdminRoom && currentAdminRoom === u.userId)
-                  const tierBadgeCls =
-                    curTier === 'admin'
-                      ? 'border-[#4D6BFE]/40 bg-[#4D6BFE]/12 text-[#4D6BFE] dark:text-[#96AEFF]'
-                      : curTier === 'ultra'
-                        ? 'border-amber-400/40 bg-amber-500/12 text-amber-700 dark:text-amber-300'
-                        : curTier === 'pro'
-                          ? 'border-sky-400/40 bg-sky-500/12 text-sky-700 dark:text-sky-300'
-                          : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-300'
                   return (
                     <div key={u.userId} className="flex items-center justify-between gap-2">
                       <div className="min-w-0 flex-1">
@@ -272,18 +246,15 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                           {u.email ? ` · ${u.email}` : ''}
                         </div>
                       </div>
-                      <select
-                        value={curTier}
-                        disabled={isSelf || updatingUserId === u.userId}
-                        onChange={(e) => handleSetUserTier(u, e.target.value)}
-                        aria-label={bi(`调整 @${u.username} 的用户等级`, `Change tier for @${u.username}`)}
-                        className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-semibold outline-none disabled:opacity-60 ${tierBadgeCls}`}
-                      >
-                        <option value="free">Free</option>
-                        <option value="pro">Pro</option>
-                        <option value="ultra">Ultra</option>
-                        <option value="admin">Admin</option>
-                      </select>
+                      {isAdm ? (
+                        <span className="shrink-0 rounded-lg border border-[#4D6BFE]/40 bg-[#4D6BFE]/12 px-2 py-0.5 text-[10.5px] font-semibold text-[#4D6BFE] dark:text-[#96AEFF]">
+                          Admin
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-[10.5px] font-medium text-slate-500 dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-400">
+                          {bi('成员', 'User')}
+                        </span>
+                      )}
                     </div>
                   )
                 })}
@@ -315,16 +286,14 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           </div>
 
           <div className="mt-2 flex items-center justify-between gap-2">
-            <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('用户类型', 'User Tier')}</span>
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">{bi('账号角色', 'Role')}</span>
             <select
-              value={inviteTier}
-              onChange={(e) => setInviteTier(e.target.value)}
+              value={grantAdmin ? 'admin' : 'user'}
+              onChange={(e) => setGrantAdmin(e.target.value === 'admin')}
               className="rounded-xl border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1C1F28] dark:text-slate-100"
             >
-              <option value="free">{bi('普通用户 (1GB/月)', 'Free (1GB/mo)')}</option>
-              <option value="pro">{bi('Pro (5GB/月 · 10倍日额)', 'Pro (5GB/mo · 10x)')}</option>
-              <option value="ultra">{bi('Ultra (不限流)', 'Ultra (Unlimited)')}</option>
-              <option value="admin">{bi('管理员 (不限流)', 'Admin (Unlimited)')}</option>
+              <option value="user">{bi('普通用户 (P2P 直连不限流)', 'Standard User (Direct P2P)')}</option>
+              <option value="admin">{bi('管理员 (Admin)', 'Administrator')}</option>
             </select>
           </div>
 
@@ -416,17 +385,9 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         >
                           {inv.code}
                         </span>
-                        {(inv.tier && inv.tier !== 'free') || inv.grantAdmin ? (
-                          <span
-                            className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
-                              inv.grantAdmin || inv.tier === 'admin'
-                                ? 'bg-[#4D6BFE]/15 text-[#4D6BFE] dark:text-[#96AEFF]'
-                                : inv.tier === 'ultra'
-                                  ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
-                                  : 'bg-sky-500/15 text-sky-600 dark:text-sky-300'
-                            }`}
-                          >
-                            {(inv.grantAdmin ? 'ADMIN' : String(inv.tier || '').toUpperCase())}
+                        {inv.grantAdmin ? (
+                          <span className="rounded-full bg-[#4D6BFE]/15 px-1.5 py-0.5 text-[10px] font-bold text-[#4D6BFE] dark:text-[#96AEFF]">
+                            ADMIN
                           </span>
                         ) : null}
                         <span

@@ -1,8 +1,6 @@
 import http from 'node:http'
-import { randomUUID } from 'node:crypto'
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs'
-import { readFile as readFileAsync, rename as renameAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
-import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
@@ -10,7 +8,7 @@ import { createAccountStore, validateEmail, validatePassword } from './accounts.
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
-import { RelayTrafficGuard, formatBytesShort } from './traffic-guard.js'
+import { createStunServer } from './stun-server.js'
 import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
@@ -18,9 +16,9 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '0.5.9')
+    return String(pkg?.version || '1.0.0')
   } catch {
-    return '0.5.9'
+    return '1.0.0'
   }
 })()
 
@@ -67,19 +65,11 @@ const MIME_TYPES = {
   '.sh': 'text/plain; charset=utf-8',
 }
 
-const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // Free-tier default (15MB); Pro=100MB, Ultra/Admin=1GB via trafficGuard
-const MAX_JSON_UPLOAD_BYTES = 100 * 1024 * 1024 // Cap legacy JSON Base64 uploads to prevent server RAM spikes
-const UPLOAD_CIPHER_OVERHEAD_BYTES = 64 * 1024 // Headroom for AES-GCM tags & AIO2 chunk framing
-const MAX_TOTAL_UPLOAD_BYTES = Math.max(
-  64,
-  Number(process.env.RELAY_MAX_TOTAL_UPLOAD_MB || 2048) || 2048,
-) * 1024 * 1024 // default 2GB total temp upload pool (configurable via RELAY_MAX_TOTAL_UPLOAD_MB)
-const MAX_ROOM_UPLOAD_BYTES = Math.max(
-  16,
-  Number(process.env.RELAY_MAX_ROOM_UPLOAD_MB || 64) || 64,
-) * 1024 * 1024 // default 64MB per-room temp upload quota for free tier (Pro/Ultra scale via trafficGuard)
-const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
-const UPLOAD_CLEANUP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
+const DEFAULT_PUBLIC_STUN_SERVERS = [
+  'stun:stun.miwifi.com:3478',
+  'stun:stun.qq.com:3478',
+  'stun:stun.cloudflare.com:3478',
+]
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 const SANDBOX_PREVIEW_CSP =
@@ -254,14 +244,59 @@ export function createRelayServer(options = {}) {
   const staticDir = resolve(
     options.staticDir ?? (process.env.STATIC_DIR || resolve(__dirname, '../../mobile-app/dist')),
   )
-  const uploadDir = resolve(
-    options.uploadDir ?? (process.env.UPLOAD_DIR || resolve(__dirname, '../data/uploads')),
-  )
   const accountsFile = resolve(
     options.accountsFile ?? (process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json')),
   )
-  mkdirSync(uploadDir, { recursive: true })
-  try { chmodSync(uploadDir, 0o700) } catch {}
+
+  const rawStunPort = options.stunPort ?? process.env.STUN_PORT ?? '3478'
+  const stunDisabled =
+    options.stunEnabled === false ||
+    String(rawStunPort).trim().toLowerCase() === 'false' ||
+    String(rawStunPort).trim().toLowerCase() === 'off' ||
+    String(rawStunPort).trim() === '-1'
+  const stunPort = stunDisabled ? -1 : Number(rawStunPort)
+  const stunHost = String(options.stunHost ?? process.env.STUN_HOST ?? host)
+  const stunServer =
+    !stunDisabled && Number.isInteger(stunPort) && stunPort >= 0
+      ? createStunServer({ port: stunPort, host: stunHost })
+      : null
+
+  function resolveIceServers(req = null) {
+    if (Array.isArray(options.iceServers)) {
+      return options.iceServers
+    }
+    const envIce = String(process.env.ICE_SERVERS || '').trim()
+    if (envIce) {
+      return envIce
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((urls) => ({ urls }))
+    }
+    const urls = []
+    const stunStats = stunServer?.getStats?.()
+    if (stunStats?.enabled && stunStats.port > 0) {
+      let stunPublicHost = ''
+      if (publicRelayUrl) {
+        try {
+          stunPublicHost = new URL(publicRelayUrl).hostname
+        } catch {}
+      }
+      if (!stunPublicHost && req?.headers?.host) {
+        try {
+          stunPublicHost = new URL(`http://${req.headers.host}`).hostname
+        } catch {}
+      }
+      if (stunPublicHost) {
+        const formattedHost = stunPublicHost.includes(':') ? `[${stunPublicHost}]` : stunPublicHost
+        urls.push(`stun:${formattedHost}:${stunStats.port}`)
+      }
+    }
+    for (const fallback of DEFAULT_PUBLIC_STUN_SERVERS) {
+      if (!urls.includes(fallback)) urls.push(fallback)
+    }
+    return urls.map((u) => ({ urls: u }))
+  }
 
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
@@ -379,20 +414,9 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  const defaultTrafficStateFile = join(dirname(accountsFile), 'traffic-usage.json')
-  const rawTgOpts = options.trafficGuard || {}
-  const trafficGuard = new RelayTrafficGuard({
-    ...rawTgOpts,
-    stateFile: rawTgOpts.stateFile === false ? '' : (rawTgOpts.stateFile || defaultTrafficStateFile),
-  })
-  const getRoomTier = (rid) => accounts.getUserTier(rid)
-  const isAdminRoom = (rid) => getRoomTier(rid) === 'admin'
-
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
-    trafficGuard,
-    isAdminRoom,
-    getRoomTier,
+    getIceServers: (req) => resolveIceServers(req),
   })
 
   function isAllowedOrigin(rawOrigin, req) {
@@ -417,147 +441,14 @@ export function createRelayServer(options = {}) {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code, X-Allinone-Encrypted',
+      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code',
     )
   }
-
-  // In-memory index for temporary encrypted uploads (avoids sync readdirSync/readFileSync scans on every POST)
-  /** @type {Map<string, { id: string, binPath: string, metaPath: string, size: number, mtimeMs: number, roomId: string }>} */
-  const uploadIndex = new Map()
-  let uploadTotalBytesCache = 0
-  /** @type {Map<string, number>} */
-  const uploadRoomBytesCache = new Map()
-  const consumedUploadIds = new Set()
-
-  function removeUploadEntry(entry, { deleteDisk = true } = {}) {
-    if (!entry) return
-    const existing = uploadIndex.get(entry.id)
-    if (existing) {
-      uploadIndex.delete(entry.id)
-      uploadTotalBytesCache = Math.max(0, uploadTotalBytesCache - existing.size)
-      if (existing.roomId) {
-        const nextRoom = Math.max(0, (uploadRoomBytesCache.get(existing.roomId) || 0) - existing.size)
-        if (nextRoom <= 0) uploadRoomBytesCache.delete(existing.roomId)
-        else uploadRoomBytesCache.set(existing.roomId, nextRoom)
-      }
-    }
-    if (deleteDisk) {
-      void unlinkAsync(entry.binPath).catch(() => {})
-      void unlinkAsync(entry.metaPath).catch(() => {})
-    }
-  }
-
-  function trackUploadEntry(entry) {
-    if (!entry?.id) return
-    if (uploadIndex.has(entry.id)) {
-      removeUploadEntry(uploadIndex.get(entry.id), { deleteDisk: false })
-    }
-    uploadIndex.set(entry.id, entry)
-    uploadTotalBytesCache += entry.size
-    if (entry.roomId) {
-      uploadRoomBytesCache.set(entry.roomId, (uploadRoomBytesCache.get(entry.roomId) || 0) + entry.size)
-    }
-  }
-
-  // One-time startup scan to populate uploadIndex & prune orphaned/expired temp files
-  function initUploadIndex() {
-    try {
-      const now = Date.now()
-      const cutoff = now - UPLOAD_TTL_MS
-      const files = readdirSync(uploadDir)
-      const binIds = new Set()
-      for (const file of files) {
-        if (file.endsWith('.bin')) binIds.add(file.slice(0, -4))
-      }
-      const discovered = []
-      for (const file of files) {
-        if (file.endsWith('.json')) {
-          const id = file.slice(0, -5)
-          const metaPath = join(uploadDir, file)
-          if (!binIds.has(id)) {
-            void unlinkAsync(metaPath).catch(() => {})
-          }
-          continue
-        }
-        if (!file.endsWith('.bin')) continue
-        const id = file.slice(0, -4)
-        const binPath = join(uploadDir, file)
-        const metaPath = join(uploadDir, `${id}.json`)
-        let st
-        try {
-          st = statSync(binPath)
-        } catch {
-          continue
-        }
-        if (st.mtimeMs < cutoff) {
-          void unlinkAsync(binPath).catch(() => {})
-          void unlinkAsync(metaPath).catch(() => {})
-          continue
-        }
-        let roomId = ''
-        try {
-          if (existsSync(metaPath)) {
-            roomId = String(JSON.parse(readFileSync(metaPath, 'utf8'))?.roomId || '')
-          }
-        } catch {}
-        discovered.push({ id, binPath, metaPath, size: st.size, mtimeMs: st.mtimeMs, roomId })
-      }
-      discovered.sort((a, b) => a.mtimeMs - b.mtimeMs)
-      for (const item of discovered) {
-        trackUploadEntry(item)
-      }
-      pruneUploadsForQuota(0, '')
-    } catch {}
-  }
-
-  // Fast O(k) in-memory quota & TTL eviction (zero sync filesystem scans on upload hot path)
-  function pruneUploadsForQuota(incomingBytes = 0, targetRoomId = '', roomMaxBytes = MAX_ROOM_UPLOAD_BYTES) {
-    try {
-      const now = Date.now()
-      const cutoff = now - UPLOAD_TTL_MS
-      const effectiveRoomQuota = Math.max(roomMaxBytes || MAX_ROOM_UPLOAD_BYTES, incomingBytes)
-      const effectiveGlobalQuota = Math.max(MAX_TOTAL_UPLOAD_BYTES, incomingBytes)
-      // 1. Evict expired entries (Map preserves oldest-first insertion order)
-      for (const entry of [...uploadIndex.values()]) {
-        if (entry.mtimeMs < cutoff) {
-          removeUploadEntry(entry, { deleteDisk: true })
-        }
-      }
-      // 2. Enforce per-room disk quota
-      if (targetRoomId && (uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes > effectiveRoomQuota) {
-        for (const entry of [...uploadIndex.values()]) {
-          if (entry.roomId !== targetRoomId) continue
-          if ((uploadRoomBytesCache.get(targetRoomId) || 0) + incomingBytes <= effectiveRoomQuota) break
-          removeUploadEntry(entry, { deleteDisk: true })
-        }
-      }
-      // 3. Enforce global disk quota
-      if (uploadTotalBytesCache + incomingBytes > effectiveGlobalQuota) {
-        for (const entry of [...uploadIndex.values()]) {
-          if (uploadTotalBytesCache + incomingBytes <= effectiveGlobalQuota) break
-          removeUploadEntry(entry, { deleteDisk: true })
-        }
-      }
-    } catch {}
-  }
-
-  initUploadIndex()
-
-  const cleanupTimer = setInterval(() => {
-    pruneUploadsForQuota(0, '')
-  }, UPLOAD_CLEANUP_INTERVAL_MS)
-  cleanupTimer.unref()
 
   function extractBearer(req) {
     const header = req.headers.authorization || ''
     if (header.startsWith('Bearer ')) return header.slice(7).trim()
     return ''
-  }
-
-  function extractMediaToken(req, urlObj) {
-    const headerTok = extractBearer(req)
-    if (headerTok) return headerTok
-    return String(urlObj.searchParams.get('mt') || '').trim()
   }
 
   function getClientIp(req) {
@@ -1532,8 +1423,8 @@ export function createRelayServer(options = {}) {
       const payload = requireAdmin(req, res)
       if (!payload) return
       const serverHealth = collectServerHealth({
-        uploadDir,
         mailer,
+        stun: stunServer?.getStats?.() || null,
         registerInviteGated: true,
         startedAt,
         version: RELAY_VERSION,
@@ -1623,45 +1514,6 @@ export function createRelayServer(options = {}) {
           roomId: revoked.roomId,
           tokenVersion: revoked.tokenVersion,
           disconnectedClients,
-        })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin Monitor: Update a user's tier (free | pro | ultra | admin) in real time
-    if (pathname === '/api/admin/users/set-tier' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.userId || body.roomId || '').trim()
-        const targetTier = String(body.tier || body.plan || '').trim().toLowerCase()
-        if (!targetRoom.startsWith('usr_') || !targetTier) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户或等级参数' })
-          return
-        }
-        const updated = accounts.setUserTier(targetRoom, targetTier, { actorUserId: payload.room })
-        if (!updated.ok) {
-          sendJson(res, updated.error === '用户不存在' ? 404 : 400, { ok: false, error: updated.error })
-          return
-        }
-        hub.notifyRoomTierChanged(targetRoom)
-        hub.recordActivity({
-          type: 'admin.tier',
-          roomId: targetRoom,
-          label: updated.user ? `@${updated.user.username}` : targetRoom,
-          detail: `Tier ${updated.prevTier} -> ${updated.tier} (by ${payload.uname ? `@${payload.uname}` : 'admin'})`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, {
-          ok: true,
-          prevTier: updated.prevTier,
-          tier: updated.tier,
-          user: updated.user,
-          fileLimits: hub.getRoomFileLimits(targetRoom),
-          traffic: hub.getRoomStats(targetRoom).traffic || null,
         })
       } catch {
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
@@ -1903,18 +1755,6 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Issue a 15-minute read-only scoped media token for downloading encrypted `/api/uploads/:id` ciphertext
-    if (pathname === '/api/auth/media-token' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
-      if (!payload) {
-        sendJson(res, 401, { ok: false, error: '登录已失效' })
-        return
-      }
-      const { mediaToken, expiresAt } = auth.signMediaToken(payload)
-      sendJson(res, 200, { ok: true, mediaToken, expiresAt })
-      return
-    }
-
     // Verify existing session token
     if (pathname === '/api/auth/me' && req.method === 'GET') {
       const payload = auth.verifySessionToken(extractBearer(req))
@@ -1939,342 +1779,13 @@ export function createRelayServer(options = {}) {
         loginEmail2fa: Boolean(acctUser.loginEmail2fa),
         emailEnabled: mailer.isConfigured(),
         role: acctUser.role,
-        plan: acctUser.plan || 'free',
-        tier: acctUser.tier || (acctUser.role === 'admin' ? 'admin' : 'free'),
-        fileLimits: hub.getRoomFileLimits(payload.room),
-        traffic: hub.getRoomStats(payload.room).traffic || null,
+        mode: 'p2p-only',
+        iceServers: resolveIceServers(req),
         label: `@${acctUser.username}`,
         devices: getMergedAccountDevices(payload.room, bridges),
         bridges,
         clientSessions,
       })
-      return
-    }
-
-    // Encrypted attachment upload (strictly requires E2EE ciphertext scoped to caller's account roomId)
-    // Supports BOTH client JWTs and PC Bridge credentials, and BOTH zero-OOM binary streaming (`application/octet-stream`)
-    // and legacy JSON Base64 payloads for backward compatibility.
-    if (pathname === '/api/uploads' && req.method === 'POST') {
-      const bridgeRoom = authenticateBridge(req, urlObj)
-      const payload = bridgeRoom ? null : auth.verifySessionToken(extractBearer(req))
-      const ownerRoom = bridgeRoom || payload?.room || ''
-      if (!ownerRoom) {
-        sendJson(res, 401, { ok: false, error: '未授权' })
-        return
-      }
-      const ownerTier = getRoomTier(ownerRoom)
-      const tierLimits = trafficGuard.getLimitsForTier(ownerTier)
-      const maxPlainBytes = Math.max(1024 * 1024, tierLimits.maxUploadBytes || MAX_UPLOAD_BYTES)
-      const maxCipherBytes = maxPlainBytes + UPLOAD_CIPHER_OVERHEAD_BYTES
-      const maxLabel = formatBytesShort(maxPlainBytes)
-      const contentType = String(req.headers['content-type'] || '').toLowerCase()
-      const isRawBinary = contentType.startsWith('application/octet-stream')
-
-      try {
-        const id = randomUUID()
-        const binPath = join(uploadDir, `${id}.bin`)
-        const metaPath = join(uploadDir, `${id}.json`)
-        let finalSize = 0
-
-        if (isRawBinary) {
-          if (String(req.headers['x-allinone-encrypted'] || '').trim() !== '1') {
-            sendJson(res, 400, {
-              ok: false,
-              code: 'E2EE_UPLOAD_REQUIRED',
-              error: '附件必须先经过端到端加密再上传',
-            })
-            return
-          }
-          const declaredLen = Number(req.headers['content-length'] || 0)
-          if (Number.isFinite(declaredLen) && declaredLen > maxCipherBytes) {
-            sendJson(res, 413, {
-              ok: false,
-              code: 'FILE_TOO_LARGE',
-              maxBytes: maxPlainBytes,
-              error: `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`,
-            })
-            return
-          }
-
-          const partPath = `${binPath}.part`
-          const streamResult = await new Promise((resolveStream, rejectStream) => {
-            const ws = createWriteStream(partPath, { mode: 0o600 })
-            let received = 0
-            let settled = false
-            const fail = (err) => {
-              if (settled) return
-              settled = true
-              try { ws.destroy() } catch {}
-              rejectStream(err)
-            }
-            req.on('data', (chunk) => {
-              if (settled) return
-              received += chunk.length
-              if (received > maxCipherBytes) {
-                const err = new Error(`文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`)
-                err.statusCode = 413
-                err.code = 'FILE_TOO_LARGE'
-                req.pause()
-                fail(err)
-                return
-              }
-              if (!ws.write(chunk)) {
-                req.pause()
-                ws.once('drain', () => {
-                  if (!settled) req.resume()
-                })
-              }
-            })
-            req.on('end', () => {
-              if (settled) return
-              ws.end()
-            })
-            req.on('aborted', () => fail(new Error('上传连接已中断')))
-            req.on('error', fail)
-            ws.on('error', fail)
-            ws.on('finish', () => {
-              if (settled) return
-              settled = true
-              resolveStream({ size: received })
-            })
-          }).catch(async (err) => {
-            await unlinkAsync(partPath).catch(() => {})
-            throw err
-          })
-
-          finalSize = streamResult.size
-          if (finalSize <= 0) {
-            await unlinkAsync(partPath).catch(() => {})
-            sendJson(res, 400, { ok: false, error: '上传文件为空' })
-            return
-          }
-          const tCheck = trafficGuard.consumeUploadPost(ownerRoom, finalSize, {
-            tier: ownerTier,
-          })
-          if (!tCheck.allowed) {
-            await unlinkAsync(partPath).catch(() => {})
-            hub.recordActivity({
-              type: 'traffic.throttled',
-              roomId: ownerRoom,
-              label: 'upload:post',
-              detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(finalSize / 1024)}KB)`,
-              ip: getClientIp(req),
-            })
-            res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
-            sendJson(res, 429, {
-              ok: false,
-              code: tCheck.code,
-              retryAfterSec: tCheck.retryAfterSec || 60,
-              error: tCheck.message,
-            })
-            return
-          }
-          pruneUploadsForQuota(finalSize, ownerRoom, tierLimits.maxRoomTempUploadBytes)
-          try {
-            await renameAsync(partPath, binPath)
-          } catch (mvErr) {
-            await unlinkAsync(partPath).catch(() => {})
-            throw mvErr
-          }
-        } else {
-          const jsonPlainCap = Math.min(maxPlainBytes, MAX_JSON_UPLOAD_BYTES)
-          const body = await readJsonBody(req, Math.ceil((jsonPlainCap + UPLOAD_CIPHER_OVERHEAD_BYTES) * 1.45))
-          if (body.encrypted !== true) {
-            sendJson(res, 400, {
-              ok: false,
-              code: 'E2EE_UPLOAD_REQUIRED',
-              error: '附件必须先经过端到端加密再上传',
-            })
-            return
-          }
-          const rawBase64 = String(body.dataBase64 || '')
-          const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',').pop() : rawBase64
-          const buf = Buffer.from(cleanBase64, 'base64')
-          if (buf.length === 0) {
-            sendJson(res, 400, { ok: false, error: '上传文件为空' })
-            return
-          }
-          if (buf.length > maxCipherBytes) {
-            sendJson(res, 413, {
-              ok: false,
-              code: 'FILE_TOO_LARGE',
-              maxBytes: maxPlainBytes,
-              error: `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`,
-            })
-            return
-          }
-          finalSize = buf.length
-          const tCheck = trafficGuard.consumeUploadPost(ownerRoom, finalSize, {
-            tier: ownerTier,
-          })
-          if (!tCheck.allowed) {
-            hub.recordActivity({
-              type: 'traffic.throttled',
-              roomId: ownerRoom,
-              label: 'upload:post',
-              detail: `${tCheck.code}${tCheck.quotaWindow ? `/${tCheck.quotaWindow}` : ''} [${ownerTier}] (${Math.round(finalSize / 1024)}KB)`,
-              ip: getClientIp(req),
-            })
-            res.setHeader('Retry-After', String(tCheck.retryAfterSec || 60))
-            sendJson(res, 429, {
-              ok: false,
-              code: tCheck.code,
-              retryAfterSec: tCheck.retryAfterSec || 60,
-              error: tCheck.message,
-            })
-            return
-          }
-          pruneUploadsForQuota(finalSize, ownerRoom, tierLimits.maxRoomTempUploadBytes)
-          await writeFileAsync(binPath, buf, { mode: 0o600 })
-        }
-
-        const meta = {
-          id,
-          roomId: ownerRoom,
-          filename: 'encrypted.bin',
-          mimeType: 'application/octet-stream',
-          encrypted: true,
-          size: finalSize,
-          createdAt: Date.now(),
-        }
-        try {
-          await writeFileAsync(metaPath, JSON.stringify(meta), { mode: 0o600 })
-        } catch (metaErr) {
-          await unlinkAsync(binPath).catch(() => {})
-          throw metaErr
-        }
-        trackUploadEntry({
-          id,
-          binPath,
-          metaPath,
-          size: finalSize,
-          mtimeMs: meta.createdAt,
-          roomId: ownerRoom,
-        })
-        sendJson(res, 200, {
-          ok: true,
-          upload: {
-            id: meta.id,
-            filename: meta.filename,
-            mimeType: meta.mimeType,
-            encrypted: true,
-            size: meta.size,
-            createdAt: meta.createdAt,
-            url: `/api/uploads/${id}`,
-          },
-        })
-      } catch (err) {
-        const statusCode = err?.statusCode === 413 || err?.message === 'Body too large' ? 413 : 400
-        sendJson(res, statusCode, {
-          ok: false,
-          ...(err?.code ? { code: err.code } : {}),
-          error:
-            statusCode === 413
-              ? `文件过大，当前等级（${ownerTier.toUpperCase()}）单文件上限为 ${maxLabel}`
-              : `上传失败：${String(err.message || err)}`,
-        })
-      }
-      return
-    }
-
-    // Encrypted attachment download (strictly isolated to the owning account roomId)
-    if (pathname.startsWith('/api/uploads/') && req.method === 'GET') {
-      const bridgeRoom = authenticateBridge(req, urlObj)
-      const clientUser = bridgeRoom ? null : auth.verifyMediaToken(extractMediaToken(req, urlObj))
-      const callerRoom = bridgeRoom || clientUser?.room || null
-      if (!callerRoom) {
-        sendJson(res, 401, { ok: false, error: '未授权' })
-        return
-      }
-      const id = pathname.slice('/api/uploads/'.length).replace(/[^a-zA-Z0-9-]/g, '')
-      const binPath = join(uploadDir, `${id}.bin`)
-      const metaPath = join(uploadDir, `${id}.json`)
-      if (!id || consumedUploadIds.has(id)) {
-        sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
-        return
-      }
-      let indexed = uploadIndex.get(id)
-      let fileRoom = indexed?.roomId || ''
-      let fileSize = indexed?.size || 0
-      if (!indexed) {
-        try {
-          const [metaRaw, st] = await Promise.all([readFileAsync(metaPath, 'utf8'), statAsync(binPath)])
-          const meta = JSON.parse(metaRaw)
-          fileRoom = String(meta?.roomId || '')
-          fileSize = st.size
-        } catch {
-          sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
-          return
-        }
-      } else {
-        try {
-          const st = await statAsync(binPath)
-          fileSize = st.size
-        } catch {
-          removeUploadEntry(indexed, { deleteDisk: false })
-          sendJson(res, 404, { ok: false, error: '文件不存在或已过期' })
-          return
-        }
-      }
-      if (!fileRoom || fileRoom !== callerRoom) {
-        sendJson(res, 403, { ok: false, error: '无权访问其他账号的文件' })
-        return
-      }
-      const callerTier = getRoomTier(callerRoom)
-      const dlCheck = trafficGuard.consumeUploadGet(callerRoom, fileSize, {
-        tier: callerTier,
-      })
-      if (!dlCheck.allowed) {
-        hub.recordActivity({
-          type: 'traffic.throttled',
-          roomId: callerRoom,
-          label: 'upload:get',
-          detail: `${dlCheck.code}${dlCheck.quotaWindow ? `/${dlCheck.quotaWindow}` : ''} [${callerTier}] (${Math.round(fileSize / 1024)}KB)`,
-          ip: getClientIp(req),
-        })
-        res.setHeader('Retry-After', String(dlCheck.retryAfterSec || 300))
-        sendJson(res, 429, {
-          ok: false,
-          code: dlCheck.code,
-          retryAfterSec: dlCheck.retryAfterSec || 300,
-          error: dlCheck.message,
-        })
-        return
-      }
-      const shouldConsume = urlObj.searchParams.get('consume') === '1'
-      if (shouldConsume) {
-        consumedUploadIds.add(id)
-        if (consumedUploadIds.size > 1000) {
-          const oldestId = consumedUploadIds.values().next().value
-          if (oldestId) consumedUploadIds.delete(oldestId)
-        }
-      }
-      res.writeHead(200, {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': fileSize,
-        'Content-Disposition': `attachment; filename*=UTF-8''encrypted.bin`,
-        'Cache-Control': 'private, no-store',
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "default-src 'none'; sandbox",
-      })
-      const stream = createReadStream(binPath)
-      const cleanupConsumed = () => {
-        if (!shouldConsume) return
-        if (indexed) {
-          removeUploadEntry(indexed, { deleteDisk: true })
-        } else {
-          void unlinkAsync(binPath).catch(() => {})
-          void unlinkAsync(metaPath).catch(() => {})
-        }
-      }
-      stream.on('error', () => {
-        try { res.destroy() } catch {}
-      })
-      stream.on('end', cleanupConsumed)
-      res.on('close', () => {
-        if (!stream.destroyed) stream.destroy()
-      })
-      stream.pipe(res)
       return
     }
 
@@ -2419,10 +1930,10 @@ export function createRelayServer(options = {}) {
     }
   })
 
-  // WebSocket server handling both /ws/bridge and /ws/client (32MB supports high-res PC screenshots)
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 })
+  // Pure Control-Plane WebSocket server (strictly capped at 256 KB — zero data-plane relay)
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 })
   wss.on('error', (err) => {
-    console.warn('[relay] WebSocketServer error:', err?.message || err)
+    console.warn('[control] WebSocketServer error:', err?.message || err)
   })
 
   server.on('upgrade', (req, socket, head) => {
@@ -2474,7 +1985,7 @@ export function createRelayServer(options = {}) {
         ip: getClientIp(req),
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
-        hub.registerBridge(ws, meta)
+        hub.registerBridge(ws, meta, { req })
       })
       return
     }
@@ -2494,7 +2005,6 @@ export function createRelayServer(options = {}) {
         socket.destroy()
         return
       }
-      const lastSeq = Number(urlObj.searchParams.get('lastSeq') || 0)
       const clientIp = getClientIp(req)
       const clientUa = String(req.headers['user-agent'] || '')
       const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
@@ -2505,10 +2015,10 @@ export function createRelayServer(options = {}) {
           ip: clientIp,
         })
       } catch (err) {
-        console.warn('[relay] Failed to persist touchUserSession on WS upgrade:', err?.message || err)
+        console.warn('[control] Failed to persist touchUserSession on WS upgrade:', err?.message || err)
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
-        hub.registerClient(ws, user, { lastSeq, ip: clientIp, userAgent: clientUa })
+        hub.registerClient(ws, user, { ip: clientIp, userAgent: clientUa, req })
       })
       return
     }
@@ -2517,34 +2027,49 @@ export function createRelayServer(options = {}) {
     socket.destroy()
   })
 
-  const start = () =>
-    new Promise((resolveStart) => {
+  const start = async () => {
+    let stunInfo = { enabled: false, port: 0 }
+    if (stunServer) {
+      try {
+        const bound = await stunServer.start()
+        stunInfo = { enabled: true, port: bound.port }
+      } catch (err) {
+        console.warn(`[stun] Could not bind UDP ${stunPort} (${err?.message || err}); continuing with public STUN fallbacks`)
+      }
+    }
+    return await new Promise((resolveStart) => {
       server.listen(port, host, () => {
         const addr = server.address()
         const boundPort = typeof addr === 'object' && addr ? addr.port : port
-        console.log(`[relay] AllinOne Relay Server listening on http://${host}:${boundPort}`)
-        console.log(`[relay] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
-        console.log(`[relay] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
-        console.log(`[relay] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
-        if (jwtSecret.length < 16) {
-          console.warn('[relay] WARNING: JWT_SECRET is not set — using an ephemeral random signing key (sessions will reset on restart). Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
+        console.log(`[control] AllinOne Control Server (v${RELAY_VERSION}, pure P2P signaling) listening on http://${host}:${boundPort}`)
+        if (stunInfo.enabled) {
+          console.log(`[stun] Stateless RFC 5389 STUN listening on udp://${stunHost}:${stunInfo.port}`)
         }
-        resolveStart({ port: boundPort, host })
+        console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
+        console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
+        console.log(`[control] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
+        if (jwtSecret.length < 16) {
+          console.warn('[control] WARNING: JWT_SECRET is not set — using an ephemeral random signing key. Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
+        }
+        resolveStart({ port: boundPort, host, stunPort: stunInfo.port })
       })
     })
+  }
 
-  const close = () =>
-    new Promise((resolveClose) => {
-      clearInterval(cleanupTimer)
-      accounts.flush()
-      trafficGuard.flush()
-      hub.shutdown()
+  const close = async () => {
+    accounts.flush()
+    hub.shutdown()
+    if (stunServer) {
+      try { await stunServer.close() } catch {}
+    }
+    await new Promise((resolveClose) => {
       wss.close(() => {
         server.close(() => resolveClose())
       })
     })
+  }
 
-  return { server, wss, hub, accounts, mailer, trafficGuard, start, close }
+  return { server, wss, hub, accounts, mailer, stunServer, start, close }
 }
 
 // Run directly when invoked as main script

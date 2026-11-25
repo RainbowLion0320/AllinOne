@@ -7,12 +7,14 @@ import {
   Lock,
   Menu,
   QrCode,
+  RefreshCw,
   ScanLine,
   ShieldCheck,
   Smartphone,
   SquarePen,
   WifiOff,
   X,
+  Zap,
 } from 'lucide-react'
 import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
@@ -25,7 +27,6 @@ import {
   probeDeviceStatus,
   removeAccountDevice,
   renameAccountDevice,
-  requestMediaToken,
   revokeAuthSession,
   revokeDeviceSessions,
   revokeOtherAuthSessions,
@@ -107,6 +108,9 @@ export function App() {
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [connState, setConnState] = useState('disconnected')
   const [connError, setConnError] = useState('')
+  const [p2pState, setP2pState] = useState('idle')
+  const [p2pError, setP2pError] = useState('')
+  const [p2pEngine, setP2pEngine] = useState('')
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
   const [clientSessions, setClientSessions] = useState({
@@ -121,7 +125,6 @@ export function App() {
   const [pendingGrantPopup, setPendingGrantPopup] = useState(null)
   const [qrNudge, setQrNudge] = useState(null)
   const [phoneGuideDismissed, setPhoneGuideDismissed] = useState(false)
-  const [mediaAuth, setMediaAuth] = useState({ deviceId: '', mediaToken: '' })
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
@@ -619,53 +622,6 @@ export function App() {
     return { name: parts[parts.length - 1] || selectedDraftCwd, path: selectedDraftCwd }
   }, [selectedDraftCwd, effectiveWorkspaces])
 
-  // Mint and auto-refresh a short-lived 15-min read-only media token so the 30-day master JWT never appears in image URLs
-  useEffect(() => {
-    if (
-      !activeDevice?.id ||
-      !activeDevice?.baseUrl ||
-      !activeDevice?.token ||
-      connState === 'unauthorized' ||
-      connState === 'error'
-    ) {
-      setMediaAuth({ deviceId: '', mediaToken: '' })
-      return
-    }
-    let cancelled = false
-    let expiresAt = 0
-    const deviceId = activeDevice.id
-    const baseUrl = activeDevice.baseUrl
-    const token = activeDevice.token
-
-    const refresh = () => {
-      requestMediaToken(baseUrl, token)
-        .then((res) => {
-          if (cancelled) return
-          expiresAt = res.expiresAt || 0
-          setMediaAuth({
-            deviceId,
-            mediaToken: res.mediaToken || '',
-          })
-        })
-        .catch(() => {})
-    }
-
-    const onWake = () => {
-      if (document.visibilityState === 'visible' && (!expiresAt || Date.now() > expiresAt - 5 * 60 * 1000)) {
-        refresh()
-      }
-    }
-
-    refresh()
-    const timer = setInterval(refresh, 10 * 60 * 1000)
-    document.addEventListener('visibilitychange', onWake)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-      document.removeEventListener('visibilitychange', onWake)
-    }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, connState])
-
   const activeBridgeE2ee = useMemo(() => {
     const raw = activeBridge?.e2ee || null
     const enabled = Boolean(raw?.enabled && raw?.keyId)
@@ -761,7 +717,6 @@ export function App() {
   }, [activeDevice?.e2eeKeys])
 
   const imageContext = useMemo(() => {
-    const matched = mediaAuth.deviceId === activeDevice?.id
     const localBridgeId = String(desktopBridge?.bridgeId || '').trim()
     const isLocalDesktopBridge = Boolean(
       desktopApi &&
@@ -772,10 +727,10 @@ export function App() {
     return {
       baseUrl: activeDevice?.baseUrl || '',
       roomId: activeDevice?.roomId || '',
-      mediaToken: matched ? mediaAuth.mediaToken : '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       client: clientRef.current,
+      p2pState,
       e2eeKey: activeBridgeE2ee.matchedKey,
       e2eeKeyId: activeBridgeE2ee.keyId,
       e2eeKeys: activeDevice?.e2eeKeys || {},
@@ -790,10 +745,9 @@ export function App() {
     activeDevice?.baseUrl,
     activeDevice?.roomId,
     activeDevice?.e2eeKeys,
-    mediaAuth.deviceId,
-    mediaAuth.mediaToken,
     activeSession?.cwd,
     activeBridgeId,
+    p2pState,
     activeBridgeE2ee.matchedKey,
     activeBridgeE2ee.keyId,
     desktopApi,
@@ -1295,6 +1249,9 @@ export function App() {
     if (!activeDevice?.id || !activeDevice?.baseUrl || !initialToken) {
       setConnState('disconnected')
       setConnError('')
+      setP2pState('idle')
+      setP2pError('')
+      setP2pEngine('')
       setBridges([])
       setAccountDevices([])
       setClientSessions({
@@ -1309,6 +1266,9 @@ export function App() {
     }
 
     setConnError('')
+    setP2pState('idle')
+    setP2pError('')
+    setP2pEngine('')
     setBridges([])
     setAccountDevices([])
     setClientSessions({
@@ -1331,10 +1291,13 @@ export function App() {
     setQrNudge(null)
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ }) => {
+    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ, p2pState: nextP2p, p2pError: nextP2pErr, p2pEngine: nextP2pEngine }) => {
       if (clientRef.current !== client) return
       setConnState(state)
       setConnError(error || '')
+      setP2pState(nextP2p || 'idle')
+      setP2pError(nextP2pErr || '')
+      setP2pEngine(nextP2pEngine || '')
       setBridges(bList || [])
       if (Array.isArray(dList)) setAccountDevices(dList)
       if (typeof occ === 'number') setLiveOnlineClientCount(occ)
@@ -2408,6 +2371,8 @@ export function App() {
     if (connState === 'error') return `${activeDeviceName} · ${bi('连接已断开', 'Disconnected')}`
     if (connState !== 'connected') return `${activeDeviceName} · ${t('common.connecting')}`
     if (!bridgeOnline) return `${activeDeviceName} · ${t('common.offline')}`
+    if (!e2eeLocked && p2pState === 'failed') return `${activeDeviceName} · ${bi('P2P 直连受限', 'P2P Blocked')}`
+    if (!e2eeLocked && p2pState === 'connecting') return `${activeDeviceName} · ${bi('正在建立 P2P 直连...', 'Connecting P2P...')}`
     if (hasMultipleTargets) {
       return currentWorkspaceLabel
         ? `${activeDeviceName} · ${currentWorkspaceLabel}`
@@ -2493,7 +2458,11 @@ export function App() {
                     connState === 'unauthorized' || connState === 'error'
                       ? 'bg-rose-500'
                       : connState === 'connected' && bridgeOnline
-                        ? 'bg-emerald-500'
+                        ? !e2eeLocked && p2pState === 'failed'
+                          ? 'bg-rose-500'
+                          : !e2eeLocked && p2pState === 'connecting'
+                            ? 'bg-amber-400 animate-pulse'
+                            : 'bg-emerald-500'
                         : connState === 'connecting'
                           ? 'bg-amber-400'
                           : 'bg-rose-400'
@@ -2502,6 +2471,18 @@ export function App() {
                 <span className="truncate">{headerSubtitle}</span>
                 <ChevronDown className="h-3 w-3 shrink-0 opacity-65" />
               </button>
+              {connState === 'connected' && bridgeOnline && !e2eeLocked && p2pState === 'connected' && (
+                <span
+                  title={bi(
+                    `WebRTC 端到端 P2P 直连（0 服务器流量${p2pEngine ? ` · ${p2pEngine}` : ''}）`,
+                    `Direct WebRTC P2P connection (0 server relay traffic${p2pEngine ? ` · ${p2pEngine}` : ''})`,
+                  )}
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
+                >
+                  <Zap className="h-2.5 w-2.5" />
+                  <span>P2P</span>
+                </span>
+              )}
               {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && (
                 <button
                   type="button"
@@ -2591,7 +2572,7 @@ export function App() {
         </div>
       )}
 
-      {/* Offline warning bar if relay connected but target PC bridge offline */}
+      {/* Offline warning bar if control server connected but target PC bridge offline */}
       {connState === 'connected' && !bridgeOnline && (
         <div className="flex flex-wrap items-center justify-center gap-2 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <WifiOff className="h-3.5 w-3.5 shrink-0" />
@@ -2607,6 +2588,29 @@ export function App() {
           >
             <ArrowLeftRight className="h-3 w-3" />
             <span>{accountDevices.length === 0 ? bi('绑定', 'Link') : t('common.switch')}</span>
+          </button>
+        </div>
+      )}
+
+      {/* Honest P2P unreachable banner when strict UDP firewall blocks direct NAT traversal (0 server relay fallback) */}
+      {connState === 'connected' && bridgeOnline && !e2eeLocked && p2pState === 'failed' && (
+        <div className="flex flex-wrap items-center justify-center gap-2 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
+          <WifiOff className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            {p2pError || bi('P2P 直连受当前网络防火墙限制，请切换 Wi-Fi / 5G 后重试', 'Direct P2P blocked by network firewall. Switch Wi-Fi / 5G and retry.')}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              void clientRef.current
+                ?.retryP2p(activeBridgeId)
+                ?.then(() => loadWorkspaceData(activeBridgeId))
+                .catch(() => {})
+            }}
+            className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
+          >
+            <RefreshCw className="h-3 w-3" />
+            <span>{bi('重试直连', 'Retry P2P')}</span>
           </button>
         </div>
       )}
@@ -2899,7 +2903,7 @@ export function App() {
           }
         }}
         imageContext={imageContext}
-        onUploadFile={(file) => clientRef.current?.uploadFile(file)}
+        onUploadFile={(file) => clientRef.current?.uploadFile(file, { bridgeId: activeBridgeId })}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
         onError={showToast}

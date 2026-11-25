@@ -10,14 +10,25 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import dgram from 'node:dgram'
 import http from 'node:http'
 import net from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
+import { RTCIceCandidate, RTCPeerConnection } from 'werift'
 import { createRelayServer } from '../packages/relay-server/src/index.js'
-import { RelayTrafficGuard } from '../packages/relay-server/src/traffic-guard.js'
+import {
+  BULK_FLAG_EOF,
+  BULK_SLICE_BYTES,
+  P2P_BULK_LABEL,
+  P2P_CTRL_LABEL,
+  createCtrlCodec,
+  decodeBulkFrame,
+  encodeBulkFrame,
+  sendWithBackpressure,
+} from '../packages/shared/src/p2p-mux.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
 import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
@@ -61,6 +72,7 @@ import {
   bytesToBase64,
   computeE2eeKeyId,
   computeGrantPubKeyFp,
+  decryptAutoStream,
   decryptBytes,
   decryptGrantPayload,
   decryptJson,
@@ -68,6 +80,7 @@ import {
   encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
   encryptBytes,
+  encryptChunkedBytes,
   encryptGrantPayload,
   encryptJson,
   formatE2eeFingerprint,
@@ -136,6 +149,57 @@ import {
 const TEST_BOOTSTRAP_TOKEN = 'smoke-bootstrap-token-123'
 const SMOKE_ADMIN_PASS = 'SmokeAdminPass99!'
 
+function createSmokeByteQueue() {
+  const chunks = []
+  let waiter = null
+  let ended = false
+  let error = null
+  return {
+    push(u8) {
+      if (ended || error || !u8?.byteLength) return
+      if (waiter) {
+        const w = waiter
+        waiter = null
+        w.resolve({ value: u8, done: false })
+      } else {
+        chunks.push(u8)
+      }
+    },
+    end() {
+      if (ended || error) return
+      ended = true
+      if (waiter) {
+        const w = waiter
+        waiter = null
+        w.resolve({ value: undefined, done: true })
+      }
+    },
+    fail(err) {
+      if (ended || error) return
+      error = err || new Error('aborted')
+      if (waiter) {
+        const w = waiter
+        waiter = null
+        w.reject(error)
+      }
+    },
+    iterable: {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            if (chunks.length > 0) return Promise.resolve({ value: chunks.shift(), done: false })
+            if (error) return Promise.reject(error)
+            if (ended) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve, reject) => {
+              waiter = { resolve, reject }
+            })
+          },
+        }
+      },
+    },
+  }
+}
+
 async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-client', clientKind = 'web' } = {}) {
   const ticketRes = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
     method: 'POST',
@@ -144,8 +208,10 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
   })).json()
   assert.equal(ticketRes.ok, true, 'POST /api/auth/ws-ticket should succeed')
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(ticketRes.ticket)}`)
-  const pending = new Map()
+  const relayPending = new Map()
   const events = []
+  const p2pEvents = []
+  const peers = new Map() // bridgeId -> P2P peer state
   let hello = null
   let closedCode = null
   await new Promise((resolve, reject) => {
@@ -157,58 +223,382 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
         return
       }
       if (msg.type === 'rpc.res') {
-        const p = pending.get(msg.id)
+        const p = relayPending.get(msg.id)
         if (p) {
-          pending.delete(msg.id)
+          relayPending.delete(msg.id)
           p.resolve(msg)
         }
-      } else if (msg.type === 'event') {
+        return
+      }
+      if (msg.type === 'p2p.signal') {
+        const p = peers.get(String(msg.bridgeId || ''))
+        if (p) void p.handleSignal(msg)
+        return
+      }
+      if (msg.type === 'p2p.signal.error') {
+        const p = peers.get(String(msg.bridgeId || ''))
+        if (p) p.handleSignalError(msg)
+        return
+      }
+      if (msg.type === 'event') {
         events.push(msg)
       }
     })
     ws.on('close', (code) => { closedCode = code })
     ws.on('error', reject)
   })
+
   let reqSeq = 1
-  const sendEncryptedRpc = async (method, params = {}, { e2eeKey, roomId, bridgeId = '' } = {}) => {
-    const id = `t-${reqSeq++}`
-    const env = await encryptJson(
-      e2eeKey,
-      { method, params, cid: id, ts: Date.now() },
-      { kind: 'rpc.req', roomId },
-    )
-    const rawRes = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pending.delete(id)
-        reject(new Error(`RPC timeout: ${method}`))
-      }, 20_000)
-      pending.set(id, {
-        resolve: (m) => {
-          clearTimeout(timer)
-          resolve(m)
-        },
-      })
-      ws.send(JSON.stringify({
-        type: 'rpc.req',
-        id,
-        method: E2EE_METHOD_MARKER,
-        e2ee: env,
-        ...(bridgeId ? { bridgeId } : {}),
-      }))
-    })
-    if (rawRes.e2ee) {
-      const dec = await decryptJson(e2eeKey, rawRes.e2ee, { kind: 'rpc.res', roomId })
-      assert.equal(dec.cid, id, 'Decrypted RPC response cid must match request id')
-      if (dec.ok) return dec.result
-      const err = new Error(dec.error?.message || 'RPC error')
-      err.code = dec.error?.code || 'RPC_ERROR'
-      throw err
+  let uploadStreamSeq = 1
+
+  const connectP2p = async ({ bridgeId, e2eeKey, roomId }) => {
+    const bid = String(bridgeId || hello?.bridges?.[0]?.bridgeId || '')
+    const existing = peers.get(bid)
+    if (existing && !existing.closed) {
+      await existing.ready
+      return existing
     }
-    const err = new Error(rawRes.error?.message || 'RPC error')
-    err.code = rawRes.error?.code || 'RPC_ERROR'
-    throw err
+
+    const sessionId = `smoke-p2p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    const pc = new RTCPeerConnection({ iceServers: [] })
+    const ctrlDc = pc.createDataChannel(P2P_CTRL_LABEL, { ordered: true })
+    const bulkDc = pc.createDataChannel(P2P_BULK_LABEL, { ordered: true })
+    const ctrlCodec = createCtrlCodec()
+    const pendingRpcs = new Map()
+    const activeDownloads = new Map()
+    const activeUploads = new Map()
+    const remoteIceQueue = []
+    let remoteDescSet = false
+    let resolveReady
+    let rejectReady
+    const ready = new Promise((res, rej) => {
+      resolveReady = res
+      rejectReady = rej
+    })
+    ready.catch(() => {})
+
+    const peerObj = {
+      bridgeId: bid,
+      sessionId,
+      pc,
+      ctrlDc,
+      bulkDc,
+      ready,
+      closed: false,
+      closedAt: 0,
+      e2eeKey,
+      roomId,
+      sendCtrlJson(obj) {
+        if (peerObj.closed || ctrlDc.readyState !== 'open') return false
+        for (const f of ctrlCodec.encode(obj)) ctrlDc.send(f)
+        return true
+      },
+      async sendBulkCtrl(inner) {
+        const e2ee = await encryptJson(e2eeKey, inner, { kind: 'p2p.bulk', roomId })
+        assert.equal(peerObj.sendCtrlJson({ type: 'bulk.ctrl', e2ee }), true, 'bulk.ctrl send should succeed')
+      },
+      async close() {
+        if (peerObj.closed) return
+        peerObj.closed = true
+        peerObj.closedAt = Date.now()
+        rejectReady(new Error('P2P closed'))
+        for (const p of pendingRpcs.values()) {
+          clearTimeout(p.timer)
+          p.reject(new Error('P2P closed'))
+        }
+        pendingRpcs.clear()
+        for (const dl of activeDownloads.values()) {
+          dl.headerReject?.(new Error('P2P closed'))
+          dl.queue.fail(new Error('P2P closed'))
+        }
+        activeDownloads.clear()
+        for (const up of activeUploads.values()) {
+          up.readyReject?.(new Error('P2P closed'))
+          up.doneReject?.(new Error('P2P closed'))
+        }
+        activeUploads.clear()
+        try { ctrlDc.close() } catch {}
+        try { bulkDc.close() } catch {}
+        try { await pc.close() } catch {}
+      },
+      handleSignalError(msg) {
+        if (msg.sessionId && msg.sessionId !== sessionId) return
+        const err = new Error(msg.message || msg.code || 'P2P signal error')
+        err.code = msg.code || 'BRIDGE_OFFLINE'
+        rejectReady(err)
+        void peerObj.close()
+      },
+      async handleSignal(msg) {
+        if (peerObj.closed || (msg.sessionId && msg.sessionId !== sessionId)) return
+        let inner
+        try {
+          inner = await decryptJson(e2eeKey, msg.e2ee, { kind: 'p2p.signal', roomId })
+        } catch {
+          return
+        }
+        if (inner.kind === 'answer' && inner.sdp) {
+          await pc.setRemoteDescription({ type: 'answer', sdp: inner.sdp })
+          remoteDescSet = true
+          while (remoteIceQueue.length > 0) {
+            await pc.addIceCandidate(new RTCIceCandidate(remoteIceQueue.shift())).catch(() => {})
+          }
+        } else if (inner.kind === 'ice' && inner.candidate) {
+          if (!remoteDescSet) remoteIceQueue.push(inner.candidate)
+          else await pc.addIceCandidate(new RTCIceCandidate(inner.candidate)).catch(() => {})
+        } else if (inner.kind === 'close') {
+          await peerObj.close()
+        }
+      },
+      async sendRawCtrlRpc(frame) {
+        await ready
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pendingRpcs.delete(frame.id)
+            reject(new Error(`Raw P2P RPC timeout: ${frame.id}`))
+          }, 15_000)
+          pendingRpcs.set(frame.id, {
+            resolve: (m) => { clearTimeout(timer); resolve(m) },
+            reject: (e) => { clearTimeout(timer); reject(e) },
+            timer,
+          })
+          if (!peerObj.sendCtrlJson(frame)) {
+            clearTimeout(timer)
+            pendingRpcs.delete(frame.id)
+            reject(new Error('P2P channel closed'))
+          }
+        })
+      },
+      async sendEncryptedRpc(method, params = {}) {
+        const id = `t-${reqSeq++}`
+        const env = await encryptJson(
+          e2eeKey,
+          { method, params, cid: id, ts: Date.now() },
+          { kind: 'rpc.req', roomId },
+        )
+        const rawRes = await peerObj.sendRawCtrlRpc({ type: 'rpc.req', id, e2ee: env })
+        if (rawRes.e2ee) {
+          const dec = await decryptJson(e2eeKey, rawRes.e2ee, { kind: 'rpc.res', roomId })
+          assert.equal(dec.cid, id, 'Decrypted RPC response cid must match request id')
+          if (dec.ok) return dec.result
+          const err = new Error(dec.error?.message || 'RPC error')
+          err.code = dec.error?.code || 'RPC_ERROR'
+          throw err
+        }
+        const err = new Error(rawRes.error?.message || 'RPC error')
+        err.code = rawRes.error?.code || 'RPC_ERROR'
+        throw err
+      },
+      async downloadBulkStream(streamId) {
+        await ready
+        const queue = createSmokeByteQueue()
+        let headerResolve
+        let headerReject
+        const headerPromise = new Promise((res, rej) => {
+          headerResolve = res
+          headerReject = rej
+        })
+        activeDownloads.set(streamId, { queue, headerResolve, headerReject })
+        try {
+          await peerObj.sendBulkCtrl({ action: 'pull', streamId })
+          const header = await headerPromise
+          const dec = await decryptAutoStream(e2eeKey, queue.iterable, {
+            iv: header.e2ee.iv,
+            kid: header.e2ee.kid || '',
+            kind: 'upload',
+            roomId,
+            chunked: Boolean(header.e2ee.chunked),
+          })
+          return Buffer.concat((dec.chunks || []).map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)))
+        } finally {
+          activeDownloads.delete(streamId)
+        }
+      },
+      async uploadFileBulk(buf, { filename = 'upload.bin', mimeType = 'application/octet-stream' } = {}) {
+        await ready
+        const raw = Buffer.isBuffer(buf) ? buf : Buffer.from(buf)
+        const transferId = `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+        const streamId = uploadStreamSeq++
+        let readyResolve
+        let readyReject
+        let doneResolve
+        let doneReject
+        const readyPromise = new Promise((res, rej) => { readyResolve = res; readyReject = rej })
+        const donePromise = new Promise((res, rej) => { doneResolve = res; doneReject = rej })
+        activeUploads.set(transferId, { streamId, readyResolve, readyReject, doneResolve, doneReject })
+        try {
+          let seq = 0
+          await encryptChunkedBytes(
+            e2eeKey,
+            {
+              totalSize: raw.length,
+              readSlice: async (offset, len) => new Uint8Array(raw.buffer, raw.byteOffset + offset, len),
+            },
+            {
+              kind: 'upload',
+              roomId,
+              onHeader: async (e2eeMeta) => {
+                await peerObj.sendBulkCtrl({
+                  action: 'upload.start',
+                  transferId,
+                  streamId,
+                  filename,
+                  mimeType,
+                  size: raw.length,
+                  e2ee: e2eeMeta,
+                })
+                await readyPromise
+              },
+              onChunk: async (cipherChunk) => {
+                for (let off = 0; off < cipherChunk.byteLength; off += BULK_SLICE_BYTES) {
+                  const slice = cipherChunk.subarray(off, Math.min(cipherChunk.byteLength, off + BULK_SLICE_BYTES))
+                  const f = encodeBulkFrame(streamId, seq++, slice, 0); await sendWithBackpressure(bulkDc, Buffer.from(f.buffer, f.byteOffset, f.byteLength))
+                }
+              },
+            },
+          )
+          const eofF = encodeBulkFrame(streamId, seq++, new Uint8Array(0), BULK_FLAG_EOF); await sendWithBackpressure(bulkDc, Buffer.from(eofF.buffer, eofF.byteOffset, eofF.byteLength))
+          return await donePromise
+        } finally {
+          activeUploads.delete(transferId)
+        }
+      },
+    }
+
+    const checkOpen = () => {
+      if (ctrlDc.readyState === 'open' && bulkDc.readyState === 'open') resolveReady(peerObj)
+    }
+    ctrlDc.stateChanged.subscribe((st) => {
+      if (st === 'open') checkOpen()
+      if (st === 'closed' || st === 'closing') void peerObj.close()
+    })
+    bulkDc.stateChanged.subscribe((st) => {
+      if (st === 'open') checkOpen()
+      if (st === 'closed' || st === 'closing') void peerObj.close()
+    })
+    ctrlDc.onMessage.subscribe((raw) => {
+      const text = typeof raw === 'string' ? raw : Buffer.from(raw).toString('utf8')
+      const msg = ctrlCodec.decode(text)
+      if (!msg) return
+      if (msg.type === 'rpc.res') {
+        const p = pendingRpcs.get(msg.id)
+        if (p) {
+          pendingRpcs.delete(msg.id)
+          p.resolve(msg)
+        }
+      } else if (msg.type === 'event' && msg.e2ee) {
+        p2pEvents.push({ ...msg, bridgeId: bid })
+      } else if (msg.type === 'bulk.ctrl' && msg.e2ee) {
+        decryptJson(e2eeKey, msg.e2ee, { kind: 'p2p.bulk', roomId })
+          .then((inner) => {
+            if (inner.action === 'download.header') {
+              activeDownloads.get(Number(inner.streamId))?.headerResolve?.(inner)
+            } else if (inner.action === 'download.error') {
+              const dl = activeDownloads.get(Number(inner.streamId))
+              const err = new Error(inner.message || 'download error')
+              dl?.headerReject?.(err)
+              dl?.queue?.fail(err)
+            } else if (inner.action === 'upload.ready') {
+              activeUploads.get(String(inner.transferId))?.readyResolve?.(inner)
+            } else if (inner.action === 'upload.done') {
+              activeUploads.get(String(inner.transferId))?.doneResolve?.(inner)
+            } else if (inner.action === 'upload.error') {
+              const up = activeUploads.get(String(inner.transferId))
+              const err = new Error(inner.message || 'upload error')
+              up?.readyReject?.(err)
+              up?.doneReject?.(err)
+            }
+          })
+          .catch(() => {})
+      }
+    })
+    bulkDc.onMessage.subscribe((raw) => {
+      const u8 = Buffer.isBuffer(raw) ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength) : new Uint8Array(raw)
+      const frame = decodeBulkFrame(u8)
+      if (!frame) return
+      const dl = activeDownloads.get(frame.streamId)
+      if (!dl) return
+      if (frame.payload.byteLength > 0) dl.queue.push(frame.payload)
+      if (frame.eof) dl.queue.end()
+    })
+
+    const localIceQueue = []
+    let offerSent = false
+    pc.onIceCandidate.subscribe(async (cand) => {
+      if (!cand || peerObj.closed || ws.readyState !== WebSocket.OPEN) return
+      const cObj = { candidate: cand.candidate, sdpMid: cand.sdpMid, sdpMLineIndex: cand.sdpMLineIndex }
+      if (!offerSent) {
+        localIceQueue.push(cObj)
+        return
+      }
+      const e2ee = await encryptJson(e2eeKey, { kind: 'ice', candidate: cObj }, { kind: 'p2p.signal', roomId })
+      if (!peerObj.closed && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'p2p.signal', bridgeId: bid, sessionId, e2ee }))
+      }
+    })
+    pc.connectionStateChange.subscribe((st) => {
+      if (st === 'failed' || st === 'closed') void peerObj.close()
+    })
+
+    peers.set(bid, peerObj)
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    const offerEnc = await encryptJson(e2eeKey, { kind: 'offer', sdp: offer.sdp }, { kind: 'p2p.signal', roomId })
+    ws.send(JSON.stringify({ type: 'p2p.signal', bridgeId: bid, sessionId, e2ee: offerEnc }))
+    offerSent = true
+    while (localIceQueue.length > 0 && !peerObj.closed && ws.readyState === WebSocket.OPEN) {
+      const cObj = localIceQueue.shift()
+      const e2ee = await encryptJson(e2eeKey, { kind: 'ice', candidate: cObj }, { kind: 'p2p.signal', roomId })
+      if (!peerObj.closed && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'p2p.signal', bridgeId: bid, sessionId, e2ee }))
+      }
+    }
+
+    const timeout = setTimeout(() => {
+      rejectReady(new Error(`P2P connect timeout to bridge ${bid}`))
+      void peerObj.close()
+    }, 10_000)
+    try {
+      await ready
+    } finally {
+      clearTimeout(timeout)
+    }
+    return peerObj
   }
-  return { ws, hello, events, sendEncryptedRpc, getClosedCode: () => closedCode }
+
+  const sendEncryptedRpc = async (method, params = {}, { e2eeKey, roomId, bridgeId = '' } = {}) => {
+    const peer = await connectP2p({ bridgeId, e2eeKey, roomId })
+    return peer.sendEncryptedRpc(method, params)
+  }
+
+  const sendLegacyRelayRpc = (frame) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        relayPending.delete(frame.id)
+        reject(new Error(`Relay RPC timeout: ${frame.id}`))
+      }, 5_000)
+      relayPending.set(frame.id, {
+        resolve: (m) => { clearTimeout(timer); resolve(m) },
+      })
+      ws.send(JSON.stringify(frame))
+    })
+
+  const closeAll = async () => {
+    for (const p of peers.values()) await p.close()
+    peers.clear()
+    try { ws.close() } catch {}
+  }
+
+  return {
+    ws,
+    hello,
+    events,
+    p2pEvents,
+    connectP2p,
+    sendEncryptedRpc,
+    sendLegacyRelayRpc,
+    closeAll,
+    getClosedCode: () => closedCode,
+  }
 }
 
 async function main() {
@@ -220,7 +610,7 @@ async function main() {
     jwtSecret: 'smoke-test-jwt-secret-0123456789',
     adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
     accountsFile: join(tmpDir, 'accounts.json'),
-    uploadDir: join(tmpDir, 'uploads'),
+    stunEnabled: false,
   })
   const { port } = await relay.start()
   const httpBase = `http://127.0.0.1:${port}`
@@ -381,7 +771,7 @@ async function main() {
     assert.equal(removedProxyRes.status, 404, 'Legacy /api/bridge-file endpoint must be permanently removed (404)')
     console.log(`[smoke] 4.5/6 E2EE RPC.FILE_READ OK (${imgBuf.length} bytes PNG, non-image blocked, /api/bridge-file=404)`)
 
-    cli.ws.close()
+    await cli.closeAll()
 
     // 5. Verify DSH Cordis plugin registration registers all 6 master dispatch tools
     const registeredTools = []
@@ -515,63 +905,38 @@ async function main() {
     assert.equal(wsACli.hello.bridges[0].bridgeId, friendDevA.bridgeId)
     wsACli.ws.close()
 
-    // Plaintext /api/uploads must be rejected with 400 E2EE_UPLOAD_REQUIRED
-    const plainUploadRes = await fetch(`${httpBase}/api/uploads`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${loginData.token}`,
-      },
-      body: JSON.stringify({
-        filename: 'plain.txt',
-        mimeType: 'text/plain',
-        dataBase64: Buffer.from('not-encrypted').toString('base64'),
-      }),
-    })
-    assert.equal(plainUploadRes.status, 400, 'Plaintext /api/uploads must be rejected with 400')
-    const plainUploadJson = await plainUploadRes.json()
-    assert.equal(plainUploadJson.code, 'E2EE_UPLOAD_REQUIRED')
+    // Pure Control Plane v1.0.0: verify all server data-plane upload & tier endpoints are permanently removed (404)
+    for (const [method, path] of [
+      ['POST', '/api/uploads'],
+      ['GET', '/api/uploads/00000000-0000-0000-0000-000000000000'],
+      ['POST', '/api/auth/media-token'],
+      ['POST', '/api/admin/users/set-tier'],
+    ]) {
+      const r = await fetch(`${httpBase}${path}`, {
+        method,
+        headers: {
+          ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+          Authorization: `Bearer ${loginData.token}`,
+        },
+        body: method === 'POST' ? '{}' : undefined,
+      })
+      assert.equal(r.status, 404, `Removed v0.5 data-plane endpoint ${method} ${path} must return 404`)
+    }
 
-    // Cross-account encrypted upload isolation check
-    const encAdminBlob = await encryptBytes(primaryE2eeKey, Buffer.from('admin-private-data', 'utf8'), {
-      kind: 'upload',
-      roomId: smokeAdmin.roomId,
+    // Legacy WS data-plane rpc.req must be explicitly rejected with P2P_REQUIRED
+    const legacyRpcCheckCli = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'legacy-rpc-check' })
+    const legacyRpcRes = await legacyRpcCheckCli.sendLegacyRelayRpc({
+      type: 'rpc.req',
+      id: 'legacy-rpc-1',
+      method: E2EE_METHOD_MARKER,
+      bridgeId: smokeDev.bridgeId,
     })
-    const adminUpload = await (await fetch(`${httpBase}/api/uploads`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${loginData.token}`,
-      },
-      body: JSON.stringify({
-        filename: 'secret.txt',
-        mimeType: 'text/plain',
-        encrypted: true,
-        dataBase64: bytesToBase64(encAdminBlob.ciphertext),
-      }),
-    })).json()
-    assert.equal(adminUpload.ok, true)
-
-    const adminMediaTok = await (await fetch(`${httpBase}/api/auth/media-token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${loginData.token}` },
-    })).json()
-    const friendAMediaTok = await (await fetch(`${httpBase}/api/auth/media-token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${friendA.token}` },
-    })).json()
-
-    const adminDl = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`)
-    assert.equal(adminDl.status, 200)
-    const crossPhoneDl = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(friendAMediaTok.mediaToken)}`)
-    assert.equal(crossPhoneDl.status, 403, 'Friend A media token must be blocked (403) from Admin uploads')
-    const crossBridgeDl = await fetch(`${httpBase}${adminUpload.upload.url}`, {
-      headers: { 'X-Room-Id': friendA.roomId, 'X-Bridge-Secret': friendDevA.deviceSecret },
-    })
-    assert.equal(crossBridgeDl.status, 403, 'Friend Bridge A must be blocked (403) from Admin uploads')
+    assert.equal(legacyRpcRes.ok, false)
+    assert.equal(legacyRpcRes.error?.code, 'P2P_REQUIRED', 'Server must reject legacy WS rpc.req with P2P_REQUIRED')
+    await legacyRpcCheckCli.closeAll()
 
     const bundlePath = join(process.cwd(), 'packages/mobile-app/public/downloads/allinone-bridge.mjs')
-    console.log('[smoke] 6/6 Multi-tenant isolation, deleted legacy routes & encrypted upload isolation OK')
+    console.log('[smoke] 6/6 Multi-tenant isolation, deleted legacy/upload routes & P2P_REQUIRED enforcement OK')
 
     // 7. Multi-device switching, /api/auth/me status probing, strict bridgeId routing, & scoped cache isolation
     const meA = await (await fetch(`${httpBase}/api/auth/me`, {
@@ -634,7 +999,7 @@ async function main() {
       (err) => err.code === 'BRIDGE_OFFLINE',
       'RPC targeting offline bridgeId must fail strictly with BRIDGE_OFFLINE',
     )
-    wsMulti.ws.close()
+    await wsMulti.closeAll()
 
     // Mobile multi-account store: legacy owner/rm_* entries auto-purged + multi-account coexist + isolated cache
     const memStore = new Map()
@@ -718,14 +1083,10 @@ async function main() {
     assert.equal(dState.devices.length, 1)
     assert.equal(dState.activeDeviceId, devAId)
 
-    // Image URL helper only signs `/api/uploads/...` with short-lived `mt=` mediaToken; local paths never fall back to removed `/api/bridge-file`
-    const uploadImgSrc = resolveImageSrc({ url: '/api/uploads/sample-id' }, {
-      baseUrl: httpBase,
-      mediaToken: 'mtok',
-      token: 'master-tok',
-    })
-    assert.ok(uploadImgSrc.includes('mt=mtok') && !uploadImgSrc.includes('master-tok'), 'resolveImageSrc must use mt= mediaToken only')
-    const localImgSrc = resolveImageSrc('/tmp/shot.png', { baseUrl: httpBase, mediaToken: 'mtok' })
+    // Image URL helper only passes external HTTPS or data/blob URLs; local PC paths & deleted /api/uploads never build relay URLs
+    assert.equal(resolveImageSrc('https://example.com/demo.png'), 'https://example.com/demo.png')
+    assert.equal(resolveImageSrc({ url: '/api/uploads/sample-id' }), '', 'Removed /api/uploads paths must return empty string')
+    const localImgSrc = resolveImageSrc('/tmp/shot.png')
     assert.equal(localImgSrc, '', 'Local paths must never build removed /api/bridge-file URLs')
     console.log('[smoke] 7/8 Multi-device store, status probe, strict bridgeId routing & scoped cache OK')
 
@@ -810,26 +1171,7 @@ async function main() {
       'Reusing a single-use WS ticket must be rejected',
     )
 
-    // 8.4 Scoped read-only media token (works ONLY for /api/uploads/:id; master session token rejected on media endpoint & media token rejected on session APIs)
-    const mtUploadRes = await fetch(
-      `${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`,
-    )
-    assert.equal(mtUploadRes.status, 200, 'Scoped mediaToken must authorize GET /api/uploads/:id')
-    const rawSessionOnUpload = await fetch(
-      `${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(loginData.token)}`,
-    )
-    assert.equal(rawSessionOnUpload.status, 401, 'Master session JWT must NOT be accepted on scoped media endpoint')
-    const mtOnMe = await fetch(`${httpBase}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${adminMediaTok.mediaToken}` },
-    })
-    assert.equal(mtOnMe.status, 401, 'Media token must NOT work as a full session token on /api/auth/me')
-    const mtOnTicket = await fetch(`${httpBase}/api/auth/ws-ticket`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${adminMediaTok.mediaToken}` },
-    })
-    assert.equal(mtOnTicket.status, 401, 'Media token must NOT mint WS tickets')
-
-    // 8.5 Bridge URL query secret rejection + ephemeral consume on encrypted upload + safe headers
+    // 8.4 Bridge URL query secret rejection (header-only auth)
     await assert.rejects(
       () =>
         new Promise((resolve, reject) => {
@@ -839,19 +1181,8 @@ async function main() {
         }),
       'Bridge WS must reject ?secret= in URL query string',
     )
-    const qsUploadTry = await fetch(`${httpBase}${adminUpload.upload.url}?secret=${encodeURIComponent(smokeDev.deviceSecret)}`)
-    assert.equal(qsUploadTry.status, 401, 'Upload download must reject ?secret= in URL query string')
 
-    const bridgeConsumeRes = await fetch(`${httpBase}${adminUpload.upload.url}?consume=1`, {
-      headers: { 'X-Room-Id': smokeAdmin.roomId, 'X-Bridge-Secret': smokeDev.deviceSecret },
-    })
-    assert.equal(bridgeConsumeRes.status, 200)
-    assert.ok(String(bridgeConsumeRes.headers.get('content-disposition') || '').startsWith('attachment'))
-    assert.equal(bridgeConsumeRes.headers.get('content-security-policy'), "default-src 'none'; sandbox")
-    const afterConsumeRes = await fetch(`${httpBase}${adminUpload.upload.url}?mt=${encodeURIComponent(adminMediaTok.mediaToken)}`)
-    assert.equal(afterConsumeRes.status, 404, 'Consumed encrypted upload must be deleted immediately from relay disk')
-
-    // 8.6 SSRF & X-Bridge-Secret leak defense in materializeAttachments
+    // 8.6 SSRF & caller-supplied localPath / fake p2pToken defense in materializeAttachments
     let attackerHits = 0
     const attackerServer = http.createServer((req, res) => {
       attackerHits += 1
@@ -865,9 +1196,10 @@ async function main() {
         { url: `http://127.0.0.1:${attackerPort}/steal`, filename: 'evil.txt', mimeType: 'text/plain', e2ee: { iv: 'AAAAAAAAAAAAAAAA' } },
         { url: '/api/uploads/../../etc/passwd', filename: 'trav.txt', mimeType: 'text/plain', e2ee: { iv: 'AAAAAAAAAAAAAAAA' } },
         { localPath: '/etc/passwd', filename: 'passwd', mimeType: 'text/plain' },
+        { p2pToken: 'p2p_forged_token', filename: 'forged.txt', mimeType: 'text/plain' },
       ])
-      assert.equal(matResult.length, 0, 'Untrusted URLs and caller-supplied localPath must all be rejected')
-      assert.equal(attackerHits, 0, 'Bridge must NEVER send fetch or X-Bridge-Secret to external/attacker URLs')
+      assert.equal(matResult.length, 0, 'Untrusted URLs, forged p2pToken, and caller-supplied localPath must all be rejected')
+      assert.equal(attackerHits, 0, 'Bridge must NEVER send fetch to external/attacker URLs')
     } finally {
       await new Promise((r) => attackerServer.close(r))
     }
@@ -894,23 +1226,7 @@ async function main() {
       /非法的/,
     )
 
-    // 8.9 Token revocation (`POST /api/auth/sessions/revoke-all`) kicks active WS with 4401 and invalidates JWT + mediaToken
-    const encFriendBlob = await encryptBytes(friendE2eeKeyA, Buffer.from('friend-a-file', 'utf8'), {
-      kind: 'upload',
-      roomId: friendA.roomId,
-    })
-    const friendUpload = await (await fetch(`${httpBase}/api/uploads`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${friendA.token}` },
-      body: JSON.stringify({
-        filename: 'a.txt',
-        mimeType: 'text/plain',
-        encrypted: true,
-        dataBase64: bytesToBase64(encFriendBlob.ciphertext),
-      }),
-    })).json()
-    assert.equal(friendUpload.ok, true)
-
+    // 8.9 Token revocation (`POST /api/auth/sessions/revoke-all`) kicks active WS with 4401 and invalidates JWT
     const wsRevokeCli = await openTicketClientWs(httpBase, port, friendA.token, { deviceName: 'revoke-test-phone' })
     const closeCodePromise = new Promise((resolve) => {
       wsRevokeCli.ws.on('close', (code) => resolve(code))
@@ -928,10 +1244,6 @@ async function main() {
       headers: { Authorization: `Bearer ${friendA.token}` },
     })
     assert.equal(revokedMe.status, 401, 'Revoked JWT must return 401 on /api/auth/me')
-    const revokedMedia = await fetch(
-      `${httpBase}${friendUpload.upload.url}?mt=${encodeURIComponent(friendAMediaTok.mediaToken)}`,
-    )
-    assert.equal(revokedMedia.status, 401, 'Revoked account mediaToken must return 401')
 
     // Re-logging in after revocation issues a fresh working token (tv=1)
     const postRevokeLogin = await (await fetch(`${httpBase}/api/account/login`, {
@@ -996,7 +1308,7 @@ async function main() {
         jwtSecret: 'acct-test-jwt-secret-0123456789',
         adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
         accountsFile: join(tmpDir, 'acct-accounts.json'),
-        uploadDir: join(tmpDir, 'acct-uploads'),
+        stunEnabled: false,
       })
       const { port: acctPort } = await acctRelay.start()
       const acctHttpBase = `http://127.0.0.1:${acctPort}`
@@ -1491,7 +1803,7 @@ async function main() {
       host: '127.0.0.1',
       jwtSecret: 'email-jwt-secret-0123456789',
       adminBootstrapToken: 'email-bootstrap-secret-99',
-      uploadDir: join(tmpDir, 'email-uploads'),
+      stunEnabled: false,
       accountsFile: join(tmpDir, 'email-accounts.json'),
       smtpHost: '127.0.0.1',
       smtpPort: mockSmtpPort,
@@ -1985,7 +2297,7 @@ async function main() {
         jwtSecret: 'sess-jwt-secret-0123456789',
         adminBootstrapToken: 'sess-owner-pass',
         accountsFile: join(tmpDir, 'sess-accounts.json'),
-        uploadDir: join(tmpDir, 'sess-uploads'),
+        stunEnabled: false,
       })
       const { port: sPort } = await sessRelay.start()
       const sBase = `http://127.0.0.1:${sPort}`
@@ -2146,7 +2458,7 @@ async function main() {
         jwtSecret: 'mon-jwt-secret-0123456789',
         adminBootstrapToken: 'mon-owner-secret',
         accountsFile: join(tmpDir, 'mon-accounts.json'),
-        uploadDir: join(tmpDir, 'mon-uploads'),
+        stunEnabled: false,
       })
       const { port: mPort } = await monRelay.start()
       const mBase = `http://127.0.0.1:${mPort}`
@@ -2545,7 +2857,7 @@ async function main() {
         jwtSecret: 'sec-jwt-secret-0123456789',
         adminBootstrapToken: 'sec-bootstrap-pass-123',
         staticDir: secStaticDir,
-        uploadDir: join(tmpDir, 'sec-uploads'),
+        stunEnabled: false,
         accountsFile: join(tmpDir, 'sec-accounts.json'),
         smtpHost: '127.0.0.1',
         smtpPort: secSmtpPort,
@@ -3113,55 +3425,20 @@ async function main() {
         )
         assert.equal(relayPlainImg.status, 404, 'Legacy /api/bridge-file must be permanently deleted (404)')
 
-        // Open client WS via single-use ticket and test: plaintext rejection, wrong-key rejection, encrypted FILE_READ, replay block, encrypted event
-        const e2eeTicket = await (await fetch(`${httpBase}/api/auth/ws-ticket`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${loginData.token}` },
-        })).json()
-        assert.equal(e2eeTicket.ok, true)
-        const capturedWireFrames = []
-        e2eeWs = new WebSocket(`ws://127.0.0.1:${port}/ws/client?ticket=${encodeURIComponent(e2eeTicket.ticket)}`)
-        const pendingMap = new Map()
-        const rawEvents = []
-        await new Promise((resolve, reject) => {
-          e2eeWs.on('message', (raw) => {
-            const text = String(raw)
-            capturedWireFrames.push(text)
-            const msg = JSON.parse(text)
-            if (msg.type === 'hello') {
-              resolve()
-              return
-            }
-            if (msg.type === 'rpc.res') {
-              const p = pendingMap.get(msg.id)
-              if (p) {
-                pendingMap.delete(msg.id)
-                p.resolve(msg)
-              }
-            } else if (msg.type === 'event') {
-              rawEvents.push(msg)
-            }
-          })
-          e2eeWs.on('error', reject)
+        // Open Control WS + Direct WebRTC P2P (`aio-ctrl` + `aio-bulk`) and verify:
+        // plaintext rejection, wrong-key rejection, encrypted FILE_READ, replay block, P2P streaming events & P2P bulk uploads
+        const e2eeCli = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'e2ee-p2p-client' })
+        e2eeWs = e2eeCli
+        const p2pPeer = await e2eeCli.connectP2p({
+          bridgeId: e2eeDevice.bridgeId,
+          e2eeKey,
+          roomId: e2eeDevice.roomId,
         })
 
-        const sendWsFrame = (frame) =>
-          new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error(`WS timeout ${frame.id}`)), 15_000)
-            pendingMap.set(frame.id, {
-              resolve: (m) => {
-                clearTimeout(timer)
-                resolve(m)
-              },
-            })
-            e2eeWs.send(JSON.stringify(frame))
-          })
-
-        // 1) Plaintext RPC rejected with E2EE_KEY_REQUIRED
-        const plainTry = await sendWsFrame({
+        // 1) Plaintext RPC on aio-ctrl rejected with E2EE_KEY_REQUIRED
+        const plainTry = await p2pPeer.sendRawCtrlRpc({
           type: 'rpc.req',
           id: 'e2ee-plain-1',
-          bridgeId: e2eeDevice.bridgeId,
           method: RPC.APPS_STATUS,
           params: {},
         })
@@ -3175,17 +3452,15 @@ async function main() {
           { method: RPC.APPS_STATUS, params: {}, cid: 'e2ee-wrong-1', ts: Date.now() },
           { kind: 'rpc.req', roomId: e2eeDevice.roomId },
         )
-        const wrongTry = await sendWsFrame({
+        const wrongTry = await p2pPeer.sendRawCtrlRpc({
           type: 'rpc.req',
           id: 'e2ee-wrong-1',
-          bridgeId: e2eeDevice.bridgeId,
-          method: E2EE_METHOD_MARKER,
           e2ee: wrongEnv,
         })
         assert.equal(wrongTry.ok, false)
         assert.equal(wrongTry.error?.code, 'E2EE_KEY_MISMATCH')
 
-        // 3) Valid E2EE encrypted RPC.FILE_READ (verifies image bytes & path stay opaque on relay!)
+        // 3) Valid E2EE encrypted RPC.FILE_READ directly over P2P (0 bytes through server!)
         const fileReqEnv = await encryptJson(
           e2eeKey,
           {
@@ -3196,11 +3471,9 @@ async function main() {
           },
           { kind: 'rpc.req', roomId: e2eeDevice.roomId },
         )
-        const encFileRes = await sendWsFrame({
+        const encFileRes = await p2pPeer.sendRawCtrlRpc({
           type: 'rpc.req',
           id: 'e2ee-file-1',
-          bridgeId: e2eeDevice.bridgeId,
-          method: E2EE_METHOD_MARKER,
           e2ee: fileReqEnv,
         })
         assert.equal(encFileRes.ok, true)
@@ -3216,35 +3489,26 @@ async function main() {
         assert.equal(decFileRes.result.mimeType, 'image/png')
         assert.ok(Buffer.from(decFileRes.result.dataBase64, 'base64').subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])))
 
-        // Verify relay room stats NEVER recorded plaintext RPC method name
-        assert.equal(relay.hub.getRoomStats(e2eeDevice.roomId).lastRpcMethod, E2EE_METHOD_MARKER)
-
-        // 4) Replaying exact same encrypted rpc.req envelope must be rejected by bridge
-        const replayRes = await sendWsFrame({
+        // 4) Replaying exact same encrypted rpc.req envelope must be rejected by PC bridge
+        const replayRes = await p2pPeer.sendRawCtrlRpc({
           type: 'rpc.req',
           id: 'e2ee-replay-1',
-          bridgeId: e2eeDevice.bridgeId,
-          method: E2EE_METHOD_MARKER,
           e2ee: fileReqEnv,
         })
         assert.equal(replayRes.ok, false)
         assert.equal(replayRes.error?.code, 'E2EE_REPLAY_DETECTED', 'Replayed ciphertext IV must be rejected')
 
-        // 5) Encrypted streaming event -> Relay buffer contains ONLY ciphertext, client decrypts secret token!
+        // 5) Encrypted streaming event pushed directly over P2P `aio-ctrl` (0 bytes via Control Server WS!)
+        const controlEventsBefore = e2eeCli.events.length
         const secretToken = 'ZERO_KNOWLEDGE_SECRET_DELTA_987654'
         e2eeBridge.link.pushEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:s1', delta: secretToken })
         for (let i = 0; i < 30; i++) {
-          if (rawEvents.some((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)) break
+          if (e2eeCli.p2pEvents.some((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)) break
           await new Promise((r) => setTimeout(r, 50))
         }
-        const encEvent = rawEvents.find((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)
-        assert.ok(encEvent, 'Client must receive E2EE-wrapped streaming event')
-        assert.equal(encEvent.event, '__e2ee__')
-        assert.equal(
-          JSON.stringify(relay.hub.getRoomEventState(e2eeDevice.roomId).buffer).includes(secretToken),
-          false,
-          'Relay event catch-up buffer must NEVER contain plaintext streaming tokens',
-        )
+        const encEvent = e2eeCli.p2pEvents.find((e) => e.bridgeId === e2eeDevice.bridgeId && e.e2ee?.ct)
+        assert.ok(encEvent, 'Client must receive E2EE-wrapped streaming event over P2P')
+        assert.equal(e2eeCli.events.length, controlEventsBefore, 'Streaming event must NOT traverse Control Server WS')
         const decEvent = await decryptJson(e2eeKey, encEvent.e2ee, {
           kind: 'event',
           roomId: e2eeDevice.roomId,
@@ -3252,73 +3516,44 @@ async function main() {
         assert.equal(decEvent.event, EVENTS.STREAM_DELTA)
         assert.equal(decEvent.payload.delta, secretToken)
 
-        // 6) Encrypted Attachment Upload -> relay disk holds ONLY ciphertext & generic metadata, bridge decrypts cleanly!
+        // 6) Encrypted P2P Attachment Upload over `aio-bulk` -> single-use opaque `p2pToken` -> materializeAttachments!
         const secretFileText = 'TOP_SECRET_ATTACHMENT_CONTENT_ALPHA_2026'
-        const encUpload = await encryptBytes(e2eeKey, Buffer.from(secretFileText, 'utf8'), {
-          kind: 'upload',
-          roomId: e2eeDevice.roomId,
+        const upDone = await p2pPeer.uploadFileBulk(Buffer.from(secretFileText, 'utf8'), {
+          filename: 'secret-note.txt',
+          mimeType: 'text/plain',
         })
-        const upRes = await (await fetch(`${httpBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${loginData.token}`,
-          },
-          body: JSON.stringify({
-            filename: 'secret-note.txt',
-            mimeType: 'text/plain',
-            encrypted: true,
-            dataBase64: bytesToBase64(encUpload.ciphertext),
-          }),
-        })).json()
-        assert.equal(upRes.ok, true)
-        assert.equal(upRes.upload.filename, 'encrypted.bin', 'Relay must strip original filename for encrypted uploads')
-        assert.equal(upRes.upload.mimeType, 'application/octet-stream')
-        const relayBinDisk = readFileSync(join(tmpDir, 'uploads', `${upRes.upload.id}.bin`))
-        const relayMetaDisk = readFileSync(join(tmpDir, 'uploads', `${upRes.upload.id}.json`), 'utf8')
-        assert.equal(relayBinDisk.toString('utf8').includes(secretFileText), false, 'Relay disk .bin must hold ciphertext only')
-        assert.equal(relayMetaDisk.includes('secret-note.txt'), false, 'Relay disk .json must not store original filename')
+        assert.ok(upDone.p2pToken && upDone.p2pToken.startsWith('p2p_'), 'P2P upload must return opaque p2pToken')
 
-        const materialized = await e2eeBridge.orchestrator.materializeAttachments([
-          {
-            id: upRes.upload.id,
-            url: upRes.upload.url,
-            filename: 'secret-note.txt',
-            mimeType: 'text/plain',
-            e2ee: { v: encUpload.v, kid: encUpload.kid, iv: encUpload.iv },
-          },
-        ])
+        const materialized = await e2eeBridge.orchestrator.materializeAttachments(
+          [
+            {
+              id: upDone.p2pToken,
+              p2pToken: upDone.p2pToken,
+              filename: 'secret-note.txt',
+              mimeType: 'text/plain',
+            },
+          ],
+          { clientId: e2eeCli.hello.clientId },
+        )
         assert.equal(materialized.length, 1)
         assert.equal(readFileSync(materialized[0].localPath, 'utf8'), secretFileText)
         assert.ok(materialized[0].localPath.endsWith('secret-note.txt'))
 
-        // Relay strictly rejects plaintext upload (400 E2EE_UPLOAD_REQUIRED) AND bridge rejects attachments missing `att.e2ee`
-        const plainUpResp = await fetch(`${httpBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${loginData.token}`,
-          },
-          body: JSON.stringify({
-            filename: 'plain.txt',
-            mimeType: 'text/plain',
-            dataBase64: Buffer.from('unencrypted-data', 'utf8').toString('base64'),
-          }),
-        })
-        assert.equal(plainUpResp.status, 400)
-        const plainUpJson = await plainUpResp.json()
-        assert.equal(plainUpJson.code, 'E2EE_UPLOAD_REQUIRED')
-
-        const rejectedPlainAtt = await e2eeBridge.orchestrator.materializeAttachments([
-          { id: upRes.upload.id, url: upRes.upload.url, filename: 'plain.txt', mimeType: 'text/plain' },
-        ])
-        assert.equal(rejectedPlainAtt.length, 0)
+        // Reusing a consumed single-use p2pToken or sending raw url/localPath must be rejected!
+        const replayTokenAtt = await e2eeBridge.orchestrator.materializeAttachments(
+          [
+            { id: upDone.p2pToken, p2pToken: upDone.p2pToken, filename: 'secret-note.txt', mimeType: 'text/plain' },
+            { url: '/api/uploads/forged', filename: 'plain.txt', mimeType: 'text/plain' },
+          ],
+          { clientId: e2eeCli.hello.clientId },
+        )
+        assert.equal(replayTokenAtt.length, 0, 'Consumed p2pToken and legacy URLs must be rejected')
       } finally {
-        if (e2eeWs) try { e2eeWs.close() } catch {}
+        if (e2eeWs) await e2eeWs.closeAll()
         await e2eeBridge.stop()
       }
     }
-    console.log('[smoke] 20/21 Zero-Knowledge E2EE (AES-256-GCM, QR sync, replay defense, blind relay & encrypted uploads) OK')
+    console.log('[smoke] 20/21 Zero-Knowledge E2EE over Direct WebRTC P2P (AES-256-GCM, QR sync, replay defense & P2P bulk uploads) OK')
 
     // 21. Zero-Knowledge Device-to-Device Key Grant (Phone B -> Computer C via ECDH P-256 + HKDF + AES-256-GCM + 6-digit SAS + Reverse QR)
     {
@@ -3416,7 +3651,7 @@ async function main() {
         jwtSecret: 'grant-smoke-jwt-secret-0123456789',
         adminBootstrapToken: 'grant-bootstrap-99',
         accountsFile: join(tmpDir, 'grant-accounts.json'),
-        uploadDir: join(tmpDir, 'grant-uploads'),
+        stunEnabled: false,
       })
       const grantSockets = []
       const openGrantWs = async (gBase, token, devName, kind = 'web') => {
@@ -5208,10 +5443,14 @@ async function main() {
         symlinkSync(keyTarget, fakePdfLink)
         await assert.rejects(() => docOrch.readLocalFile({ path: fakePdfLink, cwd: docDir, mode: 'document' }), /符号链接指向不允许的格式/)
 
-        // 32f. Oversized document (> 10MB) rejected cleanly
+        // 32f. Large deliverable (> 128KB, even > 10MB!) switches cleanly to `transferMode: 'p2p-bulk'` (no server cap!)
         const hugePpt = join(docDir, 'huge-deck.pptx')
         writeFileSync(hugePpt, Buffer.alloc(10 * 1024 * 1024 + 65536, 0x41))
-        await assert.rejects(() => docOrch.readLocalFile({ path: hugePpt, cwd: docDir, mode: 'document' }), /超出限制.*10MB/)
+        const hugeRes = await docOrch.readLocalFile({ path: hugePpt, cwd: docDir, mode: 'document' })
+        assert.equal(hugeRes.ok, true)
+        assert.equal(hugeRes.transferMode, 'p2p-bulk')
+        assert.equal(hugeRes.size, 10 * 1024 * 1024 + 65536)
+        assert.ok(hugeRes._localRealPath, 'p2p-bulk descriptor must carry internal canonical path for P2PBridgeManager')
 
         // 32g. Frontend deliverable extractor: keeps real deliverables, filters boilerplate & external URLs
         const extracted = extractDeliverableRefsFromMessage({
@@ -5249,709 +5488,222 @@ async function main() {
     }
     console.log('[smoke] 32/32 Deliverable document E2EE download (HTML/PDF/Word/Excel/PPT, 10MB cap, security guards & extractor) OK')
 
-    // 33. Per-room sliding-window traffic quota, upload rate limit (429), WS large-frame guard & admin metrics
+    // 33. Built-in Stateless RFC 5389 STUN Server (UDP) & Pure Control Plane Mode (v1.0.0)
     {
-      let mockNow = 1_700_000_000_000
-      const tg = new RelayTrafficGuard({
-        burstLimitBytes: 1024 * 1024, // 1 MB / 10m
-        dailyLimitBytes: 3 * 1024 * 1024, // 3 MB / 24h
-        uploadMaxPerMinute: 2,
-        largeFrameThresholdBytes: 256 * 1024,
-        hardDisconnectMultiplier: 2,
-        adminExempt: true,
-        nowFn: () => mockNow,
-      })
-
-      // 33a. Upload per-minute rate limit triggers on 3rd attempt in 60s
-      assert.equal(tg.consumeUploadPost('usr_normal', 100 * 1024).allowed, true)
-      assert.equal(tg.consumeUploadPost('usr_normal', 100 * 1024).allowed, true)
-      const rateBlocked = tg.consumeUploadPost('usr_normal', 100 * 1024)
-      assert.equal(rateBlocked.allowed, false)
-      assert.equal(rateBlocked.code, 'UPLOAD_RATE_LIMIT')
-      assert.ok(rateBlocked.retryAfterSec >= 1)
-
-      // Advance 61s -> upload rate window clears, cumulative bytes still in 10m window
-      mockNow += 61_000
-      assert.equal(tg.consumeUploadPost('usr_normal', 600 * 1024).allowed, true) // total 800KB in 10m
-
-      // 33b. Large WS frame (>256KB) pushing over 1MB burst limit is blocked, while small text chat (<256KB) stays online
-      const bigWsBlocked = tg.consumeBytes('usr_normal', 300 * 1024)
-      assert.equal(bigWsBlocked.allowed, false)
-      assert.equal(bigWsBlocked.hardKick, false)
-      assert.equal(bigWsBlocked.code, 'TRAFFIC_QUOTA_EXCEEDED')
-
-      const smallChatOk = tg.consumeBytes('usr_normal', 4 * 1024)
-      assert.equal(smallChatOk.allowed, true)
-
-      // 33c. Persistent flood exceeding 2x burst limit triggers hardKick
-      const floodKick = tg.consumeBytes('usr_normal', 1500 * 1024)
-      assert.equal(floodKick.allowed, false)
-      assert.equal(floodKick.hardKick, true)
-
-      // 33d. Admin account is exempted from blocking while still metered
-      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
-      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
-      assert.equal(tg.consumeUploadPost('usr_admin', 5 * 1024 * 1024, { isAdmin: true }).allowed, true)
-      assert.equal(tg.getRoomUsage('usr_admin').bytes24h, 15 * 1024 * 1024)
-
-      // 33e. Live Relay HTTP /api/uploads 429 enforcement & admin overview traffic metrics
-      const quotaDir = join(tmpDir, 'quota-relay')
-      mkdirSync(quotaDir, { recursive: true })
-      const quotaRelay = createRelayServer({
+      const stunDir = join(tmpDir, 'stun-control')
+      mkdirSync(stunDir, { recursive: true })
+      const stunRelay = createRelayServer({
         port: 0,
         host: '127.0.0.1',
-        jwtSecret: 'smoke-quota-secret-123456',
-        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
-        accountsFile: join(quotaDir, 'accounts.json'),
-        uploadDir: join(quotaDir, 'uploads'),
-        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
-        trafficGuard: {
-          burstLimitBytes: 512 * 1024,
-          dailyLimitBytes: 1024 * 1024,
-          uploadMaxPerMinute: 2,
-          adminExempt: true,
-        },
+        jwtSecret: 'smoke-stun-secret-123456',
+        adminBootstrapToken: 'STUN-BOOT-1',
+        accountsFile: join(stunDir, 'accounts.json'),
+        publicRelayUrl: 'https://stun-host.example.com',
+        stunEnabled: true,
+        stunPort: 0,
       })
-      const qAddr = await quotaRelay.start()
-      const qBase = `http://127.0.0.1:${qAddr.port}`
+      const { port: sPort, stunPort } = await stunRelay.start()
+      const sBase = `http://127.0.0.1:${sPort}`
       try {
-        const qAdminReg = await (await fetch(`${qBase}/api/account/register`, {
+        assert.ok(stunPort > 0, 'Built-in STUN server must bind an active UDP port')
+
+        // 33a. Send real RFC 5389 STUN Binding Request over UDP and verify XOR-MAPPED-ADDRESS
+        const udp = dgram.createSocket('udp4')
+        try {
+          await new Promise((r) => udp.bind(0, '127.0.0.1', r))
+          const localUdpPort = udp.address().port
+          const req = Buffer.alloc(20)
+          req.writeUInt16BE(0x0001, 0)
+          req.writeUInt16BE(0, 2)
+          req.writeUInt32BE(0x2112a442, 4)
+          for (let i = 0; i < 12; i += 1) req[8 + i] = i + 1
+          const resp = await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error('STUN timeout')), 3000)
+            udp.once('message', (msg) => { clearTimeout(t); resolve(msg) })
+            udp.send(req, stunPort, '127.0.0.1')
+          })
+          assert.equal(resp.readUInt16BE(0), 0x0101, 'STUN response must be Binding Success (0x0101)')
+          assert.equal(resp.readUInt32BE(4), 0x2112a442, 'STUN magic cookie must match')
+          assert.ok(resp.subarray(8, 20).equals(req.subarray(8, 20)), 'STUN Transaction ID must echo verbatim')
+          assert.equal(resp.readUInt16BE(20), 0x0020, 'Attribute must be XOR-MAPPED-ADDRESS (0x0020)')
+          const xPort = resp.readUInt16BE(26) ^ 0x2112
+          assert.equal(xPort, localUdpPort, 'Decoded XOR port must match sender UDP port')
+          const ipBytes = [resp[28] ^ 0x21, resp[29] ^ 0x12, resp[30] ^ 0xa4, resp[31] ^ 0x42]
+          assert.equal(ipBytes.join('.'), '127.0.0.1', 'Decoded XOR IPv4 must match 127.0.0.1')
+        } finally {
+          udp.close()
+        }
+
+        // 33b. Verify Control WS hello advertises p2p-only mode + built-in STUN in iceServers + admin overview STUN stats
+        const sAdmin = await (await fetch(`${sBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'q_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
+          body: JSON.stringify({ username: 'stun_admin', password: 'StunPassword123!', inviteCode: 'STUN-BOOT-1' }),
         })).json()
-        assert.equal(qAdminReg.ok, true)
-        const qInv = await (await fetch(`${qBase}/api/admin/invites`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdminReg.token}` },
-          body: JSON.stringify({ count: 1 }),
-        })).json()
-        const qUserReg = await (await fetch(`${qBase}/api/account/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            username: 'q_user',
-            password: SMOKE_ADMIN_PASS,
-            inviteCode: qInv.invites[0].code,
-          }),
-        })).json()
-        assert.equal(qUserReg.ok, true)
+        assert.equal(sAdmin.ok, true)
 
-        const tinyPayload = JSON.stringify({
-          encrypted: true,
-          dataBase64: Buffer.alloc(4096, 0x61).toString('base64'),
-        })
-        const u1 = await fetch(`${qBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
-          body: tinyPayload,
-        })
-        const u2 = await fetch(`${qBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
-          body: tinyPayload,
-        })
-        const u3 = await fetch(`${qBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qUserReg.token}` },
-          body: tinyPayload,
-        })
-        assert.equal(u1.status, 200)
-        assert.equal(u2.status, 200)
-        assert.equal(u3.status, 429, '3rd upload within 1 minute must return HTTP 429')
-        assert.ok(Number(u3.headers.get('retry-after')) >= 1)
+        const sCli = await openTicketClientWs(sBase, sPort, sAdmin.token, { deviceName: 'stun-check' })
+        try {
+          assert.equal(sCli.hello.mode, 'p2p-only')
+          assert.equal(sCli.hello.protocolVersion, 1)
+          assert.ok(Array.isArray(sCli.hello.iceServers) && sCli.hello.iceServers.length >= 1)
+          const hasSelfStun = sCli.hello.iceServers.some((s) =>
+            String(s.urls || '').includes(`stun:stun-host.example.com:${stunPort}`),
+          )
+          assert.equal(hasSelfStun, true, 'hello.iceServers must prioritize self-hosted STUN server')
+        } finally {
+          await sCli.closeAll()
+        }
 
-        const ovRes = await (await fetch(`${qBase}/api/admin/overview`, {
-          headers: { Authorization: `Bearer ${qAdminReg.token}` },
+        const sOv = await (await fetch(`${sBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${sAdmin.token}` },
         })).json()
-        assert.equal(ovRes.ok, true)
-        assert.ok(ovRes.summary.totalTraffic24hBytes >= 8192)
-        assert.ok(ovRes.summary.totalThrottledCount >= 1)
-        const trackedUser = ovRes.users.find((u) => u.username === 'q_user')
-        assert.ok(trackedUser?.stats?.traffic?.bytes24h >= 8192)
-        assert.ok(trackedUser?.stats?.traffic?.throttledCount >= 1)
+        assert.equal(sOv.ok, true)
+        assert.equal(sOv.server.mode, 'p2p-only')
+        assert.equal(sOv.server.stun.enabled, true)
+        assert.equal(sOv.server.stun.port, stunPort)
+        assert.ok(sOv.server.stun.requests >= 1, 'Admin overview must record STUN binding hit count')
+        assert.equal(sOv.server.storage.uploadFileCount, 0)
       } finally {
-        await quotaRelay.close()
+        await stunRelay.close()
       }
     }
-    console.log('[smoke] 33/33 Relay per-room traffic quota, upload 429 rate limit, WS flood guard & admin traffic metrics OK')
+    console.log('[smoke] 33/34 Built-in stateless RFC 5389 STUN (UDP) & pure Control Plane hello.iceServers OK')
 
-    // 34. Four-tier user system (free / pro / ultra / admin): Pro 5GB/month + 10x daily, Ultra & Admin unlimited, persistent monthly usage & live tier API
+    // 34. Full-Duplex AIO-P2P v1 E2E: 5MB AIO2 PC->Phone download, 5MB AIO2 Phone->PC upload, 48KB ctrl fragmentation & <200ms instant revocation
     {
-      const tierDir = join(tmpDir, 'tier-relay')
-      mkdirSync(tierDir, { recursive: true })
-      const tierStateFile = join(tierDir, 'traffic-usage.json')
-
-      // 34a. Unit verification of all 4 tiers, Free 1GB/month default, Pro 5GB/month + 10x daily, disk persistence & calendar-month auto-reset
-      const tgDefaults = new RelayTrafficGuard()
-      assert.equal(tgDefaults.getLimitsForTier('free').monthlyBytes, 1024 * 1024 * 1024, 'Default free monthly limit must be 1 GB')
-      assert.equal(tgDefaults.getLimitsForTier('pro').monthlyBytes, 5 * 1024 * 1024 * 1024, 'Default Pro monthly limit must be 5 GB')
-      assert.equal(tgDefaults.getLimitsForTier('pro').daily24hBytes, tgDefaults.getLimitsForTier('free').daily24hBytes * 10)
-
-      let mockNow = new Date('2026-03-15T10:00:00Z').getTime()
-      const tg1 = new RelayTrafficGuard({
-        burstLimitBytes: 100 * 1024, // 100 KB / 10m (free) -> 1000 KB / 10m (pro)
-        dailyLimitBytes: 200 * 1024, // 200 KB / 24h (free) -> 2000 KB / 24h (pro = 10x)
-        monthlyLimitBytes: 300 * 1024, // 300 KB / month (free) for fast deterministic test
-        proMonthlyLimitBytes: 3 * 1024 * 1024, // 3 MB / month (pro) for fast deterministic test
-        uploadMaxPerMinute: 2, // 2/min (free) -> 10/min (pro)
-        largeFrameThresholdBytes: 64 * 1024,
-        hardDisconnectMultiplier: 2,
-        adminExempt: true,
-        stateFile: tierStateFile,
-        saveDebounceMs: 60_000,
-        nowFn: () => mockNow,
-      })
-
-      // Verify effective limits for all 4 tiers
-      assert.equal(tg1.getLimitsForTier('free').daily24hBytes, 200 * 1024)
-      assert.equal(tg1.getLimitsForTier('free').monthlyBytes, 300 * 1024)
-      assert.equal(tg1.getLimitsForTier('pro').daily24hBytes, 200 * 1024 * 10, 'Pro daily limit must be 10x normal user')
-      assert.equal(tg1.getLimitsForTier('pro').burst10mBytes, 100 * 1024 * 10, 'Pro 10m burst limit must be 10x normal user')
-      assert.equal(tg1.getLimitsForTier('pro').monthlyBytes, 3 * 1024 * 1024)
-      assert.equal(tg1.getLimitsForTier('ultra').unlimited, true, 'Ultra tier must be unlimited')
-      assert.equal(tg1.getLimitsForTier('admin').unlimited, true, 'Admin tier must be unlimited')
-
-      // Free user hits 100KB burst immediately on 120KB frame
-      assert.equal(tg1.consumeBytes('usr_t_free', 120 * 1024, { tier: 'free' }).allowed, false)
-
-      // Free user accumulates 200KB on day 1, then on day 2 hits 300KB monthly cap even though 24h window cleared
-      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true)
-      mockNow += 11 * 60 * 1000
-      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true) // 180KB
-      mockNow += 25 * 60 * 60 * 1000 // +25h -> 24h cleared, monthly still 180KB
-      assert.equal(tg1.consumeBytes('usr_t_free_mo', 90 * 1024, { tier: 'free' }).allowed, true) // 270KB / 300KB
-      mockNow += 11 * 60 * 1000
-      const freeMonthBlocked = tg1.consumeBytes('usr_t_free_mo', 70 * 1024, { tier: 'free' })
-      assert.equal(freeMonthBlocked.allowed, false, 'Free user exceeding monthly cap must be blocked')
-      assert.equal(freeMonthBlocked.quotaWindow, 'month')
-      assert.equal(freeMonthBlocked.hardKick, false, 'Soft monthly block must not hard-kick free user')
-      assert.equal(tg1.consumeBytes('usr_t_free_mo', 4 * 1024, { tier: 'free' }).allowed, true, 'Small chat must still pass')
-
-      // Pro user easily transfers 900KB in 10m & 1.8MB in 24h (well above free's 200KB daily limit)
-      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true)
-      mockNow += 11 * 60 * 1000 // +11m -> burst resets, still same 24h
-      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true) // 1.8MB in 24h (<= 2000KB)
-      mockNow += 11 * 60 * 1000 // +11m -> burst resets again, 24h total still 1.8MB
-      // Pushing past Pro's 2000KB daily cap blocks with quotaWindow === '24h'
-      const proDayBlocked = tg1.consumeBytes('usr_t_pro', 300 * 1024, { tier: 'pro' })
-      assert.equal(proDayBlocked.allowed, false)
-      assert.equal(proDayBlocked.quotaWindow, '24h')
-
-      // Advance 25 hours -> 24h window clears, but monthly total (1.8MB) remains!
-      mockNow += 25 * 60 * 60 * 1000
-      assert.equal(tg1.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' }).allowed, true) // 2.7MB / 3MB monthly
-      tg1.flush()
-
-      // Reload into a fresh RelayTrafficGuard instance (simulating server restart)
-      const tg2 = new RelayTrafficGuard({
-        burstLimitBytes: 100 * 1024,
-        dailyLimitBytes: 200 * 1024,
-        monthlyLimitBytes: 300 * 1024,
-        proMonthlyLimitBytes: 3 * 1024 * 1024,
-        uploadMaxPerMinute: 2,
-        largeFrameThresholdBytes: 64 * 1024,
-        hardDisconnectMultiplier: 2,
-        adminExempt: true,
-        stateFile: tierStateFile,
-        nowFn: () => mockNow,
-      })
-      assert.equal(tg2.getRoomUsage('usr_t_free_mo', 'free').bytesMonth, 274 * 1024, 'Free monthly usage must persist across restarts')
-      assert.equal(tg2.getRoomUsage('usr_t_pro', 'pro').bytesMonth, 2700 * 1024, 'Monthly usage must persist across restarts')
-      const proMonthBlocked = tg2.consumeBytes('usr_t_pro', 500 * 1024, { tier: 'pro' })
-      assert.equal(proMonthBlocked.allowed, false, 'Pro user exceeding monthly cap must be blocked')
-      assert.equal(proMonthBlocked.quotaWindow, 'month')
-      assert.equal(proMonthBlocked.hardKick, false, 'Soft monthly block must not hard-kick')
-      // Small chat frame still allowed even when monthly file quota reached
-      assert.equal(tg2.consumeBytes('usr_t_pro', 4 * 1024, { tier: 'pro' }).allowed, true)
-
-      // Advance to next calendar month (April 2026) -> monthly usage auto-resets!
-      mockNow = new Date('2026-04-02T10:00:00Z').getTime()
-      const nextMonthOk = tg2.consumeBytes('usr_t_pro', 900 * 1024, { tier: 'pro' })
-      assert.equal(nextMonthOk.allowed, true, 'Pro monthly quota must reset on new calendar month')
-      assert.equal(tg2.getRoomUsage('usr_t_pro', 'pro').bytesMonth, 900 * 1024)
-
-      // Ultra & Admin are never throttled even past 20MB, yet remain metered
-      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
-      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
-      assert.equal(tg2.consumeUploadPost('usr_t_ultra', 10 * 1024 * 1024, { tier: 'ultra' }).allowed, true)
-      assert.equal(tg2.getRoomUsage('usr_t_ultra', 'ultra').bytesMonth, 30 * 1024 * 1024)
-      assert.equal(tg2.getRoomUsage('usr_t_ultra', 'ultra').unlimited, true)
-      assert.equal(tg2.consumeUploadPost('usr_t_admin', 10 * 1024 * 1024, { tier: 'admin' }).allowed, true)
-      assert.equal(tg2.getRoomUsage('usr_t_admin', 'admin').unlimited, true)
-
-      // 34b. Live HTTP APIs: tiered invites, strict non-admin isolation for Pro/Ultra, live tier switching & overview
-      const tierRelay = createRelayServer({
-        port: 0,
-        host: '127.0.0.1',
-        jwtSecret: 'smoke-tier-secret-123456',
-        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
-        accountsFile: join(tierDir, 'accounts.json'),
-        uploadDir: join(tierDir, 'uploads'),
-        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
-        trafficGuard: {
-          burstLimitBytes: 128 * 1024,
-          dailyLimitBytes: 256 * 1024,
-          monthlyLimitBytes: 1024 * 1024,
-          proMonthlyLimitBytes: 5 * 1024 * 1024,
-          uploadMaxPerMinute: 2,
-          adminExempt: true,
-        },
-      })
-      const tAddr = await tierRelay.start()
-      const tBase = `http://127.0.0.1:${tAddr.port}`
-      try {
-        const tAdmin = await (await fetch(`${tBase}/api/account/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 't_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
-        })).json()
-        assert.equal(tAdmin.ok, true)
-        assert.equal(tAdmin.user.tier, 'admin')
-
-        const [invFree, invPro, invUltra] = await Promise.all([
-          fetch(`${tBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'free', note: 'free-inv' }),
-          }).then((r) => r.json()),
-          fetch(`${tBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'pro', note: 'pro-inv' }),
-          }).then((r) => r.json()),
-          fetch(`${tBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'ultra', note: 'ultra-inv' }),
-          }).then((r) => r.json()),
-        ])
-        assert.equal(invFree.invites[0].tier, 'free')
-        assert.equal(invPro.invites[0].tier, 'pro')
-        assert.equal(invPro.invites[0].grantAdmin, false)
-        assert.equal(invUltra.invites[0].tier, 'ultra')
-        assert.equal(invUltra.invites[0].grantAdmin, false)
-
-        const [uFree, uPro, uUltra] = await Promise.all([
-          fetch(`${tBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 't_free', password: SMOKE_ADMIN_PASS, inviteCode: invFree.invites[0].code }),
-          }).then((r) => r.json()),
-          fetch(`${tBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 't_pro', password: SMOKE_ADMIN_PASS, inviteCode: invPro.invites[0].code }),
-          }).then((r) => r.json()),
-          fetch(`${tBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 't_ultra', password: SMOKE_ADMIN_PASS, inviteCode: invUltra.invites[0].code }),
-          }).then((r) => r.json()),
-        ])
-        assert.equal(uFree.user.tier, 'free')
-        assert.equal(uFree.user.role, 'user')
-        assert.equal(uPro.user.tier, 'pro')
-        assert.equal(uPro.user.role, 'user')
-        assert.equal(uUltra.user.tier, 'ultra')
-        assert.equal(uUltra.user.role, 'user')
-
-        // Pro and Ultra users must NEVER gain admin API access
-        const proAdminTry = await fetch(`${tBase}/api/admin/overview`, {
-          headers: { Authorization: `Bearer ${uPro.token}` },
-        })
-        const ultraAdminTry = await fetch(`${tBase}/api/admin/overview`, {
-          headers: { Authorization: `Bearer ${uUltra.token}` },
-        })
-        assert.equal(proAdminTry.status, 403, 'Pro user must get 403 on admin endpoints')
-        assert.equal(ultraAdminTry.status, 403, 'Ultra user must get 403 on admin endpoints')
-
-        // /api/auth/me exposes tier & traffic snapshot for both free and pro users
-        const [freeMe, proMe] = await Promise.all([
-          fetch(`${tBase}/api/auth/me`, {
-            headers: { Authorization: `Bearer ${uFree.token}` },
-          }).then((r) => r.json()),
-          fetch(`${tBase}/api/auth/me`, {
-            headers: { Authorization: `Bearer ${uPro.token}` },
-          }).then((r) => r.json()),
-        ])
-        assert.equal(freeMe.tier, 'free')
-        assert.equal(freeMe.traffic.limitMonthBytes, 1024 * 1024)
-        assert.equal(proMe.tier, 'pro')
-        assert.equal(proMe.traffic.limitMonthBytes, 5 * 1024 * 1024)
-        assert.equal(proMe.traffic.limit24hBytes, 256 * 1024 * 10)
-
-        // Upload rate enforcement: free user hits 429 on 3rd upload, while pro & ultra pass 3+ uploads cleanly
-        const sampleBody = JSON.stringify({ encrypted: true, dataBase64: Buffer.alloc(4096, 0x62).toString('base64') })
-        for (let i = 0; i < 3; i += 1) {
-          const rPro = await fetch(`${tBase}/api/uploads`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uPro.token}` },
-            body: sampleBody,
-          })
-          assert.equal(rPro.status, 200, `Pro upload #${i + 1} must succeed`)
-          const rUltra = await fetch(`${tBase}/api/uploads`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uUltra.token}` },
-            body: sampleBody,
-          })
-          assert.equal(rUltra.status, 200, `Ultra upload #${i + 1} must succeed`)
-        }
-        await fetch(`${tBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
-          body: sampleBody,
-        })
-        await fetch(`${tBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
-          body: sampleBody,
-        })
-        const freeBlocked = await fetch(`${tBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
-          body: sampleBody,
-        })
-        assert.equal(freeBlocked.status, 429, 'Free user must hit 429 on 3rd upload/min')
-
-        // Admin cannot demote self
-        const selfDemote = await fetch(`${tBase}/api/admin/users/set-tier`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
-          body: JSON.stringify({ userId: tAdmin.user.userId, tier: 'ultra' }),
-        })
-        assert.equal(selfDemote.status, 400, 'Admin must not be allowed to demote themselves')
-
-        // Live upgrade free -> ultra immediately lifts rate limit with zero re-login
-        const upgradeRes = await (await fetch(`${tBase}/api/admin/users/set-tier`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tAdmin.token}` },
-          body: JSON.stringify({ userId: uFree.user.userId, tier: 'ultra' }),
-        })).json()
-        assert.equal(upgradeRes.ok, true)
-        assert.equal(upgradeRes.prevTier, 'free')
-        assert.equal(upgradeRes.tier, 'ultra')
-        assert.equal(upgradeRes.user.role, 'user')
-
-        const freeNowUltraUpload = await fetch(`${tBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${uFree.token}` },
-          body: sampleBody,
-        })
-        assert.equal(freeNowUltraUpload.status, 200, 'Upgrading user to Ultra must lift limits immediately')
-
-        // Admin overview reports tier distribution and monthly totals
-        const ovTier = await (await fetch(`${tBase}/api/admin/overview`, {
-          headers: { Authorization: `Bearer ${tAdmin.token}` },
-        })).json()
-        assert.equal(ovTier.ok, true)
-        assert.deepEqual(ovTier.summary.tierDistribution, { free: 0, pro: 1, ultra: 2, admin: 1 })
-        assert.ok(ovTier.summary.totalTrafficMonthBytes >= 4096 * 9)
-        const proRow = ovTier.users.find((u) => u.username === 't_pro')
-        assert.equal(proRow.tier, 'pro')
-        assert.equal(proRow.stats.traffic.limitMonthBytes, 5 * 1024 * 1024)
-      } finally {
-        await tierRelay.close()
+      // 34a. Control channel 48KB SCTP automatic fragmentation & reassembly unit check
+      const encCodec = createCtrlCodec()
+      const decCodec = createCtrlCodec()
+      const bigPayload = { type: 'rpc.res', id: 'frag-1', blob: 'X'.repeat(150 * 1024) }
+      const frames = encCodec.encode(bigPayload)
+      assert.ok(frames.length >= 4, '150KB control payload must split into >=4 SCTP-safe fragments')
+      let reassembled = null
+      for (const f of frames) {
+        assert.ok(f.length <= 49 * 1024, 'Each control fragment must remain safely under SCTP limit')
+        reassembled = decCodec.decode(f)
       }
-    }
-    console.log('[smoke] 34/34 Four-tier user quotas (Free / Pro 5GB-mo+10x-day / Ultra / Admin), monthly persistence & live tier API OK')
+      assert.deepEqual(reassembled, bigPayload, 'Fragmented control JSON must reassemble losslessly')
 
-    // 35. Per-tier single-file limits (Free 15MB/10MB, Pro 100MB, Ultra/Admin 1GB), AIO2 chunked E2EE & streaming relay transfer
-    {
-      const { encryptChunkedBytes, decryptAutoStream } = await import('../packages/shared/src/e2ee.js')
+      // 34b. 5.2MB PC->Phone bulk download + 5.1MB Phone->PC bulk upload over WebRTC P2P aio-bulk (0 server bytes!)
+      const p2pDir = join(tmpDir, 'p2p-bulk-workspace')
+      mkdirSync(p2pDir, { recursive: true })
+      const bigPdfBuf = Buffer.alloc(5 * 1024 * 1024 + 200_000)
+      for (let i = 0; i < bigPdfBuf.length; i += 1) bigPdfBuf[i] = (i * 31 + 17) & 0xff
+      const bigPdfPath = join(p2pDir, 'annual-report.pdf')
+      writeFileSync(bigPdfPath, bigPdfBuf)
+      const expectedPdfSha = createHash('sha256').update(bigPdfBuf).digest('hex')
 
-      // 35a. Verify default per-tier single-file caps
-      const tgFileDef = new RelayTrafficGuard()
-      assert.equal(tgFileDef.getLimitsForTier('free').maxUploadBytes, 15 * 1024 * 1024)
-      assert.equal(tgFileDef.getLimitsForTier('free').maxDocumentBytes, 10 * 1024 * 1024)
-      assert.equal(tgFileDef.getLimitsForTier('pro').maxUploadBytes, 100 * 1024 * 1024)
-      assert.equal(tgFileDef.getLimitsForTier('pro').maxDocumentBytes, 100 * 1024 * 1024)
-      assert.equal(tgFileDef.getLimitsForTier('ultra').maxUploadBytes, 1024 * 1024 * 1024)
-      assert.equal(tgFileDef.getLimitsForTier('admin').maxUploadBytes, 1024 * 1024 * 1024)
-
-      // 35b. Verify AIO2 chunked E2EE encryption & streaming decryption across fragmented boundaries + tamper rejection
-      const chunkKey = generateE2eeKey()
-      const plainSample = new Uint8Array(70_000)
-      for (let i = 0; i < plainSample.length; i += 1) plainSample[i] = (i * 31 + 7) & 0xff
-      const encChunked = await encryptChunkedBytes(chunkKey, plainSample, {
-        kind: 'upload',
-        roomId: 'usr_chunk_test',
-        chunkSize: 16 * 1024,
-      })
-      assert.equal(encChunked.v, 2)
-      assert.equal(encChunked.chunked, true)
-      assert.equal(encChunked.totalChunks, 5)
-      const combinedCipher = Buffer.concat(encChunked.chunks.map((c) => Buffer.from(c)))
-      // Feed tiny 137-byte fragments to stress-test ByteQueue reassembly
-      const fragStream = (async function* () {
-        for (let off = 0; off < combinedCipher.length; off += 137) {
-          yield combinedCipher.subarray(off, Math.min(combinedCipher.length, off + 137))
-        }
-      })()
-      const decRes = await decryptAutoStream(chunkKey, fragStream, {
-        iv: encChunked.iv,
-        kid: encChunked.kid,
-        kind: 'upload',
-        roomId: 'usr_chunk_test',
-      })
-      assert.equal(decRes.totalPlainBytes, plainSample.length)
-      assert.ok(Buffer.compare(Buffer.concat(decRes.chunks.map((c) => Buffer.from(c))), Buffer.from(plainSample)) === 0)
-      // Truncated ciphertext must be rejected
-      await assert.rejects(
-        () =>
-          decryptAutoStream(chunkKey, combinedCipher.subarray(0, combinedCipher.length - 10), {
-            iv: encChunked.iv,
-            kid: encChunked.kid,
-            kind: 'upload',
-            roomId: 'usr_chunk_test',
-            chunked: true,
-          }),
-        /不完整|截断|失败/,
-      )
-
-      // 35c. Live Relay binary streaming upload per-tier enforcement + large-document transferMode:'upload' + consume=1 + live tier.update
-      const flDir = join(tmpDir, 'file-limit-relay')
-      mkdirSync(flDir, { recursive: true })
-      const flRelay = createRelayServer({
-        port: 0,
-        host: '127.0.0.1',
-        jwtSecret: 'smoke-file-limit-secret-123456',
-        adminBootstrapToken: TEST_BOOTSTRAP_TOKEN,
-        accountsFile: join(flDir, 'accounts.json'),
-        uploadDir: join(flDir, 'uploads'),
-        staticDir: join(process.cwd(), 'packages/mobile-app/dist'),
-        trafficGuard: {
-          freeMaxUploadBytes: 1 * 1024 * 1024, // 1 MB for fast test
-          freeMaxDocumentBytes: 1 * 1024 * 1024,
-          proMaxFileBytes: 15 * 1024 * 1024, // 15 MB for fast test
-          ultraMaxFileBytes: 30 * 1024 * 1024, // 30 MB for fast test
-          adminMaxFileBytes: 30 * 1024 * 1024,
-          burstLimitBytes: 100 * 1024 * 1024,
-          dailyLimitBytes: 200 * 1024 * 1024,
-          monthlyLimitBytes: 500 * 1024 * 1024,
-          proMonthlyLimitBytes: 500 * 1024 * 1024,
-          uploadMaxPerMinute: 100,
-        },
-      })
-      const flAddr = await flRelay.start()
-      const flBase = `http://127.0.0.1:${flAddr.port}`
-      const flWs = `ws://127.0.0.1:${flAddr.port}/ws/bridge`
-      let flBridge = null
+      const p2pCli = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'p2p-bulk-phone' })
       try {
-        const flAdmin = await (await fetch(`${flBase}/api/account/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'fl_admin', password: SMOKE_ADMIN_PASS, inviteCode: TEST_BOOTSTRAP_TOKEN }),
-        })).json()
-        const [flInvFree, flInvPro, flInvUltra] = await Promise.all([
-          fetch(`${flBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'free' }),
-          }).then((r) => r.json()),
-          fetch(`${flBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'pro' }),
-          }).then((r) => r.json()),
-          fetch(`${flBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'ultra' }),
-          }).then((r) => r.json()),
-        ])
-        const [flFree, flPro, flUltra] = await Promise.all([
-          fetch(`${flBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'fl_free', password: SMOKE_ADMIN_PASS, inviteCode: flInvFree.invites[0].code }),
-          }).then((r) => r.json()),
-          fetch(`${flBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'fl_pro', password: SMOKE_ADMIN_PASS, inviteCode: flInvPro.invites[0].code }),
-          }).then((r) => r.json()),
-          fetch(`${flBase}/api/account/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'fl_ultra', password: SMOKE_ADMIN_PASS, inviteCode: flInvUltra.invites[0].code }),
-          }).then((r) => r.json()),
-        ])
-
-        // Raw binary without X-Allinone-Encrypted: 1 must be rejected with 400
-        const unencBin = await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream', Authorization: `Bearer ${flFree.token}` },
-          body: Buffer.alloc(1024, 0x41),
+        const peer = await p2pCli.connectP2p({
+          bridgeId: smokeDev.bridgeId,
+          e2eeKey: primaryE2eeKey,
+          roomId: smokeAdmin.roomId,
         })
-        assert.equal(unencBin.status, 400)
 
-        // 2 MB binary upload: Free (1 MB limit) -> 413, Pro (15 MB limit) -> 200
-        const twoMb = Buffer.alloc(2 * 1024 * 1024, 0x55)
-        const freeOver = await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Allinone-Encrypted': '1',
-            Authorization: `Bearer ${flFree.token}`,
-          },
-          body: twoMb,
+        // PC -> Phone 5.2MB AIO2 chunked streaming download over aio-bulk
+        const metaRes = await peer.sendEncryptedRpc(RPC.FILE_READ, {
+          path: bigPdfPath,
+          cwd: p2pDir,
+          mode: 'document',
         })
-        assert.equal(freeOver.status, 413, 'Free user exceeding 1MB test cap must get 413')
+        assert.equal(metaRes.ok, true)
+        assert.equal(metaRes.transferMode, 'p2p-bulk')
+        assert.equal(metaRes._localRealPath, undefined, 'Internal canonical path must NEVER leak to client')
+        assert.ok(Number.isInteger(metaRes.streamId) && metaRes.streamId > 0)
 
-        const proOk = await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Allinone-Encrypted': '1',
-            Authorization: `Bearer ${flPro.token}`,
-          },
-          body: twoMb,
-        })
-        assert.equal(proOk.status, 200, 'Pro user within 15MB test cap must succeed')
-
-        // 18 MB binary upload: Pro (15 MB limit) -> 413, Ultra (30 MB limit) -> 200
-        const eighteenMb = Buffer.alloc(18 * 1024 * 1024, 0x77)
-        const proOver = await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Allinone-Encrypted': '1',
-            Authorization: `Bearer ${flPro.token}`,
-          },
-          body: eighteenMb,
-        })
-        assert.equal(proOver.status, 413, 'Pro user exceeding 15MB test cap must get 413')
-
-        const ultraOk = await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Allinone-Encrypted': '1',
-            Authorization: `Bearer ${flUltra.token}`,
-          },
-          body: eighteenMb,
-        })
-        assert.equal(ultraOk.status, 200, 'Ultra user within 30MB test cap must succeed')
-
-        // Bind a bridge for fl_free, verify bridge.welcome sets 1MB cap, then live-upgrade fl_free -> pro
-        // and verify tier.update pushes 15MB cap to bridge AND allows 12MB PDF transfer via transferMode:'upload'
-        const devBind = await (await fetch(`${flBase}/api/account/device-login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'fl_free', password: SMOKE_ADMIN_PASS, label: 'FL-PC' }),
-        })).json()
-        assert.equal(devBind.ok, true)
-        const flKey = generateE2eeKey()
-        flBridge = startStandaloneBridge({
-          relayUrl: flWs,
-          secret: devBind.deviceSecret,
-          roomId: devBind.roomId,
-          bridgeId: devBind.bridgeId,
-          e2eeKey: flKey,
-          cwd: flDir,
-          inboundDir: join(flDir, 'inbound'),
-          quiet: true,
-        })
-        const waitUntil = async (pred, timeoutMs = 5000) => {
-          const deadline = Date.now() + timeoutMs
-          while (Date.now() < deadline) {
-            if (pred()) return
-            await new Promise((r) => setTimeout(r, 25))
-          }
-          throw new Error('Timed out waiting for condition')
-        }
-        await waitUntil(() => flBridge.orchestrator.fileLimits.maxDocumentBytes === 1 * 1024 * 1024, 5000)
-
-        const bigPdfPath = join(flDir, 'report-12mb.pdf')
-        const bigPdfBuf = Buffer.alloc(12 * 1024 * 1024, 0x25)
-        bigPdfBuf.write('%PDF-1.7\n', 0, 'ascii')
-        writeFileSync(bigPdfPath, bigPdfBuf)
-
-        // While Free, reading 12MB PDF must fail with size limit error
-        await assert.rejects(
-          () => flBridge.orchestrator.readLocalFile({ path: bigPdfPath, cwd: flDir, mode: 'document' }),
-          /超出限制/,
+        const downloadedBuf = await peer.downloadBulkStream(metaRes.streamId)
+        assert.equal(downloadedBuf.length, bigPdfBuf.length, 'Downloaded P2P bulk length must match 5.2MB file')
+        assert.equal(
+          createHash('sha256').update(downloadedBuf).digest('hex'),
+          expectedPdfSha,
+          'Downloaded P2P bulk SHA-256 must match PC file byte-for-byte',
         )
 
-        // Live upgrade fl_free -> pro -> bridge immediately receives tier.update with 15MB cap
-        const upg = await fetch(`${flBase}/api/admin/users/set-tier`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${flAdmin.token}` },
-          body: JSON.stringify({ userId: flFree.user.userId, tier: 'pro' }),
+        // Phone -> PC 5.1MB AIO2 chunked streaming upload over aio-bulk + single-use client-scoped p2pToken
+        const bigUpBuf = Buffer.alloc(5 * 1024 * 1024 + 100_000)
+        for (let i = 0; i < bigUpBuf.length; i += 1) bigUpBuf[i] = (i * 19 + 7) & 0xff
+        const expectedUpSha = createHash('sha256').update(bigUpBuf).digest('hex')
+
+        const upDone = await peer.uploadFileBulk(bigUpBuf, {
+          filename: 'phone-capture.bin',
+          mimeType: 'application/octet-stream',
         })
-        assert.equal(upg.status, 200)
-        await waitUntil(() => flBridge.orchestrator.fileLimits.maxDocumentBytes === 15 * 1024 * 1024, 5000)
+        assert.ok(upDone.p2pToken && upDone.p2pToken.startsWith('p2p_'))
+        assert.equal(upDone.size, bigUpBuf.length)
 
-        // Now reading 12MB PDF (> 10MB inline WS threshold, <= 15MB Pro cap) uses zero-knowledge E2EE upload channel!
-        const readRes = await flBridge.orchestrator.readLocalFile({ path: bigPdfPath, cwd: flDir, mode: 'document' })
-        assert.equal(readRes.ok, true)
-        assert.equal(readRes.transferMode, 'upload')
-        assert.match(readRes.uploadUrl, /^\/api\/uploads\/[a-f0-9-]+$/i)
-        assert.ok(readRes.e2ee?.iv)
-        assert.equal(readRes.size, bigPdfBuf.length)
+        // Wrong clientId must NOT be able to consume another client's p2pToken
+        const stolenMat = await bridge.orchestrator.materializeAttachments(
+          [{ id: upDone.p2pToken, p2pToken: upDone.p2pToken, filename: 'phone-capture.bin' }],
+          { clientId: 'attacker-client-id' },
+        )
+        assert.equal(stolenMat.length, 0, 'Cross-client p2pToken hijack must be rejected')
 
-        // Client downloads with scoped mediaToken + consume=1, decrypts exact bytes, and verifies auto-cleanup
-        const mtRes = await (await fetch(`${flBase}/api/auth/media-token`, {
+        // Legitimate clientId materializes exact 5.1MB file cleanly
+        const okMat = await bridge.orchestrator.materializeAttachments(
+          [{ id: upDone.p2pToken, p2pToken: upDone.p2pToken, filename: 'phone-capture.bin' }],
+          { clientId: p2pCli.hello.clientId },
+        )
+        assert.equal(okMat.length, 1)
+        assert.equal(okMat[0].size, bigUpBuf.length)
+        assert.equal(
+          createHash('sha256').update(readFileSync(okMat[0].localPath)).digest('hex'),
+          expectedUpSha,
+          'Uploaded P2P bulk SHA-256 must match on PC disk',
+        )
+
+        // 34c. Instant revocation (client.revoked): kicking a live P2P session tears down its DataChannel immediately!
+        const kickLogin = await (await fetch(`${httpBase}/api/account/login`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${flFree.token}` },
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'smoke_admin', password: SMOKE_ADMIN_PASS, deviceName: 'victim-phone' }),
         })).json()
-        assert.equal(mtRes.ok, true)
-        const dlRes = await fetch(`${flBase}${readRes.uploadUrl}?consume=1`, {
-          headers: { Authorization: `Bearer ${mtRes.mediaToken}` },
-        })
-        assert.equal(dlRes.status, 200)
-        const dlDec = await decryptAutoStream(flKey, dlRes.body, {
-          iv: readRes.e2ee.iv,
-          kid: readRes.e2ee.kid,
-          kind: 'upload',
-          roomId: devBind.roomId,
-          chunked: Boolean(readRes.e2ee.chunked),
-        })
-        assert.equal(dlDec.totalPlainBytes, bigPdfBuf.length)
-        assert.ok(Buffer.compare(Buffer.concat(dlDec.chunks.map((c) => Buffer.from(c))), bigPdfBuf) === 0)
+        assert.equal(kickLogin.ok, true)
 
-        // Consumed upload must return 404 on second download
-        const dlAgain = await fetch(`${flBase}${readRes.uploadUrl}`, {
-          headers: { Authorization: `Bearer ${mtRes.mediaToken}` },
-        })
-        assert.equal(dlAgain.status, 404, 'Consumed upload must be deleted immediately after client download')
+        const victimCli = await openTicketClientWs(httpBase, port, kickLogin.token, { deviceName: 'victim-phone' })
+        try {
+          const victimPeer = await victimCli.connectP2p({
+            bridgeId: smokeDev.bridgeId,
+            e2eeKey: primaryE2eeKey,
+            roomId: smokeAdmin.roomId,
+          })
+          const beforeKick = await victimPeer.sendEncryptedRpc(RPC.APPS_STATUS)
+          assert.equal(beforeKick.apps.length, 4)
+          assert.ok(bridge.link.p2p.sessions.has(victimCli.hello.clientId), 'PC bridge must track active P2P session')
 
-        // Bridge materializeAttachments streams & decrypts an AIO2 chunked upload cleanly to disk
-        const chunkedAttPayload = Buffer.alloc(65_536, 0x3a)
-        const chunkedEnc = await encryptChunkedBytes(flKey, chunkedAttPayload, {
-          kind: 'upload',
-          roomId: devBind.roomId,
-          chunkSize: 16 * 1024,
-        })
-        const chunkedUp = await (await fetch(`${flBase}/api/uploads`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-Allinone-Encrypted': '1',
-            Authorization: `Bearer ${flFree.token}`,
-          },
-          body: Buffer.concat(chunkedEnc.chunks.map((c) => Buffer.from(c))),
-        })).json()
-        assert.equal(chunkedUp.ok, true)
-        const mat = await flBridge.orchestrator.materializeAttachments([
-          {
-            id: chunkedUp.upload.id,
-            url: chunkedUp.upload.url,
-            filename: 'chunked-test.bin',
-            mimeType: 'application/octet-stream',
-            e2ee: { v: chunkedEnc.v, kid: chunkedEnc.kid, iv: chunkedEnc.iv, chunked: true },
-          },
-        ])
-        assert.equal(mat.length, 1)
-        assert.equal(mat[0].size, chunkedAttPayload.length)
-        assert.ok(Buffer.compare(readFileSync(mat[0].localPath), chunkedAttPayload) === 0)
+          const kickStarted = Date.now()
+          const kickRes = await (await fetch(`${httpBase}/api/auth/sessions/revoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+            body: JSON.stringify({ sid: victimCli.hello.sid, clientId: victimCli.hello.clientId }),
+          })).json()
+          assert.equal(kickRes.ok, true)
+
+          // Wait up to 1s for PC bridge to receive client.revoked and destroy the victim P2P session
+          for (let i = 0; i < 50; i += 1) {
+            if (!bridge.link.p2p.sessions.has(victimCli.hello.clientId)) break
+            await new Promise((r) => setTimeout(r, 20))
+          }
+          const teardownMs = Date.now() - kickStarted
+          assert.equal(
+            bridge.link.p2p.sessions.has(victimCli.hello.clientId),
+            false,
+            'PC bridge must immediately tear down revoked client P2P session',
+          )
+          assert.ok(teardownMs < 1000, `Revoked P2P teardown took too long: ${teardownMs}ms`)
+          assert.ok(
+            bridge.link.p2p.revokedClients.has(victimCli.hello.clientId),
+            'PC bridge must blacklist revoked clientId against further P2P offers',
+          )
+        } finally {
+          await victimCli.closeAll()
+        }
       } finally {
-        if (flBridge) await flBridge.stop()
-        await flRelay.close()
+        await p2pCli.closeAll()
       }
     }
-    console.log('[smoke] 35/35 Per-tier single-file caps (Free 15MB/10MB, Pro 100MB, Ultra/Admin 1GB), AIO2 chunked E2EE & streaming transfer OK')
+    console.log('[smoke] 34/34 Full-duplex AIO-P2P v1 E2E (5MB AIO2 PC<->Phone bulk, 48KB ctrl frag & instant client.revoked teardown) OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {
@@ -5967,7 +5719,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error('[smoke] FAILED:', err)
-  process.exit(1)
-})
+main()
+  .then(() => {
+    process.exit(0)
+  })
+  .catch((err) => {
+    console.error('[smoke] FAILED:', err)
+    process.exit(1)
+  })
