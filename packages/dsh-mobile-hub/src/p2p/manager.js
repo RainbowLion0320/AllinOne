@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, createWriteStream, mkdirSync } from 'node:fs'
+import { chmodSync, createWriteStream, mkdirSync, realpathSync } from 'node:fs'
 import { open as openAsync, unlink as unlinkAsync } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
+  E2EE_CHUNKED_THRESHOLD,
   E2EE_IV_BYTES,
   base64UrlToBytes,
   bytesToBase64Url,
@@ -26,28 +27,38 @@ const MAX_SEEN_IVS = 4000
 const MAX_ACTIVE_PEERS = 24
 const REVOKED_TTL_MS = 24 * 60 * 60 * 1000
 const DOWNLOAD_TICKET_TTL_MS = 120_000
-const MAX_INBOUND_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local disk safety cap
+const MAX_INBOUND_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB plaintext safety cap
+const MAX_INBOUND_CIPHER_OVERHEAD_BYTES = 4 * 1024 * 1024 // headroom for AIO2 framing & GCM tags
+const MAX_NON_CHUNKED_UPLOAD_BYTES = E2EE_CHUNKED_THRESHOLD + 64 * 1024 // prevent non-chunked in-memory OOM
+const MAX_UPLOAD_QUEUE_BYTES = 32 * 1024 * 1024 // cap RAM buffered ahead of disk/AES-GCM
 
 /**
  * Push-pull async byte queue feeding `decryptAutoStream()` from incoming `aio-bulk` 64KB slices.
  */
-function createAsyncByteQueue() {
+function createAsyncByteQueue(maxQueuedBytes = MAX_UPLOAD_QUEUE_BYTES) {
   const chunks = []
+  let queuedBytes = 0
   let waiter = null
   let ended = false
   let error = null
 
   const push = (u8) => {
-    if (ended || error) return
+    if (ended || error) return true
     if (u8 && u8.byteLength > 0) {
       if (waiter) {
         const w = waiter
         waiter = null
         w.resolve({ value: u8, done: false })
       } else {
+        if (queuedBytes + u8.byteLength > maxQueuedBytes) {
+          fail(new Error('上传写入速度过慢，缓冲区超出内存上限'))
+          return false
+        }
         chunks.push(u8)
+        queuedBytes += u8.byteLength
       }
     }
+    return true
   }
   const end = () => {
     if (ended || error) return
@@ -61,6 +72,8 @@ function createAsyncByteQueue() {
   const fail = (err) => {
     if (ended || error) return
     error = err || new Error('Stream aborted')
+    chunks.length = 0
+    queuedBytes = 0
     if (waiter) {
       const w = waiter
       waiter = null
@@ -73,7 +86,9 @@ function createAsyncByteQueue() {
       return {
         next() {
           if (chunks.length > 0) {
-            return Promise.resolve({ value: chunks.shift(), done: false })
+            const nextChunk = chunks.shift()
+            queuedBytes = Math.max(0, queuedBytes - nextChunk.byteLength)
+            return Promise.resolve({ value: nextChunk, done: false })
           }
           if (error) return Promise.reject(error)
           if (ended) return Promise.resolve({ value: undefined, done: true })
@@ -109,6 +124,7 @@ export class P2PBridgeManager {
     onRpc,
     onRegisterP2pUpload,
     inboundDir,
+    webrtcProxy = null,
     log = console,
   }) {
     this.roomId = roomId
@@ -121,8 +137,8 @@ export class P2PBridgeManager {
     this.inboundDir = inboundDir
     this.log = log
 
-    const proxyPort = Number(process.env.ALLINONE_WEBRTC_PROXY_PORT || 0)
-    const proxyToken = String(process.env.ALLINONE_WEBRTC_PROXY_TOKEN || '').trim()
+    const proxyPort = Number(webrtcProxy?.port || process.env.ALLINONE_WEBRTC_PROXY_PORT || 0)
+    const proxyToken = String(webrtcProxy?.token || process.env.ALLINONE_WEBRTC_PROXY_TOKEN || '').trim()
     this.electronClient =
       proxyPort > 0 && proxyToken
         ? new ElectronWebRtcClient({ port: proxyPort, token: proxyToken, log })
@@ -132,6 +148,8 @@ export class P2PBridgeManager {
     this.sessions = new Map()
     /** @type {Map<string, number>} revokedClientId -> revokedAt */
     this.revokedClients = new Map()
+    /** @type {Map<string, number>} revokedSid -> revokedAt */
+    this.revokedSids = new Map()
     /** @type {Map<string, number>} iv -> seenAt */
     this.seenReqIvs = new Map()
     /** @type {Map<string, Promise<void>>} clientId -> serialized signal chain */
@@ -150,6 +168,9 @@ export class P2PBridgeManager {
     for (const [cid, ts] of this.revokedClients.entries()) {
       if (now - ts > REVOKED_TTL_MS) this.revokedClients.delete(cid)
     }
+    for (const [sid, ts] of this.revokedSids.entries()) {
+      if (now - ts > REVOKED_TTL_MS) this.revokedSids.delete(sid)
+    }
   }
 
   pruneSeenIvs(now = Date.now()) {
@@ -165,18 +186,32 @@ export class P2PBridgeManager {
   }
 
   /**
-   * Immediately kill active P2P DataChannels and abort any in-flight file transfers for revoked clients.
+   * Immediately kill active P2P DataChannels and abort any in-flight file transfers for revoked clients / auth sids.
    */
-  revokeClients(clientIds = []) {
+  revokeClients(clientIds = [], { sids = [], all = false, allExceptSids = [] } = {}) {
     const now = Date.now()
     this.pruneRevoked(now)
-    for (const rawId of Array.isArray(clientIds) ? clientIds : []) {
-      const cid = String(rawId || '').trim()
-      if (!cid) continue
-      this.revokedClients.set(cid, now)
-      const sess = this.sessions.get(cid)
-      if (sess) {
-        this.log.info?.(`mobile-hub: [p2p] immediately closing revoked peer clientId=${cid}`)
+    const idSet = new Set(
+      (Array.isArray(clientIds) ? clientIds : []).map((x) => String(x || '').trim()).filter(Boolean),
+    )
+    const sidSet = new Set(
+      (Array.isArray(sids) ? sids : []).map((x) => String(x || '').trim()).filter(Boolean),
+    )
+    const exceptSidSet = new Set(
+      (Array.isArray(allExceptSids) ? allExceptSids : []).map((x) => String(x || '').trim()).filter(Boolean),
+    )
+    for (const cid of idSet) this.revokedClients.set(cid, now)
+    for (const sid of sidSet) this.revokedSids.set(sid, now)
+
+    for (const [cid, sess] of [...this.sessions.entries()]) {
+      const matchId = idSet.has(cid)
+      const matchSid = Boolean(sess.authSid && sidSet.has(sess.authSid))
+      const matchAll = Boolean(all)
+      const matchExcept = exceptSidSet.size > 0 && (!sess.authSid || !exceptSidSet.has(sess.authSid))
+      if (matchId || matchSid || matchAll || matchExcept) {
+        this.revokedClients.set(cid, now)
+        if (sess.authSid && !exceptSidSet.has(sess.authSid)) this.revokedSids.set(sess.authSid, now)
+        this.log.info?.(`mobile-hub: [p2p] immediately closing revoked peer clientId=${cid}${sess.authSid ? ` sid=${sess.authSid}` : ''}`)
         void this.destroySession(cid, sess)
       }
     }
@@ -184,11 +219,13 @@ export class P2PBridgeManager {
 
   /**
    * Drop any active TURN-relayed sessions when the account crosses its monthly TURN quota,
-   * while leaving direct P2P sessions (LAN / STUN) completely untouched.
+   * while leaving direct P2P sessions (LAN / STUN) and freshly handshaking unclassified peers untouched.
    */
   dropRelayedSessions() {
+    const now = Date.now()
     for (const [cid, sess] of [...this.sessions.entries()]) {
-      if (sess.transport !== 'direct') {
+      const isRelayed = sess.transport === 'relay' || (!sess.transport && now - (sess.createdAt || 0) > 5_000)
+      if (isRelayed) {
         this.log.info?.(`mobile-hub: [p2p] closing relayed peer clientId=${cid} due to monthly TURN quota limit`)
         void this.destroySession(cid, sess)
       }
@@ -246,18 +283,23 @@ export class P2PBridgeManager {
     return next
   }
 
-  async _processEncryptedSignal({ clientId, sessionId, e2ee }) {
+  async _processEncryptedSignal({ clientId, sid: authSidRaw = '', sessionId, e2ee }) {
     if (this.disposed) return
     const cid = String(clientId || '').trim()
+    const authSid = String(authSidRaw || '').trim()
     const sid = String(sessionId || '').trim()
     if (!cid || !sid || !e2ee) return
 
+    const isRevokedOrDisposed = () =>
+      this.disposed || this.revokedClients.has(cid) || (authSid && this.revokedSids.has(authSid))
+
     this.pruneRevoked()
-    if (this.revokedClients.has(cid)) {
+    if (isRevokedOrDisposed()) {
       return
     }
 
     const expectedKid = await this.getE2eeKeyId()
+    if (isRevokedOrDisposed()) return
     if (e2ee.kid && expectedKid && e2ee.kid !== expectedKid) {
       return
     }
@@ -268,6 +310,7 @@ export class P2PBridgeManager {
     } catch {
       return
     }
+    if (isRevokedOrDisposed()) return
 
     if (!inner || typeof inner !== 'object') return
 
@@ -296,15 +339,18 @@ export class P2PBridgeManager {
       if (prev) {
         await this.destroySession(cid, prev)
       }
+      if (isRevokedOrDisposed()) return
       // Evict oldest session if over cap
       while (this.sessions.size >= MAX_ACTIVE_PEERS) {
         const oldestCid = this.sessions.keys().next().value
         if (!oldestCid) break
         await this.destroySession(oldestCid)
       }
+      if (isRevokedOrDisposed()) return
 
       const sess = {
         clientId: cid,
+        authSid,
         sessionId: sid,
         createdAt: Date.now(),
         closed: false,
@@ -322,7 +368,7 @@ export class P2PBridgeManager {
       const peerOpts = {
         iceServers: this.getIceServers(),
         onIceCandidate: (candidate) => {
-          if (sess.closed || this.sessions.get(cid) !== sess) return
+          if (sess.closed || this.sessions.get(cid) !== sess || isRevokedOrDisposed()) return
           void this.sendEncryptedSignal(cid, sid, { kind: 'ice', candidate }).catch(() => {})
         },
         onStateChange: (st) => {
@@ -357,14 +403,17 @@ export class P2PBridgeManager {
           : createWeriftPeer(peerOpts)
 
         const answer = await sess.peer.handleOffer(inner.sdp)
-        if (sess.closed || this.sessions.get(cid) !== sess) return
+        if (sess.closed || this.sessions.get(cid) !== sess || isRevokedOrDisposed()) {
+          await this.destroySession(cid, sess)
+          return
+        }
         sess.offerReady = true
         await this.sendEncryptedSignal(cid, sid, {
           kind: 'answer',
           sdp: answer.sdp,
           engine: sess.peer.engine,
         })
-        while (sess.pendingIce.length > 0 && !sess.closed && this.sessions.get(cid) === sess) {
+        while (sess.pendingIce.length > 0 && !sess.closed && this.sessions.get(cid) === sess && !isRevokedOrDisposed()) {
           const cand = sess.pendingIce.shift()
           await sess.peer.addIceCandidate(cand).catch(() => {})
         }
@@ -405,17 +454,22 @@ export class P2PBridgeManager {
       }
       if (inner.action === 'cancel') {
         const streamId = Number(inner.streamId)
-        const ac = sess.activeDownloads.get(streamId)
-        if (ac) {
-          try { ac.abort() } catch {}
-          sess.activeDownloads.delete(streamId)
+        const dir = String(inner.direction || '').trim().toLowerCase()
+        if (dir !== 'upload') {
+          const ac = sess.activeDownloads.get(streamId)
+          if (ac) {
+            try { ac.abort() } catch {}
+            sess.activeDownloads.delete(streamId)
+          }
+          sess.pendingDownloads.delete(streamId)
         }
-        sess.pendingDownloads.delete(streamId)
-        const up = sess.activeUploads.get(streamId)
-        if (up) {
-          try { up.queue.fail(new Error('Upload cancelled by client')) } catch {}
-          if (sess.activeUploads.get(streamId) === up) {
-            sess.activeUploads.delete(streamId)
+        if (dir !== 'download') {
+          const up = sess.activeUploads.get(streamId)
+          if (up) {
+            try { up.queue.fail(new Error('Upload cancelled by client')) } catch {}
+            if (sess.activeUploads.get(streamId) === up) {
+              sess.activeUploads.delete(streamId)
+            }
           }
         }
         return
@@ -554,7 +608,7 @@ export class P2PBridgeManager {
   async startBulkDownload(sess, streamId) {
     const ticket = sess.pendingDownloads.get(streamId)
     sess.pendingDownloads.delete(streamId)
-    if (!ticket) {
+    if (!ticket || Date.now() - Number(ticket.createdAt || 0) > DOWNLOAD_TICKET_TTL_MS) {
       await this.sendBulkCtrl(sess, { action: 'download.error', streamId, message: '文件传输凭证不存在或已过期' }).catch(() => {})
       return
     }
@@ -563,13 +617,28 @@ export class P2PBridgeManager {
 
     let fh = null
     try {
-      fh = await openAsync(ticket.realPath, 'r')
+      // TOCTOU re-check: ensure path was not swapped for a symlink pointing elsewhere before opening
+      let liveRealPath = ''
+      try {
+        liveRealPath = realpathSync(ticket.realPath)
+      } catch {
+        throw new Error('目标文件已不存在或无法访问')
+      }
+      if (liveRealPath !== ticket.realPath) {
+        throw new Error('出于安全限制，目标文件路径已变更，已中止下载')
+      }
+      fh = await openAsync(liveRealPath, 'r')
+      const liveStat = await fh.stat()
+      if (!liveStat.isFile() || liveStat.size <= 0) {
+        throw new Error('目标文件不可读或已变为空文件')
+      }
+      const liveSize = liveStat.size
       let seq = 0
 
       await encryptChunkedBytes(
         this.e2eeKey,
         {
-          totalSize: ticket.size,
+          totalSize: liveSize,
           readSlice: async (offset, len) => {
             if (ac.signal.aborted) {
               const err = new Error('Transfer aborted')
@@ -583,6 +652,9 @@ export class P2PBridgeManager {
               if (bytesRead <= 0) break
               pos += bytesRead
             }
+            if (pos < len) {
+              throw new Error('文件在传输过程中发生截断或变动，请重试')
+            }
             return new Uint8Array(b.buffer, b.byteOffset, pos)
           },
         },
@@ -594,7 +666,7 @@ export class P2PBridgeManager {
               action: 'download.header',
               streamId,
               e2ee: e2eeMeta,
-              size: ticket.size,
+              size: liveSize,
             })
           },
           onChunk: async (cipherChunk) => {
@@ -647,12 +719,27 @@ export class P2PBridgeManager {
       return
     }
 
+    const isChunked = Boolean(meta.e2ee.chunked)
+    const maxCipherBytes = isChunked
+      ? MAX_INBOUND_UPLOAD_BYTES + MAX_INBOUND_CIPHER_OVERHEAD_BYTES
+      : MAX_NON_CHUNKED_UPLOAD_BYTES
+    const declaredSize = Number(meta.size || 0)
+    if (!isChunked && declaredSize > MAX_NON_CHUNKED_UPLOAD_BYTES) {
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.error',
+        transferId,
+        streamId,
+        message: '大于 32MB 的上传必须启用 AIO2 分块加密',
+      }).catch(() => {})
+      return
+    }
+
     const prevUpload = sess.activeUploads.get(streamId)
     if (prevUpload) {
       try { prevUpload.queue.fail(new Error('Upload superseded by new stream')) } catch {}
     }
     const queue = createAsyncByteQueue()
-    const entry = { transferId, queue, receivedBytes: 0 }
+    const entry = { transferId, queue, receivedBytes: 0, maxCipherBytes, isChunked }
     sess.activeUploads.set(streamId, entry)
 
     let localPath = ''
@@ -692,13 +779,18 @@ export class P2PBridgeManager {
           ws.once('error', onErr)
         })
 
+      let writtenPlainBytes = 0
       const dec = await decryptAutoStream(this.e2eeKey, queue.iterable, {
         iv: meta.e2ee.iv,
         kid: meta.e2ee.kid || '',
         kind: 'upload',
         roomId: this.roomId,
-        chunked: Boolean(meta.e2ee.chunked),
+        chunked: isChunked,
         onPlainChunk: async (plainChunk) => {
+          writtenPlainBytes += plainChunk.byteLength
+          if (writtenPlainBytes > MAX_INBOUND_UPLOAD_BYTES) {
+            throw new Error('文件超过本机安全上限 (2GB)')
+          }
           await writePlain(plainChunk)
         },
       })
@@ -765,14 +857,22 @@ export class P2PBridgeManager {
     if (!up) return
     if (frame.payload.byteLength > 0) {
       up.receivedBytes += frame.payload.byteLength
-      if (up.receivedBytes > MAX_INBOUND_UPLOAD_BYTES) {
-        up.queue.fail(new Error('文件超过本机安全上限 (2GB)'))
+      const limit = up.maxCipherBytes || (MAX_INBOUND_UPLOAD_BYTES + MAX_INBOUND_CIPHER_OVERHEAD_BYTES)
+      if (up.receivedBytes > limit) {
+        up.queue.fail(
+          new Error(up.isChunked ? '文件超过本机安全上限 (2GB)' : '非分块加密上传超过 32MB 上限'),
+        )
         if (sess.activeUploads.get(frame.streamId) === up) {
           sess.activeUploads.delete(frame.streamId)
         }
         return
       }
-      up.queue.push(frame.payload)
+      if (!up.queue.push(frame.payload)) {
+        if (sess.activeUploads.get(frame.streamId) === up) {
+          sess.activeUploads.delete(frame.streamId)
+        }
+        return
+      }
     }
     if (frame.eof) {
       up.queue.end()

@@ -167,6 +167,7 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
   let messages = stripEphemeralPreviewUrls(Array.isArray(payload.messages) ? payload.messages : [])
   let hasMore = Boolean(payload.hasMore)
   let nextCursor = payload.nextCursor ?? null
+  let truncatedByCap = Boolean(payload.truncatedByCap)
   const totalCount = payload.totalCount ?? null
 
   // Enforce per-session persisted cap without ever corrupting opaque cursors (e.g. Codex)
@@ -187,22 +188,31 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
       hasMore = true
     } else {
       // For Codex / opaque-cursor sessions exceeding MAX_MESSAGES_PER_SESSION:
-      // retain the latest 120 messages cleanly and clear cursor/hasMore so we neither
-      // fabricate invalid numeric cursors nor freeze cache updates or skip history gaps.
+      // retain the latest 120 messages and record truncatedByCap so reconciliation knows
+      // older history still exists on PC when fresh.hasMore is true.
       messages = messages.slice(-MAX_MESSAGES_PER_SESSION)
       hasMore = false
       nextCursor = null
+      truncatedByCap = true
     }
+  }
+
+  // Strip embedded `messages` from `meta` to avoid doubling IndexedDB footprint
+  let safeMeta = payload.meta || null
+  if (safeMeta && typeof safeMeta === 'object' && 'messages' in safeMeta) {
+    const { messages: _dropMsgs, ...restMeta } = safeMeta
+    safeMeta = restMeta
   }
 
   const baseRecord = {
     sessionId: cacheKey,
     rawSessionId: String(sessionId),
     scope: cleanScope,
-    meta: payload.meta || null,
+    meta: safeMeta,
     messages,
     hasMore,
     nextCursor,
+    truncatedByCap,
     totalCount,
     cachedAt: Date.now(),
   }
@@ -453,6 +463,22 @@ export function reconcileCachedWithFreshPage(cached, fresh) {
       : cachedMsgs.findIndex((m) => m?.id && freshIdSet.has(m.id))
 
   if (firstOverlapIdx > 0 && cachedMsgs.length >= freshMsgs.length) {
+    // If cached record was synthetically capped at MAX_MESSAGES_PER_SESSION with cleared opaque cursor
+    // (hasMore=false, nextCursor=null) while server confirms older history exists (fresh.hasMore=true),
+    // fall back to fresh page so older-history pagination stays reachable.
+    const cacheLostOpaquePagination =
+      Boolean(fresh.hasMore) &&
+      !cached.hasMore &&
+      cached.nextCursor == null &&
+      (Boolean(cached.truncatedByCap) || cachedMsgs.length >= MAX_MESSAGES_PER_SESSION)
+    if (cacheLostOpaquePagination) {
+      return {
+        messages: freshMsgs,
+        hasMore: Boolean(fresh.hasMore),
+        nextCursor: fresh.nextCursor ?? null,
+        totalCount: fresh.totalCount ?? null,
+      }
+    }
     const firstFreshTs = Number(freshMsgs[0]?.ts || 0)
     const olderPrefix = cachedMsgs.slice(0, firstOverlapIdx).filter((m) => {
       if (!m) return false

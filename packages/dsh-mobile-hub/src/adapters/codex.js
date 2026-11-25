@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from '
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, getCodexCandidates, isExecutableFile, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getCodexCandidates, isExecutableFile, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -794,8 +794,16 @@ class CodexRpcClient {
         rejectReady(err)
       })
 
-      proc.on('exit', (code, signal) => {
+      proc.on('close', (code, signal) => {
         if (this.proc !== proc) return
+        // Flush any trailing JSON-RPC line that arrived without a final newline before process close
+        const tail = this.stdoutBuf.trim()
+        this.stdoutBuf = ''
+        if (tail) {
+          try {
+            this.handleMessage(JSON.parse(tail))
+          } catch {}
+        }
         if (!this.closing) {
           this.log.warn?.(`mobile-hub: codex(${this.label}) exited (code=${code}, signal=${signal})`)
         }
@@ -816,19 +824,23 @@ class CodexRpcClient {
         clientInfo: initClientInfo,
         capabilities: { experimentalApi: true },
       })
-        .catch(() =>
-          this.callRaw('initialize', {
+        .catch((firstErr) => {
+          if (this.proc !== proc || this.closing) throw firstErr
+          return this.callRaw('initialize', {
             clientInfo: initClientInfo,
             capabilities: null,
-          }),
-        )
+          })
+        })
         .then((res) => {
-          if (this.proc !== proc) return
+          if (this.proc !== proc) {
+            rejectReady(new Error(`codex(${this.label}) closed during initialization`))
+            return
+          }
           this.sendRaw({ jsonrpc: '2.0', method: 'initialized', params: {} })
           resolveReady(res)
         })
         .catch((err) => {
-          try { proc.kill() } catch {}
+          killProcessTree(proc, { force: true })
           if (this.proc === proc) {
             this.cleanup(err)
           }
@@ -920,21 +932,31 @@ class CodexRpcClient {
     if (!proc) return
     await new Promise((resolveDone) => {
       let settled = false
+      let forceTimer = null
+      let doneTimer = null
       const finish = () => {
         if (settled) return
         settled = true
         clearTimeout(killTimer)
+        if (forceTimer) clearTimeout(forceTimer)
+        if (doneTimer) clearTimeout(doneTimer)
         resolveDone()
       }
-      proc.once('exit', finish)
+      proc.once('close', finish)
       const killTimer = setTimeout(() => {
-        try { proc.kill() } catch {}
-        setTimeout(finish, 150)
+        killProcessTree(proc, { force: false })
+        forceTimer = setTimeout(() => {
+          killProcessTree(proc, { force: true })
+          doneTimer = setTimeout(finish, 150)
+          doneTimer.unref?.()
+        }, 500)
+        forceTimer.unref?.()
       }, 600)
+      killTimer.unref?.()
       try {
         proc.stdin.end()
       } catch {
-        try { proc.kill() } catch {}
+        killProcessTree(proc, { force: true })
         finish()
       }
     })
@@ -946,7 +968,7 @@ class CodexRpcClient {
     this.proc = null
     this.readyPromise = null
     if (proc) {
-      try { proc.kill() } catch {}
+      killProcessTree(proc, { force: true })
     }
     const err = new Error(`codex(${this.label}) disposed`)
     for (const pending of this.pendingRpc.values()) {
@@ -1469,6 +1491,21 @@ export class CodexAdapter {
       return { resolved: true, id: approvalId, decision: 'submit', steered: false }
     }
 
+    const sendApprovalReply = (payloadObj) => {
+      try {
+        entry.writer.sendRaw(payloadObj)
+      } catch (err) {
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: approvalId,
+          app: APPS.CODEX,
+          decision: 'cancel',
+        })
+        const transportErr = new Error(String(err?.message || 'Codex 进程已退出，审批请求已失效'))
+        transportErr.code = 'APPROVAL_TRANSPORT_CLOSED'
+        throw transportErr
+      }
+    }
+
     if (entry.method === 'item/tool/requestUserInput') {
       const cancelled = decision === 'cancel' || decision === 'decline'
       const responseAnswers = {}
@@ -1478,7 +1515,7 @@ export class CodexAdapter {
           responseAnswers[q.id] = { answers: ans.combined }
         }
       }
-      entry.writer.sendRaw({
+      sendApprovalReply({
         jsonrpc: '2.0',
         id: entry.rpcId,
         result: { answers: responseAnswers },
@@ -1494,7 +1531,7 @@ export class CodexAdapter {
     if (entry.method === 'item/permissions/requestApproval') {
       const accepted = decision === 'accept' || decision === 'acceptForSession'
       const scope = decision === 'acceptForSession' ? 'session' : 'turn'
-      entry.writer.sendRaw({
+      sendApprovalReply({
         jsonrpc: '2.0',
         id: entry.rpcId,
         result: {
@@ -1517,7 +1554,7 @@ export class CodexAdapter {
           ? { action: 'accept' }
           : { action: 'accept', content: answersToElicitationContent(entry.params?.requestedSchema, answers) }
         : { action }
-      entry.writer.sendRaw({
+      sendApprovalReply({
         jsonrpc: '2.0',
         id: entry.rpcId,
         result,
@@ -1534,7 +1571,7 @@ export class CodexAdapter {
       ? decision
       : 'decline'
 
-    entry.writer.sendRaw({
+    sendApprovalReply({
       jsonrpc: '2.0',
       id: entry.rpcId,
       result: { decision: validDecision },
@@ -2468,7 +2505,7 @@ export class CodexAdapter {
       }
 
       let collaborationMode
-      if (effectiveTaskMode === 'plan' || (!effectiveTaskMode && prevWasPlan)) {
+      if (effectiveTaskMode === 'plan' || (effectiveTaskMode !== 'plan' && prevWasPlan)) {
         let collabModel = effectiveModel || ''
         if (!collabModel) {
           const catalog = await this.listModels().catch(() => null)

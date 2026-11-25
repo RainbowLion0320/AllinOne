@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, getAgyCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getAgyCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -130,7 +130,9 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
         '  try {',
         '    const o = JSON.parse(s)',
         '    if (o && o.quota && Object.keys(o.quota).length > 0) {',
-        `      fs.writeFileSync(${JSON.stringify(outJson)}, s, 'utf8')`,
+        `      const tmp = ${JSON.stringify(outJson)} + '.tmp'`,
+        "      fs.writeFileSync(tmp, s, 'utf8')",
+        `      fs.renameSync(tmp, ${JSON.stringify(outJson)})`,
         '    }',
         '  } catch {}',
         '})',
@@ -187,7 +189,7 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
     }
 
     const hardTimer = setTimeout(() => {
-      try { proc?.kill() } catch {}
+      killProcessTree(proc, { force: true })
       finish()
     }, timeoutMs + 3_000)
     hardTimer.unref?.()
@@ -267,10 +269,13 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
         writeFileSync(
           pyRunner,
           [
-            'import os, pty, select, subprocess, sys, time',
+            'import os, pty, select, signal, subprocess, sys, time',
+            'def _on_term(_sig, _frame): raise SystemExit(0)',
+            'signal.signal(signal.SIGTERM, _on_term)',
+            'signal.signal(signal.SIGINT, _on_term)',
             'agy_bin, settings_path, out_path, timeout_ms = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])',
             'master_fd, slave_fd = pty.openpty()',
-            'proc = subprocess.Popen([agy_bin, "--settings", settings_path], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)',
+            'proc = subprocess.Popen([agy_bin, "--settings", settings_path], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True, start_new_session=True)',
             'os.close(slave_fd)',
             'deadline = time.monotonic() + (timeout_ms / 1000.0)',
             'try:',
@@ -280,12 +285,16 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
             '      try: os.read(master_fd, 4096)',
             '      except OSError: break',
             'finally:',
-            '  try: proc.terminate()',
-            '  except Exception: pass',
+            '  try: os.killpg(proc.pid, signal.SIGTERM)',
+            '  except Exception:',
+            '    try: proc.terminate()',
+            '    except Exception: pass',
             '  try: proc.wait(timeout=1.5)',
             '  except Exception:',
-            '    try: proc.kill()',
-            '    except Exception: pass',
+            '    try: os.killpg(proc.pid, signal.SIGKILL)',
+            '    except Exception:',
+            '      try: proc.kill()',
+            '      except Exception: pass',
             '  try: os.close(master_fd)',
             '  except Exception: pass',
             '',
@@ -811,7 +820,10 @@ class AgyAcpClient {
       this.failAll(err)
     })
 
-    proc.on('exit', (code) => {
+    proc.on('close', (code) => {
+      const tail = this.stdoutBuf.trim()
+      this.stdoutBuf = ''
+      if (tail) this.handleLine(tail)
       const msg = this.stderrBuf.trim() || `agy acp 进程退出（code=${code}）`
       this.failAll(new Error(msg))
       this.proc = null
@@ -936,21 +948,31 @@ class AgyAcpClient {
     }
     await new Promise((resolveDone) => {
       let done = false
+      let forceTimer = null
+      let doneTimer = null
       const finish = () => {
         if (done) return
         done = true
         clearTimeout(killTimer)
+        if (forceTimer) clearTimeout(forceTimer)
+        if (doneTimer) clearTimeout(doneTimer)
         resolveDone()
       }
-      proc.once('exit', finish)
+      proc.once('close', finish)
       const killTimer = setTimeout(() => {
-        try { proc.kill() } catch {}
-        setTimeout(finish, 150)
+        killProcessTree(proc, { force: false })
+        forceTimer = setTimeout(() => {
+          killProcessTree(proc, { force: true })
+          doneTimer = setTimeout(finish, 150)
+          doneTimer.unref?.()
+        }, 400)
+        forceTimer.unref?.()
       }, 500)
+      killTimer.unref?.()
       try {
         proc.stdin.end()
       } catch {
-        try { proc.kill() } catch {}
+        killProcessTree(proc, { force: true })
         finish()
       }
     })
@@ -959,7 +981,7 @@ class AgyAcpClient {
   killImmediate() {
     this.closing = true
     if (this.proc) {
-      try { this.proc.kill() } catch {}
+      killProcessTree(this.proc, { force: true })
       this.proc = null
     }
     this.failAll(new Error('agy acp disposed'))
@@ -1839,12 +1861,13 @@ export class AntigravityAdapter {
   }
 
   scheduleWakeupSettle(entry) {
+    if (this.disposed) return
     const wk = entry.wakeup
     if (!wk) return
     if (wk.settleTimer) clearTimeout(wk.settleTimer)
     wk.settleTimer = setTimeout(async () => {
       try {
-        if (entry.wakeup !== wk || entry.fgTurn) return
+        if (this.disposed || entry.wakeup !== wk || entry.fgTurn) return
         if (this.hasPendingServerRequest(entry.sessionId)) {
           this.scheduleWakeupSettle(entry)
           return
@@ -1852,7 +1875,7 @@ export class AntigravityAdapter {
         const dbPath = join(this.agyHome, 'conversation_summaries.db')
         const dbState = await queryAgyConversationState(dbPath, entry.sessionId)
         // Re-check state after async await before finalizing
-        if (entry.wakeup !== wk || entry.fgTurn) return
+        if (this.disposed || entry.wakeup !== wk || entry.fgTurn) return
         if (this.hasPendingServerRequest(entry.sessionId)) {
           this.scheduleWakeupSettle(entry)
           return
@@ -2258,27 +2281,36 @@ export class AntigravityAdapter {
         if (textBlock) textBlock.text = nextText
         else promptBlocks.unshift({ type: 'text', text: nextText })
       }
+      const isExplicitPlanSlash = /^\/plan(?:\s|$)/i.test(promptText || '')
       if (effectiveTaskMode === 'plan') {
         try {
           await entry.client.rpc('session/set_mode', { sessionId, modeId: 'plan' }, 8_000)
           entry.currentModeId = 'plan'
         } catch (modeErr) {
           this.log.warn?.(`mobile-hub: agy session/set_mode(plan) fallback to /plan: ${String(modeErr?.message || modeErr)}`)
-          if (promptText && !/^\/plan(?:\s|$)/i.test(promptText)) {
+          if (promptText && !isExplicitPlanSlash) {
             promptText = `/plan ${promptText}`
             setPromptTextBlock(promptText)
           }
         }
         entry.taskTracker.setMode('plan', Date.now())
-      } else if (effectiveTaskMode === 'goal') {
-        if (promptText && !/^\/goal(?:\s|$)/i.test(promptText)) {
-          promptText = `/goal ${promptText}`
-          setPromptTextBlock(promptText)
+      } else {
+        // Exit sticky ACP plan mode back to default when subsequent turn is not plan mode
+        if (entry.currentModeId === 'plan' && !isExplicitPlanSlash) {
+          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'default' }, 8_000).catch(() => {})
+          entry.currentModeId = 'default'
+          entry.taskTracker.setMode(null, Date.now())
         }
-        entry.taskTracker.applyAntigravityUserText(promptText || '/goal', Date.now())
-      } else if (promptText) {
-        // Forward native slash commands (/plan, /goal, /compact, etc.) verbatim to agy acp
-        entry.taskTracker.applyAntigravityUserText(promptText, Date.now())
+        if (effectiveTaskMode === 'goal') {
+          if (promptText && !/^\/goal(?:\s|$)/i.test(promptText)) {
+            promptText = `/goal ${promptText}`
+            setPromptTextBlock(promptText)
+          }
+          entry.taskTracker.applyAntigravityUserText(promptText || '/goal', Date.now())
+        } else if (promptText) {
+          // Forward native slash commands (/plan, /goal, /compact, etc.) verbatim to agy acp
+          entry.taskTracker.applyAntigravityUserText(promptText, Date.now())
+        }
       }
       const initTaskDiff = entry.taskTracker.consumeChanged()
       if (initTaskDiff.changed) {
@@ -2287,6 +2319,17 @@ export class AntigravityAdapter {
           app: APPS.ANTIGRAVITY,
           taskState: initTaskDiff.taskState,
         })
+      }
+
+      if (turnState.aborted) {
+        this.emitEvent(EVENTS.STREAM_DONE, {
+          sessionId: compositeId,
+          app: APPS.ANTIGRAVITY,
+          nativeId: sessionId,
+          finalText: '',
+          aborted: true,
+        })
+        return { sessionId: compositeId, nativeId: sessionId, finalText: '', aborted: true, usage: null }
       }
 
       // Sliding 15-min inactivity timeout (resets on every session/update chunk!)
@@ -2503,6 +2546,21 @@ export class AntigravityAdapter {
 
     const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
 
+    const sendAcpReply = (payloadObj) => {
+      try {
+        item.client.sendRaw(payloadObj)
+      } catch (err) {
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: approvalId,
+          app: APPS.ANTIGRAVITY,
+          decision: 'cancel',
+        })
+        const transportErr = new Error(String(err?.message || 'Antigravity ACP 进程已退出，审批请求已失效'))
+        transportErr.code = 'APPROVAL_TRANSPORT_CLOSED'
+        throw transportErr
+      }
+    }
+
     if (item.method === 'elicitation/create') {
       const action = decision === 'decline' ? 'decline' : decision === 'cancel' ? 'cancel' : 'accept'
       const result = action === 'accept'
@@ -2510,7 +2568,7 @@ export class AntigravityAdapter {
           ? { action: 'accept' }
           : { action: 'accept', content: answersToElicitationContent(item.params?.requestedSchema, answers) }
         : { action }
-      item.client.sendRaw({
+      sendAcpReply({
         jsonrpc: '2.0',
         id: item.rpcId,
         result,
@@ -2528,7 +2586,7 @@ export class AntigravityAdapter {
         !decision || decision === 'cancel'
           ? { outcome: 'cancelled' }
           : { outcome: 'selected', optionId: decision }
-      item.client.sendRaw({
+      sendAcpReply({
         jsonrpc: '2.0',
         id: item.rpcId,
         result: { outcome },
@@ -2586,7 +2644,7 @@ export class AntigravityAdapter {
     this.watchedSessions.clear()
     this.startingWarmSessions.clear()
     for (const proc of this.activeQuotaProcs) {
-      try { proc.kill() } catch {}
+      killProcessTree(proc, { force: true })
     }
     this.activeQuotaProcs.clear()
     for (const client of this.startingClients) {
@@ -2599,6 +2657,7 @@ export class AntigravityAdapter {
     this.activeTurns.clear()
     for (const entry of this.warmSessions.values()) {
       if (entry.wakeup?.settleTimer) clearTimeout(entry.wakeup.settleTimer)
+      entry.wakeup = null
       entry.client?.killImmediate()
     }
     this.warmSessions.clear()

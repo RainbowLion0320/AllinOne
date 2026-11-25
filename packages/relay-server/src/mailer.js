@@ -453,12 +453,12 @@ export function createMailer(options = {}) {
   )
   const smtpUser = String(options.smtpUser ?? process.env.SMTP_USER ?? '').trim()
   const smtpPass = String(options.smtpPass ?? process.env.SMTP_PASS ?? '').trim()
-  const smtpFrom = String(
-    options.smtpFrom ?? process.env.SMTP_FROM ?? (smtpUser ? `All in One <${smtpUser}>` : ''),
-  ).trim()
+  const rawSmtpFrom = String(options.smtpFrom ?? '').trim() || String(process.env.SMTP_FROM ?? '').trim()
+  const smtpFrom = rawSmtpFrom || (smtpUser ? `All in One <${smtpUser}>` : '')
 
   const resendApiKey = String(options.resendApiKey ?? process.env.RESEND_API_KEY ?? '').trim()
-  const resendFrom = String(options.resendFrom ?? process.env.RESEND_FROM ?? smtpFrom).trim()
+  const rawResendFrom = String(options.resendFrom ?? '').trim() || String(process.env.RESEND_FROM ?? '').trim()
+  const resendFrom = rawResendFrom || smtpFrom
 
   const hasSmtp = Boolean(smtpHost && (smtpUser || smtpFrom) && (smtpPass || options.smtpAllowNoAuth))
   const hasResend = Boolean(resendApiKey && resendFrom)

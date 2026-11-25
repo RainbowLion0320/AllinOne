@@ -14,6 +14,7 @@ import {
   X,
 } from 'lucide-react'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
+import { saveOrShareBlobNatively } from '../lib/e2eeFiles.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 const MIN_SCALE = 0.25
@@ -587,10 +588,30 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
     naturalSize.width / imgRef.current.offsetWidth > 1.15
 
   const isModified = displayScalePct !== 100 || rotation !== 0
+  const handleNativeAndroidImageSave = async (e) => {
+    if (!isBlobOrDataDownload || !downloadHref) return
+    const isAndroidCap = Boolean(
+      typeof window !== 'undefined' &&
+      window.Capacitor?.isNativePlatform?.() &&
+      String(window.Capacitor?.getPlatform?.() || '').toLowerCase() === 'android' &&
+      typeof window.Capacitor?.Plugins?.AllinOneFiles?.saveAndShare === 'function',
+    )
+    if (!isAndroidCap) return
+    e.preventDefault()
+    try {
+      const res = await fetch(downloadHref)
+      const blob = await res.blob()
+      await saveOrShareBlobNatively(blob, {
+        filename: current.label || 'image.png',
+        mimeType: blob.type || 'image/png',
+        mode: 'save',
+      })
+    } catch {}
+  }
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex flex-col bg-[#080A0F]/96 text-white backdrop-blur-md select-none"
+      className="fixed inset-0 z-[96] flex flex-col bg-[#080A0F]/96 text-white backdrop-blur-md select-none"
       style={{ overscrollBehavior: 'contain' }}
     >
       {/* Top Bar */}
@@ -624,6 +645,7 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
             <a
               href={downloadHref}
               download={current.label || 'image.png'}
+              onClick={handleNativeAndroidImageSave}
               {...(isBlobOrDataDownload ? {} : { target: '_blank', rel: 'noreferrer' })}
               title={bi('保存原图', 'Save image')}
               className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 transition hover:bg-white/20 active:scale-95"

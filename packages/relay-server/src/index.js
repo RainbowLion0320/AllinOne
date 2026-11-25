@@ -257,9 +257,15 @@ function setSecurityHeaders(req, res) {
   }
 }
 
+function firstNonEmptyEnv(explicit, envVal, fallback) {
+  if (explicit !== undefined && explicit !== null && String(explicit).trim() !== '') return explicit
+  if (envVal !== undefined && envVal !== null && String(envVal).trim() !== '') return envVal
+  return fallback
+}
+
 export function createRelayServer(options = {}) {
-  const port = Number(options.port ?? process.env.PORT ?? 8787)
-  const host = String(options.host ?? process.env.HOST ?? '0.0.0.0')
+  const port = Number(firstNonEmptyEnv(options.port, process.env.PORT, 8787))
+  const host = String(firstNonEmptyEnv(options.host, process.env.HOST, '0.0.0.0')).trim()
   const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '').trim()
   const adminBootstrapToken = String(options.adminBootstrapToken ?? process.env.ADMIN_BOOTSTRAP_TOKEN ?? '').trim()
   const publicRelayUrl = String(options.publicRelayUrl ?? process.env.PUBLIC_RELAY_URL ?? '').trim().replace(/\/+$/, '')
@@ -281,14 +287,16 @@ export function createRelayServer(options = {}) {
     options.accountsFile ?? (process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json')),
   )
 
-  const rawStunPort = options.stunPort ?? process.env.STUN_PORT ?? '3478'
+  const rawStunPort = firstNonEmptyEnv(options.stunPort, process.env.STUN_PORT, '3478')
   const stunDisabled =
     options.stunEnabled === false ||
     String(rawStunPort).trim().toLowerCase() === 'false' ||
     String(rawStunPort).trim().toLowerCase() === 'off' ||
     String(rawStunPort).trim() === '-1'
   const stunPort = stunDisabled ? -1 : Number(rawStunPort)
-  const stunHost = String(options.stunHost ?? process.env.STUN_HOST ?? (options.host ? options.host : '0.0.0.0'))
+  const stunHost = String(
+    firstNonEmptyEnv(options.stunHost, process.env.STUN_HOST, options.host ? options.host : '0.0.0.0'),
+  ).trim()
   const stunServer =
     !stunDisabled && Number.isInteger(stunPort) && stunPort >= 0
       ? createStunServer({ port: stunPort, host: stunHost })
@@ -296,12 +304,26 @@ export function createRelayServer(options = {}) {
 
   const turnSecret = String(options.turnSecret ?? process.env.TURN_SECRET ?? '').trim()
   const turnHostExplicit = String(options.turnHost ?? process.env.TURN_HOST ?? '').trim()
-  const turnPortRaw = options.turnPort ?? process.env.TURN_PORT ?? '3478'
+  const turnPortRaw = firstNonEmptyEnv(options.turnPort, process.env.TURN_PORT, '3478')
   const turnPort = Number.isInteger(Number(turnPortRaw)) && Number(turnPortRaw) > 0 ? Number(turnPortRaw) : 3478
-  const turnTtlSec = Math.max(120, Number(options.turnTtlSec ?? process.env.TURN_TTL_SEC ?? 600) || 600)
+  const turnTtlSec = Math.max(120, Number(firstNonEmptyEnv(options.turnTtlSec, process.env.TURN_TTL_SEC, 600)) || 600)
   const turnLogFile = String(options.turnLogFile ?? process.env.TURN_LOG_FILE ?? '').trim()
   const turnQuotaConfig = resolveTurnQuotaConfig(options, process.env)
-  const cfTurn = createCloudflareTurnProvider(options, process.env)
+  let hubRef = null
+  const cfTurn = createCloudflareTurnProvider(
+    {
+      ...options,
+      onRecovered: () => {
+        if (!hubRef) return
+        for (const rid of hubRef.getActiveRoomIds()) {
+          if (cfTurn.appliesToTier(accounts.getUserTier(rid))) {
+            hubRef.pushIceUpdate(rid, { quotaExceeded: false })
+          }
+        }
+      },
+    },
+    process.env,
+  )
 
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
@@ -327,8 +349,6 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  let lastRequestHost = ''
-
   function extractPublicHostname(req = null) {
     if (turnHostExplicit) return turnHostExplicit
     if (publicRelayUrl) {
@@ -336,16 +356,14 @@ export function createRelayServer(options = {}) {
         return new URL(publicRelayUrl).hostname
       } catch {}
     }
+    // Use per-request Host only for that specific request; never mutate global state across rooms
     if (req?.headers?.host) {
       try {
         const parsed = new URL(`http://${req.headers.host}`).hostname
-        if (parsed) {
-          lastRequestHost = parsed
-          return parsed
-        }
+        if (parsed) return parsed
       } catch {}
     }
-    return lastRequestHost
+    return ''
   }
 
   function resolveIceServers(req = null, scopeId = '') {
@@ -362,7 +380,8 @@ export function createRelayServer(options = {}) {
     }
 
     const publicHost = extractPublicHostname(req)
-    const formattedHost = publicHost && publicHost.includes(':') ? `[${publicHost}]` : publicHost
+    const bareHost = publicHost ? publicHost.replace(/^\[|\]$/g, '') : ''
+    const formattedHost = bareHost && bareHost.includes(':') ? `[${bareHost}]` : bareHost
     const stunStats = stunServer?.getStats?.()
     const quota = scopeId ? buildUserTurnQuota(scopeId) : null
 
@@ -541,6 +560,7 @@ export function createRelayServer(options = {}) {
     getTurnQuota: (roomId) => buildUserTurnQuota(roomId),
     iceRefreshIntervalMs: iceRefreshMs,
   })
+  hubRef = hub
 
   function recordTurnUsageBytes(userId, billedBytes) {
     const rid = String(userId || '').trim()
@@ -2090,7 +2110,18 @@ export function createRelayServer(options = {}) {
 
     // Static PWA, installer scripts (.ps1/.sh/.mjs), & APK serving
     if ((req.method === 'GET' || req.method === 'HEAD') && existsSync(staticDir)) {
-      const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
+      let decodedPathname = pathname
+      try {
+        decodedPathname = decodeURIComponent(pathname)
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'Bad Request' })
+        return
+      }
+      if (decodedPathname.includes('\0')) {
+        sendJson(res, 400, { ok: false, error: 'Bad Request' })
+        return
+      }
+      const rel = decodedPathname === '/' ? 'index.html' : decodedPathname.replace(/^\/+/, '')
       const candidate = resolve(staticDir, normalize(rel))
       let target = null
       const withinStaticDir = candidate === staticDir || candidate.startsWith(`${staticDir}${sep}`)
@@ -2099,7 +2130,7 @@ export function createRelayServer(options = {}) {
           if (statSync(candidate).isFile()) target = candidate
         } catch {}
       }
-      if (!target && !pathname.startsWith('/api/') && !pathname.startsWith('/ws/') && !pathname.startsWith('/downloads/') && !pathname.startsWith('/admin')) {
+      if (!target && !decodedPathname.startsWith('/api/') && !decodedPathname.startsWith('/ws/') && !decodedPathname.startsWith('/downloads/') && !decodedPathname.startsWith('/admin')) {
         const indexHtml = join(staticDir, 'index.html')
         try {
           if (statSync(indexHtml).isFile()) target = indexHtml
@@ -2142,8 +2173,11 @@ export function createRelayServer(options = {}) {
             'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
           }
           if (ext === '.html') {
-            staticHeaders['Content-Security-Policy'] =
-              basename(target) === 'sandbox-preview.html' ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
+            const isSandboxPreview = basename(target) === 'sandbox-preview.html'
+            staticHeaders['Content-Security-Policy'] = isSandboxPreview ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
+            if (isSandboxPreview) {
+              staticHeaders['X-Frame-Options'] = 'SAMEORIGIN'
+            }
           }
           if (req.method === 'HEAD') {
             res.writeHead(200, staticHeaders)
@@ -2196,12 +2230,25 @@ export function createRelayServer(options = {}) {
   })
 
   server.on('upgrade', (req, socket, head) => {
+    const onUpgradeSocketError = () => {
+      try { socket.destroy() } catch {}
+    }
+    socket.on('error', onUpgradeSocketError)
+
+    const rejectUpgrade = (statusLine) => {
+      try {
+        if (!socket.destroyed && socket.writable) {
+          socket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`)
+        }
+      } catch {}
+      try { socket.destroy() } catch {}
+    }
+
     let urlObj
     try {
       urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
     } catch {
-      try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n') } catch {}
-      try { socket.destroy() } catch {}
+      rejectUpgrade('400 Bad Request')
       return
     }
     const pathname = urlObj.pathname
@@ -2212,20 +2259,17 @@ export function createRelayServer(options = {}) {
         req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '',
       ).trim()
       if (!requestedRoom.startsWith('usr_')) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
-        socket.destroy()
+        rejectUpgrade('401 Unauthorized')
         return
       }
       if (!auth.checkBridgeRateLimit(bridgeIp, requestedRoom)) {
-        socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n')
-        socket.destroy()
+        rejectUpgrade('429 Too Many Requests')
         return
       }
       const bridgeAuth = authenticateBridgeInfo(req, urlObj)
       if (!bridgeAuth) {
         auth.recordBridgeFailure(bridgeIp, requestedRoom)
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
-        socket.destroy()
+        rejectUpgrade('401 Unauthorized')
         return
       }
       auth.clearBridgeFailure(bridgeIp, requestedRoom)
@@ -2244,6 +2288,7 @@ export function createRelayServer(options = {}) {
         ip: getClientIp(req),
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        socket.removeListener('error', onUpgradeSocketError)
         hub.registerBridge(ws, meta, { req })
       })
       return
@@ -2252,16 +2297,14 @@ export function createRelayServer(options = {}) {
     if (pathname === '/ws/client') {
       // Block cross-site WebSocket hijacking (CSWSH) from untrusted third-party web origins
       if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
-        socket.destroy()
+        rejectUpgrade('403 Forbidden')
         return
       }
       // Strictly require a single-use 30s ws-ticket (never accept master JWTs in URLs)
       const ticket = String(urlObj.searchParams.get('ticket') || '').trim()
       const user = ticket ? auth.consumeWsTicket(ticket) : null
       if (!user) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
-        socket.destroy()
+        rejectUpgrade('401 Unauthorized')
         return
       }
       const clientIp = getClientIp(req)
@@ -2277,13 +2320,13 @@ export function createRelayServer(options = {}) {
         console.warn('[control] Failed to persist touchUserSession on WS upgrade:', err?.message || err)
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        socket.removeListener('error', onUpgradeSocketError)
         hub.registerClient(ws, user, { ip: clientIp, userAgent: clientUa, req })
       })
       return
     }
 
-    socket.write('HTTP/1.1 404 Not Found\r\n\r\n')
-    socket.destroy()
+    rejectUpgrade('404 Not Found')
   })
 
   const start = async () => {
@@ -2300,54 +2343,90 @@ export function createRelayServer(options = {}) {
       await cfTurn.refresh()
       cfTurn.start()
     }
-    return await new Promise((resolveStart) => {
-      server.listen(port, host, () => {
-        const addr = server.address()
-        const boundPort = typeof addr === 'object' && addr ? addr.port : port
-        console.log(`[control] AllinOne Control Server (v${RELAY_VERSION}, pure P2P signaling) listening on http://${host}:${boundPort}`)
-        if (stunInfo.enabled) {
-          console.log(`[stun] Stateless RFC 5389 STUN listening on udp://${stunHost}:${stunInfo.port}`)
+    try {
+      return await new Promise((resolveStart, rejectStart) => {
+        const onListenError = (err) => {
+          server.removeListener('listening', onListening)
+          rejectStart(err)
         }
-        const turnPublicHost = extractPublicHostname(null)
-        if (turnSecret && turnPublicHost) {
-          console.log(
-            `[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s, quotas: free=${turnQuotaConfig.freeMb}MB pro=${turnQuotaConfig.proMb}MB ultra/admin=${turnQuotaConfig.ultraMb}MB)`,
-          )
+        const onListening = () => {
+          server.removeListener('error', onListenError)
+          const addr = server.address()
+          const boundPort = typeof addr === 'object' && addr ? addr.port : port
+          console.log(`[control] AllinOne Control Server (v${RELAY_VERSION}, pure P2P signaling) listening on http://${host}:${boundPort}`)
+          if (stunInfo.enabled) {
+            console.log(`[stun] Stateless RFC 5389 STUN listening on udp://${stunHost}:${stunInfo.port}`)
+          }
+          const turnPublicHost = extractPublicHostname(null)
+          if (turnSecret && turnPublicHost) {
+            console.log(
+              `[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s, quotas: free=${turnQuotaConfig.freeMb}MB pro=${turnQuotaConfig.proMb}MB ultra/admin=${turnQuotaConfig.ultraMb}MB)`,
+            )
+          }
+          if (cfTurn.enabled) {
+            const cfSt = cfTurn.getStats()
+            console.log(
+              `[cf-turn] Tiered Cloudflare Realtime TURN enabled (tiers=${cfSt.tiers.join(',')}, ttl=${cfSt.ttlSec}s, status=${cfSt.ready ? 'ready' : 'warming'})`,
+            )
+          }
+          if (turnMeter) {
+            turnMeter.start()
+            console.log(`[turn-meter] Watching coturn accounting log: ${turnLogFile}`)
+          }
+          console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
+          console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
+          console.log(`[control] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
+          if (jwtSecret.length < 16) {
+            console.warn('[control] WARNING: JWT_SECRET is not set — using an ephemeral random signing key. Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
+          }
+          resolveStart({ port: boundPort, host, stunPort: stunInfo.port })
         }
-        if (cfTurn.enabled) {
-          const cfSt = cfTurn.getStats()
-          console.log(
-            `[cf-turn] Tiered Cloudflare Realtime TURN enabled (tiers=${cfSt.tiers.join(',')}, ttl=${cfSt.ttlSec}s, status=${cfSt.ready ? 'ready' : 'warming'})`,
-          )
-        }
-        if (turnMeter) {
-          turnMeter.start()
-          console.log(`[turn-meter] Watching coturn accounting log: ${turnLogFile}`)
-        }
-        console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
-        console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
-        console.log(`[control] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
-        if (jwtSecret.length < 16) {
-          console.warn('[control] WARNING: JWT_SECRET is not set — using an ephemeral random signing key. Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
-        }
-        resolveStart({ port: boundPort, host, stunPort: stunInfo.port })
+        server.once('error', onListenError)
+        server.once('listening', onListening)
+        server.listen(port, host)
       })
-    })
+    } catch (err) {
+      cfTurn.stop()
+      turnMeter?.stop?.()
+      hub.shutdown()
+      if (stunServer) {
+        try { await stunServer.close() } catch {}
+      }
+      throw err
+    }
   }
 
+  let closePromise = null
   const close = async () => {
-    cfTurn.stop()
-    turnMeter?.stop?.()
-    accounts.flush()
-    hub.shutdown()
-    if (stunServer) {
-      try { await stunServer.close() } catch {}
-    }
-    await new Promise((resolveClose) => {
-      wss.close(() => {
-        server.close(() => resolveClose())
+    if (closePromise) return closePromise
+    closePromise = (async () => {
+      cfTurn.stop()
+      turnMeter?.stop?.()
+      accounts.flush()
+      hub.shutdown()
+      if (stunServer) {
+        try { await stunServer.close() } catch {}
+      }
+      await new Promise((resolveClose) => {
+        let settled = false
+        const done = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(forceTimer)
+          resolveClose()
+        }
+        const forceTimer = setTimeout(() => {
+          try { server.closeAllConnections?.() } catch {}
+          done()
+        }, 5000)
+        forceTimer.unref?.()
+        wss.close(() => {
+          try { server.closeIdleConnections?.() } catch {}
+          server.close(() => done())
+        })
       })
-    })
+    })()
+    return closePromise
   }
 
   return { server, wss, hub, accounts, mailer, stunServer, turnMeter, cfTurn, recordTurnUsageBytes, start, close }
@@ -2357,9 +2436,15 @@ export function createRelayServer(options = {}) {
 const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
 if (isMain) {
   const app = createRelayServer()
-  app.start()
+  app.start().catch((err) => {
+    console.error(`[control] Failed to start server: ${err?.stack || err}`)
+    process.exit(1)
+  })
+  let shuttingDown = false
   const shutdown = () => {
-    app.close().then(() => process.exit(0))
+    if (shuttingDown) return
+    shuttingDown = true
+    app.close().finally(() => process.exit(0))
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)

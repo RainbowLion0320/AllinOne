@@ -134,14 +134,32 @@ export function ensureRichPath(forceRefresh = false) {
   return process.env.PATH
 }
 
+const SENSITIVE_CHILD_ENV_KEYS = [
+  'ALLINONE_E2EE_KEY',
+  'ALLINONE_BRIDGE_SECRET',
+  'ALLINONE_WEBRTC_PROXY_PORT',
+  'ALLINONE_WEBRTC_PROXY_TOKEN',
+  'ALLINONE_PASSWORD',
+  'ELECTRON_RUN_AS_NODE',
+]
+
+export function sanitizeChildEnv(baseEnv = process.env) {
+  const out = { ...(baseEnv || process.env) }
+  for (const k of SENSITIVE_CHILD_ENV_KEYS) {
+    delete out[k]
+  }
+  return out
+}
+
 export function isExecutableFile(filePath) {
   if (!filePath || !existsSync(filePath)) return false
   try {
     const st = statSync(filePath)
     if (!st.isFile()) return false
-    if (process.platform !== 'win32') {
-      accessSync(filePath, constants.X_OK)
+    if (process.platform === 'win32') {
+      return /\.(exe|cmd|bat|com)$/i.test(filePath)
     }
+    accessSync(filePath, constants.X_OK)
     return true
   } catch {
     return false
@@ -161,7 +179,7 @@ export function findExecutable(names = [], extraCandidates = []) {
 
   const dirs = String(process.env.PATH || '').split(delimiter).filter(Boolean)
   const nameList = Array.isArray(names) ? names : [names]
-  const exts = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat'] : ['']
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', '.com'] : ['']
 
   for (const dir of dirs) {
     for (const rawName of nameList) {
@@ -223,15 +241,16 @@ function resolveNpmCmdShim(cmdPath) {
  */
 export function spawnCmdShim(bin, args = [], options = {}) {
   const argList = Array.isArray(args) ? args : []
+  const safeOpts = { ...options, env: sanitizeChildEnv(options.env || process.env) }
   const shim = resolveNpmCmdShim(bin)
   if (shim) {
-    return spawn(shim.nodeBin, [shim.entryScript, ...argList], options)
+    return spawn(shim.nodeBin, [shim.entryScript, ...argList], safeOpts)
   }
   const cleanBin = `"${String(bin || '').replace(/"/g, '')}"`
   const escapedArgs = argList.map(escapeWinCmdArg)
   const commandLine = `"${[cleanBin, ...escapedArgs].join(' ')}"`
   return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], {
-    ...options,
+    ...safeOpts,
     windowsVerbatimArguments: true,
   })
 }
@@ -241,10 +260,35 @@ export function spawnCmdShim(bin, args = [], options = {}) {
  */
 export function spawnCrossPlatform(bin, args = [], options = {}) {
   ensureRichPath()
+  const safeOpts = { ...options, env: sanitizeChildEnv(options.env || process.env) }
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
-    return spawnCmdShim(bin, args, options)
+    return spawnCmdShim(bin, args, safeOpts)
   }
-  return spawn(bin, args, options)
+  return spawn(bin, args, safeOpts)
+}
+
+/**
+ * Terminate a child process (and its process tree on Windows via `taskkill /T /F` when forcing)
+ * without leaving orphaned grandchildren or throwing on already-exited PIDs.
+ */
+export function killProcessTree(proc, { force = false } = {}) {
+  if (!proc) return
+  if (process.platform === 'win32' && proc.pid) {
+    if (force) {
+      try {
+        const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+        tk.on('error', () => {})
+      } catch {}
+    }
+    try { proc.kill(force ? 'SIGKILL' : 'SIGTERM') } catch {}
+    return
+  }
+  try {
+    proc.kill(force ? 'SIGKILL' : 'SIGTERM')
+  } catch {}
 }
 
 /**
@@ -337,10 +381,11 @@ export function getCodexCandidates(home = homedir(), platform = process.platform
     const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
     list.push(...listNewestCodexDesktopBins(localApp))
   }
-  list.push(
-    join(home, '.codex', '.sandbox-bin', 'codex.exe'),
-    join(home, '.codex', '.sandbox-bin', 'codex'),
-  )
+  if (platform === 'win32') {
+    list.push(join(home, '.codex', '.sandbox-bin', 'codex.exe'))
+  } else {
+    list.push(join(home, '.codex', '.sandbox-bin', 'codex'))
+  }
   if (platform === 'darwin') {
     list.push(
       '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',

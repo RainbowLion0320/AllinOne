@@ -168,6 +168,13 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
     }
     const pending = inflightLoads.get(cacheKey)
     if (pending) return attachSignal(pending, signal)
+  } else {
+    // Abort any earlier in-flight load for the same cacheKey so it cannot resolve late and revoke our newer blob URL
+    const stalePending = inflightLoads.get(cacheKey)
+    if (stalePending) {
+      inflightLoads.delete(cacheKey)
+      try { stalePending.controller?.abort() } catch {}
+    }
   }
 
   const epoch = cacheEpoch

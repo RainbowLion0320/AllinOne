@@ -138,7 +138,44 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
   }
 }
 
+function getNativeAndroidFilesPlugin() {
+  try {
+    if (!isCapacitorAndroid()) return null
+    const plugin = window.Capacitor?.Plugins?.AllinOneFiles
+    return typeof plugin?.saveAndShare === 'function' ? plugin : null
+  } catch {
+    return null
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const res = String(reader.result || '')
+      const comma = res.indexOf(',')
+      resolve(comma >= 0 ? res.slice(comma + 1) : res)
+    }
+    reader.onerror = () => reject(reader.error || new Error('Failed to read file data'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+export async function saveOrShareBlobNatively(blob, { filename = 'document', mimeType = 'application/octet-stream', mode = 'save' } = {}) {
+  const plugin = getNativeAndroidFilesPlugin()
+  if (!plugin || !blob) return false
+  const dataBase64 = await blobToBase64(blob)
+  await plugin.saveAndShare({
+    filename: String(filename || 'document'),
+    mimeType: String(mimeType || blob.type || 'application/octet-stream'),
+    dataBase64,
+    mode: mode === 'share' ? 'share' : 'save',
+  })
+  return true
+}
+
 export function canNativeShareFiles() {
+  if (getNativeAndroidFilesPlugin()) return true
   try {
     if (typeof navigator === 'undefined' || typeof navigator.share !== 'function' || typeof File === 'undefined') {
       return false
@@ -152,7 +189,15 @@ export function canNativeShareFiles() {
 }
 
 export async function shareDeliverableFile(entry) {
-  if (!entry?.blob || typeof navigator === 'undefined' || typeof navigator.share !== 'function') {
+  if (!entry?.blob) return false
+  if (getNativeAndroidFilesPlugin()) {
+    return await saveOrShareBlobNatively(entry.blob, {
+      filename: entry.filename || 'document',
+      mimeType: entry.mimeType || entry.blob.type || 'application/octet-stream',
+      mode: 'share',
+    })
+  }
+  if (typeof navigator === 'undefined' || typeof navigator.share !== 'function') {
     return false
   }
   const file = new File([entry.blob], entry.filename || 'document', {
@@ -170,6 +215,11 @@ export async function shareDeliverableFile(entry) {
   } catch (err) {
     // User cancelled the native share sheet — treat as handled without showing an error
     if (err?.name === 'AbortError') return true
+    // On iOS Safari / Android Chromium, user-activation gesture expires after a multi-second P2P transfer;
+    // return false so callers can fall back to <a download> or let the user tap once more (instant cache hit).
+    if (err?.name === 'NotAllowedError') {
+      return false
+    }
     throw err
   }
 }
@@ -187,12 +237,21 @@ function isCapacitorAndroid() {
 }
 
 /**
- * Trigger a browser download or native mobile share sheet for a decrypted deliverable Blob.
- * In Android Capacitor WebView, `<a download="blob:...">` is ignored by default, so we prefer
- * `navigator.share({ files })` first there and fall back to anchor download elsewhere.
+ * Trigger a browser download or native mobile save/share for a decrypted deliverable Blob.
+ * In Android Capacitor WebView, `<a download="blob:...">` is ignored by default, so we use
+ * our native `AllinOneFiles` Capacitor plugin (MediaStore Downloads / FileProvider share) first.
  */
 export async function triggerDeliverableDownload(entry) {
   if (!entry?.blob || !entry?.url) return false
+
+  if (getNativeAndroidFilesPlugin()) {
+    const saved = await saveOrShareBlobNatively(entry.blob, {
+      filename: entry.filename || 'document',
+      mimeType: entry.mimeType || entry.blob.type || 'application/octet-stream',
+      mode: 'save',
+    })
+    if (saved) return true
+  }
 
   if (isCapacitorAndroid() && canNativeShareFiles()) {
     const shared = await shareDeliverableFile(entry)

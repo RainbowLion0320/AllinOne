@@ -308,19 +308,28 @@ export class DesktopBridgeManager extends EventEmitter {
 
   async registerDeviceWithJwt({ baseUrl, token, existingBridgeId = '' }) {
     const label = os.hostname() || 'My-PC'
-    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/account/devices/register`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        label,
-        hostname: label,
-        platform: process.platform,
-        ...(existingBridgeId ? { bridgeId: existingBridgeId } : {}),
-      }),
-    })
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15_000)
+    timer.unref?.()
+    let res
+    try {
+      res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/account/devices/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          label,
+          hostname: label,
+          platform: process.platform,
+          ...(existingBridgeId ? { bridgeId: existingBridgeId } : {}),
+        }),
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok || !data.deviceSecret) {
       throw new Error(data.error || `自动绑定本机失败 (HTTP ${res.status})`)
@@ -521,6 +530,12 @@ export class DesktopBridgeManager extends EventEmitter {
     }
     const childAlive = Boolean(this.proc && !this.proc.killed && this.proc.exitCode === null)
     if (childAlive && this.state === 'connected') {
+      // Prompt running embedded bridge to immediately probe/reconnect its control WS after OS wake
+      try {
+        if (this.proc.stdin && !this.proc.stdin.destroyed && this.proc.stdin.writable) {
+          this.proc.stdin.write('resume\n')
+        }
+      } catch {}
       return this.getStatus()
     }
 
@@ -612,10 +627,11 @@ export class DesktopBridgeManager extends EventEmitter {
               }
             : {}),
         },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       },
     )
+    child.stdin?.on('error', () => {})
 
     this.proc = child
     let childAuthRevoked = false
@@ -759,7 +775,12 @@ export class DesktopBridgeManager extends EventEmitter {
         }
         const latestCfg = latestRes.config || cfg
         if (latestCfg?.autoStartDisabled) return
-        void this.spawnBridgeProcess(latestCfg)
+        void this.spawnBridgeProcess(latestCfg).catch((err) => {
+          this.state = 'error'
+          this.error = String(err?.message || err)
+          this.appendLog(`Auto-restart spawn failed: ${this.error}`)
+          this.emitStatus()
+        })
       }, delayMs)
     })
   }

@@ -28,6 +28,7 @@ export class RelayBridgeLink {
     mode = 'desktop',
     e2eeKey = '',
     inboundDir = '',
+    webrtcProxy = null,
     log = console,
     onRpc,
     onRegisterP2pUpload,
@@ -62,6 +63,7 @@ export class RelayBridgeLink {
     this.stopped = false
     this.attempt = 0
     this.reconnectTimer = null
+    this.stableResetTimer = null
     this.heartbeatTimer = null
     this.lastPongAt = 0
     this.metaApps = []
@@ -83,6 +85,7 @@ export class RelayBridgeLink {
       onRpc: (method, params, ctx) => this.onRpc(method, params, ctx),
       onRegisterP2pUpload,
       inboundDir: resolvedInboundDir,
+      webrtcProxy,
       log: this.log,
     })
   }
@@ -131,6 +134,10 @@ export class RelayBridgeLink {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    if (this.stableResetTimer) {
+      clearTimeout(this.stableResetTimer)
+      this.stableResetTimer = null
+    }
     this.clearHeartbeat()
     if (this.ws) {
       try { this.ws.close(1000, 'Bridge stopping') } catch {}
@@ -139,6 +146,33 @@ export class RelayBridgeLink {
     const disposePromise = this.p2p?.dispose?.().catch(() => {}) || Promise.resolve()
     this.emitState('stopped', 'Bridge stopped')
     return disposePromise
+  }
+
+  /**
+   * Called after OS wake/resume: immediately probe the control WS and tear it down if no pong arrives in 4s.
+   */
+  probeOrReconnect(reason = 'resume') {
+    if (this.stopped) return
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer)
+        this.reconnectTimer = null
+      }
+      this.attempt = 0
+      this.connect()
+      return
+    }
+    const wsRef = this.ws
+    const prevPongAt = this.lastPongAt
+    this.send({ type: 'ping', ts: Date.now() })
+    const probeTimer = setTimeout(() => {
+      if (this.stopped || this.ws !== wsRef) return
+      if (this.lastPongAt <= prevPongAt) {
+        this.log.warn?.(`mobile-hub: control socket unresponsive after ${reason}; reconnecting immediately`)
+        try { wsRef.terminate() } catch {}
+      }
+    }, 4_000)
+    probeTimer.unref?.()
   }
 
   emitState(state, detail = '') {
@@ -230,7 +264,13 @@ export class RelayBridgeLink {
         return
       }
       try {
-        this.attempt = 0
+        if (this.stableResetTimer) clearTimeout(this.stableResetTimer)
+        // Only reset exponential backoff once the connection stays healthy for 20s (prevents 1.5s 4001 kick-war storms)
+        this.stableResetTimer = setTimeout(() => {
+          this.stableResetTimer = null
+          if (this.ws === ws && !this.stopped) this.attempt = 0
+        }, 20_000)
+        this.stableResetTimer.unref?.()
         this.lastPongAt = Date.now()
         this.log.info?.(
           `mobile-hub: connected to control server ${this.relayUrl} as "${this.bridgeId}" (P2P ${this.p2p.getEngineName()} + E2EE AES-256-GCM)`,
@@ -276,7 +316,11 @@ export class RelayBridgeLink {
       }
 
       if (msg.type === EVENTS.CLIENT_REVOKED) {
-        this.p2p.revokeClients(msg.clientIds || [])
+        this.p2p.revokeClients(msg.clientIds || [], {
+          sids: msg.sids || [],
+          all: Boolean(msg.all),
+          allExceptSids: msg.allExceptSids || [],
+        })
         return
       }
 
@@ -284,6 +328,7 @@ export class RelayBridgeLink {
         try {
           await this.p2p.handleEncryptedSignal({
             clientId: msg.clientId,
+            sid: msg.sid || '',
             sessionId: msg.sessionId,
             e2ee: msg.e2ee,
           })
@@ -297,6 +342,10 @@ export class RelayBridgeLink {
       if (this.ws !== ws || authRejected) return
       const reason = reasonBuf ? reasonBuf.toString('utf8') : ''
       this.clearHeartbeat()
+      if (this.stableResetTimer) {
+        clearTimeout(this.stableResetTimer)
+        this.stableResetTimer = null
+      }
       this.ws = null
       if (this.stopped) return
       if (code === 4401) {
@@ -306,9 +355,22 @@ export class RelayBridgeLink {
         this.emitState('unauthorized', detail)
         return
       }
+      if (code === 4008) {
+        void this.p2p?.dispose?.().catch(() => {})
+        const detail = reason || 'E2EE required by control server'
+        this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
+        this.emitState('error', detail)
+        return
+      }
       const detail = `closed code=${code}${reason ? ` (${reason})` : ''}`
       this.log.warn?.(`mobile-hub: control server ${detail}`)
       this.emitState('disconnected', detail)
+      if (code === 4001 || code === 4029) {
+        // Back off heavily when replaced by another bridge instance or over room cap to avoid 1.5s kick-war storms
+        this.attempt = Math.max(this.attempt, 6)
+        this.scheduleReconnect(30_000 + Math.floor(Math.random() * 10_000))
+        return
+      }
       this.scheduleReconnect()
     })
 
@@ -340,9 +402,10 @@ export class RelayBridgeLink {
     }
   }
 
-  scheduleReconnect() {
+  scheduleReconnect(minDelayMs = 0) {
     if (this.stopped || this.reconnectTimer) return
-    const delayMs = Math.min(30_000, 1_500 * Math.pow(1.6, Math.min(this.attempt, 8)))
+    const baseDelay = Math.min(30_000, 1_500 * Math.pow(1.6, Math.min(this.attempt, 8)))
+    const delayMs = Math.max(minDelayMs, baseDelay)
     this.attempt += 1
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null

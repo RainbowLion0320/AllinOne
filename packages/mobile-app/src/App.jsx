@@ -23,6 +23,7 @@ import {
   detectDefaultServerUrl,
   fetchAuthSessions,
   listAccountDevices,
+  logoutDeviceSession,
   probeDeviceStatus,
   removeAccountDevice,
   renameAccountDevice,
@@ -2023,9 +2024,13 @@ export function App() {
 
   const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
     const target = devices.find((d) => d.id === deviceId)
-    if (revokeAll && target?.baseUrl && target?.token) {
+    if (target?.baseUrl && target?.token) {
       try {
-        await revokeDeviceSessions(target.baseUrl, target.token)
+        if (revokeAll) {
+          await revokeDeviceSessions(target.baseUrl, target.token)
+        } else {
+          await logoutDeviceSession(target.baseUrl, target.token)
+        }
       } catch {}
     }
     const removingActive = activeDevice?.id === deviceId
@@ -2056,6 +2061,7 @@ export function App() {
     const client = clientRef.current
     if (!client) throw new Error(biLang(getCurrentLang(), '未连接到服务器', 'Not connected to server'))
     const gen = deviceGenRef.current
+    const startOpenSeq = openRequestSeqRef.current
     const targetBridge = activeBridgeIdRef.current
     const res = await client.rpc(
       RPC.SESSION_CREATE,
@@ -2072,13 +2078,6 @@ export function App() {
     )
     if (deviceGenRef.current !== gen) return res.session
     const created = res.session
-    openRequestSeqRef.current += 1
-    olderReqSeqRef.current += 1
-    loadingOlderLockRef.current = false
-    setLoadingSession(false)
-    setLoadingOlder(false)
-    setOlderError('')
-    setSessionOpenSeq((n) => n + 1)
     if (model || provider || reasoningEffort) {
       setSessionModelPrefs((prev) => ({
         ...prev,
@@ -2089,12 +2088,24 @@ export function App() {
         },
       }))
     }
+    setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)])
+    // If the user explicitly opened another conversation while SESSION_CREATE was in flight,
+    // keep the newly created session in the sidebar without hijacking their active viewport.
+    if (openRequestSeqRef.current !== startOpenSeq) {
+      return created
+    }
+    openRequestSeqRef.current += 1
+    olderReqSeqRef.current += 1
+    loadingOlderLockRef.current = false
+    setLoadingSession(false)
+    setLoadingOlder(false)
+    setOlderError('')
+    setSessionOpenSeq((n) => n + 1)
     const emptyMeta = { hasMore: false, nextCursor: null, totalCount: 0 }
     activeSessionRef.current = created
     messagesRef.current = []
     historyMetaRef.current = emptyMeta
     pruneUnusedSentPreviewUrls([])
-    setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)])
     setActiveSession(created)
     saveLastSessionId(cacheScopeRef.current, created.id)
     if (created.cwd) {
@@ -2287,24 +2298,45 @@ export function App() {
         for (const a of imgAtts) {
           if (a?.localPreviewUrl) sentPreviewUrlsRef.current.delete(a.localPreviewUrl)
         }
-        const rolledBack = messagesRef.current.filter((m) => m?.id !== userMsg.id)
-        messagesRef.current = rolledBack
-        setMessages((prev) => {
-          const next = prev.filter((m) => m?.id !== userMsg.id)
-          messagesRef.current = next
-          return next
-        })
-        void saveCachedSession(
-          target.id,
-          {
-            meta: target,
-            messages: rolledBack,
-            hasMore: baseHistoryMeta.hasMore,
-            nextCursor: baseHistoryMeta.nextCursor,
-            totalCount: baseHistoryMeta.totalCount,
-          },
-          scope,
-        )
+        const stillOnTarget = activeSessionRef.current?.id === target.id
+        if (stillOnTarget) {
+          const rolledBack = messagesRef.current.filter((m) => m?.id !== userMsg.id)
+          messagesRef.current = rolledBack
+          setMessages((prev) => {
+            const next = prev.filter((m) => m?.id !== userMsg.id)
+            messagesRef.current = next
+            return next
+          })
+          void saveCachedSession(
+            target.id,
+            {
+              meta: target,
+              messages: rolledBack,
+              hasMore: baseHistoryMeta.hasMore,
+              nextCursor: baseHistoryMeta.nextCursor,
+              totalCount: baseHistoryMeta.totalCount,
+            },
+            scope,
+          )
+        } else {
+          // User already switched to another session: never overwrite Session A's cache with Session B's messages
+          void loadCachedSession(target.id, scope).then((cachedTarget) => {
+            if (!cachedTarget || !Array.isArray(cachedTarget.messages)) return
+            const cleaned = cachedTarget.messages.filter((m) => m?.id !== userMsg.id)
+            return saveCachedSession(
+              target.id,
+              {
+                meta: cachedTarget.meta || target,
+                messages: cleaned,
+                hasMore: cachedTarget.hasMore,
+                nextCursor: cachedTarget.nextCursor,
+                truncatedByCap: cachedTarget.truncatedByCap,
+                totalCount: cachedTarget.totalCount,
+              },
+              scope,
+            )
+          }).catch(() => {})
+        }
         return false
       }
       return true

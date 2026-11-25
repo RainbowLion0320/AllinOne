@@ -32,11 +32,12 @@ export function HtmlPreviewModal({ state, onClose }) {
     const onKeyDown = (e) => {
       if (e.key === 'Escape') {
         e.preventDefault()
+        e.stopImmediatePropagation()
         onClose?.()
       }
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [open, onClose])
 
   useEffect(() => {

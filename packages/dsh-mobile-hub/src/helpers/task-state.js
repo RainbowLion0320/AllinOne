@@ -207,6 +207,12 @@ export function createTaskStateTracker(initial = null) {
     updatedAt: seed?.updatedAt || 0,
   }
   let claudeTaskSeq = 0
+  for (const s of state.steps) {
+    const num = Number(s?.id)
+    if (Number.isInteger(num) && num > claudeTaskSeq) {
+      claudeTaskSeq = num
+    }
+  }
   let lastSig = ''
 
   const touch = (ts) => {
@@ -315,10 +321,15 @@ export function createTaskStateTracker(initial = null) {
       }
       return setMode('goal', ts)
     }
-    // New normal user turn after a previous checklist already finished: drop completed steps & stale focus/planDoc
+    // New normal user turn: clear sticky plan mode (when no unfinished steps remain), completed steps & stale focus/planDoc
     let changed = false
-    if (state.steps.length > 0 && state.steps.every((s) => s.status === 'done' || s.status === 'skipped')) {
+    const allStepsFinished = state.steps.length > 0 && state.steps.every((s) => s.status === 'done' || s.status === 'skipped')
+    if (allStepsFinished) {
       state.steps = []
+      changed = true
+    }
+    if (state.mode === 'plan' && state.steps.length === 0) {
+      state.mode = null
       changed = true
     }
     if (state.focus) {

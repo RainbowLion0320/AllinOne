@@ -1283,6 +1283,9 @@ export class DshAdapter {
       if (model || reasoningEffort) {
         await this.applyModelSelection(agent, lockedId, { provider, model, reasoningEffort })
       }
+      if (turnState.aborted) {
+        return { sessionId: realCompositeId, nativeId: lockedId, finalText: '', aborted: true, usage: null }
+      }
 
       let prompt = String(text || '').trim()
       if (attachments.length > 0) {

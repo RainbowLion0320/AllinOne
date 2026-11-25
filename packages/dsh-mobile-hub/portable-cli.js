@@ -32,6 +32,32 @@ const DEFAULT_SERVER_URL =
   'http://127.0.0.1:8787'
 const BRIDGE_VERSION = '1.0.13'
 
+// Capture sensitive bootstrap env vars once at process startup, then scrub them from process.env
+// so spawned AI CLIs (codex/claude/agy) and user shell commands never inherit decrypted secrets
+// or ELECTRON_RUN_AS_NODE=1.
+const BOOTSTRAP_ENV = {
+  bridgeSecret: String(process.env.ALLINONE_BRIDGE_SECRET || '').trim(),
+  e2eeKey: String(process.env.ALLINONE_E2EE_KEY || '').trim(),
+  password: String(process.env.ALLINONE_PASSWORD || ''),
+  webrtcProxyPort: Number(process.env.ALLINONE_WEBRTC_PROXY_PORT || 0),
+  webrtcProxyToken: String(process.env.ALLINONE_WEBRTC_PROXY_TOKEN || '').trim(),
+  hadDesktopSecrets: Boolean(
+    String(process.env.ALLINONE_BRIDGE_SECRET || '').trim() ||
+    String(process.env.ALLINONE_E2EE_KEY || '').trim() ||
+    Number(process.env.ALLINONE_WEBRTC_PROXY_PORT || 0) > 0,
+  ),
+}
+for (const secretKey of [
+  'ALLINONE_BRIDGE_SECRET',
+  'ALLINONE_E2EE_KEY',
+  'ALLINONE_PASSWORD',
+  'ALLINONE_WEBRTC_PROXY_PORT',
+  'ALLINONE_WEBRTC_PROXY_TOKEN',
+  'ELECTRON_RUN_AS_NODE',
+]) {
+  delete process.env[secretKey]
+}
+
 function normalizeServerUrl(raw) {
   const trimmed = String(raw || DEFAULT_SERVER_URL).trim()
   try {
@@ -57,8 +83,8 @@ function parseArgs(argv) {
     label: process.env.ALLINONE_PC_NAME || os.hostname() || 'My-PC',
     stateDir: process.env.ALLINONE_HOME || join(os.homedir(), '.allinone-bridge'),
     username: process.env.ALLINONE_USERNAME || '',
-    password: process.env.ALLINONE_PASSWORD || '',
-    e2eeKey: process.env.ALLINONE_E2EE_KEY || '',
+    password: BOOTSTRAP_ENV.password || '',
+    e2eeKey: BOOTSTRAP_ENV.e2eeKey || '',
     e2eeKeyFromCli: false,
     logout: false,
     reset: false,
@@ -124,8 +150,8 @@ function readRawConfig(configPath) {
 function readConfig(configPath) {
   const parsed = readRawConfig(configPath)
   if (!parsed) return null
-  const envSecret = String(process.env.ALLINONE_BRIDGE_SECRET || '').trim()
-  const envE2eeKey = normalizeE2eeKey(process.env.ALLINONE_E2EE_KEY || '')
+  const envSecret = BOOTSTRAP_ENV.bridgeSecret
+  const envE2eeKey = normalizeE2eeKey(BOOTSTRAP_ENV.e2eeKey || '')
   if (parsed.roomId && (parsed.bridgeSecret || envSecret)) {
     return {
       ...parsed,
@@ -139,10 +165,10 @@ function readConfig(configPath) {
 function saveConfig(configPath, cfg) {
   const toPersist = { ...cfg }
   // Never downgrade Electron safeStorage encrypted config back to plaintext on label/username sync
-  if (toPersist.bridgeSecretEnc && process.env.ALLINONE_BRIDGE_SECRET) {
+  if (toPersist.bridgeSecretEnc && BOOTSTRAP_ENV.bridgeSecret) {
     delete toPersist.bridgeSecret
   }
-  if (toPersist.e2eeKeyEnc && process.env.ALLINONE_E2EE_KEY) {
+  if (toPersist.e2eeKeyEnc && BOOTSTRAP_ENV.e2eeKey) {
     delete toPersist.e2eeKey
   }
   const payload = JSON.stringify(toPersist, null, 2)
@@ -158,8 +184,19 @@ function saveConfig(configPath, cfg) {
   try { chmodSync(configPath, 0o600) } catch {}
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  timer.unref?.()
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function loginDeviceWithAccount(serverUrl, { username, password, label, emailCode = '' }) {
-  const res = await fetch(`${serverUrl}/api/account/device-login`, {
+  const res = await fetchWithTimeout(`${serverUrl}/api/account/device-login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -170,7 +207,7 @@ async function loginDeviceWithAccount(serverUrl, { username, password, label, em
       platform: process.platform,
       ...(emailCode ? { emailCode: String(emailCode).trim() } : {}),
     }),
-  })
+  }, 15_000)
   const data = await res.json().catch(() => ({}))
   if (res.ok && data?.requires2fa) {
     return data
@@ -182,13 +219,13 @@ async function loginDeviceWithAccount(serverUrl, { username, password, label, em
 }
 
 async function fetchDeviceAccountStatus(serverUrl, roomId, bridgeSecret) {
-  const res = await fetch(`${serverUrl}/api/account/device-status`, {
+  const res = await fetchWithTimeout(`${serverUrl}/api/account/device-status`, {
     method: 'GET',
     headers: {
       'X-Room-Id': roomId,
       'X-Bridge-Secret': bridgeSecret,
     },
-  })
+  }, 8_000)
   if (res.status === 401) return null
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
@@ -461,7 +498,7 @@ async function main() {
   const hasDesktopEncryptedConfig = Boolean(
     rawExisting?.bridgeSecretEnc &&
     !rawExisting?.bridgeSecret &&
-    !String(process.env.ALLINONE_BRIDGE_SECRET || '').trim(),
+    !BOOTSTRAP_ENV.bridgeSecret,
   )
   if (hasDesktopEncryptedConfig) {
     if (!opts.reset) {
@@ -603,7 +640,7 @@ async function main() {
       delete cfg.e2eeKeyEnc
       saveConfig(configPath, cfg)
       isNewE2eeKey = true
-    } else if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !process.env.ALLINONE_E2EE_KEY) {
+    } else if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !BOOTSTRAP_ENV.e2eeKey) {
       cfg.e2eeKey = activeE2eeKey
       saveConfig(configPath, cfg)
     }
@@ -635,8 +672,9 @@ async function main() {
     }
   }
 
-  // Always persist offline E2EE QR HTML on newly generated keys or non-TTY / headless mode
-  if (isNewE2eeKey || !process.stdin.isTTY || !existsSync(e2eeHtmlPath)) {
+  // Only persist offline E2EE QR HTML in standalone CLI mode (never defeat Electron safeStorage encryption at rest)
+  const isDesktopManaged = Boolean(cfg.e2eeKeyEnc || opts.noBrowser || BOOTSTRAP_ENV.hadDesktopSecrets)
+  if (!isDesktopManaged && (isNewE2eeKey || !process.stdin.isTTY || !existsSync(e2eeHtmlPath))) {
     try {
       writeE2eeKeyPage(false)
     } catch {}
@@ -705,6 +743,10 @@ async function main() {
     log: quietLog,
     onRpc: (method, params, ctx) => orchestrator.handleRpc(method, params, ctx),
     onRegisterP2pUpload: (info) => orchestrator.registerP2pUpload(info),
+    webrtcProxy:
+      BOOTSTRAP_ENV.webrtcProxyPort > 0 && BOOTSTRAP_ENV.webrtcProxyToken
+        ? { port: BOOTSTRAP_ENV.webrtcProxyPort, token: BOOTSTRAP_ENV.webrtcProxyToken }
+        : null,
     onState: (state, detail) => {
       if (state === 'connected') {
         if (!connectedOnce) {
@@ -858,6 +900,28 @@ async function main() {
         await shutdown(0)
       }
     })
+  } else if (BOOTSTRAP_ENV.hadDesktopSecrets) {
+    // Embedded desktop-app control channel over piped stdin:
+    //  - "probe" / "resume" triggers immediate WS reconnect after OS sleep/wake
+    //  - stdin EOF means parent Electron process died/crashed -> shut down cleanly (no orphan bridge!)
+    let ctrlBuf = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', (chunk) => {
+      ctrlBuf += chunk
+      let nl
+      while ((nl = ctrlBuf.indexOf('\n')) !== -1) {
+        const line = ctrlBuf.slice(0, nl).trim().toLowerCase()
+        ctrlBuf = ctrlBuf.slice(nl + 1)
+        if (line === 'resume' || line === 'probe' || line === 'reconnect') {
+          link.probeOrReconnect('system-resume')
+        } else if (line === 'quit' || line === 'stop') {
+          void shutdown(0)
+        }
+      }
+    })
+    process.stdin.on('end', () => void shutdown(0))
+    process.stdin.on('close', () => void shutdown(0))
+    process.stdin.resume()
   }
 
   process.on('SIGINT', () => void shutdown(0))

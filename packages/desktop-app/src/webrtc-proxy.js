@@ -228,7 +228,7 @@ export class DesktopWebRtcProxy {
 
   handleWorkerControl(msg, ev = null) {
     if (!msg || msg.type === 'worker.ready') return
-    if (ev?.sender && this.workerWin && !this.workerWin.isDestroyed() && ev.sender !== this.workerWin.webContents) {
+    if (ev?.sender && (!this.workerWin || this.workerWin.isDestroyed() || ev.sender !== this.workerWin.webContents)) {
       return
     }
     if (msg.type === 'res' && msg.reqId) {
@@ -250,7 +250,7 @@ export class DesktopWebRtcProxy {
 
   handleWorkerBinary(payload, ev = null) {
     if (!payload?.bytes || !this.activeSocket || this.activeSocket.destroyed) return
-    if (ev?.sender && this.workerWin && !this.workerWin.isDestroyed() && ev.sender !== this.workerWin.webContents) {
+    if (ev?.sender && (!this.workerWin || this.workerWin.isDestroyed() || ev.sender !== this.workerWin.webContents)) {
       return
     }
     try {
@@ -263,6 +263,10 @@ export class DesktopWebRtcProxy {
     let authed = false
     let buf = Buffer.alloc(0)
     let frameQueue = Promise.resolve()
+    let queuedFrameBytes = 0
+    let socketPaused = false
+    const MAX_QUEUED_FRAME_BYTES = 4 * 1024 * 1024
+    const RESUME_QUEUED_FRAME_BYTES = 1 * 1024 * 1024
 
     const processFrame = async (kind, payload) => {
       if (socket.destroyed) return
@@ -280,7 +284,14 @@ export class DesktopWebRtcProxy {
         }
         authed = true
         if (this.activeSocket && this.activeSocket !== socket) {
-          try { this.activeSocket.destroy() } catch {}
+          const prevSocket = this.activeSocket
+          this.activePeerIds.clear()
+          this.pendingReqIds.clear()
+          if (this.workerWin && !this.workerWin.isDestroyed()) {
+            try { this.workerWin.webContents.send('webrtc-worker:cmd', { type: 'peer.closeAll' }) } catch {}
+          }
+          this.scheduleIdleDestroy()
+          try { prevSocket.destroy() } catch {}
         }
         this.activeSocket = socket
         socket.write(encodeJsonFrame({ type: 'auth.ok' }))
@@ -290,16 +301,51 @@ export class DesktopWebRtcProxy {
       if (kind === FRAME_JSON) {
         let cmd
         try { cmd = JSON.parse(payload.toString('utf8')) } catch { return }
-        if (cmd.type === 'peer.offer' && cmd.peerId) {
+        const isCreatingCmd = cmd.type === 'peer.offer'
+        if (isCreatingCmd && cmd.peerId) {
           this.activePeerIds.add(cmd.peerId)
           this.clearIdleTimer()
         } else if (cmd.type === 'peer.close' && cmd.peerId) {
           this.activePeerIds.delete(cmd.peerId)
-          if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
         } else if (cmd.type === 'peer.closeAll') {
           this.activePeerIds.clear()
-          this.scheduleIdleDestroy()
         }
+
+        // Never cold-start a hidden Chromium worker (or cancel idle destroy!) for non-creating commands
+        if (!isCreatingCmd) {
+          if (!this.workerWin || this.workerWin.isDestroyed()) {
+            if (cmd.reqId && !socket.destroyed) {
+              socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
+            }
+            return
+          }
+          if (cmd.reqId) {
+            this.pendingReqIds.add(cmd.reqId)
+          }
+          try {
+            const win = this.workerReadyPromise ? await this.workerReadyPromise : this.workerWin
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('webrtc-worker:cmd', cmd)
+            } else if (cmd.reqId) {
+              this.pendingReqIds.delete(cmd.reqId)
+              if (!socket.destroyed) {
+                socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
+              }
+            }
+          } catch (err) {
+            if (cmd.reqId) {
+              this.pendingReqIds.delete(cmd.reqId)
+              if (!socket.destroyed) {
+                socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }))
+              }
+            }
+          }
+          if ((cmd.type === 'peer.close' || cmd.type === 'peer.closeAll') && this.activePeerIds.size === 0) {
+            this.scheduleIdleDestroy()
+          }
+          return
+        }
+
         if (cmd.reqId) {
           this.pendingReqIds.add(cmd.reqId)
         }
@@ -348,11 +394,24 @@ export class DesktopWebRtcProxy {
         if (buf.length < 4 + len) break
         const kind = buf[4]
         const payload = Buffer.from(buf.subarray(5, 4 + len))
+        const frameBytes = payload.length
         buf = buf.subarray(4 + len)
+        queuedFrameBytes += frameBytes
+        if (!socketPaused && queuedFrameBytes >= MAX_QUEUED_FRAME_BYTES) {
+          socketPaused = true
+          try { socket.pause() } catch {}
+        }
         frameQueue = frameQueue
           .then(() => processFrame(kind, payload))
           .catch((err) => {
             this.log.warn?.(`[webrtc-proxy] frame error: ${String(err?.message || err)}`)
+          })
+          .finally(() => {
+            queuedFrameBytes = Math.max(0, queuedFrameBytes - frameBytes)
+            if (socketPaused && queuedFrameBytes <= RESUME_QUEUED_FRAME_BYTES && !socket.destroyed) {
+              socketPaused = false
+              try { socket.resume() } catch {}
+            }
           })
       }
     })

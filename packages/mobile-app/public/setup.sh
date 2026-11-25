@@ -3,6 +3,11 @@ set -euo pipefail
 
 SERVER_URL="${ALLINONE_SERVER:-https://your-relay.example.com}"
 SERVER_URL="${SERVER_URL%/}"
+if [[ ! "${SERVER_URL}" =~ ^https?://[A-Za-z0-9._:/\[\]-]+$ ]] || [[ "${SERVER_URL}" =~ ^https?://your-relay\.example\.com(/|$) ]]; then
+  echo "[!] Invalid or placeholder ALLINONE_SERVER URL: ${SERVER_URL}"
+  echo "    Please set ALLINONE_SERVER to your real relay server URL (e.g. https://ai.example.com)."
+  exit 1
+fi
 INSTALL_DIR="${HOME}/.allinone-bridge"
 BRIDGE_FILE="${INSTALL_DIR}/allinone-bridge.mjs"
 DOWNLOAD_URL="${SERVER_URL}/downloads/allinone-bridge.mjs"
@@ -49,14 +54,22 @@ mkdir -p "${INSTALL_DIR}"
 chmod 700 "${INSTALL_DIR}" 2>/dev/null || true
 
 echo "[2/3] Downloading portable bridge bundle..."
-curl -fsSL "${DOWNLOAD_URL}" -o "${BRIDGE_FILE}"
+BRIDGE_TMP="${BRIDGE_FILE}.tmp.$$"
+trap 'rm -f "${BRIDGE_TMP}" 2>/dev/null || true' EXIT
+curl --proto '=https,http' --proto-redir '=https,http' -fsSL "${DOWNLOAD_URL}" -o "${BRIDGE_TMP}"
+chmod 600 "${BRIDGE_TMP}" 2>/dev/null || true
+mv -f "${BRIDGE_TMP}" "${BRIDGE_FILE}"
+trap - EXIT
 
 START_SH="${INSTALL_DIR}/start.sh"
-cat > "${START_SH}" <<EOF
-#!/usr/bin/env bash
-export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:\${HOME}/.local/bin:\${HOME}/.volta/bin:\${HOME}/.bun/bin:\${PATH}"
-exec "${NODE_BIN}" "${BRIDGE_FILE}" --server "${SERVER_URL}" "\$@"
-EOF
+printf -v Q_NODE_BIN '%q' "${NODE_BIN}"
+printf -v Q_BRIDGE_FILE '%q' "${BRIDGE_FILE}"
+printf -v Q_SERVER_URL '%q' "${SERVER_URL}"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${HOME}/.local/bin:${HOME}/.volta/bin:${HOME}/.bun/bin:${PATH}"'
+  printf 'exec %s %s --server %s "$@"\n' "${Q_NODE_BIN}" "${Q_BRIDGE_FILE}" "${Q_SERVER_URL}"
+} > "${START_SH}"
 chmod +x "${START_SH}"
 
 if [ "$(uname -s)" = "Darwin" ] && [ -d "${HOME}/Desktop" ]; then

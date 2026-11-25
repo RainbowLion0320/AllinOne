@@ -37,6 +37,8 @@ export class ElectronWebRtcClient {
     this.token = String(token || '')
     this.log = log
     this.socket = null
+    this._connectingSocket = null
+    this._connectTimer = null
     this.connectPromise = null
     this.pendingReqs = new Map()
     this.peers = new Map()
@@ -53,25 +55,37 @@ export class ElectronWebRtcClient {
     }
     const connPromise = new Promise((resolveConn, rejectConn) => {
       const sock = net.createConnection({ host: '127.0.0.1', port: this.port })
+      this._connectingSocket = sock
       sock.setNoDelay(true)
       let authed = false
       let settled = false
       let buf = Buffer.alloc(0)
 
-      const rejectOnce = (err) => {
-        if (settled) return
-        settled = true
+      const clearConnectRefs = () => {
         clearTimeout(timer)
+        if (this._connectTimer === timer) this._connectTimer = null
+        if (this._connectingSocket === sock) this._connectingSocket = null
         if (this.connectPromise === connPromise) {
           this.connectPromise = null
         }
+      }
+
+      const rejectOnce = (err) => {
+        if (settled) return
+        settled = true
+        clearConnectRefs()
         rejectConn(err)
       }
 
       const resolveOnce = () => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        clearConnectRefs()
+        if (this.disposed || sock.destroyed) {
+          try { sock.destroy() } catch {}
+          rejectConn(new Error('ElectronWebRtcClient disposed'))
+          return
+        }
         this.socket = sock
         resolveConn(sock)
       }
@@ -80,8 +94,15 @@ export class ElectronWebRtcClient {
         try { sock.destroy() } catch {}
         rejectOnce(new Error('Electron WebRTC proxy connect timeout'))
       }, 8_000)
+      timer.unref?.()
+      this._connectTimer = timer
 
       sock.on('connect', () => {
+        if (this.disposed) {
+          try { sock.destroy() } catch {}
+          rejectOnce(new Error('ElectronWebRtcClient disposed'))
+          return
+        }
         sock.write(encodeJsonFrame({ type: 'auth', token: this.token }))
       })
 
@@ -182,6 +203,7 @@ export class ElectronWebRtcClient {
         this.pendingReqs.delete(reqId)
         rejectReq(new Error(`WebRTC worker command timeout: ${cmd.type}`))
       }, 15_000)
+      timer.unref?.()
       this.pendingReqs.set(reqId, { resolve: resolveReq, reject: rejectReq, timer })
       sock.write(encodeJsonFrame({ ...cmd, reqId }))
     })
@@ -194,6 +216,8 @@ export class ElectronWebRtcClient {
     let closed = false
     let proxyNotifiedClosed = false
     let bulkBuffered = 0
+    let unackedBulkBytes = 0
+    const effectiveBulkBuffered = () => bulkBuffered + unackedBulkBytes
     const drainWaiters = []
     const socketDrainWaiters = []
 
@@ -211,7 +235,7 @@ export class ElectronWebRtcClient {
     }
 
     const flushDrainWaiters = () => {
-      if (bulkBuffered > 512 * 1024) return
+      if (effectiveBulkBuffered() > 1024 * 1024) return
       while (drainWaiters.length > 0) {
         const w = drainWaiters.shift()
         w.resolve()
@@ -278,6 +302,11 @@ export class ElectronWebRtcClient {
           try { opts.onCtrlMessage?.(String(msg.data || '')) } catch {}
         } else if (msg.type === 'dc.buffered' && msg.role === 'bulk') {
           bulkBuffered = Number(msg.bufferedAmount || 0)
+          if (msg.ackedBytes !== undefined) {
+            unackedBulkBytes = Math.max(0, unackedBulkBytes - Number(msg.ackedBytes || 0))
+          } else {
+            unackedBulkBytes = 0
+          }
           flushDrainWaiters()
         } else if (msg.type === 'transport' && msg.transport) {
           try { opts.onTransportChange?.(String(msg.transport)) } catch {}
@@ -315,7 +344,7 @@ export class ElectronWebRtcClient {
       },
       sendBulk: async (bytes, { signal = null } = {}) => {
         assertBulkReady(signal)
-        while (bulkBuffered >= 2 * 1024 * 1024) {
+        while (effectiveBulkBuffered() >= 2 * 1024 * 1024) {
           await new Promise((resolveWait, rejectWait) => {
             let done = false
             const cleanup = () => {
@@ -358,6 +387,7 @@ export class ElectronWebRtcClient {
           ? bytes
           : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
         const frame = encodeBinFrame(peerId, 'bulk', raw)
+        unackedBulkBytes += raw.length
         const ok = sock.write(frame)
         if (!ok) {
           await new Promise((resolveDrain, rejectDrain) => {
@@ -430,6 +460,20 @@ export class ElectronWebRtcClient {
 
   dispose() {
     this.disposed = true
+    if (this._connectTimer) {
+      clearTimeout(this._connectTimer)
+      this._connectTimer = null
+    }
+    if (this._connectingSocket) {
+      try { this._connectingSocket.destroy() } catch {}
+      this._connectingSocket = null
+    }
+    this.connectPromise = null
+    for (const [reqId, p] of this.pendingReqs.entries()) {
+      clearTimeout(p.timer)
+      p.reject(new Error('ElectronWebRtcClient disposed'))
+      this.pendingReqs.delete(reqId)
+    }
     for (const peer of [...this.peers.values()]) {
       peer._fireClosed()
     }

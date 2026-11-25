@@ -244,12 +244,13 @@ export class MultiAppOrchestrator {
    * Security: NEVER trusts caller-supplied `localPath` or arbitrary URLs, and enforces
    * single-use + uploading-client ownership (`clientId`) when present.
    */
-  async materializeAttachments(attachments = [], { clientId = '' } = {}) {
+  async materializeAttachments(attachments = [], { clientId = '', strict = false, _burnedOut = null } = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return []
     this.pruneInboundDir()
     const now = Date.now()
     const callerClientId = String(clientId || '').trim()
     const out = []
+    let rejectedTokens = 0
 
     for (const att of attachments.slice(0, 12)) {
       if (!att || typeof att !== 'object') continue
@@ -262,14 +263,19 @@ export class MultiAppOrchestrator {
       if (!rec || now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS || !existsSync(rec.localPath)) {
         this.p2pUploads.delete(token)
         this.log.warn?.('mobile-hub: rejected expired or unknown p2pToken')
+        rejectedTokens += 1
         continue
       }
       if (rec.clientId && callerClientId && rec.clientId !== callerClientId) {
         this.log.warn?.('mobile-hub: rejected cross-client p2pToken attempt')
+        rejectedTokens += 1
         continue
       }
-      // Single-use token burn on materialization
+      // Single-use token burn on materialization (can be restored by sendMessage on pre-turn rejection)
       this.p2pUploads.delete(token)
+      if (Array.isArray(_burnedOut)) {
+        _burnedOut.push({ token, rec })
+      }
       out.push({
         id: att.id || token,
         filename: rec.filename,
@@ -278,27 +284,61 @@ export class MultiAppOrchestrator {
         localPath: rec.localPath,
       })
     }
+    if (strict && rejectedTokens > 0) {
+      // Restore any tokens already consumed in this batch before throwing
+      if (Array.isArray(_burnedOut)) {
+        for (const item of _burnedOut) {
+          this.p2pUploads.set(item.token, item.rec)
+        }
+        _burnedOut.length = 0
+      }
+      const err = new Error('部分附件上传凭证已过期或失效，请重新上传附件后再发送')
+      err.code = 'ATTACHMENT_EXPIRED'
+      throw err
+    }
     return out
   }
 
-  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, taskMode, model, provider, reasoningEffort, _clientId = '' } = {}) {
+  _isAdapterSessionBusy(adapter, sessionId) {
+    if (!adapter || !sessionId) return false
+    if (adapter.activeTurns instanceof Map && adapter.activeTurns.has(sessionId)) return true
+    if (adapter.activeProcs instanceof Map && adapter.activeProcs.has(sessionId)) return true
+    return false
+  }
+
+  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, taskMode, model, provider, reasoningEffort, _clientId = '', _preMaterialized = null, _burnedTokens = null } = {}) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
-    const materialized = await this.materializeAttachments(attachments, { clientId: _clientId })
     const adapter = this.getAdapter(parsed.app)
-    const result = await adapter.sendMessage(parsed.sessionId, {
-      text,
-      cwd,
-      title,
-      attachments: materialized,
-      approvalPolicy,
-      permissionMode,
-      taskMode,
-      model,
-      provider,
-      reasoningEffort,
-    })
-    return result
+    const burned = Array.isArray(_burnedTokens) ? _burnedTokens : []
+    const materialized = Array.isArray(_preMaterialized)
+      ? _preMaterialized
+      : await this.materializeAttachments(attachments, { clientId: _clientId, strict: true, _burnedOut: burned })
+    try {
+      const result = await adapter.sendMessage(parsed.sessionId, {
+        text,
+        cwd,
+        title,
+        attachments: materialized,
+        approvalPolicy,
+        permissionMode,
+        taskMode,
+        model,
+        provider,
+        reasoningEffort,
+      })
+      return result
+    } catch (err) {
+      // Restore single-use p2pTokens if the turn was rejected before execution (e.g. SESSION_BUSY)
+      if (burned.length > 0 && (err?.code === 'SESSION_BUSY' || !err?._streamErrorEmitted)) {
+        for (const item of burned) {
+          if (existsSync(item.rec.localPath)) {
+            this.p2pUploads.set(item.token, item.rec)
+          }
+        }
+      }
+      throw err
+    }
   }
 
   async interruptSession({ id, app, sessionId } = {}) {
@@ -344,7 +384,10 @@ export class MultiAppOrchestrator {
       try {
         return await adapter.resolveApproval(id, payload)
       } catch (err) {
-        this.pendingApprovals.set(id, req)
+        // Do not resurrect zombie approval cards when the underlying CLI transport has already died
+        if (err?.code !== 'APPROVAL_TRANSPORT_CLOSED') {
+          this.pendingApprovals.set(id, req)
+        }
         throw err
       }
     }
@@ -582,50 +625,63 @@ export class MultiAppOrchestrator {
       )
     }
 
-    if (isDocumentMode) {
-      const normReal = realPath.replace(/\\/g, '/').toLowerCase()
-      const segments = normReal.split('/').filter(Boolean)
-      const fileName = basename(realPath).toLowerCase()
-      const BLOCKED_SEGMENTS = new Set([
-        '.ssh',
-        '.aws',
-        '.gnupg',
-        '.kube',
-        '.docker',
-        '.npm',
-        '.allinone',
-        '.dsh-mobile',
-        '.dsh',
-        '.git',
-        'keychains',
-      ])
-      const isBlockedDir =
-        segments.some((seg) => BLOCKED_SEGMENTS.has(seg)) ||
-        normReal.includes('/.gemini/config/') ||
-        normReal.includes('/library/application support/google/chrome/') ||
-        normReal.includes('/library/application support/microsoft edge/') ||
-        normReal.includes('/library/application support/firefox/') ||
-        normReal.includes('/appdata/local/google/chrome/') ||
-        normReal.includes('/appdata/local/microsoft/edge/') ||
-        normReal.includes('/appdata/roaming/mozilla/') ||
-        normReal.startsWith('/etc/') ||
-        normReal.startsWith('/private/etc/') ||
-        normReal.startsWith('/proc/') ||
-        normReal.startsWith('/sys/') ||
-        normReal.startsWith('/system/') ||
-        normReal.startsWith('c:/windows/')
-      const isBlockedName =
-        /^\.env(?:\.|$)/i.test(fileName) ||
-        /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json)(?:\.|$)/i.test(fileName) ||
-        /^(?:secrets?|credentials?|passwords?|tokens?)\.(?:txt|csv|md|zip)$/i.test(fileName) ||
-        /\.(?:pem|key|p12|pfx|kdbx)$/i.test(fileName)
-      if (isBlockedDir || isBlockedName) {
-        throw new Error('出于安全限制，禁止远程下载系统敏感目录或凭据文件')
-      }
+    // Enforce sensitive directory & credential blocklist for BOTH document and image modes
+    const normReal = realPath.replace(/\\/g, '/').toLowerCase()
+    const segments = normReal.split('/').filter(Boolean)
+    const fileName = basename(realPath).toLowerCase()
+    const BLOCKED_SEGMENTS = new Set([
+      '.ssh',
+      '.aws',
+      '.gnupg',
+      '.kube',
+      '.docker',
+      '.npm',
+      '.allinone',
+      '.allinone-bridge',
+      '.dsh-mobile',
+      '.dsh',
+      '.git',
+      'keychains',
+    ])
+    const isBlockedDir =
+      segments.some((seg) => BLOCKED_SEGMENTS.has(seg)) ||
+      normReal.includes('/.gemini/config/') ||
+      normReal.includes('/library/application support/google/chrome/') ||
+      normReal.includes('/library/application support/microsoft edge/') ||
+      normReal.includes('/library/application support/firefox/') ||
+      normReal.includes('/appdata/local/google/chrome/') ||
+      normReal.includes('/appdata/local/microsoft/edge/') ||
+      normReal.includes('/appdata/roaming/mozilla/') ||
+      normReal.startsWith('/etc/') ||
+      normReal.startsWith('/private/etc/') ||
+      normReal.startsWith('/proc/') ||
+      normReal.startsWith('/sys/') ||
+      normReal.startsWith('/system/') ||
+      normReal.startsWith('c:/windows/')
+    const isBlockedName =
+      /^\.env(?:\.|$)/i.test(fileName) ||
+      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json|e2ee-key\.html)(?:\.|$)/i.test(fileName) ||
+      /^(?:secrets?|credentials?|passwords?|tokens?)\.(?:txt|csv|md|zip)$/i.test(fileName) ||
+      /\.(?:pem|key|p12|pfx|kdbx)$/i.test(fileName)
+    if (isBlockedDir || isBlockedName) {
+      throw new Error('出于安全限制，禁止远程下载系统敏感目录或凭据文件')
+    }
 
+    if (isDocumentMode) {
       const caseInsensitiveFs = process.platform === 'win32' || process.platform === 'darwin'
       const cmpPath = (targetPath) => (caseInsensitiveFs ? targetPath.toLowerCase() : targetPath)
       const normTarget = cmpPath(realPath)
+      const home = homedir()
+      let homeRealNorm = ''
+      try {
+        homeRealNorm = cmpPath(realpathSync(home))
+      } catch {
+        homeRealNorm = cmpPath(home)
+      }
+      const isOverbroadRoot = (normRoot) => {
+        if (!normRoot || normRoot === '/' || normRoot === '\\' || /^[a-z]:[\\/]?$/i.test(normRoot)) return true
+        return Boolean(homeRealNorm && normRoot === homeRealNorm)
+      }
       const checkRoots = (roots) => {
         for (const root of roots) {
           const clean = String(root || '').trim()
@@ -638,6 +694,7 @@ export class MultiAppOrchestrator {
             continue
           }
           const normRoot = cmpPath(rootReal)
+          if (isOverbroadRoot(normRoot)) continue
           const prefix = normRoot.endsWith(sep) ? normRoot : `${normRoot}${sep}`
           if (normTarget === normRoot || normTarget.startsWith(prefix)) {
             return true
@@ -646,9 +703,8 @@ export class MultiAppOrchestrator {
         return false
       }
 
-      const home = homedir()
+      // Security: NEVER trust caller-supplied `cwd` as an allowed root (prevents `cwd: '/'` bypass)
       const fastRoots = [
-        cwd,
         this.config.cwd,
         join(home, 'Desktop'),
         join(home, 'Downloads'),
@@ -755,14 +811,30 @@ export class MultiAppOrchestrator {
         if (params.wait === true) {
           return await this.sendMessage(sendParams)
         }
-        void this.sendMessage(sendParams).catch((err) => {
+        // Fail fast synchronously on busy sessions or expired attachment tokens BEFORE returning { accepted: true }
+        const adapter = this.getAdapter(parsed.app)
+        if (this._isAdapterSessionBusy(adapter, parsed.sessionId)) {
+          const err = new Error('该对话正在运行中，请等待完成或先点击停止。')
+          err.code = 'SESSION_BUSY'
+          throw err
+        }
+        const burnedTokens = []
+        const preMaterialized = await this.materializeAttachments(params.attachments || [], {
+          clientId: ctx?.clientId || '',
+          strict: true,
+          _burnedOut: burnedTokens,
+        })
+        void this.sendMessage({
+          ...sendParams,
+          _preMaterialized: preMaterialized,
+          _burnedTokens: burnedTokens,
+        }).catch((err) => {
           const msg = String(err?.message || err)
           this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)
-          // Never duplicate adapter-emitted STREAM_ERROR or kill an active stream UI spinner on SESSION_BUSY
-          if (err?._streamErrorEmitted || err?.code === 'SESSION_BUSY' || /正在运行中/.test(msg)) {
+          if (err?._streamErrorEmitted) {
             return
           }
-          // Guarantee mobile UI always exits the loading spinner even if an adapter threw early
+          // Guarantee mobile UI always exits the loading spinner even if an adapter threw early (including external SESSION_BUSY)
           this.onEvent(EVENTS.STREAM_ERROR, {
             sessionId: targetId,
             app: parsed.app,

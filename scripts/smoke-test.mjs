@@ -17,6 +17,7 @@
  * 14. Interactive Multi-Question Q&A & Approvals Across All 4 Adapters & Orchestrator
  * 15. Adapter Resilience, External Watchers & Subscription Weekly Quotas
  * 16. Unified Plan / Goal / Steps Live Sync & Interactive `taskMode` Forwarding
+ * 17. Audit Regression Guards (Env Scrubbing, File ACL, UTF-8 Framing, Proxy Idle, IPv6/Spaces, sid Revocation, Caches & Mobile Config)
  */
 
 import assert from 'node:assert/strict'
@@ -58,6 +59,7 @@ import {
 import {
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
+  CTRL_FRAG_LIMIT_CHARS,
   P2P_BULK_LABEL,
   P2P_CTRL_LABEL,
   createCtrlCodec,
@@ -65,6 +67,9 @@ import {
   encodeBulkFrame,
   sendWithBackpressure,
 } from '../packages/shared/src/p2p-mux.js'
+import { createMailer } from '../packages/relay-server/src/mailer.js'
+import { sanitizeChildEnv } from '../packages/dsh-mobile-hub/src/helpers/bin-finder.js'
+import { P2PBridgeManager } from '../packages/dsh-mobile-hub/src/p2p/manager.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
 import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
@@ -118,6 +123,7 @@ import {
   computeE2eeKeyId,
   computeGrantPubKeyFp,
   decryptAutoStream,
+  decryptChunkedStream,
   decryptGrantPayload,
   decryptJson,
   deriveGrantSas,
@@ -153,7 +159,7 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
-import { resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
+import { extractImageRefsFromText, resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
 import {
   clearDraft,
   clearDraftsForScope,
@@ -188,7 +194,7 @@ import {
   translate,
 } from '../packages/mobile-app/src/lib/i18n.js'
 
-const TOTAL_SUITES = 16
+const TOTAL_SUITES = 17
 const TEST_BOOTSTRAP_TOKEN = 'smoke-bootstrap-token-123'
 const SMOKE_ADMIN_PASS = 'SmokeAdminPass99!'
 
@@ -3944,6 +3950,260 @@ async function main() {
       await orchTask.dispose()
     }
     pass(16, 'Unified Plan/Goal/Steps live sync & interactive taskMode forwarding')
+
+    // =========================================================================
+    // 17. Audit Regression Guards (Security, Proxy, P2P, Relay, Caches & Mobile)
+    // =========================================================================
+    {
+      // 17a. Child env secret scrubbing
+      const scrubbed = sanitizeChildEnv({
+        PATH: '/usr/bin',
+        ALLINONE_E2EE_KEY: 'secret-e2ee',
+        ALLINONE_BRIDGE_SECRET: 'secret-bridge',
+        ALLINONE_WEBRTC_PROXY_PORT: '12345',
+        ALLINONE_WEBRTC_PROXY_TOKEN: 'secret-proxy',
+        ALLINONE_PASSWORD: 'secret-password',
+        ELECTRON_RUN_AS_NODE: '1',
+      })
+      assert.equal(scrubbed.PATH, '/usr/bin')
+      for (const k of ['ALLINONE_E2EE_KEY', 'ALLINONE_BRIDGE_SECRET', 'ALLINONE_WEBRTC_PROXY_PORT', 'ALLINONE_WEBRTC_PROXY_TOKEN', 'ALLINONE_PASSWORD', 'ELECTRON_RUN_AS_NODE']) {
+        assert.equal(scrubbed[k], undefined, `sanitizeChildEnv must remove ${k}`)
+      }
+
+      // 17b. readLocalFile blocks caller-supplied cwd='/' escape, .allinone-bridge & image-mode secrets
+      const aclRoot = join(tmpDir, 'acl-guard')
+      const safeDir = join(aclRoot, 'project')
+      const bridgeSecretDir = join(aclRoot, '.allinone-bridge')
+      mkdirSync(safeDir, { recursive: true })
+      mkdirSync(bridgeSecretDir, { recursive: true })
+      const leakedHtml = join(bridgeSecretDir, 'e2ee-key.html')
+      writeFileSync(leakedHtml, '<html>KEY</html>', 'utf8')
+      const secretImg = join(bridgeSecretDir, 'qr.png')
+      writeFileSync(secretImg, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+      const outsideMd = join(process.cwd(), 'README.md')
+      const aclOrch = new MultiAppOrchestrator({ config: { cwd: safeDir }, log: { info() {}, warn() {}, error() {} } })
+      aclOrch.listWorkspaces = async () => [{ path: safeDir }]
+      await assert.rejects(() => aclOrch.readLocalFile({ path: leakedHtml, cwd: bridgeSecretDir, mode: 'document' }), /敏感目录|凭据/)
+      await assert.rejects(() => aclOrch.readLocalFile({ path: secretImg, cwd: bridgeSecretDir, mode: 'image' }), /敏感目录|凭据/)
+      await assert.rejects(() => aclOrch.readLocalFile({ path: outsideMd, cwd: '/', mode: 'document' }), /仅允许远程下载/)
+      await aclOrch.dispose()
+
+      // 17c. createCtrlCodec UTF-8 byte budget on CJK & double-escaped JSON + decryptChunkedStream trailing-data fail-fast
+      const utf8Codec = createCtrlCodec()
+      const cjkPayload = { type: 'test', body: '中文测试"quoted"\\slash\n'.repeat(3000) }
+      const cjkFrames = utf8Codec.encode(cjkPayload)
+      assert.ok(cjkFrames.length >= 2, 'Large CJK payload must be fragmented')
+      for (const f of cjkFrames) {
+        assert.ok(Buffer.byteLength(f, 'utf8') <= CTRL_FRAG_LIMIT_CHARS, 'Every control fragment must be <= 48KB UTF-8 bytes')
+      }
+      let decodedCjk = null
+      for (const f of cjkFrames) decodedCjk = utf8Codec.decode(f)
+      assert.deepEqual(decodedCjk, cjkPayload)
+
+      const trailKey = generateE2eeKey()
+      const encChunks = []
+      let encHdr = null
+      await encryptChunkedBytes(trailKey, new TextEncoder().encode('hello-aio2'), {
+        kind: 'upload',
+        roomId: 'usr_trail',
+        onHeader: (h) => { encHdr = h },
+        onChunk: (c) => { encChunks.push(c) },
+      })
+      let yieldedAfterGarbage = false
+      async function* garbageStream() {
+        for (const c of encChunks) yield c
+        yield new Uint8Array([1, 2, 3, 4])
+        yieldedAfterGarbage = true
+        yield new Uint8Array([5, 6, 7, 8])
+      }
+      await assert.rejects(
+        () => decryptChunkedStream(trailKey, garbageStream(), { iv: encHdr.iv, kid: encHdr.kid, kind: 'upload', roomId: 'usr_trail' }),
+        (err) => err?.code === 'E2EE_DECRYPT_FAILED',
+      )
+      assert.equal(yieldedAfterGarbage, false, 'decryptChunkedStream must fail fast on trailing bytes without buffering until EOF')
+
+      // 17d. DesktopWebRtcProxy: peer.close when idle must NOT cold-start worker; closing last peer must keep idleTimer armed
+      let idleProxyWinCreates = 0
+      const idleIpc = new EventEmitter()
+      class IdleTestWin extends EventEmitter {
+        constructor() {
+          super()
+          idleProxyWinCreates += 1
+          this._destroyed = false
+          this.webContents = Object.assign(new EventEmitter(), {
+            send: (_ch, msg) => {
+              if (msg?.type === 'peer.offer' && msg?.reqId) {
+                setImmediate(() => idleIpc.emit('webrtc-worker:control', { sender: this.webContents }, { type: 'res', reqId: msg.reqId, ok: true, answer: { type: 'answer', sdp: 'v=0\r\n' } }))
+              }
+            },
+          })
+        }
+        isDestroyed() { return this._destroyed }
+        destroy() { if (!this._destroyed) { this._destroyed = true; this.emit('closed') } }
+        async loadFile() {
+          setImmediate(() => { if (!this._destroyed) idleIpc.emit('webrtc-worker:control', { sender: this.webContents }, { type: 'worker.ready' }) })
+        }
+      }
+      const idleProxy = new DesktopWebRtcProxy({ BrowserWindow: IdleTestWin, ipcMain: idleIpc, srcDir: join(process.cwd(), 'packages/desktop-app/src'), log: { info() {}, warn() {}, error() {} } })
+      const { port: ipPort, token: ipToken } = await idleProxy.start()
+      try {
+        const ipClient = new ElectronWebRtcClient({ port: ipPort, token: ipToken, log: { info() {}, warn() {}, error() {} } })
+        await ipClient.sendCommand({ type: 'peer.close', peerId: 'ghost' }, false)
+        await ipClient.sendCommand({ type: 'peer.closeAll' }, false)
+        await new Promise((r) => setTimeout(r, 40))
+        assert.equal(idleProxyWinCreates, 0, 'peer.close/closeAll when idle must never cold-start Chromium worker')
+        const p1 = ipClient.createPeer({ iceServers: [] })
+        await p1.handleOffer('v=0\r\n')
+        assert.equal(idleProxyWinCreates, 1)
+        await p1.close()
+        await new Promise((r) => setTimeout(r, 40))
+        assert.ok(idleProxy.idleTimer, 'Closing last peer must keep idleTimer armed')
+        ipClient.dispose()
+      } finally {
+        await idleProxy.dispose()
+      }
+
+      // 17e. Relay: IPv6 single-bracket STUN, URL-decoded spaces static download, aborted WS upgrade survival & empty RESEND_FROM fallback
+      const regStaticDir = join(tmpDir, 'static-spaces')
+      mkdirSync(join(regStaticDir, 'downloads'), { recursive: true })
+      writeFileSync(join(regStaticDir, 'downloads', 'All in One-1.0.13.dmg'), 'dmg-bytes', 'utf8')
+      const ipv6Relay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        stunPort: 0,
+        stunHost: '127.0.0.1',
+        jwtSecret: 'ipv6-test-secret-0123456789',
+        publicRelayUrl: 'https://[2001:db8::1]:8787',
+        staticDir: regStaticDir,
+        accountsFile: join(tmpDir, 'ipv6-accounts.json'),
+      })
+      const ipv6Started = await ipv6Relay.start()
+      try {
+        const dmgRes = await fetch(`http://127.0.0.1:${ipv6Started.port}/downloads/All%20in%20One-1.0.13.dmg`)
+        assert.equal(dmgRes.status, 200, 'Static download with URL-encoded spaces must succeed')
+        assert.equal(await dmgRes.text(), 'dmg-bytes')
+
+        // Trigger aborted WS upgrade to verify no uncaught socket 'error' crash
+        await new Promise((resolveSock) => {
+          const s = net.connect(ipv6Started.port, '127.0.0.1', () => {
+            s.write('GET /ws/client?ticket=bad HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+            s.resetAndDestroy?.() || s.destroy()
+            setTimeout(resolveSock, 40)
+          })
+          s.on('error', () => resolveSock())
+        })
+        assert.equal((await (await fetch(`http://127.0.0.1:${ipv6Started.port}/api/health`)).json()).ok, true)
+
+        const iceList = ipv6Relay.hub.getIceServers(null, '')
+        assert.ok(iceList.some((x) => String(x.urls).startsWith('stun:[2001:db8::1]:')), 'IPv6 STUN URI must use single brackets')
+        assert.ok(!iceList.some((x) => String(x.urls).includes('[[')), 'IPv6 STUN URI must never double-bracket')
+      } finally {
+        await ipv6Relay.close()
+      }
+
+      const prevResendFrom = process.env.RESEND_FROM
+      const prevSmtpFrom = process.env.SMTP_FROM
+      const prevResendKey = process.env.RESEND_API_KEY
+      try {
+        process.env.RESEND_API_KEY = 're_test_key'
+        process.env.RESEND_FROM = ''
+        process.env.SMTP_FROM = 'AllinOne <noreply@example.com>'
+        const fallbackMailer = createMailer({})
+        assert.equal(fallbackMailer.getProvider(), 'resend', 'Empty RESEND_FROM env must fall back to SMTP_FROM')
+      } finally {
+        if (prevResendFrom === undefined) delete process.env.RESEND_FROM
+        else process.env.RESEND_FROM = prevResendFrom
+        if (prevSmtpFrom === undefined) delete process.env.SMTP_FROM
+        else process.env.SMTP_FROM = prevSmtpFrom
+        if (prevResendKey === undefined) delete process.env.RESEND_API_KEY
+        else process.env.RESEND_API_KEY = prevResendKey
+      }
+
+      // 17f. P2PBridgeManager sid-based revocation kills peer even when clientId changed
+      const sidMgr = new P2PBridgeManager({
+        roomId: 'usr_sid_test',
+        e2eeKey: generateE2eeKey(),
+        getE2eeKeyId: async () => '0000000000000000',
+        sendSignal: () => {},
+        onRpc: async () => ({}),
+        inboundDir: tmpDir,
+        log: { info() {}, warn() {}, error() {} },
+      })
+      let peerClosedBySid = false
+      sidMgr.sessions.set('old-client-id', {
+        clientId: 'old-client-id',
+        authSid: 's_1122334455667788',
+        sessionId: 'ps1',
+        closed: false,
+        activeDownloads: new Map(),
+        pendingDownloads: new Map(),
+        activeUploads: new Map(),
+        peer: { close: async () => { peerClosedBySid = true } },
+      })
+      sidMgr.revokeClients(['new-client-id-after-ws-reconnect'], { sids: ['s_1122334455667788'] })
+      await new Promise((r) => setTimeout(r, 20))
+      assert.equal(peerClosedBySid, true, 'Revoking by auth sid must kill live P2P peer even after clientId rotation')
+      await sidMgr.dispose()
+
+      // 17g. Frontend caches, image extractor, multi-turn Claude TaskCreate & Claude agent-* filter
+      await saveCachedSession(
+        'codex:capped-meta',
+        {
+          meta: { app: 'codex', id: 'codex:capped-meta', messages: [{ id: 'dup', role: 'user', text: 'dup' }] },
+          messages: Array.from({ length: 130 }, (_, idx) => ({ id: `k-${idx}`, role: 'user', text: `t${idx}`, ts: idx + 1 })),
+          hasMore: true,
+          nextCursor: 'opaque-1',
+        },
+        'scope-cap',
+      )
+      const capRec = await loadCachedSession('codex:capped-meta', 'scope-cap')
+      assert.equal(capRec.meta.messages, undefined, 'saveCachedSession must strip meta.messages')
+      assert.equal(capRec.truncatedByCap, true)
+      const capReconciled = reconcileCachedWithFreshPage(capRec, {
+        messages: capRec.messages.slice(-14),
+        hasMore: true,
+        nextCursor: 'opaque-fresh-2',
+      })
+      assert.equal(capReconciled.hasMore, true, 'Capped Codex cache must not swallow server hasMore=true')
+      assert.equal(capReconciled.nextCursor, 'opaque-fresh-2')
+
+      const imgExtracted = extractImageRefsFromText('See https://example.com/chart.png and file:///Users/alice/out.png')
+      assert.equal(imgExtracted.some((r) => r.raw === 's://example.com/chart.png'), false, 'Must not misparse https:// as Windows s:// drive')
+      assert.equal(imgExtracted.some((r) => r.raw === 'e:///Users/alice/out.png'), false, 'Must not double-match file:/// as Windows e:/// drive')
+      assert.equal(imgExtracted.length, 1)
+
+      const mtClaude = createTaskStateTracker({ steps: [{ id: '1', title: 'Turn 1 A', status: 'done' }, { id: '2', title: 'Turn 1 B', status: 'done' }] })
+      mtClaude.applyClaudeTool('TaskCreate', { subject: 'Turn 2 New' }, 50)
+      assert.equal(mtClaude.snapshot().steps.length, 3)
+      assert.equal(mtClaude.snapshot().steps[2].id, '3', 'Multi-turn TaskCreate must continue sequence without overwriting id 1')
+      const stickyAgy = createTaskStateTracker({ mode: 'plan', steps: [] })
+      stickyAgy.applyAntigravityUserText('Normal follow-up message', 100)
+      assert.equal(stickyAgy.snapshot(), null, 'Normal user turn must clear sticky plan mode with no pending steps')
+
+      const agFilterHome = join(tmpDir, 'claude-agent-filter')
+      const agProj = join(agFilterHome, 'projects', 'p1')
+      mkdirSync(agProj, { recursive: true })
+      for (let i = 0; i < 25; i += 1) {
+        writeFileSync(join(agProj, `agent-sub-${i}.jsonl`), `${JSON.stringify({ type: 'user', uuid: `a${i}`, cwd: tmpDir, timestamp: new Date().toISOString(), message: { role: 'user', content: 'subagent' } })}\n`)
+      }
+      writeFileSync(join(agProj, '11111111-2222-3333-4444-555555555555.jsonl'), `${JSON.stringify({ type: 'user', uuid: 'real1', cwd: tmpDir, timestamp: new Date().toISOString(), message: { role: 'user', content: 'Real user chat' } })}\n`)
+      const agAdapter = new ClaudeAdapter({ config: { claudeHome: agFilterHome, claudeDesktopRoots: [], cwd: tmpDir } })
+      const agListed = await agAdapter.listSessions({ limit: 20 })
+      assert.equal(agListed.length, 1)
+      assert.equal(agListed[0].nativeId, '11111111-2222-3333-4444-555555555555')
+      assert.ok(agAdapter.trackedListSessions.has('11111111-2222-3333-4444-555555555555'), 'Real session must stay tracked despite >20 agent-*.jsonl files')
+      await agAdapter.dispose()
+
+      // 17h. Mobile Capacitor config, Android manifest & sandbox-preview meta CSP
+      const capCfg = JSON.parse(readFileSync(join(process.cwd(), 'packages/mobile-app/capacitor.config.json'), 'utf8'))
+      assert.equal(capCfg.server?.url, undefined, 'capacitor.config.json must not hardcode placeholder server.url')
+      assert.equal(capCfg.android?.adjustMarginsForEdgeToEdge, 'auto')
+      const manifestXml = readFileSync(join(process.cwd(), 'packages/mobile-app/android/app/src/main/AndroidManifest.xml'), 'utf8')
+      assert.ok(manifestXml.includes('android.permission.ACCESS_NETWORK_STATE'))
+      const sandboxHtml = readFileSync(join(process.cwd(), 'packages/mobile-app/public/sandbox-preview.html'), 'utf8')
+      assert.ok(sandboxHtml.includes("connect-src 'none'") && sandboxHtml.includes("form-action 'none'"))
+    }
+    pass(17, 'Audit regression guards (env scrubbing, ACL, UTF-8 mux, proxy idle, IPv6/spaces, sid revocation, caches & mobile config)')
 
     console.log(`\nALL ${TOTAL_SUITES} SMOKE TEST SUITES PASSED!`)
   } finally {

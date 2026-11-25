@@ -104,6 +104,7 @@ function main() {
     },
     android: {
       allowMixedContent: false,
+      adjustMarginsForEdgeToEdge: 'auto',
     },
     ios: {
       contentInset: 'automatic',

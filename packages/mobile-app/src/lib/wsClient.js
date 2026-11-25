@@ -576,6 +576,20 @@ export async function revokeAuthSession(baseUrl, token, { sid = '', clientId = '
   }
 }
 
+export async function logoutDeviceSession(baseUrl, token) {
+  const base = normalizeBaseUrl(baseUrl)
+  if (!base || !token) return { ok: false }
+  const res = await fetch(`${base}/api/auth/logout`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    keepalive: true,
+  })
+  const data = await res.json().catch(() => ({}))
+  return { ok: Boolean(res.ok && data.ok), ...data }
+}
+
 export async function revokeOtherAuthSessions(baseUrl, token, currentClientId = '') {
   const base = normalizeBaseUrl(baseUrl)
   const devMeta = detectClientDeviceMeta()
@@ -653,7 +667,17 @@ export class MobileRelayClient {
 
     this._onWindowOnline = () => {
       if (this.closed) return
+      // Expedite control WS reconnect immediately if we were waiting on backoff when connectivity returned
+      if (this.connectionState === 'disconnected') {
+        this.attempt = 0
+        void this.openSocket()
+        return
+      }
       if (this.connectionState === 'connected' && this.p2pState === 'failed') {
+        const activeTarget = this._resolveTargetBridgeId()
+        if (this._quotaBlockedBridgeId && this._quotaBlockedBridgeId === activeTarget && this.turnQuota?.exceeded) {
+          return
+        }
         void this.retryP2p().catch(() => {})
       }
     }
@@ -715,8 +739,12 @@ export class MobileRelayClient {
   }
 
   _closeAllP2pPeers(notifyPeers = true) {
+    const notifyPromises = []
     for (const peer of this.p2pPeers.values()) {
-      try { peer.close(notifyPeers) } catch {}
+      try {
+        const p = peer.close(notifyPeers)
+        if (p && typeof p.then === 'function') notifyPromises.push(p)
+      } catch {}
     }
     this.p2pPeers.clear()
     this._quotaBlockedBridgeId = ''
@@ -724,6 +752,7 @@ export class MobileRelayClient {
     this.p2pError = ''
     this.p2pEngine = ''
     this.p2pTransport = ''
+    return notifyPromises
   }
 
   _pruneOfflinePeers() {
@@ -947,12 +976,22 @@ export class MobileRelayClient {
       this.reconnectTimer = null
     }
     this.stopPing()
-    this._closeAllP2pPeers(true)
+    const notifyPromises = this._closeAllP2pPeers(true)
     this._settleGrantListResolvers()
     if (this.ws) {
       const oldWs = this.ws
       this.ws = null
-      try { oldWs.close(1000) } catch {}
+      const closeOldWs = () => {
+        try { oldWs.close(1000) } catch {}
+      }
+      if (notifyPromises.length > 0 && oldWs.readyState === WebSocket.OPEN) {
+        Promise.race([
+          Promise.allSettled(notifyPromises),
+          new Promise((r) => setTimeout(r, 150)),
+        ]).finally(closeOldWs)
+      } else {
+        closeOldWs()
+      }
     }
     this.connectionState = 'disconnected'
     this.connectionError = ''
@@ -1043,6 +1082,16 @@ export class MobileRelayClient {
         this.connectionState = 'connected'
         this.connectionError = ''
         this._pruneOfflinePeers()
+        // Clear any prior non-quota-blocked 'failed' P2P peers on fresh control-plane reconnect
+        // (we just received fresh iceServers/TURN credentials and network may have recovered)
+        for (const [bid, peer] of [...this.p2pPeers.entries()]) {
+          const isQuotaBlocked = this._quotaBlockedBridgeId === bid && Boolean(this.turnQuota?.exceeded)
+          if (peer.state === 'failed' && !isQuotaBlocked) {
+            this.p2pPeers.delete(bid)
+            try { peer.close(false) } catch {}
+          }
+        }
+        this._syncActiveP2pStatus()
         if (Array.isArray(msg.pendingGrants)) {
           this.pendingGrants = msg.pendingGrants
           for (const g of msg.pendingGrants) {
@@ -1051,7 +1100,6 @@ export class MobileRelayClient {
             }
           }
         }
-        this.emitStatus()
         this._maybeAutoConnectP2p()
         return
       }

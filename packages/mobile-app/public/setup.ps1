@@ -1,7 +1,12 @@
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ServerUrl = if ($env:ALLINONE_SERVER) { $env:ALLINONE_SERVER.TrimEnd('/') } else { 'https://your-relay.example.com' }
+$ServerUrl = if ($env:ALLINONE_SERVER) { $env:ALLINONE_SERVER.Trim().TrimEnd('/') } else { 'https://your-relay.example.com' }
+if ($ServerUrl -notmatch '^https?://[A-Za-z0-9._:/\[\]-]+$' -or $ServerUrl -match '^https?://your-relay\.example\.com(/|$)') {
+    Write-Host "[!] Invalid or placeholder ALLINONE_SERVER URL: $ServerUrl" -ForegroundColor Red
+    Write-Host '    Please set $env:ALLINONE_SERVER to your real relay server URL (e.g. https://ai.example.com).' -ForegroundColor Yellow
+    return
+}
 $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $InstallDir = Join-Path $HomeDir '.allinone-bridge'
 $BridgeFile = Join-Path $InstallDir 'allinone-bridge.mjs'
@@ -70,16 +75,32 @@ Write-Host "[1/3] Node.js ready: $nodeVerText ($NodeExe)" -ForegroundColor Green
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Write-Host "[2/3] Downloading portable bridge bundle..." -ForegroundColor Cyan
-Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $BridgeFile
+$BridgeTmp = "$BridgeFile.tmp.$PID"
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $BridgeTmp
+    Move-Item -Force -Path $BridgeTmp -Destination $BridgeFile
+} finally {
+    if (Test-Path $BridgeTmp) { Remove-Item -Force -Path $BridgeTmp -ErrorAction SilentlyContinue }
+}
+
+function Format-BatchQuotedArg([string]$Val) {
+    if ($Val -match '[\r\n"&|<>^]') {
+        throw "Unsafe characters in launcher argument: $Val"
+    }
+    return '"' + ($Val -replace '%', '%%') + '"'
+}
 
 $DesktopDir = [Environment]::GetFolderPath('Desktop')
 if ($DesktopDir -and (Test-Path $DesktopDir)) {
     $LauncherPath = Join-Path $DesktopDir 'All in One Bridge.cmd'
+    $SafeNode = Format-BatchQuotedArg $NodeExe
+    $SafeBridge = Format-BatchQuotedArg $BridgeFile
+    $SafeServer = Format-BatchQuotedArg $ServerUrl
     $LauncherContent = @(
         '@echo off',
         'chcp 65001 >nul',
         'title All in One PC Bridge',
-        "`"$NodeExe`" `"$BridgeFile`" --server `"$ServerUrl`"",
+        "$SafeNode $SafeBridge --server $SafeServer",
         'pause'
     ) -join "`r`n"
     [System.IO.File]::WriteAllText($LauncherPath, $LauncherContent, (New-Object System.Text.UTF8Encoding($false)))

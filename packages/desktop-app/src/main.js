@@ -368,8 +368,38 @@ function createMainWindow({ showOnReady = true } = {}) {
   win.on('resized', () => saveWindowBounds(win))
   win.on('moved', () => saveWindowBounds(win))
 
-  // Open external http/https links in the system browser, never inside Electron
-  win.webContents.setWindowOpenHandler(({ url }) => {
+  const devUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
+  let devOrigin = ''
+  if (devUrl) {
+    try {
+      devOrigin = new URL(devUrl).origin
+    } catch {}
+  }
+
+  const isAllowedAppUrl = (url) => {
+    const s = String(url || '')
+    if (s === 'about:blank' || s.startsWith('app://allinone/')) return true
+    if (devOrigin) {
+      try {
+        if (new URL(s).origin === devOrigin) return true
+      } catch {}
+    }
+    return false
+  }
+
+  // Open external http/https links in the system browser, never inside Electron —
+  // and block unsolicited popups originating from sandboxed HTML preview iframes (opaque/null frameOrigin).
+  win.webContents.setWindowOpenHandler((details) => {
+    const url = String(details?.url || '')
+    const frameOrigin = String(details?.frameOrigin || '')
+    const referrerUrl = String(details?.referrer?.url || '')
+    const fromSandboxFrame =
+      !frameOrigin ||
+      frameOrigin === 'null' ||
+      referrerUrl.includes('sandbox-preview.html')
+    if (fromSandboxFrame) {
+      return { action: 'deny' }
+    }
     try {
       const u = new URL(url)
       if (u.protocol === 'https:' || u.protocol === 'http:') {
@@ -379,22 +409,8 @@ function createMainWindow({ showOnReady = true } = {}) {
     return { action: 'deny' }
   })
 
-  const devUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
-  let devOrigin = ''
-  if (devUrl) {
-    try {
-      devOrigin = new URL(devUrl).origin
-    } catch {}
-  }
-
   win.webContents.on('will-navigate', (event, url) => {
-    let allowed = url.startsWith('app://allinone/')
-    if (!allowed && devOrigin) {
-      try {
-        if (new URL(url).origin === devOrigin) allowed = true
-      } catch {}
-    }
-    if (!allowed) {
+    if (!isAllowedAppUrl(url)) {
       event.preventDefault()
       try {
         const u = new URL(url)
@@ -402,6 +418,14 @@ function createMainWindow({ showOnReady = true } = {}) {
           void shell.openExternal(url)
         }
       } catch {}
+    }
+  })
+
+  // Also block subframe / sandboxed-iframe navigations away from our app origin (e.g. location.href or <form>)
+  win.webContents.on('will-frame-navigate', (details) => {
+    if (details?.isMainFrame) return
+    if (!isAllowedAppUrl(details?.url)) {
+      details.preventDefault()
     }
   })
 
@@ -627,7 +651,7 @@ function registerStaticProtocol() {
       if (extname(target).toLowerCase() === '.html') {
         const isSandboxFrame = target.endsWith(`${sep}sandbox-preview.html`)
         headers['Content-Security-Policy'] = isSandboxFrame
-          ? "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox; default-src 'self' app: 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'"
+          ? "sandbox allow-scripts allow-forms; default-src 'self' app: 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'"
           : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https: http:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
       }
       return new Response(buf, {
@@ -740,9 +764,21 @@ function registerIpc() {
     if (p.startsWith('~/') || p.startsWith('~\\')) {
       p = join(homedir(), p.slice(2))
     }
-    if (process.platform === 'win32') p = p.replace(/\//g, '\\')
+    if (process.platform === 'win32') {
+      // Block Windows UNC paths (\\host\share) and device namespaces (\\?\, \\.\) to prevent NTLMv2 leaks & remote opens
+      if (/^(?:\\\\|\/\/)/.test(p)) {
+        return { ok: false, error: '出于安全限制，禁止直接打开网络共享 (UNC) 或设备路径' }
+      }
+      p = p.replace(/\//g, '\\')
+      if (/^\\\\/.test(p)) {
+        return { ok: false, error: '出于安全限制，禁止直接打开网络共享 (UNC) 或设备路径' }
+      }
+    }
     const baseDir = String(cwd || '').trim() || homedir()
     const resolved = isAbsolute(p) ? resolve(p) : resolve(baseDir, p)
+    if (process.platform === 'win32' && !/^[A-Za-z]:\\/.test(resolved)) {
+      return { ok: false, error: '出于安全限制，仅允许打开本地磁盘上的交付文件' }
+    }
     const ext = extname(resolved).toLowerCase()
     if (!SAFE_DELIVERABLE_EXTS.has(ext)) {
       return { ok: false, error: `不支持直接打开该格式（${ext || '未知格式'}）` }
@@ -893,4 +929,13 @@ if (!gotLock) {
       })
     }
   })
+
+  const handleExitSignal = () => {
+    isQuitting = true
+    void disposeBridgeOnce().finally(() => {
+      app.quit()
+    })
+  }
+  process.on('SIGINT', handleExitSignal)
+  process.on('SIGTERM', handleExitSignal)
 }

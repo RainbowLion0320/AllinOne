@@ -5,7 +5,7 @@ import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, getClaudeCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getClaudeCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 
@@ -1475,7 +1475,7 @@ export class ClaudeAdapter {
         try { stat = statSync(pDir) } catch { continue }
         if (!stat.isDirectory()) continue
         for (const f of readdirSync(pDir)) {
-          if (!f.endsWith('.jsonl')) continue
+          if (!f.endsWith('.jsonl') || f.startsWith('agent-')) continue
           const fp = join(pDir, f)
           try {
             const fst = statSync(fp)
@@ -1485,12 +1485,14 @@ export class ClaudeAdapter {
       }
       allFiles.sort((a, b) => b.mtimeMs - a.mtimeMs)
 
-      // Scan most recent 150 files for crisp latency
+      // Scan most recent 150 user session files for crisp latency
+      let acceptedCount = 0
       for (let i = 0; i < Math.min(allFiles.length, 150); i += 1) {
         const entry = allFiles[i]
         const summary = scanClaudeSessionSummary(entry.fp, entry.proj)
         if (!summary || seen.has(summary.nativeId)) continue
         seen.add(summary.nativeId)
+        const sessionIdx = acceptedCount++
         const desktopCodeMeta = desktopCodeByCliId.get(summary.nativeId)
         if (desktopCodeMeta) {
           if (desktopCodeMeta.title) summary.title = desktopCodeMeta.title
@@ -1503,7 +1505,7 @@ export class ClaudeAdapter {
         const isLocalActive = this.activeProcs.has(summary.nativeId)
         let probe = null
         let externalRunning = false
-        if (!isLocalActive && (i < CLAUDE_TRACKED_LIST_LIMIT || now - (summary.updatedAt || 0) <= this.externalMaxIdleMs + 5 * 60_000)) {
+        if (!isLocalActive && (sessionIdx < CLAUDE_TRACKED_LIST_LIMIT || now - (summary.updatedAt || 0) <= this.externalMaxIdleMs + 5 * 60_000)) {
           probe = probeClaudeExternalStatus({
             pidSessionsDir: join(this.claudeHome, 'sessions'),
             targetCliSessionId: summary.nativeId,
@@ -1525,7 +1527,7 @@ export class ClaudeAdapter {
           summary.status = 'running'
           summary.syncState = { externalRunning: true, source: summary.source }
         }
-        if (!search && i < CLAUDE_TRACKED_LIST_LIMIT) {
+        if (!search && sessionIdx < CLAUDE_TRACKED_LIST_LIMIT) {
           this.rememberTrackedListSession(summary.nativeId, {
             ...summary,
             filePath: entry.fp,
@@ -2357,8 +2359,13 @@ export class ClaudeAdapter {
     this.watchedSessions.clear()
     this.trackedListSessions.clear()
     for (const active of this.activeProcs.values()) {
-      try { active.proc.kill() } catch {}
+      active.aborted = true
+      if (typeof this.clearPendingControlRequests === 'function') {
+        try { this.clearPendingControlRequests(active.proc) } catch {}
+      }
+      killProcessTree(active.proc, { force: true })
     }
     this.activeProcs.clear()
+    this.pendingControlRequests?.clear?.()
   }
 }

@@ -192,21 +192,30 @@ export function extractImageRefsFromText(text) {
     masked = `${masked.slice(0, l.start)}${' '.repeat(l.end - l.start)}${masked.slice(l.end)}`
   }
 
-  // 2. Standalone file:///... image URIs
+  // 2. Standalone file:///... image URIs (mask matched spans so step 4 never re-matches `e:///...`)
   const fileUriRe = /file:\/\/\/[^\s"'`<>\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif)/gi
+  const fileUriSpans = []
   let m
   while ((m = fileUriRe.exec(masked)) !== null) {
     pushRef(m[0])
+    fileUriSpans.push({ start: m.index, end: m.index + m[0].length })
+  }
+  for (let k = fileUriSpans.length - 1; k >= 0; k -= 1) {
+    const s = fileUriSpans[k]
+    masked = `${masked.slice(0, s.start)}${' '.repeat(s.end - s.start)}${masked.slice(s.end)}`
   }
 
+  // Mask http(s):// URLs so `https://...png` never matches `s://...png` as a Windows drive path
+  masked = masked.replace(/https?:\/\/[^\s"'`<>\]\r\n]+/gi, (seg) => ' '.repeat(seg.length))
+
   // 3. Backticked or quoted Windows absolute image paths (supports spaces & Chinese & (1))
-  const quotedWinRe = /[`"']([A-Za-z]:[\\/][^`"'<>\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))[`"']/gi
+  const quotedWinRe = /[`"']([A-Za-z]:[\\/](?!\/)[^`"'<>\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))[`"']/gi
   while ((m = quotedWinRe.exec(masked)) !== null) {
     pushRef(m[1])
   }
 
   // 4. Plain Windows absolute image paths in prose (no newlines/quotes/brackets)
-  const plainWinRe = /([A-Za-z]:[\\/][^\s`"'<>|*?\[\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))/gi
+  const plainWinRe = /(?<![A-Za-z0-9_])([A-Za-z]:[\\/](?!\/)[^\s`"'<>|*?\[\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))/gi
   while ((m = plainWinRe.exec(masked)) !== null) {
     pushRef(m[1])
   }

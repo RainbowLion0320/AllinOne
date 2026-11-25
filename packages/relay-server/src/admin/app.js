@@ -22,6 +22,7 @@
 
   const state = {
     token: '',
+    tokenSource: '', // 'admin' | 'main_app' | ''
     lang: loadInitialLang(),
     theme: loadInitialTheme(), // 'dark' | 'light'
     activeTab: 'overview', // 'overview' | 'connections' | 'invites' | 'activity'
@@ -369,7 +370,7 @@
 
   function tryLoadSavedToken() {
     try {
-      if (sessionStorage.getItem(ADMIN_LOGOUT_FLAG) === '1') return ''
+      if (sessionStorage.getItem(ADMIN_LOGOUT_FLAG) === '1') return { token: '', source: '' }
     } catch {}
 
     // 1. Dedicated admin session token
@@ -379,7 +380,7 @@
         if (raw) {
           const parsed = JSON.parse(raw)
           if (parsed && typeof parsed.token === 'string' && parsed.token) {
-            return parsed.token
+            return { token: parsed.token, source: 'admin' }
           }
         }
       } catch {}
@@ -406,12 +407,12 @@
               matchesBase = savedBase === targetBase
             } catch {}
           }
-          if (matchesBase) return d.token
+          if (matchesBase) return { token: d.token, source: 'main_app' }
         }
       }
     } catch {}
 
-    return ''
+    return { token: '', source: '' }
   }
 
   function saveAdminToken(token, remember) {
@@ -426,6 +427,7 @@
 
   function clearAdminToken() {
     state.token = ''
+    state.tokenSource = ''
     state.data = null
     stopAutoRefresh()
     try { sessionStorage.removeItem(ADMIN_AUTH_KEY) } catch {}
@@ -1486,11 +1488,19 @@
           },
         })
         if (res.user?.role !== 'admin') {
+          if (res.token) {
+            fetch(`${RELAY_BASE_PATH}/api/auth/logout`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${res.token}` },
+              keepalive: true,
+            }).catch(() => {})
+          }
           throw new Error(bi('该账号不是管理员，无法进入服务器监控看板', 'This account is not an administrator'))
         }
         twofaWrap.classList.add('hidden')
         twofaInput.value = ''
         state.token = res.token
+        state.tokenSource = 'admin'
         saveAdminToken(res.token, remember)
         document.getElementById('inp-password').value = ''
         await loadOverview()
@@ -1555,13 +1565,14 @@
     document.getElementById('btn-lang').addEventListener('click', toggleLang)
     document.getElementById('login-lang-btn').addEventListener('click', toggleLang)
 
-    // Logout (revoke current session sid server-side so bearer JWT cannot be reused)
+    // Logout (only revoke dedicated admin session server-side; never kick borrowed main-app sessions)
     document.getElementById('btn-logout').addEventListener('click', () => {
       const tok = state.token
+      const source = state.tokenSource
       clearAdminToken()
       showLoginView()
       showToast(bi('已退出监控后台', 'Signed out of monitor'))
-      if (tok) {
+      if (tok && source === 'admin') {
         fetch(`${RELAY_BASE_PATH}/api/auth/logout`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${tok}` },
@@ -1838,8 +1849,9 @@
     applyStaticI18n()
     bindEvents()
     const saved = tryLoadSavedToken()
-    if (saved) {
-      state.token = saved
+    if (saved.token) {
+      state.token = saved.token
+      state.tokenSource = saved.source
       void loadOverview()
     } else {
       showLoginView()

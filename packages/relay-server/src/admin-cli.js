@@ -76,7 +76,7 @@ if (cmd === 'invite' && sub === 'create') {
     const link = publicUrl ? `  ->  ${publicUrl}/?invite=${encodeURIComponent(inv.code)}` : ''
     console.log(`  ${inv.code}${inv.note ? `  (${inv.note})` : ''}${link}`)
   }
-  console.log('\n提示：如果中转服务正在运行，通过管理员监控后台 (/admin) 生成无需重启；CLI 修改后请重启中转服务（例如 systemctl restart allinone-relay）使运行中内存生效。\n')
+  console.log('\n提示：如果中转服务正在运行，推荐直接在管理员监控后台 (/admin) 操作（即时生效）；使用离线 CLI 修改前请先停止中转服务（避免在线进程退出时 accounts.flush() 覆写磁盘变更），修改后再启动服务。\n')
   process.exit(0)
 }
 
@@ -107,6 +107,7 @@ if (cmd === 'invite' && sub === 'revoke') {
     process.exit(1)
   }
   console.log(`✓ 已作废邀请码 ${res.invite.code}`)
+  console.log('提示：如中转服务正在运行，请先停服再运行离线 CLI（或直接用 /admin 后台即时作废），以免在线进程退出时覆写磁盘变更。')
   process.exit(0)
 }
 
@@ -141,7 +142,7 @@ if (cmd === 'user' && sub === 'tier') {
     process.exit(1)
   }
   console.log(`✓ 已将 @${res.user.username} (${res.user.userId}) 等级从 ${res.prevTier} 调整为 ${res.tier} [${TIER_LABELS[res.tier] || res.tier}]`)
-  console.log('提示：如通过管理员监控后台 (/admin) 调整可即时生效；CLI 调整后请重启中转服务使运行中内存加载最新配置。')
+  console.log('提示：如通过管理员监控后台 (/admin) 调整可即时生效；使用离线 CLI 调整前请先停止中转服务（避免在线进程退出时 accounts.flush() 覆写磁盘变更），调整后再启动服务。')
   process.exit(0)
 }
 

@@ -36,6 +36,7 @@ function ChatImageCard({
   useEffect(() => {
     setPreviewFailed(false)
     setManualLoadAllowed(false)
+    setRetryNonce(0)
   }, [item?.localPreviewUrl, item?.url, item?.path])
 
   const effectiveItem =
@@ -85,8 +86,9 @@ function ChatImageCard({
       setE2eeSrc('')
       return
     }
-    if (cachedE2eeSrc && retryNonce === 0) {
-      setE2eeSrc(cachedE2eeSrc)
+    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+    if (latestCached && retryNonce === 0) {
+      setE2eeSrc(latestCached)
       return
     }
     if (deferForRelay) {
@@ -100,9 +102,10 @@ function ChatImageCard({
     }
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
     let cancelled = false
+    const isForceRetry = retryNonce > 0
     setStatus('loading')
     loadE2eeImageUrl(effectiveItem, imageContextRef.current, {
-      forceRefresh: retryNonce > 0,
+      forceRefresh: isForceRetry,
       signal: controller?.signal || null,
     })
       .then((blobUrl) => {
@@ -112,6 +115,7 @@ function ChatImageCard({
           return
         }
         setE2eeSrc(blobUrl)
+        if (isForceRetry) setRetryNonce(0)
       })
       .catch((err) => {
         if (cancelled || err?.name === 'AbortError') return
@@ -124,7 +128,6 @@ function ChatImageCard({
     }
   }, [
     needsE2ee,
-    cachedE2eeSrc,
     deferForRelay,
     waitingForTransport,
     isOnline,
@@ -325,7 +328,7 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
     <div className={`mt-2.5 flex flex-wrap gap-2 ${compact ? 'justify-end' : ''}`}>
       {resolvedList.map((entry, idx) => (
         <ChatImageCard
-          key={`${entry.rawPath || entry.src || entry.item?.id || idx}-${idx}`}
+          key={`${entry.rawPath || entry.item?.id || entry.item?.url || idx}-${idx}`}
           item={entry.item}
           imageContext={imageContext}
           compact={compact || images.length > 1}

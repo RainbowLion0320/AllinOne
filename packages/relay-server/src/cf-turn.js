@@ -74,12 +74,13 @@ export function normalizeCloudflareIceResponse(data) {
 export function createCloudflareTurnProvider(options = {}, env = process.env) {
   const tokenId = String(options.cfTurnTokenId ?? env.CF_TURN_TOKEN_ID ?? '').trim()
   const apiToken = String(options.cfTurnApiToken ?? env.CF_TURN_API_TOKEN ?? '').trim()
-  const apiBase = String(options.cfTurnApiBase ?? env.CF_TURN_API_BASE ?? DEFAULT_CF_TURN_API_BASE)
-    .trim()
-    .replace(/\/+$/, '')
-  const ttlSec = clampTtl(options.cfTurnTtlSec ?? env.CF_TURN_TTL_SEC ?? DEFAULT_CF_TURN_TTL_SEC)
+  const rawApiBase = String(options.cfTurnApiBase ?? env.CF_TURN_API_BASE ?? '').trim()
+  const apiBase = (rawApiBase || DEFAULT_CF_TURN_API_BASE).replace(/\/+$/, '')
+  const rawTtl = options.cfTurnTtlSec ?? (String(env.CF_TURN_TTL_SEC ?? '').trim() || undefined)
+  const ttlSec = clampTtl(rawTtl ?? DEFAULT_CF_TURN_TTL_SEC)
   const tiers = parseCfTurnTiers(options.cfTurnTiers ?? env.CF_TURN_TIERS ?? 'free')
   const fetchFn = typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch
+  const onRecovered = typeof options.onRecovered === 'function' ? options.onRecovered : null
   const log = options.log || console
 
   const enabled = Boolean(tokenId && apiToken && tiers.size > 0)
@@ -137,6 +138,8 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
           throw new Error('Cloudflare TURN returned empty turnServers')
         }
         const now = Date.now()
+        const wasUnavailable = !cached || now >= cached.expiresAt - 10_000
+        const hadPriorFailure = Boolean(lastError || retryAttempt > 0)
         cached = {
           stunServers: normalized.stunServers,
           turnServers: normalized.turnServers,
@@ -146,6 +149,9 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
         lastError = ''
         retryAttempt = 0
         clearRetryTimer()
+        if (wasUnavailable && hadPriorFailure && onRecovered) {
+          try { onRecovered(cached) } catch {}
+        }
         return cached
       } catch (err) {
         lastError = String(err?.message || err)

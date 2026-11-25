@@ -30,33 +30,33 @@ import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 // Native slash commands inherited from each AI tool (forwarded directly on send)
 const NATIVE_SLASH_COMMANDS = {
   antigravity: [
-    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 先规划步骤再执行', en: 'Plan step-by-step before executing' },
-    { cmd: '/goal', icon: Timer, zh: '目标模式 · 持续推进直到完成', en: 'Run until the goal is completely finished' },
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 先规划步骤再执行', en: 'Plan step-by-step before executing' },
+    { cmd: '/goal', needsArgs: true, icon: Timer, zh: '目标模式 · 持续推进直到完成', en: 'Run until the goal is completely finished' },
     { cmd: '/compact', icon: FoldVertical, zh: '压缩总结当前对话上下文', en: 'Compact & summarize conversation context' },
-    { cmd: '/schedule', icon: Clock, zh: '设置定时或周期执行任务', en: 'Schedule recurring job or one-shot timer' },
-    { cmd: '/browser', icon: Globe, zh: '调用浏览器 Agent 处理网页任务', en: 'Invoke browser agent for web tasks' },
-    { cmd: '/btw', icon: MessageSquarePlus, zh: '顺便提问而不打断主对话', en: 'Ask a quick question without interrupting' },
+    { cmd: '/schedule', needsArgs: true, icon: Clock, zh: '设置定时或周期执行任务', en: 'Schedule recurring job or one-shot timer' },
+    { cmd: '/browser', needsArgs: true, icon: Globe, zh: '调用浏览器 Agent 处理网页任务', en: 'Invoke browser agent for web tasks' },
+    { cmd: '/btw', needsArgs: true, icon: MessageSquarePlus, zh: '附带一个独立的快速提问', en: 'Ask a quick side question' },
     { cmd: '/grill-me', icon: MessageSquareText, zh: '交互式访谈对齐方案细节', en: 'Interactive interview to align on a plan' },
-    { cmd: '/teamwork', icon: Users, zh: '多 Agent 协同处理复杂任务', en: 'Multi-agent teamwork for large projects' },
-    { cmd: '/boost', icon: Sparkles, zh: '深度思考与多视角严格验证', en: 'Deep thinking & rigorous verification' },
+    { cmd: '/teamwork', needsArgs: true, icon: Users, zh: '多 Agent 协同处理复杂任务', en: 'Multi-agent teamwork for large projects' },
+    { cmd: '/boost', needsArgs: true, icon: Sparkles, zh: '深度思考与多视角严格验证', en: 'Deep thinking & rigorous verification' },
     { cmd: '/learn', icon: BookOpen, zh: '固化经验偏好供后续复用', en: 'Persist learnings for future tasks' },
   ],
   codex: [
-    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 先制定实施计划', en: 'Plan mode before executing changes' },
-    { cmd: '/goal', icon: Timer, zh: '设定当前线程持续目标', en: 'Set an active goal for this thread' },
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 先制定实施计划', en: 'Plan mode before executing changes' },
+    { cmd: '/goal', needsArgs: true, icon: Timer, zh: '设定当前线程持续目标', en: 'Set an active goal for this thread' },
     { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
     { cmd: '/review', icon: FileSearch, zh: '审查当前代码改动', en: 'Review workspace changes' },
     { cmd: '/diff', icon: FileDiff, zh: '查看当前工作区改动', en: 'Inspect current workspace diff' },
   ],
   claude: [
-    { cmd: '/plan', icon: ListTodo, zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
     { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
     { cmd: '/review', icon: FileSearch, zh: '代码审查与风险检查', en: 'Review code changes' },
     { cmd: '/clear', icon: Eraser, zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
     { cmd: '/init', icon: FileCode, zh: '初始化项目 CLAUDE.md 指引', en: 'Initialize project CLAUDE.md guide' },
   ],
   dsh: [
-    { cmd: '/plan', icon: ListTodo, zh: '计划模式', en: 'Plan mode' },
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式', en: 'Plan mode' },
     { cmd: '/compact', icon: FoldVertical, zh: '压缩对话上下文', en: 'Compact conversation context' },
   ],
 }
@@ -142,6 +142,7 @@ export function Composer({
   const textRef = useRef(text)
   const attachmentsRef = useRef(attachments)
   const sendingRef = useRef(false)
+  const composingRef = useRef(false)
   const mountedRef = useRef(true)
   textRef.current = text
   attachmentsRef.current = attachments
@@ -226,6 +227,11 @@ export function Composer({
     setText(next)
     setSlashDismissed(true)
     saveDraft(draftKeyRef.current, { text: next, attachments: attachmentsRef.current })
+    // Focus synchronously inside the user tap/click gesture so iOS Safari keeps the virtual keyboard open
+    const elSync = textareaRef.current
+    if (elSync) {
+      try { elSync.focus() } catch {}
+    }
     requestAnimationFrame(() => {
       const el = textareaRef.current
       if (!el) return
@@ -370,7 +376,10 @@ export function Composer({
   }
 
   const handleKeyDown = (e) => {
-    if (showSlashMenu && !e.nativeEvent.isComposing) {
+    const isImeComposing = Boolean(
+      composingRef.current || e.nativeEvent?.isComposing || e.keyCode === 229,
+    )
+    if (showSlashMenu && !isImeComposing) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setSlashIdx((i) => (i + 1) % slashOptions.length)
@@ -394,8 +403,8 @@ export function Composer({
       }
       if (e.key === 'Enter' && !e.shiftKey) {
         const picked = slashOptions[slashIdx] || slashOptions[0]
-        // If user hasn't typed the exact command yet, Enter completes it; if exact command already typed (e.g. /compact), Enter sends directly
-        if (picked && text.trim().toLowerCase() !== picked.cmd.toLowerCase()) {
+        // Complete partial commands or argument-requiring commands (e.g. /plan, /goal, /browser) with a trailing space
+        if (picked && (picked.needsArgs || text.trim().toLowerCase() !== picked.cmd.toLowerCase())) {
           e.preventDefault()
           applySlashCommand(picked.cmd)
           return
@@ -403,7 +412,7 @@ export function Composer({
       }
     }
 
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+    if (e.key === 'Enter' && !e.shiftKey && !isImeComposing) {
       e.preventDefault()
       if (!uploading && !sendingRef.current) {
         void handleSubmit()
@@ -501,8 +510,15 @@ export function Composer({
           <textarea
             ref={textareaRef}
             rows={1}
+            readOnly={sending}
             value={text}
+            onCompositionStart={() => { composingRef.current = true }}
+            onCompositionEnd={() => {
+              // WebKit/Safari fires keydown Enter right after compositionend in the same frame
+              setTimeout(() => { composingRef.current = false }, 0)
+            }}
             onChange={(e) => {
+              if (sendingRef.current) return
               updateText(e.target.value)
               autoResize(e.target)
             }}
@@ -545,7 +561,7 @@ export function Composer({
               />
               <button
                 type="button"
-                disabled={uploading || disabled}
+                disabled={uploading || disabled || sending}
                 onClick={() => fileRef.current?.click()}
                 aria-label={bi('上传图片或文件', 'Upload image or file')}
                 className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-200/70 disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-700/60"

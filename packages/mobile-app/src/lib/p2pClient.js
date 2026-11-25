@@ -231,11 +231,11 @@ export class P2PPeerSession {
     return ctx
   }
 
-  async _sendEncryptedSignal(inner) {
-    if (this.closed) return
+  async _sendEncryptedSignal(inner, { allowWhenClosing = false } = {}) {
+    if (this.closed && !allowWhenClosing) return
     const ctx = this._getRequiredE2ee()
     const e2ee = await encryptJson(ctx.key, inner, { kind: 'p2p.signal', roomId: this.roomId })
-    if (this.closed) return
+    if (this.closed && !allowWhenClosing) return
     this.sendSignal({
       bridgeId: this.bridgeId,
       sessionId: this.sessionId,
@@ -307,9 +307,25 @@ export class P2PPeerSession {
   _startKeepalive() {
     this._stopKeepalive()
     this._lastPongAt = Date.now()
+    this._lastKeepaliveTickAt = this._lastPongAt
+    this._wakeGraceUntil = 0
     this._keepaliveTimer = setInterval(() => {
       if (!this.isOpen()) return
       const now = Date.now()
+      const tickGap = now - (this._lastKeepaliveTickAt || now)
+      this._lastKeepaliveTickAt = now
+      // Detect OS/mobile sleep jump (> 2.5x keepalive interval): send a probe ping and grant 6s grace
+      // instead of immediately killing a healthy P2P link on wake.
+      if (tickGap > P2P_KEEPALIVE_MS * 2.5) {
+        this._wakeGraceUntil = now + 6_000
+        this._sendCtrlJson({ type: 'ping', ts: now })
+        return
+      }
+      if (this._wakeGraceUntil > 0 && now < this._wakeGraceUntil) {
+        this._sendCtrlJson({ type: 'ping', ts: now })
+        return
+      }
+      this._wakeGraceUntil = 0
       if (this._lastPongAt > 0 && now - this._lastPongAt > P2P_KEEPALIVE_TIMEOUT_MS) {
         this._failAndTeardown(
           new Error(L('P2P 直连心跳超时，请重试连接', 'P2P keepalive timed out. Please reconnect.')),
@@ -728,6 +744,7 @@ export class P2PPeerSession {
       if (up) {
         this._activeUploads.delete(transferId)
         const err = new Error(inner.message || L('P2P 上传失败', 'P2P upload failed'))
+        up.remoteError = err
         up.readyReject?.(err)
         up.doneReject?.(err)
       }
@@ -828,13 +845,19 @@ export class P2PPeerSession {
     }
     this._activeDownloads.set(cleanId, dl)
 
+    let cancelSent = false
+    const sendDownloadCancel = () => {
+      if (cancelSent) return
+      cancelSent = true
+      void this._sendBulkCtrl({ action: 'cancel', streamId: cleanId, direction: 'download' }).catch(() => {})
+    }
     const onAbort = () => {
       const err = new Error(L('已取消文件传输', 'File transfer cancelled'))
       err.name = 'AbortError'
       dl.headerReject?.(err)
       queue.fail(err)
       this._activeDownloads.delete(cleanId)
-      void this._sendBulkCtrl({ action: 'cancel', streamId: cleanId }).catch(() => {})
+      sendDownloadCancel()
     }
     if (signal) {
       if (signal.aborted) {
@@ -844,6 +867,7 @@ export class P2PPeerSession {
       signal.addEventListener('abort', onAbort, { once: true })
     }
 
+    let completedNormally = false
     try {
       await this._sendBulkCtrl({ action: 'pull', streamId: cleanId })
 
@@ -870,6 +894,7 @@ export class P2PPeerSession {
         chunked: Boolean(header.e2ee.chunked),
       })
 
+      completedNormally = true
       return {
         blob: new Blob(dec.chunks || [], { type: mimeType || 'application/octet-stream' }),
         size: dec.totalPlainBytes,
@@ -877,6 +902,9 @@ export class P2PPeerSession {
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort)
       this._activeDownloads.delete(cleanId)
+      if (!completedNormally) {
+        sendDownloadCancel()
+      }
     }
   }
 
@@ -914,13 +942,15 @@ export class P2PPeerSession {
     })
     donePromise.catch(() => {})
 
-    this._activeUploads.set(transferId, {
+    const uploadEntry = {
       streamId,
       readyResolve,
       readyReject,
       doneResolve,
       doneReject,
-    })
+      remoteError: null,
+    }
+    this._activeUploads.set(transferId, uploadEntry)
 
     const onAbort = () => {
       const err = new Error(L('已取消文件上传', 'File upload cancelled'))
@@ -928,7 +958,7 @@ export class P2PPeerSession {
       readyReject?.(err)
       doneReject?.(err)
       this._activeUploads.delete(transferId)
-      void this._sendBulkCtrl({ action: 'cancel', streamId }).catch(() => {})
+      void this._sendBulkCtrl({ action: 'cancel', streamId, direction: 'upload' }).catch(() => {})
     }
     if (signal) {
       if (signal.aborted) {
@@ -977,6 +1007,7 @@ export class P2PPeerSession {
           },
           onChunk: async (cipherChunk) => {
             for (let off = 0; off < cipherChunk.byteLength; off += BULK_SLICE_BYTES) {
+              if (uploadEntry.remoteError) throw uploadEntry.remoteError
               if (signal?.aborted || this.closed) {
                 const err = new Error('Transfer aborted')
                 err.name = 'AbortError'
@@ -1010,6 +1041,12 @@ export class P2PPeerSession {
         await waitReadyWithTimeout()
         const cipher = enc.ciphertext
         for (let off = 0; off < cipher.byteLength; off += BULK_SLICE_BYTES) {
+          if (uploadEntry.remoteError) throw uploadEntry.remoteError
+          if (signal?.aborted || this.closed) {
+            const err = new Error('Transfer aborted')
+            err.name = 'AbortError'
+            throw err
+          }
           const slice = cipher.subarray(off, Math.min(cipher.byteLength, off + BULK_SLICE_BYTES))
           const frame = encodeBulkFrame(streamId, seq++, slice, 0)
           await sendWithBackpressure(this.bulkDc, frame, { signal })
@@ -1020,6 +1057,7 @@ export class P2PPeerSession {
         }
       }
 
+      if (uploadEntry.remoteError) throw uploadEntry.remoteError
       const eofFrame = encodeBulkFrame(streamId, seq++, new Uint8Array(0), BULK_FLAG_EOF)
       await sendWithBackpressure(this.bulkDc, eofFrame, { signal })
 
@@ -1061,10 +1099,12 @@ export class P2PPeerSession {
   }
 
   close(notifyPeer = true) {
-    if (this.closed) return
+    if (this.closed) return Promise.resolve()
+    let notifyPromise = Promise.resolve()
     if (notifyPeer && this.pc) {
-      void this._sendEncryptedSignal({ kind: 'close' }).catch(() => {})
+      notifyPromise = this._sendEncryptedSignal({ kind: 'close' }, { allowWhenClosing: true }).catch(() => {})
     }
     this._failAndTeardown(new Error(L('连接已关闭', 'Connection closed')), 'closed')
+    return notifyPromise
   }
 }

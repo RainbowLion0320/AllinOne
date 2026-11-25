@@ -260,12 +260,14 @@ export function createAccountStore({ filePath }) {
         try {
           await writeFileAsync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
           try { await chmodAsync(tmpPath, 0o600) } catch {}
+          // Perform generation check + atomic rename synchronously on the main thread
+          // so a concurrent sync save() (gen N+1) can never be overwritten by a stale libuv renameAsync(gen N).
           if (persistedGen >= targetGen) {
             try { await unlinkAsync(tmpPath) } catch {}
             continue
           }
-          await renameAsync(tmpPath, filePath)
-          try { await chmodAsync(filePath, 0o600) } catch {}
+          renameSync(tmpPath, filePath)
+          try { chmodSync(filePath, 0o600) } catch {}
           persistedGen = Math.max(persistedGen, targetGen)
         } catch (err) {
           try { await unlinkAsync(tmpPath) } catch {}

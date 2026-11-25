@@ -483,7 +483,14 @@ export async function decryptChunkedStream(
         headerParsed = true
       }
 
-      if (chunkIndex >= totalChunks) return
+      if (chunkIndex >= totalChunks) {
+        if (queue.byteLength > 0) {
+          const err = new Error('端到端分块密文包含多余尾部数据')
+          err.code = 'E2EE_DECRYPT_FAILED'
+          throw err
+        }
+        return
+      }
 
       if (nextFrameLen === -1) {
         if (queue.byteLength < 4) return

@@ -293,20 +293,34 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
     const appendOut = (chunk) => {
       outputTail = (outputTail + chunk.toString('utf8')).slice(-4000)
     }
+    let forceKillTimer = null
     const finish = (ok, code, error = '') => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer)
+        forceKillTimer = null
+      }
       resolveDone({ ok, code, error, output: outputTail.trim() })
     }
 
     const timer = setTimeout(() => {
+      if (process.platform === 'win32' && proc?.pid) {
+        try {
+          const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+          tk.on('error', () => {})
+        } catch {}
+      }
       try { proc?.kill('SIGTERM') } catch {}
-      setTimeout(() => {
+      forceKillTimer = setTimeout(() => {
+        forceKillTimer = null
         try { proc?.kill('SIGKILL') } catch {}
       }, 2000)
+      forceKillTimer.unref?.()
       finish(false, -1, `安装超时 (${Math.round(timeoutMs / 1000)}s)`)
     }, timeoutMs)
+    timer.unref?.()
 
     try {
       const isWinCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(step.cmd)

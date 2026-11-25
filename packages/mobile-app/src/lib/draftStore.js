@@ -27,17 +27,25 @@ function readRawStorage() {
   }
 }
 
-function sanitizeDraftAttachments(rawList) {
+const P2P_DRAFT_TOKEN_TTL_MS = 14 * 60 * 1000 // PC bridge expires p2pTokens at 15 min
+
+function sanitizeDraftAttachments(rawList, { forPersistence = false, now = Date.now() } = {}) {
   if (!Array.isArray(rawList)) return []
   const out = []
   for (const item of rawList) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue
-    if ('localPreviewUrl' in item) {
-      const { localPreviewUrl: _drop, ...rest } = item
-      out.push(rest)
-    } else {
-      out.push({ ...item })
+    const isEphemeralP2p = typeof item.p2pToken === 'string' && item.p2pToken.trim().startsWith('p2p_')
+    // Ephemeral p2pTokens live only in PC bridge RAM bound to the current WS clientId — never persist across reloads
+    if (forPersistence && isEphemeralP2p) continue
+    if (isEphemeralP2p && item._draftSavedAt && now - Number(item._draftSavedAt) > P2P_DRAFT_TOKEN_TTL_MS) {
+      continue
     }
+    const clean = { ...item }
+    delete clean.localPreviewUrl
+    if (isEphemeralP2p && !clean._draftSavedAt) {
+      clean._draftSavedAt = now
+    }
+    out.push(clean)
   }
   return out
 }
@@ -50,7 +58,7 @@ function hydrateOnce() {
   for (const [key, entry] of Object.entries(raw)) {
     if (!key || !entry || typeof entry !== 'object') continue
     const text = typeof entry.text === 'string' ? entry.text : ''
-    const attachments = sanitizeDraftAttachments(entry.attachments)
+    const attachments = sanitizeDraftAttachments(entry.attachments, { forPersistence: true })
     if (!text && attachments.length === 0) continue
     memoryDrafts.set(key, {
       text: text.slice(0, MAX_TEXT_CHARS),
@@ -63,13 +71,21 @@ function hydrateOnce() {
 function persistDrafts() {
   try {
     if (typeof localStorage === 'undefined') return
-    if (memoryDrafts.size === 0) {
+    const obj = {}
+    let count = 0
+    for (const [k, v] of memoryDrafts.entries()) {
+      const persistedAtts = sanitizeDraftAttachments(v.attachments, { forPersistence: true })
+      if (!v.text && persistedAtts.length === 0) continue
+      obj[k] = {
+        text: v.text,
+        attachments: persistedAtts,
+        updatedAt: v.updatedAt,
+      }
+      count += 1
+    }
+    if (count === 0) {
       localStorage.removeItem(DRAFTS_STORAGE_KEY)
       return
-    }
-    const obj = {}
-    for (const [k, v] of memoryDrafts.entries()) {
-      obj[k] = v
     }
     localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(obj))
   } catch {

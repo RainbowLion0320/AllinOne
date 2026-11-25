@@ -123,11 +123,16 @@
       } else if (ev.data instanceof ArrayBuffer) {
         const bytes = new Uint8Array(ev.data)
         if (entry.pendingBlobs > 0) {
-          entry.blobQueue = entry.blobQueue.then(() => {
-            if (peers.get(peerId) === entry) {
-              api.sendBinary(peerId, role, bytes)
-            }
-          })
+          entry.pendingBlobs += 1
+          entry.blobQueue = entry.blobQueue
+            .then(() => {
+              if (peers.get(peerId) === entry) {
+                api.sendBinary(peerId, role, bytes)
+              }
+            })
+            .finally(() => {
+              entry.pendingBlobs = Math.max(0, entry.pendingBlobs - 1)
+            })
         } else {
           api.sendBinary(peerId, role, bytes)
         }
@@ -151,7 +156,9 @@
     } catch {}
     dc.onbufferedamountlow = () => {
       if (peers.get(peerId) !== entry) return
-      api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0 })
+      const ackedBytes = role === 'bulk' ? entry.bulkAckedSinceReport : 0
+      if (role === 'bulk') entry.bulkAckedSinceReport = 0
+      api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0, ackedBytes })
     }
     // Per W3C WebRTC spec, remote-created DataChannels delivered via ondatachannel
     // often arrive already in 'open' state and never fire an 'open' event.
@@ -178,6 +185,7 @@
           transportRetryTimer: null,
           blobQueue: Promise.resolve(),
           pendingBlobs: 0,
+          bulkAckedSinceReport: 0,
         }
         peers.set(peerId, entry)
 
@@ -296,7 +304,14 @@
     try {
       dc.send(bytes)
       const buffered = dc.bufferedAmount || 0
-      if (buffered >= 512 * 1024) {
+      if (role === 'bulk') {
+        entry.bulkAckedSinceReport += bytes?.byteLength || 0
+        if (buffered >= 512 * 1024 || entry.bulkAckedSinceReport >= 256 * 1024) {
+          const ackedBytes = entry.bulkAckedSinceReport
+          entry.bulkAckedSinceReport = 0
+          api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: buffered, ackedBytes })
+        }
+      } else if (buffered >= 512 * 1024) {
         api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: buffered })
       }
     } catch (err) {

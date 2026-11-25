@@ -178,6 +178,14 @@ export async function sendWithBackpressure(dc, bytes, opts = {}) {
   dc.send(bytes)
 }
 
+const ctrlTextEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null
+function utf8ByteLength(str) {
+  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
+    return Buffer.byteLength(str, 'utf8')
+  }
+  return ctrlTextEncoder ? ctrlTextEncoder.encode(str).byteLength : str.length * 3
+}
+
 /**
  * Create a symmetric JSON control-channel codec with automatic 48 KB SCTP fragmentation.
  * Ensures large RPC payloads (e.g. 500 KB session history) never hit SCTP message-size limits.
@@ -187,13 +195,14 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
   /** @type {Map<string, { parts: string[], received: number, total: number, createdAt: number }>} */
   const assemblies = new Map()
 
-  function pruneStale(now = Date.now()) {
+  function pruneStale(now = Date.now(), reserve = 0) {
     for (const [id, entry] of assemblies.entries()) {
       if (now - entry.createdAt > fragTimeoutMs) {
         assemblies.delete(id)
       }
     }
-    while (assemblies.size > maxFragsInFlight) {
+    const maxAllowed = Math.max(0, maxFragsInFlight - reserve)
+    while (assemblies.size > maxAllowed) {
       const oldest = assemblies.keys().next().value
       if (!oldest) break
       assemblies.delete(oldest)
@@ -201,29 +210,62 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
   }
 
   /**
-   * Encode an arbitrary JS object into 1 or more JSON frames <= 48 KB each.
+   * Encode an arbitrary JS object into 1 or more JSON frames <= 48 KB UTF-8 bytes each.
+   * Dynamically sizes slices so non-ASCII UTF-8 expansion and JSON double-escaping never exceed SCTP limits.
    * @param {any} msg
    * @returns {string[]}
    */
   function encode(msg) {
     const raw = JSON.stringify(msg)
-    if (raw.length <= CTRL_FRAG_LIMIT_CHARS) {
+    if (utf8ByteLength(raw) <= CTRL_FRAG_LIMIT_CHARS) {
       return [raw]
     }
     const id = `f${fragSeq++}`
-    const total = Math.ceil(raw.length / CTRL_FRAG_LIMIT_CHARS)
-    const frames = []
+    // Leave generous headroom for {"_aioFrag":{"id":"f...","i":999,"n":999,"d":"..."}} wrapper
+    const maxDataJsonBytes = Math.max(1024, CTRL_FRAG_LIMIT_CHARS - 128)
+    const parts = []
+    let pos = 0
+    while (pos < raw.length) {
+      let lo = 1
+      let hi = Math.min(raw.length - pos, CTRL_FRAG_LIMIT_CHARS)
+      let best = 1
+      while (lo <= hi) {
+        let mid = (lo + hi) >>> 1
+        // Never split a UTF-16 surrogate pair across fragments
+        const lastCode = raw.charCodeAt(pos + mid - 1)
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff && pos + mid < raw.length) {
+          if (mid + 1 <= hi) mid += 1
+          else if (mid > 1) mid -= 1
+        }
+        const encodedSlice = JSON.stringify(raw.slice(pos, pos + mid))
+        if (utf8ByteLength(encodedSlice) <= maxDataJsonBytes) {
+          best = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      // Final surrogate-pair guard in case best landed on a high surrogate
+      if (best < raw.length - pos) {
+        const lastCode = raw.charCodeAt(pos + best - 1)
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff && best > 1) {
+          best -= 1
+        }
+      }
+      parts.push(raw.slice(pos, pos + best))
+      pos += best
+    }
+    const total = parts.length
+    const frames = new Array(total)
     for (let i = 0; i < total; i += 1) {
-      frames.push(
-        JSON.stringify({
-          _aioFrag: {
-            id,
-            i,
-            n: total,
-            d: raw.slice(i * CTRL_FRAG_LIMIT_CHARS, (i + 1) * CTRL_FRAG_LIMIT_CHARS),
-          },
-        }),
-      )
+      frames[i] = JSON.stringify({
+        _aioFrag: {
+          id,
+          i,
+          n: total,
+          d: parts[i],
+        },
+      })
     }
     return frames
   }
@@ -254,9 +296,9 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
     if (!id || !Number.isInteger(idx) || !Number.isInteger(total) || total <= 0 || total > 1024 || idx < 0 || idx >= total) {
       return null
     }
-    pruneStale()
     let entry = assemblies.get(id)
     if (!entry) {
+      pruneStale(Date.now(), 1)
       entry = { parts: new Array(total), received: 0, total, createdAt: Date.now() }
       assemblies.set(id, entry)
     } else if (entry.total !== total) {

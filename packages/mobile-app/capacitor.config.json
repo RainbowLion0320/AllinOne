@@ -3,12 +3,12 @@
   "appName": "All in One",
   "webDir": "dist",
   "server": {
-    "url": "https://your-relay.example.com/",
     "androidScheme": "https",
     "cleartext": false
   },
   "android": {
-    "allowMixedContent": false
+    "allowMixedContent": false,
+    "adjustMarginsForEdgeToEdge": "auto"
   },
   "ios": {
     "contentInset": "automatic"

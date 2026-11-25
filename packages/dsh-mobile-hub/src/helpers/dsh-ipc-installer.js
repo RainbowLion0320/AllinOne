@@ -129,9 +129,10 @@ export function ensureDshLocalIpcPlugin({
 
   try {
     mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(pluginPkgPath, `${buildPluginPackageJson()}\n`, 'utf8')
+    // Write implementation files BEFORE package.json version marker so an interrupted write never leaves a stale "up-to-date" install
     writeFileSync(join(pluginDir, 'cordis.patch.yml'), CORDIS_PATCH_YML, 'utf8')
     writeFileSync(join(pluginDir, 'index.js'), pluginCode, 'utf8')
+    writeFileSync(pluginPkgPath, `${buildPluginPackageJson()}\n`, 'utf8')
 
     if (needsBundleEntry) {
       const backupPath = join(profileDir, 'package.json.bak-before-allinone')

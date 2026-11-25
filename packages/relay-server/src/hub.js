@@ -285,15 +285,27 @@ export class RelayHub {
 
   /**
    * Immediately notify all online PC bridges in `roomId` to tear down active P2P DataChannels
-   * for revoked/kicked `clientIds`.
+   * for revoked/kicked `clientIds`, `sids`, `all`, or `allExceptSids`.
    */
-  notifyBridgesClientRevoked(roomId, clientIds, reason = 'revoked') {
+  notifyBridgesClientRevoked(
+    roomId,
+    clientIds = [],
+    reason = 'revoked',
+    { sids = [], all = false, allExceptSids = [] } = {},
+  ) {
     const rid = String(roomId || '').trim()
-    const ids = Array.isArray(clientIds) ? clientIds.map((x) => String(x || '').trim()).filter(Boolean) : []
-    if (!rid || ids.length === 0) return
+    const ids = Array.isArray(clientIds) ? [...new Set(clientIds.map((x) => String(x || '').trim()).filter(Boolean))] : []
+    const cleanSids = Array.isArray(sids) ? [...new Set(sids.map((x) => String(x || '').trim()).filter(Boolean))] : []
+    const exceptSids = Array.isArray(allExceptSids)
+      ? [...new Set(allExceptSids.map((x) => String(x || '').trim()).filter(Boolean))]
+      : []
+    if (!rid || (ids.length === 0 && cleanSids.length === 0 && !all && exceptSids.length === 0)) return
     const frame = JSON.stringify({
       type: EVENTS.CLIENT_REVOKED,
       clientIds: ids,
+      ...(cleanSids.length > 0 ? { sids: cleanSids } : {}),
+      ...(all ? { all: true } : {}),
+      ...(exceptSids.length > 0 ? { allExceptSids: exceptSids } : {}),
       reason: String(reason || 'revoked'),
       ts: Date.now(),
     })
@@ -301,6 +313,17 @@ export class RelayHub {
       if (b.roomId !== rid || b.ws.readyState !== 1) continue
       try { b.ws.send(frame) } catch {}
     }
+  }
+
+  getActiveRoomIds() {
+    const activeRooms = new Set()
+    for (const b of this.bridges.values()) {
+      if (b.ws.readyState === 1) activeRooms.add(b.roomId)
+    }
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === 1) activeRooms.add(c.roomId)
+    }
+    return [...activeRooms]
   }
 
   getOrCreateRoomStats(roomId) {
@@ -841,6 +864,7 @@ export class RelayHub {
       this.sendRaw(bridge.ws, {
         type: EVENTS.P2P_SIGNAL,
         clientId,
+        ...(client.sid ? { sid: client.sid } : {}),
         sessionId,
         e2ee: msg.e2ee,
         ts: Date.now(),
@@ -1116,25 +1140,28 @@ export class RelayHub {
     return true
   }
 
-  _dropClients(targets, code = 4401, reason = 'Session revoked', grantReason = 'revoked') {
+  _dropClients(targets, code = 4401, reason = 'Session revoked', grantReason = 'revoked', { notifyBridges = true } = {}) {
     if (!targets.length) return 0
-    /** @type {Map<string, string[]>} */
+    /** @type {Map<string, { ids: string[], sids: string[] }>} */
     const revokedByRoom = new Map()
     for (const [cid, client] of targets) {
       this.clients.delete(cid)
       this._unindexRoomClient(client.roomId, cid)
       if (grantReason === 'revoked') {
-        const list = revokedByRoom.get(client.roomId) || []
-        list.push(cid)
-        revokedByRoom.set(client.roomId, list)
+        const entry = revokedByRoom.get(client.roomId) || { ids: [], sids: [] }
+        entry.ids.push(cid)
+        if (client.sid) entry.sids.push(client.sid)
+        revokedByRoom.set(client.roomId, entry)
       }
       try { client.ws.close(code, reason) } catch {}
     }
     for (const [cid] of targets) {
       this.cancelClientGrants(cid, grantReason)
     }
-    for (const [rid, ids] of revokedByRoom.entries()) {
-      this.notifyBridgesClientRevoked(rid, ids, reason)
+    if (notifyBridges) {
+      for (const [rid, entry] of revokedByRoom.entries()) {
+        this.notifyBridgesClientRevoked(rid, entry.ids, reason, { sids: entry.sids })
+      }
     }
     return targets.length
   }
@@ -1150,7 +1177,12 @@ export class RelayHub {
       const matchSid = targetSid && client.sid && client.sid === targetSid
       if (matchCid || matchSid) targets.push([cid, client])
     }
-    const disconnected = this._dropClients(targets, code, reason, 'revoked')
+    const disconnected = this._dropClients(targets, code, reason, 'revoked', { notifyBridges: false })
+    const droppedIds = targets.map(([cid]) => cid)
+    const droppedSids = [...new Set([targetSid, ...targets.map(([, c]) => c.sid)].filter(Boolean))]
+    if (droppedIds.length > 0 || droppedSids.length > 0) {
+      this.notifyBridgesClientRevoked(rid, droppedIds, reason, { sids: droppedSids })
+    }
     if (disconnected > 0) {
       this.log.info(`[control] Kicked ${disconnected} client connection(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
@@ -1163,15 +1195,23 @@ export class RelayHub {
     if (!rid) return 0
     const keepCid = String(keepClientId || '').trim()
     const keepSession = String(keepSid || '').trim()
+    const nextKeepSid = String(newSidForKept || '').trim()
     const targets = []
     for (const [cid, client] of this._getRoomClientEntries(rid)) {
       if ((keepCid && cid === keepCid) || (keepSession && client.sid && client.sid === keepSession)) {
-        if (newSidForKept) client.sid = String(newSidForKept)
+        if (nextKeepSid) client.sid = nextKeepSid
         continue
       }
       targets.push([cid, client])
     }
-    const disconnected = this._dropClients(targets, code, reason, 'revoked')
+    const disconnected = this._dropClients(targets, code, reason, 'revoked', { notifyBridges: false })
+    const droppedIds = targets.map(([cid]) => cid)
+    const droppedSids = targets.map(([, c]) => c.sid).filter(Boolean)
+    const keepSids = [keepSession, nextKeepSid].filter(Boolean)
+    this.notifyBridgesClientRevoked(rid, droppedIds, reason, {
+      sids: droppedSids,
+      ...(keepSids.length > 0 ? { allExceptSids: keepSids } : { all: true }),
+    })
     if (disconnected > 0) {
       this.log.info(`[control] Kicked ${disconnected} other client(s) in room=${rid}`)
       this.broadcastRoomClients(rid)
@@ -1183,7 +1223,10 @@ export class RelayHub {
     const rid = String(roomId || '').trim()
     if (!rid) return 0
     const targets = this._getRoomClientEntries(rid)
-    const disconnected = this._dropClients(targets, code, reason, 'revoked')
+    const disconnected = this._dropClients(targets, code, reason, 'revoked', { notifyBridges: false })
+    const droppedIds = targets.map(([cid]) => cid)
+    const droppedSids = targets.map(([, c]) => c.sid).filter(Boolean)
+    this.notifyBridgesClientRevoked(rid, droppedIds, reason, { sids: droppedSids, all: true })
     if (disconnected > 0) {
       this.log.info(`[control] Revoked and disconnected ${disconnected} client(s) in room=${rid}`)
     }

@@ -25,12 +25,29 @@ export async function copyTextToClipboard(text) {
     if (typeof document === 'undefined') return false
     const ta = document.createElement('textarea')
     ta.value = str
+    ta.setAttribute('readonly', '')
     ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '-9999px'
+    ta.style.fontSize = '16px' // prevents iOS Safari auto-zoom
     ta.style.opacity = '0'
     ta.style.pointerEvents = 'none'
     document.body.appendChild(ta)
-    ta.focus()
-    ta.select()
+    const isIOS = typeof navigator !== 'undefined' && /iPad|iPhone|iPod/i.test(navigator.userAgent || '')
+    if (isIOS) {
+      const range = document.createRange()
+      range.selectNodeContents(ta)
+      const sel = window.getSelection?.()
+      if (sel) {
+        sel.removeAllRanges()
+        sel.addRange(range)
+      }
+      ta.setSelectionRange(0, str.length)
+    } else {
+      ta.focus({ preventScroll: true })
+      ta.select()
+      ta.setSelectionRange(0, str.length)
+    }
     const ok = document.execCommand('copy')
     document.body.removeChild(ta)
     return Boolean(ok)

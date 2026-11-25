@@ -23,6 +23,8 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
   const [content, setContent] = useState(() => (typeof planDoc?.content === 'string' ? planDoc.content : ''))
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
+  const imageContextRef = useRef(imageContext)
+  imageContextRef.current = imageContext
   const isMacDesktop =
     typeof window !== 'undefined' &&
     Boolean(window.allinoneDesktop?.isDesktop) &&
@@ -50,7 +52,7 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
     let cancelled = false
     setLoading(true)
     setErrorMsg('')
-    fetchE2eeDeliverableFile(planDoc.path, imageContext, { forceRefresh: true })
+    fetchE2eeDeliverableFile(planDoc.path, imageContextRef.current, { forceRefresh: true })
       .then((entry) => entry.blob.text())
       .then((txt) => {
         if (!cancelled) setContent(txt)
@@ -66,7 +68,15 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
     return () => {
       cancelled = true
     }
-  }, [planDoc?.path, planDoc?.content, imageContext, bi])
+  }, [
+    planDoc?.path,
+    planDoc?.content,
+    imageContext?.roomId,
+    imageContext?.bridgeId,
+    imageContext?.cwd,
+    imageContext?.e2eeKeyId,
+    bi,
+  ])
 
   if (typeof document === 'undefined') return null
 
@@ -252,7 +262,7 @@ export function TaskStateBar({ sessionId = '', taskState = null, running = false
     }
     wasActionableRef.current = false
     setJustCompleted(false)
-  }, [isActionable, allDone, running, expanded, planOpen])
+  }, [sessionId, isActionable, allDone, running, expanded, planOpen])
 
   useEffect(() => {
     return () => {
