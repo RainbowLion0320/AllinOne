@@ -281,7 +281,7 @@ export class MultiAppOrchestrator {
     return out
   }
 
-  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, model, provider, reasoningEffort, _clientId = '' } = {}) {
+  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, taskMode, model, provider, reasoningEffort, _clientId = '' } = {}) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
     const materialized = await this.materializeAttachments(attachments, { clientId: _clientId })
@@ -293,6 +293,7 @@ export class MultiAppOrchestrator {
       attachments: materialized,
       approvalPolicy,
       permissionMode,
+      taskMode,
       model,
       provider,
       reasoningEffort,
@@ -653,6 +654,7 @@ export class MultiAppOrchestrator {
         join(home, 'Downloads'),
         join(home, 'Documents'),
         join(home, '.gemini', 'antigravity', 'brain'),
+        join(home, '.claude', 'plans'),
         tmpdir(),
         process.platform !== 'win32' ? '/tmp' : '',
       ]

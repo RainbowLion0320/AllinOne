@@ -12,6 +12,7 @@ import {
   normalizeResolvePayload,
   normalizeSingleAnswer,
 } from '../helpers/interactive-schema.js'
+import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 
 /**
  * Fallback discovery on macOS/Linux: if Codex Desktop / ChatGPT app is currently running
@@ -258,6 +259,66 @@ export function extractPendingCodexAsyncQuestionFromRollout(rawPath, { tailBytes
       }
     }
     return latestItem && !answeredCallIds.has(latestItem.id) ? latestItem : null
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+  }
+}
+
+/**
+ * Zero-OOM tail-seek extractor for Codex rollout `.jsonl` plan steps, collaboration mode (`plan`/`default`),
+ * and goal triggers. Safe on multi-GB rollouts.
+ */
+export function extractCodexTaskStateFromRollout(rawPath, { maxBytes = 512 * 1024 } = {}) {
+  const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
+  if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
+    return null
+  }
+  let fd = null
+  try {
+    fd = openSync(cleanPath, 'r')
+    const totalSize = fstatSync(fd).size
+    if (totalSize <= 0) return null
+    const readLen = Math.min(totalSize, maxBytes)
+    const startOffset = totalSize - readLen
+    const buf = Buffer.alloc(readLen)
+    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
+    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
+    if (startOffset > 0 && lines.length > 0) lines.shift()
+
+    const tracker = createTaskStateTracker()
+    for (const line of lines) {
+      if (!line || line[0] !== '{') continue
+      let obj
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const ts = toEpochMs(obj.timestamp || Date.now())
+      if (obj.type === 'event_msg' && obj.payload && typeof obj.payload === 'object') {
+        const p = obj.payload
+        if (p.type === 'task_started') {
+          tracker.applyCodexTurnMode(p.collaboration_mode_kind, p.turn_attribution?.turn_trigger, ts)
+        } else if (p.type === 'plan_update') {
+          tracker.applyCodexPlanUpdate(p, ts)
+        } else if (p.type === 'item_completed' && p.item && (p.item.type === 'Plan' || p.item.type === 'plan')) {
+          tracker.applyCodexPlanItem(p.item, ts)
+        }
+      } else if (obj.type === 'turn_context' && obj.payload && typeof obj.payload === 'object') {
+        const modeKind = obj.payload.collaboration_mode_kind || obj.payload.collaboration_mode?.mode || ''
+        if (modeKind) tracker.applyCodexTurnMode(modeKind, '', ts)
+      } else if (obj.type === 'response_item' && obj.payload && typeof obj.payload === 'object') {
+        const p = obj.payload
+        if ((p.type === 'function_call' || p.type === 'custom_tool_call') && p.name === 'update_plan') {
+          tracker.applyCodexPlanUpdate(p.arguments ?? p.input, ts)
+        }
+      }
+    }
+    return tracker.snapshot()
   } catch {
     return null
   } finally {
@@ -750,10 +811,17 @@ class CodexRpcClient {
         }
       })
 
+      const initClientInfo = { name: 'allinone-dsh-mobile', version: '1.0.8' }
       this.callRaw('initialize', {
-        clientInfo: { name: 'allinone-dsh-mobile', version: '1.0.7' },
-        capabilities: null,
+        clientInfo: initClientInfo,
+        capabilities: { experimentalApi: true },
       })
+        .catch(() =>
+          this.callRaw('initialize', {
+            clientInfo: initClientInfo,
+            capabilities: null,
+          }),
+        )
         .then((res) => {
           if (this.proc !== proc) return
           this.sendRaw({ jsonrpc: '2.0', method: 'initialized', params: {} })
@@ -989,6 +1057,8 @@ export class CodexAdapter {
     this.dismissedAsyncQuestions = new Set() // callId skipped locally by user on idle threads
     this.answeredAsyncQuestions = new Set() // callId already answered via All in One
     this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
+    this.sessionModes = new Map() // threadId -> 'plan' | 'default'
+    this.sessionTaskStates = new Map() // threadId -> normalized taskState | null
     this.modelsCache = null
     this.modelsCacheAt = 0
     this.quotaCache = null
@@ -1478,11 +1548,47 @@ export class CodexAdapter {
     return { resolved: true, id: approvalId, decision: validDecision }
   }
 
+  emitTaskStateIfChanged(threadId, tracker) {
+    if (!threadId || !tracker) return
+    const diff = tracker.consumeChanged()
+    if (!diff.changed) return
+    this.sessionTaskStates.set(threadId, diff.taskState)
+    this.emitEvent(EVENTS.STREAM_TASK_STATE, {
+      sessionId: makeCompositeId(APPS.CODEX, threadId),
+      app: APPS.CODEX,
+      taskState: diff.taskState,
+    })
+  }
+
   handleNotification(method, params) {
     const threadId = params.threadId
     if (!threadId) return
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
     const active = this.activeTurns.get(threadId)
+
+    if (method === 'turn/plan/updated') {
+      const tracker = active?.taskTracker || createTaskStateTracker(this.sessionTaskStates.get(threadId) || null)
+      if (active) active.taskTracker = tracker
+      tracker.applyCodexPlanUpdate(params, Date.now())
+      this.emitTaskStateIfChanged(threadId, tracker)
+      return
+    }
+
+    if (method === 'thread/goal/updated' && params.goal) {
+      const tracker = active?.taskTracker || createTaskStateTracker(this.sessionTaskStates.get(threadId) || null)
+      if (active) active.taskTracker = tracker
+      tracker.setGoal(params.goal, Date.now())
+      this.emitTaskStateIfChanged(threadId, tracker)
+      return
+    }
+
+    if (method === 'thread/goal/cleared') {
+      const tracker = active?.taskTracker || createTaskStateTracker(this.sessionTaskStates.get(threadId) || null)
+      if (active) active.taskTracker = tracker
+      tracker.clearGoal(Date.now())
+      this.emitTaskStateIfChanged(threadId, tracker)
+      return
+    }
 
     if (method === 'item/agentMessage/delta') {
       const delta = params.delta || ''
@@ -1532,6 +1638,11 @@ export class CodexAdapter {
           status: item.status === 'failed' || item.error ? 'error' : 'completed',
           output: (item.aggregatedOutput || (item.result ? JSON.stringify(item.result) : '')).slice(0, 3000),
         })
+      } else if (item.type === 'plan' && item.text) {
+        const tracker = active?.taskTracker || createTaskStateTracker(this.sessionTaskStates.get(threadId) || null)
+        if (active) active.taskTracker = tracker
+        tracker.applyCodexPlanItem(item, Date.now())
+        this.emitTaskStateIfChanged(threadId, tracker)
       } else if (item.type === 'agentMessage') {
         if (item.text && active && !active.textBuffer) {
           active.textBuffer = item.text
@@ -1710,6 +1821,7 @@ export class CodexAdapter {
       workspace: entry.workspace || (entry.cwd ? basename(entry.cwd) : ''),
       model: pref?.model || entry.model || '',
       status: isRunning ? 'running' : 'idle',
+      ...(entry.taskState !== undefined ? { taskState: entry.taskState } : {}),
       syncState: { externalRunning },
       writable: true,
       createdAt: entry.createdAt || 0,
@@ -1759,6 +1871,15 @@ export class CodexAdapter {
           tracked.externalRunning = cur.running
         }
         emittedIds.add(tid)
+        if (fileChanged) {
+          const rolloutTask = extractCodexTaskStateFromRollout(w.path)
+          const goalRes = await this.rpc('thread/goal/get', { threadId: tid }, 2_000).catch(() => null)
+          const tracker = createTaskStateTracker(rolloutTask)
+          if (goalRes?.goal) tracker.setGoal(goalRes.goal, toEpochMs(goalRes.goal.updatedAt || Date.now()))
+          w.taskState = tracker.snapshot()
+          this.sessionTaskStates.set(tid, w.taskState)
+          this.sessionModes.set(tid, w.taskState?.mode === 'plan' ? 'plan' : 'default')
+        }
         const pendingAsync = extractPendingCodexAsyncQuestionFromRollout(w.path)
         if (pendingAsync) {
           this.registerAsyncQuestionPrompt(tid, pendingAsync, {
@@ -2054,11 +2175,38 @@ export class CodexAdapter {
     }
 
     const pref = this.sessionPrefs.get(threadId)
-    const isLocalActive = this.activeTurns.has(threadId)
+    const activeTurn = this.activeTurns.get(threadId)
+    const isLocalActive = Boolean(activeTurn)
     const rolloutProbe = !isLocalActive && t.path
       ? probeCodexRolloutStatus(t.path, { maxIdleMs: this.externalMaxIdleMs })
       : null
     const externalRunning = Boolean(!isLocalActive && rolloutProbe?.running)
+
+    let taskState = null
+    if (isLocalActive && activeTurn?.taskTracker) {
+      taskState = activeTurn.taskTracker.snapshot()
+    } else if (!cursor) {
+      const rolloutTask = t.path ? extractCodexTaskStateFromRollout(t.path) : null
+      const tracker = createTaskStateTracker(rolloutTask)
+      if (Array.isArray(loadedTurns)) {
+        for (const turn of loadedTurns) {
+          for (const item of turn?.items || []) {
+            if (item?.type === 'plan' && item.text) {
+              tracker.applyCodexPlanItem(item, toEpochMs(item.completedAtMs || item.startedAtMs || turn.startedAt || Date.now()))
+            }
+          }
+        }
+      }
+      const goalRes = !pendingNew ? await this.rpc('thread/goal/get', { threadId }, 2_500).catch(() => null) : null
+      if (goalRes?.goal) {
+        tracker.setGoal(goalRes.goal, toEpochMs(goalRes.goal.updatedAt || Date.now()))
+      }
+      taskState = tracker.snapshot()
+      this.sessionTaskStates.set(threadId, taskState)
+      this.sessionModes.set(threadId, taskState?.mode === 'plan' ? 'plan' : 'default')
+    } else {
+      taskState = this.sessionTaskStates.get(threadId) || null
+    }
     const title = (t.name && t.name.trim()) || (t.preview && t.preview.trim().slice(0, 56)) || pendingNew?.summary?.title || threadId
     const cwd = t.cwd || pendingNew?.summary?.cwd || ''
     const model = pref?.model || t.model || ''
@@ -2104,6 +2252,7 @@ export class CodexAdapter {
       reasoningEffort: pref?.reasoningEffort || t.reasoningEffort || '',
       writable: true,
       status: isLocalActive || externalRunning ? 'running' : 'idle',
+      taskState,
       syncState: { externalRunning },
       updatedAt,
       messages,
@@ -2163,9 +2312,10 @@ export class CodexAdapter {
     }
   }
 
-  async sendMessage(threadId, { text, cwd, attachments = [], approvalPolicy, model, reasoningEffort } = {}) {
+  async sendMessage(threadId, { text, cwd, attachments = [], approvalPolicy, taskMode, model, reasoningEffort } = {}) {
     threadId = assertSafeSessionId(threadId, 'Codex threadId')
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
+    const effectiveTaskMode = normalizeTaskMode(taskMode)
     if (this.activeTurns.has(threadId)) {
       const err = new Error('该 Codex 对话正在运行中，请等待完成或先中断当前任务。')
       err.code = 'SESSION_BUSY'
@@ -2203,6 +2353,7 @@ export class CodexAdapter {
       turnId: null,
       cwd: cwd || '',
       textBuffer: '',
+      taskTracker: createTaskStateTracker(this.sessionTaskStates.get(threadId) || null),
       aborted: false,
       settled: false,
       resolve: resolveTurn,
@@ -2282,14 +2433,79 @@ export class CodexAdapter {
         this.sessionPrefs.set(threadId, { model: effectiveModel || '', reasoningEffort: effectiveEffort || '' })
       }
 
-      const startRes = await writer.rpc('turn/start', {
+      const prevWasPlan =
+        this.sessionModes.get(threadId) === 'plan' ||
+        turnState.taskTracker.snapshot()?.mode === 'plan'
+
+      if (effectiveTaskMode === 'goal' && trimmedText) {
+        await writer
+          .rpc(
+            'thread/goal/set',
+            {
+              threadId,
+              objective: trimmedText.slice(0, 1000),
+              status: 'active',
+              origin: 'user',
+            },
+            8_000,
+          )
+          .catch((goalErr) => {
+            this.log.warn?.(`mobile-hub: codex thread/goal/set skipped: ${String(goalErr?.message || goalErr)}`)
+          })
+        turnState.taskTracker.setGoal({ objective: trimmedText.slice(0, 400), status: 'active' }, Date.now())
+      }
+
+      let collaborationMode
+      if (effectiveTaskMode === 'plan' || (!effectiveTaskMode && prevWasPlan)) {
+        let collabModel = effectiveModel || ''
+        if (!collabModel) {
+          const catalog = await this.listModels().catch(() => null)
+          collabModel = catalog?.defaultModel || ''
+        }
+        if (collabModel) {
+          collaborationMode = {
+            mode: effectiveTaskMode === 'plan' ? 'plan' : 'default',
+            settings: {
+              model: collabModel,
+              ...(effectiveEffort && effectiveEffort !== 'off' ? { reasoning_effort: effectiveEffort } : {}),
+              developer_instructions: null,
+            },
+          }
+        }
+      }
+
+      turnState.taskTracker.applyCodexTurnMode(
+        effectiveTaskMode === 'plan' ? 'plan' : prevWasPlan ? 'default' : '',
+        effectiveTaskMode === 'goal' ? 'goal' : '',
+        Date.now(),
+      )
+      this.sessionModes.set(threadId, effectiveTaskMode === 'plan' ? 'plan' : 'default')
+      this.emitTaskStateIfChanged(threadId, turnState.taskTracker)
+
+      const turnStartBase = {
         threadId,
         input,
         ...(cwd ? { cwd } : {}),
         ...(approvalPolicy ? { approvalPolicy } : {}),
         ...(effectiveModel ? { model: effectiveModel } : {}),
         ...(effectiveEffort && effectiveEffort !== 'off' ? { effort: effectiveEffort } : {}),
-      })
+      }
+      let startRes
+      if (collaborationMode) {
+        try {
+          startRes = await writer.rpc('turn/start', { ...turnStartBase, collaborationMode })
+        } catch (collabErr) {
+          const errMsg = String(collabErr?.message || collabErr)
+          if (/collaborationMode|unknown field|experimental|invalid params/i.test(errMsg)) {
+            this.log.warn?.(`mobile-hub: codex collaborationMode unsupported, retrying default turn/start: ${errMsg}`)
+            startRes = await writer.rpc('turn/start', turnStartBase)
+          } else {
+            throw collabErr
+          }
+        }
+      } else {
+        startRes = await writer.rpc('turn/start', turnStartBase)
+      }
       turnState.turnId = startRes?.turn?.id || null
 
       // If interrupt() was called while turn/start was in flight, immediately send turn/interrupt now that turnId is known

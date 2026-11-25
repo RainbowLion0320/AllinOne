@@ -7,6 +7,7 @@ import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getClaudeCandidates, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
+import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 
 const claudeParseCache = createFileParseCache(24)
 
@@ -794,7 +795,9 @@ function parseClaudeJsonlMessages(filePath) {
     const { headLines, bodyLines } = readClaudeFileForParse(filePath)
     const messages = []
     const toolIndex = new Map()
+    const exitPlanToolIds = new Set()
     const seenUserUuids = new Set()
+    const taskTracker = createTaskStateTracker()
     let cwd = ''
     let title = ''
     let model = ''
@@ -847,6 +850,11 @@ function parseClaudeJsonlMessages(filePath) {
 
       const ts = toEpochMs(obj.timestamp || obj._audit_timestamp || Date.now())
 
+      if (typeof obj.permissionMode === 'string') {
+        if (obj.permissionMode === 'plan') taskTracker.setMode('plan', ts)
+        else if (taskTracker.snapshot()?.mode === 'plan') taskTracker.setMode(null, ts)
+      }
+
       if (obj.type === 'user' && !obj.isMeta) {
         const content = obj.message?.content
         if (Array.isArray(content)) {
@@ -860,6 +868,9 @@ function parseClaudeJsonlMessages(filePath) {
                 target.status = b.is_error ? 'error' : 'completed'
                 const resText = extractTextFromContent(b.content) || (typeof b.content === 'string' ? b.content : '')
                 target.output = resText.slice(0, 800)
+              }
+              if (exitPlanToolIds.has(b.tool_use_id) && !b.is_error) {
+                taskTracker.setMode(null, ts)
               }
             } else if (b?.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
               hasText = true
@@ -903,6 +914,10 @@ function parseClaudeJsonlMessages(filePath) {
               status: 'completed',
               output: '',
             }
+            if (toolObj.name === 'ExitPlanMode') {
+              exitPlanToolIds.add(toolObj.id)
+            }
+            taskTracker.applyClaudeTool(toolObj.name, toolObj.input, ts)
             tools.push(toolObj)
             toolIndex.set(toolObj.id, toolObj)
           }
@@ -921,7 +936,13 @@ function parseClaudeJsonlMessages(filePath) {
       }
     }
 
-    return { messages: mergeAndCompactMessages(messages), cwd, title, model }
+    return {
+      messages: mergeAndCompactMessages(messages),
+      cwd,
+      title,
+      model,
+      taskState: taskTracker.snapshot(),
+    }
   })
 }
 
@@ -972,6 +993,7 @@ export class ClaudeAdapter {
     this.pendingControlRequests = new Map() // approvalId -> { proc, requestId, toolName, toolInput, questions, sessionId }
     this.pendingCreated = new Map() // sessionId -> summary (before first turn persists jsonl)
     this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
+    this.sessionTaskStates = new Map() // sessionId -> normalized taskState | null
     this.weeklyQuota = null
     this.shortQuota = null
     this.desktopEntriesById = new Map() // nativeId -> desktop entry descriptor
@@ -1117,6 +1139,7 @@ export class ClaudeAdapter {
       source: meta.source || 'claude-code',
       writable: meta.writable !== false,
       status: running ? 'running' : 'idle',
+      ...(meta.taskState !== undefined ? { taskState: meta.taskState } : {}),
       syncState: {
         externalRunning: Boolean(running),
         source: meta.source || 'claude-code',
@@ -1202,6 +1225,15 @@ export class ClaudeAdapter {
           entry.externalRunning = probe.running
           entry.waitingPermission = probe.waitingPermission
           entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0), Math.round(projMtime || 0))
+          if (historyChanged) {
+            const targetFile = entry.projJsonlPath || entry.filePath || entry.auditPath || ''
+            if (targetFile && existsSync(targetFile)) {
+              try {
+                entry.taskState = parseClaudeJsonlMessages(targetFile).taskState || null
+                this.sessionTaskStates.set(nativeId, entry.taskState)
+              } catch {}
+            }
+          }
           if (probe.running) entry.lastSeenAt = now
           emittedIds.add(nativeId)
           this.emitEvent(EVENTS.SESSION_UPDATED, {
@@ -1565,7 +1597,13 @@ export class ClaudeAdapter {
       parsed = parseClaudeJsonlMessages(desktopEntry.auditPath)
     }
 
-    const isLocalActive = this.activeProcs.has(sessionId)
+    const activeProc = this.activeProcs.get(sessionId)
+    const isLocalActive = Boolean(activeProc)
+    const taskState =
+      isLocalActive && activeProc?.taskTracker
+        ? activeProc.taskTracker.snapshot()
+        : parsed.taskState || null
+    this.sessionTaskStates.set(sessionId, taskState)
     const probeTarget = desktopEntry || {
       nativeId: sessionId,
       source: 'claude-code',
@@ -1635,6 +1673,7 @@ export class ClaudeAdapter {
       source,
       writable,
       status: isLocalActive || externalRunning ? 'running' : 'idle',
+      taskState,
       syncState: {
         externalRunning,
         source,
@@ -1674,8 +1713,9 @@ export class ClaudeAdapter {
     return summary
   }
 
-  async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, model, reasoningEffort } = {}) {
+  async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, taskMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
+    const effectiveTaskMode = normalizeTaskMode(taskMode)
     if (this.activeProcs.has(sessionId)) {
       const err = new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
       err.code = 'SESSION_BUSY'
@@ -1727,7 +1767,7 @@ export class ClaudeAdapter {
     const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
     const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
     const effectivePermissionMode = assertSafeCliToken(
-      permissionMode || this.permissionMode,
+      permissionMode || (effectiveTaskMode === 'plan' ? 'plan' : this.permissionMode),
       'permissionMode',
       { allowEmpty: false },
     )
@@ -1783,8 +1823,26 @@ export class ClaudeAdapter {
       proc.stdout.setEncoding('utf8')
       proc.stderr?.setEncoding('utf8')
 
-      const state = { proc, aborted: false }
+      const taskTracker = createTaskStateTracker(this.sessionTaskStates.get(sessionId) || null)
+      if (effectivePermissionMode === 'plan') {
+        taskTracker.setMode('plan', Date.now())
+      } else if (taskTracker.snapshot()?.mode === 'plan') {
+        taskTracker.setMode(null, Date.now())
+      }
+      const emitTaskState = () => {
+        const diff = taskTracker.consumeChanged()
+        if (!diff.changed) return
+        this.sessionTaskStates.set(sessionId, diff.taskState)
+        this.emitEvent(EVENTS.STREAM_TASK_STATE, {
+          sessionId: compositeId,
+          app: APPS.CLAUDE,
+          taskState: diff.taskState,
+        })
+      }
+
+      const state = { proc, aborted: false, taskTracker, emitTaskState }
       this.activeProcs.set(sessionId, state)
+      emitTaskState()
 
       let stdoutBuf = ''
       let stderrBuf = ''
@@ -1821,6 +1879,9 @@ export class ClaudeAdapter {
                 app: APPS.CLAUDE,
                 tool: { id: b.id, name: b.name || 'tool', input: b.input ?? {} },
               })
+              if (taskTracker.applyClaudeTool(b.name || 'tool', b.input ?? {}, Date.now())) {
+                emitTaskState()
+              }
             } else if (b?.type === 'text' && typeof b.text === 'string') {
               fullText += b.text
             }
@@ -2122,6 +2183,10 @@ export class ClaudeAdapter {
     }
 
     if (toolName === 'ExitPlanMode') {
+      const active = this.activeProcs.get(sessionId)
+      if (active?.taskTracker && active.taskTracker.applyClaudeTool('ExitPlanMode', toolInput, Date.now())) {
+        active.emitTaskState?.()
+      }
       const aprId = `cld-plan-${randomUUID().slice(0, 10)}`
       this.pendingControlRequests.set(aprId, {
         proc,
@@ -2220,6 +2285,13 @@ export class ClaudeAdapter {
     }
 
     const allowed = decision === 'allow' || decision === 'accept' || decision === 'acceptForSession'
+    if (entry.toolName === 'ExitPlanMode' && allowed && entry.sessionId) {
+      const active = this.activeProcs.get(entry.sessionId)
+      if (active?.taskTracker) {
+        active.taskTracker.setMode(null, Date.now())
+        active.emitTaskState?.()
+      }
+    }
     this.writeControlResponse(
       entry.proc,
       entry.requestId,

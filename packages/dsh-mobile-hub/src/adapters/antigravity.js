@@ -10,6 +10,7 @@ import {
   elicitationSchemaToQuestions,
   normalizeResolvePayload,
 } from '../helpers/interactive-schema.js'
+import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 
 const AGY_APP_DATA_DIR = 'antigravity'
 const transcriptCache = createFileParseCache(16)
@@ -566,6 +567,7 @@ async function queryAgySummariesDb(dbPath, limit = 80, search = '') {
 export function parseAgyTranscriptContent(raw) {
   const messages = []
   const usedIds = new Set()
+  const taskTracker = createTaskStateTracker()
   let maxStepIndex = -1
   let latestStepIndex = -1
   let branchEpoch = 0
@@ -626,6 +628,7 @@ export function parseAgyTranscriptContent(raw) {
       // Unwrap Antigravity's internal <USER_REQUEST> wrapper if present in raw transcript logs
       const reqMatch = text.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/)
       if (reqMatch) text = reqMatch[1].trim()
+      if (text) taskTracker.applyAntigravityUserText(text, ts)
       if (text || mediaImages.length > 0) {
         messages.push({
           id: makeUniqueId('u'),
@@ -640,13 +643,18 @@ export function parseAgyTranscriptContent(raw) {
       const text = String(obj.content || '').trim()
       const thinking = String(obj.thinking || '').trim()
       const tools = Array.isArray(obj.tool_calls)
-        ? obj.tool_calls.map((tc, idx) => ({
-            id: tc.id || (branchEpoch > 0 ? `agy-t-b${branchEpoch}-${obj.step_index}-${idx}` : `agy-t-${obj.step_index}-${idx}`),
-            name: tc.name || tc.tool || 'tool',
-            input: tc.args ?? tc.arguments ?? {},
-            status: 'completed',
-            output: '',
-          }))
+        ? obj.tool_calls.map((tc, idx) => {
+            const toolName = tc.name || tc.tool || 'tool'
+            const toolInput = tc.args ?? tc.arguments ?? {}
+            taskTracker.applyAntigravityTool(toolName, toolInput, ts)
+            return {
+              id: tc.id || (branchEpoch > 0 ? `agy-t-b${branchEpoch}-${obj.step_index}-${idx}` : `agy-t-${obj.step_index}-${idx}`),
+              name: toolName,
+              input: toolInput,
+              status: 'completed',
+              output: '',
+            }
+          })
         : []
       if (text || thinking || tools.length > 0 || mediaImages.length > 0) {
         messages.push({
@@ -668,6 +676,7 @@ export function parseAgyTranscriptContent(raw) {
     divergence,
     latestStepIndex,
     branchEpoch,
+    taskState: taskTracker.snapshot(),
   }
 }
 
@@ -677,7 +686,7 @@ const AGY_TAIL_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 function parseDesktopTranscript(conversationId, agyHome = getAgyHome()) {
   const transcriptPath = getTranscriptPathSafe(agyHome, conversationId)
   if (!existsSync(transcriptPath)) {
-    return { messages: [], divergence: null, latestStepIndex: -1, branchEpoch: 0 }
+    return { messages: [], divergence: null, latestStepIndex: -1, branchEpoch: 0, taskState: null }
   }
   return transcriptCache.getOrParse(transcriptPath, () => {
     const st = statSync(transcriptPath)
@@ -1423,6 +1432,9 @@ export class AntigravityAdapter {
         : total
     const startIdx = Math.max(0, endIdx - pageSize)
 
+    const liveTaskState = selfActive && warmEntry?.taskTracker ? warmEntry.taskTracker.snapshot() : null
+    const taskState = liveTaskState || parsed.taskState || null
+
     return {
       id: makeCompositeId(APPS.ANTIGRAVITY, conversationId),
       app: APPS.ANTIGRAVITY,
@@ -1433,6 +1445,7 @@ export class AntigravityAdapter {
       reasoningEffort: pref?.reasoningEffort || '',
       writable: cliReady,
       status,
+      taskState,
       syncState: {
         externalRunning,
         desktopRunning,
@@ -1556,6 +1569,7 @@ export class AntigravityAdapter {
         w.externalRunning = externalRunning
 
         const pref = this.sessionPrefs.get(sid)
+        const latestTaskState = fileChanged ? parseDesktopTranscript(sid, this.agyHome).taskState : undefined
         this.emitEvent(EVENTS.SESSION_UPDATED, {
           historyChanged: fileChanged,
           statusChanged,
@@ -1570,6 +1584,7 @@ export class AntigravityAdapter {
             model: pref?.model || '',
             reasoningEffort: pref?.reasoningEffort || '',
             status: externalRunning ? 'running' : 'idle',
+            ...(latestTaskState !== undefined ? { taskState: latestTaskState } : {}),
             syncState: { externalRunning },
             writable: w.cliReady,
             updatedAt: curFp.mtimeMs || now,
@@ -1620,6 +1635,8 @@ export class AntigravityAdapter {
       if (!sessionId) throw new Error('Antigravity ACP 未返回有效 sessionId')
 
       entry.sessionId = sessionId
+      entry.currentModeId = String(res?.modes?.currentModeId || 'default')
+      entry.taskTracker = createTaskStateTracker(entry.currentModeId === 'plan' ? { mode: 'plan' } : null)
       entry.lastActivityAt = Date.now()
 
       if (model || reasoningEffort) {
@@ -1678,6 +1695,8 @@ export class AntigravityAdapter {
       starting: Boolean(starting),
       fgTurn: null,
       wakeup: null,
+      currentModeId: 'default',
+      taskTracker: null,
       lastActivityAt: Date.now(),
       lastTranscriptMtimeMs: fp.mtimeMs,
       lastTranscriptSize: fp.size,
@@ -1860,6 +1879,27 @@ export class AntigravityAdapter {
     const u = params?.update || {}
     const kind = u.sessionUpdate
 
+    // Track real-time plan / steps / focus / mode updates from ACP (works for both foreground & wakeup turns)
+    if (!entry.taskTracker) {
+      entry.taskTracker = createTaskStateTracker()
+    }
+    if (kind === 'current_mode_update' && u.currentModeId) {
+      entry.currentModeId = String(u.currentModeId)
+    }
+    if (entry.taskTracker.applyAntigravityAcpUpdate(u, Date.now())) {
+      const diff = entry.taskTracker.consumeChanged()
+      if (diff.changed) {
+        this.emitEvent(EVENTS.STREAM_TASK_STATE, {
+          sessionId: compositeId,
+          app: APPS.ANTIGRAVITY,
+          taskState: diff.taskState,
+        })
+      }
+    }
+    if (kind === 'plan' || kind === 'current_mode_update') {
+      return
+    }
+
     // Detect background task / subagent / schedule launches so we keep the ACP worker warm
     const rawToolName = String(u.name || u.title || '').toLowerCase()
     if (
@@ -2036,8 +2076,15 @@ export class AntigravityAdapter {
     try {
       await client.start()
       if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
-      await client.rpc('session/resume', { sessionId, cwd: targetCwd, mcpServers: [] }, 30_000)
+      const resumeRes = await client.rpc('session/resume', { sessionId, cwd: targetCwd, mcpServers: [] }, 30_000)
       if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
+      entry.currentModeId = String(resumeRes?.modes?.currentModeId || 'default')
+      const diskTaskState = parseDesktopTranscript(sessionId, this.agyHome).taskState
+      entry.taskTracker = createTaskStateTracker(diskTaskState)
+      if (entry.currentModeId === 'plan') {
+        entry.taskTracker.setMode('plan')
+      }
+      entry.taskTracker.consumeChanged()
       const [fp, dbState] = await Promise.all([
         Promise.resolve(getTranscriptFingerprint(this.agyHome, sessionId)),
         queryAgyConversationState(dbPath, sessionId),
@@ -2063,9 +2110,10 @@ export class AntigravityAdapter {
     }
   }
 
-  async sendMessage(sessionId, { text, cwd, attachments = [], model, reasoningEffort } = {}) {
+  async sendMessage(sessionId, { text, cwd, attachments = [], taskMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'Antigravity conversationId')
     const compositeId = makeCompositeId(APPS.ANTIGRAVITY, sessionId)
+    const effectiveTaskMode = normalizeTaskMode(taskMode)
 
     if (this.activeTurns.has(sessionId)) {
       const err = new Error('该 Antigravity 对话正在运行中，请等待完成或先点击停止。')
@@ -2199,6 +2247,58 @@ export class AntigravityAdapter {
             this.log.warn?.(`mobile-hub: agy session/set_model(${resolvedModel}) failed: ${String(err?.message || err)}`)
           })
         }
+      }
+
+      // Sync interactive Plan / Goal mode cleanly via native ACP `session/set_mode` + `/goal` slash trigger
+      if (!entry.taskTracker) {
+        entry.taskTracker = createTaskStateTracker(parseDesktopTranscript(sessionId, this.agyHome).taskState)
+      }
+      const setPromptTextBlock = (nextText) => {
+        const textBlock = promptBlocks.find((b) => b?.type === 'text')
+        if (textBlock) textBlock.text = nextText
+        else promptBlocks.unshift({ type: 'text', text: nextText })
+      }
+      if (effectiveTaskMode === 'plan') {
+        try {
+          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'plan' }, 8_000)
+          entry.currentModeId = 'plan'
+        } catch (modeErr) {
+          this.log.warn?.(`mobile-hub: agy session/set_mode(plan) fallback to /plan: ${String(modeErr?.message || modeErr)}`)
+          if (promptText && !/^\/plan(?:\s|$)/i.test(promptText)) {
+            promptText = `/plan ${promptText}`
+            setPromptTextBlock(promptText)
+          }
+        }
+        entry.taskTracker.setMode('plan', Date.now())
+      } else if (effectiveTaskMode === 'goal') {
+        if (entry.currentModeId === 'plan') {
+          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'default' }, 8_000).catch(() => {})
+          entry.currentModeId = 'default'
+        }
+        if (promptText && !/^\/goal(?:\s|$)/i.test(promptText)) {
+          promptText = `/goal ${promptText}`
+          setPromptTextBlock(promptText)
+        }
+        entry.taskTracker.applyAntigravityUserText(promptText || '/goal', Date.now())
+      } else {
+        if (entry.currentModeId === 'plan') {
+          await entry.client.rpc('session/set_mode', { sessionId, modeId: 'default' }, 8_000).catch(() => {})
+          entry.currentModeId = 'default'
+          if (entry.taskTracker.snapshot()?.mode === 'plan') {
+            entry.taskTracker.setMode(null, Date.now())
+          }
+        }
+        if (promptText) {
+          entry.taskTracker.applyAntigravityUserText(promptText, Date.now())
+        }
+      }
+      const initTaskDiff = entry.taskTracker.consumeChanged()
+      if (initTaskDiff.changed) {
+        this.emitEvent(EVENTS.STREAM_TASK_STATE, {
+          sessionId: compositeId,
+          app: APPS.ANTIGRAVITY,
+          taskState: initTaskDiff.taskState,
+        })
       }
 
       // Sliding 15-min inactivity timeout (resets on every session/update chunk!)

@@ -53,6 +53,7 @@ import { AntigravityAdapter, normalizeAntigravityQuota, parseAgyTranscriptConten
 import {
   CodexAdapter,
   buildCodexQuestionReplyText,
+  extractCodexTaskStateFromRollout,
   extractPendingCodexAsyncQuestionFromRollout,
   formatCodexQuestionReplyForDisplay,
   normalizeCodexAsyncQuestionCard,
@@ -62,6 +63,12 @@ import {
   probeCodexRolloutStatus,
   readCodexRolloutTail,
 } from '../packages/dsh-mobile-hub/src/adapters/codex.js'
+import {
+  createTaskStateTracker,
+  normalizeStepStatus,
+  normalizeTaskMode,
+  normalizeTaskState,
+} from '../packages/dsh-mobile-hub/src/helpers/task-state.js'
 import {
   ClaudeAdapter,
   normalizeClaudeQuota,
@@ -6360,7 +6367,212 @@ async function main() {
         await new Promise((r) => mockCfServer.close(r))
       }
     }
-    console.log('[smoke] 38/38 Tiered Cloudflare Realtime TURN (free -> CF 1TB pool + domestic STUN & automatic fallback) OK')
+    console.log('[smoke] 38/39 Tiered Cloudflare Realtime TURN (free -> CF 1TB pool + domestic STUN & automatic fallback) OK')
+
+    // 39. Unified Plan / Goal / Steps sync (Phase 1) & interactive taskMode forwarding (Phase 2)
+    {
+      assert.equal(EVENTS.STREAM_TASK_STATE, 'stream.task_state')
+      assert.equal(normalizeTaskState({ mode: null, focus: '', steps: [] }), null, 'Empty taskState must normalize to null')
+      assert.equal(normalizeStepStatus('inProgress'), 'in_progress')
+      assert.equal(normalizeStepStatus('completed'), 'done')
+      assert.equal(normalizeStepStatus('cancelled'), 'skipped')
+      assert.equal(normalizeTaskMode('PLAN'), 'plan')
+      assert.equal(normalizeTaskMode('goal'), 'goal')
+      assert.equal(normalizeTaskMode('unknown'), '')
+
+      // 39.1 Antigravity transcript.jsonl: /goal cue + JSON-stringified update_steps + update_focus + artifact planDoc
+      const agyTranscript = [
+        JSON.stringify({
+          type: 'USER_INPUT',
+          step_index: 0,
+          created_at: '2026-11-25T08:00:00Z',
+          content: '<USER_REQUEST>/goal Refactor WebRTC pipeline and verify all smoke tests</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          type: 'PLANNER_RESPONSE',
+          step_index: 1,
+          created_at: '2026-11-25T08:00:05Z',
+          content: 'Working on it',
+          tool_calls: [
+            {
+              id: 'tc-1',
+              name: 'update_steps',
+              args: {
+                steps: JSON.stringify([
+                  { title: 'Inspect adapters', status: 'done' },
+                  { title: 'Wire taskState sync', status: 'in_progress' },
+                  { title: 'Release v1.0.8', status: 'pending' },
+                ]),
+              },
+            },
+            {
+              id: 'tc-2',
+              name: 'update_focus',
+              args: { focus: JSON.stringify('Wiring adapters for Plan/Goal sync') },
+            },
+            {
+              id: 'tc-3',
+              name: 'write_file',
+              args: {
+                Path: JSON.stringify('C:/Users/Test/.gemini/antigravity/brain/conv-1/implementation_plan.md'),
+                ArtifactMetadata: JSON.stringify({ UserFacing: true, Summary: 'Plan', RequestFeedback: true }),
+              },
+            },
+          ],
+        }),
+      ].join('\n')
+      const agyParsed = parseAgyTranscriptContent(agyTranscript)
+      assert.ok(agyParsed.taskState, 'Antigravity transcript must yield normalized taskState')
+      assert.equal(agyParsed.taskState.mode, 'goal')
+      assert.equal(agyParsed.taskState.goal?.objective, 'Refactor WebRTC pipeline and verify all smoke tests')
+      assert.equal(agyParsed.taskState.focus, 'Wiring adapters for Plan/Goal sync')
+      assert.equal(agyParsed.taskState.steps.length, 3)
+      assert.equal(agyParsed.taskState.steps[0].status, 'done')
+      assert.equal(agyParsed.taskState.steps[1].status, 'in_progress')
+      assert.equal(agyParsed.taskState.planDoc?.title, 'implementation_plan.md')
+      assert.ok(agyParsed.taskState.planDoc?.path.endsWith('implementation_plan.md'))
+
+      // 39.2 Antigravity ACP live updates (native `plan` + `current_mode_update`)
+      const agyTracker = createTaskStateTracker()
+      assert.equal(agyTracker.applyAntigravityAcpUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'plan' }, 100), true)
+      assert.equal(agyTracker.applyAntigravityAcpUpdate({
+        sessionUpdate: 'plan',
+        entries: [{ content: 'Design schema', status: 'completed' }, { content: 'Implement UI', status: 'in_progress' }],
+      }, 200), true)
+      const agyLiveSnap = agyTracker.snapshot()
+      assert.equal(agyLiveSnap.mode, 'plan')
+      assert.equal(agyLiveSnap.steps.length, 2)
+      assert.equal(agyLiveSnap.steps[0].status, 'done')
+      assert.equal(agyTracker.applyAntigravityAcpUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'default' }, 300), true)
+      assert.equal(agyTracker.snapshot().mode, null, 'Leaving ACP plan mode must clear plan badge')
+
+      // 39.3 Codex rollout tail extraction (`task_started` plan mode + `update_plan` + `Plan` item) & ThreadGoal tracker
+      const cdxRolloutPath = join(tmpDir, 'codex-plan-rollout.jsonl')
+      writeFileSync(
+        cdxRolloutPath,
+        [
+          JSON.stringify({
+            timestamp: '2026-11-25T08:10:00Z',
+            type: 'event_msg',
+            payload: { type: 'task_started', collaboration_mode_kind: 'plan' },
+          }),
+          JSON.stringify({
+            timestamp: '2026-11-25T08:10:03Z',
+            type: 'response_item',
+            payload: {
+              type: 'function_call',
+              name: 'update_plan',
+              arguments: JSON.stringify({
+                explanation: 'Drafting migration steps',
+                plan: [
+                  { step: 'Audit schema', status: 'completed' },
+                  { step: 'Update writers', status: 'in_progress' },
+                ],
+              }),
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-11-25T08:10:08Z',
+            type: 'event_msg',
+            payload: {
+              type: 'item_completed',
+              item: { type: 'Plan', id: 'p-1', text: '# Codex Plan\n1. Audit\n2. Ship' },
+            },
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      )
+      const cdxRolloutTask = extractCodexTaskStateFromRollout(cdxRolloutPath)
+      assert.ok(cdxRolloutTask)
+      assert.equal(cdxRolloutTask.mode, 'plan')
+      assert.equal(cdxRolloutTask.focus, 'Drafting migration steps')
+      assert.equal(cdxRolloutTask.steps.length, 2)
+      assert.equal(cdxRolloutTask.steps[0].status, 'done')
+      assert.equal(cdxRolloutTask.steps[1].status, 'in_progress')
+      assert.ok(cdxRolloutTask.planDoc?.content.includes('# Codex Plan'))
+
+      const cdxGoalTracker = createTaskStateTracker(cdxRolloutTask)
+      cdxGoalTracker.setGoal({ objective: 'Keep CI green overnight', status: 'active' }, 500)
+      assert.equal(cdxGoalTracker.snapshot().goal?.objective, 'Keep CI green overnight')
+      cdxGoalTracker.clearGoal(600)
+      assert.equal(cdxGoalTracker.snapshot().goal, undefined)
+
+      // 39.4 Claude Code JSONL (`EnterPlanMode`, `TodoWrite`, `TaskCreate`, `TaskUpdate`, `ExitPlanMode` approval)
+      const cldTaskHome = join(tmpDir, 'claude-task-home')
+      const cldProjDir = join(cldTaskHome, 'projects', 'demo-proj')
+      mkdirSync(cldProjDir, { recursive: true })
+      const cldSid = 'aaaaaaaa-1111-2222-3333-444444444444'
+      writeFileSync(
+        join(cldProjDir, `${cldSid}.jsonl`),
+        [
+          JSON.stringify({ type: 'user', uuid: 'u1', cwd: tmpDir, timestamp: '2026-11-25T08:20:00Z', message: { role: 'user', content: 'Plan the feature' } }),
+          JSON.stringify({
+            type: 'assistant',
+            uuid: 'a1',
+            timestamp: '2026-11-25T08:20:02Z',
+            message: {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'tu-enter', name: 'EnterPlanMode', input: {} },
+                {
+                  type: 'tool_use',
+                  id: 'tu-todo',
+                  name: 'TodoWrite',
+                  input: {
+                    todos: [
+                      { content: 'Read files', status: 'completed' },
+                      { content: 'Write patch', status: 'in_progress', activeForm: 'Writing patch' },
+                    ],
+                  },
+                },
+                { type: 'tool_use', id: 'tu-exit', name: 'ExitPlanMode', input: { plan: '## Claude Plan\n- Step A\n- Step B' } },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: 'user',
+            uuid: 'u2',
+            timestamp: '2026-11-25T08:20:05Z',
+            message: {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: 'tu-exit', content: 'Approved', is_error: false }],
+            },
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      )
+      const cldTaskAdapter = new ClaudeAdapter({ config: { claudeHome: cldTaskHome, claudeDesktopRoots: [], cwd: tmpDir } })
+      const cldRead = await cldTaskAdapter.readSession(cldSid)
+      assert.ok(cldRead.taskState, 'Claude readSession must return normalized taskState')
+      assert.equal(cldRead.taskState.mode, null, 'Approved ExitPlanMode tool_result must exit plan badge')
+      assert.equal(cldRead.taskState.focus, 'Writing patch')
+      assert.equal(cldRead.taskState.steps.length, 2)
+      assert.equal(cldRead.taskState.steps[0].status, 'done')
+      assert.equal(cldRead.taskState.steps[1].status, 'in_progress')
+      assert.ok(cldRead.taskState.planDoc?.content.includes('Claude Plan'))
+      await cldTaskAdapter.dispose()
+
+      // 39.5 Claude TaskCreate + TaskUpdate (including deletion)
+      const taskApiTracker = createTaskStateTracker()
+      taskApiTracker.applyClaudeTool('TaskCreate', { subject: 'Task One' }, 10)
+      taskApiTracker.applyClaudeTool('TaskCreate', { subject: 'Task Two' }, 20)
+      taskApiTracker.applyClaudeTool('TaskUpdate', { taskId: '1', status: 'completed' }, 30)
+      taskApiTracker.applyClaudeTool('TaskUpdate', { taskId: '2', status: 'deleted' }, 40)
+      assert.deepEqual(taskApiTracker.snapshot().steps, [{ id: '1', title: 'Task One', status: 'done' }])
+
+      // 39.6 MultiAppOrchestrator forwards `taskMode` cleanly to target adapter
+      let capturedSendArgs = null
+      const orchTask = new MultiAppOrchestrator({ config: { cwd: tmpDir } })
+      orchTask.adapters.claude.sendMessage = async (sid, opts) => {
+        capturedSendArgs = { sid, opts }
+        return { sessionId: `claude:${sid}`, nativeId: sid, finalText: 'ok', aborted: false }
+      }
+      await orchTask.sendMessage({ id: 'claude:test-plan-1', text: 'Design API', taskMode: 'plan' })
+      assert.equal(capturedSendArgs?.sid, 'test-plan-1')
+      assert.equal(capturedSendArgs?.opts?.taskMode, 'plan')
+      await orchTask.dispose()
+    }
+    console.log('[smoke] 39/39 Unified Plan/Goal/Steps sync & interactive taskMode forwarding OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

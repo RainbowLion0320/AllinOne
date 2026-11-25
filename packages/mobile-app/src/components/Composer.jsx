@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
-import { ArrowUp, ChevronDown, Loader2, Paperclip, SlidersHorizontal, Square, X } from 'lucide-react'
+import { ArrowUp, ChevronDown, ListChecks, Loader2, Paperclip, SlidersHorizontal, Square, Target, X } from 'lucide-react'
 import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
@@ -65,6 +65,9 @@ export function Composer({
   targetWorkspaceName = '',
   modelPref,
   modelDisplayName,
+  taskMode = '',
+  supportedTaskModes = [],
+  onChangeTaskMode = null,
   onOpenModelPicker,
   onUploadFile,
   onSend,
@@ -286,11 +289,16 @@ export function Composer({
     !uploading &&
     !sending &&
     !needsWorkspace
+  const hasModeControls = Array.isArray(supportedTaskModes) && supportedTaskModes.length > 0 && Boolean(onChangeTaskMode)
   const placeholderText = needsWorkspace
     ? bi('请先在上方选择目标项目目录...', 'Select a project directory above first...')
-    : targetWorkspaceName
-      ? bi(`在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName} in ${targetWorkspaceName}...`)
-      : bi(`给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName}...`)
+    : taskMode === 'plan'
+      ? bi(`Plan 模式 · 先向 ${meta.shortName} 规划方案...`, `Plan mode · Plan with ${meta.shortName} first...`)
+      : taskMode === 'goal'
+        ? bi(`Goal 模式 · 为 ${meta.shortName} 设定持续目标...`, `Goal mode · Set an ongoing goal for ${meta.shortName}...`)
+        : targetWorkspaceName
+          ? bi(`在 ${targetWorkspaceName} 给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName} in ${targetWorkspaceName}...`)
+          : bi(`给 ${meta.shortName} 发送消息...`, `Message ${meta.shortName}...`)
 
   return (
     <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
@@ -332,7 +340,7 @@ export function Composer({
           />
 
           <div className="mt-2 flex items-center justify-between gap-2">
-            {/* Left model & reasoning effort pill */}
+            {/* Left model & minimal Plan/Goal mode pills */}
             <div className="no-scrollbar flex min-w-0 items-center gap-1.5 overflow-x-auto">
               {onOpenModelPicker && (
                 <button
@@ -342,7 +350,11 @@ export function Composer({
                   className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200/80 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:border-[#4D6BFE]/50 active:scale-95 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-200"
                 >
                   <SlidersHorizontal className="h-3 w-3 shrink-0 text-[#4D6BFE]" />
-                  <span className="max-w-[200px] truncate sm:max-w-[260px]">
+                  <span
+                    className={`truncate ${
+                      hasModeControls ? 'max-w-[140px] sm:max-w-[220px]' : 'max-w-[200px] sm:max-w-[260px]'
+                    }`}
+                  >
                     {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (
@@ -353,6 +365,36 @@ export function Composer({
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />
                 </button>
               )}
+
+              {hasModeControls &&
+                supportedTaskModes.map((m) => {
+                  const isPlan = m === 'plan'
+                  const active = taskMode === m
+                  return (
+                    <button
+                      key={m}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => onChangeTaskMode(active ? '' : m)}
+                      aria-pressed={active}
+                      title={
+                        isPlan
+                          ? bi('Plan 模式：先制定方案再执行', 'Plan mode: design a plan before executing')
+                          : bi('Goal 模式：设定目标并持续推进', 'Goal mode: set a goal and work toward it')
+                      }
+                      className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11.5px] font-medium transition active:scale-95 disabled:opacity-45 ${
+                        active
+                          ? isPlan
+                            ? 'border-[#4D6BFE]/55 bg-[#EEF2FF] text-[#3552E8] dark:border-[#4D6BFE]/60 dark:bg-[#222A46] dark:text-[#9AB0FF]'
+                            : 'border-amber-400/60 bg-amber-50 text-amber-700 dark:border-amber-500/50 dark:bg-amber-950/45 dark:text-amber-300'
+                          : 'border-slate-200/80 bg-white text-slate-500 hover:border-slate-300 hover:text-slate-700 dark:border-slate-700 dark:bg-[#181A20] dark:text-slate-400 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      {isPlan ? <ListChecks className="h-3 w-3 shrink-0" /> : <Target className="h-3 w-3 shrink-0" />}
+                      <span>{isPlan ? 'Plan' : 'Goal'}</span>
+                    </button>
+                  )
+                })}
             </div>
 
             {/* Right actions: Upload + Send / Stop */}

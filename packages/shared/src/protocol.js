@@ -84,6 +84,7 @@ export const EVENTS = Object.freeze({
   STREAM_THINKING: 'stream.thinking',
   STREAM_TOOL_START: 'stream.tool.start',
   STREAM_TOOL_END: 'stream.tool.end',
+  STREAM_TASK_STATE: 'stream.task_state',
   STREAM_DONE: 'stream.done',
   STREAM_ERROR: 'stream.error',
   SESSION_UPDATED: 'session.updated',

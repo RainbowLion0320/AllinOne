@@ -6,6 +6,7 @@ import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
+import { createTaskStateTracker } from '../helpers/task-state.js'
 import { DshLocalIpcClient } from '../dsh-local-ipc.js'
 
 /**
@@ -183,6 +184,22 @@ function parseDshEvents(events) {
   }
 
   return messages
+}
+
+function extractDshTaskState(events) {
+  const tracker = createTaskStateTracker()
+  for (const ev of events || []) {
+    if (!ev || ev.type !== 'assistant/message') continue
+    const ts = toEpochMs(ev.timestamp || ev.at || ev.createdAt || Date.now())
+    const blocks = ev.data?.message?.content ?? ev.data?.content ?? []
+    if (!Array.isArray(blocks)) continue
+    for (const b of blocks) {
+      if (b && (b.type === 'tool_use' || b.type === 'tool_call')) {
+        tracker.applyDshTool(b.name || 'tool', b.input ?? b.arguments ?? {}, ts)
+      }
+    }
+  }
+  return tracker.snapshot()
 }
 
 /**
@@ -1023,6 +1040,7 @@ export class DshAdapter {
       }
     }
     let messages = []
+    let taskState = null
     let title = sessionId
     let cwd = ''
     let model = ''
@@ -1042,7 +1060,9 @@ export class DshAdapter {
           }
         }
         if (session && typeof session.ownEvents === 'function') {
-          messages = parseDshEvents(session.ownEvents())
+          const ownEvents = session.ownEvents()
+          messages = parseDshEvents(ownEvents)
+          taskState = extractDshTaskState(ownEvents)
           const t = this.ctx.get?.('sessionTitle')?.get?.(session)
           if (t?.title) title = t.title
           cwd = session.meta?.cwd || cwd
@@ -1103,6 +1123,7 @@ export class DshAdapter {
       reasoningEffort,
       writable: this.isLive(),
       status: isLocalActive || externalRunning ? 'running' : 'idle',
+      taskState,
       syncState: { externalRunning },
       messages: pageMessages,
       hasMore: startIdx > 0,
@@ -1275,6 +1296,9 @@ export class DshAdapter {
       const emittedThinkMap = new Map()
       const seenToolStarts = new Set()
       const seenToolEnds = new Set()
+      const taskTracker = createTaskStateTracker(
+        typeof agent.session?.ownEvents === 'function' ? extractDshTaskState(agent.session.ownEvents()) : null,
+      )
 
       this.emitEvent(EVENTS.STREAM_START, {
         sessionId: realCompositeId,
@@ -1299,11 +1323,22 @@ export class DshAdapter {
                 fullText += b.text
               } else if ((b?.type === 'tool_use' || b?.type === 'tool_call') && b.id && !seenToolStarts.has(b.id)) {
                 seenToolStarts.add(b.id)
+                const toolInput = b.input ?? b.arguments ?? {}
                 this.emitEvent(EVENTS.STREAM_TOOL_START, {
                   sessionId: realCompositeId,
                   app: APPS.DSH,
-                  tool: { id: b.id, name: b.name || 'tool', input: b.input ?? b.arguments ?? {} },
+                  tool: { id: b.id, name: b.name || 'tool', input: toolInput },
                 })
+                if (taskTracker.applyDshTool(b.name || 'tool', toolInput, Date.now())) {
+                  const diff = taskTracker.consumeChanged()
+                  if (diff.changed) {
+                    this.emitEvent(EVENTS.STREAM_TASK_STATE, {
+                      sessionId: realCompositeId,
+                      app: APPS.DSH,
+                      taskState: diff.taskState,
+                    })
+                  }
+                }
               }
             }
             const prevThink = emittedThinkMap.get(msgId) || ''

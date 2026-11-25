@@ -25,6 +25,7 @@ import { ChatImageGallery } from './ChatImageGallery.jsx'
 import { ChatDeliverableList } from './ChatDeliverableList.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
 import { InteractivePromptCard } from './InteractivePromptCard.jsx'
+import { TaskStateBar } from './TaskStateBar.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang } from '../lib/i18n.js'
 
@@ -707,6 +708,12 @@ export function ChatView({
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
+      <TaskStateBar
+        sessionId={session?.id || ''}
+        taskState={session?.taskState || null}
+        running={Boolean(streamingState?.active || session?.syncState?.externalRunning)}
+        imageContext={imageContext}
+      />
       <div
         ref={scrollRef}
         onScroll={handleScroll}
