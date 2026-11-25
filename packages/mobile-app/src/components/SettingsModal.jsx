@@ -8,6 +8,7 @@ import {
   FileText,
   Globe,
   HardDrive,
+  HelpCircle,
   Laptop,
   Loader2,
   Lock,
@@ -25,6 +26,7 @@ import {
   Ticket,
   Trash2,
   User,
+  Wifi,
   X,
   Zap,
 } from 'lucide-react'
@@ -52,6 +54,36 @@ function ToggleSwitch({ checked, onChange, disabled = false, label }) {
         }`}
       />
     </button>
+  )
+}
+
+function HelpButton({ active, onClick, label }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+      aria-expanded={active}
+      aria-label={label}
+      className={`inline-flex shrink-0 items-center justify-center rounded-full p-0.5 transition ${
+        active
+          ? 'text-[#4D6BFE] bg-[#4D6BFE]/12'
+          : 'text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200'
+      }`}
+    >
+      <HelpCircle className="h-3.5 w-3.5" />
+    </button>
+  )
+}
+
+function HelpCallout({ show, children }) {
+  if (!show) return null
+  return (
+    <div className="mt-2 rounded-xl border border-slate-200/70 bg-slate-50/90 px-2.5 py-2 text-[11px] leading-relaxed text-slate-500 dark:border-slate-700/70 dark:bg-[#171921] dark:text-slate-400">
+      {children}
+    </div>
   )
 }
 
@@ -94,6 +126,7 @@ export function SettingsModal({
   const { lang, setLang, bi, t } = useI18n()
   const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
   const [cacheClearedHint, setCacheClearedHint] = useState(false)
+  const [openHelpKey, setOpenHelpKey] = useState('')
 
   const [showEmailForm, setShowEmailForm] = useState(false)
   const [emailDraft, setEmailDraft] = useState('')
@@ -108,6 +141,7 @@ export function SettingsModal({
 
   useEffect(() => {
     if (!open) {
+      setOpenHelpKey('')
       setShowEmailForm(false)
       setEmailDraft('')
       setEmailCodeDraft('')
@@ -131,6 +165,10 @@ export function SettingsModal({
   }, [emailCooldown])
 
   if (!open) return null
+
+  const toggleHelp = (key) => {
+    setOpenHelpKey((cur) => (cur === key ? '' : key))
+  }
 
   const appVersion =
     desktopApi?.version ||
@@ -225,6 +263,12 @@ export function SettingsModal({
       updateState.status === 'installing' ||
       updateState.status === 'error')
 
+  const hasTools = Boolean(
+    onOpenShare ||
+      (isAdmin && onOpenInviteManager) ||
+      (isAdmin && activeDevice?.baseUrl),
+  )
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center sm:p-4"
@@ -254,12 +298,13 @@ export function SettingsModal({
 
         {/* Scrollable Content */}
         <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3.5">
-          {/* Section 1: Account */}
+          {/* Section 1: Account & Security (core everyday identity & security only) */}
           <section>
             <div className="mb-1 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
-              {bi('账号', 'Account')}
+              {bi('账号与安全', 'Account & Security')}
             </div>
             <div className="overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:border-slate-800 dark:bg-[#22252E]">
+              {/* Profile Header */}
               <div className="flex items-center gap-3 px-3.5 py-2.5">
                 <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/15 text-sm font-bold text-[#4D6BFE]">
                   {activeDevice?.username
@@ -342,94 +387,48 @@ export function SettingsModal({
                 )}
               </div>
 
-              {activeDevice && turnQuota && (
-                <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    <div className="flex min-w-0 items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
-                      <Zap
-                        className={`h-3.5 w-3.5 shrink-0 ${
-                          turnQuota.provider === 'cloudflare'
-                            ? 'text-sky-500'
-                            : turnQuota.exceeded
-                              ? 'text-rose-500'
-                              : turnQuota.pct >= 85
-                                ? 'text-amber-500'
-                                : 'text-sky-500'
-                        }`}
-                      />
-                      <span className="truncate">{bi('本月加密中继', 'Monthly Relay')}</span>
-                      {turnQuota.provider === 'cloudflare' && (
-                        <span className="shrink-0 rounded-md bg-sky-500/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-sky-600 dark:text-sky-400">
-                          CF Free
-                        </span>
-                      )}
-                    </div>
-                    <span
-                      className={`shrink-0 font-mono text-[11px] font-semibold ${
-                        turnQuota.provider === 'cloudflare'
-                          ? 'text-sky-600 dark:text-sky-400'
-                          : turnQuota.exceeded
-                            ? 'text-rose-500 dark:text-rose-400'
-                            : turnQuota.pct >= 85
-                              ? 'text-amber-600 dark:text-amber-400'
-                              : 'text-slate-600 dark:text-slate-300'
+              {/* End-to-End Encryption */}
+              {activeDevice && onOpenE2eeSync && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose()
+                    onOpenE2eeSync()
+                  }}
+                  className="flex w-full items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2.5 text-left transition hover:bg-slate-50/80 dark:border-slate-800 dark:hover:bg-slate-800/50"
+                >
+                  <div className="flex min-w-0 items-center gap-2 text-xs text-slate-700 dark:text-slate-200">
+                    <Lock
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        e2eeStatus?.locked
+                          ? 'text-amber-500'
+                          : e2eeStatus?.enabled
+                            ? 'text-emerald-500'
+                            : 'text-slate-400'
                       }`}
-                    >
-                      {turnQuota.provider === 'cloudflare'
-                        ? bi('CF 1TB 公益池', 'CF 1TB Pool')
-                        : turnQuota.unlimited
-                          ? `${formatBytesCompact(turnQuota.usedBytes)} / ${bi('不限', 'Unlimited')}`
-                          : `${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}`}
-                    </span>
+                    />
+                    <span className="truncate">{bi('端到端加密', 'End-to-End Encryption')}</span>
                   </div>
-                  {!turnQuota.unlimited && turnQuota.provider !== 'cloudflare' && (
-                    <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
-                      <div
-                        className={`h-full rounded-full transition-all ${
-                          turnQuota.exceeded
-                            ? 'bg-rose-500'
-                            : turnQuota.pct >= 85
-                              ? 'bg-amber-500'
-                              : 'bg-sky-500'
-                        }`}
-                        style={{ width: `${Math.min(100, Math.max(0, Number(turnQuota.pct) || 0))}%` }}
-                      />
-                    </div>
-                  )}
-                  <div className="mt-1 flex items-center justify-between text-[10.5px] text-slate-400">
-                    <span>
-                      {turnQuota.provider === 'cloudflare'
-                        ? bi('当前使用免费公共中继 · P2P 直连优先', 'Using Cloudflare free relay · Direct P2P preferred')
-                        : turnQuota.exceeded
-                          ? bi('本月额度已用完，仅支持 P2P 直连', 'Monthly limit reached · Direct P2P only')
-                          : bi('P2P 直连永久无限 · 仅双对称 NAT 扣减', 'Direct P2P always free · Only double-NAT relay metered')}
-                    </span>
-                    {turnQuota.month && <span className="shrink-0 font-mono">{turnQuota.month}</span>}
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {e2eeStatus?.locked ? (
+                      <span className="rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-amber-600 dark:text-amber-400">
+                        {bi('需同步密钥', 'Sync Key')}
+                      </span>
+                    ) : e2eeStatus?.enabled || e2eeStatus?.keyId ? (
+                      <span className="rounded-md bg-emerald-500/12 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                        {formatE2eeFingerprint(e2eeStatus.keyId).slice(0, 9) || 'AES-256'}
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-400">{bi('扫码同步', 'Sync')}</span>
+                    )}
+                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
                   </div>
-                </div>
+                </button>
               )}
 
-              {activeDevice && onToggleRelayDataSaver && (
-                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">
-                      <Zap className="h-3.5 w-3.5 shrink-0 text-sky-500" />
-                      <span>{bi('中继自动省流', 'Relay Data Saver')}</span>
-                    </div>
-                    <div className="mt-0.5 pl-5.5 text-[10.5px] text-slate-400">
-                      {bi('走中继时图片点击再加载，P2P 直连自动显示', 'Tap to load images over relay; auto-loads over direct P2P')}
-                    </div>
-                  </div>
-                  <ToggleSwitch
-                    checked={Boolean(relayDataSaver)}
-                    onChange={onToggleRelayDataSaver}
-                    label={bi('切换中继自动省流', 'Toggle relay data saver')}
-                  />
-                </div>
-              )}
-
+              {/* Email */}
               {activeDevice && (
-                <div className="border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
+                <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                       <Mail className="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -519,110 +518,31 @@ export function SettingsModal({
                 </div>
               )}
 
+              {/* Email Login 2FA */}
               {activeDevice && emailEnabled && boundEmail && onToggleLogin2fa && (
-                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
-                  <div className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
-                    <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                    <span>{bi('登录邮箱二次验证', 'Email Login 2FA')}</span>
-                  </div>
-                  <ToggleSwitch
-                    checked={Boolean(activeDevice?.loginEmail2fa)}
-                    onChange={() => onToggleLogin2fa(!activeDevice?.loginEmail2fa)}
-                    label={bi('切换登录邮箱二次验证', 'Toggle email login 2FA')}
-                  />
-                </div>
-              )}
-
-              {activeDevice && onOpenE2eeSync && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose()
-                    onOpenE2eeSync()
-                  }}
-                  className="flex w-full items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2.5 text-left transition hover:bg-slate-50/80 dark:border-slate-800 dark:hover:bg-slate-800/50"
-                >
-                  <div className="flex min-w-0 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
-                    <Lock
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        e2eeStatus?.locked
-                          ? 'text-amber-500'
-                          : e2eeStatus?.enabled
-                            ? 'text-emerald-500'
-                            : 'text-slate-400'
-                      }`}
-                    />
-                    <span className="truncate">{bi('端到端加密', 'End-to-End Encryption')}</span>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {e2eeStatus?.locked ? (
-                      <span className="rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-amber-600 dark:text-amber-400">
-                        {bi('需同步密钥', 'Sync Key')}
-                      </span>
-                    ) : e2eeStatus?.enabled || e2eeStatus?.keyId ? (
-                      <span className="rounded-md bg-emerald-500/12 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                        {formatE2eeFingerprint(e2eeStatus.keyId).slice(0, 9) || 'AES-256'}
-                      </span>
-                    ) : (
-                      <span className="text-[11px] text-slate-400">{bi('扫码同步', 'Sync')}</span>
-                    )}
-                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                </button>
-              )}
-
-              {activeDevice?.id && onRemoveDevice && (
-                <div className="border-t border-slate-100 px-3.5 py-2 dark:border-slate-800">
-                  {!confirmLogout ? (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmLogout(true)}
-                      className="flex w-full items-center justify-between text-xs font-medium text-rose-500 hover:text-rose-600"
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <LogOut className="h-3.5 w-3.5" />
-                        <span>{bi('退出登录', 'Sign Out')}</span>
-                      </span>
-                      <ChevronRight className="h-3.5 w-3.5 opacity-60" />
-                    </button>
-                  ) : (
-                    <div className="space-y-2 rounded-xl bg-rose-50/90 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
-                      <div className="flex items-center justify-between">
-                        <span>{bi(`确认退出 ${displayUser}？`, `Sign out ${displayUser}?`)}</span>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmLogout(false)}
-                          className="rounded-lg bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
-                        >
-                          {t('common.cancel')}
-                        </button>
-                      </div>
-                      <div className="flex flex-wrap justify-end gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setConfirmLogout(false)
-                            onClose()
-                            onRemoveDevice(activeDevice.id, { revokeAll: false })
-                          }}
-                          className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
-                        >
-                          {bi('仅退出本设备', 'This Device')}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setConfirmLogout(false)
-                            onClose()
-                            onRemoveDevice(activeDevice.id, { revokeAll: true })
-                          }}
-                          className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
-                        >
-                          {bi('退出全部设备', 'All Devices')}
-                        </button>
-                      </div>
+                <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+                      <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                      <span className="truncate">{bi('登录邮箱二次验证', 'Email Login 2FA')}</span>
+                      <HelpButton
+                        active={openHelpKey === '2fa'}
+                        onClick={() => toggleHelp('2fa')}
+                        label={bi('查看邮箱二次验证说明', 'About email login 2FA')}
+                      />
                     </div>
-                  )}
+                    <ToggleSwitch
+                      checked={Boolean(activeDevice?.loginEmail2fa)}
+                      onChange={() => onToggleLogin2fa(!activeDevice?.loginEmail2fa)}
+                      label={bi('切换登录邮箱二次验证', 'Toggle email login 2FA')}
+                    />
+                  </div>
+                  <HelpCallout show={openHelpKey === '2fa'}>
+                    {bi(
+                      '开启后，使用密码登录账号时需要额外输入发送到绑定邮箱的 6 位一次性验证码，防止密码泄露后被他人登录。',
+                      'When enabled, signing in with your password also requires a 6-digit one-time code sent to your linked email.',
+                    )}
+                  </HelpCallout>
                 </div>
               )}
             </div>
@@ -757,59 +677,187 @@ export function SettingsModal({
             </section>
           )}
 
-          {/* Section 4: Share, Admin & Cache */}
+          {/* Section 4: Tools & Admin */}
+          {hasTools && (
+            <section>
+              <div className="mb-1 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
+                {bi('工具', 'Tools')}
+              </div>
+              <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#22252E]">
+                {onOpenShare && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose()
+                      onOpenShare()
+                    }}
+                    className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Share2 className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                      <span>{bi('分享与下载', 'Share & Downloads')}</span>
+                    </span>
+                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                  </button>
+                )}
+                {isAdmin && onOpenInviteManager && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose()
+                      onOpenInviteManager()
+                    }}
+                    className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                      <span>{bi('邀请码管理', 'Invite Codes')}</span>
+                    </span>
+                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                  </button>
+                )}
+                {isAdmin && activeDevice?.baseUrl && (
+                  <a
+                    href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={onClose}
+                    className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Activity className="h-3.5 w-3.5 text-emerald-500" />
+                      <span>{bi('服务器监控看板', 'Server Monitor')}</span>
+                    </span>
+                    <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
+                  </a>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* Section 5: Network & Storage (advanced / secondary telemetry tucked cleanly below) */}
           <section>
             <div className="mb-1 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
-              {bi('工具与存储', 'Tools & Storage')}
+              {bi('网络与存储', 'Network & Storage')}
             </div>
             <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#22252E]">
-              {onOpenShare && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose()
-                    onOpenShare()
-                  }}
-                  className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
-                >
-                  <span className="inline-flex items-center gap-2">
-                    <Share2 className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('分享与下载', 'Share & Downloads')}</span>
-                  </span>
-                  <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                </button>
+              {activeDevice && turnQuota && (
+                <div className="px-3.5 py-2.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <div className="flex min-w-0 items-center gap-1.5 font-medium text-slate-700 dark:text-slate-200">
+                      <Wifi
+                        className={`h-3.5 w-3.5 shrink-0 ${
+                          turnQuota.provider === 'cloudflare'
+                            ? 'text-sky-500'
+                            : turnQuota.exceeded
+                              ? 'text-rose-500'
+                              : turnQuota.pct >= 85
+                                ? 'text-amber-500'
+                                : 'text-sky-500'
+                        }`}
+                      />
+                      <span className="truncate">{bi('本月加密中继', 'Monthly Relay')}</span>
+                      {turnQuota.provider === 'cloudflare' && (
+                        <span className="shrink-0 rounded-md bg-sky-500/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-sky-600 dark:text-sky-400">
+                          CF Free
+                        </span>
+                      )}
+                      {turnQuota.exceeded && turnQuota.provider !== 'cloudflare' && (
+                        <span className="shrink-0 rounded-md bg-rose-500/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-500 dark:text-rose-400">
+                          {bi('已达上限', 'Limit')}
+                        </span>
+                      )}
+                      <HelpButton
+                        active={openHelpKey === 'relayQuota'}
+                        onClick={() => toggleHelp('relayQuota')}
+                        label={bi('查看本月加密中继说明', 'About monthly relay quota')}
+                      />
+                    </div>
+                    <span
+                      className={`shrink-0 font-mono text-[11px] font-semibold ${
+                        turnQuota.provider === 'cloudflare'
+                          ? 'text-sky-600 dark:text-sky-400'
+                          : turnQuota.exceeded
+                            ? 'text-rose-500 dark:text-rose-400'
+                            : turnQuota.pct >= 85
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-slate-500 dark:text-slate-300'
+                      }`}
+                    >
+                      {turnQuota.provider === 'cloudflare'
+                        ? bi('CF 1TB 公益池', 'CF 1TB Pool')
+                        : turnQuota.unlimited
+                          ? `${formatBytesCompact(turnQuota.usedBytes)} / ${bi('不限', 'Unlimited')}`
+                          : `${formatBytesCompact(turnQuota.usedBytes)} / ${formatBytesCompact(turnQuota.quotaBytes)}`}
+                    </span>
+                  </div>
+                  {!turnQuota.unlimited && turnQuota.provider !== 'cloudflare' && (
+                    <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          turnQuota.exceeded
+                            ? 'bg-rose-500'
+                            : turnQuota.pct >= 85
+                              ? 'bg-amber-500'
+                              : 'bg-sky-500'
+                        }`}
+                        style={{ width: `${Math.min(100, Math.max(0, Number(turnQuota.pct) || 0))}%` }}
+                      />
+                    </div>
+                  )}
+                  <HelpCallout show={openHelpKey === 'relayQuota'}>
+                    <div>
+                      {turnQuota.provider === 'cloudflare'
+                        ? bi(
+                            '当前免费档优先 P2P 直连；遇到复杂防火墙无法直连时，自动走 Cloudflare 免费公益加密中继池，不消耗服务器流量。',
+                            'Direct P2P is always preferred; when symmetric NAT blocks direct connections, traffic falls back to Cloudflare free encrypted relay.',
+                          )
+                        : turnQuota.exceeded
+                          ? bi(
+                              '本月加密中继额度已用完，当前仅支持 P2P 直连（次月 1 日自动重置，或联系管理员调整档位）。',
+                              'Monthly encrypted relay limit reached — direct P2P still works without limits. Resets on the 1st of next month.',
+                            )
+                          : bi(
+                              'P2P 点对点直连流量永久无限且免费；仅在双对称 NAT 等极端网络回落加密中继时才会计入本月额度。',
+                              'Direct P2P traffic is always unlimited and free. Only fallback encrypted relay traffic on double-symmetric NAT counts toward this quota.',
+                            )}
+                    </div>
+                    {turnQuota.month && (
+                      <div className="mt-1 font-mono text-[10px] text-slate-400">
+                        {bi(`统计周期：${turnQuota.month}`, `Billing cycle: ${turnQuota.month}`)}
+                      </div>
+                    )}
+                  </HelpCallout>
+                </div>
               )}
-              {isAdmin && onOpenInviteManager && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose()
-                    onOpenInviteManager()
-                  }}
-                  className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
-                >
-                  <span className="inline-flex items-center gap-2">
-                    <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('邀请码管理', 'Invite Codes')}</span>
-                  </span>
-                  <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                </button>
+
+              {activeDevice && onToggleRelayDataSaver && (
+                <div className="px-3.5 py-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-200">
+                      <Zap className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                      <span className="truncate">{bi('中继自动省流', 'Relay Data Saver')}</span>
+                      <HelpButton
+                        active={openHelpKey === 'dataSaver'}
+                        onClick={() => toggleHelp('dataSaver')}
+                        label={bi('查看中继自动省流说明', 'About relay data saver')}
+                      />
+                    </div>
+                    <ToggleSwitch
+                      checked={Boolean(relayDataSaver)}
+                      onChange={onToggleRelayDataSaver}
+                      label={bi('切换中继自动省流', 'Toggle relay data saver')}
+                    />
+                  </div>
+                  <HelpCallout show={openHelpKey === 'dataSaver'}>
+                    {bi(
+                      '开启后，当连接回落至加密中继时图片需点击再加载以节省流量；处于 P2P 直连时始终自动加载高清原图。',
+                      'When connected via fallback relay, images load on tap to save relay quota. Over direct P2P, images always auto-load.',
+                    )}
+                  </HelpCallout>
+                </div>
               )}
-              {isAdmin && activeDevice?.baseUrl && (
-                <a
-                  href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={onClose}
-                  className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
-                >
-                  <span className="inline-flex items-center gap-2">
-                    <Activity className="h-3.5 w-3.5 text-emerald-500" />
-                    <span>{bi('服务器监控看板', 'Server Monitor')}</span>
-                  </span>
-                  <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
-                </a>
-              )}
+
               <div className="flex items-center justify-between gap-2 px-3.5 py-2.5">
                 <div className="flex min-w-0 items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">
                   <HardDrive className="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -833,7 +881,7 @@ export function SettingsModal({
             </div>
           </section>
 
-          {/* Section 5: About & Updates */}
+          {/* Section 6: About & Updates */}
           <section>
             <div className="mb-1 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
               {bi('关于', 'About')}
@@ -1015,6 +1063,61 @@ export function SettingsModal({
               </div>
             </div>
           </section>
+
+          {/* Standalone Sign Out at the very bottom (safe from accidental taps) */}
+          {activeDevice?.id && onRemoveDevice && (
+            <section>
+              <div className="overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:border-slate-800 dark:bg-[#22252E]">
+                {!confirmLogout ? (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmLogout(true)}
+                    className="flex w-full items-center justify-center gap-1.5 px-3.5 py-2.5 text-xs font-semibold text-rose-500 transition hover:bg-rose-50/70 hover:text-rose-600 dark:hover:bg-rose-950/30"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span>{bi('退出登录', 'Sign Out')}</span>
+                  </button>
+                ) : (
+                  <div className="space-y-2 bg-rose-50/90 px-3.5 py-2.5 text-xs text-rose-700 dark:bg-rose-950/45 dark:text-rose-200">
+                    <div className="flex items-center justify-between">
+                      <span>{bi(`确认退出 ${displayUser}？`, `Sign out ${displayUser}?`)}</span>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmLogout(false)}
+                        className="rounded-lg bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                      >
+                        {t('common.cancel')}
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap justify-end gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmLogout(false)
+                          onClose()
+                          onRemoveDevice(activeDevice.id, { revokeAll: false })
+                        }}
+                        className="rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-200"
+                      >
+                        {bi('仅退出本设备', 'This Device')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmLogout(false)
+                          onClose()
+                          onRemoveDevice(activeDevice.id, { revokeAll: true })
+                        }}
+                        className="rounded-lg bg-rose-500 px-2.5 py-1 text-[11px] font-semibold text-white"
+                      >
+                        {bi('退出全部设备', 'All Devices')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
         </div>
       </div>
     </div>
