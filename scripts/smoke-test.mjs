@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import dgram from 'node:dgram'
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
@@ -21,7 +21,7 @@ import WebSocket from 'ws'
 import { RTCIceCandidate, RTCPeerConnection } from 'werift'
 import { DesktopWebRtcProxy } from '../packages/desktop-app/src/webrtc-proxy.js'
 import { ElectronWebRtcClient } from '../packages/dsh-mobile-hub/src/p2p/peer-electron.js'
-import { createRelayServer } from '../packages/relay-server/src/index.js'
+import { buildTurnCredentials, createRelayServer } from '../packages/relay-server/src/index.js'
 import {
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
@@ -5849,7 +5849,79 @@ async function main() {
         await proxy.dispose()
       }
     }
-    console.log('[smoke] 35/35 DesktopWebRtcProxy + ElectronWebRtcClient cold-start concurrency, FIFO framing & worker recovery OK')
+    console.log('[smoke] 35/36 DesktopWebRtcProxy + ElectronWebRtcClient cold-start concurrency, FIFO framing & worker recovery OK')
+
+    // 36. Dynamic RFC HMAC-SHA1 TURN credentials, clean ICE ordering & secret non-leakage
+    {
+      const fixedNow = 1_750_000_000
+      const creds = buildTurnCredentials({
+        secret: 'super-secret-turn-key-123456',
+        userId: 'usr_abc123',
+        ttlSec: 3600,
+        nowSec: fixedNow,
+      })
+      assert.equal(creds.username, `${fixedNow + 3600}:usr_abc123`)
+      assert.equal(
+        creds.credential,
+        createHmac('sha1', 'super-secret-turn-key-123456').update(creds.username).digest('base64'),
+      )
+
+      const turnDir = join(tmpDir, 'turn-control')
+      mkdirSync(turnDir, { recursive: true })
+      const turnSecret = 'smoke-turn-hmac-secret-998877665544'
+      const turnRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-turn-jwt-secret-123456',
+        adminBootstrapToken: 'TURN-BOOT-1',
+        accountsFile: join(turnDir, 'accounts.json'),
+        publicRelayUrl: 'https://turn.example.com',
+        stunEnabled: false,
+        turnSecret,
+        turnHost: 'turn.example.com',
+        turnPort: 3478,
+        turnTtlSec: 3600,
+      })
+      const { port: tPort } = await turnRelay.start()
+      const tBase = `http://127.0.0.1:${tPort}`
+      try {
+        const tAdmin = await (await fetch(`${tBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'turn_admin', password: 'TurnPassword123!', inviteCode: 'TURN-BOOT-1' }),
+        })).json()
+        assert.equal(tAdmin.ok, true)
+
+        const tCli = await openTicketClientWs(tBase, tPort, tAdmin.token, { deviceName: 'turn-phone' })
+        try {
+          const ice = tCli.hello.iceServers
+          assert.equal(ice.length, 3, 'TURN mode must emit exactly 1 STUN + 2 TURN (UDP+TCP) entries with no proxy-polluting public STUNs')
+          assert.equal(ice[0].urls, 'stun:turn.example.com:3478')
+          assert.equal(ice[1].urls, 'turn:turn.example.com:3478?transport=udp')
+          assert.equal(ice[2].urls, 'turn:turn.example.com:3478?transport=tcp')
+          assert.ok(ice[1].username.endsWith(`:${tAdmin.roomId}`))
+          assert.equal(
+            ice[1].credential,
+            createHmac('sha1', turnSecret).update(ice[1].username).digest('base64'),
+            'Issued TURN credential must match RFC HMAC-SHA1',
+          )
+          assert.equal(JSON.stringify(ice).includes(turnSecret), false, 'TURN static secret must NEVER leak to clients')
+        } finally {
+          await tCli.closeAll()
+        }
+
+        const tOv = await (await fetch(`${tBase}/api/admin/overview`, {
+          headers: { Authorization: `Bearer ${tAdmin.token}` },
+        })).json()
+        assert.equal(tOv.ok, true)
+        assert.equal(tOv.server.turn.enabled, true)
+        assert.equal(tOv.server.turn.port, 3478)
+        assert.equal(JSON.stringify(tOv).includes(turnSecret), false, 'Admin overview must NEVER expose turnSecret')
+      } finally {
+        await turnRelay.close()
+      }
+    }
+    console.log('[smoke] 36/36 Dynamic RFC HMAC-SHA1 TURN credentials, clean ICE ordering & secret non-leakage OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

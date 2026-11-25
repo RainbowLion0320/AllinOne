@@ -110,6 +110,7 @@ export function App() {
   const [p2pState, setP2pState] = useState('idle')
   const [p2pError, setP2pError] = useState('')
   const [p2pEngine, setP2pEngine] = useState('')
+  const [p2pTransport, setP2pTransport] = useState('')
   const [bridges, setBridges] = useState([])
   const [accountDevices, setAccountDevices] = useState([])
   const [clientSessions, setClientSessions] = useState({
@@ -1251,6 +1252,7 @@ export function App() {
       setP2pState('idle')
       setP2pError('')
       setP2pEngine('')
+      setP2pTransport('')
       setBridges([])
       setAccountDevices([])
       setClientSessions({
@@ -1268,6 +1270,7 @@ export function App() {
     setP2pState('idle')
     setP2pError('')
     setP2pEngine('')
+    setP2pTransport('')
     setBridges([])
     setAccountDevices([])
     setClientSessions({
@@ -1290,13 +1293,14 @@ export function App() {
     setQrNudge(null)
     clientRef.current = client
 
-    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ, p2pState: nextP2p, p2pError: nextP2pErr, p2pEngine: nextP2pEngine }) => {
+    const unsubStatus = client.onStatus(({ state, error, bridges: bList, devices: dList, onlineClientCount: occ, p2pState: nextP2p, p2pError: nextP2pErr, p2pEngine: nextP2pEngine, p2pTransport: nextP2pTransport }) => {
       if (clientRef.current !== client) return
       setConnState(state)
       setConnError(error || '')
       setP2pState(nextP2p || 'idle')
       setP2pError(nextP2pErr || '')
       setP2pEngine(nextP2pEngine || '')
+      setP2pTransport(nextP2pTransport || '')
       setBridges(bList || [])
       if (Array.isArray(dList)) setAccountDevices(dList)
       if (typeof occ === 'number') setLiveOnlineClientCount(occ)
@@ -2472,14 +2476,25 @@ export function App() {
               </button>
               {connState === 'connected' && bridgeOnline && !e2eeLocked && p2pState === 'connected' && (
                 <span
-                  title={bi(
-                    `WebRTC 端到端 P2P 直连（0 服务器流量${p2pEngine ? ` · ${p2pEngine}` : ''}）`,
-                    `Direct WebRTC P2P connection (0 server relay traffic${p2pEngine ? ` · ${p2pEngine}` : ''})`,
-                  )}
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
+                  title={
+                    p2pTransport === 'relay'
+                      ? bi(
+                          `当前处于双对称 NAT，已自动经加密 TURN 中继连接（保持 AES-256-GCM 端到端加密${p2pEngine ? ` · ${p2pEngine}` : ''}）`,
+                          `Connected via encrypted TURN relay for symmetric NAT traversal (AES-256-GCM E2EE${p2pEngine ? ` · ${p2pEngine}` : ''})`,
+                        )
+                      : bi(
+                          `WebRTC 端到端 P2P 直连（0 服务器流量${p2pEngine ? ` · ${p2pEngine}` : ''}）`,
+                          `Direct WebRTC P2P connection (0 server relay traffic${p2pEngine ? ` · ${p2pEngine}` : ''})`,
+                        )
+                  }
+                  className={`inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                    p2pTransport === 'relay'
+                      ? 'bg-sky-500/12 text-sky-600 dark:text-sky-400'
+                      : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                  }`}
                 >
                   <Zap className="h-2.5 w-2.5" />
-                  <span>P2P</span>
+                  <span>{p2pTransport === 'relay' ? bi('中继', 'Relay') : 'P2P'}</span>
                 </span>
               )}
               {connState === 'connected' && bridgeOnline && activeBridgeE2ee.enabled && e2eeLocked && (

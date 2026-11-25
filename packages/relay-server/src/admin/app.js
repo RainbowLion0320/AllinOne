@@ -544,7 +544,7 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.2'}`
+    if (verEl) verEl.textContent = `v${srv.version || '1.0.3'}`
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {
@@ -552,12 +552,15 @@
       const up = fmtUptime(srv.node?.uptimeSec || 0)
       const rss = fmtBytes(srv.node?.rssBytes || 0)
       const stun = srv.stun || {}
-      const stunText = stun.enabled
-        ? `STUN UDP :${stun.port || 3478} (${stun.requests || 0})`
-        : bi('STUN 关', 'STUN Off')
+      const turn = srv.turn || {}
+      const iceText = turn.enabled
+        ? `STUN+TURN :${turn.port || 3478}`
+        : stun.enabled
+          ? `STUN UDP :${stun.port || 3478} (${stun.requests || 0})`
+          : bi('STUN 关', 'STUN Off')
       subEl.textContent = bi(
-        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · ${stunText} · 纯控制面 (0 字节中转)`,
-        `Host ${hostName} · Up ${up} · RSS ${rss} · ${stunText} · Pure Control Plane (0 B relayed)`,
+        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · ${iceText} · 纯控制面 (P2P 优先)`,
+        `Host ${hostName} · Up ${up} · RSS ${rss} · ${iceText} · Control Plane (P2P-first)`,
       )
     }
 

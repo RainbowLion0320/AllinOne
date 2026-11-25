@@ -36,9 +36,10 @@ function normalizePlatformBucket(platform) {
 export function collectServerHealth({
   mailer = null,
   stun = null,
+  turn = null,
   registerInviteGated = true,
   startedAt = Date.now(),
-  version = '1.0.2',
+  version = '1.0.3',
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -76,6 +77,7 @@ export function collectServerHealth({
       memUsagePct: totalMem > 0 ? Number(((usedMem / totalMem) * 100).toFixed(1)) : 0,
     },
     stun: stun || { enabled: false, port: 0, requests: 0 },
+    turn: turn || { enabled: false, host: '', port: 0 },
     storage: {
       uploadFileCount: 0,
       uploadTotalBytes: 0,

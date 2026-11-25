@@ -20,7 +20,7 @@ import { bi, getCurrentLang } from './i18n.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
 
-const P2P_CONNECT_TIMEOUT_MS = 10_000
+const P2P_CONNECT_TIMEOUT_MS = 15_000
 const P2P_KEEPALIVE_MS = 20_000
 const MAX_P2P_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local disk safety cap (0 bytes via server)
 
@@ -127,6 +127,7 @@ export class P2PPeerSession {
     this.state = 'idle' // 'idle' | 'connecting' | 'connected' | 'failed' | 'closed'
     this.error = ''
     this.remoteEngine = ''
+    this.transportType = '' // 'direct' | 'relay' | ''
     this.closed = false
 
     this.pc = null
@@ -160,8 +161,8 @@ export class P2PPeerSession {
     )
   }
 
-  _setState(nextState, errorMsg = '') {
-    if (this.state === nextState && this.error === errorMsg) return
+  _setState(nextState, errorMsg = '', forceEmit = false) {
+    if (!forceEmit && this.state === nextState && this.error === errorMsg) return
     this.state = nextState
     this.error = errorMsg
     try {
@@ -170,7 +171,38 @@ export class P2PPeerSession {
         state: this.state,
         error: this.error,
         engine: this.remoteEngine,
+        transport: this.transportType,
       })
+    } catch {}
+  }
+
+  async _detectIceTransport() {
+    if (this.closed || !this.pc || typeof this.pc.getStats !== 'function') return
+    try {
+      const stats = await this.pc.getStats()
+      if (this.closed || !stats) return
+      let selectedPair = null
+      stats.forEach((rep) => {
+        if (rep.type === 'transport' && rep.selectedCandidatePairId) {
+          selectedPair = stats.get(rep.selectedCandidatePairId) || selectedPair
+        }
+      })
+      if (!selectedPair) {
+        stats.forEach((rep) => {
+          if (rep.type === 'candidate-pair' && (rep.selected || (rep.nominated && rep.state === 'succeeded'))) {
+            selectedPair = rep
+          }
+        })
+      }
+      if (!selectedPair) return
+      const localCand = selectedPair.localCandidateId ? stats.get(selectedPair.localCandidateId) : null
+      const remoteCand = selectedPair.remoteCandidateId ? stats.get(selectedPair.remoteCandidateId) : null
+      const isRelay = localCand?.candidateType === 'relay' || remoteCand?.candidateType === 'relay'
+      const nextTransport = isRelay ? 'relay' : 'direct'
+      if (nextTransport !== this.transportType && !this.closed) {
+        this.transportType = nextTransport
+        this._setState(this.state, this.error, true)
+      }
     } catch {}
   }
 
@@ -235,6 +267,7 @@ export class P2PPeerSession {
       }
       this._startKeepalive()
       this._setState('connected', '')
+      void this._detectIceTransport()
       if (this._readyResolve) {
         const res = this._readyResolve
         this._readyResolve = null

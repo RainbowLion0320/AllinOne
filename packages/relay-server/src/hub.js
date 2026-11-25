@@ -491,7 +491,7 @@ export class RelayHub {
       mode: 'p2p-only',
       roomId,
       bridgeId,
-      iceServers: this.getIceServers(req),
+      iceServers: this.getIceServers(req, roomId),
       ts: now,
     })
     this.broadcastControlEvent(roomId, bridgeId, EVENTS.BRIDGE_STATUS, {
@@ -645,7 +645,7 @@ export class RelayHub {
       clientId,
       sid: entry.sid,
       roomId,
-      iceServers: this.getIceServers(req),
+      iceServers: this.getIceServers(req, roomId),
       bridges,
       ...(devices ? { devices } : {}),
       clients,

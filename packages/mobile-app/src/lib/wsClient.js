@@ -569,6 +569,7 @@ export class MobileRelayClient {
     this.p2pState = 'idle' // 'idle' | 'connecting' | 'connected' | 'failed'
     this.p2pError = ''
     this.p2pEngine = ''
+    this.p2pTransport = '' // 'direct' | 'relay' | ''
 
     this._onWindowOnline = () => {
       if (this.closed) return
@@ -602,6 +603,7 @@ export class MobileRelayClient {
       this.p2pState = 'idle'
       this.p2pError = ''
       this.p2pEngine = ''
+      this.p2pTransport = ''
       this.emitStatus()
       return
     }
@@ -610,10 +612,12 @@ export class MobileRelayClient {
       this.p2pState = 'idle'
       this.p2pError = ''
       this.p2pEngine = ''
+      this.p2pTransport = ''
     } else {
       this.p2pState = peer.state === 'closed' ? 'idle' : peer.state
       this.p2pError = peer.error || ''
       this.p2pEngine = peer.remoteEngine || ''
+      this.p2pTransport = peer.transportType || ''
     }
     this.emitStatus()
   }
@@ -626,6 +630,7 @@ export class MobileRelayClient {
     this.p2pState = 'idle'
     this.p2pError = ''
     this.p2pEngine = ''
+    this.p2pTransport = ''
   }
 
   _pruneOfflinePeers() {
@@ -678,13 +683,14 @@ export class MobileRelayClient {
           }))
         } catch {}
       },
-      onStateChange: ({ bridgeId: bid, state, error, engine }) => {
+      onStateChange: ({ bridgeId: bid, state, error, engine, transport }) => {
         if (this.p2pPeers.get(bid) !== peer) return
         const activeTarget = this._resolveTargetBridgeId()
         if (bid === activeTarget) {
           this.p2pState = state === 'closed' ? 'idle' : state
           this.p2pError = error || ''
           this.p2pEngine = engine || ''
+          this.p2pTransport = transport || ''
           this.emitStatus()
         }
       },
@@ -801,6 +807,7 @@ export class MobileRelayClient {
       p2pState: this.p2pState,
       p2pError: this.p2pError,
       p2pEngine: this.p2pEngine,
+      p2pTransport: this.p2pTransport,
     })
     return () => this.statusListeners.delete(fn)
   }
@@ -816,6 +823,7 @@ export class MobileRelayClient {
       p2pState: this.p2pState,
       p2pError: this.p2pError,
       p2pEngine: this.p2pEngine,
+      p2pTransport: this.p2pTransport,
     }
     for (const fn of this.statusListeners) {
       try { fn(snap) } catch {}

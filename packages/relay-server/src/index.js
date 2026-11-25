@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto'
 import http from 'node:http'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, extname, join, normalize, resolve, sep } from 'node:path'
@@ -16,9 +17,9 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '1.0.2')
+    return String(pkg?.version || '1.0.3')
   } catch {
-    return '1.0.2'
+    return '1.0.3'
   }
 })()
 
@@ -66,10 +67,24 @@ const MIME_TYPES = {
 }
 
 const DEFAULT_PUBLIC_STUN_SERVERS = [
-  'stun:stun.miwifi.com:3478',
-  'stun:stun.qq.com:3478',
+  'stun:stun.chat.bilibili.com:3478',
   'stun:stun.cloudflare.com:3478',
 ]
+
+/**
+ * Generate RFC draft-uberti-behave-turn-rest-00 time-limited HMAC-SHA1 TURN credentials
+ * compatible with `coturn --use-auth-secret`.
+ */
+export function buildTurnCredentials({ secret, userId = 'allinone', ttlSec = 86_400, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  const cleanSecret = String(secret || '').trim()
+  if (!cleanSecret) return null
+  const safeTtl = Math.max(60, Math.min(7 * 86_400, Number(ttlSec) || 86_400))
+  const expiry = Math.floor(Number(nowSec) || Math.floor(Date.now() / 1000)) + safeTtl
+  const safeUser = String(userId || 'allinone').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'allinone'
+  const username = `${expiry}:${safeUser}`
+  const credential = createHmac('sha1', cleanSecret).update(username).digest('base64')
+  return { username, credential, expiresAt: expiry * 1000 }
+}
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 const SANDBOX_PREVIEW_CSP =
@@ -261,7 +276,28 @@ export function createRelayServer(options = {}) {
       ? createStunServer({ port: stunPort, host: stunHost })
       : null
 
-  function resolveIceServers(req = null) {
+  const turnSecret = String(options.turnSecret ?? process.env.TURN_SECRET ?? '').trim()
+  const turnHostExplicit = String(options.turnHost ?? process.env.TURN_HOST ?? '').trim()
+  const turnPortRaw = options.turnPort ?? process.env.TURN_PORT ?? '3478'
+  const turnPort = Number.isInteger(Number(turnPortRaw)) && Number(turnPortRaw) > 0 ? Number(turnPortRaw) : 3478
+  const turnTtlSec = Number(options.turnTtlSec ?? process.env.TURN_TTL_SEC ?? 86_400) || 86_400
+
+  function extractPublicHostname(req = null) {
+    if (turnHostExplicit) return turnHostExplicit
+    if (publicRelayUrl) {
+      try {
+        return new URL(publicRelayUrl).hostname
+      } catch {}
+    }
+    if (req?.headers?.host) {
+      try {
+        return new URL(`http://${req.headers.host}`).hostname
+      } catch {}
+    }
+    return ''
+  }
+
+  function resolveIceServers(req = null, scopeId = '') {
     if (Array.isArray(options.iceServers)) {
       return options.iceServers
     }
@@ -273,29 +309,43 @@ export function createRelayServer(options = {}) {
         .filter(Boolean)
         .map((urls) => ({ urls }))
     }
-    const urls = []
+
+    const publicHost = extractPublicHostname(req)
+    const formattedHost = publicHost && publicHost.includes(':') ? `[${publicHost}]` : publicHost
+
+    // Mode 1: Hardened self-hosted coturn (handles BOTH STUN and TURN UDP+TCP cleanly with zero proxy-polluted public STUNs)
+    if (turnSecret && formattedHost) {
+      const creds = buildTurnCredentials({
+        secret: turnSecret,
+        userId: scopeId || 'allinone',
+        ttlSec: turnTtlSec,
+      })
+      const servers = [{ urls: `stun:${formattedHost}:${turnPort}` }]
+      if (creds) {
+        servers.push(
+          {
+            urls: `turn:${formattedHost}:${turnPort}?transport=udp`,
+            username: creds.username,
+            credential: creds.credential,
+          },
+          {
+            urls: `turn:${formattedHost}:${turnPort}?transport=tcp`,
+            username: creds.username,
+            credential: creds.credential,
+          },
+        )
+      }
+      return servers
+    }
+
+    // Mode 2: Built-in stateless Node STUN (UDP 3478)
     const stunStats = stunServer?.getStats?.()
-    if (stunStats?.enabled && stunStats.port > 0) {
-      let stunPublicHost = ''
-      if (publicRelayUrl) {
-        try {
-          stunPublicHost = new URL(publicRelayUrl).hostname
-        } catch {}
-      }
-      if (!stunPublicHost && req?.headers?.host) {
-        try {
-          stunPublicHost = new URL(`http://${req.headers.host}`).hostname
-        } catch {}
-      }
-      if (stunPublicHost) {
-        const formattedHost = stunPublicHost.includes(':') ? `[${stunPublicHost}]` : stunPublicHost
-        urls.push(`stun:${formattedHost}:${stunStats.port}`)
-      }
+    if (stunStats?.enabled && stunStats.port > 0 && formattedHost) {
+      return [{ urls: `stun:${formattedHost}:${stunStats.port}` }]
     }
-    for (const fallback of DEFAULT_PUBLIC_STUN_SERVERS) {
-      if (!urls.includes(fallback)) urls.push(fallback)
-    }
-    return urls.map((u) => ({ urls: u }))
+
+    // Mode 3: Public STUN fallback (only when neither TURN nor built-in STUN is active)
+    return DEFAULT_PUBLIC_STUN_SERVERS.map((u) => ({ urls: u }))
   }
 
   const accounts = createAccountStore({ filePath: accountsFile })
@@ -416,7 +466,7 @@ export function createRelayServer(options = {}) {
 
   const hub = new RelayHub({
     getRoomDevices: (roomId, liveBridges) => getMergedAccountDevices(roomId, liveBridges),
-    getIceServers: (req) => resolveIceServers(req),
+    getIceServers: (req, roomId) => resolveIceServers(req, roomId),
   })
 
   function isAllowedOrigin(rawOrigin, req) {
@@ -1425,6 +1475,11 @@ export function createRelayServer(options = {}) {
       const serverHealth = collectServerHealth({
         mailer,
         stun: stunServer?.getStats?.() || null,
+        turn: {
+          enabled: Boolean(turnSecret && extractPublicHostname(req)),
+          host: extractPublicHostname(req) || '',
+          port: turnSecret ? turnPort : 0,
+        },
         registerInviteGated: true,
         startedAt,
         version: RELAY_VERSION,
@@ -2044,6 +2099,10 @@ export function createRelayServer(options = {}) {
         console.log(`[control] AllinOne Control Server (v${RELAY_VERSION}, pure P2P signaling) listening on http://${host}:${boundPort}`)
         if (stunInfo.enabled) {
           console.log(`[stun] Stateless RFC 5389 STUN listening on udp://${stunHost}:${stunInfo.port}`)
+        }
+        const turnPublicHost = extractPublicHostname(null)
+        if (turnSecret && turnPublicHost) {
+          console.log(`[turn] Dynamic HMAC-SHA1 TURN enabled (turn:${turnPublicHost}:${turnPort} udp+tcp, ttl=${turnTtlSec}s)`)
         }
         console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
         console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
