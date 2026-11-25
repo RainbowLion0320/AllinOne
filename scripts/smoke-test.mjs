@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import dgram from 'node:dgram'
+import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -18,6 +19,8 @@ import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
 import { RTCIceCandidate, RTCPeerConnection } from 'werift'
+import { DesktopWebRtcProxy } from '../packages/desktop-app/src/webrtc-proxy.js'
+import { ElectronWebRtcClient } from '../packages/dsh-mobile-hub/src/p2p/peer-electron.js'
 import { createRelayServer } from '../packages/relay-server/src/index.js'
 import {
   BULK_FLAG_EOF,
@@ -5703,7 +5706,150 @@ async function main() {
         await p2pCli.closeAll()
       }
     }
-    console.log('[smoke] 34/34 Full-duplex AIO-P2P v1 E2E (5MB AIO2 PC<->Phone bulk, 48KB ctrl frag & instant client.revoked teardown) OK')
+    console.log('[smoke] 34/35 Full-duplex AIO-P2P v1 E2E (5MB AIO2 PC<->Phone bulk, 48KB ctrl frag & instant client.revoked teardown) OK')
+
+    // 35. DesktopWebRtcProxy + ElectronWebRtcClient cold-start concurrency race, FIFO framing & worker recovery
+    {
+      const ipcMain = new EventEmitter()
+      const receivedCmds = []
+      const receivedBins = []
+      let failFirstLoad = true
+      let createdWinCount = 0
+
+      class FakeBrowserWindow extends EventEmitter {
+        constructor() {
+          super()
+          createdWinCount += 1
+          this._destroyed = false
+          const win = this
+          this.webContents = Object.assign(new EventEmitter(), {
+            send(channel, payload) {
+              if (channel === 'webrtc-worker:cmd') {
+                receivedCmds.push(payload)
+                if (payload.type === 'peer.offer') {
+                  // Simulate async SDP answer + immediate dc.open notification
+                  setTimeout(() => {
+                    ipcMain.emit('webrtc-worker:control', { sender: win.webContents }, {
+                      type: 'res',
+                      reqId: payload.reqId,
+                      ok: true,
+                      answer: { type: 'answer', sdp: 'v=0\r\nmock-answer\r\n' },
+                    })
+                    ipcMain.emit('webrtc-worker:control', { sender: win.webContents }, {
+                      type: 'dc.open',
+                      peerId: payload.peerId,
+                      role: 'ctrl',
+                    })
+                    ipcMain.emit('webrtc-worker:control', { sender: win.webContents }, {
+                      type: 'dc.open',
+                      peerId: payload.peerId,
+                      role: 'bulk',
+                    })
+                  }, 15)
+                }
+              } else if (channel === 'webrtc-worker:send-binary') {
+                receivedBins.push(payload)
+              }
+            },
+          })
+        }
+        isDestroyed() { return this._destroyed }
+        destroy() {
+          if (this._destroyed) return
+          this._destroyed = true
+          this.emit('closed')
+        }
+        async loadFile() {
+          if (failFirstLoad) {
+            failFirstLoad = false
+            throw new Error('simulated worker load error')
+          }
+          setTimeout(() => {
+            if (!this._destroyed) {
+              ipcMain.emit('webrtc-worker:control', { sender: this.webContents }, { type: 'worker.ready' })
+            }
+          }, 30)
+        }
+      }
+
+      const proxy = new DesktopWebRtcProxy({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain,
+        srcDir: join(process.cwd(), 'packages/desktop-app/src'),
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+      })
+      const { port: pxPort, token: pxToken } = await proxy.start()
+      let acceptedSockets = 0
+      proxy.server.on('connection', () => { acceptedSockets += 1 })
+
+      const eClient = new ElectronWebRtcClient({
+        port: pxPort,
+        token: pxToken,
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+      })
+      try {
+        // 35a. First offer fails cleanly when worker fails to load, AND proxy recovers cleanly on retry
+        const badPeer = eClient.createPeer({ iceServers: [] })
+        await assert.rejects(() => badPeer.handleOffer('v=0\r\n'), /simulated worker load error/)
+        await badPeer.close()
+
+        // 35b. Re-create a fresh cold ElectronWebRtcClient and fire offer + 10 concurrent ICE candidates simultaneously!
+        // Previously this opened 2 TCP sockets -> proxy destroyed sock1 -> "Electron WebRTC proxy closed"
+        eClient.dispose()
+        const coldClient = new ElectronWebRtcClient({
+          port: pxPort,
+          token: pxToken,
+          log: { info: () => {}, warn: () => {}, error: () => {} },
+        })
+        const socketsBefore = acceptedSockets
+        try {
+          let ctrlOpened = false
+          let bulkOpened = false
+          const peer = coldClient.createPeer({
+            iceServers: [],
+            onCtrlOpen: () => { ctrlOpened = true },
+            onBulkOpen: () => { bulkOpened = true },
+          })
+          const offerP = peer.handleOffer('v=0\r\nconcurrent-offer\r\n')
+          const icePs = Array.from({ length: 10 }, (_, idx) =>
+            peer.addIceCandidate({ candidate: `candidate:${idx} 1 udp 1 127.0.0.1 ${50000 + idx} typ host` }),
+          )
+          const ans = await offerP
+          await Promise.all(icePs)
+          assert.equal(ans.type, 'answer')
+          assert.equal(
+            acceptedSockets - socketsBefore,
+            1,
+            'Cold concurrent offer + 10 ICE calls must deduplicate onto exactly 1 loopback TCP socket',
+          )
+          for (let i = 0; i < 30 && (!ctrlOpened || !bulkOpened); i += 1) {
+            await new Promise((r) => setTimeout(r, 10))
+          }
+          assert.equal(peer.isCtrlOpen(), true)
+          assert.equal(peer.isBulkOpen(), true)
+
+          // Verify FIFO ordering: peer.offer arrived strictly before all 10 peer.ice frames!
+          const offerIdx = receivedCmds.findIndex((c) => c.type === 'peer.offer' && c.sdp?.includes('concurrent-offer'))
+          const firstIceIdx = receivedCmds.findIndex((c) => c.type === 'peer.ice')
+          assert.ok(offerIdx >= 0 && firstIceIdx > offerIdx, 'peer.offer must be dispatched strictly before peer.ice')
+
+          // Verify binary bulk frame delivery
+          await peer.sendBulk(new Uint8Array([1, 2, 3, 4]))
+          for (let i = 0; i < 30 && receivedBins.length === 0; i += 1) {
+            await new Promise((r) => setTimeout(r, 10))
+          }
+          assert.equal(receivedBins.length, 1)
+          assert.deepEqual(Buffer.from(receivedBins[0].bytes), Buffer.from([1, 2, 3, 4]))
+          await peer.close()
+        } finally {
+          coldClient.dispose()
+        }
+        assert.ok(createdWinCount >= 2, 'Proxy should recreate worker cleanly after failed load')
+      } finally {
+        await proxy.dispose()
+      }
+    }
+    console.log('[smoke] 35/35 DesktopWebRtcProxy + ElectronWebRtcClient cold-start concurrency, FIFO framing & worker recovery OK')
 
     console.log('\nALL SMOKE TESTS PASSED!')
   } finally {

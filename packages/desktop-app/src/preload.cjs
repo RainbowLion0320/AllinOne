@@ -5,7 +5,7 @@ const initInfo = ipcRenderer.sendSync('desktop:get-init') || {}
 contextBridge.exposeInMainWorld('allinoneDesktop', {
   isDesktop: true,
   platform: initInfo.platform || process.platform,
-  version: initInfo.version || '1.0.0',
+  version: initInfo.version || '1.0.1',
   defaultServerUrl: initInfo.defaultServerUrl || '',
   initialLang: initInfo.lang || '',
   setLanguage: (lang) => ipcRenderer.invoke('desktop:set-language', lang),

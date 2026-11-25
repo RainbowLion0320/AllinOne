@@ -258,7 +258,11 @@ export class P2PBridgeManager {
     if (inner.kind === 'ice') {
       const existing = this.sessions.get(cid)
       if (existing && existing.sessionId === sid && inner.candidate) {
-        await existing.peer.addIceCandidate(inner.candidate)
+        if (!existing.offerReady || !existing.peer) {
+          existing.pendingIce.push(inner.candidate)
+        } else {
+          await existing.peer.addIceCandidate(inner.candidate)
+        }
       }
       return
     }
@@ -280,6 +284,8 @@ export class P2PBridgeManager {
         sessionId: sid,
         createdAt: Date.now(),
         closed: false,
+        offerReady: false,
+        pendingIce: [],
         ctrlCodec: createCtrlCodec(),
         peer: null,
         pendingDownloads: new Map(), // streamId -> { realPath, size, mimeType, filename, createdAt }
@@ -324,11 +330,16 @@ export class P2PBridgeManager {
 
         const answer = await sess.peer.handleOffer(inner.sdp)
         if (sess.closed || this.sessions.get(cid) !== sess) return
+        sess.offerReady = true
         await this.sendEncryptedSignal(cid, sid, {
           kind: 'answer',
           sdp: answer.sdp,
           engine: sess.peer.engine,
         })
+        while (sess.pendingIce.length > 0 && !sess.closed && this.sessions.get(cid) === sess) {
+          const cand = sess.pendingIce.shift()
+          await sess.peer.addIceCandidate(cand).catch(() => {})
+        }
       } catch (err) {
         this.log.warn?.(`mobile-hub: [p2p] offer handling failed (${cid}): ${String(err?.message || err)}`)
         await this.destroySession(cid, sess)

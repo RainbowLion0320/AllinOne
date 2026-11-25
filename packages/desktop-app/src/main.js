@@ -811,6 +811,13 @@ if (!gotLock) {
     powerMonitor.on('resume', onSystemResume)
     powerMonitor.on('unlock-screen', onSystemResume)
 
+    // Start local loopback WebRTC proxy (lazy worker window, 0MB idle RAM) before creating UI or starting bridge
+    try {
+      await webrtcProxy.start()
+    } catch (err) {
+      console.warn('[desktop] WebRTC proxy failed to start (will fall back to werift):', err?.message || err)
+    }
+
     refreshTrayMenu()
     let openedAsHidden = false
     if (process.platform === 'darwin') {
@@ -819,13 +826,6 @@ if (!gotLock) {
       } catch {}
     }
     createMainWindow({ showOnReady: !openedAsHidden })
-
-    // Start local loopback WebRTC proxy (lazy worker window, 0MB idle RAM) before starting embedded bridge
-    try {
-      await webrtcProxy.start()
-    } catch (err) {
-      console.warn('[desktop] WebRTC proxy failed to start (will fall back to werift):', err?.message || err)
-    }
 
     // Immediately resume background bridge if this PC already has an account binding
     void bridgeManager.startFromSavedConfigIfPresent()

@@ -61,8 +61,8 @@ export class DesktopWebRtcProxy {
     this.idleTimer = null
     this.disposed = false
 
-    this._onWorkerControl = (_ev, msg) => this.handleWorkerControl(msg)
-    this._onWorkerBinary = (_ev, payload) => this.handleWorkerBinary(payload)
+    this._onWorkerControl = (ev, msg) => this.handleWorkerControl(msg, ev)
+    this._onWorkerBinary = (ev, payload) => this.handleWorkerBinary(payload, ev)
   }
 
   async start() {
@@ -120,41 +120,94 @@ export class DesktopWebRtcProxy {
         preload: join(this.srcDir, 'webrtc-worker-preload.cjs'),
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: true,
         backgroundThrottling: false,
       },
     })
     this.workerWin = win
 
-    this.workerReadyPromise = new Promise((resolveReady, rejectReady) => {
-      const timer = setTimeout(() => rejectReady(new Error('WebRTC worker init timeout')), 10_000)
-      const onReady = (_ev, msg) => {
-        if (msg?.type === 'worker.ready') {
-          clearTimeout(timer)
-          this.ipcMain.removeListener('webrtc-worker:control', onReady)
-          resolveReady(win)
+    const readyPromise = new Promise((resolveReady, rejectReady) => {
+      let settled = false
+      const cleanupWorker = () => {
+        if (this.workerWin === win) {
+          this.workerWin = null
+        }
+        if (this.workerReadyPromise === readyPromise) {
+          this.workerReadyPromise = null
+        }
+        if (!win.isDestroyed()) {
+          try { win.destroy() } catch {}
+        }
+      }
+      const failOnce = (err) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.ipcMain.removeListener('webrtc-worker:control', onReady)
+        cleanupWorker()
+        this.log.warn?.(`[webrtc-proxy] worker init failed: ${String(err?.message || err)}`)
+        rejectReady(err)
+      }
+      const succeedOnce = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.ipcMain.removeListener('webrtc-worker:control', onReady)
+        resolveReady(win)
+      }
+
+      const timer = setTimeout(() => failOnce(new Error('WebRTC worker init timeout')), 10_000)
+      const onReady = (ev, msg) => {
+        if (msg?.type === 'worker.ready' && (!ev?.sender || ev.sender === win.webContents)) {
+          succeedOnce()
         }
       }
       this.ipcMain.on('webrtc-worker:control', onReady)
+
+      win.webContents?.on?.('did-fail-load', (_ev, code, desc) => {
+        failOnce(new Error(`WebRTC worker failed to load (${code}: ${desc})`))
+      })
+      win.webContents?.on?.('render-process-gone', (_ev, details) => {
+        const reason = details?.reason || 'gone'
+        if (!settled) {
+          failOnce(new Error(`WebRTC worker render process ${reason}`))
+        } else if (this.workerWin === win) {
+          this.log.warn?.(`[webrtc-proxy] worker render process ${reason}; resetting worker`)
+          cleanupWorker()
+        }
+      })
+
       win.once('closed', () => {
         clearTimeout(timer)
         this.ipcMain.removeListener('webrtc-worker:control', onReady)
+        if (!settled) {
+          settled = true
+          if (this.workerWin === win) this.workerWin = null
+          if (this.workerReadyPromise === readyPromise) this.workerReadyPromise = null
+          rejectReady(new Error('WebRTC worker closed before ready'))
+          return
+        }
         if (this.workerWin === win) {
           this.workerWin = null
-          this.workerReadyPromise = null
+          if (this.workerReadyPromise === readyPromise) {
+            this.workerReadyPromise = null
+          }
         }
       })
       win.loadFile(join(this.srcDir, 'webrtc-worker.html')).catch((err) => {
-        clearTimeout(timer)
-        this.ipcMain.removeListener('webrtc-worker:control', onReady)
-        rejectReady(err)
+        failOnce(err)
       })
     })
+    this.workerReadyPromise = readyPromise
 
-    return this.workerReadyPromise
+    return readyPromise
   }
 
-  handleWorkerControl(msg) {
+  handleWorkerControl(msg, ev = null) {
     if (!msg || msg.type === 'worker.ready') return
+    if (ev?.sender && this.workerWin && !this.workerWin.isDestroyed() && ev.sender !== this.workerWin.webContents) {
+      return
+    }
     if (msg.type === 'state' && (msg.state === 'closed' || msg.state === 'failed')) {
       this.activePeerIds.delete(msg.peerId)
       if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
@@ -166,8 +219,11 @@ export class DesktopWebRtcProxy {
     }
   }
 
-  handleWorkerBinary(payload) {
+  handleWorkerBinary(payload, ev = null) {
     if (!payload?.bytes || !this.activeSocket || this.activeSocket.destroyed) return
+    if (ev?.sender && this.workerWin && !this.workerWin.isDestroyed() && ev.sender !== this.workerWin.webContents) {
+      return
+    }
     try {
       this.activeSocket.write(encodeBinFrame(payload.peerId, payload.role, payload.bytes))
     } catch {}
@@ -177,8 +233,10 @@ export class DesktopWebRtcProxy {
     socket.setNoDelay(true)
     let authed = false
     let buf = Buffer.alloc(0)
+    let frameQueue = Promise.resolve()
 
     const processFrame = async (kind, payload) => {
+      if (socket.destroyed) return
       if (!authed) {
         if (kind !== FRAME_JSON) {
           socket.destroy()
@@ -219,7 +277,7 @@ export class DesktopWebRtcProxy {
             win.webContents.send('webrtc-worker:cmd', cmd)
           }
         } catch (err) {
-          if (cmd.reqId) {
+          if (cmd.reqId && !socket.destroyed) {
             socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }))
           }
         }
@@ -232,7 +290,7 @@ export class DesktopWebRtcProxy {
         if (payload.length < 2 + pidLen) return
         const peerId = payload.subarray(1, 1 + pidLen).toString('utf8')
         const role = payload[1 + pidLen] === 1 ? 'bulk' : 'ctrl'
-        const bytes = payload.subarray(2 + pidLen)
+        const bytes = Buffer.from(payload.subarray(2 + pidLen))
         if (this.workerWin && !this.workerWin.isDestroyed()) {
           this.workerWin.webContents.send('webrtc-worker:send-binary', { peerId, role, bytes })
         }
@@ -249,9 +307,13 @@ export class DesktopWebRtcProxy {
         }
         if (buf.length < 4 + len) break
         const kind = buf[4]
-        const payload = buf.subarray(5, 4 + len)
+        const payload = Buffer.from(buf.subarray(5, 4 + len))
         buf = buf.subarray(4 + len)
-        void processFrame(kind, payload)
+        frameQueue = frameQueue
+          .then(() => processFrame(kind, payload))
+          .catch((err) => {
+            this.log.warn?.(`[webrtc-proxy] frame error: ${String(err?.message || err)}`)
+          })
       }
     })
 

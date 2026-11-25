@@ -45,17 +45,40 @@ export class ElectronWebRtcClient {
 
   ensureConnected() {
     if (this.disposed) return Promise.reject(new Error('ElectronWebRtcClient disposed'))
-    if (this.socket && !this.socket.destroyed && this.connectPromise) {
+    if (this.socket && !this.socket.destroyed) {
+      return Promise.resolve(this.socket)
+    }
+    if (this.connectPromise) {
       return this.connectPromise
     }
-    this.connectPromise = new Promise((resolveConn, rejectConn) => {
+    const connPromise = new Promise((resolveConn, rejectConn) => {
       const sock = net.createConnection({ host: '127.0.0.1', port: this.port })
       sock.setNoDelay(true)
       let authed = false
+      let settled = false
       let buf = Buffer.alloc(0)
+
+      const rejectOnce = (err) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (this.connectPromise === connPromise) {
+          this.connectPromise = null
+        }
+        rejectConn(err)
+      }
+
+      const resolveOnce = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.socket = sock
+        resolveConn(sock)
+      }
+
       const timer = setTimeout(() => {
         try { sock.destroy() } catch {}
-        rejectConn(new Error('Electron WebRTC proxy connect timeout'))
+        rejectOnce(new Error('Electron WebRTC proxy connect timeout'))
       }, 8_000)
 
       sock.on('connect', () => {
@@ -80,9 +103,7 @@ export class ElectronWebRtcClient {
             try { msg = JSON.parse(payload.toString('utf8')) } catch { continue }
             if (!authed && msg.type === 'auth.ok') {
               authed = true
-              this.socket = sock
-              clearTimeout(timer)
-              resolveConn(sock)
+              resolveOnce()
               continue
             }
             this.handleMessage(msg)
@@ -100,14 +121,20 @@ export class ElectronWebRtcClient {
       })
 
       sock.on('error', (err) => {
-        clearTimeout(timer)
-        if (!authed) rejectConn(err)
+        if (!authed) {
+          rejectOnce(err)
+        }
       })
 
       sock.on('close', () => {
         clearTimeout(timer)
-        if (this.socket === sock) {
-          this.socket = null
+        if (!authed) {
+          rejectOnce(new Error('Electron WebRTC proxy closed during auth'))
+          return
+        }
+        if (this.socket !== sock) return
+        this.socket = null
+        if (this.connectPromise === connPromise) {
           this.connectPromise = null
         }
         for (const [reqId, p] of this.pendingReqs.entries()) {
@@ -120,7 +147,8 @@ export class ElectronWebRtcClient {
         }
       })
     })
-    return this.connectPromise
+    this.connectPromise = connPromise
+    return connPromise
   }
 
   handleMessage(msg) {
@@ -141,6 +169,9 @@ export class ElectronWebRtcClient {
 
   async sendCommand(cmd, expectReply = false) {
     const sock = await this.ensureConnected()
+    if (!sock || sock.destroyed) {
+      throw new Error('Electron WebRTC proxy closed')
+    }
     if (!expectReply) {
       sock.write(encodeJsonFrame(cmd))
       return null

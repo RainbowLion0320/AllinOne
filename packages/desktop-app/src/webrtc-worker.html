@@ -29,9 +29,13 @@
     if (role === 'ctrl') entry.ctrl = dc
     else entry.bulk = dc
 
-    dc.onopen = () => {
+    let openSent = false
+    const notifyOpen = () => {
+      if (openSent) return
+      openSent = true
       api.sendControl({ type: 'dc.open', peerId, role })
     }
+    dc.onopen = notifyOpen
     dc.onclose = () => {
       api.sendControl({ type: 'dc.close', peerId, role })
     }
@@ -53,6 +57,11 @@
     dc.onbufferedamountlow = () => {
       api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0 })
     }
+    // Per W3C WebRTC spec, remote-created DataChannels delivered via ondatachannel
+    // often arrive already in 'open' state and never fire an 'open' event.
+    if (dc.readyState === 'open') {
+      notifyOpen()
+    }
   }
 
   api.onCommand(async (cmd) => {
@@ -62,12 +71,17 @@
         closePeer(peerId)
         const iceServers = Array.isArray(cmd.iceServers) ? cmd.iceServers : []
         const pc = new RTCPeerConnection({ iceServers })
-        const entry = { pc, ctrl: null, bulk: null, pendingIce: [] }
+        const entry = { pc, ctrl: null, bulk: null, pendingIce: [], localIceQueue: [], answerSent: false }
         peers.set(peerId, entry)
 
         pc.onicecandidate = (ev) => {
           if (ev.candidate) {
-            api.sendControl({ type: 'ice', peerId, candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate })
+            const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
+            if (!entry.answerSent) {
+              entry.localIceQueue.push(candidate)
+              return
+            }
+            api.sendControl({ type: 'ice', peerId, candidate })
           }
         }
         pc.onconnectionstatechange = () => {
@@ -88,7 +102,13 @@
 
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: answer.sdp } })
+        const finalSdp = pc.localDescription?.sdp || answer.sdp
+        api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: finalSdp } })
+        entry.answerSent = true
+        for (const candidate of entry.localIceQueue) {
+          api.sendControl({ type: 'ice', peerId, candidate })
+        }
+        entry.localIceQueue = []
         return
       }
 
