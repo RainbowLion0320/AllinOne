@@ -5,13 +5,16 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
-packages/mobile-app/android/
 packages/mobile-app/ios/
 *.apk
+*.jks
+*.keystore
+*.p12
 packages/relay-server/data/
 packages/dsh-mobile-hub/*.status.json
 packages/dsh-mobile-hub/cordis.patch.yml
 packages/mobile-app/public/downloads/allinone-bridge.mjs
+packages/mobile-app/release/
 packages/desktop-app/release/
 packages/desktop-app/renderer/
 packages/desktop-app/bridge-runtime/

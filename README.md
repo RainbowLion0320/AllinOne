@@ -355,21 +355,19 @@ npm run pack:mac   # 输出 packages/desktop-app/release/*.dmg
 npm run pack:win   # 输出 packages/desktop-app/release/*.exe（在 Windows 运行）
 ```
 
-也可以在你 Fork 的仓库里通过 **Actions → Build Desktop Installers → Run workflow** 填入 `relay_url`，由 GitHub Actions 自动产出双端安装包。
+也可以在你 Fork 的仓库里通过 **Actions → Build Desktop & Android Installers → Run workflow** 填入 `relay_url`，由 GitHub Actions 自动产出 macOS / Windows / Android 三端安装包。
 
 </details>
 
 <details>
 <summary>3. Capacitor Android 手机壳、DeepSeek Harness 插件与环境变量</summary>
 
-- **Capacitor Android 手机壳**：将 `packages/mobile-app/capacitor.config.json` 中的 `server.url` 改为你的 HTTPS 地址后执行：
+- **Capacitor Android 手机壳**：每次打 `v*` 标签发版时，GitHub Actions 会自动同步版本号并构建签名 `All-in-One-Android.apk` 上传到 Release（支持 App 内摄像头扫码同步 E2EE 密钥与自动热更新界面）。如需本地自行构建，设置 `PUBLIC_RELAY_URL=https://你的服务器` 后执行：
   ```bash
-  cd packages/mobile-app
-  npm run build
-  npx cap add android   # 首次初始化 Android 工程时执行
-  npx cap sync android
-  npx cap open android
+  npm run prepare:android
+  cd packages/mobile-app/android && ./gradlew assembleRelease
   ```
+  > 在 GitHub Secrets 中配置 `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 即可固定 Release 签名证书，后续版本无缝覆盖升级；未配置 `PUBLIC_RELAY_URL` 或传入 `ANDROID_BUNDLED_UI=1` 时自动打包为独立离线本地资源 APK。
 - **DeepSeek Harness 本地 IPC 与手动插件模式**：All in One 桌面端/桥接器检测到本机已安装 DeepSeek Harness（`~/.dsh/profiles/desktop`）时，会自动安装零依赖本地环回 IPC 插件 `allinone-dsh-ipc`（`127.0.0.1` + 256-bit Bearer Token），无需终端配置，DSH 桌面端运行期间即可开箱即用读写与切模型。如需高级手动挂载完整 `dsh-mobile-hub`，可复制 `packages/dsh-mobile-hub/cordis.patch.example.yml` 为 `cordis.patch.yml` 并填入配置，在 `~/.dsh/profiles/desktop/package.json` 链接 `dsh-mobile-hub` 并加入 `dsh.profile.bundles`，重启 DSH 生效。
 - **关闭后台自动补装 CLI 与 DSH 本地 IPC 自动安装**：设置环境变量 `ALLINONE_NO_AUTOFIX=1`。
 
@@ -387,7 +385,7 @@ AllinOne/
 │   ├── mobile-app/      # React + Tailwind + Vite + PWA 前端（WebRTC P2P 与中继省流按需加载）
 │   └── desktop-app/     # Electron 桌面客户端、原生 libwebrtc worker (webrtc-proxy.js)、安全存储与安装包构建
 ├── deploy/              # Dockerfile / docker-compose.yml / Caddyfile / nginx.conf / install.sh
-├── scripts/             # 桥接打包器与 38 项端到端冒烟与安全测试套件
+├── scripts/             # 桥接打包器与 16 组端到端冒烟与安全测试套件
 └── .github/workflows/   # CI 测试、Docker GHCR 推送与多端发版工作流
 ```
 
