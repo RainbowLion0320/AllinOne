@@ -116,7 +116,7 @@ function ComposerAttachmentChip({ att, onRemove }) {
 
   if (isImg && thumbSrc) {
     return (
-      <div className="relative flex h-14 w-14 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 shadow-2xs dark:border-slate-700 dark:bg-[#232630]">
+      <div className="animate-chip-in relative flex h-14 w-14 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 shadow-2xs dark:border-slate-700 dark:bg-[#232630]">
         <img
           src={thumbSrc}
           alt={att.filename}
@@ -135,7 +135,7 @@ function ComposerAttachmentChip({ att, onRemove }) {
   }
 
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#232630] dark:text-slate-200">
+    <span className="animate-chip-in inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-700 dark:border-slate-700 dark:bg-[#232630] dark:text-slate-200">
       <span className="max-w-[140px] truncate">{att.filename}</span>
       <button
         type="button"
@@ -562,7 +562,7 @@ export function Composer({
             ref={slashListRef}
             role="listbox"
             aria-label={bi('斜杠命令', 'Slash commands')}
-            className="absolute right-0 bottom-full left-0 z-30 mb-2 max-h-72 overflow-y-auto rounded-2xl border border-slate-200/90 bg-white p-1.5 shadow-xl dark:border-slate-700/80 dark:bg-[#1C1E26]"
+            className="animate-pop-up absolute right-0 bottom-full left-0 z-30 mb-2 max-h-72 overflow-y-auto rounded-2xl border border-slate-200/90 bg-white p-1.5 shadow-xl dark:border-slate-700/80 dark:bg-[#1C1E26]"
           >
             {slashOptions.map((item, idx) => {
               const active = idx === slashIdx
@@ -606,7 +606,7 @@ export function Composer({
         )}
 
         {inlineError && (
-          <div className="mb-2 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
+          <div className="animate-reveal-down mb-2 flex items-center justify-between gap-2 rounded-xl bg-rose-50 px-3 py-1.5 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
             <span className="min-w-0 flex-1 truncate">{inlineError}</span>
             <button type="button" onClick={() => setInlineError('')} className="shrink-0 p-0.5 hover:opacity-75">
               <X className="h-3.5 w-3.5" />
@@ -632,10 +632,10 @@ export function Composer({
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
-          className={`rounded-[26px] border px-3.5 pt-2.5 pb-2 shadow-xs transition ${
+          className={`rounded-[26px] border px-3.5 pt-2.5 pb-2 shadow-xs transition-all duration-200 ${
             draggingFiles
               ? 'border-[#4D6BFE] bg-[#F0F4FF] ring-2 ring-[#4D6BFE]/20 dark:border-[#4D6BFE] dark:bg-[#22283C]'
-              : 'border-slate-200/90 bg-[#F4F6FA] focus-within:border-[#4D6BFE]/60 focus-within:bg-white dark:border-slate-700/80 dark:bg-[#21232B] dark:focus-within:bg-[#242731]'
+              : 'border-slate-200/90 bg-[#F4F6FA] focus-within:border-[#4D6BFE]/65 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(77,107,254,0.12)] dark:border-slate-700/80 dark:bg-[#21232B] dark:focus-within:bg-[#242731] dark:focus-within:shadow-[0_0_0_3px_rgba(77,107,254,0.18)]'
           }`}
         >
           <textarea
@@ -715,7 +715,7 @@ export function Composer({
                   type="button"
                   onClick={onInterrupt}
                   aria-label={bi('停止生成', 'Stop generating')}
-                  className="flex h-8 w-8 items-center justify-center rounded-full bg-rose-500 text-white shadow-xs transition active:scale-95"
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-rose-500 text-white shadow-xs transition-all duration-150 hover:scale-105 hover:bg-rose-600 active:scale-95"
                 >
                   <Square className="h-3.5 w-3.5 fill-current" />
                 </button>
@@ -725,7 +725,7 @@ export function Composer({
                   disabled={!canSend}
                   onClick={handleSubmit}
                   aria-label={bi('发送', 'Send')}
-                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[#4D6BFE] text-white shadow-xs transition active:scale-95 disabled:bg-slate-300 dark:disabled:bg-slate-700"
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[#4D6BFE] text-white shadow-xs transition-all duration-150 hover:scale-105 hover:bg-[#3B59ED] hover:shadow-md hover:shadow-[#4D6BFE]/30 active:scale-95 disabled:scale-100 disabled:bg-slate-300 disabled:shadow-none dark:disabled:bg-slate-700"
                 >
                   <ArrowUp className="h-4.5 w-4.5 stroke-[2.5]" />
                 </button>

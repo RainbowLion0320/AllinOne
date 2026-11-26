@@ -117,7 +117,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
     return (
       <form
         onSubmit={handleSubmit}
-        className="rounded-2xl border border-[#4D6BFE]/40 bg-[#F4F7FF]/95 p-3.5 shadow-sm dark:border-[#4D6BFE]/45 dark:bg-[#1C2338]/90"
+        className="animate-msg-in rounded-2xl border border-[#4D6BFE]/40 bg-[#F4F7FF]/95 p-3.5 shadow-sm dark:border-[#4D6BFE]/45 dark:bg-[#1C2338]/90"
       >
         <div className="flex items-center gap-2">
           {prompt.app ? (
@@ -281,7 +281,7 @@ export function InteractivePromptCard({ prompt, onResolve }) {
 
   // URL elicitation or standard command / file_change / permissions approval card
   return (
-    <div className="rounded-2xl border border-amber-300/80 bg-amber-50/90 p-3.5 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/35">
+    <div className="animate-msg-in rounded-2xl border border-amber-300/80 bg-amber-50/90 p-3.5 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/35">
       <div className="flex items-center gap-2 text-xs font-bold text-amber-900 dark:text-amber-200">
         {prompt.app ? (
           <VendorBadge app={prompt.app} size="xs" />

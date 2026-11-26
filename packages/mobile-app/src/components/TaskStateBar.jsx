@@ -85,7 +85,7 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
       role="dialog"
       aria-modal="true"
       aria-label={planDoc?.title || 'Plan'}
-      className="fixed inset-0 z-[92] flex flex-col bg-white dark:bg-[#16181F]"
+      className="animate-fullscreen-in fixed inset-0 z-[92] flex flex-col bg-white dark:bg-[#16181F]"
     >
       <div
         className={`${
@@ -358,11 +358,11 @@ export function TaskStateBar({ sessionId = '', taskState = null, running = false
             )}
 
             {canExpand && (
-              expanded ? (
-                <ChevronUp className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-              )
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform duration-200 ${
+                  expanded ? 'rotate-180' : ''
+                }`}
+              />
             )}
           </button>
 
@@ -381,7 +381,7 @@ export function TaskStateBar({ sessionId = '', taskState = null, running = false
 
         {/* Expanded detail drawer */}
         {expanded && canExpand && (
-          <div className="space-y-2 border-t border-slate-200/60 px-3.5 pt-2 pb-2.5 dark:border-slate-800/80">
+          <div className="animate-reveal-down space-y-2 border-t border-slate-200/60 px-3.5 pt-2 pb-2.5 dark:border-slate-800/80">
             {goal && (
               <div className="flex items-start gap-2 text-xs">
                 <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${goalBadge.cls}`}>

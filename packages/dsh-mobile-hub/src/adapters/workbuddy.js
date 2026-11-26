@@ -43,6 +43,8 @@ const WORKBUDDY_LIST_DISCOVERY_INTERVAL_MS = 15_000
 const WORKBUDDY_TRACKED_LIST_LIMIT = 20
 const WORKBUDDY_TAIL_PROBE_BYTES = 64 * 1024
 const WORKBUDDY_TAIL_PROBE_MAX_BYTES = 512 * 1024
+const WORKBUDDY_QUOTA_CACHE_TTL_MS = 2 * 60 * 1_000
+const WORKBUDDY_QUOTA_TIMEOUT_MS = 4_500
 const WORKBUDDY_MAX_FULL_PARSE_BYTES = 32 * 1024 * 1024
 const WORKBUDDY_TAIL_FALLBACK_BYTES = 4 * 1024 * 1024
 
@@ -212,6 +214,221 @@ export function hasStandaloneCodebuddyAuth({ authDir = '', env = process.env } =
     }
   } catch {}
   return false
+}
+
+/**
+ * Read the signed-in standalone CodeBuddy CLI OAuth credential file (`*.info`, excluding
+ * WorkBuddy Desktop's Electron-encrypted `workbuddy-desktop*.info`) strictly for querying
+ * official read-only billing/credits summary. Never logs or exposes the access token.
+ */
+export function readStandaloneCodebuddyCredential({ authDir = '', env = process.env } = {}) {
+  const dir = authDir || getCodebuddyAuthDir({ env })
+  if (!dir || !existsSync(dir)) return null
+  try {
+    const names = readdirSync(dir)
+    const candidates = []
+    for (const name of names) {
+      if (!name.endsWith('.info')) continue
+      const lower = name.toLowerCase()
+      if (lower.startsWith('workbuddy-desktop')) continue
+      if (/\.\d{4}-\d{2}-\d{2}t\d{2}-\d{2}-\d{2}/i.test(lower)) continue
+      const full = join(dir, name)
+      if (existsSync(`${full}.logout`)) continue
+      let st
+      try {
+        st = statSync(full)
+        if (!st.isFile() || st.size <= 2 || st.size > 256 * 1024) continue
+      } catch {
+        continue
+      }
+      candidates.push({ full, mtimeMs: st.mtimeMs })
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    for (const item of candidates) {
+      let data
+      try {
+        data = JSON.parse(readFileSync(item.full, 'utf8'))
+      } catch {
+        continue
+      }
+      const accessToken = String(data?.auth?.accessToken || '').trim()
+      if (!accessToken || accessToken.length < 16) continue
+      const rawDomain = String(data?.auth?.domain || 'www.codebuddy.cn').trim().replace(/^https?:\/\//i, '').replace(/\/+.*$/, '')
+      const domain = rawDomain || 'www.codebuddy.cn'
+      if (!isSafeWorkbuddyAuthUrl(`https://${domain}/`)) continue
+      const uid = String(data?.account?.uid || '').trim()
+      const enterpriseId = String(data?.account?.enterpriseId || '').trim()
+      const accountType = String(data?.account?.type || 'personal').trim()
+      return {
+        accessToken,
+        domain,
+        uid,
+        enterpriseId,
+        accountType,
+      }
+    }
+  } catch {}
+  return null
+}
+
+function roundCredit(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return 0
+  return Math.round(v * 10) / 10
+}
+
+/**
+ * Normalize Tencent WorkBuddy / CodeBuddy personal (`get-user-resource-summary`) or
+ * enterprise (`get-enterprise-user-usage`) billing responses into All in One's unified quota shape.
+ */
+export function normalizeWorkbuddyCreditsQuota(rawPayload, { isEnterprise = false } = {}) {
+  if (!rawPayload || typeof rawPayload !== 'object') return null
+  const data = rawPayload?.data?.data || rawPayload?.data || rawPayload
+  if (!data || typeof data !== 'object') return null
+
+  if (isEnterprise || typeof data.limitNum === 'number') {
+    const limitNum = Number(data.limitNum)
+    if (!Number.isFinite(limitNum)) return null
+    const resetsAt = data.cycleResetTime ? toEpochMs(data.cycleResetTime) : 0
+    if (limitNum === -1) {
+      return {
+        windowKind: 'credits',
+        remainingPercent: 100,
+        usedPercent: 0,
+        creditsRemaining: null,
+        creditsTotal: null,
+        creditsUsed: roundCredit(data.credit || 0),
+        unlimited: true,
+        planType: 'Enterprise',
+        resetsAt,
+        updatedAt: Date.now(),
+      }
+    }
+    if (limitNum <= 0) return null
+    const used = Math.max(0, roundCredit(data.credit || 0))
+    const remaining = Math.max(0, roundCredit(limitNum - used))
+    const remainingPercent = Math.max(0, Math.min(100, Math.round((remaining / limitNum) * 100)))
+    return {
+      windowKind: 'credits',
+      remainingPercent,
+      usedPercent: Math.max(0, Math.min(100, 100 - remainingPercent)),
+      creditsRemaining: remaining,
+      creditsTotal: roundCredit(limitNum),
+      creditsUsed: used,
+      unlimited: false,
+      planType: 'Enterprise',
+      resetsAt,
+      updatedAt: Date.now(),
+    }
+  }
+
+  const groups = Array.isArray(data.CreditGroups) ? data.CreditGroups : []
+  const packages = Array.isArray(data.Packages) ? data.Packages : []
+  const sourceList = groups.length > 0 ? groups : packages
+  const hasExplicitTotalCredits =
+    data.TotalCredits !== undefined &&
+    data.TotalCredits !== null &&
+    String(data.TotalCredits).trim() !== '' &&
+    Number.isFinite(Number(data.TotalCredits))
+  if (sourceList.length === 0 && !hasExplicitTotalCredits) return null
+
+  let totalSum = 0
+  let usedSum = 0
+  let remainSum = 0
+  const creditGroups = []
+  for (const g of sourceList) {
+    if (!g || typeof g !== 'object') continue
+    const gTotal = Number(g.CycleTotalCapacity) || 0
+    const gUsed = Number(g.CycleUsedCapacity) || 0
+    const gRemain = Number(g.CycleRemainCapacity) || 0
+    totalSum += gTotal
+    usedSum += gUsed
+    remainSum += gRemain
+    if (g.Name && (gTotal > 0 || gRemain > 0)) {
+      creditGroups.push({
+        kind: String(g.Kind || ''),
+        name: String(g.Name),
+        remaining: roundCredit(gRemain),
+        total: roundCredit(gTotal),
+      })
+    }
+  }
+
+  const remaining = Math.max(0, roundCredit(hasExplicitTotalCredits ? Number(data.TotalCredits) : remainSum))
+  const used = Math.max(0, roundCredit(usedSum))
+  const total = roundCredit(totalSum > 0 ? totalSum : (remaining + used))
+  const remainingPercent =
+    total > 0
+      ? Math.max(0, Math.min(100, Math.round((remaining / total) * 100)))
+      : (remaining > 0 ? 100 : 0)
+  const planType = String(
+    data.SubscriptionPackageName || (data.IsPaidUser ? 'Pro' : 'Free'),
+  ).trim()
+
+  return {
+    windowKind: 'credits',
+    remainingPercent,
+    usedPercent: Math.max(0, Math.min(100, 100 - remainingPercent)),
+    creditsRemaining: remaining,
+    creditsTotal: total,
+    creditsUsed: used,
+    unlimited: false,
+    planType,
+    creditGroups,
+    resetsAt: 0,
+    updatedAt: Date.now(),
+  }
+}
+
+export async function fetchWorkbuddyCreditsQuota({
+  authDir = '',
+  env = process.env,
+  endpointOverride = '',
+  fetchImpl = globalThis.fetch,
+  timeoutMs = WORKBUDDY_QUOTA_TIMEOUT_MS,
+} = {}) {
+  if (typeof fetchImpl !== 'function') return null
+  const cred = readStandaloneCodebuddyCredential({ authDir, env })
+  if (!cred) return null
+
+  const isEnterprise = Boolean(cred.enterpriseId)
+  const baseUrl = endpointOverride
+    ? String(endpointOverride).replace(/\/+$/, '')
+    : `https://${cred.domain}`
+  if (!endpointOverride && !isSafeWorkbuddyAuthUrl(`${baseUrl}/`)) return null
+
+  const path = isEnterprise
+    ? '/v2/billing/meter/get-enterprise-user-usage'
+    : '/billing/meter/get-user-resource-summary'
+  const headers = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${cred.accessToken}`,
+    'Content-Type': 'application/json',
+    'X-Domain': cred.domain,
+    'Accept-Language': 'zh',
+    ...(cred.uid ? { 'X-User-Id': cred.uid } : {}),
+    ...(cred.enterpriseId ? { 'X-Enterprise-Id': cred.enterpriseId, 'X-Tenant-Id': cred.enterpriseId } : {}),
+  }
+
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  timer?.unref?.()
+  try {
+    const res = await fetchImpl(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers,
+      body: '{}',
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    if (!res?.ok) return null
+    const json = await res.json()
+    if (json && typeof json.code === 'number' && json.code !== 0) return null
+    return normalizeWorkbuddyCreditsQuota(json, { isEnterprise })
+  } catch {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function extractTextFromBlocks(content) {
@@ -1013,6 +1230,16 @@ export class WorkBuddyAdapter {
     this.cliCheckedAt = 0
     this.cliAuthenticated = false
     this.activeLoginSession = null
+    this.quotaCache = null
+    this.quotaCacheAt = 0
+    this.quotaFetchInFlight = null
+    this.quotaEndpointOverride = String(config.workbuddyQuotaEndpoint || '').trim()
+    this.fetchQuotaFn = typeof config.fetchWorkbuddyQuota === 'function'
+      ? config.fetchWorkbuddyQuota
+      : () => fetchWorkbuddyCreditsQuota({
+          authDir: this.authDir,
+          endpointOverride: this.quotaEndpointOverride,
+        })
     this.disposed = false
   }
 
@@ -1090,6 +1317,36 @@ export class WorkBuddyAdapter {
     return Boolean(cliVer && this.isCliAuthenticated())
   }
 
+  async refreshQuotaInBackground({ force = false } = {}) {
+    if (this.disposed) return this.quotaCache
+    const now = Date.now()
+    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < WORKBUDDY_QUOTA_CACHE_TTL_MS) {
+      return this.quotaCache
+    }
+    if (this.quotaFetchInFlight) return this.quotaFetchInFlight
+    const task = Promise.resolve()
+      .then(() => this.fetchQuotaFn())
+      .then((fresh) => {
+        if (this.disposed) return null
+        this.quotaCacheAt = Date.now()
+        if (fresh) {
+          this.quotaCache = fresh
+          this.emitEvent(EVENTS.BRIDGE_STATUS, {
+            type: 'quota.updated',
+            app: APPS.WORKBUDDY,
+            quota: fresh,
+          })
+        }
+        return this.quotaCache
+      })
+      .catch(() => this.quotaCache)
+      .finally(() => {
+        if (this.quotaFetchInFlight === task) this.quotaFetchInFlight = null
+      })
+    this.quotaFetchInFlight = task
+    return task
+  }
+
   async getStatus() {
     const cliVersion = await this.probeCliVersion({ force: true })
     const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
@@ -1099,6 +1356,30 @@ export class WorkBuddyAdapter {
     const authenticated = cliInstalled && this.isCliAuthenticated()
     const writable = cliInstalled && authenticated
     const sessionCount = dbSnap.sessionsById.size
+
+    let quota = this.quotaCache
+    if (authenticated || hasStandaloneCodebuddyAuth({ authDir: this.authDir })) {
+      const now = Date.now()
+      const stale = !quota || now - this.quotaCacheAt >= WORKBUDDY_QUOTA_CACHE_TTL_MS
+      if (stale) {
+        const refreshPromise = this.refreshQuotaInBackground()
+        if (!quota) {
+          // On cold start give the lightweight summary API up to 1.8s so the first sidebar render shows credits immediately
+          let t = null
+          try {
+            quota = await Promise.race([
+              refreshPromise,
+              new Promise((r) => {
+                t = setTimeout(() => r(null), 1_800)
+                t.unref?.()
+              }),
+            ])
+          } finally {
+            if (t) clearTimeout(t)
+          }
+        }
+      }
+    }
 
     const setupState = writable
       ? 'ready'
@@ -1127,6 +1408,7 @@ export class WorkBuddyAdapter {
       loginInProgress: Boolean(this.activeLoginSession),
       detail,
       activeCount: this.activeProcs.size,
+      ...(quota ? { quota } : {}),
     }
   }
 
@@ -1412,6 +1694,7 @@ export class WorkBuddyAdapter {
         }
         if (this.isCliAuthenticated()) {
           this.cliAuthenticated = true
+          void this.refreshQuotaInBackground({ force: true })
           this.emitEvent(EVENTS.SESSION_UPDATED, {
             externalUpdate: true,
             authReady: true,
@@ -2417,6 +2700,7 @@ export class WorkBuddyAdapter {
           finalText,
           aborted: state.aborted,
         })
+        void this.refreshQuotaInBackground({ force: true })
       })
 
       const userFrame = JSON.stringify({

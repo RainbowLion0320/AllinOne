@@ -21,7 +21,11 @@ import {
   X,
 } from 'lucide-react'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
-import { computeSidebarVendorLayout } from '../lib/sidebarVendors.js'
+import {
+  computeSidebarVendorLayout,
+  formatQuotaBadgeText,
+  formatQuotaTooltip,
+} from '../lib/sidebarVendors.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang, translate } from '../lib/i18n.js'
 
@@ -121,14 +125,14 @@ function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSu
     <button
       type="button"
       onClick={onSelect}
-      className={`group flex w-full flex-col rounded-xl px-2.5 py-2 text-left transition ${
+      className={`group flex w-full flex-col rounded-xl px-2.5 py-2 text-left transition-all duration-150 active:scale-[0.985] ${
         isActive
           ? 'bg-[#E9EEFF] text-[#2842C9] dark:bg-[#273154] dark:text-white'
           : 'hover:bg-slate-200/50 dark:hover:bg-slate-800/60'
       }`}
     >
       <div className="flex items-center gap-2">
-        <VendorBadge app={session.app} size="xs" />
+        <VendorBadge app={session.app} size="xs" active={session.status === 'running' || hasPendingPrompt} />
         <span className="flex-1 truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
           {session.title}
         </span>
@@ -165,21 +169,6 @@ function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSu
   )
 }
 
-function formatResetShort(ts, lang) {
-  if (!ts || !Number.isFinite(ts)) return ''
-  try {
-    const d = new Date(ts)
-    if (Number.isNaN(d.getTime())) return ''
-    const mm = String(d.getMonth() + 1).padStart(2, '0')
-    const dd = String(d.getDate()).padStart(2, '0')
-    const hh = String(d.getHours()).padStart(2, '0')
-    const mi = String(d.getMinutes()).padStart(2, '0')
-    return lang === 'en' ? `Resets ${mm}/${dd} ${hh}:${mi}` : `${mm}/${dd} ${hh}:${mi} 重置`
-  } catch {
-    return ''
-  }
-}
-
 function getQuotaTone(remainingPercent) {
   if (remainingPercent >= 40) {
     return {
@@ -199,28 +188,6 @@ function getQuotaTone(remainingPercent) {
   }
 }
 
-function formatQuotaTooltip(label, quota, lang) {
-  if (!quota || typeof quota.remainingPercent !== 'number') return label
-  const planSuffix = quota.planType ? ` (${String(quota.planType).toUpperCase()})` : ''
-  const bucketPrefix = quota.bucketLabel ? `${quota.bucketLabel} ` : ''
-  const windowLabel =
-    quota.windowKind === 'weekly'
-      ? lang === 'en' ? `${bucketPrefix}Weekly left` : `${bucketPrefix}周额度剩余`
-      : lang === 'en' ? `${bucketPrefix}Quota left` : `${bucketPrefix}额度剩余`
-  const parts = [`${label}${planSuffix}`, `${windowLabel} ${quota.remainingPercent}%`]
-  if (quota.shortWindow && typeof quota.shortWindow.remainingPercent === 'number') {
-    const hrs = Math.max(1, Math.round((quota.shortWindow.windowMinutes || 300) / 60))
-    parts.push(
-      lang === 'en'
-        ? `${hrs}h left ${quota.shortWindow.remainingPercent}%`
-        : `${hrs}h剩余 ${quota.shortWindow.remainingPercent}%`,
-    )
-  }
-  const resetStr = formatResetShort(quota.resetsAt, lang)
-  if (resetStr) parts.push(resetStr)
-  return parts.join(' · ')
-}
-
 export function SidebarDrawer({
   open,
   onClose,
@@ -229,6 +196,7 @@ export function SidebarDrawer({
   activeSessionId,
   pendingApprovalSessionIds = null,
   onSelectSession,
+  onGoHome,
   onNewChat,
   filterApp: controlledFilterApp,
   onFilterAppChange,
@@ -402,14 +370,22 @@ export function SidebarDrawer({
             isMacDesktop ? 'pt-9' : 'pt-safe'
           }`}
         >
-          <div className="app-no-drag flex min-w-0 items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              onGoHome?.()
+              onClose()
+            }}
+            title={bi('回到主界面', 'Back to home')}
+            className="app-no-drag flex min-w-0 items-center gap-2.5 rounded-xl py-0.5 pr-2 text-left transition hover:opacity-85 active:scale-[0.98]"
+          >
             <img src="./icon-192.png" alt="All in One" className="h-7.5 w-7.5 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
             <div className="min-w-0">
               <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
                 All in One
               </div>
             </div>
-          </div>
+          </button>
 
           <div className="app-no-drag flex items-center gap-0.5">
             <button
@@ -508,7 +484,7 @@ export function SidebarDrawer({
 
         {/* Collapsible Search Input (toggled from top bar search icon) */}
         {searchOpen && (
-          <div className="px-4 pb-2">
+          <div className="animate-reveal-down px-4 pb-2">
             <div className="relative">
               <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
               <input
@@ -560,12 +536,13 @@ export function SidebarDrawer({
                 {inlineTabs.map((tab) => {
                   const active = filterApp === tab.id
                   const quota = tab.id !== 'all' ? tab.quota || null : null
-                  const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
+                  const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent ?? 100))) : null
                   const tone = pct !== null ? getQuotaTone(pct) : null
+                  const badgeText = quota ? formatQuotaBadgeText(quota, { compact: true, lang }) : ''
                   const tooltip = formatQuotaTooltip(tab.label, quota, lang)
 
-                  // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
-                  if (pct !== null && tone) {
+                  // Tiles WITH subscription quota or credits balance: rounded-square border is the progress ring!
+                  if (pct !== null && tone && badgeText) {
                     return (
                       <button
                         key={tab.id}
@@ -576,7 +553,7 @@ export function SidebarDrawer({
                           setMoreVendorsOpen(false)
                           setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
                         }}
-                        className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
+                        className={`group relative h-11 rounded-xl p-[2px] transition-all duration-150 hover:-translate-y-0.5 active:scale-95 ${
                           active ? 'shadow-xs' : ''
                         }`}
                         style={{
@@ -592,9 +569,9 @@ export function SidebarDrawer({
                             />
                           )}
                           <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                            <VendorIcon app={tab.id} size={16} />
+                            <VendorIcon app={tab.id} size={16} active={Boolean(tab.hasRunning)} />
                             <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
-                              {pct}%
+                              {badgeText}
                             </span>
                           </span>
                         </span>
@@ -612,7 +589,7 @@ export function SidebarDrawer({
                         setMoreVendorsOpen(false)
                         setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
                       }}
-                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition-all duration-150 hover:-translate-y-0.5 active:scale-95 ${
                         active
                           ? 'border-transparent shadow-xs'
                           : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
@@ -631,6 +608,7 @@ export function SidebarDrawer({
                         app={tab.id}
                         size={tab.id === 'all' ? 17 : 19}
                         mono={tab.id === 'all'}
+                        active={tab.id !== 'all' && Boolean(tab.hasRunning)}
                       />
                     </button>
                   )
@@ -657,9 +635,9 @@ export function SidebarDrawer({
                           style={{ backgroundColor: `${activeOverflowVendor.color}24` }}
                         />
                         <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                          <VendorIcon app={activeOverflowVendor.id} size={16} />
+                          <VendorIcon app={activeOverflowVendor.id} size={16} active={Boolean(activeOverflowVendor.hasRunning)} />
                           <span className={`text-[10px] leading-none font-semibold tabular-nums ${activeOverflowTone.text}`}>
-                            {activeOverflowPct}%
+                            {formatQuotaBadgeText(activeOverflowQuota, { compact: true, lang })}
                           </span>
                         </span>
                         <span
@@ -685,7 +663,7 @@ export function SidebarDrawer({
                         color: activeOverflowVendor.color,
                       }}
                     >
-                      <VendorIcon app={activeOverflowVendor.id} size={19} />
+                      <VendorIcon app={activeOverflowVendor.id} size={19} active={Boolean(activeOverflowVendor.hasRunning)} />
                       <span
                         aria-hidden="true"
                         className="pointer-events-none absolute top-0.5 right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-slate-900/12 text-slate-600 dark:bg-white/15 dark:text-slate-200"
@@ -723,7 +701,7 @@ export function SidebarDrawer({
                 <div
                   role="menu"
                   aria-label={bi('更多厂商', 'More tools')}
-                  className="absolute top-full right-4 z-30 mt-1 w-56 rounded-2xl border border-slate-200/90 bg-white/98 p-1.5 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#232631]/98"
+                  className="animate-pop-in absolute top-full right-4 z-30 mt-1 w-56 rounded-2xl border border-slate-200/90 bg-white/98 p-1.5 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#232631]/98"
                 >
                   <div className="px-2.5 pt-1 pb-1 text-[10.5px] font-medium text-slate-400 dark:text-slate-500">
                     {bi('更多厂商', 'More tools')}
@@ -754,7 +732,7 @@ export function SidebarDrawer({
                           }`}
                           style={active ? { backgroundColor: `${tab.color}1A` } : undefined}
                         >
-                          <VendorIcon app={tab.id} size={17} />
+                          <VendorIcon app={tab.id} size={17} active={Boolean(tab.hasRunning)} />
                           <span className="min-w-0 flex-1 truncate">{tab.label}</span>
                           {tab.hasRunning && (
                             <span
@@ -764,7 +742,7 @@ export function SidebarDrawer({
                           )}
                           {pct !== null && tone && (
                             <span className={`shrink-0 text-[10.5px] font-semibold tabular-nums ${tone.text}`}>
-                              {pct}%
+                              {formatQuotaBadgeText(tab.quota, { compact: false, lang })}
                             </span>
                           )}
                           {tab.sessionCount > 0 && (
@@ -807,7 +785,7 @@ export function SidebarDrawer({
                     />
                   </div>
                   <span className={`text-[11px] font-semibold tabular-nums ${tone.text}`}>
-                    {pct}%
+                    {formatQuotaBadgeText(soleQuotaTab.quota, { compact: false, lang, showTotal: true })}
                   </span>
                 </div>
               </div>
@@ -878,13 +856,13 @@ export function SidebarDrawer({
                       <button
                         type="button"
                         onClick={() => toggleProject(group.key, expanded)}
-                        className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left"
+                        className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left transition-colors hover:bg-slate-100/60 dark:hover:bg-slate-800/40"
                       >
-                        {expanded ? (
-                          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                        ) : (
-                          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                        )}
+                        <ChevronRight
+                          className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform duration-200 ${
+                            expanded ? 'rotate-90' : ''
+                          }`}
+                        />
                         {expanded ? (
                           <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
                         ) : (
@@ -917,7 +895,7 @@ export function SidebarDrawer({
                     </div>
 
                     {expanded && (
-                      <div className="space-y-0.5 border-t border-slate-100 px-1.5 py-1.5 dark:border-slate-800/80">
+                      <div className="animate-reveal-down space-y-0.5 border-t border-slate-100 px-1.5 py-1.5 dark:border-slate-800/80">
                         {group.items.map((s) => (
                           <SessionRow
                             key={s.id}
@@ -1006,7 +984,7 @@ export function SidebarDrawer({
                 }}
                 title={bi('显示本机二维码，供手机扫码同步', 'Show QR code for phone sync')}
                 aria-label={bi('连手机', 'Connect Phone')}
-                className="inline-flex h-9 shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE]/10 px-2.5 text-[11.5px] font-semibold text-[#3B59ED] transition hover:bg-[#4D6BFE]/18 active:scale-95 dark:bg-[#4D6BFE]/18 dark:text-[#9BB0FF] dark:hover:bg-[#4D6BFE]/28"
+                className="scan-btn-sweep scan-btn-sweep-subtle inline-flex h-9 shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE]/12 px-2.5 text-[11.5px] font-semibold text-[#3B59ED] ring-1 ring-[#4D6BFE]/22 transition-all duration-150 hover:bg-[#4D6BFE]/20 active:scale-95 dark:bg-[#4D6BFE]/20 dark:text-[#9BB0FF] dark:ring-[#4D6BFE]/35 dark:hover:bg-[#4D6BFE]/28"
               >
                 <QrCode className="h-3.5 w-3.5 shrink-0" />
                 <span>{bi('连手机', 'Phone')}</span>
@@ -1020,15 +998,16 @@ export function SidebarDrawer({
                 }}
                 title={bi('扫一扫（同步密钥 / 授权新设备）', 'Scan QR (Sync Key / Authorize Device)')}
                 aria-label={bi('扫一扫', 'Scan QR')}
-                className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition active:scale-95 ${
+                className={`scan-btn-sweep scan-btn-sweep-subtle relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ring-1 transition-all duration-150 hover:scale-105 active:scale-95 ${
                   e2eeLocked
-                    ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
-                    : 'text-slate-500 hover:bg-slate-200/70 hover:text-[#4D6BFE] dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-[#8CA3FF]'
+                    ? 'bg-amber-500/15 text-amber-600 ring-amber-500/35 hover:bg-amber-500/25 dark:text-amber-400'
+                    : 'bg-[#4D6BFE]/10 text-[#4D6BFE] ring-[#4D6BFE]/22 hover:bg-[#4D6BFE]/18 dark:bg-[#4D6BFE]/18 dark:text-[#8CA3FF] dark:ring-[#4D6BFE]/32 dark:hover:bg-[#4D6BFE]/26'
                 }`}
               >
-                <ScanLine className="h-4.5 w-4.5" />
+                <ScanLine className="relative z-10 h-4.5 w-4.5" />
+                <span aria-hidden="true" className="scan-btn-beam z-20" />
                 {e2eeLocked && (
-                  <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
+                  <span className="absolute top-1 right-1 z-30 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] animate-pulse-dot dark:ring-[#1B1D23]" />
                 )}
               </button>
             ) : null}

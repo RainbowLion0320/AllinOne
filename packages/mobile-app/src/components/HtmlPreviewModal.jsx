@@ -80,7 +80,7 @@ export function HtmlPreviewModal({ state, onClose }) {
       role="dialog"
       aria-modal="true"
       aria-label={filename}
-      className="fixed inset-0 z-[95] flex flex-col bg-white dark:bg-[#16181F]"
+      className="animate-fullscreen-in fixed inset-0 z-[95] flex flex-col bg-white dark:bg-[#16181F]"
     >
       {/* Top toolbar with proper notch / status-bar & macOS traffic-light safe area */}
       <div

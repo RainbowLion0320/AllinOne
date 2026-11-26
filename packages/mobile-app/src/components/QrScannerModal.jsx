@@ -364,7 +364,7 @@ export function QrScannerModal({ open, onClose, onDetected }) {
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-[70] flex flex-col bg-[#06080E] text-white">
+    <div className="animate-fullscreen-in fixed inset-0 z-[70] flex flex-col bg-[#06080E] text-white">
       {/* Top Bar */}
       <div className="pt-safe relative z-20 flex items-center justify-between px-4 pb-3">
         <button
@@ -420,8 +420,8 @@ export function QrScannerModal({ open, onClose, onDetected }) {
               <span className="absolute top-0 right-0 h-8 w-8 rounded-tr-3xl border-t-4 border-r-4 border-[#4D6BFE]" />
               <span className="absolute bottom-0 left-0 h-8 w-8 rounded-bl-3xl border-b-4 border-l-4 border-[#4D6BFE]" />
               <span className="absolute right-0 bottom-0 h-8 w-8 rounded-br-3xl border-r-4 border-b-4 border-[#4D6BFE]" />
-              {/* Subtle center pulse line */}
-              <div className="absolute inset-x-4 top-1/2 h-0.5 -translate-y-1/2 animate-pulse rounded-full bg-gradient-to-r from-transparent via-[#4D6BFE] to-transparent shadow-[0_0_12px_#4D6BFE]" />
+              {/* Sweeping laser scan beam */}
+              <div className="animate-qr-laser absolute inset-x-4 top-0 h-0.5 rounded-full bg-gradient-to-r from-transparent via-[#6C88FF] to-transparent shadow-[0_0_14px_2px_#4D6BFE]" />
             </div>
             <p className="mt-6 rounded-full bg-black/45 px-4 py-1.5 text-xs text-white/85 backdrop-blur-sm">
               {bi('对准二维码自动识别', 'Align QR code inside frame')}

@@ -24,6 +24,7 @@ import { extractDeliverableRefsFromMessage } from '../lib/deliverableFiles.js'
 import { ChatImageGallery } from './ChatImageGallery.jsx'
 import { ChatDeliverableList } from './ChatDeliverableList.jsx'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { formatQuotaBadgeText, formatQuotaTooltip } from '../lib/sidebarVendors.js'
 import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { TaskStateBar } from './TaskStateBar.jsx'
 import { useI18n } from '../lib/i18n.jsx'
@@ -38,14 +39,14 @@ function ThinkingBlock({ text, streaming }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-200/80 dark:bg-[#232630] dark:text-slate-300"
+        className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 transition-all duration-150 hover:bg-slate-200/80 active:scale-[0.98] dark:bg-[#232630] dark:text-slate-300"
       >
         <Brain className="h-3.5 w-3.5 text-[#4D6BFE]" />
         <span>{streaming ? bi('深度思考中...', 'Thinking...') : bi('已深度思考', 'Thought process')}</span>
-        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <ChevronRight className={`h-3.5 w-3.5 transition-transform duration-200 ${open ? 'rotate-90' : ''}`} />
       </button>
       {open && (
-        <div className="mt-2 border-l-2 border-slate-200 pl-3 text-[13px] leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-slate-500 dark:border-slate-700 dark:text-slate-400">
+        <div className="animate-reveal-down mt-2 border-l-2 border-slate-200 pl-3 text-[13px] leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-slate-500 dark:border-slate-700 dark:text-slate-400">
           {text}
         </div>
       )}
@@ -92,15 +93,11 @@ function ToolCallDetailRow({ tool }) {
         <span className="flex-1 truncate font-mono text-[11px] text-slate-500 dark:text-slate-400">
           {inputSummary.slice(0, 80)}
         </span>
-        {open ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-        )}
+        <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform duration-200 ${open ? 'rotate-90' : ''}`} />
       </button>
 
       {open && (
-        <div className="space-y-2 bg-slate-50/70 px-3 py-2 font-mono text-[11px] dark:bg-[#16181F]/80">
+        <div className="animate-reveal-down space-y-2 bg-slate-50/70 px-3 py-2 font-mono text-[11px] dark:bg-[#16181F]/80">
           {inputSummary && (
             <div>
               <div className="mb-0.5 text-[10px] font-semibold uppercase text-slate-400">{bi('参数', 'Input')}</div>
@@ -185,15 +182,11 @@ function ToolCallsGroup({ tools, totalToolCount = null, streaming = false }) {
             : bi(`${displayCount} 次工具 · ${summaryText}`, `${displayCount} tool${displayCount === 1 ? '' : 's'} · ${summaryText}`)}
         </span>
 
-        {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-70" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 opacity-70" />
-        )}
+        <ChevronRight className={`h-3.5 w-3.5 shrink-0 opacity-70 transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`} />
       </button>
 
       {expanded && (
-        <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200/80 bg-[#F8FAFC] dark:border-slate-700/80 dark:bg-[#1F222B]">
+        <div className="animate-reveal-down mt-2 overflow-hidden rounded-2xl border border-slate-200/80 bg-[#F8FAFC] dark:border-slate-700/80 dark:bg-[#1F222B]">
           {tools.map((t, idx) => (
             <ToolCallDetailRow key={t.id || `tool-${idx}`} tool={t} />
           ))}
@@ -338,7 +331,7 @@ export function ChatView({
   imageContext,
   onResolveApproval,
 }) {
-  const { bi, t } = useI18n()
+  const { lang, bi, t } = useI18n()
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
   const topSentinelRef = useRef(null)
@@ -805,10 +798,10 @@ export function ChatView({
         {/* Empty Greeting Screen */}
         {!loadingSession && !hasContent && (
           <div className="flex flex-col items-center pt-20 pb-8 text-center">
-            <div className="mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10">
+            <div className="animate-home-rise mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10 transition-transform duration-300 hover:scale-105">
               <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
             </div>
-            <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+            <h2 className="animate-home-rise text-lg font-bold text-slate-900 dark:text-white">
               {session ? session.title : 'All in One'}
             </h2>
 
@@ -832,17 +825,23 @@ export function ChatView({
                   })
                   if (detectedAppIds.length > 0) {
                     return (
-                      <div className="mt-5 flex flex-wrap justify-center gap-2">
+                      <div className="animate-home-rise-1 mt-5 flex flex-wrap justify-center gap-2">
                         {detectedAppIds.map((appId) => {
                           const info = appsStatus.find((a) => a.app === appId)
                           const am = APP_META[appId]
                           const online = info?.available
                           const rw = info?.writable
                           const selected = activeApp === appId
+                          const creditLabel =
+                            info?.quota?.windowKind === 'credits'
+                              ? formatQuotaBadgeText(info.quota, { compact: false, lang })
+                              : ''
+                          const pillTip = formatQuotaTooltip(am.shortName, info?.quota, lang)
                           return (
                             <button
                               key={appId}
                               type="button"
+                              title={pillTip}
                               onClick={() => onSelectApp?.(appId)}
                               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
                                 selected
@@ -852,6 +851,11 @@ export function ChatView({
                             >
                               <VendorIcon app={appId} size={13} />
                               <span>{am.shortName}</span>
+                              {creditLabel && (
+                                <span className="rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] leading-none font-semibold text-emerald-600 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-400">
+                                  {creditLabel}
+                                </span>
+                              )}
                               <span
                                 className={`h-1.5 w-1.5 rounded-full ${
                                   online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
@@ -877,7 +881,7 @@ export function ChatView({
                 })()}
 
                 {/* Explicit Project Directory Selector (prevents blind sends to unknown directories) */}
-                <div className="mt-6 w-full max-w-md">
+                <div className="animate-home-rise-2 mt-6 w-full max-w-md">
                   <div className="mb-2 text-[11px] font-medium text-slate-400 dark:text-slate-500">
                     {selectedWorkspace ? bi('目标项目', 'Target Project') : bi('请选择目标项目后开始对话', 'Select a project directory to start chatting')}
                   </div>
@@ -936,8 +940,8 @@ export function ChatView({
 
             {/* Live streaming assistant message */}
             {streamingState?.active && (
-              <div className="flex items-start gap-2.5">
-                <VendorBadge app={session?.app || 'dsh'} size="md" className="mt-0.5 shadow-2xs" />
+              <div className="animate-msg-in flex items-start gap-2.5">
+                <VendorBadge app={session?.app || 'dsh'} size="md" active={true} className="mt-0.5 shadow-2xs" />
                 <div className="min-w-0 flex-1">
                   {streamingState.thinking && (
                     <ThinkingBlock text={streamingState.thinking} streaming={true} />
@@ -967,8 +971,9 @@ export function ChatView({
 
             {/* External Desktop live-sync pulse (Antigravity / Codex / Claude Desktop currently generating) */}
             {!streamingState?.active && session?.syncState?.externalRunning && (
-              <div className="space-y-1.5 py-1">
+              <div className="animate-msg-in space-y-1.5 py-1">
                 <div className="flex items-center gap-2 text-xs text-slate-400 dark:text-slate-500">
+                  <VendorBadge app={session?.app || 'dsh'} size="xs" active={true} />
                   <Loader2 className="h-3.5 w-3.5 animate-spin text-[#4D6BFE]" />
                   <span>{bi('桌面端正在运行此对话，进度自动实时同步中...', 'Running on Desktop, syncing live progress...')}</span>
                 </div>
@@ -1019,7 +1024,7 @@ export function ChatView({
             isNearBottomRef.current = true
             scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
           }}
-          className="absolute right-4 bottom-3 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-slate-200/90 bg-white/95 text-slate-600 shadow-lg backdrop-blur-md transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/90 dark:bg-[#232630]/95 dark:text-slate-200"
+          className="animate-pop-up absolute right-4 bottom-3 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-slate-200/90 bg-white/95 text-slate-600 shadow-lg backdrop-blur-md transition-all duration-150 hover:-translate-y-0.5 hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700/90 dark:bg-[#232630]/95 dark:text-slate-200"
         >
           <ChevronDown className="h-4.5 w-4.5" />
         </button>

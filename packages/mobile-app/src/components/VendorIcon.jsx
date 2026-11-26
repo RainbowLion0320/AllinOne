@@ -83,7 +83,7 @@ export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {
  * Official brand vector icons for DeepSeek (DSH), OpenAI Codex, Anthropic Claude,
  * Google Antigravity, and Tencent WorkBuddy.
  */
-export function VendorIcon({ app, size = 18, className = '', mono = false }) {
+export function VendorIcon({ app, size = 18, className = '', mono = false, active = false }) {
   const color = mono ? 'currentColor' : APP_META[app]?.color || '#4D6BFE'
 
   if (app === 'all') {
@@ -115,10 +115,14 @@ export function VendorIcon({ app, size = 18, className = '', mono = false }) {
         draggable={false}
         decoding="async"
         aria-hidden="true"
-        style={{ width: size, height: size }}
+        style={{
+          width: size,
+          height: size,
+          ...(active ? { '--vendor-glow': APP_META[app]?.color || '#4D6BFE' } : {}),
+        }}
         className={`inline-block shrink-0 select-none object-contain ${
           app === 'workbuddy' ? 'rounded-[22%]' : ''
-        } ${className}`}
+        } ${active ? 'vendor-icon-live' : ''} ${className}`}
       />
     )
   }
@@ -148,13 +152,18 @@ const VENDOR_TINTS = {
 
 /**
  * Sleek tinted icon tile replacing old text badges ("DSH", "CDX", "CLD", "AGY").
+ * Pass `active={true}` for in-progress conversations to render a soft brand-colored breathing aura.
  */
-export function VendorBadge({ app, size = 'sm', className = '' }) {
+export function VendorBadge({ app, size = 'sm', active = false, className = '' }) {
   const cfg = BADGE_SIZES[size] || BADGE_SIZES.sm
   const tint = VENDOR_TINTS[app] || VENDOR_TINTS.dsh
+  const glowColor = APP_META[app]?.color || '#4D6BFE'
   return (
     <span
-      className={`inline-flex shrink-0 items-center justify-center ring-1 ring-inset ${cfg.box} ${tint} ${className}`}
+      style={active ? { '--vendor-glow': glowColor } : undefined}
+      className={`inline-flex shrink-0 items-center justify-center ring-1 ring-inset ${cfg.box} ${tint} ${
+        active ? 'vendor-badge-live' : ''
+      } ${className}`}
       title={APP_META[app]?.name || app}
     >
       <VendorIcon app={app} size={cfg.icon} />

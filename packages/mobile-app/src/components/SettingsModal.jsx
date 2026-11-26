@@ -391,11 +391,11 @@ export function SettingsModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center sm:p-4"
+      className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center sm:p-4"
       onClick={onClose}
     >
       <div
-        className="pb-safe flex max-h-[88vh] w-full max-w-md flex-col rounded-t-3xl bg-[#F8F9FC] shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
+        className="animate-sheet-in pb-safe flex max-h-[88vh] w-full max-w-md flex-col rounded-t-3xl bg-[#F8F9FC] shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

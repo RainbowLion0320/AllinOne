@@ -15,14 +15,130 @@ function toValidTimestamp(value) {
 }
 
 function getValidQuota(info) {
-  if (
-    info?.quota &&
-    typeof info.quota.remainingPercent === 'number' &&
-    Number.isFinite(info.quota.remainingPercent)
-  ) {
-    return info.quota
+  const q = info?.quota
+  if (!q || typeof q !== 'object') return null
+  if (typeof q.remainingPercent === 'number' && Number.isFinite(q.remainingPercent)) {
+    return q
+  }
+  if (q.windowKind === 'credits' && (q.unlimited || (typeof q.creditsRemaining === 'number' && Number.isFinite(q.creditsRemaining)))) {
+    return q
   }
   return null
+}
+
+export function formatCreditsExact(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return '0'
+  const rounded = Math.round(n * 10) / 10
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+}
+
+export function formatCreditsCompact(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return '0'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (n >= 10_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1).replace(/\.0$/, '')}k`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`
+  if (n >= 100) return String(Math.round(n))
+  return formatCreditsExact(n)
+}
+
+export function formatQuotaBadgeText(quota, { compact = true, lang = 'zh', showTotal = false } = {}) {
+  if (!quota || typeof quota !== 'object') return ''
+  if (quota.windowKind === 'credits') {
+    if (quota.unlimited) {
+      return compact ? '∞' : (lang === 'en' ? 'Unlimited' : '不限积分')
+    }
+    const rem = Number(quota.creditsRemaining)
+    if (Number.isFinite(rem)) {
+      if (compact) return formatCreditsCompact(rem)
+      const remStr = formatCreditsExact(rem)
+      const total = Number(quota.creditsTotal)
+      const unit = lang === 'en' ? (showTotal ? 'credits' : 'cr') : '积分'
+      if (showTotal && Number.isFinite(total) && total > 0) {
+        return `${remStr} / ${formatCreditsExact(total)} ${unit}`
+      }
+      return `${remStr} ${unit}`
+    }
+  }
+  if (typeof quota.remainingPercent === 'number' && Number.isFinite(quota.remainingPercent)) {
+    const pct = Math.max(0, Math.min(100, Math.round(quota.remainingPercent)))
+    return `${pct}%`
+  }
+  return ''
+}
+
+function formatResetShort(ts, lang) {
+  if (!ts || !Number.isFinite(ts)) return ''
+  try {
+    const d = new Date(ts)
+    if (Number.isNaN(d.getTime())) return ''
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    const hh = String(d.getHours()).padStart(2, '0')
+    const mi = String(d.getMinutes()).padStart(2, '0')
+    return lang === 'en' ? `Resets ${mm}/${dd} ${hh}:${mi}` : `${mm}/${dd} ${hh}:${mi} 重置`
+  } catch {
+    return ''
+  }
+}
+
+export function formatQuotaTooltip(label, quota, lang = 'zh') {
+  if (!quota || typeof quota !== 'object') return label
+  const planRaw = String(quota.planType || '').trim()
+  const planSuffix = planRaw ? ` (${/^[a-z0-9_-]+$/i.test(planRaw) ? planRaw.toUpperCase() : planRaw})` : ''
+
+  if (quota.windowKind === 'credits') {
+    const parts = [`${label}${planSuffix}`]
+    if (quota.unlimited) {
+      parts.push(lang === 'en' ? 'Credits: Unlimited' : '积分余额 不限')
+    } else if (typeof quota.creditsRemaining === 'number' && Number.isFinite(quota.creditsRemaining)) {
+      const remStr = formatCreditsExact(quota.creditsRemaining)
+      const total = Number(quota.creditsTotal)
+      const pctStr =
+        typeof quota.remainingPercent === 'number' && Number.isFinite(quota.remainingPercent)
+          ? ` (${Math.max(0, Math.min(100, Math.round(quota.remainingPercent)))}%)`
+          : ''
+      if (Number.isFinite(total) && total > 0) {
+        parts.push(
+          lang === 'en'
+            ? `Credits left ${remStr} / ${formatCreditsExact(total)}${pctStr}`
+            : `剩余积分 ${remStr} / ${formatCreditsExact(total)}${pctStr}`,
+        )
+      } else {
+        parts.push(lang === 'en' ? `Credits left ${remStr}` : `剩余积分 ${remStr}`)
+      }
+    }
+    if (Array.isArray(quota.creditGroups) && quota.creditGroups.length > 0) {
+      const grpParts = quota.creditGroups
+        .filter((g) => g?.name && Number.isFinite(Number(g.remaining)))
+        .slice(0, 3)
+        .map((g) => `${g.name} ${formatCreditsExact(g.remaining)}`)
+      if (grpParts.length > 0) parts.push(grpParts.join(' · '))
+    }
+    const resetStr = formatResetShort(quota.resetsAt, lang)
+    if (resetStr) parts.push(resetStr)
+    return parts.join(' · ')
+  }
+
+  if (typeof quota.remainingPercent !== 'number' || !Number.isFinite(quota.remainingPercent)) return label
+  const bucketPrefix = quota.bucketLabel ? `${quota.bucketLabel} ` : ''
+  const windowLabel =
+    quota.windowKind === 'weekly'
+      ? lang === 'en' ? `${bucketPrefix}Weekly left` : `${bucketPrefix}周额度剩余`
+      : lang === 'en' ? `${bucketPrefix}Quota left` : `${bucketPrefix}额度剩余`
+  const parts = [`${label}${planSuffix}`, `${windowLabel} ${quota.remainingPercent}%`]
+  if (quota.shortWindow && typeof quota.shortWindow.remainingPercent === 'number') {
+    const hrs = Math.max(1, Math.round((quota.shortWindow.windowMinutes || 300) / 60))
+    parts.push(
+      lang === 'en'
+        ? `${hrs}h left ${quota.shortWindow.remainingPercent}%`
+        : `${hrs}h剩余 ${quota.shortWindow.remainingPercent}%`,
+    )
+  }
+  const resetStr = formatResetShort(quota.resetsAt, lang)
+  if (resetStr) parts.push(resetStr)
+  return parts.join(' · ')
 }
 
 export function computeSidebarVendorLayout({

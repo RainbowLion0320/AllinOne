@@ -59,10 +59,8 @@ import {
 } from './lib/sessionCache.js'
 import {
   clearDraftsForScope,
-  loadLastSessionId,
   loadLastWorkspace,
   makeDraftKey,
-  saveLastSessionId,
   saveLastWorkspace,
 } from './lib/draftStore.js'
 import { LoginScreen } from './components/LoginScreen.jsx'
@@ -252,7 +250,6 @@ export function App() {
   const activeQuietSyncSeqRef = useRef(0)
   const quietSyncPendingRef = useRef('')
   const lastFocusSyncAtRef = useRef(0)
-  const autoOpenedScopeRef = useRef('')
   const toastTimerRef = useRef(null)
 
   const revokeAllSentPreviewUrls = useCallback(() => {
@@ -674,7 +671,6 @@ export function App() {
     setDraftDshPref(null)
     setSelectedDraftApp('')
     setSelectedDraftCwd('')
-    autoOpenedScopeRef.current = ''
     setWorkspaces([])
     setSessions([])
     setStreamingBySession({})
@@ -1219,7 +1215,6 @@ export function App() {
         setSelectedDraftCwd(sessionOrId.cwd)
       }
     }
-    saveLastSessionId(scope, id)
     if (isDifferentSession) {
       // Clear previous session's messages immediately so ChatView never measures stale scrollHeight
       messagesRef.current = []
@@ -1376,23 +1371,21 @@ export function App() {
     }
   }, [clearLiveStreamEntry, isStaleStreamForIdle, pruneUnusedSentPreviewUrls])
 
-  // Auto-resume the last active conversation (or most recent conversation) once per connected PC,
-  // so opening the app lands straight inside a real project conversation instead of an unscoped blank screen.
-  useEffect(() => {
-    if (connState !== 'connected' || !activeBridgeId || !cacheScope) return
-    if (sessions.length === 0) return
-    if (autoOpenedScopeRef.current === cacheScope) return
-    if (activeSessionRef.current) {
-      autoOpenedScopeRef.current = cacheScope
-      return
-    }
-    autoOpenedScopeRef.current = cacheScope
-    const savedId = loadLastSessionId(cacheScope)
-    const targetSess = (savedId && sessions.find((s) => s.id === savedId)) || sessions[0]
-    if (targetSess) {
-      void openSession(targetSess)
-    }
-  }, [connState, activeBridgeId, cacheScope, sessions, openSession])
+  // Return cleanly to the empty All in One home screen (without disturbing background streams)
+  const returnToHome = useCallback(() => {
+    openRequestSeqRef.current += 1
+    activeQuietSyncSeqRef.current += 1
+    loadingOlderLockRef.current = false
+    activeSessionRef.current = null
+    messagesRef.current = []
+    historyMetaRef.current = { hasMore: false, nextCursor: null, totalCount: null }
+    setActiveSession(null)
+    setMessages([])
+    setHistoryMeta({ hasMore: false, nextCursor: null, totalCount: null })
+    setOlderError('')
+    setLoadingSession(false)
+    setLoadingOlder(false)
+  }, [])
 
   // Restore last explicitly used project directory on the empty screen (only if still present on this PC)
   useEffect(() => {
@@ -2427,7 +2420,6 @@ export function App() {
     historyMetaRef.current = emptyMeta
     pruneUnusedSentPreviewUrls([])
     setActiveSession(created)
-    saveLastSessionId(cacheScopeRef.current, created.id)
     if (created.cwd) {
       saveLastWorkspace(cacheScopeRef.current, created.cwd)
       setSelectedDraftCwd(created.cwd)
@@ -2802,6 +2794,7 @@ export function App() {
         activeSessionId={activeSession?.id}
         pendingApprovalSessionIds={pendingApprovalSessionIds}
         onSelectSession={openSession}
+        onGoHome={returnToHome}
         filterApp={sidebarFilterApp}
         onFilterAppChange={setSidebarFilterApp}
         onNewChat={(cwdHint = '', appHint = '') => openNewChatModal(cwdHint, appHint)}
@@ -2852,7 +2845,15 @@ export function App() {
               onClick={() => setDrawerOpen(true)}
               className="flex max-w-full items-center gap-1.5 lg:pointer-events-none"
             >
-              <VendorBadge app={activeApp} size="xs" />
+              <VendorBadge
+                app={activeApp}
+                size="xs"
+                active={Boolean(
+                  currentStream?.active ||
+                    activeSession?.status === 'running' ||
+                    activeSession?.syncState?.externalRunning,
+                )}
+              />
               <span className="truncate text-[14.5px] font-semibold text-slate-900 dark:text-white">
                 {activeSession?.title || 'All in One'}
               </span>
@@ -3058,7 +3059,7 @@ export function App() {
         activeBridgeE2ee.shareableKey &&
         (!qrNudge.wantedKeyId || activeBridgeE2ee.shareableKeyId === qrNudge.wantedKeyId) &&
         !e2eeModal.open && (
-        <div className="flex flex-wrap items-center justify-center gap-2 border-b border-[#4D6BFE]/20 bg-[#EEF2FF] px-3 py-2 text-xs text-[#2842C9] dark:border-[#4D6BFE]/30 dark:bg-[#1C243C] dark:text-[#C5D3FF]">
+        <div className="animate-reveal-down flex flex-wrap items-center justify-center gap-2 border-b border-[#4D6BFE]/20 bg-[#EEF2FF] px-3 py-2 text-xs text-[#2842C9] dark:border-[#4D6BFE]/30 dark:bg-[#1C243C] dark:text-[#C5D3FF]">
           <span className="h-2 w-2 shrink-0 rounded-full bg-[#4D6BFE] animate-pulse" />
           <Smartphone className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
           <span>
@@ -3070,7 +3071,7 @@ export function App() {
           <button
             type="button"
             onClick={openDesktopQrModal}
-            className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white shadow-xs transition hover:bg-[#3B59ED] active:scale-95"
+            className="scan-btn-sweep inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white shadow-xs transition hover:bg-[#3B59ED] active:scale-95"
           >
             <QrCode className="h-3 w-3" />
             <span>{bi('一键显示二维码', 'Show QR Code')}</span>
@@ -3096,7 +3097,7 @@ export function App() {
         !phoneGuideDismissed &&
         !qrNudge &&
         !e2eeModal.open && (
-          <div className="flex flex-wrap items-center justify-center gap-2 border-b border-slate-200/70 bg-[#F4F7FF] px-3 py-2 text-xs text-slate-700 dark:border-slate-800 dark:bg-[#1A1F30] dark:text-slate-200">
+          <div className="animate-reveal-down flex flex-wrap items-center justify-center gap-2 border-b border-slate-200/70 bg-[#F4F7FF] px-3 py-2 text-xs text-slate-700 dark:border-slate-800 dark:bg-[#1A1F30] dark:text-slate-200">
             <Smartphone className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
             <span>
               {bi(
@@ -3107,7 +3108,7 @@ export function App() {
             <button
               type="button"
               onClick={openDesktopQrModal}
-              className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
+              className="scan-btn-sweep inline-flex shrink-0 items-center gap-1 rounded-lg bg-[#4D6BFE] px-2.5 py-1 text-[11px] font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
             >
               <QrCode className="h-3 w-3" />
               <span>{bi('显示二维码', 'Show QR')}</span>
@@ -3126,7 +3127,7 @@ export function App() {
       {/* Non-intrusive toast pill */}
       {toastMsg && (
         <div className="pointer-events-none fixed top-16 left-1/2 z-[60] -translate-x-1/2">
-          <div className="rounded-full bg-slate-900/90 px-4 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-md dark:bg-white/95 dark:text-slate-900">
+          <div className="animate-toast-in rounded-full bg-slate-900/90 px-4 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-md dark:bg-white/95 dark:text-slate-900">
             {toastMsg}
           </div>
         </div>
@@ -3135,7 +3136,7 @@ export function App() {
       {/* Main Chat Viewport (or E2EE Key Sync Lock Screen when bridge is E2EE-protected and key is not yet synced) */}
       {connState === 'connected' && bridgeOnline && e2eeLocked ? (
         <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
-          <div className="w-full max-w-sm rounded-3xl border border-slate-200/80 bg-slate-50/70 p-6 shadow-sm dark:border-slate-800 dark:bg-[#1C1F27]">
+          <div className="animate-sheet-in w-full max-w-sm rounded-3xl border border-slate-200/80 bg-slate-50/70 p-6 shadow-sm dark:border-slate-800 dark:bg-[#1C1F27]">
             <div className="mx-auto mb-3.5 flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-500">
               <Lock className="h-6 w-6" />
             </div>
@@ -3178,7 +3179,7 @@ export function App() {
                   <button
                     type="button"
                     onClick={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
-                    className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98]"
+                    className="scan-btn-sweep flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition hover:bg-[#3B59ED] active:scale-[0.98]"
                   >
                     <ScanLine className="h-4 w-4" />
                     <span>{bi('扫一扫二维码', 'Scan QR Code')}</span>

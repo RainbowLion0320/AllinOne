@@ -647,7 +647,7 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
 
   return (
     <div
-      className="fixed inset-0 z-[96] flex flex-col bg-[#080A0F]/96 text-white backdrop-blur-md select-none"
+      className="animate-fullscreen-in fixed inset-0 z-[96] flex flex-col bg-[#080A0F]/96 text-white backdrop-blur-md select-none"
       style={{ overscrollBehavior: 'contain' }}
     >
       {/* Top Bar */}

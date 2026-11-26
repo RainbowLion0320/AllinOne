@@ -557,11 +557,11 @@ export function E2eeSyncModal({
   return (
     <>
       <div
-        className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 backdrop-blur-[2px] sm:items-center sm:p-4"
+        className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/50 backdrop-blur-[2px] sm:items-center sm:p-4"
         onClick={onClose}
       >
         <div
-          className="pb-safe flex max-h-[90vh] w-full max-w-md flex-col rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
+          className="animate-sheet-in pb-safe flex max-h-[90vh] w-full max-w-md flex-col rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
@@ -667,11 +667,12 @@ export function E2eeSyncModal({
                       setError('')
                       setScannerOpen(true)
                     }}
-                    className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-2.5 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
+                    className="scan-btn-sweep scan-btn-sweep-subtle flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-2.5 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
                   >
                     <div className="flex min-w-0 items-center gap-2.5">
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
+                      <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
                         <ScanLine className="h-4 w-4" />
+                        <span aria-hidden="true" className="scan-btn-beam" />
                       </div>
                       <span className="truncate text-xs font-bold text-[#2842C9] dark:text-white">
                         {bi('扫一扫授权新设备', 'Scan to Authorize New Device')}
@@ -865,11 +866,12 @@ export function E2eeSyncModal({
                     setError('')
                     setScannerOpen(true)
                   }}
-                  className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-3 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
+                  className="scan-btn-sweep scan-btn-sweep-subtle flex w-full items-center justify-between gap-3 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-3.5 py-3 text-left transition hover:border-[#4D6BFE] hover:bg-[#E9EEFF] active:scale-[0.99] disabled:opacity-60 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]"
                 >
                   <div className="flex min-w-0 items-center gap-2.5">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
+                    <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE] text-white">
                       <ScanLine className="h-4.5 w-4.5" />
+                      <span aria-hidden="true" className="scan-btn-beam" />
                     </div>
                     <span className="truncate text-[13px] font-bold text-[#2842C9] dark:text-white">
                       {bi('扫一扫二维码', 'Scan QR Code')}

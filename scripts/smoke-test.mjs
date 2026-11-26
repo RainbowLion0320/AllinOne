@@ -81,8 +81,10 @@ import {
   cleanWorkbuddyUserText,
   hasStandaloneCodebuddyAuth,
   isSafeWorkbuddyAuthUrl,
+  normalizeWorkbuddyCreditsQuota,
   parseWorkbuddyJsonlMessages,
   probeWorkbuddyTranscriptTail,
+  readStandaloneCodebuddyCredential,
   readWorkbuddyDbSnapshot,
 } from '../packages/dsh-mobile-hub/src/adapters/workbuddy.js'
 import {
@@ -117,7 +119,11 @@ import {
 } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
 import { extractDeliverableRefsFromMessage } from '../packages/mobile-app/src/lib/deliverableFiles.js'
-import { computeSidebarVendorLayout } from '../packages/mobile-app/src/lib/sidebarVendors.js'
+import {
+  computeSidebarVendorLayout,
+  formatQuotaBadgeText,
+  formatQuotaTooltip,
+} from '../packages/mobile-app/src/lib/sidebarVendors.js'
 import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
 import {
   parseCompositeId as hubParseCompositeId,
@@ -3336,6 +3342,26 @@ async function main() {
       assert.equal(layout1.showBar, false)
       assert.equal(layout1.soleQuotaTab?.tab?.id, 'codex')
       assert.equal(layout1.soleQuotaTab?.quota?.remainingPercent, 88)
+
+      // Credit-based quota formatting & tooltips (WorkBuddy)
+      const wbCreditQuota = {
+        windowKind: 'credits',
+        remainingPercent: 99,
+        creditsRemaining: 791.8,
+        creditsTotal: 800,
+        planType: '体验版',
+        creditGroups: [
+          { name: '套餐基础积分', remaining: 491.8, total: 500 },
+          { name: '平台奖励积分', remaining: 300, total: 300 },
+        ],
+      }
+      assert.equal(formatQuotaBadgeText(wbCreditQuota, { compact: true, lang: 'zh' }), '792')
+      assert.equal(formatQuotaBadgeText(wbCreditQuota, { compact: false, lang: 'zh' }), '791.8 积分')
+      assert.equal(formatQuotaBadgeText(wbCreditQuota, { compact: false, lang: 'zh', showTotal: true }), '791.8 / 800 积分')
+      assert.equal(formatQuotaBadgeText({ windowKind: 'credits', creditsRemaining: 1500 }, { compact: true }), '1.5k')
+      assert.equal(formatQuotaBadgeText({ windowKind: 'credits', unlimited: true }, { compact: true }), '∞')
+      assert.ok(formatQuotaTooltip('WorkBuddy', wbCreditQuota, 'zh').includes('剩余积分 791.8 / 800 (99%)'))
+      assert.ok(formatQuotaTooltip('WorkBuddy', wbCreditQuota, 'en').includes('Credits left 791.8 / 800 (99%)'))
     }
     pass(11, 'Frontend guards (React Hooks, i18n parity, deviceStore LRU, scoped sessionCache, drafts & smart vendor bar)')
 
@@ -4829,6 +4855,36 @@ async function main() {
         mkdirSync(wbAuthDir, { recursive: true })
         writeFileSync(join(wbAuthDir, 'workbuddy-desktop.info'), '{"encrypted":true}', 'utf8')
         assert.equal(hasStandaloneCodebuddyAuth({ authDir: wbAuthDir, env: {} }), false, 'Desktop-encrypted auth must not be counted as standalone CLI auth')
+        assert.equal(readStandaloneCodebuddyCredential({ authDir: wbAuthDir, env: {} }), null)
+
+        // Credits normalization (personal + enterprise) & untrusted domain SSRF rejection
+        const normPersonal = normalizeWorkbuddyCreditsQuota({
+          code: 0,
+          data: {
+            TotalCredits: '791.8',
+            SubscriptionPackageName: '体验版',
+            IsPaidUser: false,
+            CreditGroups: [
+              { Kind: 'plan_base', Name: '套餐基础积分', CycleTotalCapacity: '500', CycleRemainCapacity: '491.8', CycleUsedCapacity: '8.2' },
+              { Kind: 'benefit', Name: '平台奖励积分', CycleTotalCapacity: '300', CycleRemainCapacity: '300', CycleUsedCapacity: '0' },
+            ],
+          },
+        })
+        assert.equal(normPersonal.windowKind, 'credits')
+        assert.equal(normPersonal.creditsRemaining, 791.8)
+        assert.equal(normPersonal.creditsTotal, 800)
+        assert.equal(normPersonal.remainingPercent, 99)
+        assert.equal(normPersonal.planType, '体验版')
+        assert.equal(normPersonal.creditGroups.length, 2)
+
+        const normEntUnlim = normalizeWorkbuddyCreditsQuota({ data: { limitNum: -1, credit: 12.5 } }, { isEnterprise: true })
+        assert.equal(normEntUnlim.unlimited, true)
+        assert.equal(normEntUnlim.remainingPercent, 100)
+
+        const evilAuthDir = join(tmpDir, 'mock-wb-evil-auth')
+        mkdirSync(evilAuthDir, { recursive: true })
+        writeFileSync(join(evilAuthDir, 'evil.info'), JSON.stringify({ auth: { accessToken: 'tok_1234567890abcdef', domain: '169.254.169.254' }, account: { uid: 'u1' } }), 'utf8')
+        assert.equal(readStandaloneCodebuddyCredential({ authDir: evilAuthDir, env: {} }), null, 'Must reject untrusted SSRF auth domain')
 
         // Verify env-autofix detects half-installed WorkBuddy (native zero-Node installer)
         const wbFakeHome = join(tmpDir, 'wb-autofix-home')
@@ -4919,6 +4975,7 @@ async function main() {
             workbuddyAuthDir: wbAuthDir,
             workbuddyCliBin: mockCliBin,
             cwd: wbProjDir,
+            fetchWorkbuddyQuota: async () => normPersonal,
           },
           log: { info() {}, warn() {}, error() {} },
           emitEvent: (ev, payload) => rwEvents.push({ ev, payload }),
@@ -4947,6 +5004,9 @@ async function main() {
           assert.equal(stRw.writable, true)
           assert.equal(stRw.setupState, 'ready')
           assert.equal(stRw.mode, 'codebuddy-cli-stream')
+          assert.equal(stRw.quota?.windowKind, 'credits')
+          assert.equal(stRw.quota?.creditsRemaining, 791.8)
+          assert.equal(stRw.quota?.creditsTotal, 800)
 
           // Security guards: reject permission escalation and CLI injection
           await assert.rejects(

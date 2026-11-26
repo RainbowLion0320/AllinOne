@@ -179,12 +179,12 @@ export function NewChatModal({
   return (
     <>
       <div
-        className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 backdrop-blur-[2px] sm:items-center"
+        className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/40 backdrop-blur-[2px] sm:items-center"
         onClick={onClose}
       >
         <div
           onClick={(e) => e.stopPropagation()}
-          className="pb-safe max-h-[90vh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1E2028]"
+          className="animate-sheet-in pb-safe max-h-[90vh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1E2028]"
         >
           <div className="mb-3 flex items-center justify-between">
             <h3 className="text-base font-bold text-slate-900 dark:text-white">{t('common.newChat')}</h3>

@@ -322,12 +322,12 @@ export function ModelPickerSheet({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center"
+      className="animate-backdrop-in fixed inset-0 z-[60] flex items-end justify-center bg-black/45 backdrop-blur-[2px] sm:items-center"
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="flex max-h-[84vh] w-full max-w-md flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1C1E26]"
+        className="animate-sheet-in flex max-h-[84vh] w-full max-w-md flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl dark:bg-[#1C1E26]"
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-100 px-5 pt-4 pb-3 dark:border-slate-800">

@@ -301,11 +301,11 @@ export function E2eeGrantApproveModal({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-end justify-center bg-black/55 backdrop-blur-[2px] sm:items-center sm:p-4"
+      className="animate-backdrop-in fixed inset-0 z-[60] flex items-end justify-center bg-black/55 backdrop-blur-[2px] sm:items-center sm:p-4"
       onClick={handleDismiss}
     >
       <div
-        className="pb-safe w-full max-w-sm rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
+        className="animate-sheet-in pb-safe w-full max-w-sm rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-[#1B1D23]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-2">
