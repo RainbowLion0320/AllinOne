@@ -14,7 +14,8 @@
 export const P2P_CTRL_LABEL = 'aio-ctrl'
 export const P2P_BULK_LABEL = 'aio-bulk'
 
-export const CTRL_FRAG_LIMIT_CHARS = 48 * 1024
+export const CTRL_FRAG_LIMIT_BYTES = 48 * 1024
+export const CTRL_FRAG_LIMIT_CHARS = CTRL_FRAG_LIMIT_BYTES
 export const BULK_SLICE_BYTES = 60 * 1024
 export const BULK_HIGH_WATER_BYTES = 2 * 1024 * 1024
 export const BULK_LOW_WATER_BYTES = 512 * 1024
@@ -26,6 +27,12 @@ const BULK_MAGIC_0 = 0x41 // 'A'
 const BULK_MAGIC_1 = 0x49 // 'I'
 const BULK_MAGIC_2 = 0x4f // 'O'
 const BULK_MAGIC_3 = 0x42 // 'B'
+
+const CTRL_SINGLE_MAGIC_3 = 0x43 // 'C' -> 'AIOC'
+const CTRL_FRAG_MAGIC_3 = 0x46   // 'F' -> 'AIOF'
+const CTRL_SINGLE_HEADER_BYTES = 4
+const CTRL_FRAG_HEADER_BYTES = 16
+const MAX_CTRL_REASSEMBLY_BYTES = 32 * 1024 * 1024
 
 function toU8(data) {
   if (data instanceof Uint8Array && data.constructor === Uint8Array) return data
@@ -178,21 +185,35 @@ export async function sendWithBackpressure(dc, bytes, opts = {}) {
   dc.send(bytes)
 }
 
-const ctrlTextEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null
-function utf8ByteLength(str) {
-  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
-    return Buffer.byteLength(str, 'utf8')
+const ctrlTextEncoder = new TextEncoder()
+const ctrlTextDecoder = new TextDecoder()
+
+function unpackCtrlLogical(logical) {
+  if (!logical || logical.byteLength < 4) return null
+  const view = new DataView(logical.buffer, logical.byteOffset, 4)
+  const metaLen = view.getUint32(0, false)
+  if (metaLen === 0 || 4 + metaLen > logical.byteLength) return null
+  let meta
+  try {
+    meta = JSON.parse(ctrlTextDecoder.decode(logical.subarray(4, 4 + metaLen)))
+  } catch {
+    return null
   }
-  return ctrlTextEncoder ? ctrlTextEncoder.encode(str).byteLength : str.length * 3
+  const binStart = 4 + metaLen
+  if (binStart < logical.byteLength && meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    meta.bin = logical.subarray(binStart)
+  }
+  return meta
 }
 
 /**
- * Create a symmetric JSON control-channel codec with automatic 48 KB SCTP fragmentation.
- * Ensures large RPC payloads (e.g. 500 KB session history) never hit SCTP message-size limits.
+ * Create a symmetric binary control-channel codec with automatic 48 KB binary SCTP fragmentation.
+ * Supports arbitrary JSON metadata plus an optional zero-copy `bin: Uint8Array` payload
+ * (eliminates +33% Base64URL inflation and JSON double-escaping on `aio-ctrl`).
  */
 export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 } = {}) {
   let fragSeq = 1
-  /** @type {Map<string, { parts: string[], received: number, total: number, createdAt: number }>} */
+  /** @type {Map<number, { parts: (Uint8Array | undefined)[], received: number, receivedBytes: number, total: number, createdAt: number }>} */
   const assemblies = new Map()
 
   function pruneStale(now = Date.now(), reserve = 0) {
@@ -204,119 +225,125 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
     const maxAllowed = Math.max(0, maxFragsInFlight - reserve)
     while (assemblies.size > maxAllowed) {
       const oldest = assemblies.keys().next().value
-      if (!oldest) break
+      if (oldest === undefined) break
       assemblies.delete(oldest)
     }
   }
 
   /**
-   * Encode an arbitrary JS object into 1 or more JSON frames <= 48 KB UTF-8 bytes each.
-   * Dynamically sizes slices so non-ASCII UTF-8 expansion and JSON double-escaping never exceed SCTP limits.
+   * Encode a control message object (with optional `bin: Uint8Array`) into 1 or more binary frames <= 48 KB each.
    * @param {any} msg
-   * @returns {string[]}
+   * @returns {Uint8Array[]}
    */
   function encode(msg) {
-    const raw = JSON.stringify(msg)
-    if (utf8ByteLength(raw) <= CTRL_FRAG_LIMIT_CHARS) {
-      return [raw]
+    let metaObj = msg
+    let binBytes = null
+    if (msg && typeof msg === 'object' && !Array.isArray(msg) && msg.bin !== undefined) {
+      const { bin, ...rest } = msg
+      metaObj = rest
+      binBytes = bin ? toU8(bin) : null
     }
-    const id = `f${fragSeq++}`
-    // Leave generous headroom for {"_aioFrag":{"id":"f...","i":999,"n":999,"d":"..."}} wrapper
-    const maxDataJsonBytes = Math.max(1024, CTRL_FRAG_LIMIT_CHARS - 128)
-    const parts = []
-    let pos = 0
-    while (pos < raw.length) {
-      let lo = 1
-      let hi = Math.min(raw.length - pos, CTRL_FRAG_LIMIT_CHARS)
-      let best = 1
-      while (lo <= hi) {
-        let mid = (lo + hi) >>> 1
-        // Never split a UTF-16 surrogate pair across fragments
-        const lastCode = raw.charCodeAt(pos + mid - 1)
-        if (lastCode >= 0xd800 && lastCode <= 0xdbff && pos + mid < raw.length) {
-          if (mid + 1 <= hi) mid += 1
-          else if (mid > 1) mid -= 1
-        }
-        const encodedSlice = JSON.stringify(raw.slice(pos, pos + mid))
-        if (utf8ByteLength(encodedSlice) <= maxDataJsonBytes) {
-          best = mid
-          lo = mid + 1
-        } else {
-          hi = mid - 1
-        }
-      }
-      // Final surrogate-pair guard in case best landed on a high surrogate
-      if (best < raw.length - pos) {
-        const lastCode = raw.charCodeAt(pos + best - 1)
-        if (lastCode >= 0xd800 && lastCode <= 0xdbff && best > 1) {
-          best -= 1
-        }
-      }
-      parts.push(raw.slice(pos, pos + best))
-      pos += best
+    const metaBytes = ctrlTextEncoder.encode(JSON.stringify(metaObj))
+    const binLen = binBytes ? binBytes.byteLength : 0
+    const logicalLen = 4 + metaBytes.byteLength + binLen
+    const logical = new Uint8Array(logicalLen)
+    new DataView(logical.buffer, logical.byteOffset, 4).setUint32(0, metaBytes.byteLength, false)
+    logical.set(metaBytes, 4)
+    if (binLen > 0) logical.set(binBytes, 4 + metaBytes.byteLength)
+
+    if (logicalLen <= CTRL_FRAG_LIMIT_BYTES - CTRL_SINGLE_HEADER_BYTES) {
+      const frame = new Uint8Array(CTRL_SINGLE_HEADER_BYTES + logicalLen)
+      frame[0] = BULK_MAGIC_0
+      frame[1] = BULK_MAGIC_1
+      frame[2] = BULK_MAGIC_2
+      frame[3] = CTRL_SINGLE_MAGIC_3
+      frame.set(logical, CTRL_SINGLE_HEADER_BYTES)
+      return [frame]
     }
-    const total = parts.length
+
+    const fragId = fragSeq++ >>> 0
+    const sliceCap = CTRL_FRAG_LIMIT_BYTES - CTRL_FRAG_HEADER_BYTES
+    const total = Math.ceil(logicalLen / sliceCap)
     const frames = new Array(total)
     for (let i = 0; i < total; i += 1) {
-      frames[i] = JSON.stringify({
-        _aioFrag: {
-          id,
-          i,
-          n: total,
-          d: parts[i],
-        },
-      })
+      const start = i * sliceCap
+      const slice = logical.subarray(start, Math.min(logicalLen, start + sliceCap))
+      const frame = new Uint8Array(CTRL_FRAG_HEADER_BYTES + slice.byteLength)
+      frame[0] = BULK_MAGIC_0
+      frame[1] = BULK_MAGIC_1
+      frame[2] = BULK_MAGIC_2
+      frame[3] = CTRL_FRAG_MAGIC_3
+      const view = new DataView(frame.buffer, frame.byteOffset, CTRL_FRAG_HEADER_BYTES)
+      view.setUint32(4, fragId, false)
+      view.setUint32(8, i >>> 0, false)
+      view.setUint32(12, total >>> 0, false)
+      frame.set(slice, CTRL_FRAG_HEADER_BYTES)
+      frames[i] = frame
     }
     return frames
   }
 
   /**
-   * Feed one incoming JSON string frame. Returns the parsed object once complete, or `null` if waiting for more fragments.
-   * @param {string|Uint8Array} rawFrame
+   * Feed one incoming binary control frame (`AIOC` or `AIOF`).
+   * Returns the decoded object once complete, or `null` while awaiting remaining fragments.
+   * @param {Uint8Array|ArrayBuffer} rawFrame
    * @returns {any|null}
    */
   function decode(rawFrame) {
-    const text =
-      typeof rawFrame === 'string'
-        ? rawFrame
-        : new TextDecoder().decode(toU8(rawFrame))
-    let parsed
-    try {
-      parsed = JSON.parse(text)
-    } catch {
+    if (!rawFrame || typeof rawFrame === 'string') return null
+    const bytes = toU8(rawFrame)
+    if (
+      bytes.byteLength < CTRL_SINGLE_HEADER_BYTES ||
+      bytes[0] !== BULK_MAGIC_0 ||
+      bytes[1] !== BULK_MAGIC_1 ||
+      bytes[2] !== BULK_MAGIC_2
+    ) {
       return null
     }
-    if (!parsed || typeof parsed !== 'object' || !parsed._aioFrag) {
-      return parsed
+    if (bytes[3] === CTRL_SINGLE_MAGIC_3) {
+      return unpackCtrlLogical(bytes.subarray(CTRL_SINGLE_HEADER_BYTES))
     }
-    const f = parsed._aioFrag
-    const id = String(f.id || '')
-    const idx = Number(f.i)
-    const total = Number(f.n)
-    if (!id || !Number.isInteger(idx) || !Number.isInteger(total) || total <= 0 || total > 1024 || idx < 0 || idx >= total) {
+    if (bytes[3] !== CTRL_FRAG_MAGIC_3 || bytes.byteLength < CTRL_FRAG_HEADER_BYTES) {
       return null
     }
-    let entry = assemblies.get(id)
+    const view = new DataView(bytes.buffer, bytes.byteOffset, CTRL_FRAG_HEADER_BYTES)
+    const fragId = view.getUint32(4, false)
+    const idx = view.getUint32(8, false)
+    const total = view.getUint32(12, false)
+    if (total === 0 || total > 1024 || idx >= total) {
+      return null
+    }
+    const slice = bytes.subarray(CTRL_FRAG_HEADER_BYTES)
+    let entry = assemblies.get(fragId)
     if (!entry) {
       pruneStale(Date.now(), 1)
-      entry = { parts: new Array(total), received: 0, total, createdAt: Date.now() }
-      assemblies.set(id, entry)
+      entry = { parts: new Array(total), received: 0, receivedBytes: 0, total, createdAt: Date.now() }
+      assemblies.set(fragId, entry)
     } else if (entry.total !== total) {
       return null
     }
     if (entry.parts[idx] === undefined) {
-      entry.parts[idx] = String(f.d || '')
+      if (entry.receivedBytes + slice.byteLength > MAX_CTRL_REASSEMBLY_BYTES) {
+        assemblies.delete(fragId)
+        return null
+      }
+      entry.parts[idx] = slice
       entry.received += 1
+      entry.receivedBytes += slice.byteLength
     }
     if (entry.received < entry.total) {
       return null
     }
-    assemblies.delete(id)
-    try {
-      return JSON.parse(entry.parts.join(''))
-    } catch {
-      return null
+    assemblies.delete(fragId)
+    const full = new Uint8Array(entry.receivedBytes)
+    let offset = 0
+    for (let i = 0; i < entry.total; i += 1) {
+      const part = entry.parts[i]
+      if (!part) return null
+      full.set(part, offset)
+      offset += part.byteLength
     }
+    return unpackCtrlLogical(full)
   }
 
   function clear() {

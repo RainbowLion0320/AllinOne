@@ -1,6 +1,5 @@
-import { randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs'
-import { readFile as readFileAsync } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
@@ -11,9 +10,12 @@ import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
 
 const P2P_UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes
-const P2P_INLINE_MAX_BYTES = 128 * 1024 // Files > 128 KB stream directly over `aio-bulk`
 const MAX_P2P_DOCUMENT_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local safety cap
 const MAX_P2P_IMAGE_BYTES = 100 * 1024 * 1024 // 100 MB image cap
+
+function computeRpcEtag(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16)
+}
 
 /**
  * Central multi-app orchestrator powering BOTH:
@@ -38,7 +40,6 @@ export class MultiAppOrchestrator {
     /** @type {Map<string, { clientId: string, localPath: string, filename: string, mimeType: string, size: number, createdAt: number }>} */
     this.p2pUploads = new Map()
     this._lastInboundPruneAt = 0
-    this._activeDocReads = 0
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -548,7 +549,6 @@ export class MultiAppOrchestrator {
     const isDocumentMode = String(mode || '').trim().toLowerCase() === 'document'
     const ALLOWED_MIMES = isDocumentMode ? DOCUMENT_MIMES : IMAGE_MIMES
     const MAX_BYTES = isDocumentMode ? MAX_P2P_DOCUMENT_BYTES : MAX_P2P_IMAGE_BYTES
-    const MAX_CONCURRENT_DOC_READS = 4
 
     let p = String(rawPath || '').trim()
     if (!p) throw new Error(isDocumentMode ? '缺少文件路径' : '缺少图片路径')
@@ -743,45 +743,17 @@ export class MultiAppOrchestrator {
       )
     }
 
-    // Files > 128 KB stream directly peer-to-peer over `aio-bulk` (AIO2 4MB chunked E2EE + 64KB SCTP slices)
-    if (st.size > P2P_INLINE_MAX_BYTES) {
-      return {
-        ok: true,
-        kind: isDocumentMode ? 'document' : 'image',
-        transferMode: 'p2p-bulk',
-        _localRealPath: realPath,
-        filename: basename(realPath),
-        mimeType: realMimeType,
-        size: st.size,
-        mtimeMs: st.mtimeMs,
-        path: realPath,
-      }
-    }
-
-    let buf
-    if (isDocumentMode) {
-      if (this._activeDocReads >= MAX_CONCURRENT_DOC_READS) {
-        throw new Error('当前有其他文档正在传输，请稍后再试')
-      }
-      this._activeDocReads += 1
-      try {
-        buf = await readFileAsync(realPath)
-      } finally {
-        this._activeDocReads = Math.max(0, this._activeDocReads - 1)
-      }
-    } else {
-      buf = readFileSync(realPath)
-    }
-
+    // All files & images stream directly peer-to-peer over binary `aio-bulk` (AIO2 chunked E2EE + conditional deflate-raw)
     return {
       ok: true,
       kind: isDocumentMode ? 'document' : 'image',
+      transferMode: 'p2p-bulk',
+      _localRealPath: realPath,
       filename: basename(realPath),
       mimeType: realMimeType,
-      size: buf.length,
+      size: st.size,
       mtimeMs: st.mtimeMs,
       path: realPath,
-      dataBase64: buf.toString('base64'),
     }
   }
 
@@ -794,14 +766,47 @@ export class MultiAppOrchestrator {
         return await this.readLocalFile(params)
       case RPC.APPS_STATUS:
         return { apps: await this.getAppsStatus() }
-      case RPC.MODELS_LIST:
-        return { catalog: await this.listModels(params) }
+      case RPC.MODELS_LIST: {
+        const catalog = await this.listModels(params)
+        const etag = computeRpcEtag(catalog)
+        const reqEtag = String(params?.etag || '').trim()
+        if (reqEtag && reqEtag === etag) {
+          return { unchanged: true, etag }
+        }
+        return { catalog, etag }
+      }
       case RPC.WORKSPACES_LIST:
         return { workspaces: await this.listWorkspaces() }
       case RPC.SESSIONS_LIST:
         return { sessions: await this.listSessions(params) }
-      case RPC.SESSION_READ:
-        return { session: await this.readSession(params) }
+      case RPC.SESSION_READ: {
+        const session = await this.readSession(params)
+        if (!params?.cursor && session && typeof session === 'object') {
+          const etag = computeRpcEtag({
+            id: session.id,
+            title: session.title,
+            cwd: session.cwd,
+            workspace: session.workspace,
+            status: session.status,
+            model: session.model,
+            provider: session.provider,
+            reasoningEffort: session.reasoningEffort,
+            writable: session.writable,
+            taskState: session.taskState ?? null,
+            syncState: session.syncState ?? null,
+            hasMore: Boolean(session.hasMore),
+            nextCursor: session.nextCursor ?? null,
+            totalCount: session.totalCount ?? null,
+            messages: session.messages || [],
+          })
+          const reqEtag = String(params?.etag || '').trim()
+          if (reqEtag && reqEtag === etag) {
+            return { unchanged: true, etag }
+          }
+          return { session: { ...session, etag }, etag }
+        }
+        return { session }
+      }
       case RPC.SESSION_CREATE:
         return { session: await this.createSession(params) }
       case RPC.SESSION_SEND: {

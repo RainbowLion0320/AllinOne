@@ -146,8 +146,13 @@ export function createWeriftPeer({
       })
       dc.onMessage.subscribe((msg) => {
         if (closed) return
-        const text = typeof msg === 'string' ? msg : Buffer.from(msg).toString('utf8')
-        try { onCtrlMessage?.(text) } catch {}
+        const bytes =
+          msg instanceof Uint8Array
+            ? msg
+            : Buffer.isBuffer(msg)
+              ? new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength)
+              : new Uint8Array(Buffer.from(String(msg), 'utf8'))
+        try { onCtrlMessage?.(bytes) } catch {}
       })
     } else if (label === 'aio-bulk') {
       bulkDc = dc
@@ -209,10 +214,17 @@ export function createWeriftPeer({
     isBulkOpen() {
       return !closed && Boolean(bulkDc && bulkDc.readyState === 'open')
     },
-    sendCtrl(text) {
+    sendCtrl(data) {
       if (closed || !ctrlDc || ctrlDc.readyState !== 'open') return false
       try {
-        ctrlDc.send(String(text))
+        if (typeof data === 'string') {
+          ctrlDc.send(data)
+        } else {
+          const buf = Buffer.isBuffer(data)
+            ? data
+            : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+          ctrlDc.send(buf)
+        }
         return true
       } catch {
         return false

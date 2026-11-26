@@ -4,13 +4,14 @@ import { open as openAsync, unlink as unlinkAsync } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
   E2EE_CHUNKED_THRESHOLD,
-  E2EE_IV_BYTES,
-  base64UrlToBytes,
-  bytesToBase64Url,
   decryptAutoStream,
+  decryptBinaryJson,
   decryptJson,
+  encryptBinaryJson,
   encryptChunkedBytes,
   encryptJson,
+  isCompressibleFile,
+  parseBinaryE2eeHeader,
 } from '@allinone/shared/e2ee'
 import {
   BULK_FLAG_EOF,
@@ -19,6 +20,7 @@ import {
   decodeBulkFrame,
   encodeBulkFrame,
 } from '@allinone/shared/p2p-mux'
+import { EVENTS } from '../protocol.js'
 import { ElectronWebRtcClient } from './peer-electron.js'
 import { createWeriftPeer } from './peer-werift.js'
 
@@ -31,6 +33,8 @@ const MAX_INBOUND_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB plaintext safety
 const MAX_INBOUND_CIPHER_OVERHEAD_BYTES = 4 * 1024 * 1024 // headroom for AIO2 framing & GCM tags
 const MAX_NON_CHUNKED_UPLOAD_BYTES = E2EE_CHUNKED_THRESHOLD + 64 * 1024 // prevent non-chunked in-memory OOM
 const MAX_UPLOAD_QUEUE_BYTES = 32 * 1024 * 1024 // cap RAM buffered ahead of disk/AES-GCM
+const STREAM_COALESCE_WINDOW_MS = 60
+const STREAM_COALESCE_MAX_CHARS = 16 * 1024
 
 /**
  * Push-pull async byte queue feeding `decryptAutoStream()` from incoming `aio-bulk` 64KB slices.
@@ -157,6 +161,8 @@ export class P2PBridgeManager {
     this._eventSeq = 0
     this._streamSeq = 1
     this._eventQueue = Promise.resolve()
+    /** @type {Map<string, { event: string, payload: any, timer: any }>} */
+    this._pendingDeltas = new Map()
     this.disposed = false
   }
 
@@ -438,10 +444,10 @@ export class P2PBridgeManager {
     }
 
     // Encrypted bulk control messages (bulk.pull / bulk.cancel / bulk.upload.start)
-    if (msg.type === 'bulk.ctrl' && msg.e2ee) {
+    if (msg.type === 'bulk.ctrl' && msg.bin) {
       let inner
       try {
-        inner = await decryptJson(this.e2eeKey, msg.e2ee, { kind: 'p2p.bulk', roomId: this.roomId })
+        inner = await decryptBinaryJson(this.e2eeKey, msg.bin, { kind: 'p2p.bulk', roomId: this.roomId })
       } catch {
         return
       }
@@ -484,7 +490,7 @@ export class P2PBridgeManager {
     const id = String(msg.id || '')
     const expectedKid = await this.getE2eeKeyId()
 
-    if (!msg.e2ee) {
+    if (!msg.bin) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
         id,
@@ -493,7 +499,17 @@ export class P2PBridgeManager {
       })
       return
     }
-    if (msg.e2ee.kid && expectedKid && msg.e2ee.kid !== expectedKid) {
+    const hdr = parseBinaryE2eeHeader(msg.bin)
+    if (!hdr) {
+      this.sendCtrlJson(sess, {
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: { code: 'E2EE_DECRYPT_FAILED', keyId: expectedKid, message: '端到端二进制密文格式无效' },
+      })
+      return
+    }
+    if (hdr.kid && expectedKid && hdr.kid !== expectedKid) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
         id,
@@ -505,7 +521,7 @@ export class P2PBridgeManager {
 
     let decrypted
     try {
-      decrypted = await decryptJson(this.e2eeKey, msg.e2ee, { kind: 'rpc.req', roomId: this.roomId })
+      decrypted = await decryptBinaryJson(this.e2eeKey, msg.bin, { kind: 'rpc.req', roomId: this.roomId })
     } catch (err) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
@@ -517,17 +533,7 @@ export class P2PBridgeManager {
     }
 
     const now = Date.now()
-    const ivBytes = base64UrlToBytes(msg.e2ee.iv)
-    const ivKey = ivBytes && ivBytes.byteLength === E2EE_IV_BYTES ? bytesToBase64Url(ivBytes) : ''
-    if (!ivKey) {
-      this.sendCtrlJson(sess, {
-        type: 'rpc.res',
-        id,
-        ok: false,
-        error: { code: 'E2EE_DECRYPT_FAILED', message: '端到端密文 IV 无效' },
-      })
-      return
-    }
+    const ivKey = hdr.iv
     this.pruneSeenIvs(now)
     const prevSeen = this.seenReqIvs.get(ivKey)
     if (prevSeen && now - prevSeen <= REPLAY_WINDOW_MS) {
@@ -584,8 +590,8 @@ export class P2PBridgeManager {
     }
 
     try {
-      const enc = await encryptJson(this.e2eeKey, innerRes, { kind: 'rpc.res', roomId: this.roomId })
-      this.sendCtrlJson(sess, { type: 'rpc.res', id, ok: true, e2ee: enc })
+      const enc = await encryptBinaryJson(this.e2eeKey, innerRes, { kind: 'rpc.res', roomId: this.roomId })
+      this.sendCtrlJson(sess, { type: 'rpc.res', id, ok: true, bin: enc.bytes })
     } catch (err) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
@@ -598,8 +604,8 @@ export class P2PBridgeManager {
 
   async sendBulkCtrl(sess, innerPayload) {
     if (sess.closed) return
-    const enc = await encryptJson(this.e2eeKey, innerPayload, { kind: 'p2p.bulk', roomId: this.roomId })
-    this.sendCtrlJson(sess, { type: 'bulk.ctrl', e2ee: enc })
+    const enc = await encryptBinaryJson(this.e2eeKey, innerPayload, { kind: 'p2p.bulk', roomId: this.roomId })
+    this.sendCtrlJson(sess, { type: 'bulk.ctrl', bin: enc.bytes })
   }
 
   /**
@@ -661,6 +667,7 @@ export class P2PBridgeManager {
         {
           kind: 'upload',
           roomId: this.roomId,
+          compress: isCompressibleFile(ticket.mimeType, ticket.filename),
           onHeader: async (e2eeMeta) => {
             await this.sendBulkCtrl(sess, {
               action: 'download.header',
@@ -786,6 +793,7 @@ export class P2PBridgeManager {
         kind: 'upload',
         roomId: this.roomId,
         chunked: isChunked,
+        compressed: Boolean(meta.e2ee.compressed),
         onPlainChunk: async (plainChunk) => {
           writtenPlainBytes += plainChunk.byteLength
           if (writtenPlainBytes > MAX_INBOUND_UPLOAD_BYTES) {
@@ -879,10 +887,7 @@ export class P2PBridgeManager {
     }
   }
 
-  /**
-   * Broadcast an E2EE streaming event directly to all open P2P clients over `aio-ctrl` (0 bytes via server!).
-   */
-  broadcastEvent(event, payload) {
+  _enqueueBroadcastEvent(event, payload) {
     if (this.disposed || this.sessions.size === 0) return
     this._eventQueue = this._eventQueue
       .then(async () => {
@@ -893,12 +898,12 @@ export class P2PBridgeManager {
         }
         if (targets.length === 0) return
         const seq = ++this._eventSeq
-        const enc = await encryptJson(
+        const enc = await encryptBinaryJson(
           this.e2eeKey,
           { event, payload, seq, ts: Date.now() },
           { kind: 'event', roomId: this.roomId },
         )
-        const frameObj = { type: 'event', seq, e2ee: enc }
+        const frameObj = { type: 'event', seq, bin: enc.bytes }
         for (const sess of targets) {
           this.sendCtrlJson(sess, frameObj)
         }
@@ -906,8 +911,70 @@ export class P2PBridgeManager {
       .catch(() => {})
   }
 
+  _flushPendingDelta(sessionId) {
+    const sid = String(sessionId || '')
+    if (!sid) return
+    const pending = this._pendingDeltas.get(sid)
+    if (!pending) return
+    this._pendingDeltas.delete(sid)
+    if (pending.timer) clearTimeout(pending.timer)
+    this._enqueueBroadcastEvent(pending.event, pending.payload)
+  }
+
+  /**
+   * Broadcast an E2EE streaming event directly to all open P2P clients over `aio-ctrl` (0 bytes via server!).
+   * Coalesces consecutive `stream.delta` / `stream.thinking` events per session within a 60ms window
+   * and flushes immediately before any state-transition event so ordering is strictly preserved.
+   */
+  broadcastEvent(event, payload) {
+    if (this.disposed || this.sessions.size === 0) return
+    const sid = String(payload?.sessionId || payload?.session?.id || '')
+    const isCoalesceable =
+      Boolean(sid) &&
+      (event === EVENTS.STREAM_DELTA || event === EVENTS.STREAM_THINKING) &&
+      typeof payload?.delta === 'string'
+
+    if (!isCoalesceable) {
+      if (sid && this._pendingDeltas.has(sid)) {
+        this._flushPendingDelta(sid)
+      }
+      this._enqueueBroadcastEvent(event, payload)
+      return
+    }
+
+    const existing = this._pendingDeltas.get(sid)
+    if (existing && existing.event === event) {
+      const mergedDelta = String(existing.payload.delta || '') + payload.delta
+      existing.payload = { ...existing.payload, ...payload, delta: mergedDelta }
+      if (mergedDelta.length >= STREAM_COALESCE_MAX_CHARS) {
+        this._flushPendingDelta(sid)
+      }
+      return
+    }
+    if (existing) {
+      this._flushPendingDelta(sid)
+    }
+
+    const entry = {
+      event,
+      payload: { ...payload },
+      timer: setTimeout(() => {
+        this._flushPendingDelta(sid)
+      }, STREAM_COALESCE_WINDOW_MS),
+    }
+    entry.timer.unref?.()
+    this._pendingDeltas.set(sid, entry)
+    if (payload.delta.length >= STREAM_COALESCE_MAX_CHARS) {
+      this._flushPendingDelta(sid)
+    }
+  }
+
   async dispose() {
     this.disposed = true
+    for (const pending of this._pendingDeltas.values()) {
+      if (pending.timer) clearTimeout(pending.timer)
+    }
+    this._pendingDeltas.clear()
     this._signalChains.clear()
     for (const cid of [...this.sessions.keys()]) {
       await this.destroySession(cid)

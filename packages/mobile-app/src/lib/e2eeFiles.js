@@ -1,5 +1,4 @@
 import { RPC } from '@allinone/shared'
-import { base64ToBytes } from '@allinone/shared/e2ee'
 import { bi, getCurrentLang } from './i18n.js'
 import { getDeliverableName, normalizeDeliverableKey } from './deliverableFiles.js'
 
@@ -103,10 +102,6 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
       })
       blob = dl.blob
       size = size || dl.size
-    } else if (result?.dataBase64) {
-      const bytes = base64ToBytes(result.dataBase64)
-      blob = new Blob([bytes], { type: mimeType })
-      size = size || bytes.byteLength
     } else {
       throw new Error(L('未能读取到文件内容', 'Failed to read file bytes'))
     }

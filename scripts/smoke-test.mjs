@@ -123,12 +123,15 @@ import {
   computeE2eeKeyId,
   computeGrantPubKeyFp,
   decryptAutoStream,
+  decryptBinaryJson,
   decryptChunkedStream,
   decryptGrantPayload,
   decryptJson,
+  deflateRawBytes,
   deriveGrantSas,
   encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
+  encryptBinaryJson,
   encryptChunkedBytes,
   encryptGrantPayload,
   encryptJson,
@@ -136,9 +139,16 @@ import {
   generateE2eeKey,
   generateGrantKeyPair,
   generateGrantReqId,
+  inflateRawBytes,
+  isCompressibleFile,
   parseE2eeGrantQrInput,
   parseE2eeQrInput,
 } from '../packages/shared/src/e2ee.js'
+import {
+  computeResizedDimensions,
+  replaceFileExtension,
+  shouldAttemptImageCompress,
+} from '../packages/mobile-app/src/lib/imageCompress.js'
 import { renderQrSvg as renderSharedQrSvg } from '../packages/shared/src/qr-svg.js'
 import {
   getActiveDevice,
@@ -458,12 +468,14 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
       roomId,
       sendCtrlJson(obj) {
         if (peerObj.closed || ctrlDc.readyState !== 'open') return false
-        for (const f of ctrlCodec.encode(obj)) ctrlDc.send(f)
+        for (const f of ctrlCodec.encode(obj)) {
+          ctrlDc.send(Buffer.from(f.buffer, f.byteOffset, f.byteLength))
+        }
         return true
       },
       async sendBulkCtrl(inner) {
-        const e2ee = await encryptJson(e2eeKey, inner, { kind: 'p2p.bulk', roomId })
-        assert.equal(peerObj.sendCtrlJson({ type: 'bulk.ctrl', e2ee }), true, 'bulk.ctrl send should succeed')
+        const enc = await encryptBinaryJson(e2eeKey, inner, { kind: 'p2p.bulk', roomId })
+        assert.equal(peerObj.sendCtrlJson({ type: 'bulk.ctrl', bin: enc.bytes }), true, 'bulk.ctrl send should succeed')
       },
       async close() {
         if (peerObj.closed) return
@@ -537,14 +549,14 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
       },
       async sendEncryptedRpc(method, params = {}) {
         const id = `t-${reqSeq++}`
-        const env = await encryptJson(
+        const enc = await encryptBinaryJson(
           e2eeKey,
           { method, params, cid: id, ts: Date.now() },
           { kind: 'rpc.req', roomId },
         )
-        const rawRes = await peerObj.sendRawCtrlRpc({ type: 'rpc.req', id, e2ee: env })
-        if (rawRes.e2ee) {
-          const dec = await decryptJson(e2eeKey, rawRes.e2ee, { kind: 'rpc.res', roomId })
+        const rawRes = await peerObj.sendRawCtrlRpc({ type: 'rpc.req', id, bin: enc.bytes })
+        if (rawRes.bin) {
+          const dec = await decryptBinaryJson(e2eeKey, rawRes.bin, { kind: 'rpc.res', roomId })
           assert.equal(dec.cid, id, 'Decrypted RPC response cid must match request id')
           if (dec.ok) return dec.result
           const err = new Error(dec.error?.message || 'RPC error')
@@ -574,6 +586,7 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
             kind: 'upload',
             roomId,
             chunked: Boolean(header.e2ee.chunked),
+            compressed: Boolean(header.e2ee.compressed),
           })
           return Buffer.concat((dec.chunks || []).map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)))
         } finally {
@@ -603,6 +616,7 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
             {
               kind: 'upload',
               roomId,
+              compress: isCompressibleFile(mimeType, filename),
               onHeader: async (e2eeMeta) => {
                 await peerObj.sendBulkCtrl({
                   action: 'upload.start',
@@ -645,8 +659,12 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
       if (st === 'closed' || st === 'closing') void peerObj.close()
     })
     ctrlDc.onMessage.subscribe((raw) => {
-      const text = typeof raw === 'string' ? raw : Buffer.from(raw).toString('utf8')
-      const msg = ctrlCodec.decode(text)
+      const u8 = Buffer.isBuffer(raw)
+        ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+        : raw instanceof Uint8Array
+          ? raw
+          : new Uint8Array(raw)
+      const msg = ctrlCodec.decode(u8)
       if (!msg) return
       if (msg.type === 'rpc.res') {
         const p = pendingRpcs.get(msg.id)
@@ -654,10 +672,10 @@ async function openTicketClientWs(httpBase, port, token, { deviceName = 'smoke-c
           pendingRpcs.delete(msg.id)
           p.resolve(msg)
         }
-      } else if (msg.type === 'event' && msg.e2ee) {
+      } else if (msg.type === 'event' && msg.bin) {
         p2pEvents.push({ ...msg, bridgeId: bid })
-      } else if (msg.type === 'bulk.ctrl' && msg.e2ee) {
-        decryptJson(e2eeKey, msg.e2ee, { kind: 'p2p.bulk', roomId })
+      } else if (msg.type === 'bulk.ctrl' && msg.bin) {
+        decryptBinaryJson(e2eeKey, msg.bin, { kind: 'p2p.bulk', roomId })
           .then((inner) => {
             if (inner.action === 'download.header') {
               activeDownloads.get(Number(inner.streamId))?.headerResolve?.(inner)
@@ -1118,13 +1136,17 @@ async function main() {
         }
       }
 
-      // E2EE RPC.FILE_READ image loading + non-image guardrail
-      const fileRes = await rpc(RPC.FILE_READ, {
+      // E2EE RPC.FILE_READ image loading over binary aio-bulk + non-image guardrail
+      const filePeer = await cli.connectP2p({ bridgeId: smokeDev.bridgeId, e2eeKey: primaryE2eeKey, roomId: smokeAdmin.roomId })
+      const fileRes = await filePeer.sendEncryptedRpc(RPC.FILE_READ, {
         path: 'packages/mobile-app/public/icon-192.png',
         cwd: process.cwd(),
       })
       assert.equal(fileRes.mimeType, 'image/png')
-      const imgBuf = Buffer.from(fileRes.dataBase64, 'base64')
+      assert.equal(fileRes.transferMode, 'p2p-bulk')
+      assert.equal(fileRes.dataBase64, undefined)
+      assert.ok(fileRes.streamId > 0)
+      const imgBuf = await filePeer.downloadBulkStream(fileRes.streamId)
       assert.ok(imgBuf.length > 1000 && imgBuf[0] === 0x89 && imgBuf[1] === 0x50)
       await assert.rejects(
         () => rpc(RPC.FILE_READ, { path: 'package.json', cwd: process.cwd() }),
@@ -1387,7 +1409,7 @@ async function main() {
       assert.ok(frames.length >= 4)
       let reassembled = null
       for (const f of frames) {
-        assert.ok(f.length <= 49 * 1024)
+        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_CHARS)
         reassembled = decCodec.decode(f)
       }
       assert.deepEqual(reassembled, bigCtrl)
@@ -1414,16 +1436,16 @@ async function main() {
         assert.equal(plainTry.error?.code, 'E2EE_KEY_REQUIRED')
 
         // Wrong key -> E2EE_KEY_MISMATCH
-        const wrongEnv = await encryptJson(
+        const wrongEnc = await encryptBinaryJson(
           generateE2eeKey(),
           { method: RPC.APPS_STATUS, params: {}, cid: 'e2ee-wrong', ts: Date.now() },
           { kind: 'rpc.req', roomId: smokeAdmin.roomId },
         )
-        const wrongTry = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-wrong', e2ee: wrongEnv })
+        const wrongTry = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-wrong', bin: wrongEnc.bytes })
         assert.equal(wrongTry.error?.code, 'E2EE_KEY_MISMATCH')
 
         // Valid encrypted FILE_READ + exact ciphertext replay rejection
-        const fileReqEnv = await encryptJson(
+        const fileReqEnc = await encryptBinaryJson(
           primaryE2eeKey,
           {
             method: RPC.FILE_READ,
@@ -1433,14 +1455,16 @@ async function main() {
           },
           { kind: 'rpc.req', roomId: smokeAdmin.roomId },
         )
-        const encFileRes = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-file-1', e2ee: fileReqEnv })
+        const encFileRes = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-file-1', bin: fileReqEnc.bytes })
         assert.equal(encFileRes.ok, true)
         assert.equal(encFileRes.result, undefined)
-        assert.equal(JSON.stringify(encFileRes).includes('image/png'), false)
-        const decFileRes = await decryptJson(primaryE2eeKey, encFileRes.e2ee, { kind: 'rpc.res', roomId: smokeAdmin.roomId })
+        assert.ok(encFileRes.bin instanceof Uint8Array)
+        assert.equal(Buffer.from(encFileRes.bin).includes(Buffer.from('image/png')), false)
+        const decFileRes = await decryptBinaryJson(primaryE2eeKey, encFileRes.bin, { kind: 'rpc.res', roomId: smokeAdmin.roomId })
         assert.equal(decFileRes.result.mimeType, 'image/png')
+        assert.equal(decFileRes.result.transferMode, 'p2p-bulk')
 
-        const replayRes = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-replay', e2ee: fileReqEnv })
+        const replayRes = await peer.sendRawCtrlRpc({ type: 'rpc.req', id: 'e2ee-replay', bin: fileReqEnc.bytes })
         assert.equal(replayRes.error?.code, 'E2EE_REPLAY_DETECTED')
 
         // Streaming event pushed over P2P aio-ctrl (0 frames via Control Server WS)
@@ -1448,13 +1472,13 @@ async function main() {
         const secretToken = 'ZERO_KNOWLEDGE_SECRET_DELTA_987654'
         bridge.link.pushEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:s1', delta: secretToken })
         for (let i = 0; i < 30; i += 1) {
-          if (p2pCli.p2pEvents.some((e) => e.bridgeId === smokeDev.bridgeId && e.e2ee?.ct)) break
+          if (p2pCli.p2pEvents.some((e) => e.bridgeId === smokeDev.bridgeId && e.bin)) break
           await new Promise((r) => setTimeout(r, 40))
         }
-        const encEv = p2pCli.p2pEvents.find((e) => e.bridgeId === smokeDev.bridgeId && e.e2ee?.ct)
+        const encEv = p2pCli.p2pEvents.find((e) => e.bridgeId === smokeDev.bridgeId && e.bin)
         assert.ok(encEv)
         assert.equal(p2pCli.events.length, controlEventsBefore, 'Streaming event must not traverse Control WS')
-        const decEv = await decryptJson(primaryE2eeKey, encEv.e2ee, { kind: 'event', roomId: smokeAdmin.roomId })
+        const decEv = await decryptBinaryJson(primaryE2eeKey, encEv.bin, { kind: 'event', roomId: smokeAdmin.roomId })
         assert.equal(decEv.event, EVENTS.STREAM_DELTA)
         assert.equal(decEv.payload.delta, secretToken)
 
@@ -3134,7 +3158,9 @@ async function main() {
       try {
         const htmlRes = await docOrch.readLocalFile({ path: 'dashboard.html', cwd: docDir, mode: 'document' })
         assert.equal(htmlRes.mimeType, 'text/html; charset=utf-8')
-        assert.ok(Buffer.from(htmlRes.dataBase64, 'base64').toString('utf8').includes('Q4 KPI'))
+        assert.equal(htmlRes.transferMode, 'p2p-bulk')
+        assert.equal(htmlRes.dataBase64, undefined)
+        assert.ok(readFileSync(htmlRes._localRealPath, 'utf8').includes('Q4 KPI'))
         assert.equal((await docOrch.readLocalFile({ path: `file://${xlsxPath}`, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         assert.equal((await docOrch.readLocalFile({ path: docxPath, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
         assert.equal((await docOrch.readLocalFile({ path: pptxPath, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
@@ -3988,13 +4014,13 @@ async function main() {
       await assert.rejects(() => aclOrch.readLocalFile({ path: outsideMd, cwd: '/', mode: 'document' }), /仅允许远程下载/)
       await aclOrch.dispose()
 
-      // 17c. createCtrlCodec UTF-8 byte budget on CJK & double-escaped JSON + decryptChunkedStream trailing-data fail-fast
+      // 17c. createCtrlCodec binary byte budget on CJK & double-escaped JSON + decryptChunkedStream trailing-data fail-fast
       const utf8Codec = createCtrlCodec()
       const cjkPayload = { type: 'test', body: '中文测试"quoted"\\slash\n'.repeat(3000) }
       const cjkFrames = utf8Codec.encode(cjkPayload)
       assert.ok(cjkFrames.length >= 2, 'Large CJK payload must be fragmented')
       for (const f of cjkFrames) {
-        assert.ok(Buffer.byteLength(f, 'utf8') <= CTRL_FRAG_LIMIT_CHARS, 'Every control fragment must be <= 48KB UTF-8 bytes')
+        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_CHARS, 'Every control fragment must be <= 48KB binary bytes')
       }
       let decodedCjk = null
       for (const f of cjkFrames) decodedCjk = utf8Codec.decode(f)
@@ -4216,8 +4242,138 @@ async function main() {
       }
       const pickerSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/components/ModelPickerSheet.jsx'), 'utf8')
       assert.ok(pickerSrc.includes('role="slider"') && pickerSrc.includes('ReasoningEffortSlider'))
+
+      // 17j. Bandwidth optimizations: deflate-raw + binary ctrl framing, zip-bomb cap, 60ms delta coalescing,
+      //      SESSION_READ/MODELS_LIST ETag short-circuits, conditional aio-bulk compression & image compress guards
+      const bwKey = generateE2eeKey()
+      const largeJson = {
+        messages: Array.from({ length: 40 }, (_, i) => ({
+          id: `m-${i}`,
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          text: 'All in One WebRTC E2EE compressed payload test — 端到端加密传输压缩测试内容。'.repeat(6),
+        })),
+      }
+      const rawJsonBytes = Buffer.byteLength(JSON.stringify(largeJson), 'utf8')
+      const binEnc = await encryptBinaryJson(bwKey, largeJson, { kind: 'rpc.res', roomId: 'usr_bw' })
+      assert.ok(binEnc.bytes.byteLength < rawJsonBytes * 0.25, `Binary deflate-raw E2EE must cut repetitive JSON >=75% (got ${binEnc.bytes.byteLength} vs ${rawJsonBytes})`)
+      const binDec = await decryptBinaryJson(bwKey, binEnc.bytes, { kind: 'rpc.res', roomId: 'usr_bw' })
+      assert.deepEqual(binDec, largeJson)
+
+      // Zip-bomb decompression cap must reject payloads expanding beyond maxBytes
+      const bombRaw = new Uint8Array(64 * 1024)
+      const bombCompressed = await deflateRawBytes(bombRaw)
+      assert.ok(bombCompressed.byteLength < 1024)
+      await assert.rejects(
+        () => inflateRawBytes(bombCompressed, 8 * 1024),
+        (err) => err?.code === 'E2EE_DECRYPT_FAILED',
+      )
+
+      // 60ms delta coalescing merges bursts and flushes immediately before STREAM_DONE
+      const coalKey = generateE2eeKey()
+      const coalMgr = new P2PBridgeManager({
+        roomId: 'usr_coal',
+        e2eeKey: coalKey,
+        getE2eeKeyId: async () => computeE2eeKeyId(coalKey),
+        sendSignal: () => {},
+        onRpc: async () => ({}),
+        inboundDir: tmpDir,
+        log: { info() {}, warn() {}, error() {} },
+      })
+      const coalCodec = createCtrlCodec()
+      const capturedCtrlFrames = []
+      coalMgr.sessions.set('c-coal', {
+        clientId: 'c-coal',
+        sessionId: 's-coal',
+        closed: false,
+        ctrlCodec: createCtrlCodec(),
+        activeDownloads: new Map(),
+        pendingDownloads: new Map(),
+        activeUploads: new Map(),
+        peer: {
+          isCtrlOpen: () => true,
+          sendCtrl: (frame) => {
+            const decoded = coalCodec.decode(frame)
+            if (decoded) capturedCtrlFrames.push(decoded)
+            return true
+          },
+          close: async () => {},
+        },
+      })
+      for (let i = 0; i < 10; i += 1) {
+        coalMgr.broadcastEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:c1', delta: `t${i}-` })
+      }
+      coalMgr.broadcastEvent(EVENTS.STREAM_DONE, { sessionId: 'codex:c1', finalText: 'done' })
+      await coalMgr._eventQueue
+      assert.equal(capturedCtrlFrames.length, 2, '10 rapid deltas + STREAM_DONE must coalesce into exactly 2 frames')
+      const ev0 = await decryptBinaryJson(coalKey, capturedCtrlFrames[0].bin, { kind: 'event', roomId: 'usr_coal' })
+      const ev1 = await decryptBinaryJson(coalKey, capturedCtrlFrames[1].bin, { kind: 'event', roomId: 'usr_coal' })
+      assert.equal(ev0.event, EVENTS.STREAM_DELTA)
+      assert.equal(ev0.payload.delta, 't0-t1-t2-t3-t4-t5-t6-t7-t8-t9-')
+      assert.equal(ev1.event, EVENTS.STREAM_DONE)
+      await coalMgr.dispose()
+
+      // SESSION_READ & MODELS_LIST ETag short-circuits
+      const etagOrch = new MultiAppOrchestrator({ config: { cwd: tmpDir }, log: { info() {}, warn() {}, error() {} } })
+      let mockMsgText = 'hello-v1'
+      etagOrch.readSession = async () => ({
+        id: 'codex:e1',
+        app: 'codex',
+        title: 'ETag Test',
+        cwd: tmpDir,
+        workspace: 'tmp',
+        status: 'idle',
+        hasMore: false,
+        nextCursor: null,
+        totalCount: 1,
+        messages: [{ id: 'm1', role: 'user', text: mockMsgText }],
+      })
+      etagOrch.listModels = async () => ({ codex: { defaultModel: 'gpt-5', models: [{ id: 'gpt-5' }] } })
+      const sr1 = await etagOrch.handleRpc(RPC.SESSION_READ, { id: 'codex:e1', limit: 14 })
+      assert.ok(sr1.etag && sr1.session?.etag === sr1.etag)
+      const sr2 = await etagOrch.handleRpc(RPC.SESSION_READ, { id: 'codex:e1', limit: 14, etag: sr1.etag })
+      assert.deepEqual(sr2, { unchanged: true, etag: sr1.etag })
+      mockMsgText = 'hello-v2'
+      const sr3 = await etagOrch.handleRpc(RPC.SESSION_READ, { id: 'codex:e1', limit: 14, etag: sr1.etag })
+      assert.equal(sr3.unchanged, undefined)
+      assert.notEqual(sr3.etag, sr1.etag)
+      assert.equal(sr3.session.messages[0].text, 'hello-v2')
+
+      const ml1 = await etagOrch.handleRpc(RPC.MODELS_LIST, {})
+      assert.ok(ml1.etag && ml1.catalog?.codex)
+      const ml2 = await etagOrch.handleRpc(RPC.MODELS_LIST, { etag: ml1.etag })
+      assert.deepEqual(ml2, { unchanged: true, etag: ml1.etag })
+      await etagOrch.dispose()
+
+      // Conditional aio-bulk compression: compressible HTML shrinks >75%, JPEG/PNG skipped
+      assert.equal(isCompressibleFile('text/html; charset=utf-8', 'report.html'), true)
+      assert.equal(isCompressibleFile('text/markdown', 'README.md'), true)
+      assert.equal(isCompressibleFile('image/jpeg', 'photo.jpg'), false)
+      assert.equal(isCompressibleFile('image/png', 'screen.png'), false)
+      assert.equal(isCompressibleFile('application/zip', 'archive.zip'), false)
+      const bigHtmlBytes = new TextEncoder().encode(`<!doctype html><html><body>${'<section><p>AllinOne Report Row</p></section>\n'.repeat(4000)}</body></html>`)
+      const compEnc = await encryptChunkedBytes(bwKey, bigHtmlBytes, { kind: 'upload', roomId: 'usr_bw', compress: true })
+      assert.equal(compEnc.compressed, true)
+      assert.ok(compEnc.totalBytes < bigHtmlBytes.byteLength * 0.1, `Compressed AIO2 HTML must shrink >90% (got ${compEnc.totalBytes} vs ${bigHtmlBytes.byteLength})`)
+      const compPlain = await decryptAutoStream(bwKey, Buffer.concat(compEnc.chunks.map((c) => Buffer.from(c))), {
+        iv: compEnc.iv,
+        kid: compEnc.kid,
+        kind: 'upload',
+        roomId: 'usr_bw',
+        chunked: true,
+        compressed: true,
+      })
+      assert.equal(Buffer.concat(compPlain.chunks.map((c) => Buffer.from(c))).equals(Buffer.from(bigHtmlBytes)), true)
+
+      // Smart image upload compression guards
+      assert.equal(shouldAttemptImageCompress({ type: 'image/jpeg', name: 'big.jpg', size: 3 * 1024 * 1024 }), true)
+      assert.equal(shouldAttemptImageCompress({ type: 'image/gif', name: 'anim.gif', size: 2 * 1024 * 1024 }), false)
+      assert.equal(shouldAttemptImageCompress({ type: 'image/svg+xml', name: 'vec.svg', size: 500 * 1024 }), false)
+      assert.equal(shouldAttemptImageCompress({ type: 'image/png', name: 'tiny.png', size: 80 * 1024 }), false)
+      assert.deepEqual(computeResizedDimensions(4032, 3024, 2048), { width: 2048, height: 1536, resized: true })
+      assert.deepEqual(computeResizedDimensions(1200, 900, 2048), { width: 1200, height: 900, resized: false })
+      assert.equal(replaceFileExtension('IMG_1234.HEIC', '.webp'), 'IMG_1234.webp')
     }
-    pass(17, 'Audit regression guards (env scrubbing, ACL, UTF-8 mux, proxy idle, IPv6/spaces, sid revocation, caches & mobile config)')
+    pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & mobile config)')
 
     console.log(`\nALL ${TOTAL_SUITES} SMOKE TEST SUITES PASSED!`)
   } finally {

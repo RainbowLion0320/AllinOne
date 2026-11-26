@@ -32,6 +32,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
+import { clearE2eeMediaCache, getPersistedMediaCacheStats } from '../lib/e2eeMedia.js'
 import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { useI18n } from '../lib/i18n.jsx'
 import { translate } from '../lib/i18n.js'
@@ -164,11 +165,13 @@ export function SettingsModal({
   turnQuota = null,
   relayDataSaver = true,
   onToggleRelayDataSaver = null,
+  smartImageCompress = true,
+  onToggleSmartImageCompress = null,
   onOpenE2eeSync = null,
   onRemoveDevice = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
-  const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+  const [cacheStats, setCacheStats] = useState({ sessionCount: 0, messageCount: 0, imageCount: 0, totalBytes: 0 })
   const [cacheClearedHint, setCacheClearedHint] = useState(false)
   const [openHelpKey, setOpenHelpKey] = useState('')
 
@@ -208,8 +211,20 @@ export function SettingsModal({
 
   useEffect(() => {
     if (!open) return
-    getSessionCacheStats(cacheScope).then(setCacheStats).catch(() => {})
-  }, [open, cacheScope])
+    Promise.all([
+      getSessionCacheStats(cacheScope).catch(() => ({ sessionCount: 0, messageCount: 0, totalBytes: 0 })),
+      getPersistedMediaCacheStats({ roomId: activeDevice?.roomId || '' }).catch(() => ({ imageCount: 0, totalBytes: 0 })),
+    ])
+      .then(([sess, media]) => {
+        setCacheStats({
+          sessionCount: Number(sess.sessionCount || 0),
+          messageCount: Number(sess.messageCount || 0),
+          imageCount: Number(media.imageCount || 0),
+          totalBytes: Number(sess.totalBytes || 0) + Number(media.totalBytes || 0),
+        })
+      })
+      .catch(() => {})
+  }, [open, cacheScope, activeDevice?.roomId])
 
   useEffect(() => {
     if (emailCooldown <= 0) return undefined
@@ -228,7 +243,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '1.0.15'
+    '1.0.16'
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -254,8 +269,11 @@ export function SettingsModal({
   }
 
   const handleClearCache = async () => {
-    await clearSessionCache(cacheScope)
-    setCacheStats({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
+    await Promise.all([
+      clearSessionCache(cacheScope),
+      clearE2eeMediaCache({ persistent: true, roomId: activeDevice?.roomId || '' }),
+    ])
+    setCacheStats({ sessionCount: 0, messageCount: 0, imageCount: 0, totalBytes: 0 })
     setCacheClearedHint(true)
     setTimeout(() => setCacheClearedHint(false), 1800)
   }
@@ -1095,6 +1113,33 @@ export function SettingsModal({
                 </div>
               )}
 
+              {activeDevice && onToggleSmartImageCompress && (
+                <div className="px-3.5 py-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-200">
+                      <Zap className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+                      <span className="truncate">{bi('上传图片智能压缩', 'Smart Photo Compression')}</span>
+                      <HelpButton
+                        active={openHelpKey === 'imgCompress'}
+                        onClick={() => toggleHelp('imgCompress')}
+                        label={bi('查看图片智能压缩说明', 'About smart photo compression')}
+                      />
+                    </div>
+                    <ToggleSwitch
+                      checked={Boolean(smartImageCompress)}
+                      onChange={onToggleSmartImageCompress}
+                      label={bi('切换上传图片智能压缩', 'Toggle smart photo compression')}
+                    />
+                  </div>
+                  <HelpCallout show={openHelpKey === 'imgCompress'}>
+                    {bi(
+                      '开启后，发送大于 200 KB 的照片/截图时自动缩放至 2048px 并转 WebP 压缩（通常可省 80%-90% 流量，跳过动图 GIF）；关闭则发送未经处理的原图。',
+                      'Automatically resizes photos/screenshots >200 KB to max 2048px WebP before upload (saves 80%-90% traffic, skips GIFs). Turn off to upload raw originals.',
+                    )}
+                  </HelpCallout>
+                </div>
+              )}
+
               <div className="flex items-center justify-between gap-2 px-3.5 py-2.5">
                 <div className="flex min-w-0 items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">
                   <HardDrive className="h-3.5 w-3.5 shrink-0 text-slate-400" />
@@ -1102,12 +1147,14 @@ export function SettingsModal({
                   <span className="truncate text-[11px] font-normal text-slate-400">
                     {cacheClearedHint
                       ? bi('已清理', 'Cleared')
-                      : `${cacheStats.sessionCount} ${bi('会话', 'chats')} · ${formatBytesCompact(cacheStats.totalBytes)}`}
+                      : cacheStats.imageCount > 0
+                        ? `${cacheStats.sessionCount} ${bi('会话', 'chats')} · ${cacheStats.imageCount} ${bi('图片', 'imgs')} · ${formatBytesCompact(cacheStats.totalBytes)}`
+                        : `${cacheStats.sessionCount} ${bi('会话', 'chats')} · ${formatBytesCompact(cacheStats.totalBytes)}`}
                   </span>
                 </div>
                 <button
                   type="button"
-                  disabled={cacheStats.sessionCount === 0}
+                  disabled={cacheStats.sessionCount === 0 && cacheStats.imageCount === 0}
                   onClick={handleClearCache}
                   className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:border-rose-900/60 dark:hover:bg-rose-950/40 dark:hover:text-rose-300"
                 >

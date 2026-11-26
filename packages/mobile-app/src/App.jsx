@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
+import { compressImageForUpload } from './lib/imageCompress.js'
 import {
   MobileRelayClient,
   bindAccountEmail,
@@ -107,6 +108,7 @@ export function App() {
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [relayDataSaver, setRelayDataSaver] = useState(() => localStorage.getItem('allinone_relay_data_saver') !== '0')
+  const [smartImageCompress, setSmartImageCompress] = useState(() => localStorage.getItem('allinone_image_compress') !== '0')
   const [mediaCacheRev, setMediaCacheRev] = useState(0)
   const [connState, setConnState] = useState('disconnected')
   const [connError, setConnError] = useState('')
@@ -231,6 +233,9 @@ export function App() {
   activeSessionRef.current = activeSession
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+  const modelsCatalogRef = useRef(modelsCatalog)
+  modelsCatalogRef.current = modelsCatalog
+  const modelsEtagRef = useRef({ bridgeId: '', etag: '' })
   const historyMetaRef = useRef(historyMeta)
   historyMetaRef.current = historyMeta
   const openRequestSeqRef = useRef(0)
@@ -495,6 +500,12 @@ export function App() {
     } catch {}
   }, [relayDataSaver])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('allinone_image_compress', smartImageCompress ? '1' : '0')
+    } catch {}
+  }, [smartImageCompress])
+
   const resetTransientWorkspace = useCallback(() => {
     deviceGenRef.current += 1
     openRequestSeqRef.current += 1
@@ -507,6 +518,7 @@ export function App() {
     liveStreamMapRef.current = {}
     activeSessionRef.current = null
     messagesRef.current = []
+    modelsEtagRef.current = { bridgeId: '', etag: '' }
     historyMetaRef.current = { hasMore: false, nextCursor: null, totalCount: null }
     setActiveSession(null)
     setMessages([])
@@ -786,9 +798,15 @@ export function App() {
     const scope = cacheScopeRef.current
     const targetBridge = activeBridgeIdRef.current
     try {
+      const curMsgs = messagesRef.current || []
+      const hasOptimistic = curMsgs.some((m) => /^msg-[ua]-/.test(String(m?.id || '')))
+      const syncEtag =
+        !hasOptimistic && curMsgs.length > 0 && activeSessionRef.current?.id === targetId
+          ? String(activeSessionRef.current?.etag || '')
+          : ''
       const res = await client.rpc(
         RPC.SESSION_READ,
-        { id: targetId, limit: 14 },
+        { id: targetId, limit: 14, ...(syncEtag ? { etag: syncEtag } : {}) },
         30_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
@@ -798,6 +816,9 @@ export function App() {
         activeSessionRef.current?.id !== targetId ||
         liveStreamMapRef.current[targetId]?.active
       ) {
+        return
+      }
+      if (res?.unchanged) {
         return
       }
       if (res?.session) {
@@ -887,12 +908,18 @@ export function App() {
     setRefreshing(true)
     try {
       const rpcOpts = targetBridge ? { bridgeId: targetBridge } : {}
+      const cachedModelsEtag =
+        modelsEtagRef.current.bridgeId === targetBridge &&
+        modelsEtagRef.current.etag &&
+        Object.keys(modelsCatalogRef.current || {}).length > 0
+          ? modelsEtagRef.current.etag
+          : ''
       const [statusRes, sessRes, wsRes, aprRes, modelsRes] = await Promise.all([
         client.rpc(RPC.APPS_STATUS, {}, 45_000, rpcOpts).catch(() => null),
         client.rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 100 }, 45_000, rpcOpts).catch(() => null),
         client.rpc(RPC.WORKSPACES_LIST, {}, 45_000, rpcOpts).catch(() => null),
         client.rpc(RPC.APPROVAL_LIST, {}, 45_000, rpcOpts).catch(() => null),
-        client.rpc(RPC.MODELS_LIST, {}, 45_000, rpcOpts).catch(() => null),
+        client.rpc(RPC.MODELS_LIST, cachedModelsEtag ? { etag: cachedModelsEtag } : {}, 45_000, rpcOpts).catch(() => null),
       ])
       if (
         deviceGenRef.current !== gen ||
@@ -942,8 +969,13 @@ export function App() {
       if (aprRes && Array.isArray(aprRes.approvals)) {
         setApprovals(aprRes.approvals)
       }
-      if (modelsRes?.catalog && Object.keys(modelsRes.catalog).length > 0) {
+      if (modelsRes?.unchanged) {
+        if (modelsRes.etag) {
+          modelsEtagRef.current = { bridgeId: targetBridge, etag: String(modelsRes.etag) }
+        }
+      } else if (modelsRes?.catalog && Object.keys(modelsRes.catalog).length > 0) {
         setModelsCatalog(modelsRes.catalog)
+        modelsEtagRef.current = { bridgeId: targetBridge, etag: String(modelsRes.etag || '') }
       }
     } finally {
       if (deviceGenRef.current === gen && workspaceLoadSeqRef.current === loadSeq) {
@@ -997,8 +1029,14 @@ export function App() {
       if (client) {
         const gen = deviceGenRef.current
         const reqBridgeId = activeBridgeId
+        const reqEtag =
+          modelsEtagRef.current.bridgeId === reqBridgeId &&
+          modelsEtagRef.current.etag &&
+          Object.keys(modelsCatalogRef.current || {}).length > 0
+            ? modelsEtagRef.current.etag
+            : ''
         client
-          .rpc(RPC.MODELS_LIST, {}, 45_000, { bridgeId: reqBridgeId })
+          .rpc(RPC.MODELS_LIST, reqEtag ? { etag: reqEtag } : {}, 45_000, { bridgeId: reqBridgeId })
           .then((res) => {
             if (
               deviceGenRef.current !== gen ||
@@ -1007,8 +1045,9 @@ export function App() {
             ) {
               return
             }
-            if (res?.catalog && Object.keys(res.catalog).length > 0) {
+            if (!res?.unchanged && res?.catalog && Object.keys(res.catalog).length > 0) {
               setModelsCatalog(res.catalog)
+              modelsEtagRef.current = { bridgeId: reqBridgeId, etag: String(res.etag || '') }
             }
           })
           .catch(() => {})
@@ -1082,13 +1121,27 @@ export function App() {
 
     // 2. Sync latest page from PC (14 merged real Q&A bubbles ~15KB) and reconcile with phone cache
     try {
+      const cachedMsgs = Array.isArray(cached?.messages) ? cached.messages : []
+      const cachedHasOptimistic = cachedMsgs.some((m) => /^msg-[ua]-/.test(String(m?.id || '')))
+      const openEtag = !cachedHasOptimistic && cachedMsgs.length > 0 ? String(cached?.meta?.etag || '') : ''
       const res = await client.rpc(
         RPC.SESSION_READ,
-        { id, limit: 14 },
+        { id, limit: 14, ...(openEtag ? { etag: openEtag } : {}) },
         45_000,
         targetBridge ? { bridgeId: targetBridge } : {},
       )
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
+      if (res?.unchanged) {
+        if (cached?.meta?.status === 'idle' && isStaleStreamForIdle(id)) {
+          clearLiveStreamEntry(id)
+        }
+        if (res.etag && activeSessionRef.current?.id === id && activeSessionRef.current.etag !== res.etag) {
+          const mergedMeta = { ...activeSessionRef.current, etag: res.etag }
+          activeSessionRef.current = mergedMeta
+          setActiveSession(mergedMeta)
+        }
+        return
+      }
       if (res?.session) {
         if (res.session.status === 'idle' && isStaleStreamForIdle(id)) {
           clearLiveStreamEntry(id)
@@ -2075,7 +2128,7 @@ export function App() {
     }
     const st = await desktopApi.getBridgeStatus?.().catch(() => null)
     if (st) setDesktopBridge(st)
-    clearE2eeMediaCache()
+    void clearE2eeMediaCache({ persistent: true, roomId: activeDevice.roomId })
     showToast(biLang(getCurrentLang(), '已轮换端到端密钥并重启本机桥接', 'Rotated E2EE key and restarted local bridge'))
   }, [desktopApi, activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, showToast])
 
@@ -2093,6 +2146,9 @@ export function App() {
     const removingActive = activeDevice?.id === deviceId
     const removingLast = devices.length <= 1
     void clearSessionCache(deviceId, { prefix: true })
+    if (target?.roomId) {
+      void clearE2eeMediaCache({ persistent: true, roomId: target.roomId })
+    }
     clearDraftsForScope(deviceId)
     if (removingActive) {
       resetTransientWorkspace()
@@ -3043,7 +3099,12 @@ export function App() {
               })
           }
         }}
-        onUploadFile={(file) => clientRef.current?.uploadFile(file, { bridgeId: activeBridgeId })}
+        onUploadFile={async (rawFile) => {
+          const { file: uploadTarget } = await compressImageForUpload(rawFile, {
+            enabled: smartImageCompress,
+          })
+          return clientRef.current?.uploadFile(uploadTarget, { bridgeId: activeBridgeId })
+        }}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
         onError={showToast}
@@ -3203,6 +3264,8 @@ export function App() {
             turnQuota={turnQuota}
             relayDataSaver={relayDataSaver}
             onToggleRelayDataSaver={() => setRelayDataSaver((v) => !v)}
+            smartImageCompress={smartImageCompress}
+            onToggleSmartImageCompress={() => setSmartImageCompress((v) => !v)}
             onOpenE2eeSync={() =>
               setE2eeModal({
                 open: true,

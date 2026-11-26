@@ -1,10 +1,11 @@
 import {
-  E2EE_CHUNKED_THRESHOLD,
   decryptAutoStream,
+  decryptBinaryJson,
   decryptJson,
-  encryptBytes,
+  encryptBinaryJson,
   encryptChunkedBytes,
   encryptJson,
+  isCompressibleFile,
 } from '@allinone/shared/e2ee'
 import {
   BULK_FLAG_EOF,
@@ -153,6 +154,7 @@ export class P2PPeerSession {
     this._activeDownloads = new Map() // streamId -> { queue, headerResolve, headerReject, receivedBytes, totalSize, onProgress }
     this._activeUploads = new Map() // transferId -> { streamId, readyResolve, readyReject, doneResolve, doneReject }
     this._inboundEventQueue = Promise.resolve()
+    this._ctrlDecodeQueue = Promise.resolve()
     this._bulkDecodeQueue = Promise.resolve()
   }
 
@@ -261,8 +263,8 @@ export class P2PPeerSession {
       throw new Error(L('P2P 控制通道未就绪', 'P2P control channel is not open'))
     }
     const ctx = this._getRequiredE2ee()
-    const e2ee = await encryptJson(ctx.key, inner, { kind: 'p2p.bulk', roomId: this.roomId })
-    if (!this._sendCtrlJson({ type: 'bulk.ctrl', e2ee })) {
+    const enc = await encryptBinaryJson(ctx.key, inner, { kind: 'p2p.bulk', roomId: this.roomId })
+    if (!this._sendCtrlJson({ type: 'bulk.ctrl', bin: enc.bytes })) {
       throw new Error(L('P2P 发送控制指令失败', 'Failed to send P2P bulk control message'))
     }
   }
@@ -430,6 +432,7 @@ export class P2PPeerSession {
 
     const ctrlDc = pc.createDataChannel(P2P_CTRL_LABEL, { ordered: true })
     const bulkDc = pc.createDataChannel(P2P_BULK_LABEL, { ordered: true })
+    ctrlDc.binaryType = 'arraybuffer'
     bulkDc.binaryType = 'arraybuffer'
     this.ctrlDc = ctrlDc
     this.bulkDc = bulkDc
@@ -437,10 +440,27 @@ export class P2PPeerSession {
     ctrlDc.onopen = () => this._checkChannelsReady()
     bulkDc.onopen = () => this._checkChannelsReady()
 
+    const feedCtrlBytes = (u8) => {
+      if (this.closed) return
+      const msg = this.ctrlCodec.decode(u8)
+      if (msg) this._handleCtrlMessage(msg)
+    }
+
     ctrlDc.onmessage = (ev) => {
       if (this.closed) return
-      const msg = this.ctrlCodec.decode(ev.data)
-      if (msg) this._handleCtrlMessage(msg)
+      const data = ev.data
+      if (data instanceof ArrayBuffer) {
+        feedCtrlBytes(new Uint8Array(data))
+      } else if (ArrayBuffer.isView(data)) {
+        feedCtrlBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+      } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        this._ctrlDecodeQueue = this._ctrlDecodeQueue
+          .then(() => data.arrayBuffer())
+          .then((buf) => {
+            if (!this.closed) feedCtrlBytes(new Uint8Array(buf))
+          })
+          .catch(() => {})
+      }
     }
 
     bulkDc.onmessage = (ev) => {
@@ -616,7 +636,7 @@ export class P2PPeerSession {
       clearTimeout(p.timer)
       this._pendingRpcs.delete(msg.id)
 
-      if (msg.e2ee) {
+      if (msg.bin) {
         const ctx = this.getE2eeContext(this.bridgeId)
         const key = p.e2eeKey || ctx?.key || ''
         if (!key) {
@@ -625,7 +645,7 @@ export class P2PPeerSession {
           p.reject(err)
           return
         }
-        decryptJson(key, msg.e2ee, { kind: 'rpc.res', roomId: this.roomId })
+        decryptBinaryJson(key, msg.bin, { kind: 'rpc.res', roomId: this.roomId })
           .then((inner) => {
             if (p.cid && inner?.cid && inner.cid !== p.cid) {
               const err = new Error(L('端到端响应编号校验失败', 'E2EE response correlation mismatch'))
@@ -657,16 +677,16 @@ export class P2PPeerSession {
       return
     }
 
-    if (msg.type === 'event' && msg.e2ee) {
+    if (msg.type === 'event' && msg.bin) {
       const ctx = this.getE2eeContext(this.bridgeId)
       const key = ctx?.key || ''
       if (!key) return
-      const envSnap = msg.e2ee
+      const binSnap = msg.bin
       const rawMsg = { ...msg, bridgeId: this.bridgeId, transport: 'p2p' }
       this._inboundEventQueue = this._inboundEventQueue
         .then(async () => {
           if (this.closed) return
-          const inner = await decryptJson(key, envSnap, { kind: 'event', roomId: this.roomId })
+          const inner = await decryptBinaryJson(key, binSnap, { kind: 'event', roomId: this.roomId })
           if (this.closed || !inner?.event) return
           try {
             this.onEvent(inner.event, inner.payload, rawMsg)
@@ -676,11 +696,11 @@ export class P2PPeerSession {
       return
     }
 
-    if (msg.type === 'bulk.ctrl' && msg.e2ee) {
+    if (msg.type === 'bulk.ctrl' && msg.bin) {
       const ctx = this.getE2eeContext(this.bridgeId)
       const key = ctx?.key || ''
       if (!key) return
-      decryptJson(key, msg.e2ee, { kind: 'p2p.bulk', roomId: this.roomId })
+      decryptBinaryJson(key, msg.bin, { kind: 'p2p.bulk', roomId: this.roomId })
         .then((inner) => {
           if (!this.closed && inner && typeof inner === 'object') {
             this._handleBulkCtrl(inner)
@@ -779,7 +799,7 @@ export class P2PPeerSession {
     }
 
     const id = `p-${this._reqSeq++}-${Date.now()}`
-    const e2ee = await encryptJson(
+    const enc = await encryptBinaryJson(
       ctx.key,
       { method, params, cid: id, ts: Date.now() },
       { kind: 'rpc.req', roomId: this.roomId },
@@ -804,7 +824,7 @@ export class P2PPeerSession {
         e2eeKey: ctx.key,
       })
 
-      if (!this._sendCtrlJson({ type: 'rpc.req', id, e2ee })) {
+      if (!this._sendCtrlJson({ type: 'rpc.req', id, bin: enc.bytes })) {
         clearTimeout(timer)
         this._pendingRpcs.delete(id)
         reject(new Error(L('P2P 通道发送失败', 'Failed to send request over P2P channel')))
@@ -892,6 +912,7 @@ export class P2PPeerSession {
         kind: 'upload',
         roomId: this.roomId,
         chunked: Boolean(header.e2ee.chunked),
+        compressed: Boolean(header.e2ee.compressed),
       })
 
       completedNormally = true
@@ -989,72 +1010,42 @@ export class P2PPeerSession {
       let seq = 0
       let sentBytes = 0
 
-      if (totalSize > E2EE_CHUNKED_THRESHOLD) {
-        await encryptChunkedBytes(ctx.key, file, {
-          kind: 'upload',
-          roomId: this.roomId,
-          onHeader: async (e2eeMeta) => {
-            await this._sendBulkCtrl({
-              action: 'upload.start',
-              transferId,
-              streamId,
-              filename,
-              mimeType: realMime,
-              size: totalSize,
-              e2ee: e2eeMeta,
-            })
-            await waitReadyWithTimeout()
-          },
-          onChunk: async (cipherChunk) => {
-            for (let off = 0; off < cipherChunk.byteLength; off += BULK_SLICE_BYTES) {
-              if (uploadEntry.remoteError) throw uploadEntry.remoteError
-              if (signal?.aborted || this.closed) {
-                const err = new Error('Transfer aborted')
-                err.name = 'AbortError'
-                throw err
-              }
-              const slice = cipherChunk.subarray(off, Math.min(cipherChunk.byteLength, off + BULK_SLICE_BYTES))
-              const frame = encodeBulkFrame(streamId, seq++, slice, 0)
-              await sendWithBackpressure(this.bulkDc, frame, { signal })
-              sentBytes += slice.byteLength
-              if (typeof onProgress === 'function') {
-                try { onProgress({ loaded: Math.min(sentBytes, totalSize), total: totalSize }) } catch {}
-              }
+      await encryptChunkedBytes(ctx.key, file, {
+        kind: 'upload',
+        roomId: this.roomId,
+        compress: isCompressibleFile(realMime, filename),
+        onHeader: async (e2eeMeta) => {
+          await this._sendBulkCtrl({
+            action: 'upload.start',
+            transferId,
+            streamId,
+            filename,
+            mimeType: realMime,
+            size: totalSize,
+            e2ee: e2eeMeta,
+          })
+          await waitReadyWithTimeout()
+        },
+        onChunk: async (cipherChunk) => {
+          for (let off = 0; off < cipherChunk.byteLength; off += BULK_SLICE_BYTES) {
+            if (uploadEntry.remoteError) throw uploadEntry.remoteError
+            if (signal?.aborted || this.closed) {
+              const err = new Error('Transfer aborted')
+              err.name = 'AbortError'
+              throw err
             }
-          },
-        })
-      } else {
-        const rawBytes = new Uint8Array(await file.arrayBuffer())
-        const enc = await encryptBytes(ctx.key, rawBytes, {
-          kind: 'upload',
-          roomId: this.roomId,
-        })
-        await this._sendBulkCtrl({
-          action: 'upload.start',
-          transferId,
-          streamId,
-          filename,
-          mimeType: realMime,
-          size: totalSize,
-          e2ee: { v: enc.v, kid: enc.kid, iv: enc.iv },
-        })
-        await waitReadyWithTimeout()
-        const cipher = enc.ciphertext
-        for (let off = 0; off < cipher.byteLength; off += BULK_SLICE_BYTES) {
-          if (uploadEntry.remoteError) throw uploadEntry.remoteError
-          if (signal?.aborted || this.closed) {
-            const err = new Error('Transfer aborted')
-            err.name = 'AbortError'
-            throw err
+            const slice = cipherChunk.subarray(off, Math.min(cipherChunk.byteLength, off + BULK_SLICE_BYTES))
+            const frame = encodeBulkFrame(streamId, seq++, slice, 0)
+            await sendWithBackpressure(this.bulkDc, frame, { signal })
+            sentBytes += slice.byteLength
+            if (typeof onProgress === 'function') {
+              try { onProgress({ loaded: Math.min(sentBytes, totalSize), total: totalSize }) } catch {}
+            }
           }
-          const slice = cipher.subarray(off, Math.min(cipher.byteLength, off + BULK_SLICE_BYTES))
-          const frame = encodeBulkFrame(streamId, seq++, slice, 0)
-          await sendWithBackpressure(this.bulkDc, frame, { signal })
-          sentBytes += slice.byteLength
-        }
-        if (typeof onProgress === 'function') {
-          try { onProgress({ loaded: totalSize, total: totalSize }) } catch {}
-        }
+        },
+      })
+      if (typeof onProgress === 'function') {
+        try { onProgress({ loaded: totalSize, total: totalSize }) } catch {}
       }
 
       if (uploadEntry.remoteError) throw uploadEntry.remoteError

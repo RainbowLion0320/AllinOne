@@ -8,7 +8,12 @@ import {
   Zap,
 } from 'lucide-react'
 import { getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
-import { getCachedE2eeImageUrl, loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
+import {
+  getCachedE2eeImageUrl,
+  loadE2eeImageUrl,
+  loadPersistedE2eeImageUrl,
+  needsE2eeMediaLoad,
+} from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 /**
@@ -37,7 +42,16 @@ function ChatImageCard({
     setPreviewFailed(false)
     setManualLoadAllowed(false)
     setRetryNonce(0)
-  }, [item?.localPreviewUrl, item?.url, item?.path])
+    setE2eeSrc('')
+  }, [
+    item?.localPreviewUrl,
+    item?.url,
+    item?.path,
+    imageContext?.roomId,
+    imageContext?.bridgeId,
+    imageContext?.cwd,
+    imageContext?.e2eeKeyId,
+  ])
 
   const effectiveItem =
     previewFailed && item && typeof item === 'object'
@@ -50,20 +64,21 @@ function ChatImageCard({
 
   const needsE2ee = needsE2eeMediaLoad(effectiveItem)
   const cachedE2eeSrc = needsE2ee ? getCachedE2eeImageUrl(effectiveItem, imageContext) : ''
+  const resolvedE2eeSrc = e2eeSrc || cachedE2eeSrc
   const waitingForTransport = Boolean(
     needsE2ee &&
-      !cachedE2eeSrc &&
+      !resolvedE2eeSrc &&
       isOnline &&
       (p2pState === 'idle' || p2pState === 'connecting'),
   )
   const transportUnavailable = Boolean(
     needsE2ee &&
-      !cachedE2eeSrc &&
+      !resolvedE2eeSrc &&
       (!isOnline || p2pState === 'failed'),
   )
   const deferForRelay = Boolean(
     needsE2ee &&
-      !cachedE2eeSrc &&
+      !resolvedE2eeSrc &&
       !manualLoadAllowed &&
       isOnline &&
       p2pState === 'connected' &&
@@ -73,13 +88,45 @@ function ChatImageCard({
   const directSrc = needsE2ee
     ? ''
     : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem)
-  const baseSrc = needsE2ee ? (e2eeSrc || cachedE2eeSrc) : directSrc
+  const baseSrc = needsE2ee ? resolvedE2eeSrc : directSrc
   const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
 
   const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
   const rawHint = item?.path || item?.raw || ''
+
+  // Hydrate previously viewed images from persistent IndexedDB first (0 network bytes, works offline & on Relay Saver)
+  useEffect(() => {
+    if (!needsE2ee || retryNonce > 0) return
+    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+    if (latestCached) {
+      setE2eeSrc(latestCached)
+      return
+    }
+    let cancelled = false
+    loadPersistedE2eeImageUrl(effectiveItem, imageContextRef.current)
+      .then((persistedUrl) => {
+        if (!cancelled && persistedUrl) {
+          setE2eeSrc(persistedUrl)
+        }
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [
+    needsE2ee,
+    retryNonce,
+    previewFailed,
+    effectiveItem?.path,
+    effectiveItem?.url,
+    effectiveItem?.raw,
+    imageContext?.roomId,
+    imageContext?.bridgeId,
+    imageContext?.cwd,
+    imageContext?.e2eeKeyId,
+  ])
 
   useEffect(() => {
     if (!needsE2ee) {
@@ -92,11 +139,9 @@ function ChatImageCard({
       return
     }
     if (deferForRelay) {
-      setE2eeSrc('')
       return
     }
     if (!isOnline || p2pState !== 'connected') {
-      setE2eeSrc('')
       if (waitingForTransport) setStatus('loading')
       return
     }

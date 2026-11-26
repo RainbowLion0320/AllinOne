@@ -16,6 +16,7 @@ export const E2EE_VERSION = 1
 export const E2EE_CHUNKED_VERSION = 2
 export const E2EE_KEY_BYTES = 32
 export const E2EE_IV_BYTES = 12
+export const E2EE_BIN_HEADER_BYTES = 1 + 8 + E2EE_IV_BYTES // 21 bytes: [1B v][8B kid][12B iv]
 export const E2EE_CHUNK_SIZE = 4 * 1024 * 1024
 export const E2EE_CHUNKED_THRESHOLD = 32 * 1024 * 1024
 export const E2EE_URI_PREFIX = 'allinone-e2ee://v1'
@@ -23,9 +24,195 @@ export const E2EE_GRANT_URI_PREFIX = 'allinone-e2ee-grant://v1'
 
 const AIO2_MAGIC = [0x41, 0x49, 0x4f, 0x32] // 'AIO2'
 const AIO2_HEADER_BYTES = 12
+const COMPRESS_MIN_BYTES = 512
+const MAX_INFLATE_JSON_BYTES = 16 * 1024 * 1024
+const PAYLOAD_FLAG_RAW = 0x00
+const PAYLOAD_FLAG_DEFLATE_RAW = 0x01
 
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
+
+const INCOMPRESSIBLE_EXTS = new Set([
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.heic', '.heif',
+  '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v',
+  '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.flac',
+  '.zip', '.gz', '.tgz', '.bz2', '.xz', '.zst', '.7z', '.rar',
+  '.apk', '.dmg', '.pkg', '.woff2', '.epub',
+])
+
+const INCOMPRESSIBLE_MIMES = new Set([
+  'image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif',
+  'image/avif', 'image/heic', 'image/heif',
+  'application/zip', 'application/x-zip-compressed',
+  'application/gzip', 'application/x-gzip', 'application/x-bzip2',
+  'application/x-xz', 'application/zstd', 'application/x-7z-compressed',
+  'application/vnd.rar', 'application/x-rar-compressed',
+  'application/vnd.android.package-archive', 'application/epub+zip',
+  'font/woff2',
+])
+
+export function isDeflateAvailable() {
+  return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function'
+}
+
+/**
+ * Decide whether an `aio-bulk` file transfer benefits from per-chunk `deflate-raw` compression.
+ * Skips already-compressed binary formats (JPEG/PNG/WebP/video/audio/archives) to save CPU.
+ */
+export function isCompressibleFile(mimeType = '', filename = '') {
+  const mime = String(mimeType || '').split(';')[0].trim().toLowerCase()
+  if (mime.startsWith('video/') || mime.startsWith('audio/') || INCOMPRESSIBLE_MIMES.has(mime)) {
+    return false
+  }
+  const cleanName = String(filename || '').trim().toLowerCase()
+  const dotIdx = cleanName.lastIndexOf('.')
+  if (dotIdx >= 0) {
+    const ext = cleanName.slice(dotIdx)
+    if (INCOMPRESSIBLE_EXTS.has(ext)) return false
+  }
+  return true
+}
+
+function concatUint8Arrays(parts, totalLen) {
+  if (parts.length === 1) return parts[0]
+  const out = new Uint8Array(totalLen)
+  let offset = 0
+  for (const p of parts) {
+    out.set(p, offset)
+    offset += p.byteLength
+  }
+  return out
+}
+
+export async function deflateRawBytes(input) {
+  const u8 = toUint8Array(input)
+  if (u8.byteLength === 0) return new Uint8Array(0)
+  const cs = new CompressionStream('deflate-raw')
+  const writer = cs.writable.getWriter()
+  const reader = cs.readable.getReader()
+  const parts = []
+  let total = 0
+
+  const writeTask = (async () => {
+    await writer.write(u8)
+    await writer.close()
+  })()
+
+  const readTask = (async () => {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value && value.byteLength > 0) {
+        const chunk = toUint8Array(value)
+        parts.push(chunk)
+        total += chunk.byteLength
+      }
+    }
+  })()
+
+  await Promise.all([writeTask, readTask])
+  return concatUint8Arrays(parts, total)
+}
+
+export async function inflateRawBytes(input, maxBytes = MAX_INFLATE_JSON_BYTES) {
+  const u8 = toUint8Array(input)
+  if (u8.byteLength === 0) return new Uint8Array(0)
+  const ds = new DecompressionStream('deflate-raw')
+  const writer = ds.writable.getWriter()
+  const reader = ds.readable.getReader()
+  const parts = []
+  let total = 0
+  let overflowErr = null
+
+  const writeTask = (async () => {
+    try {
+      await writer.write(u8)
+      await writer.close()
+    } catch (err) {
+      if (!overflowErr) throw err
+    }
+  })()
+
+  const readTask = (async () => {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value && value.byteLength > 0) {
+        const chunk = toUint8Array(value)
+        total += chunk.byteLength
+        if (total > maxBytes) {
+          overflowErr = new Error('端到端压缩数据超出安全大小上限')
+          overflowErr.code = 'E2EE_DECRYPT_FAILED'
+          try { await reader.cancel(overflowErr) } catch {}
+          try { await writer.abort(overflowErr) } catch {}
+          throw overflowErr
+        }
+        parts.push(chunk)
+      }
+    }
+  })()
+
+  try {
+    await Promise.all([writeTask, readTask])
+  } catch (err) {
+    if (overflowErr) throw overflowErr
+    const wrapped = new Error('端到端压缩数据解压失败')
+    wrapped.code = 'E2EE_DECRYPT_FAILED'
+    throw wrapped
+  }
+  return concatUint8Arrays(parts, total)
+}
+
+async function packJsonBytes(data) {
+  const utf8 = textEncoder.encode(JSON.stringify(data))
+  if (utf8.byteLength >= COMPRESS_MIN_BYTES && isDeflateAvailable()) {
+    try {
+      const deflated = await deflateRawBytes(utf8)
+      if (deflated.byteLength + 16 < utf8.byteLength) {
+        const out = new Uint8Array(1 + deflated.byteLength)
+        out[0] = PAYLOAD_FLAG_DEFLATE_RAW
+        out.set(deflated, 1)
+        return out
+      }
+    } catch {}
+  }
+  const out = new Uint8Array(1 + utf8.byteLength)
+  out[0] = PAYLOAD_FLAG_RAW
+  out.set(utf8, 1)
+  return out
+}
+
+async function unpackJsonBytes(plainBytes) {
+  const u8 = toUint8Array(plainBytes)
+  if (u8.byteLength < 2) {
+    const err = new Error('端到端明文格式无效')
+    err.code = 'E2EE_DECRYPT_FAILED'
+    throw err
+  }
+  const flag = u8[0]
+  let utf8
+  if (flag === PAYLOAD_FLAG_RAW) {
+    utf8 = u8.subarray(1)
+  } else if (flag === PAYLOAD_FLAG_DEFLATE_RAW) {
+    if (!isDeflateAvailable()) {
+      const err = new Error('当前环境不支持 deflate-raw 解压')
+      err.code = 'E2EE_DECRYPT_FAILED'
+      throw err
+    }
+    utf8 = await inflateRawBytes(u8.subarray(1), MAX_INFLATE_JSON_BYTES)
+  } else {
+    const err = new Error('端到端明文压缩标识无效')
+    err.code = 'E2EE_DECRYPT_FAILED'
+    throw err
+  }
+  try {
+    return JSON.parse(textDecoder.decode(utf8))
+  } catch {
+    const err = new Error('端到端明文解析失败')
+    err.code = 'E2EE_DECRYPT_FAILED'
+    throw err
+  }
+}
 
 /** @type {Map<string, Promise<{ cryptoKey: CryptoKey, keyId: string, rawBytes: Uint8Array }>>} */
 const keyCache = new Map()
@@ -155,7 +342,8 @@ async function importCachedKey(rawKeyStr) {
       idInput.set(prefix, 0)
       idInput.set(rawBytes, prefix.length)
       const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', idInput))
-      const keyId = bytesToHex(digest.subarray(0, 8))
+      const keyIdBytes = digest.slice(0, 8)
+      const keyId = bytesToHex(keyIdBytes)
       const cryptoKey = await globalThis.crypto.subtle.importKey(
         'raw',
         rawBytes,
@@ -163,7 +351,7 @@ async function importCachedKey(rawKeyStr) {
         false,
         ['encrypt', 'decrypt'],
       )
-      return { cryptoKey, keyId, rawBytes }
+      return { cryptoKey, keyId, keyIdBytes, rawBytes }
     })()
     keyCache.set(normalized, entry)
     entry.catch(() => {
@@ -362,10 +550,11 @@ async function* iterateByteSource(source) {
 export async function encryptChunkedBytes(
   rawKeyStr,
   source,
-  { kind = 'upload', roomId = '', chunkSize = E2EE_CHUNK_SIZE, onChunk = null, onHeader = null } = {},
+  { kind = 'upload', roomId = '', chunkSize = E2EE_CHUNK_SIZE, compress = false, onChunk = null, onHeader = null } = {},
 ) {
   const { cryptoKey, keyId } = await importCachedKey(rawKeyStr)
   const cleanChunkSize = Math.max(1024, Math.min(16 * 1024 * 1024, Math.floor(Number(chunkSize) || E2EE_CHUNK_SIZE)))
+  const useCompress = Boolean(compress && isDeflateAvailable())
 
   let totalSize = 0
   let readSlice = null
@@ -388,7 +577,14 @@ export async function encryptChunkedBytes(
   globalThis.crypto.getRandomValues(baseIv)
   const ivStr = bytesToBase64Url(baseIv)
   if (onHeader) {
-    await onHeader({ v: E2EE_CHUNKED_VERSION, kid: keyId, iv: ivStr, chunked: true, totalChunks })
+    await onHeader({
+      v: E2EE_CHUNKED_VERSION,
+      kid: keyId,
+      iv: ivStr,
+      chunked: true,
+      totalChunks,
+      ...(useCompress ? { compressed: true } : {}),
+    })
   }
 
   const header = new Uint8Array(AIO2_HEADER_BYTES)
@@ -404,12 +600,33 @@ export async function encryptChunkedBytes(
     const offset = i * cleanChunkSize
     const len = Math.min(cleanChunkSize, Math.max(0, totalSize - offset))
     const plainSlice = len > 0 ? toUint8Array(await readSlice(offset, len)) : new Uint8Array(0)
+    let payloadToEncrypt = plainSlice
+    if (useCompress) {
+      let deflated = null
+      if (plainSlice.byteLength >= COMPRESS_MIN_BYTES) {
+        try {
+          const cand = await deflateRawBytes(plainSlice)
+          if (cand.byteLength + 32 < plainSlice.byteLength && cand.byteLength < plainSlice.byteLength * 0.96) {
+            deflated = cand
+          }
+        } catch {}
+      }
+      if (deflated) {
+        payloadToEncrypt = new Uint8Array(1 + deflated.byteLength)
+        payloadToEncrypt[0] = PAYLOAD_FLAG_DEFLATE_RAW
+        payloadToEncrypt.set(deflated, 1)
+      } else {
+        payloadToEncrypt = new Uint8Array(1 + plainSlice.byteLength)
+        payloadToEncrypt[0] = PAYLOAD_FLAG_RAW
+        payloadToEncrypt.set(plainSlice, 1)
+      }
+    }
     const iv = deriveChunkIv(baseIv, i)
     const aad = buildChunkAad({ kind, roomId, keyId, chunkIndex: i, totalChunks })
     const cipherBuf = await globalThis.crypto.subtle.encrypt(
       { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
       cryptoKey,
-      plainSlice,
+      payloadToEncrypt,
     )
     const cipherU8 = new Uint8Array(cipherBuf)
     const frame = new Uint8Array(4 + cipherU8.byteLength)
@@ -427,6 +644,7 @@ export async function encryptChunkedBytes(
     chunked: true,
     totalChunks,
     totalBytes,
+    ...(useCompress ? { compressed: true } : {}),
     ...(chunks ? { chunks } : {}),
   }
 }
@@ -438,7 +656,7 @@ export async function encryptChunkedBytes(
 export async function decryptChunkedStream(
   rawKeyStr,
   streamOrBytes,
-  { iv, kid = '', kind = 'upload', roomId = '', onPlainChunk = null } = {},
+  { iv, kid = '', kind = 'upload', roomId = '', compressed = false, onPlainChunk = null } = {},
 ) {
   const { cryptoKey, keyId } = await importCachedKey(rawKeyStr)
   if (kid && String(kid) !== keyId) {
@@ -453,6 +671,7 @@ export async function decryptChunkedStream(
     err.code = 'E2EE_DECRYPT_FAILED'
     throw err
   }
+  const isCompressed = Boolean(compressed)
 
   const queue = new ByteQueue()
   let headerParsed = false
@@ -496,7 +715,8 @@ export async function decryptChunkedStream(
         if (queue.byteLength < 4) return
         const lenBuf = queue.shift(4)
         nextFrameLen = readUint32BE(lenBuf, 0)
-        if (nextFrameLen < 16 || nextFrameLen > chunkSize + 16) {
+        const maxFrameBytes = chunkSize + (isCompressed ? 1 : 0) + 16
+        if (nextFrameLen < 16 || nextFrameLen > maxFrameBytes) {
           const err = new Error('端到端分块密文帧长度非法')
           err.code = 'E2EE_DECRYPT_FAILED'
           throw err
@@ -521,7 +741,24 @@ export async function decryptChunkedStream(
         err.code = 'E2EE_DECRYPT_FAILED'
         throw err
       }
-      const plainU8 = new Uint8Array(plainBuf)
+      let plainU8 = new Uint8Array(plainBuf)
+      if (isCompressed) {
+        if (plainU8.byteLength < 1) {
+          const err = new Error('端到端分块压缩帧无效')
+          err.code = 'E2EE_DECRYPT_FAILED'
+          throw err
+        }
+        const flag = plainU8[0]
+        if (flag === PAYLOAD_FLAG_RAW) {
+          plainU8 = plainU8.subarray(1)
+        } else if (flag === PAYLOAD_FLAG_DEFLATE_RAW) {
+          plainU8 = await inflateRawBytes(plainU8.subarray(1), chunkSize)
+        } else {
+          const err = new Error('端到端分块压缩标识无效')
+          err.code = 'E2EE_DECRYPT_FAILED'
+          throw err
+        }
+      }
       totalPlainBytes += plainU8.byteLength
       chunkIndex += 1
       if (onPlainChunk) await onPlainChunk(plainU8)
@@ -550,15 +787,15 @@ export async function decryptChunkedStream(
 export async function decryptAutoStream(
   rawKeyStr,
   streamOrBytes,
-  { iv, kid = '', kind = 'upload', roomId = '', chunked = false, onPlainChunk = null } = {},
+  { iv, kid = '', kind = 'upload', roomId = '', chunked = false, compressed = false, onPlainChunk = null } = {},
 ) {
   if (chunked) {
-    return decryptChunkedStream(rawKeyStr, streamOrBytes, { iv, kid, kind, roomId, onPlainChunk })
+    return decryptChunkedStream(rawKeyStr, streamOrBytes, { iv, kid, kind, roomId, compressed, onPlainChunk })
   }
   if (streamOrBytes instanceof Uint8Array || ArrayBuffer.isView(streamOrBytes) || streamOrBytes instanceof ArrayBuffer) {
     const u8 = toUint8Array(streamOrBytes)
     if (isChunkedE2eeHeader(u8)) {
-      return decryptChunkedStream(rawKeyStr, u8, { iv, kid, kind, roomId, onPlainChunk })
+      return decryptChunkedStream(rawKeyStr, u8, { iv, kid, kind, roomId, compressed, onPlainChunk })
     }
     const plain = await decryptBytes(rawKeyStr, u8, { iv, kid, kind, roomId })
     if (onPlainChunk) {
@@ -610,7 +847,7 @@ export async function decryptAutoStream(
     })()
 
     if (head4 && isChunkedE2eeHeader(head4)) {
-      return await decryptChunkedStream(rawKeyStr, replayStream, { iv, kid, kind, roomId, onPlainChunk })
+      return await decryptChunkedStream(rawKeyStr, replayStream, { iv, kid, kind, roomId, compressed, onPlainChunk })
     }
 
     const parts = []
@@ -637,7 +874,7 @@ export async function decryptAutoStream(
 }
 
 export async function encryptJson(rawKeyStr, data, { kind = 'msg', roomId = '' } = {}) {
-  const plainBytes = textEncoder.encode(JSON.stringify(data))
+  const plainBytes = await packJsonBytes(data)
   const { v, kid, iv, ciphertext } = await encryptBytes(rawKeyStr, plainBytes, { kind, roomId })
   return {
     v,
@@ -665,13 +902,88 @@ export async function decryptJson(rawKeyStr, envelope, { kind = 'msg', roomId = 
     kind,
     roomId,
   })
-  try {
-    return JSON.parse(textDecoder.decode(plainBytes))
-  } catch {
-    const err = new Error('端到端明文解析失败')
+  return unpackJsonBytes(plainBytes)
+}
+
+/**
+ * Parse the 21-byte binary E2EE header without decrypting (for fast `kid` & replay `iv` checks):
+ *   [0]      uint8  version (E2EE_VERSION = 1)
+ *   [1..8]   8B     keyId bytes
+ *   [9..20]  12B    AES-GCM IV bytes
+ *   [21..N]  bytes  AES-256-GCM ciphertext (>= 16B tag)
+ */
+export function parseBinaryE2eeHeader(rawBytes) {
+  const u8 = toUint8Array(rawBytes)
+  if (u8.byteLength < E2EE_BIN_HEADER_BYTES + 16) return null
+  const v = u8[0]
+  if (v !== E2EE_VERSION) return null
+  const kid = bytesToHex(u8.subarray(1, 9))
+  const ivBytes = u8.subarray(9, 21)
+  const iv = bytesToBase64Url(ivBytes)
+  const ciphertext = u8.subarray(21)
+  return { v, kid, iv, ivBytes, ciphertext }
+}
+
+/**
+ * Compress (`deflate-raw` when >= 512 B) and AES-256-GCM encrypt a JSON payload into a raw binary
+ * envelope with ZERO Base64URL overhead (used over P2P `aio-ctrl`).
+ */
+export async function encryptBinaryJson(rawKeyStr, data, { kind = 'msg', roomId = '' } = {}) {
+  const { cryptoKey, keyId, keyIdBytes } = await importCachedKey(rawKeyStr)
+  const iv = new Uint8Array(E2EE_IV_BYTES)
+  globalThis.crypto.getRandomValues(iv)
+  const plainBytes = await packJsonBytes(data)
+  const aad = buildAad({ kind, roomId, keyId })
+  const cipherBuf = await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
+    cryptoKey,
+    plainBytes,
+  )
+  const cipherU8 = new Uint8Array(cipherBuf)
+  const bytes = new Uint8Array(E2EE_BIN_HEADER_BYTES + cipherU8.byteLength)
+  bytes[0] = E2EE_VERSION
+  bytes.set(keyIdBytes, 1)
+  bytes.set(iv, 9)
+  bytes.set(cipherU8, E2EE_BIN_HEADER_BYTES)
+  return {
+    v: E2EE_VERSION,
+    kid: keyId,
+    iv: bytesToBase64Url(iv),
+    bytes,
+  }
+}
+
+/**
+ * Decrypt and decompress a binary E2EE JSON envelope produced by `encryptBinaryJson`.
+ */
+export async function decryptBinaryJson(rawKeyStr, rawBytes, { kind = 'msg', roomId = '' } = {}) {
+  const hdr = parseBinaryE2eeHeader(rawBytes)
+  if (!hdr) {
+    const err = new Error('端到端二进制密文格式无效')
     err.code = 'E2EE_DECRYPT_FAILED'
     throw err
   }
+  const { cryptoKey, keyId } = await importCachedKey(rawKeyStr)
+  if (hdr.kid !== keyId) {
+    const err = new Error('端到端密钥不匹配，请重新扫码同步最新密钥')
+    err.code = 'E2EE_KEY_MISMATCH'
+    err.expectedKeyId = hdr.kid
+    throw err
+  }
+  const aad = buildAad({ kind, roomId, keyId })
+  let plainBuf
+  try {
+    plainBuf = await globalThis.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: hdr.ivBytes, additionalData: aad, tagLength: 128 },
+      cryptoKey,
+      hdr.ciphertext,
+    )
+  } catch {
+    const err = new Error('端到端解密失败：密钥不匹配或密文已被篡改')
+    err.code = 'E2EE_DECRYPT_FAILED'
+    throw err
+  }
+  return unpackJsonBytes(new Uint8Array(plainBuf))
 }
 
 /**

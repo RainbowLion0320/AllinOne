@@ -317,7 +317,7 @@ export class ElectronWebRtcClient {
         if (role === 'bulk') {
           try { opts.onBulkMessage?.(bytes) } catch {}
         } else {
-          try { opts.onCtrlMessage?.(Buffer.from(bytes).toString('utf8')) } catch {}
+          try { opts.onCtrlMessage?.(bytes) } catch {}
         }
       },
       handleOffer: async (sdp) => {
@@ -333,10 +333,17 @@ export class ElectronWebRtcClient {
       },
       isCtrlOpen: () => !closed && ctrlOpen,
       isBulkOpen: () => !closed && bulkOpen,
-      sendCtrl: (text) => {
+      sendCtrl: (data) => {
         if (closed || !ctrlOpen || !this.socket || this.socket.destroyed) return false
         try {
-          this.socket.write(encodeJsonFrame({ type: 'dc.sendText', peerId, role: 'ctrl', data: String(text) }))
+          if (typeof data === 'string') {
+            this.socket.write(encodeJsonFrame({ type: 'dc.sendText', peerId, role: 'ctrl', data }))
+          } else {
+            const raw = Buffer.isBuffer(data)
+              ? data
+              : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+            this.socket.write(encodeBinFrame(peerId, 'ctrl', raw))
+          }
           return true
         } catch {
           return false
