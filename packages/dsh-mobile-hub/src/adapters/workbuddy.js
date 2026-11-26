@@ -1429,7 +1429,7 @@ export class WorkBuddyAdapter {
             params: {
               protocolVersion: 1,
               clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-              clientInfo: { name: 'allinone', version: '1.0.22' },
+              clientInfo: { name: 'allinone', version: '1.0.23' },
             },
           })}\n`,
           'utf8',
