@@ -19,7 +19,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PLUGIN_NAME = 'allinone-dsh-ipc'
-const PLUGIN_VERSION = '1.0.25'
+const PLUGIN_VERSION = '1.0.26'
 
 const CORDIS_PATCH_YML = [
   '# Managed automatically by All in One Desktop App (authenticated 127.0.0.1 IPC only)',
