@@ -381,7 +381,7 @@ export function SettingsModal({
   })()
 
   const hasActionableUpdate =
-    desktopApi &&
+    Boolean(onCheckUpdate) &&
     updateState &&
     (updateState.status === 'available' ||
       updateState.status === 'downloading' ||
@@ -1027,7 +1027,7 @@ export function SettingsModal({
                     href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    onClick={onClose}
+                    onClick={() => setTimeout(() => onClose?.(), 0)}
                     className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
                   >
                     <span className="inline-flex items-center gap-2">
@@ -1234,7 +1234,7 @@ export function SettingsModal({
                     <span className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300">
                       v{appVersion}
                     </span>
-                    {desktopApi && updateState?.status === 'up-to-date' && (
+                    {onCheckUpdate && updateState?.status === 'up-to-date' && (
                       <span className="inline-flex items-center gap-0.5 rounded-md bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                         <Check className="h-2.5 w-2.5" />
                         <span>{bi('已最新', 'Latest')}</span>
@@ -1242,7 +1242,7 @@ export function SettingsModal({
                     )}
                   </div>
                 </div>
-                {desktopApi && onCheckUpdate ? (
+                {onCheckUpdate ? (
                   <button
                     type="button"
                     disabled={

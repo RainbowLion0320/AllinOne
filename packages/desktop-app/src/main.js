@@ -406,17 +406,13 @@ function createMainWindow({ showOnReady = true } = {}) {
     return false
   }
 
-  // Open external http/https links in the system browser, never inside Electron —
-  // and block unsolicited popups originating from sandboxed HTML preview iframes (opaque/null frameOrigin).
+  // Open external http/https links in the system browser, never inside Electron.
+  // Sandboxed HTML preview iframes omit `allow-popups` (blocked by Chromium before reaching here);
+  // also deny POST form popups and any sandbox-preview referrer as defense-in-depth.
   win.webContents.setWindowOpenHandler((details) => {
     const url = String(details?.url || '')
-    const frameOrigin = String(details?.frameOrigin || '')
-    const referrerUrl = String(details?.referrer?.url || '')
-    const fromSandboxFrame =
-      !frameOrigin ||
-      frameOrigin === 'null' ||
-      referrerUrl.includes('sandbox-preview.html')
-    if (fromSandboxFrame) {
+    const referrerUrl = String(details?.referrer?.url || '').toLowerCase()
+    if (details?.postBody || referrerUrl.includes('sandbox-preview.html')) {
       return { action: 'deny' }
     }
     try {
@@ -1021,13 +1017,28 @@ if (!gotLock) {
     // Immediately resume background bridge if this PC already has an account binding
     void bridgeManager.startFromSavedConfigIfPresent()
 
-    // Quietly check GitHub Releases for a newer version shortly after startup
+    // Quietly check GitHub Releases for a newer version shortly after startup,
+    // then periodically every 4 hours so tray-resident users still get notified.
+    const UPDATE_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000
     const startupCheckTimer = setTimeout(() => {
       if (!isQuitting) {
         void updater.checkForUpdates({ silent: true })
       }
     }, 8_000)
     startupCheckTimer.unref?.()
+
+    const periodicCheckTimer = setInterval(() => {
+      if (isQuitting) return
+      const st = updater.getState?.()
+      if (st && (st.status === 'downloading' || st.status === 'downloaded' || st.status === 'installing')) return
+      void updater.checkForUpdates({ silent: true })
+    }, UPDATE_POLL_INTERVAL_MS)
+    periodicCheckTimer.unref?.()
+
+    app.once('before-quit', () => {
+      clearTimeout(startupCheckTimer)
+      clearInterval(periodicCheckTimer)
+    })
   })
 
   app.on('activate', () => {

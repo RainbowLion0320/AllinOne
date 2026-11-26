@@ -926,6 +926,7 @@ export function createRelayServer(options = {}) {
       const bridges = hub.getBridgeList(user.room)
       sendJson(res, 200, {
         ok: true,
+        version: RELAY_VERSION,
         roomId: user.room,
         bridges,
         onlineBridges: bridges.filter((b) => b.online).length,

@@ -175,6 +175,7 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
+import { compareSemver as compareMobileSemver } from '../packages/mobile-app/src/lib/clientHelpers.js'
 import {
   extractImageRefsFromText,
   isExternalHttpImageUrl,
@@ -4564,6 +4565,14 @@ async function main() {
       assert.equal(isPrivateOrLoopbackUrl('https://[::ffff:127.0.0.1]/x.png'), true)
       assert.equal(isPrivateOrLoopbackUrl('https://cdn.example.com/ok.png'), false)
       assert.equal(resolveImageSrc('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4='), '')
+
+      // 6) Electron setWindowOpenHandler must not check non-existent details.frameOrigin (which blocked all target="_blank" links)
+      const desktopMainSrc = readFileSync(join(process.cwd(), 'packages/desktop-app/src/main.js'), 'utf8')
+      assert.equal(desktopMainSrc.includes('details?.frameOrigin'), false, 'Electron HandlerDetails has no frameOrigin property')
+      assert.equal(desktopMainSrc.includes('UPDATE_POLL_INTERVAL_MS'), true, 'Desktop updater must schedule periodic checks')
+      assert.equal(compareMobileSemver('1.0.21', '1.0.20'), 1)
+      assert.equal(compareMobileSemver('1.0.20', '1.0.20'), 0)
+      assert.equal(compareMobileSemver('1.0.19', '1.0.20'), -1)
     }
     pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & mobile config)')
 

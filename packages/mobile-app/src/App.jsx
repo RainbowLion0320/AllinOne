@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
+import { checkNativeMobileUpdate } from './lib/clientHelpers.js'
 import { compressImageForUpload } from './lib/imageCompress.js'
 import {
   MobileRelayClient,
@@ -169,6 +170,8 @@ export function App() {
 
   const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
   const isMacDesktop = desktopApi?.platform === 'darwin'
+  const isNativeMobile =
+    typeof window !== 'undefined' && !desktopApi && Boolean(window.Capacitor?.isNativePlatform?.())
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
@@ -385,6 +388,42 @@ export function App() {
       try { unsubMenu?.() } catch {}
     }
   }, [desktopApi, openNewChatModal])
+
+  const handleCheckNativeMobileUpdate = useCallback(
+    async ({ silent = false } = {}) => {
+      if (!isNativeMobile) return null
+      const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
+      if (!silent) {
+        setUpdateState((prev) => ({ ...(prev || {}), status: 'checking', currentVersion }))
+      }
+      const next = await checkNativeMobileUpdate({
+        currentVersion,
+        baseUrl: activeDevice?.baseUrl || '',
+        token: activeDevice?.token || '',
+      })
+      if (silent && next.status === 'error') {
+        return next
+      }
+      setUpdateState(next)
+      return next
+    },
+    [isNativeMobile, activeDevice?.baseUrl, activeDevice?.token],
+  )
+
+  // Native mobile (Android APK) automatic update check shortly after launch + every 4 hours
+  useEffect(() => {
+    if (!isNativeMobile) return
+    const startupTimer = setTimeout(() => {
+      void handleCheckNativeMobileUpdate({ silent: true })
+    }, 5_000)
+    const periodicTimer = setInterval(() => {
+      void handleCheckNativeMobileUpdate({ silent: true })
+    }, 4 * 60 * 60 * 1000)
+    return () => {
+      clearTimeout(startupTimer)
+      clearInterval(periodicTimer)
+    }
+  }, [isNativeMobile, handleCheckNativeMobileUpdate])
 
   const hadDesktopAccountRef = useRef(false)
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
@@ -3301,7 +3340,13 @@ export function App() {
             }
             onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
             updateState={updateState}
-            onCheckUpdate={desktopApi ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) } : null}
+            onCheckUpdate={
+              desktopApi
+                ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) }
+                : isNativeMobile
+                  ? () => { void handleCheckNativeMobileUpdate({ silent: false }) }
+                  : null
+            }
             onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
             onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
             onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
