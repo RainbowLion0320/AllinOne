@@ -6,7 +6,7 @@
 
 <p>
   <strong>Not an Agent. Not a Harness. Just a Tool.</strong><br/>
-  <sub>零侵入、零额外 Token —— 在手机或任意电脑上，端到端加密远程控制你本机的 AI 编程工具</sub>
+  <sub>单一设备掌控所有互联电脑 —— 零侵入、零额外 Token，端到端加密远程调度多台电脑上的 AI 编程工具</sub>
 </p>
 
 <p>
@@ -14,7 +14,9 @@
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
-  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong>
+  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp; <em>and more</em>
+  <br/>
+  <sub>目前已接入以上主流 AI 工具，更多工具持续扩展中</sub>
 </p>
 
 <p>
@@ -58,10 +60,10 @@
   </tr>
 </table>
 
-- **一站聚合多款主流工具**：直接复用本机已有对话、项目工作区与官方 Prompt Cache，按活跃度自动排序，主界面实时总览各厂商 5 小时/周额度、积分与账户余额。
+- **一端掌控所有互联电脑**：用一台手机或任意一台电脑，即可随时切换并调度你账号下所有已接入的 Windows / macOS / Linux 电脑，直接复用各机已有对话、项目工作区与官方 Prompt Cache，首页实时总览各厂商 5 小时/周额度、积分与账户余额。
 - **P2P 直连优先，0 流量限速**：默认 WebRTC 端到端直连，常规网络 **0 字节经过服务器**；极端网络自动回落加密 TURN 中继。
-- **零知识端到端加密**：所有对话、代码与文件均由本机 256-bit 密钥（`AES-256-GCM`）加解密，服务器只做鉴权与信令，看不到任何内容。
-- **全平台 + 极轻自建**：提供 macOS / Windows / Android 客户端（支持签名应用内热更重启）、iOS 网页 PWA 与 Linux 一行接入脚本；1 核 1G 服务器一条 Docker 命令即可部署。
+- **零知识端到端加密**：所有对话、代码与文件均由设备间 256-bit 密钥（`AES-256-GCM`）加解密，服务器只做鉴权与信令，看不到任何内容。
+- **全平台控制端 + 极轻自建**：手机（Android 应用内热更 / iOS 网页 PWA）与电脑（macOS / Windows）均可作为总控端，Linux 宿主机支持一行脚本接入；1 核 1G 服务器一条 Docker 命令即可部署。
 
 ---
 
@@ -128,7 +130,7 @@
 
 ```mermaid
 flowchart LR
-  subgraph Clients["手机 / 电脑客户端（持有本机 E2EE 密钥）"]
+  subgraph Clients["任意单台控制端（手机 / 电脑 · 持有 E2EE 密钥）"]
     M["手机 PWA / Android APK / 桌面端"]
   end
 
@@ -136,9 +138,9 @@ flowchart LR
     R["@allinone/relay-server<br/>账号鉴权 · 加密信令 · STUN · 可选 TURN 凭证"]
   end
 
-  subgraph PC["你的电脑（出站连接 · 零开端口）"]
-    B["All in One 桥接器"]
-    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy"]
+  subgraph PC["所有互联电脑（Windows / macOS / Linux · 出站连接零开端口）"]
+    B["All in One 桥接器（多机并存 · 随时切换）"]
+    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy ..."]
     B <-->|"官方本地接口"| A
   end
 

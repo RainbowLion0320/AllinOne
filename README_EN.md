@@ -6,7 +6,7 @@
 
 <p>
   <strong>Not an Agent. Not a Harness. Just a Tool.</strong><br/>
-  <sub>Zero prompt injection, zero extra token overhead — end-to-end encrypted remote control for your local AI coding tools</sub>
+  <sub>Control every connected computer from any single device — zero prompt injection, zero extra tokens, end-to-end encrypted</sub>
 </p>
 
 <p>
@@ -14,7 +14,9 @@
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
-  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong>
+  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp; <em>and more</em>
+  <br/>
+  <sub>Currently integrated — continuously expanding to more AI tools</sub>
 </p>
 
 <p>
@@ -58,10 +60,10 @@
   </tr>
 </table>
 
-- **All Your Agents, One Unified Workspace**: Reuse existing local chats, workspaces, and vendor prompt caches with activity-sorted tabs and a live home dashboard showing 5-hour/weekly limits, credits, and account balances.
+- **One Device, Every Connected Computer**: Use a single phone or any computer to switch between and orchestrate all your linked Windows / macOS / Linux machines — reusing each machine's existing threads, workspaces, and vendor prompt caches, with a live home dashboard for 5h/weekly limits, credits, and balances.
 - **Direct P2P First, Zero Relay Traffic**: Connects directly over encrypted WebRTC DataChannels by default (**0 bytes through your server**); automatically falls back to encrypted TURN on double-symmetric NATs.
-- **Mandatory Zero-Knowledge E2EE**: All messages, code, and files are encrypted client-side with a local 256-bit `AES-256-GCM` key — your server handles only auth and signaling.
-- **Cross-Platform & 1-Minute Self-Hosting**: Desktop apps for macOS / Windows, Android APK (with signed in-app OTA hot updates), iOS PWA, Linux one-liner CLI, and single-command Docker self-hosting on any 1-vCPU VPS.
+- **Mandatory Zero-Knowledge E2EE**: All messages, code, and files are encrypted end-to-end with 256-bit `AES-256-GCM` keys — your server handles only auth and signaling.
+- **Cross-Platform Control & 1-Minute Self-Hosting**: Control from macOS / Windows desktop, Android APK (with signed in-app OTA hot updates), or iOS PWA; link headless Linux hosts with one command, and self-host on any 1-vCPU VPS via Docker.
 
 ---
 
@@ -128,7 +130,7 @@
 
 ```mermaid
 flowchart LR
-  subgraph Clients["Phone / Desktop Clients (Holds Local E2EE Key)"]
+  subgraph Clients["Any Single Controller (Phone / Desktop · Holds E2EE Keys)"]
     M["Mobile PWA / Android APK / Desktop"]
   end
 
@@ -136,9 +138,9 @@ flowchart LR
     R["@allinone/relay-server<br/>Auth · Encrypted Signaling · STUN · Optional TURN Credentials"]
   end
 
-  subgraph PC["Your Computer (Outbound Only · Zero Open Ports)"]
-    B["All in One Bridge"]
-    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy"]
+  subgraph PC["All Connected Computers (Windows / macOS / Linux · Outbound Only)"]
+    B["All in One Bridge (Multi-Host · Instant Switch)"]
+    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy ..."]
     B <-->|"Official Local Interface"| A
   end
 
