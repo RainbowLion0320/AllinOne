@@ -97,6 +97,7 @@ export function ensureRichPath(forceRefresh = false) {
       join(home, '.antigravity', 'bin'),
       join(home, '.agy', 'bin'),
       join(home, '.claude', 'local'),
+      join(home, '.codebuddy', 'bin'),
       ...listNewestVersionBins(join(home, '.nvm', 'versions', 'node'), 'bin'),
       ...listNewestVersionBins(join(home, '.fnm', 'node-versions'), join('installation', 'bin')),
       ...listNewestVersionBins(join(home, 'Library', 'Application Support', 'fnm', 'node-versions'), join('installation', 'bin')),
@@ -420,6 +421,43 @@ export function getCodexCandidates(home = homedir(), platform = process.platform
       join(appData, 'npm', 'codex.exe'),
       join(localApp, 'Programs', 'ChatGPT', 'resources', 'codex-cli', 'codex.exe'),
       join(localApp, 'Programs', 'Codex', 'resources', 'codex.exe'),
+    )
+  }
+  return list.filter(Boolean)
+}
+
+/**
+ * Unified candidate executable paths for Tencent CodeBuddy Code CLI (`codebuddy` / `cbc`),
+ * the official standalone CLI sharing account & Credits quota with WorkBuddy Desktop.
+ */
+export function getCodebuddyCandidates(home = homedir(), platform = process.platform, env = process.env, configuredBin = '') {
+  const list = [
+    configuredBin,
+    env?.WORKBUDDY_CLI_BIN,
+    env?.CODEBUDDY_BIN,
+  ]
+  if (platform === 'win32') {
+    const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(
+      join(appData, 'npm', 'codebuddy.cmd'),
+      join(appData, 'npm', 'codebuddy.exe'),
+      join(appData, 'npm', 'cbc.cmd'),
+      join(appData, 'npm', 'cbc.exe'),
+      join(home, '.local', 'bin', 'codebuddy.exe'),
+      join(home, '.codebuddy', 'bin', 'codebuddy.exe'),
+      join(localApp, 'Programs', 'CodeBuddy', 'bin', 'codebuddy.cmd'),
+    )
+  } else {
+    list.push(
+      join(home, '.local', 'bin', 'codebuddy'),
+      join(home, '.codebuddy', 'bin', 'codebuddy'),
+      join(home, '.npm-global', 'bin', 'codebuddy'),
+      '/opt/homebrew/bin/codebuddy',
+      '/usr/local/bin/codebuddy',
+      join(home, '.local', 'bin', 'cbc'),
+      '/opt/homebrew/bin/cbc',
+      '/usr/local/bin/cbc',
     )
   }
   return list.filter(Boolean)

@@ -2,7 +2,7 @@
  * All in One — Streamlined v1.x End-to-End Smoke & Security Test Suite (16 modules)
  *
  *  1. Account Bootstrap, Open Registration, Daily Cap, Multi-Tenant Isolation, Device Lifecycle & Portable CLI
- *  2. Live E2EE PC Bridge & 4-App RPC Routing (DSH, Codex, Claude, Antigravity)
+ *  2. Live E2EE PC Bridge & 5-App RPC Routing (DSH, Codex, Claude, Antigravity, WorkBuddy)
  *  3. Core Control Plane & Bridge Security Hardening
  *  4. Full-Duplex Zero-Knowledge E2EE & Direct WebRTC P2P (`aio-ctrl` + `aio-bulk` + Instant Revocation)
  *  5. Zero-Knowledge Device-to-Device Key Grant (ECDH P-256 + SAS + Reverse-QR) & QR Scan Nudge
@@ -76,6 +76,14 @@ import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
 import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local-ipc.js'
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
+import {
+  WorkBuddyAdapter,
+  hasStandaloneCodebuddyAuth,
+  isSafeWorkbuddyAuthUrl,
+  parseWorkbuddyJsonlMessages,
+  probeWorkbuddyTranscriptTail,
+  readWorkbuddyDbSnapshot,
+} from '../packages/dsh-mobile-hub/src/adapters/workbuddy.js'
 import {
   AntigravityAdapter,
   normalizeAntigravityQuota,
@@ -1168,13 +1176,13 @@ async function main() {
       )
 
       const statusRes = await rpc(RPC.APPS_STATUS)
-      assert.equal(statusRes.apps.length, 4)
+      assert.equal(statusRes.apps.length, 5)
 
       const wsRes = await rpc(RPC.WORKSPACES_LIST)
       assert.ok(Array.isArray(wsRes.workspaces))
 
       const modelsRes = await rpc(RPC.MODELS_LIST)
-      for (const app of ['dsh', 'codex', 'claude', 'antigravity']) {
+      for (const app of ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy']) {
         assert.ok(Array.isArray(modelsRes.catalog[app]?.models))
         const appInfo = statusRes.apps.find((a) => a.app === app)
         if (appInfo?.writable || app === 'dsh') {
@@ -1184,7 +1192,7 @@ async function main() {
 
       const listRes = await rpc(RPC.SESSIONS_LIST, { app: 'all', limit: 40 })
       assert.ok(Array.isArray(listRes.sessions))
-      for (const app of ['dsh', 'codex', 'claude', 'antigravity']) {
+      for (const app of ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy']) {
         const sample = listRes.sessions.find((s) => s.app === app)
         if (!sample) continue
         const readRes = await rpc(RPC.SESSION_READ, { id: sample.id, limit: 10 })
@@ -1590,7 +1598,7 @@ async function main() {
             e2eeKey: primaryE2eeKey,
             roomId: smokeAdmin.roomId,
           })
-          assert.equal((await victimPeer.sendEncryptedRpc(RPC.APPS_STATUS)).apps.length, 4)
+          assert.equal((await victimPeer.sendEncryptedRpc(RPC.APPS_STATUS)).apps.length, 5)
           assert.ok(bridge.link.p2p.sessions.has(victimCli.hello.clientId))
 
           const kickStarted = Date.now()
@@ -4619,6 +4627,8 @@ async function main() {
       rootOrch.adapters.dsh.listSessions = async () => []
       rootOrch.adapters.claude.listSessions = async () => []
       rootOrch.adapters.antigravity.listSessions = async () => []
+      rootOrch.adapters.workbuddy.listWorkspaces = async () => []
+      rootOrch.adapters.workbuddy.listSessions = async () => []
       const okRead = await rootOrch.readLocalFile({ path: 'outputs/report.md', cwd: codexProjDir, mode: 'document', sessionId: 'codex:t1' })
       assert.equal(okRead.filename, 'report.md')
       await assert.rejects(
@@ -4626,8 +4636,281 @@ async function main() {
         /出于安全限制/,
       )
       await rootOrch.dispose()
+
+      // 8) WorkBuddy 5th-app adapter: SQLite + JSONL parsing, external live sync, readonly/writable CLI stream & security guards
+      {
+        const wbHome = join(tmpDir, 'mock-wb-home')
+        const wbCodeHome = join(tmpDir, 'mock-cb-home')
+        const wbProjDir = join(tmpDir, 'mock-wb-proj')
+        const wbSessDir = join(wbHome, 'projects', 'mock-wb-proj')
+        mkdirSync(wbSessDir, { recursive: true })
+        mkdirSync(wbProjDir, { recursive: true })
+
+        const wbSessId = 'wb-sess-001'
+        const wbJsonlPath = join(wbSessDir, `${wbSessId}.jsonl`)
+        const nowMs = Date.now()
+        writeFileSync(
+          wbJsonlPath,
+          [
+            JSON.stringify({ id: 'u1', timestamp: nowMs - 5000, type: 'message', role: 'user', content: [{ type: 'input_text', text: '分析下项目结构' }], sessionId: wbSessId, cwd: wbProjDir }),
+            JSON.stringify({ id: 'r1', timestamp: nowMs - 4000, type: 'reasoning', rawContent: [{ type: 'text', text: '先查看目录文件' }], providerData: { model: 'glm-5.3' }, sessionId: wbSessId, cwd: wbProjDir }),
+            JSON.stringify({ id: 'fc1', timestamp: nowMs - 3000, type: 'function_call', callId: 'call_1', name: 'Bash', arguments: '{"command":"ls"}', sessionId: wbSessId, cwd: wbProjDir }),
+            JSON.stringify({ id: 'fr1', timestamp: nowMs - 2000, type: 'function_call_result', callId: 'call_1', name: 'Bash', status: 'completed', output: { type: 'text', text: 'src/ package.json' }, sessionId: wbSessId, cwd: wbProjDir }),
+            JSON.stringify({ id: 'a1', timestamp: nowMs - 1000, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '项目包含 src 和 package.json。' }], providerData: { requestModelId: 'glm-5.3' }, sessionId: wbSessId, cwd: wbProjDir }),
+            JSON.stringify({ id: 't1', timestamp: nowMs - 500, type: 'custom-title', customTitle: 'WorkBuddy 实测会话', sessionId: wbSessId }),
+          ].join('\n') + '\n',
+          'utf8',
+        )
+
+        // Populate a real SQLite workbuddy.db when node:sqlite is available
+        try {
+          const { DatabaseSync } = await import('node:sqlite')
+          const db = new DatabaseSync(join(wbHome, 'workbuddy.db'))
+          db.exec(`
+            CREATE TABLE sessions (
+              id TEXT PRIMARY KEY, cwd TEXT NOT NULL, user_id TEXT NOT NULL, title TEXT, custom_title TEXT,
+              status TEXT NOT NULL DEFAULT 'completed', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              deleted_at INTEGER, model TEXT, mode TEXT, permission_mode TEXT, thought_level TEXT, source_mode TEXT, transport TEXT
+            );
+            CREATE TABLE workspaces (path TEXT PRIMARY KEY, last_opened_at INTEGER NOT NULL);
+          `)
+          db.prepare(
+            `INSERT INTO sessions (id, cwd, user_id, title, custom_title, status, created_at, updated_at, model, transport)
+             VALUES (?, ?, 'u_test', '原标题', 'WorkBuddy 实测会话', 'completed', ?, ?, 'glm-5.3', 'local')`,
+          ).run(wbSessId, wbProjDir, nowMs - 5000, nowMs - 500)
+          db.prepare('INSERT INTO workspaces (path, last_opened_at) VALUES (?, ?)').run(wbProjDir, nowMs)
+          db.close()
+          const snap = readWorkbuddyDbSnapshot(wbHome)
+          assert.equal(snap.sessionsById.get(wbSessId)?.title, 'WorkBuddy 实测会话')
+          assert.ok(snap.workspaces.some((w) => w.path === wbProjDir))
+        } catch {}
+
+        // 8a. Read-only mode (no codebuddy CLI)
+        const wbEvents = []
+        const wbRo = new WorkBuddyAdapter({
+          config: {
+            workbuddyHome: wbHome,
+            codebuddyHome: wbCodeHome,
+            workbuddyCliBin: join(tmpDir, 'nonexistent-codebuddy-bin'),
+            cwd: wbProjDir,
+            workbuddyWatchPollMs: 60,
+          },
+          log: { info() {}, warn() {}, error() {} },
+          emitEvent: (ev, payload) => wbEvents.push({ ev, payload }),
+        })
+        wbRo.codebuddyBin = ''
+        wbRo.probeCliVersion = async () => false
+        try {
+          const stRo = await wbRo.getStatus()
+          assert.equal(stRo.app, 'workbuddy')
+          assert.equal(stRo.available, true)
+          assert.equal(stRo.writable, false)
+          assert.equal(stRo.mode, 'readonly')
+
+          const parsed = parseWorkbuddyJsonlMessages(wbJsonlPath)
+          assert.equal(parsed.messages.length, 2)
+          assert.equal(parsed.messages[0].role, 'user')
+          assert.equal(parsed.messages[1].thinking, '先查看目录文件')
+          assert.equal(parsed.messages[1].tools?.[0]?.name, 'Bash')
+          assert.equal(parsed.messages[1].tools?.[0]?.output, 'src/ package.json')
+          assert.equal(parsed.messages[1].text, '项目包含 src 和 package.json。')
+
+          const wbList = await wbRo.listSessions({ limit: 20 })
+          assert.equal(wbList.length, 1)
+          assert.equal(wbList[0].id, `workbuddy:${wbSessId}`)
+          assert.equal(wbList[0].title, 'WorkBuddy 实测会话')
+          assert.equal(wbList[0].writable, false)
+
+          const wbRead = await wbRo.readSession(wbSessId)
+          assert.equal(wbRead.messages.length, 2)
+          assert.equal(wbRead.status, 'idle')
+
+          await assert.rejects(() => wbRo.createSession({ cwd: wbProjDir }), (e) => e.code === 'SESSION_READONLY')
+          await assert.rejects(() => wbRo.sendMessage(wbSessId, { text: 'hello' }), (e) => e.code === 'SESSION_READONLY')
+          await assert.rejects(() => wbRo.readSession('../../etc/passwd'), /非法的/)
+
+          // External live update detection on WorkBuddy Desktop JSONL append
+          appendFileSync(
+            wbJsonlPath,
+            JSON.stringify({ id: 'u2', timestamp: Date.now(), type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续排查' }], sessionId: wbSessId, cwd: wbProjDir }) + '\n' +
+            JSON.stringify({ id: 'fc2', timestamp: Date.now(), type: 'function_call', callId: 'call_2', name: 'Read', arguments: '{"file_path":"package.json"}', sessionId: wbSessId, cwd: wbProjDir }) + '\n',
+            'utf8',
+          )
+          const tailNow = probeWorkbuddyTranscriptTail(wbJsonlPath)
+          assert.equal(tailNow.running, true)
+          assert.equal(tailNow.lastToolName, 'Read')
+          await wbRo.pollExternalSessions()
+          const updEv = wbEvents.find((x) => x.ev === EVENTS.SESSION_UPDATED && x.payload?.session?.id === `workbuddy:${wbSessId}`)
+          assert.ok(updEv && updEv.payload.historyChanged && updEv.payload.statusChanged && updEv.payload.session.status === 'running')
+        } finally {
+          await wbRo.dispose()
+        }
+
+        // 8b. 1-click auth URL guard, standalone auth detection, env-autofix detection & ACP 1-click login + writable CLI stream
+        assert.equal(isSafeWorkbuddyAuthUrl('https://www.codebuddy.cn/oauth/login?state=1'), true)
+        assert.equal(isSafeWorkbuddyAuthUrl('https://open.weixin.qq.com/connect/qrconnect?appid=1'), true)
+        assert.equal(isSafeWorkbuddyAuthUrl('javascript:alert(1)'), false)
+        assert.equal(isSafeWorkbuddyAuthUrl('http://www.codebuddy.cn/login'), false)
+        assert.equal(isSafeWorkbuddyAuthUrl('https://evil.example.com/phish'), false)
+
+        const wbAuthDir = join(tmpDir, 'mock-wb-auth')
+        mkdirSync(wbAuthDir, { recursive: true })
+        writeFileSync(join(wbAuthDir, 'workbuddy-desktop.info'), '{"encrypted":true}', 'utf8')
+        assert.equal(hasStandaloneCodebuddyAuth({ authDir: wbAuthDir, env: {} }), false, 'Desktop-encrypted auth must not be counted as standalone CLI auth')
+
+        // Verify env-autofix detects half-installed WorkBuddy (native zero-Node installer)
+        const wbFakeHome = join(tmpDir, 'wb-autofix-home')
+        mkdirSync(join(wbFakeHome, '.workbuddy'), { recursive: true })
+        writeFileSync(join(wbFakeHome, '.workbuddy', 'workbuddy.db'), '', 'utf8')
+        const wbMissing = detectHalfInstalledClis({
+          homeDir: wbFakeHome,
+          checkBin: () => null,
+          checkSystemApps: false,
+        })
+        assert.ok(wbMissing.some((m) => m.app === 'workbuddy' && m.steps.some((s) => JSON.stringify(s.args).includes('codebuddy.cn/cli/install'))))
+
+        const mockCliJs = join(tmpDir, 'mock-codebuddy.cjs')
+        writeFileSync(
+          mockCliJs,
+          `
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const args = process.argv.slice(2);
+          if (args.includes('--version')) { console.log('2.176.0-mock'); process.exit(0); }
+          let buf = '';
+          process.stdin.setEncoding('utf8');
+          if (args.includes('--acp')) {
+            process.stdin.on('data', (c) => {
+              buf += c;
+              const lines = buf.split('\\n');
+              buf = lines.pop();
+              for (const raw of lines) {
+                if (!raw.trim()) continue;
+                const req = JSON.parse(raw);
+                if (req.method === 'initialize') {
+                  console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: 1, authMethods: [{ id: 'internal' }, { id: 'external' }] } }));
+                } else if (req.method === 'authenticate') {
+                  console.log(JSON.stringify({ jsonrpc: '2.0', method: '_codebuddy.ai/authUrl', params: { authUrl: 'https://www.codebuddy.cn/oauth/login?state=smoke&m=' + (req.params?.methodId || '') } }));
+                  setTimeout(() => {
+                    fs.writeFileSync(${JSON.stringify(join(wbAuthDir, 'codebuddy-code.info'))}, '{"ok":true}', 'utf8');
+                    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { _meta: { 'codebuddy.ai/userinfo': { userId: 'u1', userName: 'smoke' } } } }));
+                    process.exit(0);
+                  }, 150);
+                }
+              }
+            });
+            return;
+          }
+          process.stdin.on('data', (c) => {
+            buf += c;
+            if (!buf.includes('\\n')) return;
+            const line = buf.split('\\n')[0].trim();
+            const msg = JSON.parse(line);
+            const prompt = msg?.message?.content || '';
+            if (prompt.includes('TRIGGER_AUTH_ERR')) {
+              console.log(JSON.stringify({ type: 'assistant', message: { id: 'm-err', content: [{ type: 'text', text: 'Authentication required. Please use /login command to sign in to your account' }] } }));
+              console.log(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true }));
+              process.exit(0);
+              return;
+            }
+            console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'wb-sess-001', cwd: process.cwd() }));
+            console.log(JSON.stringify({ type: 'assistant', message: { id: 'm1', content: [{ type: 'thinking', thinking: '思考中' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: { path: 'README.md' } }] } }));
+            console.log(JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok-readme' }] } }));
+            console.log(JSON.stringify({ type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: '已收到:' + prompt + '|cfg=' + (process.env.CODEBUDDY_CONFIG_DIR || '') + '|args=' + args.join(' ') }] } }));
+            console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '已收到:' + prompt + '|cfg=' + (process.env.CODEBUDDY_CONFIG_DIR || '') + '|args=' + args.join(' ') }));
+            process.exit(0);
+          });
+          `,
+          'utf8',
+        )
+        const mockCliBin = process.platform === 'win32'
+          ? join(tmpDir, 'mock-codebuddy.cmd')
+          : join(tmpDir, 'mock-codebuddy.sh')
+        if (process.platform === 'win32') {
+          writeFileSync(mockCliBin, `@echo off\r\n"${process.execPath}" "${mockCliJs}" %*\r\n`, 'utf8')
+        } else {
+          writeFileSync(mockCliBin, `#!/bin/sh\nexec "${process.execPath}" "${mockCliJs}" "$@"\n`, { encoding: 'utf8', mode: 0o755 })
+        }
+
+        // Mark wb-sess-001 idle again before sending via CLI
+        appendFileSync(
+          wbJsonlPath,
+          JSON.stringify({ id: 'a2', timestamp: Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '排查完成' }], sessionId: wbSessId, cwd: wbProjDir }) + '\n',
+          'utf8',
+        )
+
+        const rwEvents = []
+        const wbRw = new WorkBuddyAdapter({
+          config: {
+            workbuddyHome: wbHome,
+            codebuddyHome: wbCodeHome,
+            workbuddyAuthDir: wbAuthDir,
+            workbuddyCliBin: mockCliBin,
+            cwd: wbProjDir,
+          },
+          log: { info() {}, warn() {}, error() {} },
+          emitEvent: (ev, payload) => rwEvents.push({ ev, payload }),
+        })
+        try {
+          // Installed CLI but unauthenticated -> setupState='needs_login', writable=false
+          const stNeedLogin = await wbRw.getStatus()
+          assert.equal(stNeedLogin.cliInstalled, true)
+          assert.equal(stNeedLogin.writable, false)
+          assert.equal(stNeedLogin.setupState, 'needs_login')
+
+          // 1-click setup triggers ACP authenticate, emits trusted authUrl, then auto-unlocks RW
+          const setupRes = await wbRw.runSetup({ action: 'setup', methodId: 'internal' })
+          assert.equal(setupRes.ok, true)
+          assert.equal(setupRes.status, 'awaiting_login')
+          assert.equal(setupRes.authUrl, 'https://www.codebuddy.cn/oauth/login?state=smoke&m=internal')
+          for (let i = 0; i < 30; i += 1) {
+            if (wbRw.isCliAuthenticated()) break
+            await new Promise((r) => setTimeout(r, 50))
+          }
+          assert.equal(wbRw.isCliAuthenticated(), true)
+          assert.ok(rwEvents.some((x) => x.ev === EVENTS.SESSION_UPDATED && x.payload?.authReady && x.payload?.app === 'workbuddy'))
+
+          const stRw = await wbRw.getStatus()
+          assert.equal(stRw.writable, true)
+          assert.equal(stRw.setupState, 'ready')
+          assert.equal(stRw.mode, 'codebuddy-cli-stream')
+
+          // Security guards: reject permission escalation and CLI injection
+          await assert.rejects(
+            () => wbRw.sendMessage(wbSessId, { text: 'hi', permissionMode: 'bypassPermissions' }),
+            /出于安全限制/,
+          )
+          await assert.rejects(
+            () => wbRw.sendMessage(wbSessId, { text: 'hi', model: 'glm-5.3 & calc.exe' }),
+            /非法的/,
+          )
+
+          const sendRes = await wbRw.sendMessage(wbSessId, {
+            text: '继续分析',
+            model: 'glm-5.3',
+            reasoningEffort: 'high',
+          })
+          assert.ok(sendRes.finalText.includes('已收到:继续分析'))
+          assert.ok(sendRes.finalText.includes(`cfg=${wbHome}`))
+          assert.ok(sendRes.finalText.includes(`--resume ${wbSessId}`))
+          assert.ok(sendRes.finalText.includes('--model glm-5.3'))
+          assert.ok(sendRes.finalText.includes('--effort high'))
+          assert.ok(rwEvents.some((x) => x.ev === EVENTS.STREAM_THINKING))
+          assert.ok(rwEvents.some((x) => x.ev === EVENTS.STREAM_TOOL_START && x.payload?.tool?.name === 'Read'))
+          assert.ok(rwEvents.some((x) => x.ev === EVENTS.STREAM_TOOL_END && x.payload?.output === 'ok-readme'))
+          assert.ok(rwEvents.some((x) => x.ev === EVENTS.STREAM_DONE))
+
+          // Friendly Chinese 1-click login prompt when CLI returns Authentication required
+          await assert.rejects(
+            () => wbRw.sendMessage(wbSessId, { text: 'TRIGGER_AUTH_ERR' }),
+            /一键微信扫码登录/,
+          )
+        } finally {
+          await wbRw.dispose()
+        }
+      }
     }
-    pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & mobile config)')
+    pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & WorkBuddy 5th-app adapter)')
 
     console.log(`\nALL ${TOTAL_SUITES} SMOKE TEST SUITES PASSED!`)
   } finally {

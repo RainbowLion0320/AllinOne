@@ -867,8 +867,8 @@ export function ChatView({
                     return (
                       <p className="mt-4 max-w-sm text-xs text-slate-400 dark:text-slate-500">
                         {bi(
-                          '本机暂未检测到已安装的 AI 工具（支持 DeepSeek Harness / Codex / Claude Code / Antigravity）',
-                          'No supported AI tools detected on this computer (DeepSeek Harness / Codex / Claude Code / Antigravity)',
+                          '本机暂未检测到已安装的 AI 工具（支持 DeepSeek Harness / Codex / Claude Code / Antigravity / WorkBuddy）',
+                          'No supported AI tools detected on this computer (DeepSeek Harness / Codex / Claude Code / Antigravity / WorkBuddy)',
                         )}
                       </p>
                     )

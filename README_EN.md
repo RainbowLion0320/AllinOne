@@ -6,7 +6,7 @@
 
 <p>
   <strong>End-to-End Encrypted Remote Control for Your Local AI Coding Agents</strong><br/>
-  Unified workspace for <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong>
+  Unified workspace for <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong> · <strong>WorkBuddy</strong>
 </p>
 
 <p>
@@ -154,6 +154,7 @@ irm https://your-server/setup.ps1 | iex
 | **Claude Code / Desktop** | `claude -p --resume --output-format stream-json` | Read/write `~/.claude/projects/` sessions, model switching, interrupt, Cowork/Code mirror | Reuses local login; Claude Desktop Cowork threads sync live with a `Desktop` badge; weekly quota ring supported |
 | **Antigravity** | `agy acp --app-data-dir antigravity` | Shared desktop history & auth, model & effort switching, background task sync | Live Desktop sync + Gemini weekly quota ring; after sending remote turns to an already-open Desktop thread, restart `Antigravity.app` before resuming natively |
 | **DeepSeek Harness** | Auto-installed loopback IPC (`allinone-dsh-ipc`) / native plugin (`dsh-mobile-hub`) | Read/write, model switching, bidirectional prompt sync; read-only history fallback when DSH is closed | Zero-terminal auto-install when `~/.dsh/profiles/desktop` is detected (`127.0.0.1` + 256-bit token); answering remotely dismisses DSH Desktop prompt cards automatically |
+| **WorkBuddy** | `~/.workbuddy` live sync + silent official native `codebuddy` CLI auto-install (1-click ACP QR sign-in) | Zero-config live sync of WorkBuddy Desktop sessions, thinking, tool calls & workspaces; 1-click UI sign-in (zero terminal, no Node.js required) unlocks remote sending, resume & model switching | Shares the same Tencent account & Credits quota as WorkBuddy Desktop; mirrors live with a `Desktop` badge until authorized once, then stays `RW` permanently |
 
 ---
 

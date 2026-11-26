@@ -18,6 +18,7 @@
     codex: { name: 'Codex', badge: 'CDX', color: '#10A37F', bg: 'rgba(16,163,127,0.16)' },
     claude: { name: 'Claude', badge: 'CLD', color: '#D97757', bg: 'rgba(217,119,87,0.16)' },
     antigravity: { name: 'Antigravity', badge: 'AGY', color: '#7C5CFF', bg: 'rgba(124,92,255,0.16)' },
+    workbuddy: { name: 'WorkBuddy', badge: 'WKB', color: '#00B8D9', bg: 'rgba(0,184,217,0.16)' },
   }
 
   const state = {
@@ -778,7 +779,7 @@
 
     // Card 2: AI Tools readiness across online PCs
     const onlineBridgeBase = Math.max(1, sum.onlineBridges || 0)
-    const appOrder = ['codex', 'claude', 'antigravity', 'dsh']
+    const appOrder = ['codex', 'claude', 'antigravity', 'dsh', 'workbuddy']
     const appBarsHtml = appOrder.map((id) => {
       const meta = APP_COLORS[id]
       const stat = apps[id] || { available: 0, writable: 0 }

@@ -6,7 +6,7 @@
 
 <p>
   <strong>在手机或任意电脑上，端到端加密远程续聊你本机的 AI 编程对话</strong><br/>
-  统一接入 <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong>
+  统一接入 <strong>Codex</strong> · <strong>Claude Code / Desktop</strong> · <strong>Antigravity</strong> · <strong>DeepSeek Harness</strong> · <strong>WorkBuddy</strong>
 </p>
 
 <p>
@@ -154,6 +154,7 @@ irm https://你的服务器/setup.ps1 | iex
 | **Claude Code / Desktop** | `claude -p --resume --output-format stream-json` | 读写 `~/.claude/projects/` 会话、切模型、中断、Cowork/Code 桌面端镜像 | 自动复用本地登录态；桌面端 Cowork 会话附带 `Desktop` 徽章实时同步；支持周额度展示 |
 | **Antigravity** | `agy acp --app-data-dir antigravity` | 共享桌面端历史与登录态、切模型与档位、后台任务同步 | 桌面端进度自动同步；支持 Gemini 周额度环形展示；远程续写同一会话后，切回原生桌面端前请先重启一次 `Antigravity.app` |
 | **DeepSeek Harness** | 自动安装本地环回 IPC (`allinone-dsh-ipc`) / 原生插件 (`dsh-mobile-hub`) | 读写会话、切模型、交互问答双向同步；未运行时自动降级为只读历史 | 检测到 `~/.dsh/profiles/desktop` 时零终端自动安装本地环回 IPC（`127.0.0.1` + 256-bit Token）；手机端回答后桌面端卡片自动静默关闭 |
+| **WorkBuddy** | `~/.workbuddy` 实时同步 + 自动静默安装官方原生 `codebuddy` CLI（ACP 一键微信扫码） | 开箱实时同步 WorkBuddy 桌面端会话、思考链、工具调用与工作区；在界面点「一键启用/扫码登录」（免命令行、免 Node.js）后解锁远程新建/续聊、切模型与推理强度 | 与 WorkBuddy 桌面端同账号、Credits 额度完全互通；未授权前自动以 `Desktop` 只读镜像实时同步，授权一次后永久保持 `RW` |
 
 ---
 

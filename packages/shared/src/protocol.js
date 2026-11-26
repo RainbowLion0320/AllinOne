@@ -8,6 +8,7 @@ export const APPS = Object.freeze({
   CODEX: 'codex',
   CLAUDE: 'claude',
   ANTIGRAVITY: 'antigravity',
+  WORKBUDDY: 'workbuddy',
 })
 
 export const APP_LIST = Object.freeze([
@@ -15,6 +16,7 @@ export const APP_LIST = Object.freeze([
   APPS.CODEX,
   APPS.CLAUDE,
   APPS.ANTIGRAVITY,
+  APPS.WORKBUDDY,
 ])
 
 export const APP_META = Object.freeze({
@@ -50,6 +52,14 @@ export const APP_META = Object.freeze({
     badge: 'AGY',
     description: '官方 ACP 协议直连 Antigravity，与桌面端原生共享同一会话与缓存',
   },
+  workbuddy: {
+    id: 'workbuddy',
+    name: 'WorkBuddy',
+    shortName: 'WorkBuddy',
+    color: '#00B8D9',
+    badge: 'WKB',
+    description: '腾讯 WorkBuddy 桌面端会话实时同步（安装并登录官方 codebuddy CLI 可解锁远程发消息，账号与额度互通）',
+  },
 })
 
 /**
@@ -57,6 +67,7 @@ export const APP_META = Object.freeze({
  */
 export const RPC = Object.freeze({
   APPS_STATUS: 'apps.status',
+  APP_SETUP: 'app.setup',
   MODELS_LIST: 'models.list',
   WORKSPACES_LIST: 'workspaces.list',
   SESSIONS_LIST: 'sessions.list',

@@ -175,6 +175,39 @@ export function VendorIcon({ app, size = 18, className = '', mono = false }) {
     )
   }
 
+  // Tencent WorkBuddy crisp geometric W-wing emblem
+  if (app === 'workbuddy') {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        className={className}
+        aria-hidden="true"
+      >
+        <rect
+          x="2.6"
+          y="3.6"
+          width="18.8"
+          height="16.8"
+          rx="4.6"
+          stroke={color}
+          strokeWidth="1.9"
+          fill={color}
+          fillOpacity="0.14"
+        />
+        <path
+          d="M6.4 8.6 8.9 15.6 12 10.2l3.1 5.4 2.5-7"
+          stroke={color}
+          strokeWidth="2.1"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    )
+  }
+
   return (
     <span
       className="inline-block rounded-full"
@@ -195,6 +228,7 @@ const VENDOR_TINTS = {
   codex: 'bg-[#10A37F]/12 ring-[#10A37F]/25 dark:bg-[#10A37F]/20 dark:ring-[#10A37F]/35',
   claude: 'bg-[#D97757]/12 ring-[#D97757]/25 dark:bg-[#D97757]/20 dark:ring-[#D97757]/35',
   antigravity: 'bg-[#7C5CFF]/12 ring-[#7C5CFF]/25 dark:bg-[#7C5CFF]/20 dark:ring-[#7C5CFF]/35',
+  workbuddy: 'bg-[#00B8D9]/12 ring-[#00B8D9]/25 dark:bg-[#00B8D9]/20 dark:ring-[#00B8D9]/35',
 }
 
 /**

@@ -17,6 +17,7 @@ import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
+import { WorkBuddyAdapter } from './adapters/workbuddy.js'
 
 const P2P_UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes
 const MAX_P2P_UPLOADS = 128
@@ -74,6 +75,7 @@ export class MultiAppOrchestrator {
       [APPS.CODEX]: new CodexAdapter({ config, log, emitEvent, onApprovalRequest }),
       [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent, onApprovalRequest }),
       [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent, onApprovalRequest }),
+      [APPS.WORKBUDDY]: new WorkBuddyAdapter({ config, log, emitEvent, onApprovalRequest }),
     }
   }
 
@@ -192,16 +194,19 @@ export class MultiAppOrchestrator {
   async listWorkspaces() {
     const needSessionDiscovery =
       this.knownSessionRoots.size === 0 || Date.now() - this._sessionRootsSyncedAt > 60_000
-    const [dshWs, claudeWs] = await Promise.all([
+    const [dshWs, claudeWs, workbuddyWs] = await Promise.all([
       this.adapters[APPS.DSH].listWorkspaces().catch(() => []),
       typeof this.adapters[APPS.CLAUDE]?.listWorkspaces === 'function'
         ? this.adapters[APPS.CLAUDE].listWorkspaces().catch(() => [])
+        : Promise.resolve([]),
+      typeof this.adapters[APPS.WORKBUDDY]?.listWorkspaces === 'function'
+        ? this.adapters[APPS.WORKBUDDY].listWorkspaces().catch(() => [])
         : Promise.resolve([]),
       needSessionDiscovery ? this.listSessions({ app: 'all', limit: 160 }).catch(() => []) : Promise.resolve([]),
     ])
     // Deduplicate by normalized path
     const map = new Map()
-    for (const w of [...dshWs, ...claudeWs]) {
+    for (const w of [...dshWs, ...claudeWs, ...workbuddyWs]) {
       if (w?.path) {
         const k = w.path.toLowerCase()
         if (!map.has(k)) map.set(k, w)
@@ -515,7 +520,7 @@ export class MultiAppOrchestrator {
     issuedBy = 'mobile',
   }) {
     if (!app || !this.adapters[app]) {
-      throw new Error(`无效的目标应用：${app}（可选：dsh, codex, claude, antigravity）`)
+      throw new Error(`无效的目标应用：${app}（可选：${APP_LIST.join(', ')}）`)
     }
     if (!String(prompt || '').trim()) {
       throw new Error('派单任务内容 prompt 不能为空')
@@ -835,6 +840,7 @@ export class MultiAppOrchestrator {
         join(home, '.codex'),
         join(home, '.claude'),
         join(home, '.gemini'),
+        join(home, 'WorkBuddy'),
       ]
       let inAllowedRoot = checkRoots(fastRoots)
       if (!inAllowedRoot && this.knownSessionRoots.size > 0) {
@@ -904,6 +910,29 @@ export class MultiAppOrchestrator {
         return await this.readLocalFile(params)
       case RPC.APPS_STATUS:
         return { apps: await this.getAppsStatus() }
+      case RPC.APP_SETUP: {
+        const app = String(params?.app || '').trim()
+        if (!app || !this.adapters[app]) {
+          throw new Error(`不支持的应用类型：${app}`)
+        }
+        const adapter = this.adapters[app]
+        if (typeof adapter.runSetup !== 'function') {
+          throw new Error(`应用 ${app} 不支持远程一键配置`)
+        }
+        const action = String(params?.action || 'setup').trim()
+        const methodId = String(params?.methodId || 'internal').trim()
+        if (!['setup', 'login', 'status'].includes(action)) {
+          throw new Error('非法的 setup action 参数')
+        }
+        if (!['internal', 'external'].includes(methodId)) {
+          throw new Error('非法的登录方式参数')
+        }
+        const res = await adapter.runSetup({ action, methodId })
+        if (res?.writable) {
+          this.refreshEnvironment()
+        }
+        return res
+      }
       case RPC.MODELS_LIST: {
         const catalog = await this.listModels(params)
         const etag = computeRpcEtag(catalog)

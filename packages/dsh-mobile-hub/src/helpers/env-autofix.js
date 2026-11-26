@@ -23,6 +23,7 @@ import {
   findExecutable,
   getAgyCandidates,
   getClaudeCandidates,
+  getCodebuddyCandidates,
   getCodexCandidates,
   isExecutableFile,
   sanitizeChildEnv,
@@ -284,7 +285,102 @@ export function detectHalfInstalledClis({
     }
   }
 
+  // 4. WorkBuddy: ~/.workbuddy or ~/.codebuddy or WorkBuddy desktop app exists, but standalone `codebuddy` CLI is missing
+  const workbuddyEvidence = [
+    join(homeDir, '.workbuddy', 'workbuddy.db'),
+    join(homeDir, '.workbuddy', 'projects'),
+    join(homeDir, '.codebuddy', 'projects'),
+    join(homeDir, 'Applications', 'WorkBuddy.app'),
+  ]
+  if (checkSystemApps) {
+    if (platform === 'darwin') workbuddyEvidence.push('/Applications/WorkBuddy.app')
+    else if (platform === 'win32') {
+      workbuddyEvidence.push(
+        join(localApp, 'WorkBuddy'),
+        join(localApp, 'Programs', 'WorkBuddy'),
+      )
+    }
+  }
+  if (hasAnyPath(workbuddyEvidence)) {
+    const cbNames = platform === 'win32'
+      ? ['codebuddy.exe', 'codebuddy.cmd', 'cbc.exe', 'cbc.cmd', 'codebuddy', 'cbc']
+      : ['codebuddy', 'cbc']
+    const cbBin = checkBin(cbNames, getCodebuddyCandidates(homeDir, platform, env))
+    if (!cbBin) {
+      const steps =
+        platform === 'win32'
+          ? [
+              {
+                label: 'official-ps1',
+                cmd: 'powershell',
+                args: [
+                  '-NoProfile',
+                  '-ExecutionPolicy',
+                  'Bypass',
+                  '-Command',
+                  'irm https://www.codebuddy.cn/cli/install.ps1 | iex',
+                ],
+              },
+            ]
+          : [
+              {
+                label: 'official-sh',
+                cmd: '/bin/bash',
+                args: ['-lc', 'curl -fsSL https://www.codebuddy.cn/cli/install.sh | bash'],
+              },
+            ]
+      const npmBin = checkBin(platform === 'win32' ? ['npm.cmd', 'npm'] : ['npm'], [])
+      if (npmBin) {
+        steps.push({
+          label: 'npm-global',
+          cmd: npmBin,
+          args: ['install', '-g', '@tencent-ai/codebuddy-code'],
+        })
+      }
+      missing.push({
+        app: 'workbuddy',
+        displayName: 'CodeBuddy CLI (codebuddy)',
+        reason: '检测到本机已有 WorkBuddy 应用/会话数据，但缺少 codebuddy 官方命令行工具',
+        steps,
+        verify: () => {
+          ensureRichPath(true)
+          return Boolean(findExecutable(cbNames, getCodebuddyCandidates(homeDir, platform, env)))
+        },
+      })
+    }
+  }
+
   return missing
+}
+
+/**
+ * On-demand single-app official CLI installer (used by 1-click UI setup buttons like WorkBuddy RW activation).
+ */
+export async function installSingleAppCli(appName, { log = console, timeoutMs = INSTALL_TIMEOUT_MS } = {}) {
+  ensureRichPath(true)
+  const item = detectHalfInstalledClis().find((m) => m.app === appName)
+  if (!item) {
+    return { ok: true, alreadyInstalled: true }
+  }
+  const env = sanitizeChildEnv(
+    detectSystemProxyEnv({
+      ...process.env,
+      PATH: ensureRichPath(true),
+      CI: '1',
+      NONINTERACTIVE: '1',
+    }),
+  )
+  let lastErr = ''
+  for (const step of item.steps) {
+    log.info?.(`[autofix] 正在通过官方脚本 (${step.label}) 安装 ${item.displayName}...`)
+    const res = await runInstallStep(step, env, timeoutMs)
+    if ((res.ok && item.verify()) || item.verify()) {
+      ensureRichPath(true)
+      return { ok: true, installed: true }
+    }
+    lastErr = res.error || res.output.split(/\r?\n/).pop() || 'unknown error'
+  }
+  return { ok: false, error: lastErr || `安装 ${item.displayName} 失败` }
 }
 
 function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {

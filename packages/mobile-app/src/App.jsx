@@ -3,7 +3,9 @@ import { EVENTS, RPC } from '@allinone/shared'
 import {
   ArrowLeftRight,
   ChevronDown,
+  ExternalLink,
   KeyRound,
+  Loader2,
   Lock,
   Menu,
   QrCode,
@@ -306,12 +308,124 @@ export function App() {
     }, 2600)
   }, [])
 
+  const [workbuddySetup, setWorkbuddySetup] = useState({
+    status: 'idle', // 'idle' | 'working' | 'awaiting_login' | 'error'
+    authUrl: '',
+    error: '',
+    methodId: 'internal',
+  })
+  const workbuddyPollTimerRef = useRef(null)
+
+  const stopWorkbuddySetupPoll = useCallback(() => {
+    if (workbuddyPollTimerRef.current) {
+      clearInterval(workbuddyPollTimerRef.current)
+      workbuddyPollTimerRef.current = null
+    }
+  }, [])
+
+  const applyWorkbuddyUnlocked = useCallback((freshApps = null) => {
+    stopWorkbuddySetupPoll()
+    setWorkbuddySetup({ status: 'idle', authUrl: '', error: '', methodId: 'internal' })
+    if (Array.isArray(freshApps)) {
+      setAppsStatus(freshApps)
+    }
+    setSessions((prev) => prev.map((s) => (s.app === 'workbuddy' ? { ...s, writable: true } : s)))
+    setActiveSession((prev) => {
+      if (!prev || prev.app !== 'workbuddy') return prev
+      const next = { ...prev, writable: true }
+      activeSessionRef.current = next
+      return next
+    })
+  }, [stopWorkbuddySetupPoll])
+
+  const handleSetupWorkbuddy = useCallback(
+    async (methodId = 'internal') => {
+      const client = clientRef.current
+      const reqBridgeId = String(activeBridgeIdRef.current || '').trim()
+      if (!client || !reqBridgeId) {
+        showToast(biLang(getCurrentLang(), '请先连接电脑后再启用 WorkBuddy', 'Connect your computer first'))
+        return
+      }
+      const gen = deviceGenRef.current
+      stopWorkbuddySetupPoll()
+      setWorkbuddySetup({ status: 'working', authUrl: '', error: '', methodId })
+      try {
+        const res = await client.rpc(
+          RPC.APP_SETUP,
+          { app: 'workbuddy', action: 'setup', methodId },
+          185_000,
+          { bridgeId: reqBridgeId },
+        )
+        if (deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) return
+
+        if (res?.writable || res?.status === 'ready') {
+          const fresh = await client.rpc(RPC.APPS_STATUS, {}, 12_000, { bridgeId: reqBridgeId }).catch(() => null)
+          applyWorkbuddyUnlocked(fresh?.apps || null)
+          showToast(biLang(getCurrentLang(), 'WorkBuddy 远程发送权限已解锁！', 'WorkBuddy remote sending unlocked!'))
+          return
+        }
+
+        if (res?.ok && res?.status === 'awaiting_login') {
+          const authUrl = typeof res.authUrl === 'string' && /^https:\/\//i.test(res.authUrl) ? res.authUrl : ''
+          setWorkbuddySetup({ status: 'awaiting_login', authUrl, error: '', methodId })
+          if (authUrl) {
+            try {
+              window.open(authUrl, '_blank', 'noopener,noreferrer')
+            } catch {}
+          }
+          showToast(
+            authUrl
+              ? biLang(getCurrentLang(), '已打开腾讯官方登录页，微信扫码确认后自动解锁', 'Opened official login page. Scan QR to unlock automatically.')
+              : biLang(getCurrentLang(), '已在电脑浏览器拉起官方登录页，扫码后自动解锁', 'Opened login page on your PC browser. Scan QR to unlock.'),
+          )
+
+          let pollCount = 0
+          workbuddyPollTimerRef.current = setInterval(() => {
+            pollCount += 1
+            if (pollCount > 48 || deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) {
+              stopWorkbuddySetupPoll()
+              return
+            }
+            const curClient = clientRef.current
+            if (!curClient) return
+            curClient
+              .rpc(RPC.APPS_STATUS, {}, 10_000, { bridgeId: reqBridgeId })
+              .then((stRes) => {
+                if (deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) return
+                if (Array.isArray(stRes?.apps)) {
+                  setAppsStatus(stRes.apps)
+                  const wb = stRes.apps.find((a) => a.app === 'workbuddy')
+                  if (wb?.writable) {
+                    applyWorkbuddyUnlocked(stRes.apps)
+                    showToast(biLang(getCurrentLang(), 'WorkBuddy 授权成功，已解锁远程发送！', 'WorkBuddy authorized! Remote sending unlocked.'))
+                  }
+                }
+              })
+              .catch(() => {})
+          }, 2_500)
+          return
+        }
+
+        const errMsg = res?.error || biLang(getCurrentLang(), '启用 WorkBuddy 失败，请稍后重试', 'Failed to set up WorkBuddy')
+        setWorkbuddySetup({ status: 'error', authUrl: '', error: errMsg, methodId })
+        showToast(errMsg)
+      } catch (err) {
+        if (deviceGenRef.current !== gen) return
+        const errMsg = String(err?.message || err)
+        setWorkbuddySetup({ status: 'error', authUrl: '', error: errMsg, methodId })
+        showToast(errMsg)
+      }
+    },
+    [applyWorkbuddyUnlocked, showToast, stopWorkbuddySetupPoll],
+  )
+
   useEffect(() => {
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+      stopWorkbuddySetupPoll()
       revokeAllSentPreviewUrls()
     }
-  }, [revokeAllSentPreviewUrls])
+  }, [revokeAllSentPreviewUrls, stopWorkbuddySetupPoll])
 
   const openNewChatModal = useCallback((cwdHint = '', appHint = '') => {
     const cleanCwd = typeof cwdHint === 'string' ? cwdHint : ''
@@ -607,7 +721,7 @@ export function App() {
   }, [activeDevice?.id, activeBridge?.bridgeId, activeBridge?.hostname, activeBridge?.platform])
 
   const defaultApp = useMemo(() => {
-    const order = ['dsh', 'codex', 'claude', 'antigravity']
+    const order = ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy']
     for (const id of order) {
       if (appsStatus.find((a) => a.app === id && a.writable)) return id
     }
@@ -1542,6 +1656,22 @@ export function App() {
         return
       }
 
+      if (event === EVENTS.SESSION_UPDATED && payload?.authReady && payload?.app === 'workbuddy') {
+        const curClient = clientRef.current
+        const reqBridgeId = activeBridgeIdRef.current
+        if (curClient && reqBridgeId) {
+          curClient
+            .rpc(RPC.APPS_STATUS, {}, 12_000, { bridgeId: reqBridgeId })
+            .then((res) => {
+              if (Array.isArray(res?.apps) && res.apps.find((a) => a.app === 'workbuddy')?.writable) {
+                applyWorkbuddyUnlocked(res.apps)
+              }
+            })
+            .catch(() => {})
+        }
+        return
+      }
+
       if (event === EVENTS.SESSION_UPDATED && payload?.session) {
         const updated = payload.session
         let clearedStaleStream = false
@@ -1723,8 +1853,13 @@ export function App() {
           if (activeSessionRef.current?.id === sid && !liveStreamMapRef.current[sid]?.active) {
             void syncActiveSessionQuietly(sid)
           }
-          // Quietly refresh E2EE subscription quota (Codex / Claude / Antigravity) after a turn finishes
-          if (payload?.app === 'codex' || payload?.app === 'claude' || payload?.app === 'antigravity') {
+          // Quietly refresh E2EE subscription quota / readiness after a turn finishes
+          if (
+            payload?.app === 'codex' ||
+            payload?.app === 'claude' ||
+            payload?.app === 'antigravity' ||
+            payload?.app === 'workbuddy'
+          ) {
             const curClient = clientRef.current
             const reqBridgeId = activeBridgeIdRef.current
             if (curClient && curClient === client && reqBridgeId && deviceGenRef.current === doneGen) {
@@ -3106,86 +3241,172 @@ export function App() {
         onResolveApproval={handleResolveApproval}
       />
 
-      {/* Floating DeepSeek-style Composer (or sleek live-mirror footer for read-only Claude Desktop Cowork sessions) */}
-      {activeSession?.writable === false ? (
-        <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
-          <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-2.5 rounded-2xl border border-slate-200/90 bg-[#F4F6FA] px-3.5 py-2.5 lg:max-w-3xl dark:border-slate-700/80 dark:bg-[#21232B]">
-            <div className="flex min-w-0 items-center gap-2">
-              <span
-                className={`h-2 w-2 shrink-0 rounded-full ${
-                  activeSession?.syncState?.externalRunning
-                    ? 'bg-emerald-500 animate-pulse-dot'
-                    : 'bg-slate-400 dark:bg-slate-500'
-                }`}
-              />
-              <span className="truncate text-xs font-medium text-slate-600 dark:text-slate-300">
-                {activeSession?.syncState?.externalRunning
-                  ? bi('Claude Desktop 正在电脑端执行 · 实时只读同步中', 'Claude Desktop running on PC · Live read-only sync')
-                  : bi('Claude Desktop (Cowork) 只读同步视图', 'Claude Desktop (Cowork) read-only mirror')}
-              </span>
+      {/* Floating DeepSeek-style Composer (or sleek live-mirror / 1-click unlock footer for read-only Desktop sessions) */}
+      {(() => {
+        const wbStatus = appsStatus.find((a) => a.app === 'workbuddy')
+        const isWorkbuddyReadonly =
+          (activeSession?.app === 'workbuddy' && activeSession?.writable === false) ||
+          (!activeSession && activeApp === 'workbuddy' && wbStatus && !wbStatus.writable)
+        if (isWorkbuddyReadonly) {
+          const isWorking = workbuddySetup.status === 'working'
+          const isAwaiting = workbuddySetup.status === 'awaiting_login'
+          const needsCli = wbStatus?.setupState === 'needs_cli' || !wbStatus?.cliInstalled
+          return (
+            <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
+              <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2.5 rounded-2xl border border-[#00B8D9]/30 bg-[#F0FAFC] px-3.5 py-2.5 lg:max-w-3xl dark:border-[#00B8D9]/30 dark:bg-[#17232A]">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      isWorking || isAwaiting || activeSession?.syncState?.externalRunning
+                        ? 'bg-[#00B8D9] animate-pulse-dot'
+                        : 'bg-amber-400'
+                    }`}
+                  />
+                  <span className="truncate text-xs font-medium text-slate-700 dark:text-slate-200">
+                    {isWorking
+                      ? bi('正在后台自动安装官方引擎并拉起扫码页，请稍候…', 'Setting up WorkBuddy engine & opening sign-in…')
+                      : isAwaiting
+                        ? bi('请在弹出的官方页面完成微信扫码确认，完成后自动解锁发送', 'Finish scanning QR on the official page — unlocks automatically')
+                        : activeSession?.syncState?.externalRunning
+                          ? bi('WorkBuddy 正在电脑端执行 · 实时只读同步中', 'WorkBuddy running on PC · Live read-only sync')
+                          : needsCli
+                            ? bi('WorkBuddy 当前实时只读同步 · 一键自动安装并扫码即可远程发送', 'WorkBuddy live mirror · 1-click auto-setup & sign in to send')
+                            : bi('WorkBuddy 引擎已就绪 · 微信扫码授权一次即可解锁远程发送', 'WorkBuddy engine ready · 1-click QR sign-in to unlock sending')}
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {isAwaiting && workbuddySetup.authUrl ? (
+                    <a
+                      href={workbuddySetup.authUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 rounded-full bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#00A2C0] active:scale-95"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      <span>{bi('打开官方授权页', 'Open Sign-In Page')}</span>
+                    </a>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={isWorking || !bridgeOnline || connState !== 'connected'}
+                        onClick={() => handleSetupWorkbuddy('internal')}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#00A2C0] active:scale-95 disabled:opacity-60"
+                      >
+                        {isWorking ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <QrCode className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {isWorking
+                            ? bi('配置中…', 'Setting up…')
+                            : needsCli
+                              ? bi('一键启用发送', '1-Click Enable')
+                              : bi('一键微信扫码登录', '1-Click QR Sign-In')}
+                        </span>
+                      </button>
+                      {!isWorking && (
+                        <button
+                          type="button"
+                          disabled={!bridgeOnline || connState !== 'connected'}
+                          onClick={() => handleSetupWorkbuddy('external')}
+                          title={bi('海外版账号（Google / GitHub）登录', 'International account (Google / GitHub)')}
+                          className="rounded-full border border-slate-300/80 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition hover:bg-white/70 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800/60"
+                        >
+                          {bi('国际版', 'Global')}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
-            <button
-              type="button"
-              onClick={() => openNewChatModal(activeSession?.cwd || '', activeSession?.app || 'claude')}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#4D6BFE] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
-            >
-              <SquarePen className="h-3.5 w-3.5" />
-              <span>{bi('同目录新建可写对话', 'New Writable Chat')}</span>
-            </button>
-          </div>
-        </div>
-      ) : (
-      <Composer
-        key={activeDevice?.id || 'none'}
-        draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
-        activeApp={activeApp}
-        streaming={Boolean(currentStream?.active)}
-        disabled={!bridgeOnline || connState !== 'connected' || e2eeLocked}
-        needsWorkspace={!activeSession && !selectedDraftCwd}
-        targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
-        modelPref={activeModelPref}
-        modelDisplayName={activeModelObj?.name || activeModelPref.model}
-        onOpenModelPicker={() => {
-          setModelPickerOpen(true)
-          const curModels = modelsCatalog?.[activeApp]?.models || []
-          if (curModels.length === 0 && clientRef.current && connState === 'connected' && activeBridgeId) {
-            const client = clientRef.current
-            const gen = deviceGenRef.current
-            const reqBridgeId = activeBridgeId
-            setLoadingModels(true)
-            client
-              .rpc(RPC.MODELS_LIST, { app: activeApp }, 25_000, { bridgeId: reqBridgeId })
-              .then((res) => {
-                if (
-                  deviceGenRef.current !== gen ||
-                  activeBridgeIdRef.current !== reqBridgeId ||
-                  clientRef.current !== client
-                ) {
-                  return
-                }
-                if (res?.catalog) {
-                  setModelsCatalog((prev) => ({ ...prev, ...res.catalog }))
-                }
+          )
+        }
+        if (activeSession?.writable === false) {
+          return (
+            <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
+              <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-2.5 rounded-2xl border border-slate-200/90 bg-[#F4F6FA] px-3.5 py-2.5 lg:max-w-3xl dark:border-slate-700/80 dark:bg-[#21232B]">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      activeSession?.syncState?.externalRunning
+                        ? 'bg-emerald-500 animate-pulse-dot'
+                        : 'bg-slate-400 dark:bg-slate-500'
+                    }`}
+                  />
+                  <span className="truncate text-xs font-medium text-slate-600 dark:text-slate-300">
+                    {activeSession?.syncState?.externalRunning
+                      ? bi('Claude Desktop 正在电脑端执行 · 实时只读同步中', 'Claude Desktop running on PC · Live read-only sync')
+                      : bi('Claude Desktop (Cowork) 只读同步视图', 'Claude Desktop (Cowork) read-only mirror')}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openNewChatModal(activeSession?.cwd || '', activeSession?.app || 'claude')}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#4D6BFE] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#3B59ED] active:scale-95"
+                >
+                  <SquarePen className="h-3.5 w-3.5" />
+                  <span>{bi('同目录新建可写对话', 'New Writable Chat')}</span>
+                </button>
+              </div>
+            </div>
+          )
+        }
+        return (
+          <Composer
+            key={activeDevice?.id || 'none'}
+            draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
+            activeApp={activeApp}
+            streaming={Boolean(currentStream?.active)}
+            disabled={!bridgeOnline || connState !== 'connected' || e2eeLocked}
+            needsWorkspace={!activeSession && !selectedDraftCwd}
+            targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
+            modelPref={activeModelPref}
+            modelDisplayName={activeModelObj?.name || activeModelPref.model}
+            onOpenModelPicker={() => {
+              setModelPickerOpen(true)
+              const curModels = modelsCatalog?.[activeApp]?.models || []
+              if (curModels.length === 0 && clientRef.current && connState === 'connected' && activeBridgeId) {
+                const client = clientRef.current
+                const gen = deviceGenRef.current
+                const reqBridgeId = activeBridgeId
+                setLoadingModels(true)
+                client
+                  .rpc(RPC.MODELS_LIST, { app: activeApp }, 25_000, { bridgeId: reqBridgeId })
+                  .then((res) => {
+                    if (
+                      deviceGenRef.current !== gen ||
+                      activeBridgeIdRef.current !== reqBridgeId ||
+                      clientRef.current !== client
+                    ) {
+                      return
+                    }
+                    if (res?.catalog) {
+                      setModelsCatalog((prev) => ({ ...prev, ...res.catalog }))
+                    }
+                  })
+                  .catch(() => {})
+                  .finally(() => {
+                    if (deviceGenRef.current === gen && activeBridgeIdRef.current === reqBridgeId) {
+                      setLoadingModels(false)
+                    }
+                  })
+              }
+            }}
+            onUploadFile={async (rawFile) => {
+              const { file: uploadTarget } = await compressImageForUpload(rawFile, {
+                enabled: smartImageCompress,
               })
-              .catch(() => {})
-              .finally(() => {
-                if (deviceGenRef.current === gen && activeBridgeIdRef.current === reqBridgeId) {
-                  setLoadingModels(false)
-                }
-              })
-          }
-        }}
-        onUploadFile={async (rawFile) => {
-          const { file: uploadTarget } = await compressImageForUpload(rawFile, {
-            enabled: smartImageCompress,
-          })
-          return clientRef.current?.uploadFile(uploadTarget, { bridgeId: activeBridgeId })
-        }}
-        onSend={handleSend}
-        onInterrupt={handleInterrupt}
-        onError={showToast}
-      />
-      )}
+              return clientRef.current?.uploadFile(uploadTarget, { bridgeId: activeBridgeId })
+            }}
+            onSend={handleSend}
+            onInterrupt={handleInterrupt}
+            onError={showToast}
+          />
+        )
+      })()}
       </>
       )}
       </div>
@@ -3230,6 +3451,8 @@ export function App() {
             workspaces={effectiveWorkspaces}
             appsStatus={appsStatus}
             modelsCatalog={modelsCatalog}
+            workbuddySetup={workbuddySetup}
+            onSetupWorkbuddy={handleSetupWorkbuddy}
             onCreate={handleCreateSession}
           />
         )}

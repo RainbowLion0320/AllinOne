@@ -59,6 +59,13 @@ const NATIVE_SLASH_COMMANDS = {
     { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式', en: 'Plan mode' },
     { cmd: '/compact', icon: FoldVertical, zh: '压缩对话上下文', en: 'Compact conversation context' },
   ],
+  workbuddy: [
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 只读分析并制定方案', en: 'Enter read-only plan mode' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/review', icon: FileSearch, zh: '审查当前代码改动', en: 'Review code changes' },
+    { cmd: '/clear', icon: Eraser, zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
+    { cmd: '/init', icon: FileCode, zh: '初始化项目指引文件', en: 'Initialize project guide' },
+  ],
 }
 
 function revokeAttachmentPreview(att) {
