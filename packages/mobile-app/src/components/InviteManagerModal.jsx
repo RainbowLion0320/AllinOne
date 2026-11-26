@@ -8,6 +8,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Share2,
   Ticket,
   Users,
   X,
@@ -530,8 +531,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
                         onClick={() => doCopy(`msg:${inv.id}`, buildShareText(inv))}
                         className="inline-flex items-center gap-1 rounded-lg bg-[#4D6BFE]/12 px-2.5 py-1 text-[11px] font-semibold text-[#4D6BFE] hover:bg-[#4D6BFE]/20 active:scale-95 dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]"
                       >
-                        {copiedKey === `msg:${inv.id}` ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                        <span>{copiedKey === `msg:${inv.id}` ? t('common.copied') : bi('分享', 'Share')}</span>
+                        {copiedKey === `msg:${inv.id}` ? <Check className="h-3 w-3 text-emerald-500" /> : <Share2 className="h-3 w-3" />}
+                        <span>{copiedKey === `msg:${inv.id}` ? t('common.copied') : bi('分享文案', 'Share Guide')}</span>
                       </button>
                     </div>
                   )}

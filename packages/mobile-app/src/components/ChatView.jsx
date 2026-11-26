@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { APP_META } from '@allinone/shared'
+import { APP_LIST, APP_META } from '@allinone/shared'
 import {
   AlertTriangle,
   ArrowUp,
@@ -824,36 +824,57 @@ export function ChatView({
               )
             ) : (
               <>
-                {/* Native AI Tool Switcher Pills */}
-                <div className="mt-5 flex flex-wrap justify-center gap-2">
-                  {['dsh', 'codex', 'claude', 'antigravity'].map((appId) => {
+                {/* Dynamic AI Tool Switcher Pills (only shows tools detected on this PC) */}
+                {(() => {
+                  const detectedAppIds = APP_LIST.filter((appId) => {
                     const info = appsStatus.find((a) => a.app === appId)
-                    const am = APP_META[appId]
-                    const online = info?.available
-                    const rw = info?.writable
-                    const selected = activeApp === appId
+                    return Boolean(info?.available || info?.writable)
+                  })
+                  if (detectedAppIds.length > 0) {
                     return (
-                      <button
-                        key={appId}
-                        type="button"
-                        onClick={() => onSelectApp?.(appId)}
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
-                          selected
-                            ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
-                            : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
-                        }`}
-                      >
-                        <VendorIcon app={appId} size={13} />
-                        <span>{am.shortName}</span>
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
-                          }`}
-                        />
-                      </button>
+                      <div className="mt-5 flex flex-wrap justify-center gap-2">
+                        {detectedAppIds.map((appId) => {
+                          const info = appsStatus.find((a) => a.app === appId)
+                          const am = APP_META[appId]
+                          const online = info?.available
+                          const rw = info?.writable
+                          const selected = activeApp === appId
+                          return (
+                            <button
+                              key={appId}
+                              type="button"
+                              onClick={() => onSelectApp?.(appId)}
+                              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
+                                selected
+                                  ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
+                                  : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
+                              }`}
+                            >
+                              <VendorIcon app={appId} size={13} />
+                              <span>{am.shortName}</span>
+                              <span
+                                className={`h-1.5 w-1.5 rounded-full ${
+                                  online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
+                                }`}
+                              />
+                            </button>
+                          )
+                        })}
+                      </div>
                     )
-                  })}
-                </div>
+                  }
+                  if (appsStatus.length > 0) {
+                    return (
+                      <p className="mt-4 max-w-sm text-xs text-slate-400 dark:text-slate-500">
+                        {bi(
+                          '本机暂未检测到已安装的 AI 工具（支持 DeepSeek Harness / Codex / Claude Code / Antigravity）',
+                          'No supported AI tools detected on this computer (DeepSeek Harness / Codex / Claude Code / Antigravity)',
+                        )}
+                      </p>
+                    )
+                  }
+                  return null
+                })()}
 
                 {/* Explicit Project Directory Selector (prevents blind sends to unknown directories) */}
                 <div className="mt-6 w-full max-w-md">

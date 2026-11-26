@@ -82,9 +82,6 @@ const ImageLightbox = React.lazy(() =>
 const HtmlPreviewModal = React.lazy(() =>
   import('./components/HtmlPreviewModal.jsx').then((m) => ({ default: m.HtmlPreviewModal })),
 )
-const ShareModal = React.lazy(() =>
-  import('./components/ShareModal.jsx').then((m) => ({ default: m.ShareModal })),
-)
 const DeviceSwitcherModal = React.lazy(() =>
   import('./components/DeviceSwitcherModal.jsx').then((m) => ({ default: m.DeviceSwitcherModal })),
 )
@@ -141,7 +138,6 @@ export function App() {
   const [selectedDraftApp, setSelectedDraftApp] = useState('')
   const [selectedDraftCwd, setSelectedDraftCwd] = useState('')
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
-  const [shareOpen, setShareOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [e2eeModal, setE2eeModal] = useState({ open: false, tab: 'auto', autoOpenScanner: false })
   const [lightboxState, setLightboxState] = useState(null)
@@ -378,7 +374,6 @@ export function App() {
         if (action === 'new-chat') openNewChatModal(activeSessionRef.current?.cwd || '')
         else if (action === 'devices') setDeviceSwitcherOpen(true)
         else if (action === 'settings') setSettingsOpen(true)
-        else if (action === 'share') setShareOpen(true)
         else if (action === 'invites') setInviteManagerOpen(true)
         else if (action === 'toggle-dark') setDarkMode((v) => !v)
       })
@@ -468,13 +463,12 @@ export function App() {
         else if (settingsOpen) setSettingsOpen(false)
         else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
         else if (inviteManagerOpen) setInviteManagerOpen(false)
-        else if (shareOpen) setShareOpen(false)
         else if (drawerOpen) setDrawerOpen(false)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, htmlPreviewState, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, shareOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, htmlPreviewState, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -610,6 +604,24 @@ export function App() {
     }
     return 'dsh'
   }, [appsStatus])
+
+  // Keep sidebar filter & draft app aligned with tools actually present on the active computer
+  useEffect(() => {
+    if (appsStatus.length === 0) return
+    const detectedSet = new Set(
+      appsStatus.filter((a) => a?.available || a?.writable).map((a) => a.app),
+    )
+    const sidebarSet = new Set(detectedSet)
+    for (const s of sessions) {
+      if (s?.app) sidebarSet.add(s.app)
+    }
+    if (sidebarFilterApp !== 'all' && (sidebarSet.size < 2 || !sidebarSet.has(sidebarFilterApp))) {
+      setSidebarFilterApp('all')
+    }
+    if (selectedDraftApp && detectedSet.size > 0 && !detectedSet.has(selectedDraftApp)) {
+      setSelectedDraftApp('')
+    }
+  }, [appsStatus, sessions, sidebarFilterApp, selectedDraftApp])
 
   const effectiveWorkspaces = useMemo(() => {
     const map = new Map()
@@ -3206,17 +3218,6 @@ export function App() {
           />
         )}
 
-        {shareOpen && (
-          <ShareModal
-            open={shareOpen}
-            onClose={() => setShareOpen(false)}
-            serverUrl={activeDevice?.baseUrl}
-            token={activeDevice?.token}
-            isAdmin={isAdmin}
-            onOpenInviteManager={() => setInviteManagerOpen(true)}
-          />
-        )}
-
         {settingsOpen && (
           <SettingsModal
             open={settingsOpen}
@@ -3257,7 +3258,6 @@ export function App() {
             onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
             onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
             onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-            onOpenShare={() => setShareOpen(true)}
             onOpenInviteManager={() => setInviteManagerOpen(true)}
             onSendBindEmailCode={handleSendBindEmailCode}
             onBindAccountEmail={handleBindAccountEmail}

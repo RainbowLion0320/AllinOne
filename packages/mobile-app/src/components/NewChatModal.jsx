@@ -40,6 +40,15 @@ export function NewChatModal({
   const appRef = useRef(app)
   appRef.current = app
 
+  const detectedApps = useMemo(() => {
+    return APP_LIST.filter((id) => {
+      const st = appsStatus.find((a) => a.app === id)
+      return Boolean(st?.available || st?.writable)
+    })
+  }, [appsStatus])
+
+  const visibleApps = detectedApps.length > 0 ? detectedApps : APP_LIST
+
   const appCatalog = modelsCatalog?.[app] || null
   const appModels = appCatalog?.models || []
 
@@ -79,24 +88,33 @@ export function NewChatModal({
       } else {
         setCwd('')
       }
-      if (initialApp && APP_LIST.includes(initialApp)) {
+      if (initialApp && visibleApps.includes(initialApp)) {
         setApp(initialApp)
       } else {
-        const curWritable = appsStatus.find((a) => a.app === appRef.current && a.writable)
-        if (!curWritable) {
-          const firstWritable = ['dsh', 'codex', 'claude', 'antigravity'].find((id) =>
+        const curReady =
+          visibleApps.includes(appRef.current) &&
+          appsStatus.find((a) => a.app === appRef.current && a.writable)
+        if (!curReady) {
+          const firstWritable = visibleApps.find((id) =>
             appsStatus.find((a) => a.app === id && a.writable),
           )
-          if (firstWritable) setApp(firstWritable)
+          setApp(firstWritable || visibleApps[0] || 'dsh')
         }
       }
       return
     }
 
+    if (detectedApps.length > 0 && !detectedApps.includes(appRef.current)) {
+      const firstWritable = detectedApps.find((id) =>
+        appsStatus.find((a) => a.app === id && a.writable),
+      )
+      setApp(firstWritable || detectedApps[0])
+    }
+
     if (!userClearedCwdRef.current && !cwdRef.current && workspaces?.[0]?.path) {
       setCwd(workspaces[0].path)
     }
-  }, [open, initialApp, initialCwd, workspaces, appsStatus])
+  }, [open, initialApp, initialCwd, workspaces, appsStatus, detectedApps, visibleApps])
 
   // Sync default model/provider/effort whenever app switches or catalog arrives (never clobber user's manual pick)
   useEffect(() => {
@@ -178,7 +196,7 @@ export function NewChatModal({
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-3.5">
-            {/* Compact 1-row 4-column icon-only app selector */}
+            {/* Dynamic app selector (only shows detected tools; falls back to all 4 if none detected) */}
             <div>
               <div className="mb-2 flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-500 dark:text-slate-400">
@@ -196,46 +214,92 @@ export function NewChatModal({
                   )}
                 </span>
               </div>
-              <div className="grid grid-cols-4 gap-2">
-                {APP_LIST.map((appId) => {
-                  const meta = APP_META[appId]
-                  const status = appsStatus.find((a) => a.app === appId)
-                  const selected = app === appId
-                  return (
-                    <button
-                      key={appId}
-                      type="button"
-                      title={`${meta.name} (${status?.writable ? bi('可读写', 'Read/Write') : status?.available ? bi('仅只读', 'Read-only') : bi('未就绪', 'Unavailable')})`}
-                      aria-label={meta.name}
-                      onClick={() => setApp(appId)}
-                      className={`relative flex h-12 items-center justify-center rounded-2xl border transition active:scale-95 ${
-                        selected
-                          ? 'shadow-xs'
-                          : 'border-slate-200/80 bg-slate-50/80 hover:bg-slate-100 dark:border-slate-700/80 dark:bg-[#16171A] dark:hover:bg-[#232630]'
+              {visibleApps.length === 1 ? (
+                <div
+                  className="flex items-center justify-between rounded-2xl border px-3.5 py-2.5"
+                  style={{
+                    backgroundColor: `${selectedAppMeta.color}14`,
+                    borderColor: `${selectedAppMeta.color}66`,
+                  }}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <VendorIcon app={visibleApps[0]} size={20} />
+                    <span className="text-xs font-semibold text-slate-900 dark:text-white">
+                      {selectedAppMeta.name}
+                    </span>
+                  </div>
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 dark:text-slate-300">
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        selectedAppStatus?.writable
+                          ? 'bg-emerald-500'
+                          : selectedAppStatus?.available
+                            ? 'bg-amber-400'
+                            : 'bg-slate-300 dark:bg-slate-600'
                       }`}
-                      style={
-                        selected
-                          ? {
-                              backgroundColor: `${meta.color}20`,
-                              borderColor: `${meta.color}99`,
-                            }
-                          : undefined
-                      }
-                    >
-                      <VendorIcon app={appId} size={22} />
-                      <span
-                        className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${
-                          status?.writable
-                            ? 'bg-emerald-500'
-                            : status?.available
-                              ? 'bg-amber-400'
-                              : 'bg-slate-300 dark:bg-slate-600'
+                    />
+                    <span>
+                      {selectedAppStatus?.writable
+                        ? bi('就绪', 'Ready')
+                        : selectedAppStatus?.available
+                          ? bi('只读', 'Read-only')
+                          : bi('未就绪', 'Unavailable')}
+                    </span>
+                  </span>
+                </div>
+              ) : (
+                <div
+                  className="grid gap-2"
+                  style={{ gridTemplateColumns: `repeat(${visibleApps.length}, minmax(0, 1fr))` }}
+                >
+                  {visibleApps.map((appId) => {
+                    const meta = APP_META[appId]
+                    const status = appsStatus.find((a) => a.app === appId)
+                    const selected = app === appId
+                    return (
+                      <button
+                        key={appId}
+                        type="button"
+                        title={`${meta.name} (${status?.writable ? bi('可读写', 'Read/Write') : status?.available ? bi('仅只读', 'Read-only') : bi('未就绪', 'Unavailable')})`}
+                        aria-label={meta.name}
+                        onClick={() => setApp(appId)}
+                        className={`relative flex h-12 items-center justify-center rounded-2xl border transition active:scale-95 ${
+                          selected
+                            ? 'shadow-xs'
+                            : 'border-slate-200/80 bg-slate-50/80 hover:bg-slate-100 dark:border-slate-700/80 dark:bg-[#16171A] dark:hover:bg-[#232630]'
                         }`}
-                      />
-                    </button>
-                  )
-                })}
-              </div>
+                        style={
+                          selected
+                            ? {
+                                backgroundColor: `${meta.color}20`,
+                                borderColor: `${meta.color}99`,
+                              }
+                            : undefined
+                        }
+                      >
+                        <VendorIcon app={appId} size={22} />
+                        <span
+                          className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${
+                            status?.writable
+                              ? 'bg-emerald-500'
+                              : status?.available
+                                ? 'bg-amber-400'
+                                : 'bg-slate-300 dark:bg-slate-600'
+                          }`}
+                        />
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+              {appsStatus.length > 0 && detectedApps.length === 0 && (
+                <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                  {bi(
+                    '当前电脑未检测到已安装的 AI 工具，安装后会自动出现。',
+                    'No installed AI tools detected on this computer yet.',
+                  )}
+                </p>
+              )}
             </div>
 
             {/* Model & Reasoning Effort Selector (per-app native rules) */}

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Check,
+  ChevronDown,
   Copy,
   KeyRound,
   Laptop,
@@ -98,6 +99,7 @@ export function DeviceSwitcherModal({
   const [editDraft, setEditDraft] = useState('')
   const [confirmDeleteId, setConfirmDeleteId] = useState(null)
   const [copiedCmd, setCopiedCmd] = useState('')
+  const [showCliBind, setShowCliBind] = useState(false)
   const copiedCmdTimerRef = useRef(null)
 
   const devicesRef = useRef(devices)
@@ -155,6 +157,7 @@ export function DeviceSwitcherModal({
     if (!open) {
       setEditingId(null)
       setConfirmDeleteId(null)
+      setShowCliBind(false)
       return
     }
     void runProbeAll(devicesRef.current)
@@ -187,10 +190,16 @@ export function DeviceSwitcherModal({
   }
 
   const onlineAcctCount = accountDevices.filter((pc) => pc.online).length
-  const acctServerBase = activeEntry?.baseUrl || ''
+  const acctServerBase = String(activeEntry?.baseUrl || '').replace(/\/+$/, '')
   const activeUsername = activeEntry
     ? `@${activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}`
     : ''
+  const bindCmdRows = acctServerBase
+    ? [
+        { key: 'unix', label: 'Mac/Linux', cmd: `curl -fsSL ${acctServerBase}/setup.sh | bash` },
+        { key: 'win', label: 'Windows', cmd: `irm ${acctServerBase}/setup.ps1 | iex` },
+      ]
+    : []
 
   return (
     <div
@@ -284,10 +293,7 @@ export function DeviceSwitcherModal({
                     )}
                   </p>
                   <div className="mt-2.5 space-y-1.5 text-left">
-                    {[
-                      { key: 'unix', label: 'Mac/Linux', cmd: `curl -fsSL ${acctServerBase}/setup.sh | bash` },
-                      { key: 'win', label: 'Windows', cmd: `irm ${acctServerBase}/setup.ps1 | iex` },
-                    ].map((row) => (
+                    {bindCmdRows.map((row) => (
                       <div key={row.key} className="flex items-center gap-1.5 rounded-xl bg-slate-900 px-2.5 py-2 font-mono text-[10px] text-slate-100">
                         <span className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-sans text-[9.5px] text-slate-300">{row.label}</span>
                         <span className="flex-1 truncate">{row.cmd}</span>
@@ -447,6 +453,53 @@ export function DeviceSwitcherModal({
                     </div>
                   )
                 })
+              )}
+
+              {accountDevices.length > 0 && bindCmdRows.length > 0 && (
+                <div className="rounded-2xl border border-dashed border-slate-200/90 bg-slate-50/50 dark:border-slate-800 dark:bg-[#151820]/70">
+                  <button
+                    type="button"
+                    onClick={() => setShowCliBind((v) => !v)}
+                    aria-expanded={showCliBind}
+                    className="flex w-full items-center justify-between gap-2 px-3 py-2 text-[11.5px] font-medium text-slate-500 transition hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <Terminal className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                      <span>{bi('命令行绑定其他电脑', 'Link another PC via CLI')}</span>
+                    </span>
+                    <ChevronDown
+                      className={`h-3.5 w-3.5 text-slate-400 transition-transform ${showCliBind ? 'rotate-180' : ''}`}
+                    />
+                  </button>
+                  {showCliBind && (
+                    <div className="space-y-1.5 px-3 pb-3">
+                      <p className="text-[10.5px] text-slate-400">
+                        {lang === 'en' ? (
+                          <>
+                            Run on another PC / Linux server and sign in as <strong>{activeUsername}</strong>
+                          </>
+                        ) : (
+                          <>
+                            在另一台电脑或 Linux 服务器运行并登录 <strong>{activeUsername}</strong>
+                          </>
+                        )}
+                      </p>
+                      {bindCmdRows.map((row) => (
+                        <div key={row.key} className="flex items-center gap-1.5 rounded-xl bg-slate-900 px-2.5 py-2 font-mono text-[10px] text-slate-100">
+                          <span className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-sans text-[9.5px] text-slate-300">{row.label}</span>
+                          <span className="flex-1 truncate">{row.cmd}</span>
+                          <button
+                            type="button"
+                            onClick={() => copyBindCmd(row.key, row.cmd)}
+                            className="shrink-0 rounded-lg bg-white/10 p-1 text-white hover:bg-white/20"
+                          >
+                            {copiedCmd === row.key ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}

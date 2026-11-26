@@ -19,7 +19,6 @@ import {
   RefreshCw,
   RotateCw,
   Settings,
-  Share2,
   ShieldCheck,
   Smartphone,
   Sun,
@@ -154,7 +153,6 @@ export function SettingsModal({
   onDownloadUpdate = null,
   onCancelUpdate = null,
   onInstallUpdate = null,
-  onOpenShare = null,
   onOpenInviteManager = null,
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
@@ -349,10 +347,8 @@ export function SettingsModal({
       updateState.status === 'installing' ||
       updateState.status === 'error')
 
-  const hasTools = Boolean(
-    onOpenShare ||
-      (isAdmin && onOpenInviteManager) ||
-      (isAdmin && activeDevice?.baseUrl),
+  const hasAdminTools = Boolean(
+    isAdmin && (onOpenInviteManager || activeDevice?.baseUrl),
   )
 
   return (
@@ -889,30 +885,14 @@ export function SettingsModal({
             </section>
           )}
 
-          {/* Section 4: Tools & Admin */}
-          {hasTools && (
+          {/* Section 4: Admin Tools (hidden completely for non-admin users) */}
+          {hasAdminTools && (
             <section>
               <div className="mb-1 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
-                {bi('工具', 'Tools')}
+                {bi('管理', 'Admin')}
               </div>
               <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#22252E]">
-                {onOpenShare && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onClose()
-                      onOpenShare()
-                    }}
-                    className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
-                  >
-                    <span className="inline-flex items-center gap-2">
-                      <Share2 className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                      <span>{bi('分享与下载', 'Share & Downloads')}</span>
-                    </span>
-                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                  </button>
-                )}
-                {isAdmin && onOpenInviteManager && (
+                {onOpenInviteManager && (
                   <button
                     type="button"
                     onClick={() => {
@@ -928,7 +908,7 @@ export function SettingsModal({
                     <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
                   </button>
                 )}
-                {isAdmin && activeDevice?.baseUrl && (
+                {activeDevice?.baseUrl && (
                   <a
                     href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}
                     target="_blank"

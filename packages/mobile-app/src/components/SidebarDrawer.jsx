@@ -284,7 +284,32 @@ export function SidebarDrawer({
     })
   }, [sessions, filterApp, search])
 
-  const filterTabs = useMemo(() => getFilterTabs(lang), [lang])
+  const { filterTabs, soleQuotaTab } = useMemo(() => {
+    const allTabs = getFilterTabs(lang)
+    const allTab = allTabs[0]
+    const sessionApps = new Set()
+    for (const s of sessions) {
+      if (s?.app) sessionApps.add(s.app)
+    }
+    const vendorTabs = allTabs.slice(1).filter((tab) => {
+      if (sessionApps.has(tab.id)) return true
+      const info = appsStatus.find((a) => a?.app === tab.id)
+      return Boolean(info?.available || info?.writable)
+    })
+    if (vendorTabs.length >= 2) {
+      return { filterTabs: [allTab, ...vendorTabs], soleQuotaTab: null }
+    }
+    if (vendorTabs.length === 1) {
+      const sole = vendorTabs[0]
+      const info = appsStatus.find((a) => a?.app === sole.id)
+      const hasQuota =
+        info?.quota &&
+        typeof info.quota.remainingPercent === 'number' &&
+        Number.isFinite(info.quota.remainingPercent)
+      return { filterTabs: [], soleQuotaTab: hasQuota ? { tab: sole, quota: info.quota } : null }
+    }
+    return { filterTabs: [], soleQuotaTab: null }
+  }, [lang, sessions, appsStatus])
   const projectGroups = useMemo(() => groupByProject(filtered, lang), [filtered, lang])
   const timeGroups = useMemo(() => groupByTime(filtered, lang), [filtered, lang])
 
@@ -471,24 +496,61 @@ export function SidebarDrawer({
           </div>
         )}
 
-        {/* Vendor Icon & Border-Integrated Subscription Quota Filter Bar (5-column grid) */}
-        <div className="px-4 pb-2">
-          <div className="grid grid-cols-5 gap-1.5">
-            {filterTabs.map((tab) => {
-              const active = filterApp === tab.id
-              const appInfo = tab.id !== 'all' ? appsStatus.find((a) => a?.app === tab.id) : null
-              const quota =
-                appInfo?.quota &&
-                typeof appInfo.quota.remainingPercent === 'number' &&
-                Number.isFinite(appInfo.quota.remainingPercent)
-                  ? appInfo.quota
-                  : null
-              const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
-              const tone = pct !== null ? getQuotaTone(pct) : null
-              const tooltip = formatQuotaTooltip(tab.label, quota, lang)
+        {/* Dynamic Vendor Filter & Subscription Quota Bar (only shows detected or active tools) */}
+        {filterTabs.length > 0 ? (
+          <div className="px-4 pb-2">
+            <div
+              className="grid gap-1.5"
+              style={{ gridTemplateColumns: `repeat(${filterTabs.length}, minmax(0, 1fr))` }}
+            >
+              {filterTabs.map((tab) => {
+                const active = filterApp === tab.id
+                const appInfo = tab.id !== 'all' ? appsStatus.find((a) => a?.app === tab.id) : null
+                const quota =
+                  appInfo?.quota &&
+                  typeof appInfo.quota.remainingPercent === 'number' &&
+                  Number.isFinite(appInfo.quota.remainingPercent)
+                    ? appInfo.quota
+                    : null
+                const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
+                const tone = pct !== null ? getQuotaTone(pct) : null
+                const tooltip = formatQuotaTooltip(tab.label, quota, lang)
 
-              // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
-              if (pct !== null && tone) {
+                // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
+                if (pct !== null && tone) {
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      title={tooltip}
+                      aria-label={tooltip}
+                      onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
+                      className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
+                        active ? 'shadow-xs' : ''
+                      }`}
+                      style={{
+                        background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
+                      }}
+                    >
+                      <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
+                        {active && (
+                          <span
+                            aria-hidden="true"
+                            className="pointer-events-none absolute inset-0"
+                            style={{ backgroundColor: `${tab.color}24` }}
+                          />
+                        )}
+                        <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
+                          <VendorIcon app={tab.id} size={16} />
+                          <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
+                            {pct}%
+                          </span>
+                        </span>
+                      </span>
+                    </button>
+                  )
+                }
+
                 return (
                   <button
                     key={tab.id}
@@ -496,64 +558,62 @@ export function SidebarDrawer({
                     title={tooltip}
                     aria-label={tooltip}
                     onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                    className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
-                      active ? 'shadow-xs' : ''
+                    className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                      active
+                        ? 'border-transparent shadow-xs'
+                        : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
                     }`}
-                    style={{
-                      background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
-                    }}
+                    style={
+                      active
+                        ? {
+                            backgroundColor: `${tab.color}1F`,
+                            borderColor: `${tab.color}66`,
+                            color: tab.color,
+                          }
+                        : undefined
+                    }
                   >
-                    <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
-                      {active && (
-                        <span
-                          aria-hidden="true"
-                          className="pointer-events-none absolute inset-0"
-                          style={{ backgroundColor: `${tab.color}24` }}
-                        />
-                      )}
-                      <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                        <VendorIcon app={tab.id} size={16} />
-                        <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
-                          {pct}%
-                        </span>
-                      </span>
-                    </span>
+                    <VendorIcon
+                      app={tab.id}
+                      size={tab.id === 'all' ? 17 : 19}
+                      mono={tab.id === 'all'}
+                    />
                   </button>
                 )
-              }
-
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  title={tooltip}
-                  aria-label={tooltip}
-                  onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                  className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
-                    active
-                      ? 'border-transparent shadow-xs'
-                      : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
-                  }`}
-                  style={
-                    active
-                      ? {
-                          backgroundColor: `${tab.color}1F`,
-                          borderColor: `${tab.color}66`,
-                          color: tab.color,
-                        }
-                      : undefined
-                  }
-                >
-                  <VendorIcon
-                    app={tab.id}
-                    size={tab.id === 'all' ? 17 : 19}
-                    mono={tab.id === 'all'}
-                  />
-                </button>
-              )
-            })}
+              })}
+            </div>
           </div>
-        </div>
+        ) : soleQuotaTab ? (() => {
+          const pct = Math.max(0, Math.min(100, Math.round(soleQuotaTab.quota.remainingPercent)))
+          const tone = getQuotaTone(pct)
+          const tooltip = formatQuotaTooltip(soleQuotaTab.tab.label, soleQuotaTab.quota, lang)
+          return (
+            <div className="px-4 pb-2">
+              <div
+                title={tooltip}
+                className="flex items-center justify-between gap-2 rounded-xl border border-slate-200/70 bg-white px-2.5 py-2 dark:border-slate-700/70 dark:bg-[#242731]"
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <VendorIcon app={soleQuotaTab.tab.id} size={16} />
+                  <span className="truncate text-xs font-semibold text-slate-700 dark:text-slate-200">
+                    {soleQuotaTab.tab.label}
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <div className="h-1.5 w-14 overflow-hidden rounded-full bg-slate-200/80 dark:bg-slate-700/80">
+                    <div
+                      className="h-full rounded-full transition-all"
+                      style={{ width: `${pct}%`, backgroundColor: tone.ring }}
+                    />
+                  </div>
+                  <span className={`text-[11px] font-semibold tabular-nums ${tone.text}`}>
+                    {pct}%
+                  </span>
+                </div>
+              </div>
+            </div>
+          )
+        })() : null}
 
         {/* Grouping Mode Switcher: By Project (default) vs By Time */}
         <div className="flex items-center justify-between px-4 pb-2 text-[11px]">
