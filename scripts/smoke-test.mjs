@@ -4202,6 +4202,41 @@ async function main() {
       assert.ok(manifestXml.includes('android.permission.ACCESS_NETWORK_STATE'))
       const sandboxHtml = readFileSync(join(process.cwd(), 'packages/mobile-app/public/sandbox-preview.html'), 'utf8')
       assert.ok(sandboxHtml.includes("connect-src 'none'") && sandboxHtml.includes("form-action 'none'"))
+
+      // 17i. Workspace label/meta enrichment (prevents header stale-project drift) & ReasoningEffortSlider guard
+      const clientHelpers = await import('../packages/mobile-app/src/lib/clientHelpers.js')
+      assert.equal(
+        clientHelpers.resolveSessionWorkspaceLabel({ id: 'antigravity:s1', cwd: '/Users/alice/MyProjects/AllinOne' }),
+        'AllinOne',
+        'Missing session.workspace must fall back to session.cwd basename, never an unrelated draft workspace',
+      )
+      assert.equal(
+        clientHelpers.resolveSessionWorkspaceLabel({ id: 'codex:s2', cwd: 'C:\\Work\\DemoApp\\' }),
+        'DemoApp',
+      )
+      assert.equal(
+        clientHelpers.resolveSessionWorkspaceLabel(
+          { id: 'dsh:s3', cwd: '/srv/repo-x' },
+          [{ path: '/srv/repo-x', name: 'Repo X Custom' }],
+        ),
+        'Repo X Custom',
+      )
+      const enrichedRead = clientHelpers.enrichSessionMeta(
+        { id: 'antigravity:s1', title: 'main', cwd: '/Users/alice/MyProjects/AllinOne' },
+        { id: 'antigravity:other', title: 'Film3', cwd: '/Users/alice/MyProjects/MovieWedding', workspace: 'MovieWedding' },
+      )
+      assert.equal(enrichedRead.workspace, 'AllinOne', 'Switching sessions must never inherit previous session workspace')
+      assert.equal(
+        clientHelpers.resolveSessionWorkspaceLabel({ id: 'antigravity:s-unscoped', title: 'Chat' }),
+        '',
+      )
+      const appSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/App.jsx'), 'utf8')
+      assert.ok(
+        appSrc.includes('activeSession\n    ? resolveSessionWorkspaceLabel(activeSession, effectiveWorkspaces)'),
+        'Header currentWorkspaceLabel must strictly derive from activeSession when open',
+      )
+      const pickerSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/components/ModelPickerSheet.jsx'), 'utf8')
+      assert.ok(pickerSrc.includes('role="slider"') && pickerSrc.includes('ReasoningEffortSlider'))
     }
     pass(17, 'Audit regression guards (env scrubbing, ACL, UTF-8 mux, proxy idle, IPv6/spaces, sid revocation, caches & mobile config)')
 

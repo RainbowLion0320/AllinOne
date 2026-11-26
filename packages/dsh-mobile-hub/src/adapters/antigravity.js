@@ -481,13 +481,15 @@ async function runAgySqliteQuery(dbPath, { sql, params = [], single = false, fal
 async function queryAgyConversationState(dbPath, conversationId) {
   if (!conversationId) return null
   const row = await runAgySqliteQuery(dbPath, {
-    sql: 'SELECT status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1',
+    sql: 'SELECT title, workspace_uris, status, not_fully_idle, step_count FROM conversation_summaries WHERE conversation_id = ? LIMIT 1',
     params: [conversationId],
     single: true,
     fallbackValue: null,
   })
   if (!row) return null
   return {
+    title: String(row.title || '').trim(),
+    cwd: parseWorkspaceUri(row.workspace_uris),
     status: String(row.status || ''),
     notFullyIdle: Boolean(row.not_fully_idle),
     stepCount: Number(row.step_count || 0),
@@ -1463,6 +1465,7 @@ export class AntigravityAdapter {
       nativeId: conversationId,
       title,
       cwd,
+      workspace: cwd ? basename(cwd) : 'Antigravity',
       model: pref?.model || '',
       reasoningEffort: pref?.reasoningEffort || '',
       writable: cliReady,
@@ -1565,6 +1568,8 @@ export class AntigravityAdapter {
         const nextStatus = String(dbState?.status || '')
         const nextNotIdle = Boolean(dbState?.notFullyIdle)
         const nextStepCount = Number(dbState?.stepCount || 0)
+        const nextTitle = dbState?.title || w.title
+        const nextCwd = dbState?.cwd || w.cwd
         const externalRunning = computeAgyExternalRunning({
           selfActive: false,
           desktopRunning,
@@ -1575,13 +1580,14 @@ export class AntigravityAdapter {
         })
 
         const fileChanged = curFp.size !== w.size || curFp.mtimeMs !== w.mtimeMs
+        const metaChanged = nextTitle !== w.title || nextCwd !== w.cwd
         const statusChanged =
           nextStatus !== w.status ||
           nextNotIdle !== w.notFullyIdle ||
           nextStepCount !== w.stepCount ||
           externalRunning !== Boolean(w.externalRunning)
 
-        if (!fileChanged && !statusChanged) continue
+        if (!fileChanged && !statusChanged && !metaChanged) continue
 
         w.mtimeMs = curFp.mtimeMs
         w.size = curFp.size
@@ -1589,6 +1595,8 @@ export class AntigravityAdapter {
         w.notFullyIdle = nextNotIdle
         w.stepCount = nextStepCount
         w.externalRunning = externalRunning
+        w.title = nextTitle
+        w.cwd = nextCwd
 
         const pref = this.sessionPrefs.get(sid)
         const latestTaskState = fileChanged ? parseDesktopTranscript(sid, this.agyHome).taskState : undefined

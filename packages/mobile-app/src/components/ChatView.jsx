@@ -19,6 +19,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { MarkdownView } from '../lib/markdown.jsx'
+import { resolveSessionWorkspaceLabel } from '../lib/clientHelpers.js'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
 import { extractDeliverableRefsFromMessage } from '../lib/deliverableFiles.js'
 import { ChatImageGallery } from './ChatImageGallery.jsx'
@@ -813,15 +814,18 @@ export function ChatView({
             </h2>
 
             {session ? (
-              session.workspace && (
-                <div
-                  title={session.cwd || session.workspace}
-                  className="mt-3 inline-flex max-w-xs items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-300"
-                >
-                  <Folder className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                  <span className="truncate">{session.workspace}</span>
-                </div>
-              )
+              (() => {
+                const wsLabel = resolveSessionWorkspaceLabel(session, workspaces)
+                return wsLabel ? (
+                  <div
+                    title={session.cwd || wsLabel}
+                    className="mt-3 inline-flex max-w-xs items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-300"
+                  >
+                    <Folder className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
+                    <span className="truncate">{wsLabel}</span>
+                  </div>
+                ) : null
+              })()
             ) : (
               <>
                 {/* Native AI Tool Switcher Pills */}

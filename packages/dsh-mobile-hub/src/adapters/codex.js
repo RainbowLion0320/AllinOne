@@ -2285,6 +2285,7 @@ export class CodexAdapter {
       nativeId: threadId,
       title,
       cwd,
+      workspace: cwd ? basename(cwd) : '',
       model,
       reasoningEffort: pref?.reasoningEffort || t.reasoningEffort || '',
       writable: true,

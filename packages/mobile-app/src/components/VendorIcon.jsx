@@ -10,6 +10,90 @@ export function formatEffortLabel(effort, lang = getCurrentLang()) {
   return val === dictKey ? effort : val
 }
 
+export function getEffortMeta(effort, lang = getCurrentLang()) {
+  const key = String(effort || '').trim().toLowerCase()
+  const isEn = lang === 'en'
+  if (key === 'off' || key === 'none') {
+    return {
+      level: 0,
+      color: '#64748B',
+      pillClass: 'bg-slate-200/75 text-slate-600 dark:bg-slate-700/70 dark:text-slate-300',
+      hint: isEn ? 'Disabled' : '已关闭',
+    }
+  }
+  if (key === 'minimal' || key === 'low') {
+    return {
+      level: 1,
+      color: '#0EA5E9',
+      pillClass: 'bg-sky-500/12 text-sky-700 dark:bg-sky-400/20 dark:text-sky-300',
+      hint: isEn ? 'Fast' : '快速响应',
+    }
+  }
+  if (key === 'medium') {
+    return {
+      level: 2,
+      color: '#4D6BFE',
+      pillClass: 'bg-[#4D6BFE]/12 text-[#3552E8] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]',
+      hint: isEn ? 'Balanced' : '均衡',
+    }
+  }
+  if (key === 'high') {
+    return {
+      level: 3,
+      color: '#4F46E5',
+      pillClass: 'bg-indigo-500/14 text-indigo-700 dark:bg-indigo-400/22 dark:text-indigo-300',
+      hint: isEn ? 'Deep' : '深度思考',
+    }
+  }
+  if (key === 'xhigh') {
+    return {
+      level: 4,
+      color: '#7C3AED',
+      pillClass: 'bg-violet-500/14 text-violet-700 dark:bg-violet-400/22 dark:text-violet-300',
+      hint: isEn ? 'Extra Deep' : '极致推理',
+    }
+  }
+  return {
+    level: 4,
+    color: '#9333EA',
+    pillClass: 'bg-purple-500/15 text-purple-700 dark:bg-purple-400/25 dark:text-purple-300',
+    hint: isEn ? 'Maximum' : '满血推理',
+  }
+}
+
+export function EffortSignalIcon({ effort, className = '' }) {
+  const { level } = getEffortMeta(effort)
+  const bars = [
+    { x: 1.5, y: 8.5, h: 3.5, active: level >= 1 },
+    { x: 5, y: 6.2, h: 5.8, active: level >= 2 },
+    { x: 8.5, y: 3.8, h: 8.2, active: level >= 3 },
+    { x: 12, y: 1.5, h: 10.5, active: level >= 4 },
+  ]
+  return (
+    <svg
+      width="12"
+      height="11"
+      viewBox="0 0 15 13"
+      fill="none"
+      className={className}
+      aria-hidden="true"
+    >
+      {bars.map((b, i) => (
+        <rect
+          key={i}
+          x={b.x}
+          y={b.y}
+          width="2.1"
+          height={b.h}
+          rx="1"
+          fill="currentColor"
+          opacity={b.active ? 1 : 0.24}
+        />
+      ))}
+    </svg>
+  )
+}
+
 export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {
   const raw = String(modelName || modelId || '').trim()
   if (!raw) return bi(lang, '默认模型', 'Default')

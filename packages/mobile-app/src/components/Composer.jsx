@@ -23,7 +23,7 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { formatEffortLabel, formatModelShort } from './VendorIcon.jsx'
+import { EffortSignalIcon, formatEffortLabel, formatModelShort, getEffortMeta } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { clearDraft, loadDraft, saveDraft } from '../lib/draftStore.js'
 
@@ -542,8 +542,13 @@ export function Composer({
                     {formatModelShort(modelPref?.model, modelDisplayName, lang)}
                   </span>
                   {modelPref?.reasoningEffort && (
-                    <span className="shrink-0 rounded-full bg-[#4D6BFE]/12 px-1.5 py-0.5 text-[10px] font-semibold text-[#3552E8] dark:bg-[#4D6BFE]/25 dark:text-[#96AEFF]">
-                      {formatEffortLabel(modelPref.reasoningEffort, lang)}
+                    <span
+                      className={`inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                        getEffortMeta(modelPref.reasoningEffort, lang).pillClass
+                      }`}
+                    >
+                      <EffortSignalIcon effort={modelPref.reasoningEffort} className="shrink-0" />
+                      <span>{formatEffortLabel(modelPref.reasoningEffort, lang)}</span>
                     </span>
                   )}
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />

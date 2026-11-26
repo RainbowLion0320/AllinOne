@@ -1026,6 +1026,29 @@ export class DshAdapter {
     return items.slice(0, limit)
   }
 
+  resolveWorkspaceInfo(sessionId = '', cwd = '') {
+    const wsPath = join(this.dshHome, 'storages', 'workspace.json')
+    const wsData = readJsonSafe(wsPath)
+    const rows = Object.values(wsData?.tables?.workspaces || {})
+    if (sessionId) {
+      for (const row of rows) {
+        if (Array.isArray(row?.sessionIds) && row.sessionIds.includes(sessionId)) {
+          return { path: row.path || '', title: row.title || '' }
+        }
+      }
+    }
+    const cleanCwd = String(cwd || '').trim().replace(/[\\/]+$/, '').toLowerCase()
+    if (cleanCwd) {
+      for (const row of rows) {
+        const rp = String(row?.path || '').trim().replace(/[\\/]+$/, '').toLowerCase()
+        if (rp && rp === cleanCwd) {
+          return { path: row.path || '', title: row.title || '' }
+        }
+      }
+    }
+    return null
+  }
+
   async readSession(sessionId, { limit = 25, cursor = null } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
     if (!this.isLive() && this.ipcClient) {
@@ -1111,6 +1134,9 @@ export class DshAdapter {
     const isLocalActive = this.activeTurns.has(sessionId)
     const desktopTurnOpen = Boolean(cacheRec?.record?.rows?.approvalState?.val?.turnOpen)
     const externalRunning = Boolean(!isLocalActive && desktopTurnOpen)
+    const wsInfo = this.resolveWorkspaceInfo(sessionId, cwd)
+    if (!cwd && wsInfo?.path) cwd = wsInfo.path
+    const workspace = wsInfo?.title || (cwd ? basename(cwd) : '')
 
     return {
       id: makeCompositeId(APPS.DSH, sessionId),
@@ -1118,6 +1144,7 @@ export class DshAdapter {
       nativeId: sessionId,
       title,
       cwd,
+      workspace,
       model,
       provider,
       reasoningEffort,
@@ -1212,12 +1239,14 @@ export class DshAdapter {
     if (model || reasoningEffort) {
       await this.applyModelSelection(agent, sessionId, { provider, model, reasoningEffort })
     }
+    const wsInfo = this.resolveWorkspaceInfo(sessionId, targetCwd)
     return {
       id: makeCompositeId(APPS.DSH, sessionId),
       app: APPS.DSH,
       nativeId: sessionId,
       title: title || '手机端总控对话',
       cwd: targetCwd,
+      workspace: wsInfo?.title || basename(targetCwd),
       model: model || '',
       provider: provider || '',
       reasoningEffort: reasoningEffort || '',

@@ -61,6 +61,7 @@ import {
   saveLastSessionId,
   saveLastWorkspace,
 } from './lib/draftStore.js'
+import { enrichSessionMeta, resolveSessionWorkspaceLabel } from './lib/clientHelpers.js'
 import { LoginScreen } from './components/LoginScreen.jsx'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
@@ -619,6 +620,8 @@ export function App() {
     }
     return [...map.values()]
   }, [workspaces, sessions])
+  const effectiveWorkspacesRef = useRef(effectiveWorkspaces)
+  effectiveWorkspacesRef.current = effectiveWorkspaces
 
   const selectedDraftWorkspaceObj = useMemo(() => {
     if (!selectedDraftCwd) return null
@@ -801,7 +804,12 @@ export function App() {
         return
       }
       if (res?.session) {
-        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
+        const enrichedSession = enrichSessionMeta(
+          res.session,
+          activeSessionRef.current,
+          effectiveWorkspacesRef.current,
+        )
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = enrichedSession
         const currentSnapshot = {
           messages: messagesRef.current,
           hasMore: historyMetaRef.current.hasMore,
@@ -819,10 +827,14 @@ export function App() {
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
         }
-        activeSessionRef.current = res.session
+        activeSessionRef.current = enrichedSession
         messagesRef.current = reconciled.messages
         historyMetaRef.current = nextHistoryMeta
-        setActiveSession(res.session)
+        setActiveSession(enrichedSession)
+        if (enrichedSession.cwd) {
+          saveLastWorkspace(scope, enrichedSession.cwd)
+          setSelectedDraftCwd(enrichedSession.cwd)
+        }
         setMessages(reconciled.messages)
         setHistoryMeta(nextHistoryMeta)
         pruneUnusedSentPreviewUrls(reconciled.messages)
@@ -831,10 +843,12 @@ export function App() {
             s.id === targetId
               ? {
                   ...s,
-                  status: res.session.status || s.status,
-                  title: res.session.title || s.title,
-                  syncState: res.session.syncState ?? null,
-                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
+                  status: enrichedSession.status || s.status,
+                  title: enrichedSession.title || s.title,
+                  cwd: enrichedSession.cwd || s.cwd,
+                  workspace: enrichedSession.workspace || s.workspace,
+                  syncState: enrichedSession.syncState ?? null,
+                  ...(enrichedSession.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, enrichedSession.updatedAt) } : {}),
                 }
               : s,
           ),
@@ -901,7 +915,32 @@ export function App() {
       }
       if (sessRes && Array.isArray(sessRes.sessions)) {
         setSessions(sessRes.sessions)
+        const latestWorkspaces = wsRes && Array.isArray(wsRes.workspaces) ? wsRes.workspaces : effectiveWorkspacesRef.current
+        const curActiveId = activeSessionRef.current?.id
         for (const s of sessRes.sessions) {
+          if (s?.id && s.id === curActiveId) {
+            setActiveSession((prev) => {
+              if (!prev || prev.id !== s.id) return prev
+              const merged = enrichSessionMeta(
+                {
+                  ...prev,
+                  title: s.title || prev.title,
+                  cwd: s.cwd || prev.cwd,
+                  workspace: s.workspace || prev.workspace,
+                  status: s.status || prev.status,
+                  ...(s.updatedAt ? { updatedAt: Math.max(prev.updatedAt || 0, s.updatedAt) } : {}),
+                },
+                prev,
+                latestWorkspaces,
+              )
+              activeSessionRef.current = merged
+              return merged
+            })
+            if (s.cwd) {
+              saveLastWorkspace(cacheScopeRef.current, s.cwd)
+              setSelectedDraftCwd(s.cwd)
+            }
+          }
           if (s?.id && s.status === 'idle' && isStaleStreamForIdle(s.id)) {
             clearLiveStreamEntry(s.id)
             if (activeSessionRef.current?.id === s.id) {
@@ -1007,9 +1046,13 @@ export function App() {
     setSessionOpenSeq((n) => n + 1)
 
     if (typeof sessionOrId === 'object') {
-      activeSessionRef.current = sessionOrId
-      setActiveSession(sessionOrId)
-      if (sessionOrId.cwd) saveLastWorkspace(scope, sessionOrId.cwd)
+      const enrichedInitial = enrichSessionMeta(sessionOrId, null, effectiveWorkspacesRef.current)
+      activeSessionRef.current = enrichedInitial
+      setActiveSession(enrichedInitial)
+      if (enrichedInitial.cwd) {
+        saveLastWorkspace(scope, enrichedInitial.cwd)
+        setSelectedDraftCwd(enrichedInitial.cwd)
+      }
     }
     saveLastSessionId(scope, id)
     if (isDifferentSession) {
@@ -1026,8 +1069,17 @@ export function App() {
     if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
     if (cached && cached.messages?.length > 0) {
       if (cached.meta && typeof sessionOrId === 'string') {
-        activeSessionRef.current = cached.meta
-        setActiveSession(cached.meta)
+        const enrichedCached = enrichSessionMeta(
+          cached.meta,
+          activeSessionRef.current,
+          effectiveWorkspacesRef.current,
+        )
+        activeSessionRef.current = enrichedCached
+        setActiveSession(enrichedCached)
+        if (enrichedCached.cwd) {
+          saveLastWorkspace(scope, enrichedCached.cwd)
+          setSelectedDraftCwd(enrichedCached.cwd)
+        }
       }
       const nextMeta = {
         hasMore: Boolean(cached.hasMore),
@@ -1060,7 +1112,12 @@ export function App() {
         if (res.session.status === 'idle' && isStaleStreamForIdle(id)) {
           clearLiveStreamEntry(id)
         }
-        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
+        const enrichedSession = enrichSessionMeta(
+          res.session,
+          activeSessionRef.current,
+          effectiveWorkspacesRef.current,
+        )
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = enrichedSession
         const reconciled = reconcileCachedWithFreshPage(cached, {
           messages: freshMsgs,
           hasMore,
@@ -1089,10 +1146,29 @@ export function App() {
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
         }
-        activeSessionRef.current = res.session
+        activeSessionRef.current = enrichedSession
         messagesRef.current = finalMessages
         historyMetaRef.current = nextMeta
-        setActiveSession(res.session)
+        setActiveSession(enrichedSession)
+        if (enrichedSession.cwd) {
+          saveLastWorkspace(scope, enrichedSession.cwd)
+          setSelectedDraftCwd(enrichedSession.cwd)
+        }
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === id
+              ? {
+                  ...s,
+                  status: enrichedSession.status || s.status,
+                  title: enrichedSession.title || s.title,
+                  cwd: enrichedSession.cwd || s.cwd,
+                  workspace: enrichedSession.workspace || s.workspace,
+                  syncState: enrichedSession.syncState ?? s.syncState,
+                  ...(enrichedSession.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, enrichedSession.updatedAt) } : {}),
+                }
+              : s,
+          ),
+        )
         setMessages(finalMessages)
         setHistoryMeta(nextMeta)
         pruneUnusedSentPreviewUrls(finalMessages)
@@ -1416,18 +1492,31 @@ export function App() {
         }
         setSessions((prev) => {
           const prevItem = prev.find((s) => s.id === updated.id)
-          const merged = prevItem ? { ...prevItem, ...updated } : updated
+          const merged = enrichSessionMeta(
+            prevItem ? { ...prevItem, ...updated } : updated,
+            prevItem,
+            effectiveWorkspacesRef.current,
+          )
           const next = [merged, ...prev.filter((s) => s.id !== updated.id)]
           next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
           return next
         })
         if (activeSessionRef.current?.id === updated.id) {
+          const nextCwd = String(updated.cwd || activeSessionRef.current?.cwd || '').trim()
           setActiveSession((prev) => {
             if (!prev || prev.id !== updated.id) return prev
-            const merged = { ...prev, ...updated }
+            const merged = enrichSessionMeta(
+              { ...prev, ...updated },
+              prev,
+              effectiveWorkspacesRef.current,
+            )
             activeSessionRef.current = merged
             return merged
           })
+          if (nextCwd) {
+            saveLastWorkspace(cacheScopeRef.current, nextCwd)
+            setSelectedDraftCwd(nextCwd)
+          }
           if (
             (payload.historyChanged || payload.statusChanged || clearedStaleStream) &&
             !liveStreamMapRef.current[updated.id]?.active
@@ -2448,7 +2537,9 @@ export function App() {
   const currentStream = activeSession ? streamingBySession[activeSession.id] : null
 
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
-  const currentWorkspaceLabel = activeSession?.workspace || selectedDraftWorkspaceObj?.name || ''
+  const currentWorkspaceLabel = activeSession
+    ? resolveSessionWorkspaceLabel(activeSession, effectiveWorkspaces)
+    : (selectedDraftWorkspaceObj?.name || '')
   const headerSubtitle = (() => {
     if (connState === 'unauthorized') return `${activeDeviceName} · ${t('common.expired')}`
     if (connState === 'error') return `${activeDeviceName} · ${bi('连接已断开', 'Disconnected')}`
