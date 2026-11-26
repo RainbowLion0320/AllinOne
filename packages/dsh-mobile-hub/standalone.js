@@ -14,7 +14,16 @@ import { normalizeE2eeKey } from '@allinone/shared/e2ee'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
-function loadDotEnv(filePath) {
+const ALLOWED_STANDALONE_DOTENV_KEYS = new Set([
+  'RELAY_URL',
+  'ALLINONE_ROOM_ID',
+  'BRIDGE_ID',
+  'DEFAULT_CWD',
+  'ALLINONE_BRIDGE_SECRET',
+  'ALLINONE_E2EE_KEY',
+])
+
+function loadDotEnv(filePath, allowedKeys = ALLOWED_STANDALONE_DOTENV_KEYS) {
   if (!existsSync(filePath)) return
   for (const line of readFileSync(filePath, 'utf8').split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -22,6 +31,7 @@ function loadDotEnv(filePath) {
     const eq = trimmed.indexOf('=')
     if (eq === -1) continue
     const k = trimmed.slice(0, eq).trim()
+    if (allowedKeys && !allowedKeys.has(k)) continue
     let v = trimmed.slice(eq + 1).trim()
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
       v = v.slice(1, -1)
@@ -31,7 +41,19 @@ function loadDotEnv(filePath) {
 }
 
 loadDotEnv(resolve(__dirname, '../../.env'))
-loadDotEnv(resolve(__dirname, '../relay-server/.env'))
+
+// Capture bootstrap secrets once, then scrub from process.env so child AI CLIs never inherit them
+const BOOTSTRAP_ENV = {
+  bridgeSecret: String(process.env.ALLINONE_BRIDGE_SECRET || '').trim(),
+  e2eeKey: String(process.env.ALLINONE_E2EE_KEY || '').trim(),
+}
+for (const secretKey of [
+  'ALLINONE_BRIDGE_SECRET',
+  'ALLINONE_E2EE_KEY',
+  'ALLINONE_PASSWORD',
+]) {
+  delete process.env[secretKey]
+}
 
 function normalizeRelayWsUrl(rawUrl) {
   const input = String(rawUrl || 'ws://127.0.0.1:8787/ws/bridge').trim()
@@ -45,12 +67,15 @@ function normalizeRelayWsUrl(rawUrl) {
 
 export function startStandaloneBridge(options = {}) {
   const relayUrl = normalizeRelayWsUrl(options.relayUrl || process.env.RELAY_URL || 'ws://127.0.0.1:8787/ws/bridge')
-  const secret = String(options.secret || process.env.ALLINONE_BRIDGE_SECRET || '').trim()
+  const secret = String(options.secret || process.env.ALLINONE_BRIDGE_SECRET || BOOTSTRAP_ENV.bridgeSecret || '').trim()
   const roomId = String(options.roomId || process.env.ALLINONE_ROOM_ID || '').trim()
   const defaultBridgeId = os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 32) || 'home-pc'
   const bridgeId = options.bridgeId || process.env.BRIDGE_ID || defaultBridgeId
   const mode = options.mode || 'standalone'
-  const rawE2eeKey = String(options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? '').trim()
+  const rawE2eeKey = String(options.e2eeKey ?? process.env.ALLINONE_E2EE_KEY ?? BOOTSTRAP_ENV.e2eeKey ?? '').trim()
+  delete process.env.ALLINONE_BRIDGE_SECRET
+  delete process.env.ALLINONE_E2EE_KEY
+  delete process.env.ALLINONE_PASSWORD
   const e2eeKey = normalizeE2eeKey(rawE2eeKey)
   if (!roomId.startsWith('usr_') || !secret || !e2eeKey) {
     throw new Error('startStandaloneBridge requires account roomId (usr_*), device secret, and valid 256-bit e2eeKey')

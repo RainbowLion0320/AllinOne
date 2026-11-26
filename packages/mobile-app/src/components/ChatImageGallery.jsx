@@ -1,13 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react'
 import {
+  Globe,
   Image as ImageIcon,
   ImageOff,
   Loader2,
   Maximize2,
   RefreshCw,
+  ShieldAlert,
   Zap,
 } from 'lucide-react'
-import { getImageLabel, resolveImageSrc } from '../lib/imageUrls.js'
+import {
+  getImageLabel,
+  isExternalHttpImageUrl,
+  isPrivateOrLoopbackUrl,
+  resolveImageSrc,
+} from '../lib/imageUrls.js'
 import {
   getCachedE2eeImageUrl,
   loadE2eeImageUrl,
@@ -88,7 +95,23 @@ function ChatImageCard({
   const directSrc = needsE2ee
     ? ''
     : (typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl) || resolveImageSrc(effectiveItem)
-  const baseSrc = needsE2ee ? resolvedE2eeSrc : directSrc
+  const isLocalPreview = Boolean(typeof effectiveItem === 'object' && effectiveItem?.localPreviewUrl)
+  const isExternalHttp = Boolean(!needsE2ee && !isLocalPreview && isExternalHttpImageUrl(directSrc))
+  const isBlockedExternal = Boolean(isExternalHttp && isPrivateOrLoopbackUrl(directSrc))
+  const deferExternalHttp = Boolean(isExternalHttp && !isBlockedExternal && !manualLoadAllowed)
+  const externalHostname = (() => {
+    if (!isExternalHttp || !directSrc) return ''
+    try {
+      return new URL(directSrc).hostname || ''
+    } catch {
+      return ''
+    }
+  })()
+  const baseSrc = needsE2ee
+    ? resolvedE2eeSrc
+    : isBlockedExternal || deferExternalHttp
+      ? ''
+      : directSrc
   const src = retryNonce > 0 && baseSrc && !baseSrc.startsWith('data:') && !baseSrc.startsWith('blob:')
     ? `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_r=${retryNonce}`
     : baseSrc
@@ -190,6 +213,7 @@ function ChatImageCard({
   ])
 
   useEffect(() => {
+    if (isBlockedExternal || deferExternalHttp) return
     if (!src) {
       if (!needsE2ee) {
         setStatus('error')
@@ -202,7 +226,7 @@ function ChatImageCard({
     } else {
       setStatus('loading')
     }
-  }, [src, needsE2ee])
+  }, [src, needsE2ee, isBlockedExternal, deferExternalHttp])
 
   if (!needsE2ee && !directSrc) return null
 
@@ -225,7 +249,42 @@ function ChatImageCard({
         compact ? 'w-[220px] max-w-full' : 'w-full max-w-[340px]'
       }`}
     >
-      {deferForRelay ? (
+      {isBlockedExternal ? (
+        <div className="flex w-full flex-col items-center justify-center gap-2 px-4 py-5 text-center">
+          <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-rose-500/12 text-rose-600 dark:text-rose-400">
+            <ShieldAlert className="h-5 w-5" />
+          </div>
+          <div className="max-w-full truncate text-xs font-semibold text-slate-700 dark:text-slate-200">
+            {externalHostname || label}
+          </div>
+          <div className="inline-flex items-center gap-1 rounded-full bg-rose-500/12 px-2.5 py-0.5 text-[10.5px] font-semibold text-rose-600 dark:text-rose-300">
+            <span>{bi('已拦截不安全/内网图片地址', 'Blocked unsafe / private image URL')}</span>
+          </div>
+        </div>
+      ) : deferExternalHttp ? (
+        <button
+          type="button"
+          onClick={() => {
+            setStatus('loading')
+            setManualLoadAllowed(true)
+          }}
+          className="flex w-full flex-col items-center justify-center gap-2 px-4 py-5 text-center transition hover:bg-slate-200/50 active:scale-[0.99] dark:hover:bg-[#232734]"
+        >
+          <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-200/80 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+            <Globe className="h-5 w-5" />
+          </div>
+          <div className="max-w-full truncate text-xs font-semibold text-slate-800 dark:text-slate-100">
+            {label}
+          </div>
+          <div className="inline-flex max-w-full items-center gap-1 rounded-full bg-[#4D6BFE]/12 px-2.5 py-0.5 text-[10.5px] font-semibold text-[#3552E8] dark:text-[#96AEFF]">
+            <span className="truncate">
+              {externalHostname
+                ? bi(`加载外部图片 · ${externalHostname}`, `Load external image · ${externalHostname}`)
+                : bi('点击加载外部图片', 'Load external image')}
+            </span>
+          </div>
+        </button>
+      ) : deferForRelay ? (
         <button
           type="button"
           onClick={() => {
@@ -320,6 +379,7 @@ function ChatImageCard({
                 alt={label}
                 loading="eager"
                 decoding="async"
+                referrerPolicy="no-referrer"
                 onLoad={() => setStatus('loaded')}
                 onError={() => {
                   if (!previewFailed && typeof item === 'object' && item?.localPreviewUrl) {
@@ -357,9 +417,13 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
 
   const resolvedList = images.map((item) => {
     const needsE2ee = needsE2eeMediaLoad(item)
-    const src = needsE2ee
+    const rawDirect = needsE2ee
       ? getCachedE2eeImageUrl(item, imageContext)
       : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item)
+    const src =
+      !needsE2ee && isExternalHttpImageUrl(rawDirect) && isPrivateOrLoopbackUrl(rawDirect)
+        ? ''
+        : rawDirect
     const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
     return {
       item,

@@ -22,6 +22,13 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * Lightweight zero-dependency Capacitor bridge allowing decrypted E2EE deliverables & images
@@ -31,6 +38,57 @@ import java.io.OutputStream;
 @CapacitorPlugin(name = "AllinOneFiles")
 public class AllinOneFilesPlugin extends Plugin {
     private static final long STALE_CACHE_MS = 2L * 60L * 60L * 1000L;
+    private static final int MAX_BASE64_LENGTH = 68 * 1024 * 1024; // ~50 MB decoded
+    private static final int MAX_DECODED_BYTES = 50 * 1024 * 1024;
+
+    private static final Map<String, String> ALLOWED_EXT_MIME;
+    private static final Set<String> BLOCKED_MIMES;
+
+    static {
+        Map<String, String> m = new HashMap<>();
+        m.put("png", "image/png");
+        m.put("jpg", "image/jpeg");
+        m.put("jpeg", "image/jpeg");
+        m.put("webp", "image/webp");
+        m.put("gif", "image/gif");
+        m.put("bmp", "image/bmp");
+        m.put("avif", "image/avif");
+        m.put("ico", "image/x-icon");
+        m.put("pdf", "application/pdf");
+        m.put("doc", "application/msword");
+        m.put("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        m.put("xls", "application/vnd.ms-excel");
+        m.put("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        m.put("csv", "text/csv");
+        m.put("ppt", "application/vnd.ms-powerpoint");
+        m.put("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+        m.put("md", "text/markdown");
+        m.put("markdown", "text/markdown");
+        m.put("txt", "text/plain");
+        m.put("log", "text/plain");
+        m.put("json", "application/json");
+        m.put("rtf", "application/rtf");
+        m.put("epub", "application/epub+zip");
+        m.put("zip", "application/zip");
+        ALLOWED_EXT_MIME = Collections.unmodifiableMap(m);
+
+        Set<String> blocked = new HashSet<>();
+        blocked.add("text/html");
+        blocked.add("application/xhtml+xml");
+        blocked.add("image/svg+xml");
+        blocked.add("application/javascript");
+        blocked.add("text/javascript");
+        blocked.add("application/x-javascript");
+        blocked.add("application/vnd.android.package-archive");
+        blocked.add("application/java-archive");
+        blocked.add("application/x-sh");
+        blocked.add("application/x-shellscript");
+        blocked.add("application/x-executable");
+        blocked.add("application/x-msdownload");
+        blocked.add("text/xml");
+        blocked.add("application/xml");
+        BLOCKED_MIMES = Collections.unmodifiableSet(blocked);
+    }
 
     private static String sanitizeFilename(String raw) {
         String base = raw == null ? "" : raw.trim();
@@ -41,15 +99,85 @@ public class AllinOneFilesPlugin extends Plugin {
         return base.length() > 120 ? base.substring(0, 120) : base;
     }
 
-    private void pruneShareCache(File dir) {
-        File[] files = dir.listFiles();
-        if (files == null) return;
-        long cutoff = System.currentTimeMillis() - STALE_CACHE_MS;
-        for (File f : files) {
-            if (f.isFile() && f.lastModified() < cutoff) {
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
+    private static String extractExtension(String filename) {
+        if (filename == null) return "";
+        int dot = filename.lastIndexOf('.');
+        if (dot <= 0 || dot >= filename.length() - 1) return "";
+        return filename.substring(dot + 1).toLowerCase(Locale.ROOT);
+    }
+
+    private static String resolveSafeMimeType(String filename, String rawMime) {
+        String ext = extractExtension(filename);
+        String canonical = ALLOWED_EXT_MIME.get(ext);
+        if (canonical == null) {
+            return null;
+        }
+        String norm = rawMime == null ? "" : rawMime.trim().toLowerCase(Locale.ROOT);
+        int semi = norm.indexOf(';');
+        if (semi >= 0) norm = norm.substring(0, semi).trim();
+        if (norm.isEmpty() || "application/octet-stream".equals(norm)) {
+            return canonical;
+        }
+        if (BLOCKED_MIMES.contains(norm)) {
+            return null;
+        }
+        int slashIdx = canonical.indexOf('/');
+        String expectedPrefix = slashIdx > 0 ? canonical.substring(0, slashIdx + 1) : "";
+        if (norm.startsWith(expectedPrefix)) {
+            return norm;
+        }
+        if ("json".equals(ext) && "text/plain".equals(norm)) {
+            return norm;
+        }
+        if ("rtf".equals(ext) && "text/rtf".equals(norm)) {
+            return norm;
+        }
+        return null;
+    }
+
+    private static void deleteRecursively(File target) {
+        if (target == null || !target.exists()) return;
+        if (target.isDirectory()) {
+            File[] children = target.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    deleteRecursively(child);
+                }
             }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        target.delete();
+    }
+
+    private void pruneShareCache(File dir) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return;
+        long cutoff = System.currentTimeMillis() - STALE_CACHE_MS;
+        for (File entry : entries) {
+            if (entry.lastModified() < cutoff) {
+                deleteRecursively(entry);
+            }
+        }
+    }
+
+    @PluginMethod
+    public void clearSharedCache(PluginCall call) {
+        try {
+            Context ctx = getContext();
+            File shareDir = new File(ctx.getCacheDir(), "allinone_shared");
+            if (shareDir.exists()) {
+                File[] children = shareDir.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        deleteRecursively(child);
+                    }
+                }
+            }
+            JSObject ret = new JSObject();
+            ret.put("ok", true);
+            call.resolve(ret);
+        } catch (Exception err) {
+            call.reject("Failed to clear shared cache: " + err.getMessage());
         }
     }
 
@@ -60,10 +188,16 @@ public class AllinOneFilesPlugin extends Plugin {
             call.reject("Missing file data");
             return;
         }
+        if (dataBase64.length() > MAX_BASE64_LENGTH) {
+            call.reject("File exceeds maximum allowed size (50 MB)");
+            return;
+        }
         String filename = sanitizeFilename(call.getString("filename", "document"));
-        String mimeType = call.getString("mimeType", "application/octet-stream");
-        if (mimeType == null || mimeType.trim().isEmpty()) {
-            mimeType = "application/octet-stream";
+        String rawMime = call.getString("mimeType", "application/octet-stream");
+        String mimeType = resolveSafeMimeType(filename, rawMime);
+        if (mimeType == null) {
+            call.reject("Blocked or unsupported file type");
+            return;
         }
         String mode = call.getString("mode", "save");
 
@@ -72,6 +206,10 @@ public class AllinOneFilesPlugin extends Plugin {
             bytes = Base64.decode(dataBase64, Base64.DEFAULT);
         } catch (IllegalArgumentException err) {
             call.reject("Invalid base64 payload");
+            return;
+        }
+        if (bytes.length > MAX_DECODED_BYTES) {
+            call.reject("File exceeds maximum allowed size (50 MB)");
             return;
         }
 
@@ -112,7 +250,11 @@ public class AllinOneFilesPlugin extends Plugin {
                 shareDir.mkdirs();
             }
             pruneShareCache(shareDir);
-            File outFile = new File(shareDir, filename);
+            File isolatedDir = new File(shareDir, UUID.randomUUID().toString());
+            if (!isolatedDir.mkdirs()) {
+                throw new IllegalStateException("Could not create isolated share directory");
+            }
+            File outFile = new File(isolatedDir, filename);
             try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 fos.write(bytes);
                 fos.flush();

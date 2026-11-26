@@ -38,7 +38,7 @@ function toU8(data) {
   if (data instanceof Uint8Array && data.constructor === Uint8Array) return data
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
   if (data instanceof ArrayBuffer) return new Uint8Array(data)
-  return new Uint8Array(data)
+  throw new TypeError('Expected Uint8Array, ArrayBufferView, or ArrayBuffer')
 }
 
 /**
@@ -68,6 +68,7 @@ export function encodeBulkFrame(streamId, seq, payload = new Uint8Array(0), flag
  * Decode one binary slice from `aio-bulk`. Returns null if frame is malformed.
  */
 export function decodeBulkFrame(raw) {
+  if (!raw || (!(raw instanceof ArrayBuffer) && !ArrayBuffer.isView(raw))) return null
   const bytes = toU8(raw)
   if (bytes.byteLength < BULK_HEADER_BYTES) return null
   if (
@@ -200,8 +201,12 @@ function unpackCtrlLogical(logical) {
     return null
   }
   const binStart = 4 + metaLen
-  if (binStart < logical.byteLength && meta && typeof meta === 'object' && !Array.isArray(meta)) {
-    meta.bin = logical.subarray(binStart)
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (binStart < logical.byteLength) {
+      meta.bin = logical.subarray(binStart)
+    } else {
+      delete meta.bin
+    }
   }
   return meta
 }
@@ -211,22 +216,39 @@ function unpackCtrlLogical(logical) {
  * Supports arbitrary JSON metadata plus an optional zero-copy `bin: Uint8Array` payload
  * (eliminates +33% Base64URL inflation and JSON double-escaping on `aio-ctrl`).
  */
-export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 } = {}) {
+export function createCtrlCodec({
+  maxFragsInFlight = 64,
+  fragTimeoutMs = 30_000,
+  maxTotalReassemblyBytes = MAX_CTRL_REASSEMBLY_BYTES,
+} = {}) {
+  const totalReassemblyCap =
+    Number.isFinite(Number(maxTotalReassemblyBytes)) && Number(maxTotalReassemblyBytes) > 0
+      ? Math.floor(Number(maxTotalReassemblyBytes))
+      : MAX_CTRL_REASSEMBLY_BYTES
   let fragSeq = 1
+  let totalReassemblyBytes = 0
   /** @type {Map<number, { parts: (Uint8Array | undefined)[], received: number, receivedBytes: number, total: number, createdAt: number }>} */
   const assemblies = new Map()
 
+  function removeAssembly(id) {
+    const entry = assemblies.get(id)
+    if (!entry) return false
+    assemblies.delete(id)
+    totalReassemblyBytes = Math.max(0, totalReassemblyBytes - entry.receivedBytes)
+    return true
+  }
+
   function pruneStale(now = Date.now(), reserve = 0) {
-    for (const [id, entry] of assemblies.entries()) {
+    for (const [id, entry] of [...assemblies.entries()]) {
       if (now - entry.createdAt > fragTimeoutMs) {
-        assemblies.delete(id)
+        removeAssembly(id)
       }
     }
     const maxAllowed = Math.max(0, maxFragsInFlight - reserve)
     while (assemblies.size > maxAllowed) {
       const oldest = assemblies.keys().next().value
       if (oldest === undefined) break
-      assemblies.delete(oldest)
+      removeAssembly(oldest)
     }
   }
 
@@ -290,7 +312,7 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
    * @returns {any|null}
    */
   function decode(rawFrame) {
-    if (!rawFrame || typeof rawFrame === 'string') return null
+    if (!rawFrame || (!(rawFrame instanceof ArrayBuffer) && !ArrayBuffer.isView(rawFrame))) return null
     const bytes = toU8(rawFrame)
     if (
       bytes.byteLength < CTRL_SINGLE_HEADER_BYTES ||
@@ -314,27 +336,46 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
       return null
     }
     const slice = bytes.subarray(CTRL_FRAG_HEADER_BYTES)
+    const now = Date.now()
     let entry = assemblies.get(fragId)
+    if (entry && now - entry.createdAt > fragTimeoutMs) {
+      removeAssembly(fragId)
+      entry = undefined
+    }
     if (!entry) {
-      pruneStale(Date.now(), 1)
-      entry = { parts: new Array(total), received: 0, receivedBytes: 0, total, createdAt: Date.now() }
+      pruneStale(now, 1)
+      if (
+        slice.byteLength > MAX_CTRL_REASSEMBLY_BYTES ||
+        totalReassemblyBytes + slice.byteLength > totalReassemblyCap
+      ) {
+        return null
+      }
+      entry = { parts: new Array(total), received: 0, receivedBytes: 0, total, createdAt: now }
       assemblies.set(fragId, entry)
     } else if (entry.total !== total) {
       return null
     }
     if (entry.parts[idx] === undefined) {
       if (entry.receivedBytes + slice.byteLength > MAX_CTRL_REASSEMBLY_BYTES) {
-        assemblies.delete(fragId)
+        removeAssembly(fragId)
         return null
+      }
+      if (totalReassemblyBytes + slice.byteLength > totalReassemblyCap) {
+        pruneStale(now, 0)
+        if (totalReassemblyBytes + slice.byteLength > totalReassemblyCap) {
+          if (entry.received === 0) removeAssembly(fragId)
+          return null
+        }
       }
       entry.parts[idx] = slice
       entry.received += 1
       entry.receivedBytes += slice.byteLength
+      totalReassemblyBytes += slice.byteLength
     }
     if (entry.received < entry.total) {
       return null
     }
-    assemblies.delete(fragId)
+    removeAssembly(fragId)
     const full = new Uint8Array(entry.receivedBytes)
     let offset = 0
     for (let i = 0; i < entry.total; i += 1) {
@@ -348,6 +389,7 @@ export function createCtrlCodec({ maxFragsInFlight = 64, fragTimeoutMs = 30_000 
 
   function clear() {
     assemblies.clear()
+    totalReassemblyBytes = 0
   }
 
   return { encode, decode, clear }

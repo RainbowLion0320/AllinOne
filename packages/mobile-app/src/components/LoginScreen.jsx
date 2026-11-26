@@ -32,7 +32,12 @@ import {
   sendEmailVerificationCode,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
-import { copyTextToClipboard } from '../lib/clientHelpers.js'
+import { copyTextToClipboard, formatSafeSetupCmd } from '../lib/clientHelpers.js'
+
+function isLoopbackHost(hostname) {
+  const h = String(hostname || '').trim().toLowerCase()
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+}
 
 const QrScannerModal = React.lazy(() =>
   import('./QrScannerModal.jsx').then((m) => ({ default: m.QrScannerModal })),
@@ -83,6 +88,7 @@ export function LoginScreen({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [infoMsg, setInfoMsg] = useState('')
+  const [pendingServerSwitch, setPendingServerSwitch] = useState(null)
 
   useEffect(() => {
     if (initialServerUrl) setServerUrl(initialServerUrl)
@@ -150,11 +156,12 @@ export function LoginScreen({
     }
   }
 
-  const winSetupCmd = `irm ${effectiveServer}/setup.ps1 | iex`
-  const unixSetupCmd = `curl -fsSL ${effectiveServer}/setup.sh | bash`
+  const winSetupCmd = formatSafeSetupCmd(effectiveServer, 'win')
+  const unixSetupCmd = formatSafeSetupCmd(effectiveServer, 'unix')
   const activeSetupCmd = osTab === 'win' ? winSetupCmd : unixSetupCmd
 
   const handleCopySetupCmd = async () => {
+    if (!activeSetupCmd) return
     await copyTextToClipboard(activeSetupCmd)
     setCopiedCmd(true)
     setTimeout(() => setCopiedCmd(false), 1800)
@@ -178,8 +185,35 @@ export function LoginScreen({
         const u = new URL(trimmed)
         const inv = u.searchParams.get('invite')
         if (inv) {
+          const isHttps = u.protocol === 'https:'
+          const isLocalHttp = u.protocol === 'http:' && isLoopbackHost(u.hostname)
+          if (!isHttps && !isLocalHttp) {
+            setError(
+              bi(
+                '已拦截不安全的 HTTP 服务器地址（非本机服务器仅支持 HTTPS）',
+                'Blocked insecure HTTP server URL (HTTPS is required for remote servers).',
+              ),
+            )
+            return
+          }
           const basePath = u.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '')
-          setServerUrl(`${u.origin}${basePath}`)
+          const scannedServer = `${u.origin}${basePath}`
+          let currentOrigin = ''
+          try {
+            currentOrigin = new URL(effectiveServer).origin
+          } catch {}
+          if (currentOrigin && u.origin !== currentOrigin) {
+            setPendingServerSwitch({
+              serverUrl: scannedServer,
+              displayHost: `${u.protocol}//${u.host}${basePath}`,
+              inviteCode: inv.trim(),
+            })
+            setShowAdvancedServer(true)
+            setMode('register')
+            setError('')
+            return
+          }
+          setPendingServerSwitch(null)
           setInviteCode(inv.trim())
           setMode('register')
           setError('')
@@ -199,7 +233,7 @@ export function LoginScreen({
         'Invalid QR code. Please scan an invite registration QR code.',
       ),
     )
-  }, [bi])
+  }, [bi, effectiveServer])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -838,11 +872,14 @@ export function LoginScreen({
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5 rounded-xl bg-slate-900 px-2.5 py-2 font-mono text-[10.5px] text-slate-100">
-                  <span className="flex-1 select-all break-all">{activeSetupCmd}</span>
+                  <span className="flex-1 select-all break-all">
+                    {activeSetupCmd || bi('服务器地址格式无效，无法生成绑定命令', 'Invalid server URL')}
+                  </span>
                   <button
                     type="button"
+                    disabled={!activeSetupCmd}
                     onClick={handleCopySetupCmd}
-                    className="shrink-0 rounded-lg bg-white/10 p-1.5 text-white hover:bg-white/20"
+                    className="shrink-0 rounded-lg bg-white/10 p-1.5 text-white hover:bg-white/20 disabled:opacity-40"
                     title={bi('复制命令', 'Copy command')}
                   >
                     {copiedCmd ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
@@ -861,25 +898,72 @@ export function LoginScreen({
               className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
             >
               <Server className="h-3 w-3" />
-              <span>{bi('服务器：', 'Server: ')}{effectiveServer.replace(/^https?:\/\//, '')}</span>
+              <span>
+                {bi('服务器：', 'Server: ')}
+                {/^http:\/\//i.test(effectiveServer)
+                  ? effectiveServer
+                  : effectiveServer.replace(/^https:\/\//i, '')}
+              </span>
               {showAdvancedServer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             </button>
             {showAdvancedServer && (
-              <div className="mt-1.5 flex items-center gap-1.5">
-                <input
-                  type="url"
-                  value={serverUrl}
-                  onChange={(e) => setServerUrl(e.target.value)}
-                  placeholder={detectDefaultServerUrl()}
-                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
-                />
-                <button
-                  type="button"
-                  onClick={() => setServerUrl(detectDefaultServerUrl())}
-                  className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-                >
-                  {t('common.default')}
-                </button>
+              <div className="mt-1.5 space-y-2">
+                {pendingServerSwitch && (
+                  <div className="space-y-2 rounded-xl border border-amber-300/80 bg-amber-50/90 p-2.5 text-[11.5px] text-amber-900 dark:border-amber-600/50 dark:bg-amber-950/40 dark:text-amber-200">
+                    <div>
+                      {bi(
+                        '扫描到的邀请码指向与当前不同的服务器，请核对完整地址后再确认切换：',
+                        'This invite QR points to a different server. Verify the full URL before switching:',
+                      )}
+                    </div>
+                    <div className="break-all rounded-lg bg-white/80 px-2.5 py-1.5 font-mono text-[11px] font-semibold text-slate-900 dark:bg-[#14161D] dark:text-amber-100">
+                      {pendingServerSwitch.displayHost}
+                    </div>
+                    <div className="flex justify-end gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setPendingServerSwitch(null)}
+                        className="rounded-lg px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-amber-100 dark:text-slate-300 dark:hover:bg-amber-900/40"
+                      >
+                        {t('common.cancel')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setServerUrl(pendingServerSwitch.serverUrl)
+                          setInviteCode(pendingServerSwitch.inviteCode)
+                          setPendingServerSwitch(null)
+                          setError('')
+                        }}
+                        className="rounded-lg bg-amber-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-amber-500 active:scale-95"
+                      >
+                        {bi('确认切换到此服务器', 'Confirm server switch')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="url"
+                    value={serverUrl}
+                    onChange={(e) => {
+                      setServerUrl(e.target.value)
+                      if (pendingServerSwitch) setPendingServerSwitch(null)
+                    }}
+                    placeholder={detectDefaultServerUrl()}
+                    className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setServerUrl(detectDefaultServerUrl())
+                      setPendingServerSwitch(null)
+                    }}
+                    className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                  >
+                    {t('common.default')}
+                  </button>
+                </div>
               </div>
             )}
           </div>

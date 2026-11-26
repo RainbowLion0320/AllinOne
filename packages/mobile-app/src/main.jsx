@@ -43,8 +43,31 @@ class AppErrorBoundary extends React.Component {
               onClick={() => {
                 try {
                   localStorage.removeItem('allinone_devices_v2')
+                  localStorage.removeItem('allinone_composer_drafts_v1')
+                  localStorage.removeItem('allinone_last_session_v1')
+                  localStorage.removeItem('allinone_last_workspace_v1')
                 } catch {}
-                window.location.reload()
+                const deleteDb = (name) =>
+                  new Promise((resolve) => {
+                    try {
+                      if (typeof indexedDB === 'undefined') return resolve()
+                      const req = indexedDB.deleteDatabase(name)
+                      req.onsuccess = () => resolve()
+                      req.onerror = () => resolve()
+                      req.onblocked = () => resolve()
+                    } catch {
+                      resolve()
+                    }
+                  })
+                Promise.race([
+                  Promise.all([
+                    deleteDb('allinone_session_cache_v2'),
+                    deleteDb('allinone_media_cache_v1'),
+                  ]),
+                  new Promise((resolve) => setTimeout(resolve, 600)),
+                ]).finally(() => {
+                  window.location.reload()
+                })
               }}
               className="rounded-2xl border border-slate-200 px-3.5 py-2.5 text-xs font-medium text-slate-600 dark:border-slate-700 dark:text-slate-300"
             >

@@ -93,6 +93,7 @@ export const EVENTS = Object.freeze({
   DISPATCH_UPDATED: 'dispatch.updated',
   E2EE_GRANT_REQUEST: 'e2ee.grant.request',
   E2EE_GRANT_OFFER: 'e2ee.grant.offer',
+  E2EE_GRANT_REVEAL: 'e2ee.grant.reveal',
   E2EE_GRANT_DELIVER: 'e2ee.grant.deliver',
   E2EE_GRANT_REJECT: 'e2ee.grant.reject',
   E2EE_GRANT_CANCEL: 'e2ee.grant.cancel',

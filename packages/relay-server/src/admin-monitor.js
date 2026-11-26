@@ -1,20 +1,30 @@
 import os from 'node:os'
 import { APP_LIST } from '@allinone/shared'
 
+const ALLOWED_APPS = new Set(APP_LIST)
+
 function normalizeApps(rawApps) {
   if (!Array.isArray(rawApps)) return []
   const out = []
+  const seen = new Set()
   for (const item of rawApps) {
     if (!item) continue
     if (typeof item === 'string') {
-      out.push({ app: item, available: true, writable: true })
-    } else if (typeof item === 'object' && item.app) {
+      const app = item.trim()
+      if (!ALLOWED_APPS.has(app) || seen.has(app)) continue
+      seen.add(app)
+      out.push({ app, available: true, writable: true })
+    } else if (typeof item === 'object' && typeof item.app === 'string') {
+      const app = item.app.trim()
+      if (!ALLOWED_APPS.has(app) || seen.has(app)) continue
+      seen.add(app)
       out.push({
-        app: String(item.app),
+        app,
         available: Boolean(item.available),
         writable: Boolean(item.writable),
       })
     }
+    if (out.length >= APP_LIST.length) break
   }
   return out
 }
@@ -127,7 +137,7 @@ export function buildAdminOverview({
   }
 
   // Distributions across online connections
-  const appStats = {}
+  const appStats = Object.create(null)
   for (const appId of APP_LIST) {
     appStats[appId] = { available: 0, writable: 0 }
   }
@@ -138,6 +148,7 @@ export function buildAdminOverview({
     if (!b.online) continue
     bridgePlatforms[normalizePlatformBucket(b.platform)] += 1
     for (const a of normalizeApps(b.apps)) {
+      if (!ALLOWED_APPS.has(a.app)) continue
       if (!appStats[a.app]) appStats[a.app] = { available: 0, writable: 0 }
       if (a.available) appStats[a.app].available += 1
       if (a.writable) appStats[a.app].writable += 1

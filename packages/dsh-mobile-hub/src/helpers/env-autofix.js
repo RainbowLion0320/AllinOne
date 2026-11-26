@@ -25,6 +25,7 @@ import {
   getClaudeCandidates,
   getCodexCandidates,
   isExecutableFile,
+  sanitizeChildEnv,
   spawnCmdShim,
 } from './bin-finder.js'
 
@@ -67,6 +68,7 @@ export function detectSystemProxyEnv(baseEnv = process.env, platform = process.p
         timeout: 1500,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
+        env: sanitizeChildEnv(env),
       })
       const readField = (key) => {
         const m = out.match(new RegExp(`^\\s*${key}\\s*:\\s*(.+)$`, 'm'))
@@ -308,7 +310,11 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
     const timer = setTimeout(() => {
       if (process.platform === 'win32' && proc?.pid) {
         try {
-          const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+          const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true,
+            env: sanitizeChildEnv(env),
+          })
           tk.on('error', () => {})
         } catch {}
       }
@@ -326,7 +332,7 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
       const isWinCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(step.cmd)
       const spawnOpts = {
         cwd: os.homedir(),
-        env,
+        env: sanitizeChildEnv(env),
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       }
@@ -381,12 +387,14 @@ export async function autoCompleteHalfInstalledClis({
     const stateFile = stateDir ? join(stateDir, 'autofix-state.json') : ''
     const state = readAutofixState(stateFile)
     const now = Date.now()
-    const env = detectSystemProxyEnv({
-      ...process.env,
-      PATH: ensureRichPath(true),
-      CI: '1',
-      NONINTERACTIVE: '1',
-    })
+    const env = sanitizeChildEnv(
+      detectSystemProxyEnv({
+        ...process.env,
+        PATH: ensureRichPath(true),
+        CI: '1',
+        NONINTERACTIVE: '1',
+      }),
+    )
 
     const installed = []
     const failed = []

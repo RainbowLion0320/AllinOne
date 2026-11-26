@@ -1,5 +1,6 @@
-import { createHmac } from 'node:crypto'
+import { createHmac, randomInt } from 'node:crypto'
 import http from 'node:http'
+import net from 'node:net'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -106,7 +107,7 @@ export function buildTurnCredentials({ secret, userId = 'allinone', ttlSec = 86_
 const APP_HTML_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 const SANDBOX_PREVIEW_CSP =
-  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
+  "sandbox allow-scripts allow-forms; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
 
 function maskEmailAddress(email) {
   const clean = String(email || '').trim()
@@ -127,11 +128,27 @@ const CAPACITOR_ORIGINS = new Set([
   'app://allinone',
 ])
 
-function isTrustedProxyAddr(rawAddr) {
+function normalizeIpForMatch(rawAddr) {
   let addr = String(rawAddr || '').trim().toLowerCase()
-  if (!addr) return false
+  if (!addr) return ''
+  if (addr.startsWith('[') && addr.endsWith(']')) addr = addr.slice(1, -1)
   if (addr.startsWith('::ffff:')) addr = addr.slice(7)
-  if (addr === '127.0.0.1' || addr === '::1') return true
+  return addr
+}
+
+function extractValidIp(raw) {
+  let clean = String(raw || '').trim()
+  if (!clean) return ''
+  if (clean.startsWith('[') && clean.endsWith(']')) clean = clean.slice(1, -1)
+  return net.isIP(clean) !== 0 ? clean : ''
+}
+
+function isLoopbackAddr(addr) {
+  return addr === '127.0.0.1' || addr === '::1'
+}
+
+function isPrivateAddr(addr) {
+  if (isLoopbackAddr(addr)) return true
   if (addr.startsWith('10.') || addr.startsWith('192.168.') || addr.startsWith('fc') || addr.startsWith('fd')) {
     return true
   }
@@ -141,6 +158,42 @@ function isTrustedProxyAddr(rawAddr) {
     if (second >= 16 && second <= 31) return true
   }
   return false
+}
+
+/**
+ * Build a trusted reverse-proxy predicate from `TRUST_PROXY`:
+ * - `'loopback'` (default): trusts ONLY `127.0.0.1` / `::1` / `::ffff:127.0.0.1`
+ * - `'private'`: trusts loopback + RFC1918 / IPv6 ULA ranges (e.g. Docker bridge)
+ * - `'none'` / `'false'` / `'0'` / `'off'`: never trusts forwarded headers
+ * - comma-separated proxy IPs (optionally mixed with `'loopback'` / `'private'`)
+ */
+function createTrustedProxyChecker(rawSpec = 'loopback') {
+  const clean = String(rawSpec ?? '').trim().toLowerCase() || 'loopback'
+  if (clean === 'false' || clean === 'none' || clean === '0' || clean === 'off') {
+    return () => false
+  }
+  const tokens = clean.split(',').map((s) => s.trim()).filter(Boolean)
+  let allowLoopback = false
+  let allowPrivate = false
+  const exactIps = new Set()
+  for (const tok of tokens) {
+    if (tok === 'loopback') allowLoopback = true
+    else if (tok === 'private') allowPrivate = true
+    else {
+      const norm = normalizeIpForMatch(tok)
+      if (norm && net.isIP(norm) !== 0) exactIps.add(norm)
+    }
+  }
+  if (!allowLoopback && !allowPrivate && exactIps.size === 0) {
+    allowLoopback = true
+  }
+  return (rawAddr) => {
+    const addr = normalizeIpForMatch(rawAddr)
+    if (!addr) return false
+    if (allowPrivate && isPrivateAddr(addr)) return true
+    if (allowLoopback && isLoopbackAddr(addr)) return true
+    return exactIps.has(addr)
+  }
 }
 
 function buildAllowedOriginsSet(publicRelayUrl, rawAllowedOrigins) {
@@ -194,6 +247,7 @@ function sendJson(res, status, data) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
   })
   res.end(body)
 }
@@ -201,8 +255,8 @@ function sendJson(res, status, data) {
 const SAFE_SCRIPT_URL_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
 const SAFE_PREFIX_RE = /^\/[A-Za-z0-9._\-\/]*$/
 
-function getTrustedForwardedProto(req) {
-  if (!isTrustedProxyAddr(req.socket?.remoteAddress)) return ''
+function getTrustedForwardedProto(req, isTrustedProxy) {
+  if (!isTrustedProxy(req.socket?.remoteAddress)) return ''
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
   return proto === 'https' || proto === 'http' ? proto : ''
 }
@@ -223,12 +277,12 @@ function validateSafeScriptUrl(rawUrl) {
   }
 }
 
-function resolveSafePublicScriptUrl(req, publicRelayUrl) {
+function resolveSafePublicScriptUrl(req, publicRelayUrl, isTrustedProxy) {
   if (publicRelayUrl) {
     return validateSafeScriptUrl(publicRelayUrl)
   }
-  const trusted = isTrustedProxyAddr(req.socket?.remoteAddress)
-  const proto = (trusted && getTrustedForwardedProto(req)) || (req.socket?.encrypted ? 'https' : 'http')
+  const trusted = isTrustedProxy(req.socket?.remoteAddress)
+  const proto = (trusted && getTrustedForwardedProto(req, isTrustedProxy)) || (req.socket?.encrypted ? 'https' : 'http')
   const rawHost = String(req.headers.host || '').trim()
   if (!rawHost) return ''
   let prefix = ''
@@ -245,13 +299,13 @@ function resolveSafePublicScriptUrl(req, publicRelayUrl) {
   return validateSafeScriptUrl(`${proto}://${rawHost}${prefix}`)
 }
 
-function setSecurityHeaders(req, res) {
+function setSecurityHeaders(req, res, isTrustedProxy) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'no-referrer')
   // Allow self camera so built-in QR scanner continues to work cleanly in PWA/WebView
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()')
-  const forwardedProto = getTrustedForwardedProto(req)
+  const forwardedProto = getTrustedForwardedProto(req, isTrustedProxy)
   if (forwardedProto === 'https' || req.socket?.encrypted) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
   }
@@ -273,6 +327,7 @@ export function createRelayServer(options = {}) {
     publicRelayUrl,
     options.allowedOrigins ?? process.env.ALLOWED_ORIGINS ?? '',
   )
+  const isTrustedProxy = createTrustedProxyChecker(options.trustProxy ?? process.env.TRUST_PROXY ?? 'loopback')
   const isProd = (options.nodeEnv ?? process.env.NODE_ENV) === 'production'
   if (isProd && !options.allowDevSecrets && jwtSecret.length < 16) {
     throw new Error(
@@ -442,6 +497,7 @@ export function createRelayServer(options = {}) {
     adminBootstrapToken,
     getTokenVersion: (roomId) => accounts.getTokenVersion(roomId),
     isSessionRevoked: (roomId, sid) => accounts.isSessionRevoked(roomId, sid),
+    hasUserSession: (roomId, sid) => accounts.hasUserSession(roomId, sid),
   })
 
   function getMergedAccountDevices(roomId, liveBridges = null) {
@@ -601,7 +657,7 @@ export function createRelayServer(options = {}) {
     if (!origin) return true
     const lower = origin.replace(/\/+$/, '').toLowerCase()
     if (allowedOrigins.has(lower)) return true
-    if (LOCAL_DEV_ORIGIN_RE.test(lower)) return true
+    if (!isProd && LOCAL_DEV_ORIGIN_RE.test(lower)) return true
     const reqHost = String(req?.headers?.host || '').trim().toLowerCase()
     if (reqHost && (lower === `https://${reqHost}` || lower === `http://${reqHost}`)) {
       return true
@@ -630,17 +686,105 @@ export function createRelayServer(options = {}) {
 
   function getClientIp(req) {
     const remote = String(req.socket?.remoteAddress || 'unknown').trim()
-    if (isTrustedProxyAddr(remote)) {
+    if (isTrustedProxy(remote)) {
       const realIp = String(req.headers['x-real-ip'] || '').trim()
-      if (realIp && !realIp.includes(',')) return realIp
+      if (realIp && !realIp.includes(',')) {
+        const validReal = extractValidIp(realIp)
+        if (validReal) return validReal
+      }
       const xff = String(req.headers['x-forwarded-for'] || '').trim()
       if (xff) {
         const parts = xff.split(',').map((s) => s.trim()).filter(Boolean)
         // Rightmost X-Forwarded-For entry is appended by the trusted reverse proxy (cannot be spoofed by client)
-        if (parts.length > 0) return parts[parts.length - 1]
+        if (parts.length > 0) {
+          const validXff = extractValidIp(parts[parts.length - 1])
+          if (validXff) return validXff
+        }
       }
     }
     return remote
+  }
+
+  // Per-user mutation & API rate limiter (bounded map, 1-minute sliding window)
+  const userActionBuckets = new Map()
+  const MAX_USER_ACTION_BUCKETS = 5000
+  function checkUserActionRateLimit(bucketName, roomId, limitPerMin = 60) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return true
+    const key = `${bucketName}:${rid}`
+    const now = Date.now()
+    const windowMs = 60_000
+    if (userActionBuckets.size >= MAX_USER_ACTION_BUCKETS) {
+      for (const [k, v] of userActionBuckets.entries()) {
+        if (now - v.startAt >= windowMs) userActionBuckets.delete(k)
+      }
+      while (userActionBuckets.size >= MAX_USER_ACTION_BUCKETS) {
+        const oldest = userActionBuckets.keys().next().value
+        if (!oldest) break
+        userActionBuckets.delete(oldest)
+      }
+    }
+    const entry = userActionBuckets.get(key)
+    if (!entry || now - entry.startAt >= windowMs) {
+      userActionBuckets.set(key, { count: 1, startAt: now })
+      return true
+    }
+    if (entry.count >= limitPerMin) return false
+    entry.count += 1
+    return true
+  }
+
+  // Per-(account, ip) 10-minute cooldown on login alert emails to prevent alert spam
+  const LOGIN_ALERT_COOLDOWN_MS = 10 * 60 * 1000
+  const MAX_LOGIN_ALERT_ENTRIES = 5000
+  const loginAlertCooldowns = new Map()
+  function shouldSendLoginAlert(userId, ip) {
+    const cleanUser = String(userId || '').trim()
+    const cleanIp = String(ip || '').trim() || 'unknown'
+    if (!cleanUser) return false
+    const now = Date.now()
+    const key = `${cleanUser}::${cleanIp}`
+    const lastAt = loginAlertCooldowns.get(key)
+    if (lastAt && now - lastAt < LOGIN_ALERT_COOLDOWN_MS) return false
+    if (loginAlertCooldowns.size >= MAX_LOGIN_ALERT_ENTRIES) {
+      for (const [k, ts] of loginAlertCooldowns.entries()) {
+        if (now - ts >= LOGIN_ALERT_COOLDOWN_MS) loginAlertCooldowns.delete(k)
+      }
+      while (loginAlertCooldowns.size >= MAX_LOGIN_ALERT_ENTRIES) {
+        const oldest = loginAlertCooldowns.keys().next().value
+        if (!oldest) break
+        loginAlertCooldowns.delete(oldest)
+      }
+    }
+    loginAlertCooldowns.set(key, now)
+    return true
+  }
+
+  // Global & per-IP concurrent WebSocket connection caps
+  const maxWsPerIp = Math.max(10, Number(firstNonEmptyEnv(options.maxWsPerIp, process.env.MAX_WS_PER_IP, 120)) || 120)
+  const maxWsGlobal = Math.max(20, Number(firstNonEmptyEnv(options.maxWsGlobal, process.env.MAX_WS_GLOBAL, 10_000)) || 10_000)
+  let activeWsGlobal = 0
+  const activeWsByIp = new Map()
+  function tryAcquireWsSlot(ip) {
+    const cleanIp = String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+    if (activeWsGlobal >= maxWsGlobal) return { ok: false, statusLine: '503 Service Unavailable', release: null }
+    const curIp = activeWsByIp.get(cleanIp) || 0
+    if (curIp >= maxWsPerIp) return { ok: false, statusLine: '429 Too Many Requests', release: null }
+    activeWsGlobal += 1
+    activeWsByIp.set(cleanIp, curIp + 1)
+    let released = false
+    return {
+      ok: true,
+      statusLine: '',
+      release: () => {
+        if (released) return
+        released = true
+        activeWsGlobal = Math.max(0, activeWsGlobal - 1)
+        const next = (activeWsByIp.get(cleanIp) || 0) - 1
+        if (next <= 0) activeWsByIp.delete(cleanIp)
+        else activeWsByIp.set(cleanIp, next)
+      },
+    }
   }
 
   /**
@@ -673,8 +817,13 @@ export function createRelayServer(options = {}) {
    * Returns `true` if login may proceed; returns `false` if an HTTP response was already sent.
    */
   async function handleOptionalEmail2fa(res, { user, emailCode, ip, accountRateKey }) {
-    if (!user?.loginEmail2fa || !mailer.isConfigured() || !user.email || !user.emailVerified) {
+    if (!user?.loginEmail2fa) {
       return true
+    }
+    // Fail-closed: never silently bypass enabled 2FA if mailer is unavailable or misconfigured
+    if (!mailer.isConfigured() || !user.email || !user.emailVerified) {
+      sendJson(res, 503, { ok: false, error: '服务器邮件服务异常，暂无法完成邮箱二次验证' })
+      return false
     }
     const cleanCode = String(emailCode || '').trim()
     const maskedEmail = maskEmailAddress(user.email)
@@ -708,7 +857,8 @@ export function createRelayServer(options = {}) {
         })
       } catch (mailErr) {
         issued.rollback?.()
-        sendJson(res, 502, { ok: false, error: `发送登录验证码失败：${String(mailErr?.message || mailErr)}` })
+        console.error(`[relay] Failed to send login 2FA email for @${user.username}:`, mailErr?.message || mailErr)
+        sendJson(res, 502, { ok: false, error: '发送登录验证码失败，请稍后重试或联系管理员检查邮件服务配置' })
         return false
       }
       sendJson(res, 200, {
@@ -729,7 +879,7 @@ export function createRelayServer(options = {}) {
     })
     if (!check2fa.ok) {
       auth.recordFailure(ip)
-      auth.recordAccountFailure(accountRateKey)
+      auth.recordAccountFailure(accountRateKey, ip)
       sendJson(res, 401, {
         ok: false,
         requires2fa: true,
@@ -744,7 +894,7 @@ export function createRelayServer(options = {}) {
 
   const server = http.createServer(async (req, res) => {
     try {
-      setSecurityHeaders(req, res)
+      setSecurityHeaders(req, res, isTrustedProxy)
       setCors(req, res)
       if (req.method === 'OPTIONS') {
         if (req.headers.origin && !isAllowedOrigin(req.headers.origin, req)) {
@@ -841,6 +991,10 @@ export function createRelayServer(options = {}) {
             sendJson(res, 401, { ok: false, error: '请先登录账号后再绑定邮箱' })
             return
           }
+          if (!checkUserActionRateLimit('write', payload.room, 60)) {
+            sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+            return
+          }
           const curUser = accounts.getUserById(payload.room)
           if (!curUser) {
             sendJson(res, 401, { ok: false, error: '账号不存在' })
@@ -858,13 +1012,31 @@ export function createRelayServer(options = {}) {
           targetUsername = curUser.username
         } else if (purpose === 'reset') {
           const matchedUser = accounts.getUserByEmail(eCheck.email)
-          if (!matchedUser) {
-            // Do not reveal whether the email is registered and do not spend SMTP quota
+          if (!matchedUser || !matchedUser.emailVerified) {
+            // Do not reveal whether the email is registered, do not spend SMTP quota,
+            // and do not insert fake emails into emailCodes.codes or emailSendLog (prevents FIFO eviction).
             shouldDeliver = false
           } else {
             targetUserId = matchedUser.userId
             targetUsername = matchedUser.username
           }
+        }
+
+        if (!shouldDeliver) {
+          const ipCheck = emailCodes.checkIpSendLimit(ip)
+          if (!ipCheck.ok) {
+            sendJson(res, 429, { ok: false, error: ipCheck.error })
+            return
+          }
+          const cfg = emailCodes.getConfig()
+          await new Promise((r) => setTimeout(r, 40 + randomInt(0, 60)))
+          sendJson(res, 200, {
+            ok: true,
+            cooldownSec: cfg.cooldownSec,
+            expiresInSec: cfg.expiresInSec,
+            message: '如果该邮箱已绑定账号，验证码已发送（10 分钟内有效）',
+          })
+          return
         }
 
         const issued = emailCodes.issueCode({
@@ -882,20 +1054,18 @@ export function createRelayServer(options = {}) {
           return
         }
 
-        if (shouldDeliver) {
-          try {
-            await mailer.sendVerificationCode({
-              to: eCheck.email,
-              code: issued.code,
-              purpose,
-              username: targetUsername,
-            })
-          } catch (err) {
-            issued.rollback()
-            console.error(`[relay] Failed to send ${purpose} verification email:`, err?.message || err)
-            sendJson(res, 502, { ok: false, error: '验证码发送失败，请稍后重试或检查邮件服务配置' })
-            return
-          }
+        try {
+          await mailer.sendVerificationCode({
+            to: eCheck.email,
+            code: issued.code,
+            purpose,
+            username: targetUsername,
+          })
+        } catch (err) {
+          issued.rollback()
+          console.error(`[relay] Failed to send ${purpose} verification email:`, err?.message || err)
+          sendJson(res, 502, { ok: false, error: '验证码发送失败，请稍后重试或检查邮件服务配置' })
+          return
         }
 
         sendJson(res, 200, {
@@ -927,6 +1097,12 @@ export function createRelayServer(options = {}) {
         const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
         const isBootstrapAdmin =
           accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAdminBootstrapToken(inviteCode)
+        // Strictly validate invite / bootstrap token BEFORE email or username checks to prevent enumeration
+        if (!isBootstrapAdmin && !accounts.hasActiveInviteCode(inviteCode)) {
+          auth.recordFailure(ip)
+          sendJson(res, 400, { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' })
+          return
+        }
 
         const rawEmail = String(body.email || '').trim()
         let verifiedEmail = ''
@@ -1009,25 +1185,51 @@ export function createRelayServer(options = {}) {
           devices: [],
           bridges: [],
         })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
     }
 
-    // Bind or replace verified email for an authenticated account
+    // Bind or replace verified email for an authenticated account (requires currentPassword re-authentication)
     if (pathname === '/api/account/email/bind' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
       if (!mailer.isConfigured()) {
         sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP）' })
         return
       }
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip) || !auth.checkAccountRateLimit(payload.room, ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请稍后再试' })
+        return
+      }
       try {
         const body = await readJsonBody(req)
+        const currentPassword = String(body.currentPassword ?? '')
+        if (!currentPassword) {
+          sendJson(res, 403, { ok: false, error: '绑定或更换邮箱需要验证当前密码' })
+          return
+        }
+        const pwValid = await accounts.verifyUserPasswordAsync(payload.room, currentPassword)
+        if (!pwValid) {
+          auth.recordFailure(ip)
+          auth.recordAccountFailure(payload.room, ip)
+          sendJson(res, 403, { ok: false, error: '绑定或更换邮箱需要验证当前密码' })
+          return
+        }
+        auth.clearAccountFailure(payload.room, ip)
         const eCheck = validateEmail(body.email)
         if (!eCheck.ok) {
           sendJson(res, 400, { ok: false, error: eCheck.error })
@@ -1044,14 +1246,34 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: codeCheck.error })
           return
         }
+        const prevUser = accounts.getUserById(payload.room)
+        const prevEmail = prevUser?.email && prevUser.emailVerified ? prevUser.email : ''
         const updated = accounts.setUserEmail(payload.room, eCheck.email, { verified: true })
         if (!updated.ok) {
           sendJson(res, 400, { ok: false, error: updated.error })
           return
         }
         emailCodes.consumeCode({ purpose: 'bind', email: eCheck.email })
+        if (prevEmail && prevEmail.toLowerCase() !== eCheck.emailLower) {
+          mailer
+            .sendSecurityNotice({
+              to: prevEmail,
+              username: updated.user.username,
+              title: '账号绑定邮箱已变更',
+              summary: `你的 All in One 账号绑定邮箱已更换为 ${maskEmailAddress(eCheck.email)}。如非本人操作，请立即修改密码并强制下线所有设备。`,
+              ip,
+              at: Date.now(),
+            })
+            .catch((err) => {
+              console.warn(`[relay] Failed to send email-change security notice for @${updated.user.username}: ${String(err?.message || err)}`)
+            })
+        }
         sendJson(res, 200, { ok: true, user: updated.user })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
@@ -1082,7 +1304,7 @@ export function createRelayServer(options = {}) {
         }
         const matchedUser = accounts.getUserByEmail(eCheck.email)
         const accountRateKey = accounts.resolveAccountKey(eCheck.email)
-        if (!auth.checkAccountRateLimit(accountRateKey)) {
+        if (accountRateKey && !auth.checkResetRateLimit(accountRateKey)) {
           sendJson(res, 429, { ok: false, error: '该账号验证尝试过于频繁，请 15 分钟后再试' })
           return
         }
@@ -1093,40 +1315,49 @@ export function createRelayServer(options = {}) {
           userId: matchedUser?.userId || '',
           consume: false,
         })
-        if (!codeCheck.ok || !matchedUser) {
+        if (!codeCheck.ok || !matchedUser || !matchedUser.emailVerified) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(accountRateKey)
+          if (accountRateKey) auth.recordResetFailure(accountRateKey)
           sendJson(res, 400, { ok: false, error: codeCheck.ok ? '邮箱验证码无效或已过期' : codeCheck.error })
           return
         }
         const reset = await accounts.resetPasswordByEmailAsync(eCheck.email, pCheck.password)
         if (!reset.ok) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(accountRateKey)
+          if (accountRateKey) auth.recordResetFailure(accountRateKey)
           sendJson(res, 400, { ok: false, error: reset.error })
           return
         }
         emailCodes.consumeCode({ purpose: 'reset', email: eCheck.email })
         auth.clearFailure(ip)
-        auth.clearAccountFailure(accountRateKey)
+        if (accountRateKey) auth.clearResetFailure(accountRateKey)
         hub.disconnectRoomClients(reset.user.userId, 4401, 'Password reset')
         sendJson(res, 200, {
           ok: true,
           username: reset.user.username,
         })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
     }
 
-    // Toggle optional email login 2FA for authenticated account
+    // Toggle optional email login 2FA for authenticated account (disabling requires currentPassword re-authentication)
     if (pathname === '/api/account/security/2fa' && req.method === 'POST') {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
+      const ip = getClientIp(req)
       try {
         const body = await readJsonBody(req)
         const nextEnabled = Boolean(body.enabled)
@@ -1134,13 +1365,51 @@ export function createRelayServer(options = {}) {
           sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP），无法开启邮箱二次验证' })
           return
         }
+        const prevUser = accounts.getUserById(payload.room)
+        if (nextEnabled === false) {
+          if (!auth.checkRateLimit(ip) || !auth.checkAccountRateLimit(payload.room, ip)) {
+            sendJson(res, 429, { ok: false, error: '尝试次数过多，请稍后再试' })
+            return
+          }
+          const currentPassword = String(body.currentPassword ?? '')
+          if (!currentPassword) {
+            sendJson(res, 403, { ok: false, error: '关闭邮箱二次验证需要验证当前密码' })
+            return
+          }
+          const pwValid = await accounts.verifyUserPasswordAsync(payload.room, currentPassword)
+          if (!pwValid) {
+            auth.recordFailure(ip)
+            auth.recordAccountFailure(payload.room, ip)
+            sendJson(res, 403, { ok: false, error: '关闭邮箱二次验证需要验证当前密码' })
+            return
+          }
+          auth.clearAccountFailure(payload.room, ip)
+        }
         const updated = accounts.setLoginEmail2fa(payload.room, nextEnabled)
         if (!updated.ok) {
           sendJson(res, 400, { ok: false, error: updated.error })
           return
         }
+        if (nextEnabled === false && prevUser?.loginEmail2fa && mailer.isConfigured() && updated.user?.email && updated.user?.emailVerified) {
+          mailer
+            .sendSecurityNotice({
+              to: updated.user.email,
+              username: updated.user.username,
+              title: '邮箱登录二次验证已关闭',
+              summary: '你的 All in One 账号刚刚关闭了邮箱登录二次验证（2FA）。如非本人操作，请立即修改密码、重新开启二次验证并下线所有其他设备。',
+              ip,
+              at: Date.now(),
+            })
+            .catch((err) => {
+              console.warn(`[relay] Failed to send 2FA-disabled security notice for @${updated.user.username}: ${String(err?.message || err)}`)
+            })
+        }
         sendJson(res, 200, { ok: true, user: updated.user })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
@@ -1157,32 +1426,34 @@ export function createRelayServer(options = {}) {
         const body = await readJsonBody(req)
         const identifier = String(body.username || '').trim()
         const accountRateKey = accounts.resolveAccountKey(identifier)
-        if (!auth.checkAccountRateLimit(accountRateKey)) {
+        if (accountRateKey && !auth.checkAccountRateLimit(accountRateKey, ip)) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
         const verified = await accounts.authenticateUserAsync(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(accountRateKey)
+          if (accountRateKey) auth.recordAccountFailure(accountRateKey, ip)
           sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
         let { user } = verified
 
-        // Optional Email 2FA: require verified 6-digit OTP when enabled on account & SMTP is active
+        // Optional Email 2FA: require verified 6-digit OTP when enabled on account (fail-closed if SMTP unavailable)
         if (!(await handleOptionalEmail2fa(res, { user, emailCode: body.emailCode, ip, accountRateKey }))) {
           return
         }
 
         auth.clearFailure(ip)
-        auth.clearAccountFailure(accountRateKey)
+        if (accountRateKey) auth.clearAccountFailure(accountRateKey, ip)
         user = accounts.markUserLogin(user.userId) || user
         const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
+        // Coalesce login context update + recordUserSession into a single atomic save()
         const { isNewContext } = accounts.checkAndRememberLoginContext(user.userId, {
           deviceName: devInfo.deviceName,
           ip,
           clientUid: body.clientUid || '',
+          skipSave: true,
         })
         const sid = auth.generateSessionId()
         const onlineSids = new Set(hub.getClientList(user.userId).map((c) => c.sid).filter(Boolean))
@@ -1197,7 +1468,7 @@ export function createRelayServer(options = {}) {
         for (const oldSid of recorded?.replacedSids || []) {
           hub.disconnectClient(user.userId, { sid: oldSid }, 4401, 'Replaced by new sign-in on same device')
         }
-        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified) {
+        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendLoginAlert(user.userId, ip)) {
           mailer
             .sendLoginAlert({
               to: user.email,
@@ -1233,7 +1504,11 @@ export function createRelayServer(options = {}) {
           devices: getMergedAccountDevices(user.userId, bridges),
           bridges,
         })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
@@ -1250,26 +1525,26 @@ export function createRelayServer(options = {}) {
         const body = await readJsonBody(req)
         const identifier = String(body.username || '').trim()
         const accountRateKey = accounts.resolveAccountKey(identifier)
-        if (!auth.checkAccountRateLimit(accountRateKey)) {
+        if (accountRateKey && !auth.checkAccountRateLimit(accountRateKey, ip)) {
           sendJson(res, 429, { ok: false, error: '该账号尝试登录失败过多，请 15 分钟后再试' })
           return
         }
         const verified = await accounts.authenticateUserAsync(identifier, body.password, { recordLogin: false })
         if (!verified) {
           auth.recordFailure(ip)
-          auth.recordAccountFailure(accountRateKey)
+          if (accountRateKey) auth.recordAccountFailure(accountRateKey, ip)
           sendJson(res, 401, { ok: false, error: '账号或密码不正确' })
           return
         }
         const { user } = verified
 
-        // Enforce the same Email 2FA verification when enabled on account & SMTP is configured
+        // Enforce the same Email 2FA verification when enabled on account (fail-closed if SMTP unavailable)
         if (!(await handleOptionalEmail2fa(res, { user, emailCode: body.emailCode, ip, accountRateKey }))) {
           return
         }
 
         auth.clearFailure(ip)
-        auth.clearAccountFailure(accountRateKey)
+        if (accountRateKey) auth.clearAccountFailure(accountRateKey, ip)
         let bound
         try {
           bound = accounts.bindDevice({
@@ -1293,7 +1568,7 @@ export function createRelayServer(options = {}) {
           deviceName: deviceLabel,
           ip,
         })
-        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified) {
+        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendLoginAlert(user.userId, ip)) {
           mailer
             .sendLoginAlert({
               to: user.email,
@@ -1315,7 +1590,11 @@ export function createRelayServer(options = {}) {
         })
         hub.broadcastRoomDevices(user.userId)
         sendJson(res, 200, { ok: true, ...bound })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
@@ -1323,11 +1602,21 @@ export function createRelayServer(options = {}) {
 
     // Bridge-authenticated device status check (lets PC CLI verify binding & list sibling PCs in the same account)
     if (pathname === '/api/account/device-status' && req.method === 'GET') {
+      const ip = getClientIp(req)
+      const requestedRoom = String(req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '').trim()
+      if (!auth.checkBridgeRateLimit(ip) || (requestedRoom && !auth.checkBridgeRateLimit(ip, requestedRoom))) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return
+      }
       const info = authenticateBridgeInfo(req, urlObj)
       if (!info || !info.roomId.startsWith('usr_')) {
+        auth.recordBridgeFailure(ip)
+        if (requestedRoom) auth.recordBridgeFailure(ip, requestedRoom)
         sendJson(res, 401, { ok: false, error: '电脑绑定凭证无效或已被解绑' })
         return
       }
+      auth.clearBridgeFailure(ip)
+      if (requestedRoom) auth.clearBridgeFailure(ip, requestedRoom)
       sendJson(res, 200, {
         ok: true,
         userId: info.userId,
@@ -1362,6 +1651,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
       try {
         const body = await readJsonBody(req)
         const bound = accounts.bindDevice({
@@ -1394,6 +1687,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
       try {
         const body = await readJsonBody(req)
         const updated = accounts.renameUserDevice(payload.room, body.deviceId, body.label)
@@ -1419,6 +1716,10 @@ export function createRelayServer(options = {}) {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权' })
+        return
+      }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
         return
       }
       try {
@@ -1454,7 +1755,7 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
-      if (!auth.checkAccountRateLimit(payload.room)) {
+      if (!auth.checkAccountRateLimit(payload.room, ip)) {
         sendJson(res, 429, { ok: false, error: '该账号尝试次数过多，请 15 分钟后再试' })
         return
       }
@@ -1464,7 +1765,7 @@ export function createRelayServer(options = {}) {
           sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
           return
         }
-        if (!auth.checkAccountRateLimit(payload.room)) {
+        if (!auth.checkAccountRateLimit(payload.room, ip)) {
           sendJson(res, 429, { ok: false, error: '该账号尝试次数过多，请 15 分钟后再试' })
           return
         }
@@ -1485,13 +1786,13 @@ export function createRelayServer(options = {}) {
           }
           if (changed.error === '当前密码不正确') {
             auth.recordFailure(ip)
-            auth.recordAccountFailure(payload.room)
+            auth.recordAccountFailure(payload.room, ip)
           }
           sendJson(res, 400, { ok: false, error: changed.error })
           return
         }
         auth.clearFailure(ip)
-        auth.clearAccountFailure(payload.room)
+        auth.clearAccountFailure(payload.room, ip)
         const currentClientId = String(body.currentClientId || '').trim()
         const devInfo = parseClientDeviceInfo(
           body.deviceName || payload.dev || '',
@@ -1520,7 +1821,11 @@ export function createRelayServer(options = {}) {
           { role: changed.user.role, username: changed.user.username, sid: newSid },
         )
         sendJson(res, 200, { ok: true, token: freshToken, user: changed.user })
-      } catch {
+      } catch (err) {
+        if (err?.statusCode === 503) {
+          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
+          return
+        }
         sendJson(res, 400, { ok: false, error: '请求格式错误' })
       }
       return
@@ -1828,6 +2133,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
+      if (!checkUserActionRateLimit('ws-ticket', payload.room, 120)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return
+      }
       let body = {}
       try {
         body = await readJsonBody(req, 16 * 1024)
@@ -1898,6 +2207,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
       try {
         const body = await readJsonBody(req)
         const targetSid = String(body.sid || '').trim()
@@ -1908,11 +2221,11 @@ export function createRelayServer(options = {}) {
           return
         }
         if (targetSid) {
-          const validFormat = /^s_[0-9a-f]{16}$/.test(targetSid)
           const liveMatch = hub.getClientList(payload.room).some((c) => c.sid === targetSid)
           const knownSid = accounts.hasUserSession(payload.room, targetSid) || liveMatch
-          if (targetSid.length > 64 || (!validFormat && !knownSid)) {
-            sendJson(res, 400, { ok: false, error: '无效的会话标识' })
+          // Reject unknown/synthetic sids so attackers cannot bloat accounts.json
+          if (targetSid.length > 64 || !knownSid) {
+            sendJson(res, 404, { ok: false, error: '目标会话不存在或已失效' })
             return
           }
         }
@@ -1948,6 +2261,10 @@ export function createRelayServer(options = {}) {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
         return
       }
       try {
@@ -2012,6 +2329,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权' })
         return
       }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return
+      }
       const revoked = accounts.revokeUserTokens(payload.room)
       if (!revoked) {
         sendJson(res, 404, { ok: false, error: '账号不存在' })
@@ -2032,6 +2353,10 @@ export function createRelayServer(options = {}) {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      if (!checkUserActionRateLimit('me', payload.room, 120)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
         return
       }
       const acctUser = accounts.getUserById(payload.room)
@@ -2150,7 +2475,7 @@ export function createRelayServer(options = {}) {
 
           // Dynamically inject this server's strictly validated public URL into setup.ps1 / setup.sh
           if (ext === '.ps1' || ext === '.sh') {
-            const effectiveUrl = resolveSafePublicScriptUrl(req, publicRelayUrl)
+            const effectiveUrl = resolveSafePublicScriptUrl(req, publicRelayUrl, isTrustedProxy)
             let scriptBody = readFileSync(target, 'utf8')
             if (effectiveUrl) {
               scriptBody = scriptBody.replaceAll('https://your-relay.example.com', effectiveUrl)
@@ -2173,7 +2498,7 @@ export function createRelayServer(options = {}) {
             'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
           }
           if (ext === '.html') {
-            const isSandboxPreview = basename(target) === 'sandbox-preview.html'
+            const isSandboxPreview = basename(target).toLowerCase() === 'sandbox-preview.html'
             staticHeaders['Content-Security-Policy'] = isSandboxPreview ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
             if (isSandboxPreview) {
               staticHeaders['X-Frame-Options'] = 'SAMEORIGIN'
@@ -2222,6 +2547,11 @@ export function createRelayServer(options = {}) {
       }
     }
   })
+
+  // Tight HTTP timeouts to mitigate Slowloris & stalled-request resource exhaustion
+  server.requestTimeout = 30_000
+  server.headersTimeout = 15_000
+  server.keepAliveTimeout = 60_000
 
   // Pure Control-Plane WebSocket server (strictly capped at 256 KB — zero data-plane relay)
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 })
@@ -2273,22 +2603,30 @@ export function createRelayServer(options = {}) {
         return
       }
       auth.clearBridgeFailure(bridgeIp, requestedRoom)
-      const initialKeyId = String(
+      const slot = tryAcquireWsSlot(bridgeIp)
+      if (!slot.ok) {
+        rejectUpgrade(slot.statusLine)
+        return
+      }
+      socket.once('close', slot.release)
+      const rawInitialKeyId = String(
         req.headers['x-e2ee-key-id'] || urlObj.searchParams.get('e2eeKeyId') || '',
       ).trim()
+      const initialKeyId = /^[0-9a-f]{16}$/i.test(rawInitialKeyId) ? rawInitialKeyId.toLowerCase() : ''
       const meta = {
         roomId: bridgeAuth.roomId,
-        bridgeId: bridgeAuth.bridgeId || urlObj.searchParams.get('bridgeId') || 'home-pc',
-        deviceId: bridgeAuth.deviceId || '',
-        label: bridgeAuth.label || '',
-        hostname: urlObj.searchParams.get('hostname') || bridgeAuth.hostname || 'PC',
-        platform: urlObj.searchParams.get('platform') || bridgeAuth.platform || 'win32',
-        mode: urlObj.searchParams.get('mode') || 'desktop',
+        bridgeId: String(bridgeAuth.bridgeId || urlObj.searchParams.get('bridgeId') || 'home-pc').trim().slice(0, 64) || 'home-pc',
+        deviceId: String(bridgeAuth.deviceId || '').trim().slice(0, 64),
+        label: String(bridgeAuth.label || '').trim().slice(0, 64),
+        hostname: String(urlObj.searchParams.get('hostname') || bridgeAuth.hostname || 'PC').trim().slice(0, 64) || 'PC',
+        platform: String(urlObj.searchParams.get('platform') || bridgeAuth.platform || 'win32').trim().slice(0, 32) || 'win32',
+        mode: String(urlObj.searchParams.get('mode') || 'desktop').trim().slice(0, 32) || 'desktop',
         ...(initialKeyId ? { e2ee: { enabled: true, v: 1, keyId: initialKeyId } } : {}),
-        ip: getClientIp(req),
+        ip: bridgeIp,
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
         socket.removeListener('error', onUpgradeSocketError)
+        ws.once('close', slot.release)
         hub.registerBridge(ws, meta, { req })
       })
       return
@@ -2300,14 +2638,21 @@ export function createRelayServer(options = {}) {
         rejectUpgrade('403 Forbidden')
         return
       }
+      const clientIp = getClientIp(req)
+      const slot = tryAcquireWsSlot(clientIp)
+      if (!slot.ok) {
+        rejectUpgrade(slot.statusLine)
+        return
+      }
       // Strictly require a single-use 30s ws-ticket (never accept master JWTs in URLs)
       const ticket = String(urlObj.searchParams.get('ticket') || '').trim()
       const user = ticket ? auth.consumeWsTicket(ticket) : null
       if (!user) {
+        slot.release()
         rejectUpgrade('401 Unauthorized')
         return
       }
-      const clientIp = getClientIp(req)
+      socket.once('close', slot.release)
       const clientUa = String(req.headers['user-agent'] || '')
       const devInfo = parseClientDeviceInfo(user.dev || '', clientUa, user.kind || '')
       try {
@@ -2321,6 +2666,7 @@ export function createRelayServer(options = {}) {
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
         socket.removeListener('error', onUpgradeSocketError)
+        ws.once('close', slot.release)
         hub.registerClient(ws, user, { ip: clientIp, userAgent: clientUa, req })
       })
       return

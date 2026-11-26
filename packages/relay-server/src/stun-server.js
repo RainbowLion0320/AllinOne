@@ -13,6 +13,10 @@ const STUN_BINDING_RESPONSE = 0x0101
 const STUN_MAGIC_COOKIE = 0x2112a442
 const STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020
 const STUN_HEADER_BYTES = 20
+const STUN_MAX_PACKET_BYTES = 1024
+const DEFAULT_MAX_PPS_PER_IP = 60
+const DEFAULT_MAX_PPS_GLOBAL = 2000
+const MAX_TRACKED_STUN_IPS = 4096
 
 function parseIpv4Bytes(ip) {
   const clean = ip.startsWith('::ffff:') ? ip.slice(7) : ip
@@ -114,12 +118,46 @@ export function buildStunBindingResponse(msg, remoteAddress, remotePort) {
 export function createStunServer({
   port = 3478,
   host = '0.0.0.0',
+  maxPpsPerIp = DEFAULT_MAX_PPS_PER_IP,
+  maxPpsGlobal = DEFAULT_MAX_PPS_GLOBAL,
   log = console,
 } = {}) {
   let socket = null
   let boundPort = 0
   let requests = 0
+  let dropped = 0
   let started = false
+  const ipCap = Math.max(1, Number(maxPpsPerIp) || DEFAULT_MAX_PPS_PER_IP)
+  const globalCap = Math.max(ipCap, Number(maxPpsGlobal) || DEFAULT_MAX_PPS_GLOBAL)
+  let windowSec = Math.floor(Date.now() / 1000)
+  let globalCount = 0
+  const ipCounts = new Map()
+
+  function allowPacket(ip) {
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (nowSec !== windowSec) {
+      windowSec = nowSec
+      globalCount = 0
+      ipCounts.clear()
+    }
+    if (globalCount >= globalCap) {
+      dropped += 1
+      return false
+    }
+    const cleanIp = String(ip || '')
+    const cur = ipCounts.get(cleanIp) || 0
+    if (cur >= ipCap) {
+      dropped += 1
+      return false
+    }
+    if (!ipCounts.has(cleanIp) && ipCounts.size >= MAX_TRACKED_STUN_IPS) {
+      dropped += 1
+      return false
+    }
+    globalCount += 1
+    ipCounts.set(cleanIp, cur + 1)
+    return true
+  }
 
   const start = () =>
     new Promise((resolveStart, rejectStart) => {
@@ -139,6 +177,8 @@ export function createStunServer({
       sock.once('error', onStartupError)
 
       sock.on('message', (msg, rinfo) => {
+        if (!Buffer.isBuffer(msg) || msg.length < STUN_HEADER_BYTES || msg.length > STUN_MAX_PACKET_BYTES) return
+        if (!allowPacket(rinfo.address)) return
         const reply = buildStunBindingResponse(msg, rinfo.address, rinfo.port)
         if (!reply) return
         requests += 1
@@ -180,6 +220,7 @@ export function createStunServer({
     enabled: started,
     port: boundPort,
     requests,
+    dropped,
   })
 
   return { start, close, getStats }

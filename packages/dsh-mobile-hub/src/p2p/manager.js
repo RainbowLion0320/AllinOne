@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto'
-import { chmodSync, createWriteStream, mkdirSync, realpathSync } from 'node:fs'
+import {
+  chmodSync,
+  constants as fsConstants,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs'
 import { open as openAsync, unlink as unlinkAsync } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
@@ -25,10 +35,18 @@ import { ElectronWebRtcClient } from './peer-electron.js'
 import { createWeriftPeer } from './peer-werift.js'
 
 const REPLAY_WINDOW_MS = 10 * 60 * 1000
+const SIGNAL_FRESHNESS_WINDOW_MS = 90_000
 const MAX_SEEN_IVS = 4000
+const MAX_SEEN_SIGNAL_IVS = 4000
 const MAX_ACTIVE_PEERS = 24
 const REVOKED_TTL_MS = 24 * 60 * 60 * 1000
 const DOWNLOAD_TICKET_TTL_MS = 120_000
+const MAX_UPLOADS_PER_PEER = 2
+const MAX_GLOBAL_UPLOADS = 4
+const MAX_DOWNLOADS_PER_PEER = 4
+const MAX_PENDING_DOWNLOADS = 32
+const DEFAULT_INBOUND_DISK_QUOTA_BYTES = 4 * 1024 * 1024 * 1024 // 4 GB total inboundDir quota
+const INBOUND_FILE_EXPIRE_MS = 24 * 60 * 60 * 1000 // 24h expiry for oldest-first quota pruning
 const MAX_INBOUND_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB plaintext safety cap
 const MAX_INBOUND_CIPHER_OVERHEAD_BYTES = 4 * 1024 * 1024 // headroom for AIO2 framing & GCM tags
 const MAX_NON_CHUNKED_UPLOAD_BYTES = E2EE_CHUNKED_THRESHOLD + 64 * 1024 // prevent non-chunked in-memory OOM
@@ -128,6 +146,7 @@ export class P2PBridgeManager {
     onRpc,
     onRegisterP2pUpload,
     inboundDir,
+    maxInboundDiskBytes = DEFAULT_INBOUND_DISK_QUOTA_BYTES,
     webrtcProxy = null,
     log = console,
   }) {
@@ -139,6 +158,10 @@ export class P2PBridgeManager {
     this.onRpc = onRpc
     this.onRegisterP2pUpload = onRegisterP2pUpload
     this.inboundDir = inboundDir
+    this.maxInboundDiskBytes =
+      Number.isFinite(Number(maxInboundDiskBytes)) && Number(maxInboundDiskBytes) > 0
+        ? Math.floor(Number(maxInboundDiskBytes))
+        : DEFAULT_INBOUND_DISK_QUOTA_BYTES
     this.log = log
 
     const proxyPort = Number(webrtcProxy?.port || process.env.ALLINONE_WEBRTC_PROXY_PORT || 0)
@@ -154,8 +177,11 @@ export class P2PBridgeManager {
     this.revokedClients = new Map()
     /** @type {Map<string, number>} revokedSid -> revokedAt */
     this.revokedSids = new Map()
-    /** @type {Map<string, number>} iv -> seenAt */
+    /** @type {Map<string, { seenAt: number, reqTs: number } | number>} iv -> record */
     this.seenReqIvs = new Map()
+    this.minAcceptedTs = 0
+    /** @type {Map<string, number>} signal iv -> seenAt */
+    this.seenSignalIvs = new Map()
     /** @type {Map<string, Promise<void>>} clientId -> serialized signal chain */
     this._signalChains = new Map()
     this._eventSeq = 0
@@ -181,14 +207,91 @@ export class P2PBridgeManager {
 
   pruneSeenIvs(now = Date.now()) {
     if (this.seenReqIvs.size < MAX_SEEN_IVS) return
-    for (const [iv, ts] of this.seenReqIvs.entries()) {
-      if (now - ts > REPLAY_WINDOW_MS) this.seenReqIvs.delete(iv)
+    for (const [iv, rec] of this.seenReqIvs.entries()) {
+      const seenAt = typeof rec === 'number' ? rec : rec.seenAt
+      if (now - seenAt > REPLAY_WINDOW_MS) this.seenReqIvs.delete(iv)
     }
     while (this.seenReqIvs.size >= MAX_SEEN_IVS) {
       const oldest = this.seenReqIvs.keys().next().value
       if (!oldest) break
+      const rec = this.seenReqIvs.get(oldest)
       this.seenReqIvs.delete(oldest)
+      if (rec !== undefined) {
+        const seenAt = typeof rec === 'number' ? rec : rec.seenAt
+        const reqTs = typeof rec === 'number' ? rec : rec.reqTs
+        if (now - seenAt <= REPLAY_WINDOW_MS && Number.isFinite(reqTs)) {
+          this.minAcceptedTs = Math.max(this.minAcceptedTs, reqTs)
+        }
+      }
     }
+  }
+
+  pruneSeenSignalIvs(now = Date.now()) {
+    if (this.seenSignalIvs.size < MAX_SEEN_SIGNAL_IVS) return
+    for (const [iv, ts] of this.seenSignalIvs.entries()) {
+      if (now - ts > REPLAY_WINDOW_MS) this.seenSignalIvs.delete(iv)
+    }
+    while (this.seenSignalIvs.size >= MAX_SEEN_SIGNAL_IVS) {
+      const oldest = this.seenSignalIvs.keys().next().value
+      if (!oldest) break
+      this.seenSignalIvs.delete(oldest)
+    }
+  }
+
+  _countGlobalActiveUploads() {
+    let count = 0
+    for (const s of this.sessions.values()) {
+      count += s.activeUploads.size
+    }
+    return count
+  }
+
+  _sumGlobalInFlightUploadBytes() {
+    let total = 0
+    for (const s of this.sessions.values()) {
+      for (const up of s.activeUploads.values()) {
+        total += Number(up.writtenPlainBytes || 0)
+      }
+    }
+    return total
+  }
+
+  _checkAndPruneInboundDiskQuota(incomingBytes = 0, now = Date.now()) {
+    let totalBytes = 0
+    const files = []
+    try {
+      if (this.inboundDir && existsSync(this.inboundDir)) {
+        for (const name of readdirSync(this.inboundDir)) {
+          const fp = join(this.inboundDir, name)
+          try {
+            const st = statSync(fp)
+            if (st.isFile()) {
+              totalBytes += st.size
+              files.push({ fp, size: st.size, mtimeMs: st.mtimeMs })
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+
+    const incoming = Math.max(0, Number.isFinite(Number(incomingBytes)) ? Number(incomingBytes) : 0)
+    const inFlightBytes = this._sumGlobalInFlightUploadBytes()
+    if (totalBytes + inFlightBytes + incoming > this.maxInboundDiskBytes && files.length > 0) {
+      // Oldest-first pruning of expired files
+      const expired = files
+        .filter((f) => now - f.mtimeMs > INBOUND_FILE_EXPIRE_MS)
+        .sort((a, b) => a.mtimeMs - b.mtimeMs)
+      for (const f of expired) {
+        if (totalBytes + inFlightBytes + incoming <= this.maxInboundDiskBytes) break
+        try {
+          unlinkSync(f.fp)
+          totalBytes = Math.max(0, totalBytes - f.size)
+        } catch {}
+      }
+    }
+
+    const ok = totalBytes + inFlightBytes + incoming <= this.maxInboundDiskBytes
+    return { ok, usedBytes: totalBytes, inFlightBytes, quotaBytes: this.maxInboundDiskBytes }
   }
 
   /**
@@ -268,7 +371,13 @@ export class P2PBridgeManager {
 
   async sendEncryptedSignal(clientId, sessionId, payload) {
     if (this.disposed) return
-    const enc = await encryptJson(this.e2eeKey, payload, { kind: 'p2p.signal', roomId: this.roomId })
+    const innerPayload = {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      clientId: String(clientId || '').trim(),
+      sessionId: String(sessionId || '').trim(),
+      ts: Date.now(),
+    }
+    const enc = await encryptJson(this.e2eeKey, innerPayload, { kind: 'p2p.signal', roomId: this.roomId })
     this.sendSignal({ clientId, sessionId, e2ee: enc })
   }
 
@@ -310,6 +419,15 @@ export class P2PBridgeManager {
       return
     }
 
+    const sigIv = typeof e2ee.iv === 'string' ? e2ee.iv.trim() : ''
+    const nowBeforeDecrypt = Date.now()
+    if (sigIv) {
+      const prevSigSeen = this.seenSignalIvs.get(sigIv)
+      if (prevSigSeen && nowBeforeDecrypt - prevSigSeen <= REPLAY_WINDOW_MS) {
+        return
+      }
+    }
+
     let inner
     try {
       inner = await decryptJson(this.e2eeKey, e2ee, { kind: 'p2p.signal', roomId: this.roomId })
@@ -319,6 +437,31 @@ export class P2PBridgeManager {
     if (isRevokedOrDisposed()) return
 
     if (!inner || typeof inner !== 'object') return
+
+    const now = Date.now()
+    if (inner.ts !== undefined) {
+      if (
+        typeof inner.ts !== 'number' ||
+        !Number.isFinite(inner.ts) ||
+        Math.abs(now - inner.ts) > SIGNAL_FRESHNESS_WINDOW_MS
+      ) {
+        return
+      }
+    }
+    if (inner.clientId !== undefined && String(inner.clientId).trim() !== cid) {
+      return
+    }
+    if (inner.sessionId !== undefined && String(inner.sessionId).trim() !== sid) {
+      return
+    }
+    if (sigIv) {
+      this.pruneSeenSignalIvs(now)
+      const prevSigSeen = this.seenSignalIvs.get(sigIv)
+      if (prevSigSeen && now - prevSigSeen <= REPLAY_WINDOW_MS) {
+        return
+      }
+      this.seenSignalIvs.set(sigIv, now)
+    }
 
     if (inner.kind === 'close') {
       const existing = this.sessions.get(cid)
@@ -444,7 +587,7 @@ export class P2PBridgeManager {
     }
 
     // Encrypted bulk control messages (bulk.pull / bulk.cancel / bulk.upload.start)
-    if (msg.type === 'bulk.ctrl' && msg.bin) {
+    if (msg.type === 'bulk.ctrl' && msg.bin instanceof Uint8Array) {
       let inner
       try {
         inner = await decryptBinaryJson(this.e2eeKey, msg.bin, { kind: 'p2p.bulk', roomId: this.roomId })
@@ -490,12 +633,21 @@ export class P2PBridgeManager {
     const id = String(msg.id || '')
     const expectedKid = await this.getE2eeKeyId()
 
-    if (!msg.bin) {
+    if (msg.bin == null) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
         id,
         ok: false,
         error: { code: 'E2EE_KEY_REQUIRED', keyId: expectedKid, message: '强制端到端加密：拒绝明文请求' },
+      })
+      return
+    }
+    if (!(msg.bin instanceof Uint8Array)) {
+      this.sendCtrlJson(sess, {
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: { code: 'E2EE_DECRYPT_FAILED', keyId: expectedKid, message: '端到端二进制密文类型无效' },
       })
       return
     }
@@ -536,7 +688,8 @@ export class P2PBridgeManager {
     const ivKey = hdr.iv
     this.pruneSeenIvs(now)
     const prevSeen = this.seenReqIvs.get(ivKey)
-    if (prevSeen && now - prevSeen <= REPLAY_WINDOW_MS) {
+    const prevSeenAt = prevSeen === undefined ? 0 : (typeof prevSeen === 'number' ? prevSeen : prevSeen.seenAt)
+    if (prevSeenAt && now - prevSeenAt <= REPLAY_WINDOW_MS) {
       this.sendCtrlJson(sess, {
         type: 'rpc.res',
         id,
@@ -554,7 +707,16 @@ export class P2PBridgeManager {
       })
       return
     }
-    this.seenReqIvs.set(ivKey, now)
+    if (this.minAcceptedTs > 0 && decrypted.ts <= this.minAcceptedTs) {
+      this.sendCtrlJson(sess, {
+        type: 'rpc.res',
+        id,
+        ok: false,
+        error: { code: 'E2EE_REPLAY_DETECTED', message: '加密请求时间戳已超出防重放窗口，已拒绝执行' },
+      })
+      return
+    }
+    this.seenReqIvs.set(ivKey, { seenAt: now, reqTs: decrypted.ts })
 
     const cid = String(decrypted?.cid || '')
     let innerRes
@@ -564,9 +726,14 @@ export class P2PBridgeManager {
       if (result && result.transferMode === 'p2p-bulk' && result._localRealPath) {
         const streamId = this._streamSeq++
         const { _localRealPath, ...publicMeta } = result
-        // Prune expired pending download tickets
+        // Prune expired pending download tickets and cap total pending tickets per peer
         for (const [k, v] of sess.pendingDownloads.entries()) {
           if (now - v.createdAt > DOWNLOAD_TICKET_TTL_MS) sess.pendingDownloads.delete(k)
+        }
+        while (sess.pendingDownloads.size >= MAX_PENDING_DOWNLOADS) {
+          const oldestKey = sess.pendingDownloads.keys().next().value
+          if (oldestKey === undefined) break
+          sess.pendingDownloads.delete(oldestKey)
         }
         sess.pendingDownloads.set(streamId, {
           realPath: _localRealPath,
@@ -618,6 +785,10 @@ export class P2PBridgeManager {
       await this.sendBulkCtrl(sess, { action: 'download.error', streamId, message: '文件传输凭证不存在或已过期' }).catch(() => {})
       return
     }
+    if (sess.activeDownloads.size >= MAX_DOWNLOADS_PER_PEER) {
+      await this.sendBulkCtrl(sess, { action: 'download.error', streamId, message: '并发下载数超出上限，请稍后重试' }).catch(() => {})
+      return
+    }
     const ac = new AbortController()
     sess.activeDownloads.set(streamId, ac)
 
@@ -633,7 +804,11 @@ export class P2PBridgeManager {
       if (liveRealPath !== ticket.realPath) {
         throw new Error('出于安全限制，目标文件路径已变更，已中止下载')
       }
-      fh = await openAsync(liveRealPath, 'r')
+      const openFlags =
+        process.platform !== 'win32'
+          ? fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0)
+          : 'r'
+      fh = await openAsync(liveRealPath, openFlags)
       const liveStat = await fh.stat()
       if (!liveStat.isFile() || liveStat.size <= 0) {
         throw new Error('目标文件不可读或已变为空文件')
@@ -731,6 +906,15 @@ export class P2PBridgeManager {
       ? MAX_INBOUND_UPLOAD_BYTES + MAX_INBOUND_CIPHER_OVERHEAD_BYTES
       : MAX_NON_CHUNKED_UPLOAD_BYTES
     const declaredSize = Number(meta.size || 0)
+    if (Number.isFinite(declaredSize) && declaredSize > MAX_INBOUND_UPLOAD_BYTES) {
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.error',
+        transferId,
+        streamId,
+        message: '文件超过本机安全上限 (2GB)',
+      }).catch(() => {})
+      return
+    }
     if (!isChunked && declaredSize > MAX_NON_CHUNKED_UPLOAD_BYTES) {
       await this.sendBulkCtrl(sess, {
         action: 'upload.error',
@@ -741,12 +925,46 @@ export class P2PBridgeManager {
       return
     }
 
+    const replacingExisting = sess.activeUploads.has(streamId)
+    const peerActiveCount = replacingExisting ? sess.activeUploads.size - 1 : sess.activeUploads.size
+    if (peerActiveCount >= MAX_UPLOADS_PER_PEER) {
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.error',
+        transferId,
+        streamId,
+        message: '当前设备并发上传数超出上限，请等待现有上传完成',
+      }).catch(() => {})
+      return
+    }
+    const globalActiveCount = this._countGlobalActiveUploads() - (replacingExisting ? 1 : 0)
+    if (globalActiveCount >= MAX_GLOBAL_UPLOADS) {
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.error',
+        transferId,
+        streamId,
+        message: '本机并发上传任务数超出上限，请稍后重试',
+      }).catch(() => {})
+      return
+    }
+
+    const quotaCheck = this._checkAndPruneInboundDiskQuota(declaredSize > 0 ? declaredSize : 0)
+    if (!quotaCheck.ok) {
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.error',
+        transferId,
+        streamId,
+        message: '本机上传缓存目录空间已达配额上限，请清理后再试',
+      }).catch(() => {})
+      return
+    }
+    const baseDiskBytes = quotaCheck.usedBytes
+
     const prevUpload = sess.activeUploads.get(streamId)
     if (prevUpload) {
       try { prevUpload.queue.fail(new Error('Upload superseded by new stream')) } catch {}
     }
     const queue = createAsyncByteQueue()
-    const entry = { transferId, queue, receivedBytes: 0, maxCipherBytes, isChunked }
+    const entry = { transferId, queue, receivedBytes: 0, writtenPlainBytes: 0, maxCipherBytes, isChunked }
     sess.activeUploads.set(streamId, entry)
 
     let localPath = ''
@@ -796,8 +1014,12 @@ export class P2PBridgeManager {
         compressed: Boolean(meta.e2ee.compressed),
         onPlainChunk: async (plainChunk) => {
           writtenPlainBytes += plainChunk.byteLength
+          entry.writtenPlainBytes = writtenPlainBytes
           if (writtenPlainBytes > MAX_INBOUND_UPLOAD_BYTES) {
             throw new Error('文件超过本机安全上限 (2GB)')
+          }
+          if (baseDiskBytes + this._sumGlobalInFlightUploadBytes() > this.maxInboundDiskBytes) {
+            throw new Error('本机上传缓存目录空间已达配额上限，请清理后再试')
           }
           await writePlain(plainChunk)
         },

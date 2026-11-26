@@ -182,15 +182,19 @@ export async function loginAccount(serverUrl, { username, password, emailCode = 
   }
 }
 
-export async function setAccountLogin2fa(baseUrl, token, enabled) {
+export async function setAccountLogin2fa(baseUrl, token, enabled, currentPassword = '') {
   const base = normalizeBaseUrl(baseUrl)
+  const payload = { enabled: Boolean(enabled) }
+  if (currentPassword) {
+    payload.currentPassword = String(currentPassword)
+  }
   const res = await fetch(`${base}/api/account/security/2fa`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ enabled: Boolean(enabled) }),
+    body: JSON.stringify(payload),
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) {
@@ -260,7 +264,7 @@ export async function sendEmailVerificationCode(serverUrl, { purpose, email, inv
   }
 }
 
-export async function bindAccountEmail(baseUrl, token, { email, code }) {
+export async function bindAccountEmail(baseUrl, token, { email, code, currentPassword = '' }) {
   const base = normalizeBaseUrl(baseUrl)
   const res = await fetch(`${base}/api/account/email/bind`, {
     method: 'POST',
@@ -271,6 +275,7 @@ export async function bindAccountEmail(baseUrl, token, { email, code }) {
     body: JSON.stringify({
       email: String(email || '').trim(),
       code: String(code || '').trim(),
+      currentPassword: String(currentPassword ?? ''),
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -444,8 +449,11 @@ export async function adminRevokeInvite(baseUrl, token, { id }) {
 }
 
 export async function probeDeviceStatus(device, timeoutMs = 5000) {
-  if (!device?.baseUrl || !device?.token) {
+  if (!device?.baseUrl) {
     return { status: 'unreachable', bridges: [], label: '', roomId: device?.roomId || '' }
+  }
+  if (!device?.token) {
+    return { status: 'expired', bridges: [], label: '', roomId: device?.roomId || '' }
   }
   const base = normalizeBaseUrl(device.baseUrl)
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
@@ -796,6 +804,7 @@ export class MobileRelayClient {
     const peer = new P2PPeerSession({
       bridgeId,
       roomId: this.roomId,
+      getClientId: () => this.clientId,
       getE2eeContext: (bid) => this.getBridgeE2eeContext(bid),
       getIceServers: () => this.iceServers,
       sendSignal: ({ bridgeId: bid, sessionId, e2ee }) => {
@@ -1194,6 +1203,7 @@ export class MobileRelayClient {
         } else if (
           msg.event === 'e2ee.grant.request' ||
           msg.event === 'e2ee.grant.offer' ||
+          msg.event === 'e2ee.grant.reveal' ||
           msg.event === 'e2ee.grant.deliver' ||
           msg.event === 'e2ee.grant.reject' ||
           msg.event === 'e2ee.grant.cancel' ||
@@ -1310,12 +1320,13 @@ export class MobileRelayClient {
     return peer.uploadFileBulk(file, { onProgress, signal })
   }
 
-  sendGrantRequest({ reqId, pubKey, wantedKeyId = '' }) {
+  sendGrantRequest({ reqId, pubKey, commit = '', wantedKeyId = '' }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     this.ws.send(JSON.stringify({
       type: 'e2ee.grant.req',
       reqId,
       pubKey,
+      ...(commit ? { commit } : {}),
       ...(wantedKeyId ? { wantedKeyId } : {}),
     }))
     return true
@@ -1337,9 +1348,20 @@ export class MobileRelayClient {
     })
   }
 
-  sendGrantOffer({ reqId, approverPubKey }) {
+  sendGrantOffer({ reqId, approverPubKey, approverNonce = '' }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
-    this.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId, approverPubKey }))
+    this.ws.send(JSON.stringify({
+      type: 'e2ee.grant.offer',
+      reqId,
+      approverPubKey,
+      ...(approverNonce ? { approverNonce } : {}),
+    }))
+    return true
+  }
+
+  sendGrantReveal({ reqId, requesterNonce }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ type: 'e2ee.grant.reveal', reqId, requesterNonce }))
     return true
   }
 

@@ -17,13 +17,16 @@ import {
 } from 'lucide-react'
 import {
   computeE2eeKeyId,
+  computeGrantCommitment,
   decryptGrantPayload,
   deriveGrantSas,
   encodeE2eeGrantQrUri,
   encodeE2eeQrUri,
   formatE2eeFingerprint,
   generateGrantKeyPair,
+  generateGrantNonce,
   generateGrantReqId,
+  generateGrantSecret,
   parseE2eeGrantQrInput,
   parseE2eeQrInput,
 } from '@allinone/shared/e2ee'
@@ -83,9 +86,11 @@ export function E2eeSyncModal({
 
   // Reverse-Auth / Device-to-Device Grant state (Computer C waiting for Phone B)
   const [grantState, setGrantState] = useState(null)
-  // { reqId, pubKeyRaw, pubKeyFp, qrDataUrl, expiresAt, phase: 'waiting'|'sas'|'rejected'|'expired', sasCode, approverDeviceName, approverIp, approverPubKey }
+  // { reqId, reqNonce, commit, pubKeyRaw, pubKeyFp, qrDataUrl, expiresAt, phase: 'waiting'|'sas'|'rejected'|'expired', sasCode, approverDeviceName, approverIp, approverPubKey, approverNonce }
   const [grantCountdownSec, setGrantCountdownSec] = useState(0)
   const grantPrivateKeyRef = useRef(null)
+  const grantSecretRef = useRef('')
+  const offerLockedReqIdRef = useRef('')
   const grantStateRef = useRef(null)
   grantStateRef.current = grantState
   const grantSessionGenRef = useRef(0)
@@ -106,6 +111,8 @@ export function E2eeSyncModal({
       } catch {}
     }
     grantPrivateKeyRef.current = null
+    grantSecretRef.current = ''
+    offerLockedReqIdRef.current = ''
     setGrantState(null)
     setGrantCountdownSec(0)
   }, [client])
@@ -120,12 +127,27 @@ export function E2eeSyncModal({
       const pair = await generateGrantKeyPair()
       if (grantSessionGenRef.current !== gen) return
       const reqId = generateGrantReqId()
-      const uri = encodeE2eeGrantQrUri({ reqId, roomId, pubKeyFp: pair.publicKeyFp })
+      const reqNonce = generateGrantNonce()
+      const commit = await computeGrantCommitment({
+        reqId,
+        roomId,
+        pubKey: pair.publicKeyRaw,
+        nonce: reqNonce,
+      })
+      if (grantSessionGenRef.current !== gen) return
+      const grantSecret = generateGrantSecret()
+      const uri = encodeE2eeGrantQrUri({
+        reqId,
+        roomId,
+        pubKeyFp: pair.publicKeyFp,
+        grantSecret,
+      })
       const qrDataUrl = renderQrDataUrl(uri, { pixelSize: 224, darkColor: '#0F172A', lightColor: '#FFFFFF' })
       if (grantSessionGenRef.current !== gen) return
       const sent = client.sendGrantRequest({
         reqId,
         pubKey: pair.publicKeyRaw,
+        commit,
         wantedKeyId: bridgeE2ee?.keyId || '',
       })
       if (!sent) {
@@ -135,9 +157,13 @@ export function E2eeSyncModal({
         return
       }
       grantPrivateKeyRef.current = pair.privateKey
+      grantSecretRef.current = grantSecret
+      offerLockedReqIdRef.current = ''
       const expiresAt = Date.now() + 120_000
       setGrantState({
         reqId,
+        reqNonce,
+        commit,
         pubKeyRaw: pair.publicKeyRaw,
         pubKeyFp: pair.publicKeyFp,
         qrDataUrl,
@@ -147,6 +173,7 @@ export function E2eeSyncModal({
         approverDeviceName: '',
         approverIp: '',
         approverPubKey: '',
+        approverNonce: '',
       })
       setGrantCountdownSec(120)
     } catch (err) {
@@ -218,31 +245,44 @@ export function E2eeSyncModal({
       if (!cur || !payload || payload.reqId !== cur.reqId) return
 
       if (event === 'e2ee.grant.offer' && payload.approverPubKey) {
+        if (cur.phase !== 'waiting' || offerLockedReqIdRef.current === cur.reqId) return
+        const appNonce = String(payload.approverNonce || '').trim()
+        if (!appNonce || !cur.reqNonce) return
+        offerLockedReqIdRef.current = cur.reqId
         try {
+          client.sendGrantReveal?.({ reqId: cur.reqId, requesterNonce: cur.reqNonce })
           const sas = await deriveGrantSas({
             requesterPubKey: cur.pubKeyRaw,
             approverPubKey: payload.approverPubKey,
             reqId: cur.reqId,
             roomId,
+            requesterNonce: cur.reqNonce,
+            approverNonce: appNonce,
           })
           setGrantState((prev) =>
-            prev && prev.reqId === cur.reqId
+            prev && prev.reqId === cur.reqId && prev.phase === 'waiting'
               ? {
                   ...prev,
                   phase: 'sas',
                   sasCode: sas,
                   approverPubKey: payload.approverPubKey,
+                  approverNonce: appNonce,
                   approverDeviceName: payload.approverDeviceName || bi('已授权设备', 'Authorized Device'),
                   approverIp: payload.approverIp || '',
                 }
               : prev,
           )
-        } catch {}
+        } catch {
+          if (offerLockedReqIdRef.current === cur.reqId) {
+            offerLockedReqIdRef.current = ''
+          }
+        }
         return
       }
 
       if (event === 'e2ee.grant.cancel') {
         if (payload.reopen) {
+          offerLockedReqIdRef.current = ''
           setGrantState((prev) =>
             prev && prev.reqId === cur.reqId
               ? {
@@ -250,6 +290,7 @@ export function E2eeSyncModal({
                   phase: 'waiting',
                   sasCode: '',
                   approverPubKey: '',
+                  approverNonce: '',
                   approverDeviceName: '',
                   approverIp: '',
                 }
@@ -257,6 +298,8 @@ export function E2eeSyncModal({
           )
         } else {
           grantPrivateKeyRef.current = null
+          grantSecretRef.current = ''
+          offerLockedReqIdRef.current = ''
           setGrantState((prev) =>
             prev && prev.reqId === cur.reqId
               ? {
@@ -264,6 +307,7 @@ export function E2eeSyncModal({
                   phase: 'expired',
                   sasCode: '',
                   approverPubKey: '',
+                  approverNonce: '',
                 }
               : prev,
           )
@@ -273,6 +317,8 @@ export function E2eeSyncModal({
 
       if (event === 'e2ee.grant.reject') {
         grantPrivateKeyRef.current = null
+        grantSecretRef.current = ''
+        offerLockedReqIdRef.current = ''
         setGrantState((prev) =>
           prev && prev.reqId === cur.reqId
             ? {
@@ -286,8 +332,19 @@ export function E2eeSyncModal({
       }
 
       if (event === 'e2ee.grant.deliver' && payload.envelope) {
+        if (cur.phase !== 'waiting' && cur.phase !== 'sas') return
         const privKey = grantPrivateKeyRef.current
         if (!privKey) return
+        const isWaitingQrPath = cur.phase === 'waiting'
+        const qrSecret = isWaitingQrPath ? String(grantSecretRef.current || '').trim() : ''
+        if (isWaitingQrPath && !qrSecret) {
+          setError(bi('缺少扫码防篡改凭证，已拒绝接收授权包', 'Missing QR verification secret; rejected authorization payload.'))
+          return
+        }
+        if (!isWaitingQrPath && !cur.approverPubKey) {
+          setError(bi('缺少已验证的授权方公钥，已拒绝接收授权包', 'Missing verified approver public key; rejected authorization payload.'))
+          return
+        }
         setBusy(true)
         setError('')
         try {
@@ -296,7 +353,9 @@ export function E2eeSyncModal({
             requesterPubKeyRaw: cur.pubKeyRaw,
             envelope: payload.envelope,
             roomId,
-            expectedApproverPubKey: cur.approverPubKey || '',
+            expectedReqId: cur.reqId,
+            expectedApproverPubKey: isWaitingQrPath ? '' : cur.approverPubKey,
+            grantSecret: isWaitingQrPath ? qrSecret : '',
           })
           const rawKeys = Array.isArray(decrypted?.keys) ? decrypted.keys : []
           const verifiedKeys = []
@@ -314,6 +373,8 @@ export function E2eeSyncModal({
             throw new Error(bi('授权包中未包含有效密钥', 'No valid keys in authorization payload'))
           }
           grantPrivateKeyRef.current = null
+          grantSecretRef.current = ''
+          offerLockedReqIdRef.current = ''
           grantStateRef.current = null
           setGrantState(null)
           const bridgeKid = String(bridgeE2ee?.keyId || '').trim().toLowerCase()

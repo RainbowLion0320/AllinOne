@@ -1,6 +1,8 @@
 import { openSync, readSync, closeSync, statSync, watch } from 'node:fs'
 
 const MB = 1024 * 1024
+const MAX_BYTES_PER_TICK = 512 * 1024
+const MAX_REMAINDER_BYTES = 64 * 1024
 
 export const DEFAULT_TURN_QUOTA_MB = Object.freeze({
   free: 1024,    // 1 GB / month
@@ -111,9 +113,17 @@ export function createTurnLogMeter({
   let remainder = ''
   let watcher = null
   let timer = null
+  let catchupTimer = null
   let reading = false
   let started = false
   let stopped = false
+
+  function clearCatchupTimer() {
+    if (catchupTimer) {
+      clearTimeout(catchupTimer)
+      catchupTimer = null
+    }
+  }
 
   function closeWatcher() {
     if (watcher) {
@@ -155,7 +165,8 @@ export function createTurnLogMeter({
   function processChunkText(text) {
     const combined = remainder + text
     const lines = combined.split(/\r?\n/)
-    remainder = lines.pop() || ''
+    const nextRemainder = lines.pop() || ''
+    remainder = nextRemainder.length > MAX_REMAINDER_BYTES ? nextRemainder.slice(-MAX_REMAINDER_BYTES) : nextRemainder
     for (const line of lines) {
       const parsed = parseCoturnUsageLine(line)
       if (parsed && typeof onUsage === 'function') {
@@ -172,6 +183,7 @@ export function createTurnLogMeter({
     if (stopped || reading || !cleanPath) return
     reading = true
     let fd = null
+    let hasMoreBacklog = false
     try {
       const st = statSync(cleanPath, { bigint: true })
       const size = Number(st.size)
@@ -199,14 +211,17 @@ export function createTurnLogMeter({
 
       fd = openSync(cleanPath, 'r')
       const MAX_BATCH = 256 * 1024
-      while (offset < size) {
-        const toRead = Math.min(MAX_BATCH, size - offset)
+      let tickBytes = 0
+      while (offset < size && tickBytes < MAX_BYTES_PER_TICK) {
+        const toRead = Math.min(MAX_BATCH, size - offset, MAX_BYTES_PER_TICK - tickBytes)
         const buf = Buffer.allocUnsafe(toRead)
         const bytesRead = readSync(fd, buf, 0, toRead, offset)
         if (bytesRead <= 0) break
         offset += bytesRead
+        tickBytes += bytesRead
         processChunkText(buf.subarray(0, bytesRead).toString('utf8'))
       }
+      hasMoreBacklog = offset < size
     } catch {
       // Log file may not exist yet or be mid-rotation
     } finally {
@@ -214,6 +229,13 @@ export function createTurnLogMeter({
         try { closeSync(fd) } catch {}
       }
       reading = false
+    }
+    if (hasMoreBacklog && started && !stopped && !catchupTimer) {
+      catchupTimer = setTimeout(() => {
+        catchupTimer = null
+        pollOnce()
+      }, 50)
+      catchupTimer.unref?.()
     }
   }
 
@@ -234,6 +256,7 @@ export function createTurnLogMeter({
   function stop() {
     stopped = true
     started = false
+    clearCatchupTimer()
     if (timer) {
       clearInterval(timer)
       timer = null

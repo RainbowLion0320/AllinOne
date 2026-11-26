@@ -1,6 +1,17 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, openSync, readSync, closeSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
@@ -19,6 +30,42 @@ const CLAUDE_LIST_DISCOVERY_INTERVAL_MS = 15_000
 const CLAUDE_TRACKED_LIST_LIMIT = 20
 const CLAUDE_TAIL_PROBE_BYTES = 64 * 1024
 const CLAUDE_TAIL_PROBE_MAX_BYTES = 512 * 1024
+
+const ALLOWED_CLAUDE_PERMISSION_MODES = Object.freeze([
+  'default',
+  'acceptEdits',
+  'plan',
+  'dontAsk',
+  'bypassPermissions',
+])
+
+const CLAUDE_PERMISSION_MODE_RANK = Object.freeze({
+  plan: 0,
+  default: 1,
+  acceptEdits: 2,
+  dontAsk: 3,
+  bypassPermissions: 4,
+})
+
+function resolveEffectiveClaudePermissionMode(requestedMode, hostConfiguredMode, effectiveTaskMode) {
+  const hostMode = ALLOWED_CLAUDE_PERMISSION_MODES.includes(hostConfiguredMode)
+    ? hostConfiguredMode
+    : 'acceptEdits'
+  const rawReq = String(requestedMode ?? '').trim()
+  if (!rawReq) {
+    if (effectiveTaskMode === 'plan') return 'plan'
+    return hostMode
+  }
+  if (!ALLOWED_CLAUDE_PERMISSION_MODES.includes(rawReq)) {
+    throw new Error('非法的 permissionMode 参数值')
+  }
+  const reqRank = CLAUDE_PERMISSION_MODE_RANK[rawReq]
+  const hostRank = CLAUDE_PERMISSION_MODE_RANK[hostMode]
+  if (reqRank > hostRank) {
+    throw new Error(`出于安全限制，不允许远程将 Claude 权限模式从 ${hostMode} 提升至 ${rawReq}`)
+  }
+  return rawReq
+}
 
 function getClaudeHome(configuredHome = '') {
   const custom = String(configuredHome || '').trim()
@@ -982,7 +1029,8 @@ export class ClaudeAdapter {
     this.claudeHome = getClaudeHome(config.claudeHome)
     this.configuredDesktopRoots = Array.isArray(config.claudeDesktopRoots) ? config.claudeDesktopRoots : null
     this.defaultCwd = config.cwd || process.cwd()
-    this.permissionMode = config.claudePermissionMode || 'acceptEdits'
+    const rawHostPerm = String(config.claudePermissionMode || 'acceptEdits').trim()
+    this.permissionMode = ALLOWED_CLAUDE_PERMISSION_MODES.includes(rawHostPerm) ? rawHostPerm : 'acceptEdits'
     this.externalMaxIdleMs = Number(config.claudeExternalMaxIdleMs) || CLAUDE_EXTERNAL_MAX_IDLE_MS
     this.watchPollMs = Number(config.claudeWatchPollMs) || CLAUDE_WATCH_POLL_MS
     this.checkPidAlive = typeof config.checkPidAlive === 'function' ? config.checkPidAlive : isPidAlive
@@ -1776,10 +1824,10 @@ export class ClaudeAdapter {
     const pref = this.sessionPrefs.get(sessionId)
     const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
     const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
-    const effectivePermissionMode = assertSafeCliToken(
-      permissionMode || (effectiveTaskMode === 'plan' ? 'plan' : this.permissionMode),
-      'permissionMode',
-      { allowEmpty: false },
+    const effectivePermissionMode = resolveEffectiveClaudePermissionMode(
+      permissionMode,
+      this.permissionMode,
+      effectiveTaskMode,
     )
     if (effectiveModel || effectiveEffort) {
       this.sessionPrefs.set(sessionId, { model: effectiveModel || 'default', reasoningEffort: effectiveEffort || '' })
@@ -1804,12 +1852,23 @@ export class ClaudeAdapter {
       args.push('--effort', effectiveEffort)
     }
     // Preserve live Windows/OS ANTHROPIC_BASE_URL & credentials over any stale ~/.claude/settings.json proxy
+    // Security: write ephemeral 0o600 temp file instead of passing API secrets on argv
     const envOverride = {}
     if (process.env.ANTHROPIC_BASE_URL) envOverride.ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL
     if (process.env.ANTHROPIC_AUTH_TOKEN) envOverride.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
     if (process.env.ANTHROPIC_API_KEY) envOverride.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
+    let tempSettingsPath = ''
+    const cleanupTempSettings = () => {
+      if (!tempSettingsPath) return
+      const p = tempSettingsPath
+      tempSettingsPath = ''
+      try { unlinkSync(p) } catch {}
+    }
     if (Object.keys(envOverride).length > 0) {
-      args.push('--settings', JSON.stringify({ env: envOverride }))
+      tempSettingsPath = join(tmpdir(), `allinone-claude-settings-${process.pid}-${randomUUID()}.json`)
+      writeFileSync(tempSettingsPath, JSON.stringify({ env: envOverride }), { encoding: 'utf8', mode: 0o600 })
+      try { chmodSync(tempSettingsPath, 0o600) } catch {}
+      args.push('--settings', tempSettingsPath)
     }
     if (existingFile) {
       args.push('--resume', sessionId)
@@ -1825,11 +1884,24 @@ export class ClaudeAdapter {
     })
 
     return new Promise((resolvePromise, rejectPromise) => {
-      const proc = spawnClaude(this.claudeBin, args, {
-        cwd: targetCwd,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
+      let proc
+      try {
+        proc = spawnClaude(this.claudeBin, args, {
+          cwd: targetCwd,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        })
+      } catch (err) {
+        cleanupTempSettings()
+        if (err && typeof err === 'object') err._streamErrorEmitted = true
+        this.emitEvent(EVENTS.STREAM_ERROR, {
+          sessionId: compositeId,
+          app: APPS.CLAUDE,
+          message: String(err?.message || err),
+        })
+        rejectPromise(err)
+        return
+      }
       proc.stdout.setEncoding('utf8')
       proc.stderr?.setEncoding('utf8')
 
@@ -1850,7 +1922,7 @@ export class ClaudeAdapter {
         })
       }
 
-      const state = { proc, aborted: false, taskTracker, emitTaskState }
+      const state = { proc, aborted: false, taskTracker, emitTaskState, cleanupTempSettings }
       this.activeProcs.set(sessionId, state)
       emitTaskState()
 
@@ -2025,7 +2097,12 @@ export class ClaudeAdapter {
         stderrBuf = (stderrBuf + chunk).slice(-4096)
       })
 
+      proc.on('exit', () => {
+        cleanupTempSettings()
+      })
+
       proc.on('error', (err) => {
+        cleanupTempSettings()
         if (settled) return
         settled = true
         if (this.activeProcs.get(sessionId) === state) {
@@ -2042,6 +2119,7 @@ export class ClaudeAdapter {
       })
 
       proc.on('close', (code) => {
+        cleanupTempSettings()
         if (settled) return
         settled = true
         if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
@@ -2360,6 +2438,7 @@ export class ClaudeAdapter {
     this.trackedListSessions.clear()
     for (const active of this.activeProcs.values()) {
       active.aborted = true
+      try { active.cleanupTempSettings?.() } catch {}
       if (typeof this.clearPendingControlRequests === 'function') {
         try { this.clearPendingControlRequests(active.proc) } catch {}
       }

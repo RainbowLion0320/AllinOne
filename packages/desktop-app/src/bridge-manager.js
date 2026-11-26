@@ -85,6 +85,13 @@ function isSecretStoreAvailable(secretStore) {
   if (!secretStore || typeof secretStore.encrypt !== 'function' || typeof secretStore.decrypt !== 'function') {
     return false
   }
+  if (typeof secretStore.getSelectedStorageBackend === 'function') {
+    try {
+      if (secretStore.getSelectedStorageBackend() === 'basic_text') return false
+    } catch {
+      return false
+    }
+  }
   if (typeof secretStore.isAvailable === 'function') {
     try {
       return Boolean(secretStore.isAvailable())
@@ -872,6 +879,10 @@ export class DesktopBridgeManager extends EventEmitter {
   }
 
   getE2eeInfo(expectedRoomId = '') {
+    const cleanExpected = String(expectedRoomId || '').trim()
+    if (!cleanExpected || !cleanExpected.startsWith('usr_')) {
+      return { enabled: false, key: '', keyId: '', roomId: '', error: '缺少有效的账号标识' }
+    }
     const cfgRes = loadConfigWithStatus(this.configPath, this.secretStore)
     if (cfgRes.status === 'decrypt-error') {
       this.state = 'error'
@@ -883,7 +894,7 @@ export class DesktopBridgeManager extends EventEmitter {
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
       return { enabled: false, key: '', keyId: '', roomId: '' }
     }
-    if (expectedRoomId && cfg.roomId !== expectedRoomId) {
+    if (cfg.roomId !== cleanExpected) {
       return { enabled: false, key: '', keyId: '', roomId: cfg.roomId }
     }
     let key = normalizeDesktopE2eeKey(cfg.e2eeKey)
@@ -916,6 +927,10 @@ export class DesktopBridgeManager extends EventEmitter {
   }
 
   async setE2eeKey(expectedRoomId = '', rawKey = '') {
+    const cleanExpected = String(expectedRoomId || '').trim()
+    if (!cleanExpected || !cleanExpected.startsWith('usr_')) {
+      throw new Error('缺少有效的账号标识，无法更新端到端密钥')
+    }
     this.syncSeq += 1
     const normalized = normalizeDesktopE2eeKey(rawKey)
     if (!normalized) {
@@ -932,7 +947,7 @@ export class DesktopBridgeManager extends EventEmitter {
     if (!cfg || cfg.mode !== 'account' || !cfg.roomId) {
       throw new Error('本机尚未绑定账号，请先登录')
     }
-    if (expectedRoomId && cfg.roomId !== expectedRoomId) {
+    if (cfg.roomId !== cleanExpected) {
       throw new Error('当前登录账号与本机桥接账号不一致')
     }
     const prevCfg = { ...cfg }

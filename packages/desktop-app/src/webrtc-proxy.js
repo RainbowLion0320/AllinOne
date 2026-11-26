@@ -20,6 +20,7 @@ import { join } from 'node:path'
 const FRAME_JSON = 1
 const FRAME_BIN = 2
 const IDLE_DESTROY_MS = 120_000
+const AUTH_TIMEOUT_MS = 5_000
 
 function encodeJsonFrame(obj) {
   const payload = Buffer.from(JSON.stringify(obj), 'utf8')
@@ -268,20 +269,37 @@ export class DesktopWebRtcProxy {
     const MAX_QUEUED_FRAME_BYTES = 4 * 1024 * 1024
     const RESUME_QUEUED_FRAME_BYTES = 1 * 1024 * 1024
 
+    let authTimer = setTimeout(() => {
+      authTimer = null
+      if (!authed && !socket.destroyed) {
+        try { socket.destroy() } catch {}
+      }
+    }, AUTH_TIMEOUT_MS)
+    authTimer.unref?.()
+    const clearAuthTimer = () => {
+      if (authTimer) {
+        clearTimeout(authTimer)
+        authTimer = null
+      }
+    }
+
     const processFrame = async (kind, payload) => {
       if (socket.destroyed) return
       if (!authed) {
         if (kind !== FRAME_JSON) {
+          clearAuthTimer()
           socket.destroy()
           return
         }
         let msg
-        try { msg = JSON.parse(payload.toString('utf8')) } catch { socket.destroy(); return }
+        try { msg = JSON.parse(payload.toString('utf8')) } catch { clearAuthTimer(); socket.destroy(); return }
         const cand = Buffer.from(String(msg?.token || ''), 'utf8')
         if (cand.length !== this.tokenBuf.length || !timingSafeEqual(cand, this.tokenBuf)) {
+          clearAuthTimer()
           socket.destroy()
           return
         }
+        clearAuthTimer()
         authed = true
         if (this.activeSocket && this.activeSocket !== socket) {
           const prevSocket = this.activeSocket
@@ -417,6 +435,7 @@ export class DesktopWebRtcProxy {
     })
 
     socket.on('close', () => {
+      clearAuthTimer()
       if (this.activeSocket === socket) {
         this.activeSocket = null
         this.activePeerIds.clear()
@@ -428,6 +447,7 @@ export class DesktopWebRtcProxy {
       }
     })
     socket.on('error', () => {
+      clearAuthTimer()
       try { socket.destroy() } catch {}
     })
   }

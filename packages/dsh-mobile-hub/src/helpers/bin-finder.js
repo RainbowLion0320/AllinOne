@@ -234,19 +234,30 @@ function resolveNpmCmdShim(cmdPath) {
   }
 }
 
+const UNSAFE_CMD_SHIM_CHAR_RE = /[\r\n\0]/
+
 /**
  * Safely spawn a Windows `.cmd`/`.bat` shim with spaces in paths and arbitrary JSON/metacharacter args.
  * Resolves standard npm JS shims directly to `node.exe` when possible, and otherwise invokes
  * `cmd.exe /d /s /c` with `windowsVerbatimArguments: true` and properly quoted/escaped arguments.
  */
 export function spawnCmdShim(bin, args = [], options = {}) {
+  const binStr = String(bin ?? '')
+  if (!binStr || UNSAFE_CMD_SHIM_CHAR_RE.test(binStr)) {
+    throw new Error('Rejected unsafe control character in executable path')
+  }
   const argList = Array.isArray(args) ? args : []
+  for (const arg of argList) {
+    if (UNSAFE_CMD_SHIM_CHAR_RE.test(String(arg ?? ''))) {
+      throw new Error('Rejected unsafe control character in command argument')
+    }
+  }
   const safeOpts = { ...options, env: sanitizeChildEnv(options.env || process.env) }
-  const shim = resolveNpmCmdShim(bin)
+  const shim = resolveNpmCmdShim(binStr)
   if (shim) {
     return spawn(shim.nodeBin, [shim.entryScript, ...argList], safeOpts)
   }
-  const cleanBin = `"${String(bin || '').replace(/"/g, '')}"`
+  const cleanBin = `"${binStr.replace(/"/g, '')}"`
   const escapedArgs = argList.map(escapeWinCmdArg)
   const commandLine = `"${[cleanBin, ...escapedArgs].join(' ')}"`
   return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], {

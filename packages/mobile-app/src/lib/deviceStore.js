@@ -50,12 +50,12 @@ function sanitizeE2eeKeysMap(rawMap) {
   return out
 }
 
-function sanitizeDevice(raw) {
+function sanitizeDevice(raw, { allowEmptyToken = false } = {}) {
   if (!raw || typeof raw !== 'object') return null
   const baseUrl = normalizeDeviceBaseUrl(raw.baseUrl)
   const token = String(raw.token || '').trim()
   const roomId = String(raw.roomId || '').trim()
-  if (!baseUrl || !token || !roomId.startsWith('usr_')) return null
+  if (!baseUrl || (!allowEmptyToken && !token) || !roomId.startsWith('usr_')) return null
   const id = String(raw.id || makeDeviceId(baseUrl, roomId)).trim()
   const firstBridge = Array.isArray(raw.bridges)
     ? raw.bridges.find((b) => b?.online) || raw.bridges[0] || null
@@ -102,7 +102,7 @@ export function loadDeviceState(storage = getDefaultStorage()) {
       const seen = new Set()
       const devices = []
       for (const item of Array.isArray(parsed?.devices) ? parsed.devices : []) {
-        const clean = sanitizeDevice(item)
+        const clean = sanitizeDevice(item, { allowEmptyToken: true })
         if (!clean || seen.has(clean.id)) continue
         seen.add(clean.id)
         devices.push(clean)
@@ -334,6 +334,28 @@ export function upsertDeviceE2eeKey(state, deviceId, keyId, key) {
   delete merged[cleanKid]
   merged[cleanKid] = cleanKey
   return updateDeviceMeta(state, deviceId, { e2eeKeys: merged })
+}
+
+export function clearDeviceCredentials(state, deviceId) {
+  if (!state || !Array.isArray(state.devices) || !deviceId) return state
+  const idx = state.devices.findIndex((d) => d.id === deviceId)
+  if (idx === -1) return state
+  const cur = state.devices[idx]
+  const hasE2eeKeys = cur.e2eeKeys && Object.keys(cur.e2eeKeys).length > 0
+  if (!cur.token && !hasE2eeKeys && !cur.e2eeKey && !cur.e2eeKeyId) return state
+  const next = {
+    ...cur,
+    token: '',
+    e2eeKeys: {},
+    e2eeKey: '',
+    e2eeKeyId: '',
+  }
+  const nextDevices = state.devices.slice()
+  nextDevices[idx] = next
+  return {
+    ...state,
+    devices: nextDevices,
+  }
 }
 
 export function removeDevice(state, deviceId) {

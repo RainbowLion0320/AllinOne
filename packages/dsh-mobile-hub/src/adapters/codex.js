@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getCodexCandidates, isExecutableFile, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
@@ -14,14 +14,58 @@ import {
 } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 
+const UNTRUSTED_CODEX_DIR_PREFIXES = [
+  '/tmp/',
+  '/private/tmp/',
+  '/var/tmp/',
+  '/private/var/tmp/',
+  '/dev/shm/',
+]
+
+function isTrustedCodexExecutable(candidate, currentUid) {
+  if (!candidate || !isExecutableFile(candidate)) return false
+  const lowerCand = candidate.toLowerCase()
+  if (UNTRUSTED_CODEX_DIR_PREFIXES.some((prefix) => lowerCand.startsWith(prefix))) {
+    return false
+  }
+  let realPath = ''
+  try {
+    realPath = realpathSync(candidate)
+  } catch {
+    return false
+  }
+  const lowerReal = realPath.toLowerCase()
+  if (UNTRUSTED_CODEX_DIR_PREFIXES.some((prefix) => lowerReal.startsWith(prefix))) {
+    return false
+  }
+  try {
+    const st = statSync(realPath)
+    if (!st.isFile()) return false
+    if (st.uid !== currentUid && st.uid !== 0) return false
+    if ((st.mode & 0o022) !== 0) return false
+
+    const parentDirs = new Set([dirname(realPath), dirname(candidate)])
+    for (const dir of parentDirs) {
+      const pSt = statSync(dir)
+      if (pSt.uid !== currentUid && pSt.uid !== 0) return false
+      if ((pSt.mode & 0o022) !== 0) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * Fallback discovery on macOS/Linux: if Codex Desktop / ChatGPT app is currently running
  * from a custom or newly reorganized app bundle path, extract the live `codex` binary path.
  */
 function findRunningCodexBinary() {
   if (process.platform === 'win32') return null
+  if (typeof process.getuid !== 'function') return null
+  const uid = process.getuid()
   try {
-    const out = execFileSync('ps', ['-axo', 'command='], {
+    const out = execFileSync('ps', ['-u', String(uid), '-o', 'command='], {
       timeout: 1200,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -31,7 +75,7 @@ function findRunningCodexBinary() {
       if (!line || !/codex/i.test(line)) continue
       // Match an absolute path ending with `/codex` followed by space + args (e.g. `app-server`, `exec-server`)
       const m = line.match(/^(\/[^\0\n]*?\/codex)(?:\s|$)/)
-      if (m && m[1] && isExecutableFile(m[1])) {
+      if (m && m[1] && isTrustedCodexExecutable(m[1], uid)) {
         return m[1]
       }
     }

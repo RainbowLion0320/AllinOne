@@ -76,6 +76,32 @@ function normalizeServerUrl(raw) {
   }
 }
 
+function isLoopbackHostname(hostname) {
+  const h = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '')
+  if (!h) return false
+  if (h === 'localhost' || h === '::1' || h === '0:0:0:0:0:0:0:1') return true
+  if (/^127(?:\.\d{1,3}){3}$/.test(h)) return true
+  return false
+}
+
+function assertSecureServerUrl(serverUrl, { allowInsecureHttp = false } = {}) {
+  let u
+  try {
+    u = new URL(serverUrl)
+  } catch {
+    throw new Error(`无效的中转服务器地址：${serverUrl}`)
+  }
+  const proto = u.protocol.toLowerCase()
+  if (proto !== 'https:' && proto !== 'http:' && proto !== 'wss:' && proto !== 'ws:') {
+    throw new Error(`不支持的服务器协议：${proto}（请使用 https:// 或 wss://）`)
+  }
+  if ((proto === 'http:' || proto === 'ws:') && !isLoopbackHostname(u.hostname) && !allowInsecureHttp) {
+    throw new Error(
+      `出于安全限制，拒绝通过明文 ${proto}// 连接到非本机服务器（${u.hostname}）。请改用 https://，或仅在受信任局域网调试时显式传入 --allow-insecure-http。`,
+    )
+  }
+}
+
 function parseArgs(argv) {
   const opts = {
     server: process.env.ALLINONE_SERVER || DEFAULT_SERVER_URL,
@@ -86,6 +112,7 @@ function parseArgs(argv) {
     password: BOOTSTRAP_ENV.password || '',
     e2eeKey: BOOTSTRAP_ENV.e2eeKey || '',
     e2eeKeyFromCli: false,
+    allowInsecureHttp: false,
     logout: false,
     reset: false,
     noBrowser: false,
@@ -111,7 +138,8 @@ function parseArgs(argv) {
     } else if (a.startsWith('--e2ee-key=')) {
       opts.e2eeKey = a.slice('--e2ee-key='.length)
       opts.e2eeKeyFromCli = true
-    } else if (a === '--logout' || a === '--login') opts.logout = true
+    } else if (a === '--allow-insecure-http') opts.allowInsecureHttp = true
+    else if (a === '--logout' || a === '--login') opts.logout = true
     else if (a === '--reset') opts.reset = true
     else if (a === '--no-browser') opts.noBrowser = true
     else if (a === '--help' || a === '-h') opts.help = true
@@ -481,14 +509,17 @@ async function main() {
   --cwd <dir>         默认工作目录 (默认: 用户主目录)
   -u, --username <u>  账号用户名（用于无交互自动绑定本机）
   -p, --password <p>  账号密码（仅用于首次换取单机密钥，绝不落盘）
-  --e2ee-key <key>    指定 256-bit 端到端加密密钥（留空自动生成）
-  --logout            退出当前账号绑定并重新登录
-  --reset             清除本地配置并重新绑定
-  --no-browser        不自动打开本地二维码网页
-  -h, --help          显示帮助
+  --e2ee-key <key>      指定 256-bit 端到端加密密钥（留空自动生成）
+  --allow-insecure-http 允许通过明文 http:// 连接非本机服务器（仅限受信任局域网调试）
+  --logout              退出当前账号绑定并重新登录
+  --reset               清除本地配置并重新绑定
+  --no-browser          不自动打开本地二维码网页
+  -h, --help            显示帮助
 `)
     process.exit(0)
   }
+
+  assertSecureServerUrl(opts.server, { allowInsecureHttp: opts.allowInsecureHttp })
 
   mkdirSync(opts.stateDir, { recursive: true })
   try { chmodSync(opts.stateDir, 0o700) } catch {}
@@ -627,7 +658,6 @@ async function main() {
   const e2eeHtmlPath = join(opts.stateDir, 'e2ee-key.html')
 
   let activeE2eeKey = ''
-  let isNewE2eeKey = false
   const explicitKeyInput = String(opts.e2eeKey || '').trim()
   if (opts.e2eeKeyFromCli || explicitKeyInput) {
     const parsedExplicitKey = normalizeE2eeKey(explicitKeyInput)
@@ -639,7 +669,6 @@ async function main() {
       cfg.e2eeKey = activeE2eeKey
       delete cfg.e2eeKeyEnc
       saveConfig(configPath, cfg)
-      isNewE2eeKey = true
     } else if (!cfg.e2eeKey && !cfg.e2eeKeyEnc && !BOOTSTRAP_ENV.e2eeKey) {
       cfg.e2eeKey = activeE2eeKey
       saveConfig(configPath, cfg)
@@ -647,7 +676,6 @@ async function main() {
   } else {
     activeE2eeKey = normalizeE2eeKey(cfg.e2eeKey || '')
     if (!activeE2eeKey) {
-      isNewE2eeKey = true
       activeE2eeKey = generateE2eeKey()
       cfg.e2eeKey = activeE2eeKey
       delete cfg.e2eeKeyEnc
@@ -656,6 +684,17 @@ async function main() {
   }
   const e2eeKeyId = await computeE2eeKeyId(activeE2eeKey)
   const e2eeFingerprint = formatE2eeFingerprint(e2eeKeyId)
+
+  let e2eeHtmlCleanupTimer = null
+  const removeTempE2eeKeyPage = () => {
+    if (e2eeHtmlCleanupTimer) {
+      clearTimeout(e2eeHtmlCleanupTimer)
+      e2eeHtmlCleanupTimer = null
+    }
+    if (existsSync(e2eeHtmlPath)) {
+      try { unlinkSync(e2eeHtmlPath) } catch {}
+    }
+  }
 
   const writeE2eeKeyPage = (openNow = false) => {
     const html = buildE2eeKeyHtml({
@@ -667,17 +706,22 @@ async function main() {
     })
     writeFileSync(e2eeHtmlPath, html, { encoding: 'utf8', mode: 0o600 })
     try { chmodSync(e2eeHtmlPath, 0o600) } catch {}
+    if (e2eeHtmlCleanupTimer) clearTimeout(e2eeHtmlCleanupTimer)
+    // Auto-unlink ephemeral QR page after 2 minutes so plaintext key does not linger on disk
+    e2eeHtmlCleanupTimer = setTimeout(() => {
+      e2eeHtmlCleanupTimer = null
+      try { unlinkSync(e2eeHtmlPath) } catch {}
+    }, 2 * 60 * 1000)
+    e2eeHtmlCleanupTimer.unref?.()
     if (openNow && !opts.noBrowser) {
       openFileInBrowser(e2eeHtmlPath)
     }
   }
 
-  // Only persist offline E2EE QR HTML in standalone CLI mode (never defeat Electron safeStorage encryption at rest)
+  // Never auto-write persistent plaintext e2ee-key.html on startup; delete any leftover file in desktop-managed mode
   const isDesktopManaged = Boolean(cfg.e2eeKeyEnc || opts.noBrowser || BOOTSTRAP_ENV.hadDesktopSecrets)
-  if (!isDesktopManaged && (isNewE2eeKey || !process.stdin.isTTY || !existsSync(e2eeHtmlPath))) {
-    try {
-      writeE2eeKeyPage(false)
-    } catch {}
+  if (isDesktopManaged && existsSync(e2eeHtmlPath)) {
+    try { unlinkSync(e2eeHtmlPath) } catch {}
   }
 
   // Ensure DeepSeek Harness local IPC plugin is installed BEFORE initial getAppsStatus()
@@ -702,6 +746,7 @@ async function main() {
   async function shutdown(exitCode = 0) {
     if (exiting) return
     exiting = true
+    removeTempE2eeKeyPage()
     const forceTimer = setTimeout(() => process.exit(exitCode), 5_000)
     forceTimer.unref?.()
     if (dshIpcWatchTimer) {
@@ -873,7 +918,7 @@ async function main() {
         console.log('')
         console.log(`[allinone] 端到端加密密钥指纹：${e2eeFingerprint}`)
         console.log(`[allinone] 恢复密钥（仅本机与手机保存）：${activeE2eeKey}`)
-        console.log(`[allinone] 已生成离线二维码页面：${e2eeHtmlPath}`)
+        console.log(`[allinone] 已生成临时离线二维码页面（2 分钟后或退出时自动销毁）：${e2eeHtmlPath}`)
         console.log('')
         return
       }

@@ -18,12 +18,13 @@ import {
   protocol,
   safeStorage,
   screen,
+  session,
   shell,
 } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
-import { dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DesktopBridgeManager } from './bridge-manager.js'
 import { DesktopUpdater } from './updater.js'
@@ -171,7 +172,14 @@ function setAutoLaunchEnabled(enabled) {
 const desktopSecretStore = {
   isAvailable() {
     try {
-      return Boolean(safeStorage?.isEncryptionAvailable?.())
+      if (!safeStorage?.isEncryptionAvailable?.()) return false
+      if (
+        typeof safeStorage.getSelectedStorageBackend === 'function' &&
+        safeStorage.getSelectedStorageBackend() === 'basic_text'
+      ) {
+        return false
+      }
+      return true
     } catch {
       return false
     }
@@ -368,12 +376,23 @@ function createMainWindow({ showOnReady = true } = {}) {
   win.on('resized', () => saveWindowBounds(win))
   win.on('moved', () => saveWindowBounds(win))
 
-  const devUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
+  let devUrl = ''
   let devOrigin = ''
-  if (devUrl) {
-    try {
-      devOrigin = new URL(devUrl).origin
-    } catch {}
+  if (!app.isPackaged) {
+    const rawDevUrl = String(process.env.ALLINONE_DESKTOP_DEV_URL || '').trim()
+    if (rawDevUrl) {
+      try {
+        const parsedDev = new URL(rawDevUrl)
+        const host = parsedDev.hostname.toLowerCase()
+        if (
+          (parsedDev.protocol === 'http:' || parsedDev.protocol === 'https:') &&
+          (host === '127.0.0.1' || host === 'localhost')
+        ) {
+          devUrl = parsedDev.toString()
+          devOrigin = parsedDev.origin
+        }
+      } catch {}
+    }
   }
 
   const isAllowedAppUrl = (url) => {
@@ -649,10 +668,10 @@ function registerStaticProtocol() {
         'X-Content-Type-Options': 'nosniff',
       }
       if (extname(target).toLowerCase() === '.html') {
-        const isSandboxFrame = target.endsWith(`${sep}sandbox-preview.html`)
+        const isSandboxFrame = basename(target).toLowerCase() === 'sandbox-preview.html'
         headers['Content-Security-Policy'] = isSandboxFrame
-          ? "sandbox allow-scripts allow-forms; default-src 'self' app: 'unsafe-inline' 'unsafe-eval' data: blob: https:; img-src * data: blob:; style-src * 'unsafe-inline'; font-src * data:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'"
-          : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https: http:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
+          ? "sandbox allow-scripts allow-forms; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'"
+          : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
       }
       return new Response(buf, {
         status: 200,
@@ -664,11 +683,71 @@ function registerStaticProtocol() {
   })
 }
 
+function assertTrustedIpcEvent(event) {
+  if (
+    !mainWindow ||
+    mainWindow.isDestroyed() ||
+    event?.sender !== mainWindow.webContents ||
+    event?.senderFrame !== mainWindow.webContents.mainFrame
+  ) {
+    throw new Error('Unauthorized IPC sender')
+  }
+}
+
+function registerPermissionHandlers() {
+  const ALLOWED_PERMISSIONS = new Set([
+    'media',
+    'clipboard-read',
+    'clipboard-sanitized-write',
+    'notifications',
+  ])
+  const isTrustedOrigin = (rawOrigin) => {
+    try {
+      const u = new URL(String(rawOrigin || ''))
+      if (u.protocol === 'app:' && u.hostname === 'allinone') return true
+      if (!app.isPackaged && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) return true
+      return false
+    } catch {
+      return false
+    }
+  }
+  const isAllowed = (webContents, permission, originCandidate, details) => {
+    if (!ALLOWED_PERMISSIONS.has(permission)) return false
+    if (!mainWindow || mainWindow.isDestroyed() || webContents !== mainWindow.webContents) return false
+    const secOrigin = String(details?.securityOrigin || originCandidate || '')
+    const reqUrl = String(details?.requestingUrl || '')
+    if (
+      secOrigin === 'null' ||
+      details?.isMainFrame === false ||
+      reqUrl.toLowerCase().includes('sandbox-preview.html')
+    ) {
+      return false
+    }
+    return isTrustedOrigin(secOrigin || reqUrl || webContents?.getURL?.() || '')
+  }
+
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    callback(isAllowed(webContents, permission, '', details))
+  })
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
+    return isAllowed(webContents, permission, requestingOrigin, details)
+  })
+}
+
 function registerIpc() {
   const desktopClientUid = loadOrCreateDesktopClientUid()
   const desktopHostname = String(hostname() || '').trim().slice(0, 40)
 
   ipcMain.on('desktop:get-init', (event) => {
+    if (
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      event?.sender !== mainWindow.webContents ||
+      event?.senderFrame !== mainWindow.webContents.mainFrame
+    ) {
+      event.returnValue = {}
+      return
+    }
     event.returnValue = {
       platform: process.platform,
       hostname: desktopHostname,
@@ -679,7 +758,8 @@ function registerIpc() {
     }
   })
 
-  ipcMain.handle('desktop:set-language', (_event, lang) => {
+  ipcMain.handle('desktop:set-language', (event, lang) => {
+    assertTrustedIpcEvent(event)
     const next = saveLangPref(lang)
     if (next !== currentLang) {
       currentLang = next
@@ -689,33 +769,43 @@ function registerIpc() {
     return currentLang
   })
 
-  ipcMain.handle('bridge:status', () => bridgeManager.getStatus())
+  ipcMain.handle('bridge:status', (event) => {
+    assertTrustedIpcEvent(event)
+    return bridgeManager.getStatus()
+  })
 
-  ipcMain.handle('bridge:sync-account', async (_event, account) => {
+  ipcMain.handle('bridge:sync-account', async (event, account) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.syncAccount(account)
   })
 
-  ipcMain.handle('bridge:stop', async () => {
+  ipcMain.handle('bridge:stop', async (event) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.stop({ nextState: 'idle' })
   })
 
-  ipcMain.handle('bridge:toggle', async () => {
+  ipcMain.handle('bridge:toggle', async (event) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.toggleEnabled()
   })
 
-  ipcMain.handle('bridge:e2ee-get', (_event, roomId) => {
+  ipcMain.handle('bridge:e2ee-get', (event, roomId) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.getE2eeInfo(roomId)
   })
 
-  ipcMain.handle('bridge:e2ee-set', async (_event, roomId, key) => {
+  ipcMain.handle('bridge:e2ee-set', async (event, roomId, key) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.setE2eeKey(roomId, key)
   })
 
-  ipcMain.handle('bridge:e2ee-rotate', async (_event, roomId) => {
+  ipcMain.handle('bridge:e2ee-rotate', async (event, roomId) => {
+    assertTrustedIpcEvent(event)
     return bridgeManager.rotateE2eeKey(roomId)
   })
 
-  ipcMain.handle('desktop:toggle-auto-launch', () => {
+  ipcMain.handle('desktop:toggle-auto-launch', (event) => {
+    assertTrustedIpcEvent(event)
     const next = !getAutoLaunchEnabled()
     setAutoLaunchEnabled(next)
     bridgeManager.emitStatus()
@@ -723,7 +813,8 @@ function registerIpc() {
     return bridgeManager.getStatus()
   })
 
-  ipcMain.handle('bridge:open-log', () => {
+  ipcMain.handle('bridge:open-log', (event) => {
+    assertTrustedIpcEvent(event)
     bridgeManager.ensureStateDir()
     if (existsSync(bridgeManager.logPath)) {
       return shell.openPath(bridgeManager.logPath)
@@ -732,8 +823,6 @@ function registerIpc() {
   })
 
   const SAFE_DELIVERABLE_EXTS = new Set([
-    '.html',
-    '.htm',
     '.pdf',
     '.doc',
     '.docx',
@@ -749,10 +838,18 @@ function registerIpc() {
     '.epub',
     '.zip',
   ])
+  const SAFE_REVEAL_DELIVERABLE_EXTS = new Set([
+    ...SAFE_DELIVERABLE_EXTS,
+    '.html',
+    '.htm',
+  ])
+  const isSafeWindowsLocalPath = (candidate) =>
+    !/^\\\\/.test(candidate) && /^[A-Za-z]:\\[^:]+$/.test(candidate)
 
-  const resolveSafeDesktopDeliverable = (rawPath, cwd = '') => {
+  const resolveSafeDesktopDeliverable = (rawPath, cwd = '', { allowHtml = false } = {}) => {
+    const allowedExts = allowHtml ? SAFE_REVEAL_DELIVERABLE_EXTS : SAFE_DELIVERABLE_EXTS
     let p = String(rawPath || '').trim()
-    if (!p) return { ok: false, error: '缺少文件路径' }
+    if (!p || p.includes('\0')) return { ok: false, error: '缺少文件路径' }
     if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
       p = p.slice(1, -1).trim()
     }
@@ -776,11 +873,11 @@ function registerIpc() {
     }
     const baseDir = String(cwd || '').trim() || homedir()
     const resolved = isAbsolute(p) ? resolve(p) : resolve(baseDir, p)
-    if (process.platform === 'win32' && !/^[A-Za-z]:\\/.test(resolved)) {
+    if (process.platform === 'win32' && !isSafeWindowsLocalPath(resolved)) {
       return { ok: false, error: '出于安全限制，仅允许打开本地磁盘上的交付文件' }
     }
     const ext = extname(resolved).toLowerCase()
-    if (!SAFE_DELIVERABLE_EXTS.has(ext)) {
+    if (!allowedExts.has(ext)) {
       return { ok: false, error: `不支持直接打开该格式（${ext || '未知格式'}）` }
     }
     if (!existsSync(resolved)) {
@@ -792,8 +889,11 @@ function registerIpc() {
     } catch (err) {
       return { ok: false, error: `无法访问本机文件：${String(err?.message || err)}` }
     }
+    if (process.platform === 'win32' && !isSafeWindowsLocalPath(realPath)) {
+      return { ok: false, error: '出于安全限制，符号链接目标仅允许指向本地磁盘文件' }
+    }
     const realExt = extname(realPath).toLowerCase()
-    if (!SAFE_DELIVERABLE_EXTS.has(realExt)) {
+    if (!allowedExts.has(realExt)) {
       return { ok: false, error: `符号链接目标格式不受支持（${realExt || '未知格式'}）` }
     }
     let isFile = false
@@ -808,25 +908,40 @@ function registerIpc() {
     return { ok: true, realPath }
   }
 
-  ipcMain.handle('desktop:open-deliverable', async (_event, rawPath, cwd = '') => {
-    const check = resolveSafeDesktopDeliverable(rawPath, cwd)
+  ipcMain.handle('desktop:open-deliverable', async (event, rawPath, cwd = '') => {
+    assertTrustedIpcEvent(event)
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd, { allowHtml: false })
     if (!check.ok) return check
     const err = await shell.openPath(check.realPath)
     return err ? { ok: false, error: err } : { ok: true, path: check.realPath }
   })
 
-  ipcMain.handle('desktop:reveal-deliverable', (_event, rawPath, cwd = '') => {
-    const check = resolveSafeDesktopDeliverable(rawPath, cwd)
+  ipcMain.handle('desktop:reveal-deliverable', (event, rawPath, cwd = '') => {
+    assertTrustedIpcEvent(event)
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd, { allowHtml: true })
     if (!check.ok) return check
     shell.showItemInFolder(check.realPath)
     return { ok: true, path: check.realPath }
   })
 
-  ipcMain.handle('updater:state', () => updater.getState())
-  ipcMain.handle('updater:check', () => updater.checkForUpdates({ silent: false }))
-  ipcMain.handle('updater:download', () => updater.downloadUpdate())
-  ipcMain.handle('updater:cancel', () => updater.cancelDownload())
-  ipcMain.handle('updater:install', async () => {
+  ipcMain.handle('updater:state', (event) => {
+    assertTrustedIpcEvent(event)
+    return updater.getState()
+  })
+  ipcMain.handle('updater:check', (event) => {
+    assertTrustedIpcEvent(event)
+    return updater.checkForUpdates({ silent: false })
+  })
+  ipcMain.handle('updater:download', (event) => {
+    assertTrustedIpcEvent(event)
+    return updater.downloadUpdate()
+  })
+  ipcMain.handle('updater:cancel', (event) => {
+    assertTrustedIpcEvent(event)
+    return updater.cancelDownload()
+  })
+  ipcMain.handle('updater:install', async (event) => {
+    assertTrustedIpcEvent(event)
     return updater.installAndRestart({
       exePath: app.getPath('exe'),
       pid: process.pid,
@@ -854,6 +969,7 @@ if (!gotLock) {
     app.setName('All in One')
     currentLang = loadSavedLangPref()
     registerStaticProtocol()
+    registerPermissionHandlers()
     registerIpc()
     buildAppMenu()
 

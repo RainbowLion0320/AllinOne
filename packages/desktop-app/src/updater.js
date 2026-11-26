@@ -10,7 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   accessSync,
@@ -149,6 +149,7 @@ export function buildWindowsUpdateScripts({
   isPackaged = false,
   logPath = '',
   ps1Path = '',
+  expectedSha256 = '',
 }) {
   const safePid = Number(pid) || 0
   const escPs = (s) => String(s || '').replace(/['\u2018\u2019\u201A\u201B]/g, '$&$&')
@@ -157,6 +158,9 @@ export function buildWindowsUpdateScripts({
   const resolvedExe = resolve(exePath)
   const resolvedLog = logPath ? resolve(logPath) : ''
   const resolvedPs1 = ps1Path ? resolve(ps1Path) : ''
+  const cleanSha = /^[a-f0-9]{64}$/i.test(String(expectedSha256 || '').trim())
+    ? String(expectedSha256).trim().toLowerCase()
+    : ''
 
   const psScript = [
     "$ErrorActionPreference = 'SilentlyContinue'",
@@ -165,6 +169,7 @@ export function buildWindowsUpdateScripts({
     `$exePath = '${escPs(resolvedExe)}'`,
     `$relaunch = ${isPackaged ? 1 : 0}`,
     `$logPath = '${escPs(resolvedLog)}'`,
+    `$expectedSha = '${cleanSha}'`,
     'function Write-UpdLog([string]$msg) {',
     '  if (-not $logPath) { return }',
     '  try { Add-Content -LiteralPath $logPath -Value ("[" + (Get-Date -Format "o") + "] " + $msg) -Encoding UTF8 } catch {}',
@@ -181,6 +186,16 @@ export function buildWindowsUpdateScripts({
     '    break',
     '  }',
     '  Start-Sleep -Milliseconds 500',
+    '}',
+    'if ($expectedSha) {',
+    "  $actualSha = ''",
+    '  try { $actualSha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() } catch {}',
+    '  if ($actualSha -ne $expectedSha) {',
+    '    Write-UpdLog ("Pre-exec SHA-256 verification failed (expected=" + $expectedSha + " actual=" + $actualSha + "); aborting")',
+    '    Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue',
+    '    if ($PSCommandPath) { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }',
+    '    exit 1',
+    '  }',
     '}',
     'if (-not $exited) {',
     '  Write-UpdLog ("Old process still running after 30s (PID=" + $oldPid + "); launching interactive installer instead of /S")',
@@ -777,9 +792,10 @@ export class DesktopUpdater extends EventEmitter {
 
       if (this.platform === 'win32') {
         mkdirSync(this.downloadDir, { recursive: true })
-        const stamp = Date.now()
-        const ps1Path = join(this.downloadDir, `apply-update-${stamp}.ps1`)
-        const vbsPath = join(this.downloadDir, `apply-update-${stamp}.vbs`)
+        try { chmodSync(this.downloadDir, 0o700) } catch {}
+        const randId = randomBytes(6).toString('hex')
+        const ps1Path = join(this.downloadDir, `apply-update-${randId}.ps1`)
+        const vbsPath = join(this.downloadDir, `apply-update-${randId}.vbs`)
         const logPath = join(this.downloadDir, 'last-update.log')
         const { psScript, vbsScript } = buildWindowsUpdateScripts({
           installerPath,
@@ -788,15 +804,16 @@ export class DesktopUpdater extends EventEmitter {
           isPackaged,
           logPath,
           ps1Path,
+          expectedSha256,
         })
 
         try {
           // UTF-8 BOM for PowerShell 5.1 Unicode paths; UTF-16LE BOM for VBScript Unicode paths
-          writeFileSync(ps1Path, `\uFEFF${psScript}`, 'utf8')
+          writeFileSync(ps1Path, `\uFEFF${psScript}`, { encoding: 'utf8', mode: 0o700, flag: 'wx' })
           const wscriptExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe')
 
           if (existsSync(wscriptExe)) {
-            writeFileSync(vbsPath, `\uFEFF${vbsScript}`, 'utf16le')
+            writeFileSync(vbsPath, `\uFEFF${vbsScript}`, { encoding: 'utf16le', mode: 0o700, flag: 'wx' })
             await spawnDetachedHelper(wscriptExe, ['//B', '//Nologo', vbsPath], {
               detached: true,
               stdio: 'ignore',
@@ -847,24 +864,18 @@ export class DesktopUpdater extends EventEmitter {
 
         if (canSelfReplace) {
           mkdirSync(this.downloadDir, { recursive: true })
-          const helperPath = join(this.downloadDir, `apply-update-${Date.now()}.sh`)
+          try { chmodSync(this.downloadDir, 0o700) } catch {}
+          const helperPath = join(this.downloadDir, `apply-update-${randomBytes(6).toString('hex')}.sh`)
           const esc = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+          const cleanSha = /^[a-f0-9]{64}$/i.test(expectedSha256) ? expectedSha256.toLowerCase() : ''
           const script = [
             '#!/usr/bin/env bash',
             'set -euo pipefail',
             `OLD_PID=${Number(pid) || 0}`,
             `DMG=${esc(resolve(installerPath))}`,
             `TARGET_APP=${esc(appBundle)}`,
-            'WAITED=0',
-            'while [ "$OLD_PID" -gt 0 ] && kill -0 "$OLD_PID" 2>/dev/null; do',
-            '  WAITED=$((WAITED + 1))',
-            '  if [ "$WAITED" -ge 60 ]; then',
-            '    open "$DMG"',
-            '    exit 1',
-            '  fi',
-            '  sleep 0.5',
-            'done',
-            'MNT="$(mktemp -d /tmp/allinone-upd-XXXXXX)"',
+            `EXPECTED_SHA=${esc(cleanSha)}`,
+            'MNT=""',
             'cleanup() {',
             '  if [ -n "${MNT:-}" ] && [ -d "$MNT" ]; then',
             '    hdiutil detach "$MNT" -quiet 2>/dev/null || hdiutil detach "$MNT" -force -quiet 2>/dev/null || true',
@@ -873,6 +884,27 @@ export class DesktopUpdater extends EventEmitter {
             '  rm -f "$0" 2>/dev/null || true',
             '}',
             'trap cleanup EXIT',
+            'verify_dmg_sha() {',
+            '  if [ -n "$EXPECTED_SHA" ]; then',
+            '    ACTUAL_SHA="$(shasum -a 256 "$DMG" 2>/dev/null | awk \'{print tolower($1)}\')"',
+            '    if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then',
+            '      rm -f "$DMG" 2>/dev/null || true',
+            '      exit 1',
+            '    fi',
+            '  fi',
+            '}',
+            'WAITED=0',
+            'while [ "$OLD_PID" -gt 0 ] && kill -0 "$OLD_PID" 2>/dev/null; do',
+            '  WAITED=$((WAITED + 1))',
+            '  if [ "$WAITED" -ge 60 ]; then',
+            '    verify_dmg_sha',
+            '    open "$DMG"',
+            '    exit 1',
+            '  fi',
+            '  sleep 0.5',
+            'done',
+            'verify_dmg_sha',
+            'MNT="$(mktemp -d /tmp/allinone-upd-XXXXXX)"',
             'if ! hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null 2>&1; then',
             '  open "$DMG"',
             '  exit 1',
@@ -901,7 +933,7 @@ export class DesktopUpdater extends EventEmitter {
             'fi',
           ].join('\n')
           try {
-            writeFileSync(helperPath, script, 'utf8')
+            writeFileSync(helperPath, script, { encoding: 'utf8', mode: 0o700, flag: 'wx' })
             try { chmodSync(helperPath, 0o700) } catch {}
             await spawnDetachedHelper('/bin/bash', [helperPath], {
               detached: true,

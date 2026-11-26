@@ -35,6 +35,7 @@ import {
   setAccountLogin2fa,
 } from './lib/wsClient.js'
 import {
+  clearDeviceCredentials,
   getActiveDevice,
   getCacheScopeKey,
   getDeviceDisplayName,
@@ -417,7 +418,7 @@ export function App() {
 
   // Keep Desktop UI's local E2EE key ring synced with the embedded bridge key (zero friction on the host PC!)
   useEffect(() => {
-    if (!desktopApi || !activeDevice?.id || !activeDevice?.roomId?.startsWith('usr_')) return
+    if (!desktopApi || !activeDevice?.id || !activeDevice?.token || !activeDevice?.roomId?.startsWith('usr_')) return
     let cancelled = false
     desktopApi
       .getE2eeInfo?.(activeDevice.roomId)
@@ -429,7 +430,7 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [desktopApi, activeDevice?.id, activeDevice?.roomId, desktopBridge?.e2eeKeyId, desktopBridge?.state])
+  }, [desktopApi, activeDevice?.id, activeDevice?.token, activeDevice?.roomId, desktopBridge?.e2eeKeyId, desktopBridge?.state])
 
   // Desktop keyboard shortcuts (Cmd/Ctrl+N new chat, Cmd/Ctrl+K switch computer, Esc close modals)
   useEffect(() => {
@@ -1374,12 +1375,15 @@ export function App() {
     }
   }, [])
 
+  const hasActiveToken = Boolean(activeDevice?.token)
+  const revokedWipeGuardRef = useRef('')
+
   // Connect WebSocket whenever the active saved account changes
   useEffect(() => {
     const devSnap = activeDeviceRef.current
     const initialToken = activeDeviceTokenRef.current
     if (!activeDevice?.id || !activeDevice?.baseUrl || !initialToken) {
-      setConnState('disconnected')
+      setConnState(activeDevice?.id && activeDevice?.baseUrl && !initialToken ? 'unauthorized' : 'disconnected')
       setConnError('')
       setP2pState('idle')
       setP2pError('')
@@ -1469,6 +1473,7 @@ export function App() {
       }
       if (
         event === EVENTS.E2EE_GRANT_OFFER ||
+        event === 'e2ee.grant.reveal' ||
         event === EVENTS.E2EE_GRANT_DELIVER ||
         event === EVENTS.E2EE_GRANT_REJECT
       ) {
@@ -1739,7 +1744,39 @@ export function App() {
         clientRef.current = null
       }
     }
-  }, [activeDevice?.id, activeDevice?.baseUrl, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+  }, [activeDevice?.id, activeDevice?.baseUrl, hasActiveToken, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+
+  // On confirmed 401 / WS 4401 remote revocation, immediately wipe local secrets, caches, drafts & in-memory state
+  useEffect(() => {
+    if (connState !== 'unauthorized') {
+      revokedWipeGuardRef.current = ''
+      return
+    }
+    const devId = activeDevice?.id
+    if (!devId || revokedWipeGuardRef.current === devId) return
+    revokedWipeGuardRef.current = devId
+    const devRoomId = activeDevice?.roomId || ''
+
+    setDeviceState((prev) => clearDeviceCredentials(prev, devId))
+    void clearSessionCache(devId, { prefix: true })
+    void clearE2eeMediaCache({ persistent: true, ...(devRoomId ? { roomId: devRoomId } : {}) })
+    clearDraftsForScope(devId)
+    resetTransientWorkspace()
+    setBridges([])
+    setAccountDevices([])
+    setClientSessions({
+      sessions: [],
+      onlineCount: 0,
+      onlineDeviceCount: 0,
+      totalCount: 0,
+    })
+    setLiveOnlineClientCount(0)
+    setPendingGrantPopup(null)
+    setQrNudge(null)
+    try {
+      window.Capacitor?.Plugins?.AllinOneFiles?.clearSharedCache?.().catch?.(() => {})
+    } catch {}
+  }, [connState, activeDevice?.id, activeDevice?.roomId, resetTransientWorkspace])
 
   // Hot-swap rotated JWT without tearing down an active WebSocket; only reconnect if unauthorized
   useEffect(() => {
@@ -1967,13 +2004,14 @@ export function App() {
   )
 
   const handleBindAccountEmail = useCallback(
-    async (targetEmail, code) => {
+    async (targetEmail, code, currentPassword = '') => {
       if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) {
         throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
       }
       const user = await bindAccountEmail(activeDevice.baseUrl, activeDevice.token, {
         email: targetEmail,
         code,
+        currentPassword,
       })
       const boundEmail = user?.email || targetEmail
       setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { email: boundEmail }))
@@ -1984,10 +2022,15 @@ export function App() {
   )
 
   const handleToggleLoginEmail2fa = useCallback(
-    async (enabled) => {
+    async (enabled, currentPassword = '') => {
       if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) return
       try {
-        const user = await setAccountLogin2fa(activeDevice.baseUrl, activeDevice.token, enabled)
+        const user = await setAccountLogin2fa(
+          activeDevice.baseUrl,
+          activeDevice.token,
+          enabled,
+          currentPassword,
+        )
         setDeviceState((prev) =>
           updateDeviceMeta(prev, activeDevice.id, { loginEmail2fa: Boolean(user?.loginEmail2fa) }),
         )
@@ -1998,6 +2041,9 @@ export function App() {
             : biLang(curLang, '已关闭登录邮箱二次验证', 'Email login 2FA disabled'),
         )
       } catch (err) {
+        if (!enabled) {
+          throw err
+        }
         showToast(String(err?.message || err))
       }
     },
@@ -2120,6 +2166,7 @@ export function App() {
         ...match,
         qrVerified: true,
         qrPubKeyFp: grantQr.pubKeyFp,
+        qrGrantSecret: grantQr.grantSecret || '',
       })
       return true
     },

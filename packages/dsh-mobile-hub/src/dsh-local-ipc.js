@@ -11,12 +11,13 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 const IPC_FILE_NAME = 'allinone-dsh-ipc.json'
+const MAX_SSE_CLIENTS = 16
 const ALLOWED_METHODS = new Set([
   'listModels',
   'listWorkspaces',
@@ -96,6 +97,7 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
   const ipcFile = getDshIpcFilePath(dshHome)
   const token = randomBytes(32).toString('hex')
   const sseClients = new Set()
+  let boundPort = 0
 
   const isAuthorized = (req) => {
     const auth = String(req.headers.authorization || '').trim()
@@ -105,9 +107,25 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
 
   const server = http.createServer(async (req, res) => {
     try {
-      // Anti-DNS-rebinding & anti-browser CSRF: reject any cross-origin/browser Origin header
+      // Anti-DNS-rebinding & anti-browser CSRF: reject Origin, browser Sec-Fetch-Site, and non-loopback Host headers
       if (req.headers.origin) {
         sendJson(res, 403, { ok: false, error: 'Browser origins are not allowed on local DSH IPC' })
+        return
+      }
+      const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase()
+      if (secFetchSite && secFetchSite !== 'none') {
+        sendJson(res, 403, { ok: false, error: 'Browser cross-site requests are not allowed on local DSH IPC' })
+        return
+      }
+      const activePort = boundPort || (typeof server.address() === 'object' ? server.address()?.port : 0) || 0
+      const hostHeader = String(req.headers.host || '').trim().toLowerCase()
+      const allowedHosts = new Set([
+        `127.0.0.1:${activePort}`,
+        `localhost:${activePort}`,
+        `[::1]:${activePort}`,
+      ])
+      if (!activePort || !allowedHosts.has(hostHeader)) {
+        sendJson(res, 403, { ok: false, error: 'Invalid Host header on local DSH IPC' })
         return
       }
       if (!isAuthorized(req)) {
@@ -135,6 +153,10 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
       }
 
       if (req.method === 'GET' && pathname === '/events') {
+        if (sseClients.size >= MAX_SSE_CLIENTS) {
+          sendJson(res, 429, { ok: false, error: 'Too many SSE clients connected' })
+          return
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-store',
@@ -244,23 +266,31 @@ export async function startDshLocalIpcServer({ dshAdapter, dshHome = '', log = c
 
   const addr = server.address()
   const port = typeof addr === 'object' && addr ? addr.port : 0
+  boundPort = port
 
   try {
-    mkdirSync(dirname(ipcFile), { recursive: true })
-    writeFileSync(
-      ipcFile,
-      JSON.stringify(
-        {
-          port,
-          token,
-          pid: process.pid,
-          startedAt: Date.now(),
-        },
-        null,
-        2,
-      ),
-      { encoding: 'utf8', mode: 0o600 },
+    const ipcDir = dirname(ipcFile)
+    mkdirSync(ipcDir, { recursive: true, mode: 0o700 })
+    try { chmodSync(ipcDir, 0o700) } catch {}
+    const payload = JSON.stringify(
+      {
+        port,
+        token,
+        pid: process.pid,
+        startedAt: Date.now(),
+      },
+      null,
+      2,
     )
+    const tmpFile = `${ipcFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+    writeFileSync(tmpFile, payload, { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(tmpFile, 0o600) } catch {}
+    try {
+      renameSync(tmpFile, ipcFile)
+    } catch (renameErr) {
+      try { unlinkSync(tmpFile) } catch {}
+      throw renameErr
+    }
     try { chmodSync(ipcFile, 0o600) } catch {}
   } catch (err) {
     log.warn?.(`mobile-hub: failed to write DSH IPC descriptor ${ipcFile}: ${String(err)}`)

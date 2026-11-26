@@ -1,8 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path'
-import { APPS, APP_LIST, EVENTS, RPC, makeCompositeId, parseCompositeId } from './protocol.js'
+import { homedir } from 'node:os'
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  APPS,
+  APP_LIST,
+  EVENTS,
+  RPC,
+  assertSafeWorkspaceCwd,
+  getWindowsSystemRootNorm,
+  makeCompositeId,
+  parseCompositeId,
+} from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
@@ -10,6 +19,7 @@ import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
 
 const P2P_UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes
+const MAX_P2P_UPLOADS = 128
 const MAX_P2P_DOCUMENT_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local safety cap
 const MAX_P2P_IMAGE_BYTES = 100 * 1024 * 1024 // 100 MB image cap
 
@@ -64,6 +74,28 @@ export class MultiAppOrchestrator {
     }
   }
 
+  _isPathInsideInboundDir(filePath, { requireExists = true } = {}) {
+    const raw = String(filePath || '').trim()
+    if (!raw) return false
+    const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin'
+    const cmp = (p) => (caseInsensitive ? p.toLowerCase() : p)
+    const baseDir = resolve(this.inboundDir)
+    const cleanPath = resolve(raw)
+    const basePrefix = cmp(baseDir).endsWith(sep) ? cmp(baseDir) : `${cmp(baseDir)}${sep}`
+    if (!cmp(cleanPath).startsWith(basePrefix)) return false
+    if (existsSync(cleanPath)) {
+      try {
+        const realBase = realpathSync(baseDir)
+        const realPath = realpathSync(cleanPath)
+        const realPrefix = cmp(realBase).endsWith(sep) ? cmp(realBase) : `${cmp(realBase)}${sep}`
+        return cmp(realPath).startsWith(realPrefix)
+      } catch {
+        return false
+      }
+    }
+    return !requireExists
+  }
+
   /**
    * Register a verified P2P uploaded file inside `inboundDir` and return an opaque token.
    * Ensures callers can NEVER inject arbitrary local file paths in `RPC.SESSION_SEND`.
@@ -73,14 +105,18 @@ export class MultiAppOrchestrator {
     for (const [tok, rec] of this.p2pUploads.entries()) {
       if (now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS) this.p2pUploads.delete(tok)
     }
+    while (this.p2pUploads.size >= MAX_P2P_UPLOADS) {
+      const oldest = this.p2pUploads.keys().next().value
+      if (!oldest) break
+      this.p2pUploads.delete(oldest)
+    }
     const cleanPath = resolve(String(localPath || ''))
-    const baseDir = resolve(this.inboundDir)
-    if (!cleanPath.startsWith(`${baseDir}${sep}`)) {
+    if (!this._isPathInsideInboundDir(cleanPath, { requireExists: false })) {
       throw new Error('Rejected P2P upload path outside inbound directory')
     }
     const token = `p2p_${randomUUID().replace(/-/g, '')}`
     this.p2pUploads.set(token, {
-      clientId: String(clientId || ''),
+      clientId: String(clientId || '').trim(),
       localPath: cleanPath,
       filename: String(filename || basename(cleanPath)),
       mimeType: String(mimeType || 'application/octet-stream'),
@@ -206,8 +242,9 @@ export class MultiAppOrchestrator {
   }
 
   async createSession({ app = APPS.DSH, cwd, title, model, provider, reasoningEffort, sandbox, approvalPolicy } = {}) {
+    const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true }) || undefined
     const created = await this.getAdapter(app).createSession({
-      cwd,
+      cwd: safeCwd,
       title,
       model,
       provider,
@@ -267,7 +304,7 @@ export class MultiAppOrchestrator {
         rejectedTokens += 1
         continue
       }
-      if (rec.clientId && callerClientId && rec.clientId !== callerClientId) {
+      if (rec.clientId && rec.clientId !== callerClientId) {
         this.log.warn?.('mobile-hub: rejected cross-client p2pToken attempt')
         rejectedTokens += 1
         continue
@@ -289,7 +326,9 @@ export class MultiAppOrchestrator {
       // Restore any tokens already consumed in this batch before throwing
       if (Array.isArray(_burnedOut)) {
         for (const item of _burnedOut) {
-          this.p2pUploads.set(item.token, item.rec)
+          if (item?.token && item?.rec?.localPath && this._isPathInsideInboundDir(item.rec.localPath)) {
+            this.p2pUploads.set(item.token, item.rec)
+          }
         }
         _burnedOut.length = 0
       }
@@ -307,18 +346,36 @@ export class MultiAppOrchestrator {
     return false
   }
 
-  async sendMessage({ id, app, sessionId, text, cwd, title, attachments = [], approvalPolicy, permissionMode, taskMode, model, provider, reasoningEffort, _clientId = '', _preMaterialized = null, _burnedTokens = null } = {}) {
+  async sendMessage(
+    {
+      id,
+      app,
+      sessionId,
+      text,
+      cwd,
+      title,
+      attachments = [],
+      approvalPolicy,
+      permissionMode,
+      taskMode,
+      model,
+      provider,
+      reasoningEffort,
+    } = {},
+    { clientId = '', preMaterialized = null, burnedTokens = null } = {},
+  ) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
+    const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true }) || undefined
     const adapter = this.getAdapter(parsed.app)
-    const burned = Array.isArray(_burnedTokens) ? _burnedTokens : []
-    const materialized = Array.isArray(_preMaterialized)
-      ? _preMaterialized
-      : await this.materializeAttachments(attachments, { clientId: _clientId, strict: true, _burnedOut: burned })
+    const burned = Array.isArray(burnedTokens) ? burnedTokens : []
+    const materialized = Array.isArray(preMaterialized)
+      ? preMaterialized
+      : await this.materializeAttachments(attachments, { clientId, strict: true, _burnedOut: burned })
     try {
       const result = await adapter.sendMessage(parsed.sessionId, {
         text,
-        cwd,
+        cwd: safeCwd,
         title,
         attachments: materialized,
         approvalPolicy,
@@ -333,7 +390,7 @@ export class MultiAppOrchestrator {
       // Restore single-use p2pTokens if the turn was rejected before execution (e.g. SESSION_BUSY)
       if (burned.length > 0 && (err?.code === 'SESSION_BUSY' || !err?._streamErrorEmitted)) {
         for (const item of burned) {
-          if (existsSync(item.rec.localPath)) {
+          if (item?.token && item?.rec?.localPath && this._isPathInsideInboundDir(item.rec.localPath)) {
             this.p2pUploads.set(item.token, item.rec)
           }
         }
@@ -414,6 +471,7 @@ export class MultiAppOrchestrator {
     if (!String(prompt || '').trim()) {
       throw new Error('派单任务内容 prompt 不能为空')
     }
+    const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true })
 
     let targetNativeId = sessionId
     if (targetNativeId && targetNativeId.includes(':')) {
@@ -423,7 +481,7 @@ export class MultiAppOrchestrator {
     if (!targetNativeId) {
       const created = await this.createSession({
         app,
-        cwd: cwd || this.config.cwd,
+        cwd: safeCwd || this.config.cwd,
         title: title || `总控派单 · ${String(prompt).trim().slice(0, 24)}`,
       })
       targetNativeId = created.nativeId
@@ -436,7 +494,7 @@ export class MultiAppOrchestrator {
       app,
       sessionId: compositeId,
       nativeId: targetNativeId,
-      cwd: cwd || this.config.cwd || '',
+      cwd: safeCwd || this.config.cwd || '',
       prompt: String(prompt),
       issuedBy,
       status: 'running',
@@ -465,7 +523,7 @@ export class MultiAppOrchestrator {
       app,
       sessionId: targetNativeId,
       text: prompt,
-      cwd,
+      cwd: safeCwd,
     })
       .then((res) => {
         task.status = res.aborted ? 'aborted' : 'completed'
@@ -627,8 +685,12 @@ export class MultiAppOrchestrator {
 
     // Enforce sensitive directory & credential blocklist for BOTH document and image modes
     const normReal = realPath.replace(/\\/g, '/').toLowerCase()
-    const segments = normReal.split('/').filter(Boolean)
+    const inInboundDir = this._isPathInsideInboundDir(realPath)
+    const segments = inInboundDir
+      ? relative(realpathSync(resolve(this.inboundDir)), realPath).replace(/\\/g, '/').toLowerCase().split('/').filter(Boolean)
+      : normReal.split('/').filter(Boolean)
     const fileName = basename(realPath).toLowerCase()
+    const winSysRoot = getWindowsSystemRootNorm()
     const BLOCKED_SEGMENTS = new Set([
       '.ssh',
       '.aws',
@@ -639,13 +701,19 @@ export class MultiAppOrchestrator {
       '.allinone',
       '.allinone-bridge',
       '.dsh-mobile',
-      '.dsh',
       '.git',
       'keychains',
     ])
     const isBlockedDir =
       segments.some((seg) => BLOCKED_SEGMENTS.has(seg)) ||
+      (!inInboundDir && (
+        normReal.includes('/.dsh/profiles/') ||
+        normReal.includes('/.dsh/storages/') ||
+        normReal.includes('/.dsh/config/')
+      )) ||
       normReal.includes('/.gemini/config/') ||
+      normReal.includes('/.codex/auth') ||
+      normReal.includes('/.claude/.credentials') ||
       normReal.includes('/library/application support/google/chrome/') ||
       normReal.includes('/library/application support/microsoft edge/') ||
       normReal.includes('/library/application support/firefox/') ||
@@ -657,17 +725,20 @@ export class MultiAppOrchestrator {
       normReal.startsWith('/proc/') ||
       normReal.startsWith('/sys/') ||
       normReal.startsWith('/system/') ||
+      normReal === winSysRoot ||
+      normReal.startsWith(`${winSysRoot}/`) ||
       normReal.startsWith('c:/windows/')
     const isBlockedName =
       /^\.env(?:\.|$)/i.test(fileName) ||
-      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json|e2ee-key\.html)(?:\.|$)/i.test(fileName) ||
+      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json|allinone-dsh-ipc\.json|e2ee-key\.html)(?:\.|$)/i.test(fileName) ||
       /^(?:secrets?|credentials?|passwords?|tokens?)\.(?:txt|csv|md|zip)$/i.test(fileName) ||
       /\.(?:pem|key|p12|pfx|kdbx)$/i.test(fileName)
     if (isBlockedDir || isBlockedName) {
       throw new Error('出于安全限制，禁止远程下载系统敏感目录或凭据文件')
     }
 
-    if (isDocumentMode) {
+    // Enforce allowed-root scope guard for BOTH document and image modes
+    {
       const caseInsensitiveFs = process.platform === 'win32' || process.platform === 'darwin'
       const cmpPath = (targetPath) => (caseInsensitiveFs ? targetPath.toLowerCase() : targetPath)
       const normTarget = cmpPath(realPath)
@@ -703,16 +774,18 @@ export class MultiAppOrchestrator {
         return false
       }
 
-      // Security: NEVER trust caller-supplied `cwd` as an allowed root (prevents `cwd: '/'` bypass)
+      // Security: NEVER trust caller-supplied `cwd` or global `/tmp` as an allowed root
       const fastRoots = [
         this.config.cwd,
+        this.inboundDir,
         join(home, 'Desktop'),
         join(home, 'Downloads'),
         join(home, 'Documents'),
-        join(home, '.gemini', 'antigravity', 'brain'),
-        join(home, '.claude', 'plans'),
-        tmpdir(),
-        process.platform !== 'win32' ? '/tmp' : '',
+        ...(!isDocumentMode ? [join(home, 'Pictures')] : []),
+        join(home, '.dsh'),
+        join(home, '.codex'),
+        join(home, '.claude'),
+        join(home, '.gemini'),
       ]
       let inAllowedRoot = checkRoots(fastRoots)
       if (!inAllowedRoot) {
@@ -722,7 +795,11 @@ export class MultiAppOrchestrator {
         } catch {}
       }
       if (!inAllowedRoot) {
-        throw new Error('出于安全限制，仅允许远程下载当前工作目录、已识别项目目录或桌面/文档/下载目录中的交付文件')
+        throw new Error(
+          isDocumentMode
+            ? '出于安全限制，仅允许远程下载当前工作目录、已识别项目目录或桌面/文档/下载目录中的交付文件'
+            : '出于安全限制，仅允许远程预览当前工作目录、已识别项目目录、AI 产物目录或桌面/文档/下载目录中的图片文件',
+        )
       }
     }
 
@@ -810,12 +887,28 @@ export class MultiAppOrchestrator {
       case RPC.SESSION_CREATE:
         return { session: await this.createSession(params) }
       case RPC.SESSION_SEND: {
-        const targetId = params.id || makeCompositeId(params.app || APPS.DSH, params.sessionId)
+        const targetId = params?.id || makeCompositeId(params?.app || APPS.DSH, params?.sessionId)
         const parsed = parseCompositeId(targetId)
-        const sendParams = ctx?.clientId ? { ...params, _clientId: ctx.clientId } : params
-        if (params.wait === true) {
-          return await this.sendMessage(sendParams)
+        // Strictly allowlist public fields (NEVER spread untrusted params with internal options)
+        const publicParams = {
+          app: parsed.app,
+          sessionId: parsed.sessionId,
+          text: params?.text,
+          cwd: params?.cwd,
+          model: params?.model,
+          provider: params?.provider,
+          reasoningEffort: params?.reasoningEffort,
+          taskMode: params?.taskMode,
+          attachments: params?.attachments,
+          wait: params?.wait,
+          timeoutMs: params?.timeoutMs,
         }
+        const callerClientId = String(ctx?.clientId || '').trim()
+        if (publicParams.wait === true) {
+          return await this.sendMessage(publicParams, { clientId: callerClientId })
+        }
+        // Validate remote cwd synchronously before returning { accepted: true }
+        assertSafeWorkspaceCwd(publicParams.cwd, { allowEmpty: true })
         // Fail fast synchronously on busy sessions or expired attachment tokens BEFORE returning { accepted: true }
         const adapter = this.getAdapter(parsed.app)
         if (this._isAdapterSessionBusy(adapter, parsed.sessionId)) {
@@ -824,15 +917,15 @@ export class MultiAppOrchestrator {
           throw err
         }
         const burnedTokens = []
-        const preMaterialized = await this.materializeAttachments(params.attachments || [], {
-          clientId: ctx?.clientId || '',
+        const preMaterialized = await this.materializeAttachments(publicParams.attachments || [], {
+          clientId: callerClientId,
           strict: true,
           _burnedOut: burnedTokens,
         })
-        void this.sendMessage({
-          ...sendParams,
-          _preMaterialized: preMaterialized,
-          _burnedTokens: burnedTokens,
+        void this.sendMessage(publicParams, {
+          clientId: callerClientId,
+          preMaterialized,
+          burnedTokens,
         }).catch((err) => {
           const msg = String(err?.message || err)
           this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)

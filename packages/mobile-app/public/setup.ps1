@@ -7,6 +7,12 @@ if ($ServerUrl -notmatch '^https?://[A-Za-z0-9._:/\[\]-]+$' -or $ServerUrl -matc
     Write-Host '    Please set $env:ALLINONE_SERVER to your real relay server URL (e.g. https://ai.example.com).' -ForegroundColor Yellow
     return
 }
+$IsLoopback = $ServerUrl -match '^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$'
+if (-not $IsLoopback -and $ServerUrl -notmatch '^https://') {
+    Write-Host "[!] Refusing insecure non-HTTPS server URL: $ServerUrl" -ForegroundColor Red
+    Write-Host '    HTTPS is required for all non-localhost relay servers.' -ForegroundColor Yellow
+    return
+}
 $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $InstallDir = Join-Path $HomeDir '.allinone-bridge'
 $BridgeFile = Join-Path $InstallDir 'allinone-bridge.mjs'

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { EVENTS, P2P_PROTOCOL_VERSION } from '@allinone/shared'
+import { APP_LIST, EVENTS, P2P_PROTOCOL_VERSION } from '@allinone/shared'
 
+const ALLOWED_APPS = new Set(APP_LIST)
 const ACTIVITY_LOG_MAX = 80
 const ROOM_STATS_MAX = 2000
 const E2EE_GRANT_TTL_MS = 120_000
@@ -11,6 +12,85 @@ const MAX_CLIENTS_PER_ROOM = 30
 const MAX_BRIDGES_PER_ROOM = 16
 const MAX_P2P_SIGNAL_BYTES = 64 * 1024
 const SAFE_SIGNAL_ID_RE = /^[a-zA-Z0-9_-]{8,64}$/
+const WS_MSG_RATE_PER_SEC = 120
+const WS_MSG_BURST = 300
+const WS_MSG_VIOLATION_CLOSE = 30
+const WS_MAX_BUFFERED_BYTES = 2 * 1024 * 1024
+const WS_MAX_BACKPRESSURE_DROPS = 5
+
+function createWsRateBucket(ratePerSec = WS_MSG_RATE_PER_SEC, burst = WS_MSG_BURST) {
+  let tokens = burst
+  let lastRefill = Date.now()
+  let violations = 0
+  return {
+    consume() {
+      const now = Date.now()
+      const elapsedSec = (now - lastRefill) / 1000
+      if (elapsedSec > 0) {
+        tokens = Math.min(burst, tokens + elapsedSec * ratePerSec)
+        lastRefill = now
+      }
+      if (tokens >= 1) {
+        tokens -= 1
+        violations = 0
+        return { ok: true, terminate: false }
+      }
+      violations += 1
+      return { ok: false, terminate: violations >= WS_MSG_VIOLATION_CLOSE }
+    },
+  }
+}
+
+function sanitizeBridgeApps(rawApps) {
+  if (!Array.isArray(rawApps)) return []
+  const out = []
+  const seen = new Set()
+  for (const a of rawApps) {
+    if (!a || typeof a !== 'object') continue
+    const app = typeof a.app === 'string' ? a.app.trim() : ''
+    if (!ALLOWED_APPS.has(app) || seen.has(app)) continue
+    seen.add(app)
+    const activeNum = Number(a.activeCount)
+    out.push({
+      app,
+      available: Boolean(a.available),
+      writable: Boolean(a.writable),
+      activeCount: Number.isFinite(activeNum) ? Math.max(0, Math.min(9999, Math.floor(activeNum))) : 0,
+    })
+    if (out.length >= APP_LIST.length) break
+  }
+  return out
+}
+
+function sanitizeBridgeE2ee(rawE2ee) {
+  if (!rawE2ee || typeof rawE2ee !== 'object') return null
+  const rawKeyId = String(rawE2ee.keyId || '').trim()
+  const keyId = /^[0-9a-f]{16}$/i.test(rawKeyId) ? rawKeyId.toLowerCase() : ''
+  const vNum = Number(rawE2ee.v)
+  return {
+    enabled: Boolean(rawE2ee.enabled),
+    v: Number.isFinite(vNum) && vNum > 0 ? Math.floor(vNum) : 1,
+    keyId,
+  }
+}
+
+function sanitizeBridgeConnectMeta(meta, roomId, bridgeId) {
+  const src = meta && typeof meta === 'object' ? meta : {}
+  const e2ee = src.e2ee ? sanitizeBridgeE2ee(src.e2ee) : null
+  return {
+    roomId,
+    bridgeId,
+    deviceId: String(src.deviceId || '').trim().slice(0, 64),
+    label: String(src.label || '').trim().slice(0, 64),
+    hostname: String(src.hostname || bridgeId).trim().slice(0, 64) || bridgeId,
+    platform: String(src.platform || 'unknown').trim().slice(0, 32) || 'unknown',
+    mode: String(src.mode || 'desktop').trim().slice(0, 32) || 'desktop',
+    p2pEngine: String(src.p2pEngine || '').trim().slice(0, 32),
+    ip: String(src.ip || '').trim().slice(0, 64),
+    apps: Array.isArray(src.apps) ? sanitizeBridgeApps(src.apps) : [],
+    ...(e2ee && e2ee.keyId ? { e2ee } : {}),
+  }
+}
 
 /**
  * Parse raw client `dev` tag and HTTP `User-Agent` into a clean human-readable device name & category.
@@ -128,6 +208,7 @@ export class RelayHub {
     }
     this.activityLog = []
     this._activitySeq = 0
+    /** @type {Map<string, Map<string, any>>} Partitioned per-room E2EE grants: roomId -> Map<reqId, grant> */
     this.e2eeGrants = new Map()
 
     this._grantSweepTimer = setInterval(() => {
@@ -177,12 +258,40 @@ export class RelayHub {
     }
   }
 
-  pruneExpiredGrants(now = Date.now()) {
-    for (const [reqId, g] of this.e2eeGrants.entries()) {
+  _getRoomGrantMap(roomId, create = false) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return null
+    let roomMap = this.e2eeGrants.get(rid)
+    if (!roomMap && create) {
+      roomMap = new Map()
+      this.e2eeGrants.set(rid, roomMap)
+    }
+    return roomMap || null
+  }
+
+  _deleteGrant(roomId, reqId) {
+    const roomMap = this.e2eeGrants.get(roomId)
+    if (!roomMap) return false
+    const deleted = roomMap.delete(reqId)
+    if (roomMap.size === 0) this.e2eeGrants.delete(roomId)
+    return deleted
+  }
+
+  pruneExpiredGrantsForRoom(roomId, now = Date.now()) {
+    const roomMap = this.e2eeGrants.get(roomId)
+    if (!roomMap) return
+    for (const [reqId, g] of roomMap.entries()) {
       if (now >= g.expiresAt || !this.clients.has(g.requesterClientId)) {
-        this.e2eeGrants.delete(reqId)
+        roomMap.delete(reqId)
         this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'expired' })
       }
+    }
+    if (roomMap.size === 0) this.e2eeGrants.delete(roomId)
+  }
+
+  pruneExpiredGrants(now = Date.now()) {
+    for (const roomId of [...this.e2eeGrants.keys()]) {
+      this.pruneExpiredGrantsForRoom(roomId, now)
     }
   }
 
@@ -196,6 +305,7 @@ export class RelayHub {
       ip: g.ip,
       pubKey: g.pubKey,
       wantedKeyId: g.wantedKeyId || '',
+      ...(g.commit ? { commit: g.commit } : {}),
       createdAt: g.createdAt,
       expiresAt: g.expiresAt,
     }
@@ -205,15 +315,36 @@ export class RelayHub {
     const rid = String(roomId || '').trim()
     if (!rid) return []
     const now = Date.now()
-    this.pruneExpiredGrants(now)
+    this.pruneExpiredGrantsForRoom(rid, now)
+    const roomMap = this.e2eeGrants.get(rid)
+    if (!roomMap || roomMap.size === 0) return []
     const out = []
-    for (const g of this.e2eeGrants.values()) {
-      if (g.roomId !== rid) continue
+    for (const g of roomMap.values()) {
       if (excludeClientId && g.requesterClientId === excludeClientId) continue
       if (g.expiresAt <= now) continue
       out.push(this.sanitizeGrantPublic(g))
     }
     return out.sort((a, b) => b.createdAt - a.createdAt)
+  }
+
+  _safeSend(ws, data, { critical = false } = {}) {
+    if (!ws || ws.readyState !== 1) return false
+    const buffered = Number(ws.bufferedAmount) || 0
+    if (buffered > WS_MAX_BUFFERED_BYTES) {
+      ws._bpDrops = (ws._bpDrops || 0) + 1
+      if (critical || buffered > WS_MAX_BUFFERED_BYTES * 2 || ws._bpDrops >= WS_MAX_BACKPRESSURE_DROPS) {
+        this.log.warn?.(`[control] Terminating stalled WS consumer (bufferedAmount=${buffered})`)
+        try { ws.terminate() } catch {}
+      }
+      return false
+    }
+    ws._bpDrops = 0
+    try {
+      ws.send(data)
+      return true
+    } catch {
+      return false
+    }
   }
 
   _indexRoomClient(roomId, clientId) {
@@ -260,26 +391,34 @@ export class RelayHub {
     for (const [cid, c] of entries) {
       if (c.ws.readyState !== 1) continue
       if (excludeClientId && cid === excludeClientId) continue
-      try { c.ws.send(frame) } catch {}
+      this._safeSend(c.ws, frame)
     }
   }
 
-  cancelClientGrants(clientId, reason = 'disconnected') {
-    for (const [reqId, g] of this.e2eeGrants.entries()) {
-      if (g.requesterClientId === clientId) {
-        this.e2eeGrants.delete(reqId)
-        this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason }, clientId)
-      } else if (g.offeredByClientId === clientId) {
-        g.offeredByClientId = ''
-        g.approverPubKey = ''
-        this.sendToClient(g.requesterClientId, {
-          type: 'event',
-          ts: Date.now(),
-          bridgeId: '',
-          event: EVENTS.E2EE_GRANT_CANCEL,
-          payload: { reqId, reason: 'approver_disconnected', reopen: true },
-        })
+  cancelClientGrants(clientId, reason = 'disconnected', roomId = '') {
+    const rid = String(roomId || '').trim()
+    const targetRooms = rid ? [rid] : [...this.e2eeGrants.keys()]
+    for (const r of targetRooms) {
+      const roomMap = this.e2eeGrants.get(r)
+      if (!roomMap) continue
+      for (const [reqId, g] of [...roomMap.entries()]) {
+        if (g.requesterClientId === clientId) {
+          roomMap.delete(reqId)
+          this.pushRoomGrantEvent(g.roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason }, clientId)
+        } else if (g.offeredByClientId === clientId) {
+          g.offeredByClientId = ''
+          g.approverPubKey = ''
+          g.approverNonce = ''
+          this.sendToClient(g.requesterClientId, {
+            type: 'event',
+            ts: Date.now(),
+            bridgeId: '',
+            event: EVENTS.E2EE_GRANT_CANCEL,
+            payload: { reqId, reason: 'approver_disconnected', reopen: true },
+          })
+        }
       }
+      if (roomMap.size === 0) this.e2eeGrants.delete(r)
     }
   }
 
@@ -311,7 +450,7 @@ export class RelayHub {
     })
     for (const b of this.bridges.values()) {
       if (b.roomId !== rid || b.ws.readyState !== 1) continue
-      try { b.ws.send(frame) } catch {}
+      this._safeSend(b.ws, frame, { critical: true })
     }
   }
 
@@ -492,7 +631,8 @@ export class RelayHub {
       try { ws.close(4401, 'Invalid account room') } catch {}
       return
     }
-    const bridgeId = String(meta.bridgeId || 'home-pc').trim() || 'home-pc'
+    const bridgeId = String(meta.bridgeId || 'home-pc').trim().slice(0, 64) || 'home-pc'
+    const safeMeta = sanitizeBridgeConnectMeta(meta, roomId, bridgeId)
     const key = this.bridgeKey(roomId, bridgeId)
     const existing = this.bridges.get(key)
     if (!existing) {
@@ -510,19 +650,20 @@ export class RelayHub {
     }
 
     const now = Date.now()
-    const entry = { roomId, bridgeId, ws, meta, connectedAt: now, lastSeen: now, isAlive: true }
+    const rateBucket = createWsRateBucket()
+    const entry = { roomId, bridgeId, ws, meta: safeMeta, connectedAt: now, lastSeen: now, isAlive: true }
     this.bridges.set(key, entry)
     this.globalStats.totalBridgeConnects += 1
     this.getOrCreateRoomStats(roomId).lastActivityAt = now
     this.recordActivity({
       type: 'bridge.online',
       roomId,
-      label: meta.label || meta.hostname || bridgeId,
-      detail: `${meta.platform || 'unknown'} · ${meta.mode || 'bridge'}`,
-      ip: meta.ip || '',
+      label: safeMeta.label || safeMeta.hostname || bridgeId,
+      detail: `${safeMeta.platform || 'unknown'} · ${safeMeta.mode || 'bridge'}`,
+      ip: safeMeta.ip || '',
     })
     this.log.info(
-      `[control] Bridge connected: room=${roomId} id=${bridgeId} (${meta.hostname || 'unknown'}, mode=${meta.mode || 'unknown'})`,
+      `[control] Bridge connected: room=${roomId} id=${bridgeId} (${safeMeta.hostname || 'unknown'}, mode=${safeMeta.mode || 'unknown'})`,
     )
 
     const bridges = this.getBridgeList(roomId)
@@ -551,6 +692,14 @@ export class RelayHub {
     ws.on('message', (raw) => {
       entry.isAlive = true
       entry.lastSeen = Date.now()
+      const rl = rateBucket.consume()
+      if (!rl.ok) {
+        if (rl.terminate) {
+          this.log.warn?.(`[control] Closing flooding bridge WS: room=${roomId} id=${bridgeId}`)
+          try { ws.close(4029, 'Message rate limit exceeded') } catch {}
+        }
+        return
+      }
       const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
       if (rawBytes > MAX_P2P_SIGNAL_BYTES + 4096) return
       let msg
@@ -623,7 +772,7 @@ export class RelayHub {
     })
     for (const [, client] of entries) {
       if (client.ws.readyState === 1) {
-        try { client.ws.send(frame) } catch {}
+        this._safeSend(client.ws, frame)
       }
     }
   }
@@ -700,6 +849,8 @@ export class RelayHub {
 
     this.broadcastRoomClients(roomId)
 
+    const rateBucket = createWsRateBucket()
+
     ws.on('pong', () => {
       entry.isAlive = true
       entry.lastSeenAt = Date.now()
@@ -708,6 +859,14 @@ export class RelayHub {
     ws.on('message', (raw) => {
       entry.isAlive = true
       entry.lastSeenAt = Date.now()
+      const rl = rateBucket.consume()
+      if (!rl.ok) {
+        if (rl.terminate) {
+          this.log.warn?.(`[control] Closing flooding client WS: room=${roomId} client=${clientId}`)
+          try { ws.close(4029, 'Message rate limit exceeded') } catch {}
+        }
+        return
+      }
       const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw?.byteLength ?? raw?.length ?? 0)
       if (rawBytes > MAX_P2P_SIGNAL_BYTES + 4096) return
       let msg
@@ -720,7 +879,7 @@ export class RelayHub {
     })
 
     ws.on('close', () => {
-      this.cancelClientGrants(clientId, 'disconnected')
+      this.cancelClientGrants(clientId, 'disconnected', roomId)
       const hadQrNudge = Boolean(entry.lastQrNudgeAt)
       const existed = this.clients.delete(clientId)
       this._unindexRoomClient(roomId, clientId)
@@ -773,10 +932,10 @@ export class RelayHub {
         safePatch.p2pEngine = incoming.p2pEngine.trim().slice(0, 32)
       }
       if (Array.isArray(incoming.apps)) {
-        safePatch.apps = incoming.apps
+        safePatch.apps = sanitizeBridgeApps(incoming.apps)
       }
       if ('e2ee' in incoming) {
-        safePatch.e2ee = incoming.e2ee && typeof incoming.e2ee === 'object' ? incoming.e2ee : null
+        safePatch.e2ee = sanitizeBridgeE2ee(incoming.e2ee)
       }
       const nextMeta = { ...activeBridge.meta, ...safePatch }
       if (!nextMeta.e2ee?.enabled || !nextMeta.e2ee?.keyId) {
@@ -877,18 +1036,19 @@ export class RelayHub {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const pubKey = String(msg.pubKey || '').trim()
       const wantedKeyId = String(msg.wantedKeyId || '').trim().toLowerCase()
+      const commit = String(msg.commit || '').trim().toLowerCase()
       if (!/^[0-9a-f]{16,32}$/.test(reqId) || !/^[A-Za-z0-9_-]{80,100}$/.test(pubKey)) return
       if (wantedKeyId && !/^[0-9a-f]{16}$/.test(wantedKeyId)) return
+      if (commit && !/^[0-9a-f]{64}$/.test(commit)) return
       const now = Date.now()
-      this.pruneExpiredGrants(now)
-      if (this.e2eeGrants.has(reqId)) return
-      const roomGrants = [...this.e2eeGrants.values()]
-        .filter((g) => g.roomId === roomId)
-        .sort((a, b) => a.createdAt - b.createdAt)
+      this.pruneExpiredGrantsForRoom(roomId, now)
+      const roomMap = this._getRoomGrantMap(roomId, true)
+      if (roomMap.has(reqId)) return
+      const roomGrants = [...roomMap.values()].sort((a, b) => a.createdAt - b.createdAt)
       while (roomGrants.length >= E2EE_GRANT_MAX_PER_ROOM) {
         const oldest = roomGrants.shift()
         if (!oldest) break
-        this.e2eeGrants.delete(oldest.reqId)
+        roomMap.delete(oldest.reqId)
         this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId: oldest.reqId, reason: 'replaced' })
       }
       const grant = {
@@ -900,12 +1060,14 @@ export class RelayHub {
         ip: client.ip || '',
         pubKey,
         wantedKeyId,
+        commit,
         createdAt: now,
         expiresAt: now + E2EE_GRANT_TTL_MS,
         offeredByClientId: '',
         approverPubKey: '',
+        approverNonce: '',
       }
-      this.e2eeGrants.set(reqId, grant)
+      roomMap.set(reqId, grant)
       this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_REQUEST, this.sanitizeGrantPublic(grant), clientId)
       return
     }
@@ -922,18 +1084,22 @@ export class RelayHub {
     if (msg.type === 'e2ee.grant.offer') {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const approverPubKey = String(msg.approverPubKey || '').trim()
+      const approverNonce = String(msg.approverNonce || '').trim()
       if (!/^[0-9a-f]{16,32}$/.test(reqId) || !/^[A-Za-z0-9_-]{80,100}$/.test(approverPubKey)) return
+      if (approverNonce && !/^[A-Za-z0-9_-]{16,44}$/.test(approverNonce)) return
       const now = Date.now()
-      this.pruneExpiredGrants(now)
-      const grant = this.e2eeGrants.get(reqId)
+      this.pruneExpiredGrantsForRoom(roomId, now)
+      const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
       if (grant.offeredByClientId && !this.clients.has(grant.offeredByClientId)) {
         grant.offeredByClientId = ''
         grant.approverPubKey = ''
+        grant.approverNonce = ''
       }
       if (grant.offeredByClientId && grant.offeredByClientId !== clientId) return
       grant.offeredByClientId = clientId
       grant.approverPubKey = approverPubKey
+      grant.approverNonce = approverNonce
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
         ts: now,
@@ -946,6 +1112,29 @@ export class RelayHub {
           approverClientKind: client.clientKind || 'mobile',
           approverIp: client.ip || '',
           approverPubKey,
+          ...(approverNonce ? { approverNonce } : {}),
+        },
+      })
+      return
+    }
+
+    if (msg.type === 'e2ee.grant.reveal') {
+      const reqId = String(msg.reqId || '').trim().toLowerCase()
+      const requesterNonce = String(msg.requesterNonce || '').trim()
+      if (!/^[0-9a-f]{16,32}$/.test(reqId) || !/^[A-Za-z0-9_-]{16,44}$/.test(requesterNonce)) return
+      const now = Date.now()
+      this.pruneExpiredGrantsForRoom(roomId, now)
+      const grant = this.e2eeGrants.get(roomId)?.get(reqId)
+      if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId || grant.expiresAt <= now) return
+      if (!grant.offeredByClientId || !this.clients.has(grant.offeredByClientId)) return
+      this.sendToClient(grant.offeredByClientId, {
+        type: 'event',
+        ts: now,
+        bridgeId: '',
+        event: EVENTS.E2EE_GRANT_REVEAL || 'e2ee.grant.reveal',
+        payload: {
+          reqId,
+          requesterNonce,
         },
       })
       return
@@ -967,19 +1156,20 @@ export class RelayHub {
         return
       }
       const now = Date.now()
-      this.pruneExpiredGrants(now)
-      const grant = this.e2eeGrants.get(reqId)
+      this.pruneExpiredGrantsForRoom(roomId, now)
+      const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
       if (grant.offeredByClientId && !this.clients.has(grant.offeredByClientId)) {
         grant.offeredByClientId = ''
         grant.approverPubKey = ''
+        grant.approverNonce = ''
       }
       if (grant.offeredByClientId && (grant.offeredByClientId !== clientId || grant.approverPubKey !== appPub)) {
         return
       }
       const requester = this.clients.get(grant.requesterClientId)
       if (!requester || requester.ws?.readyState !== 1) return
-      this.e2eeGrants.delete(reqId)
+      this._deleteGrant(roomId, reqId)
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
         ts: now,
@@ -990,7 +1180,14 @@ export class RelayHub {
           approverDeviceName: client.deviceName || 'Authorized Device',
           approverClientKind: client.clientKind || 'mobile',
           approverIp: client.ip || '',
-          envelope: { v: 1, reqId, approverPubKey: appPub, iv, ct },
+          envelope: {
+            v: 1,
+            reqId,
+            approverPubKey: appPub,
+            iv,
+            ct,
+            ...(env.mode === 'qr' ? { mode: 'qr' } : {}),
+          },
         },
       })
       this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'delivered' }, grant.requesterClientId)
@@ -1000,10 +1197,10 @@ export class RelayHub {
     if (msg.type === 'e2ee.grant.reject') {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const now = Date.now()
-      this.pruneExpiredGrants(now)
-      const grant = this.e2eeGrants.get(reqId)
+      this.pruneExpiredGrantsForRoom(roomId, now)
+      const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
-      this.e2eeGrants.delete(reqId)
+      this._deleteGrant(roomId, reqId)
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
         ts: now,
@@ -1020,9 +1217,9 @@ export class RelayHub {
 
     if (msg.type === 'e2ee.grant.cancel') {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
-      const grant = this.e2eeGrants.get(reqId)
+      const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId) return
-      this.e2eeGrants.delete(reqId)
+      this._deleteGrant(roomId, reqId)
       this.pushRoomGrantEvent(roomId, EVENTS.E2EE_GRANT_CANCEL, { reqId, reason: 'cancelled' }, clientId)
       return
     }
@@ -1067,7 +1264,7 @@ export class RelayHub {
     })
     for (const [, client] of this._getRoomClientEntries(rid)) {
       if (client.ws.readyState === 1) {
-        try { client.ws.send(frame) } catch {}
+        this._safeSend(client.ws, frame)
       }
     }
   }
@@ -1080,12 +1277,7 @@ export class RelayHub {
 
   sendRaw(ws, payload) {
     if (!ws || ws.readyState !== 1) return false
-    try {
-      ws.send(JSON.stringify(payload))
-      return true
-    } catch {
-      return false
-    }
+    return this._safeSend(ws, JSON.stringify(payload))
   }
 
   updateBridgeLabel(roomId, bridgeId, newLabel) {
@@ -1155,8 +1347,8 @@ export class RelayHub {
       }
       try { client.ws.close(code, reason) } catch {}
     }
-    for (const [cid] of targets) {
-      this.cancelClientGrants(cid, grantReason)
+    for (const [cid, client] of targets) {
+      this.cancelClientGrants(cid, grantReason, client.roomId)
     }
     if (notifyBridges) {
       for (const [rid, entry] of revokedByRoom.entries()) {
@@ -1248,12 +1440,12 @@ export class RelayHub {
     const frame = JSON.stringify(msg)
     for (const b of this.bridges.values()) {
       if (b.roomId === rid && b.ws.readyState === 1) {
-        try { b.ws.send(frame) } catch {}
+        this._safeSend(b.ws, frame)
       }
     }
     for (const [, client] of this._getRoomClientEntries(rid)) {
       if (client.ws.readyState === 1) {
-        try { client.ws.send(frame) } catch {}
+        this._safeSend(client.ws, frame)
       }
     }
   }

@@ -9,11 +9,13 @@ import {
   X,
 } from 'lucide-react'
 import {
+  computeGrantCommitment,
   computeGrantPubKeyFp,
   deriveGrantSas,
   encryptGrantPayload,
   formatE2eeFingerprint,
   generateGrantKeyPair,
+  generateGrantNonce,
 } from '@allinone/shared/e2ee'
 import { useI18n } from '../lib/i18n.jsx'
 
@@ -38,11 +40,12 @@ export function E2eeGrantApproveModal({
   onClose = null,
 }) {
   const { bi } = useI18n()
-  const [step, setStep] = useState('prompt') // 'prompt' | 'sas' | 'sending' | 'done'
+  const [step, setStep] = useState('prompt') // 'prompt' | 'waiting-reveal' | 'sas' | 'sending' | 'done'
   const [sasCode, setSasCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const pairRef = useRef(null)
+  const approverNonceRef = useRef('')
   const closeTimerRef = useRef(null)
   const stepRef = useRef(step)
   stepRef.current = step
@@ -67,6 +70,7 @@ export function E2eeGrantApproveModal({
       setBusy(false)
       setError('')
       pairRef.current = null
+      approverNonceRef.current = ''
       return
     }
     setStep('prompt')
@@ -74,9 +78,10 @@ export function E2eeGrantApproveModal({
     setBusy(false)
     setError('')
     pairRef.current = null
+    approverNonceRef.current = ''
     return () => {
       clearCloseTimer()
-      if (stepRef.current === 'sas' && !rejectedOrDoneRef.current) {
+      if ((stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') && !rejectedOrDoneRef.current) {
         rejectedOrDoneRef.current = true
         try {
           client?.sendGrantReject?.({ reqId: grantReqId })
@@ -84,6 +89,66 @@ export function E2eeGrantApproveModal({
       }
     }
   }, [open, grantReqId, client])
+
+  // Listen for Commit-then-Reveal `e2ee.grant.reveal` while modal is open (avoids race if reveal arrives fast)
+  useEffect(() => {
+    if (!open || !client || !grantReqId) return
+    let cancelled = false
+    const unsub = client.onEvent(async (event, payload) => {
+      if (cancelled || event !== 'e2ee.grant.reveal' || !payload || payload.reqId !== grantReqId) return
+      if (stepRef.current !== 'waiting-reveal') return
+      const reqNonce = String(payload.requesterNonce || '').trim()
+      const pair = pairRef.current
+      const appNonce = approverNonceRef.current
+      if (!reqNonce || !pair || !appNonce) return
+      try {
+        const expectedCommit = await computeGrantCommitment({
+          reqId: grant.reqId,
+          roomId: grant.roomId,
+          pubKey: grant.pubKey,
+          nonce: reqNonce,
+        })
+        if (cancelled) return
+        if (expectedCommit !== String(grant.commit || '').trim().toLowerCase()) {
+          rejectedOrDoneRef.current = true
+          try {
+            client.sendGrantReject?.({ reqId: grant.reqId })
+          } catch {}
+          stepRef.current = 'prompt'
+          setStep('prompt')
+          setError(
+            bi(
+              '安全校验失败：请求方承诺校验不匹配，可能存在中间人攻击，已拒绝授权！',
+              'Security check failed: requester commitment mismatch (possible MITM). Rejected!',
+            ),
+          )
+          return
+        }
+        const sas = await deriveGrantSas({
+          requesterPubKey: grant.pubKey,
+          approverPubKey: pair.publicKeyRaw,
+          reqId: grant.reqId,
+          roomId: grant.roomId,
+          requesterNonce: reqNonce,
+          approverNonce: appNonce,
+        })
+        if (cancelled) return
+        setSasCode(sas)
+        stepRef.current = 'sas'
+        setStep('sas')
+      } catch (err) {
+        if (!cancelled) {
+          stepRef.current = 'prompt'
+          setStep('prompt')
+          setError(String(err?.message || err))
+        }
+      }
+    })
+    return () => {
+      cancelled = true
+      unsub?.()
+    }
+  }, [open, client, grantReqId, grant?.reqId, grant?.roomId, grant?.pubKey, grant?.commit, bi])
 
   if (!open || !grant) return null
 
@@ -111,7 +176,7 @@ export function E2eeGrantApproveModal({
 
   const handleDismiss = () => {
     clearCloseTimer()
-    if (stepRef.current === 'sas' && !rejectedOrDoneRef.current && grant?.reqId) {
+    if ((stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') && !rejectedOrDoneRef.current && grant?.reqId) {
       rejectedOrDoneRef.current = true
       try {
         client?.sendGrantReject?.({ reqId: grant.reqId })
@@ -130,22 +195,39 @@ export function E2eeGrantApproveModal({
     setError('')
     try {
       const pair = await generateGrantKeyPair()
+      const approverNonce = generateGrantNonce()
       pairRef.current = pair
-      const sas = await deriveGrantSas({
-        requesterPubKey: grant.pubKey,
-        approverPubKey: pair.publicKeyRaw,
-        reqId: grant.reqId,
-        roomId: grant.roomId,
-      })
+      approverNonceRef.current = approverNonce
+      const hasCommit = Boolean(String(grant.commit || '').trim())
+      if (hasCommit) {
+        stepRef.current = 'waiting-reveal'
+        setStep('waiting-reveal')
+      }
       const sent = client.sendGrantOffer({
         reqId: grant.reqId,
         approverPubKey: pair.publicKeyRaw,
+        approverNonce,
       })
       if (!sent) {
+        if (hasCommit) {
+          stepRef.current = 'prompt'
+          setStep('prompt')
+        }
         throw new Error(bi('当前未连接到中转服务器，请稍后重试', 'Not connected to relay server.'))
       }
-      setSasCode(sas)
-      setStep('sas')
+      if (!hasCommit) {
+        const sas = await deriveGrantSas({
+          requesterPubKey: grant.pubKey,
+          approverPubKey: pair.publicKeyRaw,
+          reqId: grant.reqId,
+          roomId: grant.roomId,
+          requesterNonce: '',
+          approverNonce,
+        })
+        setSasCode(sas)
+        stepRef.current = 'sas'
+        setStep('sas')
+      }
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
@@ -189,6 +271,7 @@ export function E2eeGrantApproveModal({
         requesterPubKeyRaw: grant.pubKey,
         reqId: grant.reqId,
         roomId: grant.roomId,
+        grantSecret: qrVerified ? String(grant.qrGrantSecret || '') : '',
         payload: {
           keys: keyEntries,
           preferredKeyId: resolvedPreferred,
@@ -310,6 +393,13 @@ export function E2eeGrantApproveModal({
           </div>
         )}
 
+        {step === 'waiting-reveal' && (
+          <div className="mt-3.5 flex items-center justify-center gap-2 rounded-2xl border border-[#4D6BFE]/30 bg-[#F2F5FF] px-4 py-3.5 text-xs font-medium text-[#2842C9] dark:border-[#4D6BFE]/35 dark:bg-[#1E253A] dark:text-[#A9BDFF]">
+            <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+            <span>{bi('正在校验新设备安全承诺并生成安全码...', 'Verifying device commitment & generating code...')}</span>
+          </div>
+        )}
+
         {step === 'sas' && sasCode && (
           <div className="mt-3.5 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] px-4 py-3.5 text-center dark:border-[#4D6BFE]/40 dark:bg-[#1E253A]">
             <div className="text-[11.5px] font-medium text-slate-600 dark:text-slate-300">
@@ -370,6 +460,16 @@ export function E2eeGrantApproveModal({
             >
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
               <span>{bi('验证授权', 'Verify')}</span>
+            </button>
+          </div>
+        ) : step === 'waiting-reveal' ? (
+          <div className="mt-4">
+            <button
+              type="button"
+              onClick={handleReject}
+              className="w-full rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              {bi('取消授权', 'Cancel')}
             </button>
           </div>
         ) : (

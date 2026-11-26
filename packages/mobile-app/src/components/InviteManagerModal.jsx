@@ -23,7 +23,7 @@ import {
   normalizeBaseUrl,
 } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
-import { RELEASES_URL, copyTextToClipboard, resolveApkUrl } from '../lib/clientHelpers.js'
+import { RELEASES_URL, copyTextToClipboard, formatSafeSetupCmd, resolveApkUrl } from '../lib/clientHelpers.js'
 import { formatBytesCompact } from '../lib/sessionCache.js'
 
 function formatTimeShort(ts) {
@@ -116,6 +116,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
   const buildShareText = (inv) => {
     const regUrl = `${cleanBase}/?invite=${encodeURIComponent(inv.code)}`
     const apkUrl = resolveApkUrl(cleanBase)
+    const unixCmd = formatSafeSetupCmd(cleanBase, 'unix')
+    const winCmd = formatSafeSetupCmd(cleanBase, 'win')
     return (isEn
       ? [
           'Here is a single-use All in One invite code (1 user only):',
@@ -125,8 +127,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           ...(apkUrl && apkUrl !== RELEASES_URL ? [`Android Direct Link: ${apkUrl}`] : []),
           '',
           'After signing up, install the desktop app on your PC or run 1 command and sign in with the same account:',
-          `• macOS / Linux: curl -fsSL ${cleanBase}/setup.sh | bash`,
-          `• Windows (PowerShell): irm ${cleanBase}/setup.ps1 | iex`,
+          ...(unixCmd ? [`• macOS / Linux: ${unixCmd}`] : []),
+          ...(winCmd ? [`• Windows (PowerShell): ${winCmd}`] : []),
         ]
       : [
           '给你分享一个 All in One 一次性注册邀请码（仅限 1 人使用）：',
@@ -136,8 +138,8 @@ export function InviteManagerModal({ open, onClose, baseUrl, token }) {
           ...(apkUrl && apkUrl !== RELEASES_URL ? [`Android 直链：${apkUrl}`] : []),
           '',
           '注册完账号后，在自己电脑安装桌面端或运行 1 行命令并登录同一账号即可自动连接所有电脑：',
-          `• macOS / Linux: curl -fsSL ${cleanBase}/setup.sh | bash`,
-          `• Windows (PowerShell): irm ${cleanBase}/setup.ps1 | iex`,
+          ...(unixCmd ? [`• macOS / Linux: ${unixCmd}`] : []),
+          ...(winCmd ? [`• Windows (PowerShell): ${winCmd}`] : []),
         ]
     ).join('\n')
   }

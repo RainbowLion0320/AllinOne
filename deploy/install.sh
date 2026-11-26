@@ -692,6 +692,7 @@ EOF
     printf "      proxy_set_header Connection \"upgrade\";\n"
     printf "      proxy_set_header Host \$host;\n"
     printf "      proxy_set_header X-Real-IP \$remote_addr;\n"
+    printf "      proxy_set_header X-Forwarded-Proto \$scheme;\n"
     printf "      proxy_read_timeout 3600s;\n"
     printf "    }\n"
     printf "\n  ${C_YELLOW}提示：${C_RESET}请确保防火墙 / 安全组已放行 UDP 3478 端口（内置 STUN / 可选 TURN 穿透）。\n"

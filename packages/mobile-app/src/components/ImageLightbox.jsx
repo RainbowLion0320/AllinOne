@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
 import { saveOrShareBlobNatively } from '../lib/e2eeFiles.js'
+import { isExternalHttpImageUrl, isPrivateOrLoopbackUrl } from '../lib/imageUrls.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 const MIN_SCALE = 0.25
@@ -551,11 +552,19 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
   if (!state || !Array.isArray(state.images) || state.images.length === 0 || !current) return null
 
   const rawActiveSrc = resolvedMap[index] || currentInitialSrc || ''
+  const isBlockedExternal = Boolean(
+    rawActiveSrc &&
+      isExternalHttpImageUrl(rawActiveSrc) &&
+      isPrivateOrLoopbackUrl(rawActiveSrc),
+  )
+  const safeRawActiveSrc = isBlockedExternal ? '' : rawActiveSrc
   const activeSrc =
-    currentRetryNonce > 0 && rawActiveSrc && !rawActiveSrc.startsWith('data:') && !rawActiveSrc.startsWith('blob:')
-      ? `${rawActiveSrc}${rawActiveSrc.includes('?') ? '&' : '?'}_r=${currentRetryNonce}`
-      : rawActiveSrc
-  const currentError = errorMap[index] || ''
+    currentRetryNonce > 0 && safeRawActiveSrc && !safeRawActiveSrc.startsWith('data:') && !safeRawActiveSrc.startsWith('blob:')
+      ? `${safeRawActiveSrc}${safeRawActiveSrc.includes('?') ? '&' : '?'}_r=${currentRetryNonce}`
+      : safeRawActiveSrc
+  const currentError = isBlockedExternal
+    ? bi('已拦截不安全/内网图片地址', 'Blocked unsafe / private image URL')
+    : (errorMap[index] || '')
   const downloadHref = activeSrc || ''
   const isBlobOrDataDownload = downloadHref.startsWith('blob:') || downloadHref.startsWith('data:')
 
@@ -596,16 +605,43 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
       String(window.Capacitor?.getPlatform?.() || '').toLowerCase() === 'android' &&
       typeof window.Capacitor?.Plugins?.AllinOneFiles?.saveAndShare === 'function',
     )
-    if (!isAndroidCap) return
+    const maybeSvg =
+      /\.svg(?:$|[?#])/i.test(String(current.label || current.rawPath || '').trim()) ||
+      /svg/i.test(String(current.item?.mimeType || '')) ||
+      /^data:image\/svg\+xml/i.test(downloadHref)
+    if (!isAndroidCap && !maybeSvg && !downloadHref.startsWith('blob:')) return
     e.preventDefault()
     try {
       const res = await fetch(downloadHref)
-      const blob = await res.blob()
-      await saveOrShareBlobNatively(blob, {
-        filename: current.label || 'image.png',
-        mimeType: blob.type || 'image/png',
-        mode: 'save',
-      })
+      const rawBlob = await res.blob()
+      const isSvgBlob = maybeSvg || String(rawBlob.type || '').toLowerCase().includes('svg')
+      const safeMime = isSvgBlob ? 'application/octet-stream' : (rawBlob.type || 'image/png')
+      const safeBlob = isSvgBlob ? new Blob([rawBlob], { type: 'application/octet-stream' }) : rawBlob
+      if (isAndroidCap) {
+        await saveOrShareBlobNatively(safeBlob, {
+          filename: current.label || 'image.png',
+          mimeType: safeMime,
+          mode: 'save',
+        })
+        return
+      }
+      const safeUrl = isSvgBlob ? URL.createObjectURL(safeBlob) : downloadHref
+      const a = document.createElement('a')
+      a.href = safeUrl
+      a.download = current.label || 'image.png'
+      a.rel = 'noopener noreferrer'
+      a.style.display = 'none'
+      document.body.appendChild(a)
+      try {
+        a.click()
+      } finally {
+        setTimeout(() => {
+          try { a.remove() } catch {}
+          if (isSvgBlob) {
+            try { URL.revokeObjectURL(safeUrl) } catch {}
+          }
+        }, 1000)
+      }
     } catch {}
   }
 
@@ -689,6 +725,7 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
               ref={imgRef}
               src={activeSrc}
               alt={current.label || 'preview'}
+              referrerPolicy="no-referrer"
               draggable={false}
               onDragStart={(e) => e.preventDefault()}
               onClick={(e) => e.stopPropagation()}

@@ -19,7 +19,9 @@ import {
 import { useI18n } from './i18n.jsx'
 import {
   getImageLabel,
+  isExternalHttpImageUrl,
   isImageTarget,
+  isPrivateOrLoopbackUrl,
   resolveImageSrc,
 } from './imageUrls.js'
 import { needsE2eeMediaLoad } from './e2eeMedia.js'
@@ -176,13 +178,31 @@ const ALERT_STYLES = {
 }
 
 function safeUrlTransform(url) {
-  const trimmed = String(url || '').trim()
-  if (!trimmed) return ''
-  // Block dangerous script/HTML schemes while allowing http(s), mailto, tel, and file/local refs
-  if (/^(?:javascript|vbscript|data:text\/html)/i.test(trimmed)) {
-    return ''
+  const cleaned = String(url || '').replace(/[\u0000-\u001f\u007f]+/g, '').trim()
+  if (!cleaned) return ''
+  // Strip ASCII whitespace when inspecting scheme to defeat `java\tscript:` / obfuscated schemes
+  const compact = cleaned.replace(/\s+/g, '')
+  const schemeMatch = compact.match(/^([a-z][a-z0-9+.-]*):/i)
+  if (!schemeMatch) {
+    // Disallow protocol-relative URLs (`//evil.com`)
+    if (compact.startsWith('//')) return ''
+    return cleaned
   }
-  return trimmed
+  const scheme = schemeMatch[1].toLowerCase()
+  if (scheme === 'https' || scheme === 'http') {
+    return /^https?:\/\//i.test(cleaned) ? cleaned : ''
+  }
+  if (scheme === 'mailto' || scheme === 'tel') {
+    return /^(?:mailto|tel):/i.test(cleaned) ? cleaned : ''
+  }
+  // Local PC file paths (never rendered as real <a href>; converted to DeliverableChip/ImageChip/<code>)
+  if (scheme === 'file') {
+    return /^file:\/\/\//i.test(cleaned) ? cleaned : ''
+  }
+  if (/^[a-z]$/i.test(scheme) && /^[A-Za-z]:[\\/]/.test(cleaned)) {
+    return cleaned
+  }
+  return ''
 }
 
 /**
@@ -301,6 +321,7 @@ function CodeBlock({ language, code }) {
 }
 
 function ImageChip({ target, label, imageContext }) {
+  const { bi } = useI18n()
   const displayLabel = label || getImageLabel(target)
   const isUrlRef = /^(?:https?:\/\/|data:|blob:)/i.test(target)
   const item = {
@@ -310,6 +331,18 @@ function ImageChip({ target, label, imageContext }) {
   }
   const useE2ee = needsE2eeMediaLoad(item)
   const src = useE2ee ? '' : resolveImageSrc(item)
+  const blockedExternal = !useE2ee && isExternalHttpImageUrl(target) && isPrivateOrLoopbackUrl(target)
+  if (blockedExternal || (!useE2ee && !src)) {
+    return (
+      <span
+        title={bi('已拦截不安全/内网图片地址', 'Blocked unsafe / private image URL')}
+        className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-rose-50 px-2 py-0.5 align-baseline text-[12px] font-medium text-rose-600 dark:bg-rose-950/45 dark:text-rose-300"
+      >
+        <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">{bi('已拦截图片', 'Blocked image')}</span>
+      </span>
+    )
+  }
   return (
     <button
       type="button"
@@ -618,11 +651,28 @@ export function MarkdownView({ text, streaming = false, imageContext = null }) {
         if (imageContext) {
           return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageContext} />
         }
+        const safeSrc = resolveImageSrc(target)
+        if (!safeSrc) return null
+        if (isExternalHttpImageUrl(safeSrc)) {
+          if (isPrivateOrLoopbackUrl(safeSrc)) return null
+          return (
+            <a
+              href={safeSrc}
+              target="_blank"
+              rel="noreferrer"
+              className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] dark:bg-[#273154] dark:text-[#96AEFF]"
+            >
+              <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{alt || getImageLabel(safeSrc)}</span>
+            </a>
+          )
+        }
         return (
           <img
-            src={target}
+            src={safeSrc}
             alt={alt || ''}
             loading="lazy"
+            referrerPolicy="no-referrer"
             className="my-2 max-h-80 max-w-full rounded-xl border border-slate-200/80 object-contain dark:border-slate-700/80"
           />
         )

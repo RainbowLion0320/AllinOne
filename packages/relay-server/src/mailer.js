@@ -8,6 +8,15 @@ function sanitizeHeaderValue(val) {
   return String(val ?? '').replace(/[\r\n]+/g, ' ').trim()
 }
 
+function escHtml(val) {
+  return String(val ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
 function extractEmailAddress(raw) {
   const clean = sanitizeHeaderValue(raw)
   const angle = clean.match(/<([^<>\s]+@[^<>\s]+)>/)
@@ -403,10 +412,9 @@ function buildVerificationEmailContent({ code, purpose, username = '' }) {
     '验证码 10 分钟内有效，请勿泄露给他人。如非本人操作，请忽略此邮件。',
   ].join('\n')
 
-  const escapedGreeting = greeting
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+  const escapedGreeting = escHtml(greeting)
+  const escapedPurpose = escHtml(purposeLabel)
+  const escapedCode = escHtml(code)
 
   const html = `<!doctype html>
 <html lang="zh-CN">
@@ -414,9 +422,9 @@ function buildVerificationEmailContent({ code, purpose, username = '' }) {
   <div style="max-width:440px;margin:0 auto;background:#ffffff;border-radius:16px;padding:28px 24px;border:1px solid #e2e8f0;">
     <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:14px;">All in One</div>
     <p style="margin:0 0 12px;font-size:14px;line-height:1.6;color:#334155;">${escapedGreeting}</p>
-    <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#334155;">你正在进行 <strong>${purposeLabel}</strong> 操作，请在页面中输入下方验证码：</p>
+    <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#334155;">你正在进行 <strong>${escapedPurpose}</strong> 操作，请在页面中输入下方验证码：</p>
     <div style="text-align:center;margin:20px 0;padding:16px;border-radius:12px;background:#f1f5ff;border:1px solid #dbe4ff;">
-      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:30px;font-weight:700;letter-spacing:8px;color:#3b5bfe;">${code}</span>
+      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:30px;font-weight:700;letter-spacing:8px;color:#3b5bfe;">${escapedCode}</span>
     </div>
     <p style="margin:0;font-size:12px;line-height:1.6;color:#64748b;">验证码 10 分钟内有效，请勿转发或泄露给他人。如果这不是你本人的操作，直接忽略本邮件即可。</p>
   </div>
@@ -515,9 +523,9 @@ export function createMailer(options = {}) {
   }
 
   async function sendLoginAlert({ to, username = '', deviceName = '', ip = '', at = Date.now() }) {
-    const safeUser = String(username || '').replace(/[<>]/g, '')
-    const safeDevice = String(deviceName || 'Unknown Device').replace(/[<>]/g, '')
-    const safeIp = String(ip || 'unknown').replace(/[<>]/g, '')
+    const safeUser = sanitizeHeaderValue(username)
+    const safeDevice = sanitizeHeaderValue(deviceName || 'Unknown Device')
+    const safeIp = sanitizeHeaderValue(ip || 'unknown')
     const timeStr = new Date(at || Date.now()).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
     const subject = `[All in One] 新设备登录提醒 · ${safeDevice}`
     const text = [
@@ -536,13 +544,49 @@ export function createMailer(options = {}) {
 <body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;color:#1e293b;">
   <div style="max-width:460px;margin:0 auto;background:#ffffff;border-radius:16px;padding:26px 24px;border:1px solid #e2e8f0;">
     <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:12px;">All in One · 安全提醒</div>
-    <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#334155;">你好${safeUser ? ` <strong>@${safeUser}</strong>` : ''}，检测到你的账号刚刚在新设备或新网络登录：</p>
+    <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#334155;">你好${safeUser ? ` <strong>@${escHtml(safeUser)}</strong>` : ''}，检测到你的账号刚刚在新设备或新网络登录：</p>
     <div style="margin:14px 0;padding:14px 16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:13px;line-height:1.8;color:#334155;">
-      <div><strong>设备：</strong>${safeDevice}</div>
-      <div><strong>来源 IP：</strong><code>${safeIp}</code></div>
-      <div><strong>时间：</strong>${timeStr}</div>
+      <div><strong>设备：</strong>${escHtml(safeDevice)}</div>
+      <div><strong>来源 IP：</strong><code>${escHtml(safeIp)}</code></div>
+      <div><strong>时间：</strong>${escHtml(timeStr)}</div>
     </div>
     <p style="margin:14px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">如为本人操作，请忽略此邮件；如非本人操作，请立即在客户端「我的电脑 → 已登录终端」点击<strong>「下线其他」</strong>并修改密码。</p>
+  </div>
+</body>
+</html>`
+    await sendMail({ to, subject, text, html })
+    return { ok: true }
+  }
+
+  async function sendSecurityNotice({ to, username = '', title = '账号安全变更提醒', summary = '', ip = '', at = Date.now() }) {
+    const safeUser = sanitizeHeaderValue(username)
+    const safeTitle = sanitizeHeaderValue(title || '账号安全变更提醒')
+    const safeSummary = String(summary || '').trim()
+    const safeIp = sanitizeHeaderValue(ip || 'unknown')
+    const timeStr = new Date(at || Date.now()).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+    const subject = `[All in One] ${safeTitle}`
+    const text = [
+      `你好${safeUser ? ` @${safeUser}` : ''}：`,
+      '',
+      safeSummary,
+      '',
+      `  • 来源 IP：${safeIp}`,
+      `  • 时间：${timeStr}`,
+      '',
+      '如果这是你本人操作，可直接忽略本邮件。',
+      '如非本人操作，请立即修改密码并在客户端「我的电脑 → 已登录终端」下线所有其他设备。',
+    ].join('\n')
+    const html = `<!doctype html>
+<html lang="zh-CN">
+<body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;color:#1e293b;">
+  <div style="max-width:460px;margin:0 auto;background:#ffffff;border-radius:16px;padding:26px 24px;border:1px solid #e2e8f0;">
+    <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:12px;">All in One · ${escHtml(safeTitle)}</div>
+    <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#334155;">你好${safeUser ? ` <strong>@${escHtml(safeUser)}</strong>` : ''}，${escHtml(safeSummary)}</p>
+    <div style="margin:14px 0;padding:14px 16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:13px;line-height:1.8;color:#334155;">
+      <div><strong>来源 IP：</strong><code>${escHtml(safeIp)}</code></div>
+      <div><strong>时间：</strong>${escHtml(timeStr)}</div>
+    </div>
+    <p style="margin:14px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">如为本人操作，请忽略此邮件；如非本人操作，请立即修改密码并下线所有其他设备。</p>
   </div>
 </body>
 </html>`
@@ -556,5 +600,6 @@ export function createMailer(options = {}) {
     sendMail,
     sendVerificationCode,
     sendLoginAlert,
+    sendSecurityNotice,
   }
 }

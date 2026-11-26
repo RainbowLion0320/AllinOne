@@ -2,6 +2,90 @@ import { bi, getCurrentLang } from './i18n.js'
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)$/i
 
+function extractTargetString(raw) {
+  if (!raw) return ''
+  if (typeof raw === 'object') {
+    const rawUrl = String(raw.url || '').trim()
+    const rawPath = String(raw.path || '').trim()
+    const rawFallback = String(raw.raw || '').trim()
+    return (rawUrl || rawPath || rawFallback).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
+  }
+  return String(raw).trim().replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
+}
+
+export function isExternalHttpImageUrl(raw) {
+  const target = extractTargetString(raw)
+  if (!target) return false
+  return /^https?:\/\//i.test(target)
+}
+
+function isPrivateIpv4Octets(a, b, c, d) {
+  if (
+    !Number.isInteger(a) || !Number.isInteger(b) || !Number.isInteger(c) || !Number.isInteger(d) ||
+    a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255
+  ) {
+    return true
+  }
+  if (a === 0) return true
+  if (a === 10) return true
+  if (a === 127) return true
+  if (a === 169 && b === 254) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 100 && b >= 64 && b <= 127) return true
+  return false
+}
+
+export function isPrivateOrLoopbackUrl(raw) {
+  const target = extractTargetString(raw)
+  if (!target) return true
+  let u
+  try {
+    u = new URL(target)
+  } catch {
+    return true
+  }
+  if (u.protocol !== 'https:') return true
+  const rawHost = String(u.hostname || '').trim().toLowerCase().replace(/\.$/, '')
+  if (!rawHost) return true
+  if (rawHost === 'localhost' || rawHost.endsWith('.localhost') || rawHost.endsWith('.local')) {
+    return true
+  }
+  if (rawHost.startsWith('[') && rawHost.endsWith(']')) {
+    const ip6 = rawHost.slice(1, -1).split('%')[0].toLowerCase()
+    if (!ip6 || ip6 === '::' || ip6 === '::1') return true
+    if (/^(?:0+:){7}0*[01]$/.test(ip6)) return true
+    if (/^fe[89ab][0-9a-f]:/.test(ip6)) return true
+    if (/^f[cd][0-9a-f]{2}:/.test(ip6)) return true
+    const mappedDot = ip6.match(/^(?:::ffff:|0:0:0:0:0:ffff:|::)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+    if (mappedDot) {
+      return isPrivateIpv4Octets(
+        Number(mappedDot[1]),
+        Number(mappedDot[2]),
+        Number(mappedDot[3]),
+        Number(mappedDot[4]),
+      )
+    }
+    const mappedHex = ip6.match(/^(?:::ffff:|0:0:0:0:0:ffff:|::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16)
+      const lo = parseInt(mappedHex[2], 16)
+      return isPrivateIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff)
+    }
+    return false
+  }
+  const ipv4 = rawHost.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (ipv4) {
+    return isPrivateIpv4Octets(
+      Number(ipv4[1]),
+      Number(ipv4[2]),
+      Number(ipv4[3]),
+      Number(ipv4[4]),
+    )
+  }
+  return false
+}
+
 export function stripQueryHash(raw) {
   return String(raw || '').split(/[?#]/)[0]
 }
@@ -9,6 +93,8 @@ export function stripQueryHash(raw) {
 export function isImageTarget(raw) {
   const s = String(raw || '').trim()
   if (!s) return false
+  const compact = s.replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+  if (compact.startsWith('data:image/svg+xml')) return false
   if (s.startsWith('data:image/') || s.startsWith('blob:')) return true
   const clean = stripQueryHash(s).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '')
   return IMAGE_EXT_RE.test(clean)
@@ -43,7 +129,12 @@ export function resolveImageSrc(item) {
   const target = (rawUrl || rawPath).replace(/^<|>$/g, '').replace(/^['"]|['"]$/g, '').trim()
   if (!target) return ''
 
-  if (target.startsWith('data:image/') || target.startsWith('blob:')) {
+  const compact = target.replace(/[\u0000-\u0020]+/g, '').toLowerCase()
+  if (compact.startsWith('data:image/svg+xml')) {
+    return ''
+  }
+
+  if (/^data:image\//i.test(target) || /^blob:/i.test(target)) {
     return target
   }
 

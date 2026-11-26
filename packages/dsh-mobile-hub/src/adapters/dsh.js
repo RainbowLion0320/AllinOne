@@ -1,8 +1,16 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
+import {
+  APPS,
+  EVENTS,
+  assertPathWithinDir,
+  assertSafeSessionId,
+  assertSafeWorkspaceCwd,
+  makeCompositeId,
+  toEpochMs,
+} from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
@@ -1159,11 +1167,41 @@ export class DshAdapter {
     }
   }
 
+  _resolveSafeTargetCwd(rawCwd) {
+    const validated = assertSafeWorkspaceCwd(rawCwd, { allowEmpty: true })
+    if (!validated) return this.defaultCwd
+    let st
+    try {
+      st = statSync(validated)
+    } catch {
+      throw new Error('工作目录不存在或无法访问')
+    }
+    if (!st.isDirectory()) {
+      throw new Error('工作目录不是有效的文件夹路径')
+    }
+    return validated
+  }
+
+  _canRegisterWorkspaceRoot(cwd) {
+    try {
+      const safe = assertSafeWorkspaceCwd(cwd, { allowEmpty: false })
+      if (!existsSync(safe) || !statSync(safe).isDirectory()) return false
+      const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin'
+      const cmp = (p) => (caseInsensitive ? p.toLowerCase() : p)
+      const realCwd = cmp(realpathSync(safe))
+      const realHome = cmp(realpathSync(homedir()))
+      if (realCwd === realHome) return false
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async ensureAgent(sessionId, cwd, title) {
     if (!this.isLive()) {
       throw new Error('当前以独立模式运行，未挂载在 DeepSeek Harness 内部。请将 dsh-mobile-hub 链接进 DeepSeek Harness desktop profile 后重启 DSH 即可控制 DSH 会话。')
     }
-    const targetCwd = resolve(String(cwd || '').trim() || this.defaultCwd)
+    const targetCwd = this._resolveSafeTargetCwd(cwd)
     const controller = this.ctx.get?.('sessionController')
 
     if (controller !== undefined) {
@@ -1199,7 +1237,7 @@ export class DshAdapter {
 
   async afterCreate(sessionId, cwd, title) {
     const registry = this.ctx?.get?.('workspaceRegistry')
-    if (registry) {
+    if (registry && this._canRegisterWorkspaceRoot(cwd)) {
       try {
         const ws = await registry.resolveByPath(cwd)
         await ws?.attachSession(sessionId)
@@ -1222,18 +1260,18 @@ export class DshAdapter {
   }
 
   async createSession({ cwd, title, model, provider, reasoningEffort } = {}) {
+    const targetCwd = this._resolveSafeTargetCwd(cwd)
     if (!this.isLive()) {
       const ipc = await this.ipcClient?.checkHealth({ force: true })
       if (ipc) {
         return this.ipcClient.call(
           'createSession',
-          { cwd, title, model, provider, reasoningEffort },
+          { cwd: targetCwd, title, model, provider, reasoningEffort },
           { timeoutMs: 30_000 },
         )
       }
       throw new Error(this.getIpcUnavailableMessage())
     }
-    const targetCwd = resolve(String(cwd || '').trim() || this.defaultCwd)
     const sid = `mobile-${randomUUID().slice(0, 12)}`
     const { agent, sessionId } = await this.ensureAgent(sid, targetCwd, title || '手机端总控对话')
     if (model || reasoningEffort) {
@@ -1259,6 +1297,7 @@ export class DshAdapter {
 
   async sendMessage(sessionId, { text, cwd, title, attachments = [], model, provider, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'DSH sessionId')
+    const safeCwd = cwd ? this._resolveSafeTargetCwd(cwd) : undefined
     if (this.activeTurns.has(sessionId)) {
       const err = new Error('该 DeepSeek Harness 对话正在运行中，请等待完成或先点击停止。')
       err.code = 'SESSION_BUSY'
@@ -1277,7 +1316,7 @@ export class DshAdapter {
             'sendMessage',
             {
               sessionId,
-              payload: { text, cwd, title, attachments, model, provider, reasoningEffort },
+              payload: { text, cwd: safeCwd, title, attachments, model, provider, reasoningEffort },
             },
             { timeoutMs: 30 * 60 * 1000, waitForEvents: true },
           )
@@ -1293,7 +1332,7 @@ export class DshAdapter {
     let realCompositeId = makeCompositeId(APPS.DSH, sessionId)
     let pollTimer = null
     try {
-      const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, cwd, title)
+      const { agent, sessionId: resolvedId } = await this.ensureAgent(sessionId, safeCwd, title)
       if (resolvedId && resolvedId !== lockedId) {
         if (this.activeTurns.has(resolvedId)) {
           const err = new Error('该 DeepSeek Harness 对话正在运行中，请等待完成或先点击停止。')

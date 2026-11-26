@@ -24,6 +24,7 @@ export function createAuthManager({
   adminBootstrapToken = '',
   getTokenVersion = null,
   isSessionRevoked = null,
+  hasUserSession = null,
 } = {}) {
   const cleanJwtSecret = String(jwtSecret || '').trim()
   const signingKey = cleanJwtSecret.length >= 16
@@ -37,12 +38,16 @@ export function createAuthManager({
   const MAX_FAILS = 15
   const WINDOW_MS = 10 * 60 * 1000
 
-  // Per-account rate limit to block distributed multi-IP credential stuffing
+  // Per-(account, ip) rate limit for login/device-login/sensitive password checks
+  // (never inserts nonexistent usernames; isolated per IP so remote attackers cannot lock out a victim)
   const accountFailures = new Map()
   const MAX_ACCT_FAILS = 10
   const ACCT_WINDOW_MS = 15 * 60 * 1000
 
-  // Per-(IP, roomId) rate limit for /ws/bridge auth failures
+  // Separate per-account rate limit dedicated to password reset OTP verification
+  const resetAccountFailures = new Map()
+
+  // Per-(IP, roomId) rate limit for /ws/bridge & device-status auth failures
   const bridgeFailures = new Map()
   const MAX_BRIDGE_FAILS = 15
   const BRIDGE_WINDOW_MS = 10 * 60 * 1000
@@ -94,12 +99,21 @@ export function createAuthManager({
     failures.delete(ip)
   }
 
-  function normalizeAccountKey(identifier) {
-    return String(identifier || '').trim().toLowerCase().slice(0, 128)
+  function normalizeExistingAccountId(identifier) {
+    const key = String(identifier || '').trim().toLowerCase().slice(0, 128)
+    // Strictly track only real `usr_*` accounts so nonexistent usernames can never pollute or evict map entries
+    return key.startsWith('usr_') ? key : ''
   }
 
-  function checkAccountRateLimit(identifier) {
-    const key = normalizeAccountKey(identifier)
+  function normalizeAccountKey(identifier, ip = '') {
+    const acct = normalizeExistingAccountId(identifier)
+    if (!acct) return ''
+    const cleanIp = String(ip || '').trim().slice(0, 64)
+    return cleanIp ? `${acct}::${cleanIp}` : acct
+  }
+
+  function checkAccountRateLimit(identifier, ip = '') {
+    const key = normalizeAccountKey(identifier, ip)
     if (!key) return true
     const now = Date.now()
     const entry = accountFailures.get(key)
@@ -111,8 +125,8 @@ export function createAuthManager({
     return entry.count < MAX_ACCT_FAILS
   }
 
-  function recordAccountFailure(identifier) {
-    const key = normalizeAccountKey(identifier)
+  function recordAccountFailure(identifier, ip = '') {
+    const key = normalizeAccountKey(identifier, ip)
     if (!key) return
     const now = Date.now()
     pruneMap(accountFailures, ACCT_WINDOW_MS, now)
@@ -124,9 +138,40 @@ export function createAuthManager({
     }
   }
 
-  function clearAccountFailure(identifier) {
-    const key = normalizeAccountKey(identifier)
+  function clearAccountFailure(identifier, ip = '') {
+    const key = normalizeAccountKey(identifier, ip)
     if (key) accountFailures.delete(key)
+  }
+
+  function checkResetRateLimit(identifier) {
+    const key = normalizeExistingAccountId(identifier)
+    if (!key) return true
+    const now = Date.now()
+    const entry = resetAccountFailures.get(key)
+    if (!entry) return true
+    if (now - entry.firstAt > ACCT_WINDOW_MS) {
+      resetAccountFailures.delete(key)
+      return true
+    }
+    return entry.count < MAX_ACCT_FAILS
+  }
+
+  function recordResetFailure(identifier) {
+    const key = normalizeExistingAccountId(identifier)
+    if (!key) return
+    const now = Date.now()
+    pruneMap(resetAccountFailures, ACCT_WINDOW_MS, now)
+    const entry = resetAccountFailures.get(key)
+    if (!entry || now - entry.firstAt > ACCT_WINDOW_MS) {
+      resetAccountFailures.set(key, { count: 1, firstAt: now })
+    } else {
+      entry.count += 1
+    }
+  }
+
+  function clearResetFailure(identifier) {
+    const key = normalizeExistingAccountId(identifier)
+    if (key) resetAccountFailures.delete(key)
   }
 
   function normalizeBridgeKey(ip, roomId) {
@@ -200,6 +245,9 @@ export function createAuthManager({
   function isSessionActive(payload) {
     if (!isTokenVersionCurrent(payload)) return false
     if (typeof isSessionRevoked === 'function' && isSessionRevoked(payload.room, payload.sid)) {
+      return false
+    }
+    if (payload.sid && typeof hasUserSession === 'function' && !hasUserSession(payload.room, payload.sid)) {
       return false
     }
     return true
@@ -305,6 +353,9 @@ export function createAuthManager({
     checkAccountRateLimit,
     recordAccountFailure,
     clearAccountFailure,
+    checkResetRateLimit,
+    recordResetFailure,
+    clearResetFailure,
     checkBridgeRateLimit,
     recordBridgeFailure,
     clearBridgeFailure,

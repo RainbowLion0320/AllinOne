@@ -121,6 +121,7 @@ import { EVENTS, RPC, parseCompositeId, toEpochMs } from '../packages/shared/src
 import {
   base64UrlToBytes,
   computeE2eeKeyId,
+  computeGrantCommitment,
   computeGrantPubKeyFp,
   decryptAutoStream,
   decryptBinaryJson,
@@ -138,12 +139,16 @@ import {
   formatE2eeFingerprint,
   generateE2eeKey,
   generateGrantKeyPair,
+  generateGrantNonce,
   generateGrantReqId,
+  generateGrantSecret,
   inflateRawBytes,
   isCompressibleFile,
   parseE2eeGrantQrInput,
   parseE2eeQrInput,
+  parseBinaryE2eeHeader,
 } from '../packages/shared/src/e2ee.js'
+import { buildAdminOverview } from '../packages/relay-server/src/admin-monitor.js'
 import {
   computeResizedDimensions,
   replaceFileExtension,
@@ -151,6 +156,7 @@ import {
 } from '../packages/mobile-app/src/lib/imageCompress.js'
 import { renderQrSvg as renderSharedQrSvg } from '../packages/shared/src/qr-svg.js'
 import {
+  clearDeviceCredentials,
   getActiveDevice,
   getCacheScopeKey,
   getDeviceDisplayName,
@@ -169,7 +175,12 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
-import { extractImageRefsFromText, resolveImageSrc } from '../packages/mobile-app/src/lib/imageUrls.js'
+import {
+  extractImageRefsFromText,
+  isExternalHttpImageUrl,
+  isPrivateOrLoopbackUrl,
+  resolveImageSrc,
+} from '../packages/mobile-app/src/lib/imageUrls.js'
 import {
   clearDraft,
   clearDraftsForScope,
@@ -1415,7 +1426,7 @@ async function main() {
       assert.deepEqual(reassembled, bigCtrl)
 
       // 4b. Live P2P E2EE enforcement, encrypted streaming events, 5MB PC<->Phone AIO2 bulk & instant revocation
-      const p2pDir = join(tmpDir, 'p2p-bulk-workspace')
+      const p2pDir = join(bridge.orchestrator.inboundDir, 'p2p-bulk-workspace')
       mkdirSync(p2pDir, { recursive: true })
       const bigPdfBuf = Buffer.alloc(5 * 1024 * 1024 + 200_000)
       for (let i = 0; i < bigPdfBuf.length; i += 1) bigPdfBuf[i] = (i * 31 + 17) & 0xff
@@ -1577,7 +1588,24 @@ async function main() {
       assert.equal(pairC.publicKeyFp.length, 16)
       assert.equal(await computeGrantPubKeyFp(pairC.publicKeyRaw), pairC.publicKeyFp)
       const grantUri = encodeE2eeGrantQrUri({ reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp })
-      assert.deepEqual(parseE2eeGrantQrInput(grantUri), { reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp })
+      assert.deepEqual(parseE2eeGrantQrInput(grantUri), { reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp, grantSecret: '' })
+
+      // v2 Commit-then-Reveal SAS + out-of-band QR grantSecret cryptographic checks
+      const qrSec1 = generateGrantSecret()
+      const grantUriV2 = encodeE2eeGrantQrUri({ reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp, grantSecret: qrSec1 })
+      assert.deepEqual(parseE2eeGrantQrInput(grantUriV2), { reqId: reqId1, roomId: testRoomId, pubKeyFp: pairC.publicKeyFp, grantSecret: qrSec1 })
+      const reqNonce1 = generateGrantNonce()
+      const appNonce1 = generateGrantNonce()
+      const commit1 = await computeGrantCommitment({ reqId: reqId1, roomId: testRoomId, pubKey: pairC.publicKeyRaw, nonce: reqNonce1 })
+      assert.match(commit1, /^[0-9a-f]{64}$/)
+      assert.notEqual(
+        await computeGrantCommitment({ reqId: reqId1, roomId: testRoomId, pubKey: pairC.publicKeyRaw, nonce: generateGrantNonce() }),
+        commit1,
+      )
+      const sasV2C = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId, requesterNonce: reqNonce1, approverNonce: appNonce1 })
+      const sasV2B = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId, requesterNonce: reqNonce1, approverNonce: appNonce1 })
+      assert.match(sasV2C, /^\d{3}-\d{3}$/)
+      assert.equal(sasV2C, sasV2B)
 
       const sasFromC = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId })
       const sasFromB = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId })
@@ -1602,12 +1630,21 @@ async function main() {
         requesterPubKeyRaw: pairC.publicKeyRaw,
         envelope: env1,
         roomId: testRoomId,
+        expectedReqId: reqId1,
         expectedApproverPubKey: pairB.publicKeyRaw,
       })
       assert.equal(dec1.keys[0].key, roomKeyA)
       await assert.rejects(
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedReqId: 'deadbeef00000000' }),
+        (err) => err?.code === 'E2EE_GRANT_REQID_MISMATCH',
+      )
+      await assert.rejects(
         () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedApproverPubKey: pairEvil.publicKeyRaw }),
         /E2EE_GRANT_PUBKEY_MISMATCH|安全码/,
+      )
+      await assert.rejects(
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, grantSecret: qrSec1 }),
+        /解密授权密钥包失败/,
       )
       await assert.rejects(
         () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: 'usr_wrong' }),
@@ -1625,7 +1662,9 @@ async function main() {
       try {
         const cPair1 = await generateGrantKeyPair()
         const liveReqId1 = generateGrantReqId()
-        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId1, pubKey: cPair1.publicKeyRaw, wantedKeyId: roomKeyAId }))
+        const liveReqNonce1 = generateGrantNonce()
+        const liveCommit1 = await computeGrantCommitment({ reqId: liveReqId1, roomId: smokeAdmin.roomId, pubKey: cPair1.publicKeyRaw, nonce: liveReqNonce1 })
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId1, pubKey: cPair1.publicKeyRaw, commit: liveCommit1, wantedKeyId: roomKeyAId }))
         await new Promise((r) => setTimeout(r, 60))
 
         // Cross-account Mallory sees 0 grants and forged reject/offer are silently ignored
@@ -1638,16 +1677,26 @@ async function main() {
         await new Promise((r) => setTimeout(r, 60))
         assert.equal(compC.inbox.some((m) => m.event === EVENTS.E2EE_GRANT_REJECT || m.event === EVENTS.E2EE_GRANT_OFFER), false)
 
-        // Phone B connects late -> receives pending grant in hello frame
+        // Phone B connects late -> receives pending grant (including commit) in hello frame
         phoneB = await openTicketClientWs(httpBase, port, loginData.token, { deviceName: 'iPhone · Safari', clientKind: 'mobile' })
         assert.equal(phoneB.hello.pendingGrants.length, 1)
         assert.equal(phoneB.hello.pendingGrants[0].reqId, liveReqId1)
+        assert.equal(phoneB.hello.pendingGrants[0].commit, liveCommit1)
 
-        // Path A: SAS Push -> Deliver -> Single-use burn
+        // Path A: Commit-then-Reveal SAS Push -> Deliver -> Single-use burn
         const bPair1 = await generateGrantKeyPair()
-        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId: liveReqId1, approverPubKey: bPair1.publicKeyRaw }))
+        const liveAppNonce1 = generateGrantNonce()
+        phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.offer', reqId: liveReqId1, approverPubKey: bPair1.publicKeyRaw, approverNonce: liveAppNonce1 }))
         const offerEv = await compC.waitFor((m) => m.event === EVENTS.E2EE_GRANT_OFFER && m.payload?.reqId === liveReqId1)
         assert.equal(offerEv.payload.approverPubKey, bPair1.publicKeyRaw)
+        assert.equal(offerEv.payload.approverNonce, liveAppNonce1)
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.reveal', reqId: liveReqId1, requesterNonce: liveReqNonce1 }))
+        const revealEv = await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REVEAL && m.payload?.reqId === liveReqId1)
+        assert.equal(revealEv.payload.requesterNonce, liveReqNonce1)
+        assert.equal(
+          await computeGrantCommitment({ reqId: liveReqId1, roomId: smokeAdmin.roomId, pubKey: cPair1.publicKeyRaw, nonce: revealEv.payload.requesterNonce }),
+          liveCommit1,
+        )
 
         const liveEnv1 = await encryptGrantPayload({
           approverPrivateKey: bPair1.privateKey,
@@ -1664,6 +1713,7 @@ async function main() {
           requesterPubKeyRaw: cPair1.publicKeyRaw,
           envelope: deliverEv.payload.envelope,
           roomId: smokeAdmin.roomId,
+          expectedReqId: liveReqId1,
           expectedApproverPubKey: offerEv.payload.approverPubKey,
         })
         assert.equal(unlocked1.keys[0].key, roomKeyA)
@@ -1674,10 +1724,14 @@ async function main() {
         await new Promise((r) => setTimeout(r, 60))
         assert.equal(compC.inbox.filter((m) => m.event === EVENTS.E2EE_GRANT_DELIVER).length, deliverBefore)
 
-        // Path B: Reverse-QR out-of-band 1-tap delivery
+        // Path B: Reverse-QR out-of-band 1-tap delivery bound to 128-bit grantSecret
         const cPair2 = await generateGrantKeyPair()
         const liveReqId2 = generateGrantReqId()
-        const parsedQr2 = parseE2eeGrantQrInput(encodeE2eeGrantQrUri({ reqId: liveReqId2, roomId: smokeAdmin.roomId, pubKeyFp: cPair2.publicKeyFp }))
+        const liveQrSecret2 = generateGrantSecret()
+        const parsedQr2 = parseE2eeGrantQrInput(
+          encodeE2eeGrantQrUri({ reqId: liveReqId2, roomId: smokeAdmin.roomId, pubKeyFp: cPair2.publicKeyFp, grantSecret: liveQrSecret2 }),
+        )
+        assert.equal(parsedQr2.grantSecret, liveQrSecret2)
         compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId2, pubKey: cPair2.publicKeyRaw }))
         await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REQUEST && m.payload?.reqId === liveReqId2)
 
@@ -1693,15 +1747,32 @@ async function main() {
           requesterPubKeyRaw: found2.pubKey,
           reqId: liveReqId2,
           roomId: smokeAdmin.roomId,
+          grantSecret: parsedQr2.grantSecret,
           payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
         })
+        assert.equal(liveEnv2.mode, 'qr')
         phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId: liveReqId2, envelope: liveEnv2 }))
         const deliverEv2 = await compC.waitFor((m) => m.event === EVENTS.E2EE_GRANT_DELIVER && m.payload?.reqId === liveReqId2)
+        // Relay-forged delivery without grantSecret must fail decryption
+        const forgedEnv = await encryptGrantPayload({
+          approverPrivateKey: pairEvil.privateKey,
+          approverPubKeyRaw: pairEvil.publicKeyRaw,
+          requesterPubKeyRaw: cPair2.publicKeyRaw,
+          reqId: liveReqId2,
+          roomId: smokeAdmin.roomId,
+          payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }] },
+        })
+        await assert.rejects(
+          () => decryptGrantPayload({ requesterPrivateKey: cPair2.privateKey, requesterPubKeyRaw: cPair2.publicKeyRaw, envelope: forgedEnv, roomId: smokeAdmin.roomId, expectedReqId: liveReqId2, grantSecret: liveQrSecret2 }),
+          /解密授权密钥包失败/,
+        )
         const unlocked2 = await decryptGrantPayload({
           requesterPrivateKey: cPair2.privateKey,
           requesterPubKeyRaw: cPair2.publicKeyRaw,
           envelope: deliverEv2.payload.envelope,
           roomId: smokeAdmin.roomId,
+          expectedReqId: liveReqId2,
+          grantSecret: liveQrSecret2,
         })
         assert.equal(unlocked2.keys[0].key, roomKeyA)
 
@@ -2061,10 +2132,27 @@ async function main() {
         assert.equal(bindSend.ok, true)
         const frankBindCode = [...smtp.inbox].reverse().find((m) => m.rcptTo === '<frank@example.com>' && m.code)?.code
         assert.match(String(frankBindCode || ''), /^\d{6}$/)
+        // Missing or wrong currentPassword must be rejected with 403
+        assert.equal(
+          (await fetch(`${eBase}/api/account/email/bind`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${frankReg.token}` },
+            body: JSON.stringify({ email: 'frank@example.com', code: frankBindCode }),
+          })).status,
+          403,
+        )
+        assert.equal(
+          (await fetch(`${eBase}/api/account/email/bind`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${frankReg.token}` },
+            body: JSON.stringify({ email: 'frank@example.com', code: frankBindCode, currentPassword: 'WrongPassword!' }),
+          })).status,
+          403,
+        )
         const bindConfirm = await (await fetch(`${eBase}/api/account/email/bind`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${frankReg.token}` },
-          body: JSON.stringify({ email: 'frank@example.com', code: frankBindCode }),
+          body: JSON.stringify({ email: 'frank@example.com', code: frankBindCode, currentPassword: 'FrankPassword123!' }),
         })).json()
         assert.equal(bindConfirm.ok, true)
         assert.equal(bindConfirm.user.emailVerified, true)
@@ -2116,6 +2204,15 @@ async function main() {
           body: JSON.stringify({ enabled: true }),
         })).json()
         assert.equal(en2fa.user.loginEmail2fa, true)
+        // Disabling 2FA without currentPassword must be rejected with 403
+        assert.equal(
+          (await fetch(`${eBase}/api/account/security/2fa`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${daveNewLogin.token}` },
+            body: JSON.stringify({ enabled: false }),
+          })).status,
+          403,
+        )
 
         await new Promise((r) => setTimeout(r, 350))
         const step1 = await (await fetch(`${eBase}/api/account/login`, {
@@ -2143,11 +2240,12 @@ async function main() {
         })).json()
         assert.equal(ok2fa.ok, true)
 
-        // Distributed multi-IP per-account brute-force lockout (10 bad IPs -> 11th blocked with 429)
+        // Per-(account, ip) brute-force lockout: 10 failures from attacker IP lock out that IP (429),
+        // without allowing unauthenticated remote lockout DoS against the victim's own IP (200)
         for (let i = 1; i <= 10; i += 1) {
           const r = await fetch(`${eBase}/api/account/login`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Real-IP': `198.51.100.${10 + i}` },
+            headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.77' },
             body: JSON.stringify({ username: 'frank', password: `WrongPass-${i}!` }),
           })
           assert.equal(r.status, 401)
@@ -2155,10 +2253,18 @@ async function main() {
         assert.equal(
           (await fetch(`${eBase}/api/account/login`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.250' },
+            headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.77' },
             body: JSON.stringify({ username: 'frank', password: 'FrankPassword123!' }),
           })).status,
           429,
+        )
+        assert.equal(
+          (await fetch(`${eBase}/api/account/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Real-IP': '198.51.100.250' },
+            body: JSON.stringify({ username: 'frank', password: 'FrankPassword123!' }),
+          })).status,
+          200,
         )
 
         // /ws/bridge auth failure rate-limiting isolated per (ip, roomId)
@@ -4374,6 +4480,90 @@ async function main() {
       assert.deepEqual(computeResizedDimensions(4032, 3024, 2048), { width: 2048, height: 1536, resized: true })
       assert.deepEqual(computeResizedDimensions(1200, 900, 2048), { width: 1200, height: 900, resized: false })
       assert.equal(replaceFileExtension('IMG_1234.HEIC', '.webp'), 'IMG_1234.webp')
+
+      // v1.0.20 P0/P1 security audit regression guards:
+      // 1) Object.prototype pollution blocked in admin-monitor even with crafted __proto__ app entry
+      const protoBefore = ({}).available
+      const ov = buildAdminOverview({
+        hub: {
+          getAllBridges: () => [
+            {
+              roomId: 'usr_evil',
+              bridgeId: 'evil-pc',
+              online: true,
+              platform: 'linux',
+              apps: [{ app: '__proto__', available: true, writable: true }, { app: 'codex', available: true, writable: true }],
+            },
+          ],
+          getAllClients: () => [],
+          getMetricsSummary: () => ({ onlineBridgeCount: 1, onlineClientCount: 0, totalSignals: 0, totalBridgeConnects: 1, totalClientConnects: 0 }),
+          getActivityLog: () => [],
+        },
+        accounts: { listUsersForAdmin: () => [], listInvites: () => [] },
+        serverHealth: { ok: true },
+      })
+      assert.equal(({}).available, protoBefore, 'Object.prototype must never be polluted by bridge.meta.apps')
+      assert.equal(ov.distributions.apps.codex?.writable, 1)
+
+      // 2) aio-ctrl type-confusion OOM guard: encode rejects numeric bin, raw wire JSON "bin" without trailer stripped & parseBinaryE2eeHeader rejects numbers
+      const tcCodec = createCtrlCodec()
+      assert.throws(() => tcCodec.encode({ type: 'rpc.req', id: 'tc-1', bin: 1073741824 }), TypeError)
+      const validSinglePrefix = tcCodec.encode({ ok: 1 })[0].subarray(0, 4)
+      const evilMetaBytes = new TextEncoder().encode(JSON.stringify({ type: 'rpc.req', id: 'tc-1', bin: 1073741824 }))
+      const evilWire = new Uint8Array(4 + 4 + evilMetaBytes.byteLength)
+      evilWire.set(validSinglePrefix, 0)
+      new DataView(evilWire.buffer).setUint32(4, evilMetaBytes.byteLength, false)
+      evilWire.set(evilMetaBytes, 8)
+      const tcDecoded = tcCodec.decode(evilWire)
+      assert.equal(tcDecoded.bin, undefined, 'JSON numeric "bin" without binary trailer must be stripped')
+      assert.equal(parseBinaryE2eeHeader(1073741824), null, 'parseBinaryE2eeHeader must reject numeric inputs without allocating')
+
+      // 3) RPC.SESSION_SEND strips attacker-injected _preMaterialized / _burnedTokens internal fields
+      const secOrch = new MultiAppOrchestrator({ config: { cwd: tmpDir }, log: { info() {}, warn() {}, error() {} } })
+      let capturedInternalOpts = null
+      secOrch.sendMessage = async (pubParams, internalOpts) => {
+        capturedInternalOpts = { pubParams, internalOpts }
+        return { ok: true, sessionId: 'codex:sec1' }
+      }
+      await secOrch.handleRpc(
+        RPC.SESSION_SEND,
+        {
+          app: 'codex',
+          sessionId: 'codex:sec1',
+          text: 'hi',
+          wait: true,
+          _preMaterialized: [{ localPath: '/etc/passwd', mimeType: 'image/png', filename: 'x.png' }],
+          _burnedTokens: [{ token: 'p2p_evil', rec: { localPath: '/etc/passwd' } }],
+        },
+        { clientId: 'cli-1' },
+      )
+      assert.equal(capturedInternalOpts.pubParams._preMaterialized, undefined)
+      assert.equal(capturedInternalOpts.pubParams._burnedTokens, undefined)
+      assert.equal(capturedInternalOpts.internalOpts.clientId, 'cli-1')
+      await secOrch.dispose()
+
+      // 4) Remote revocation credential wipe helper clears token & e2eeKeys while keeping account entry
+      const revUp = upsertDevice(
+        { devices: [], activeDeviceId: null },
+        { baseUrl: 'https://relay.example.com', token: 'tok-secret', roomId: 'usr_rev', username: 'alice' },
+      )
+      const revDevId = revUp.device.id
+      const revStateWithKey = upsertDeviceE2eeKey(revUp.state, revDevId, '0123456789abcdef', generateE2eeKey())
+      const wipedState = clearDeviceCredentials(revStateWithKey, revDevId)
+      const wipedDev = wipedState.devices.find((d) => d.id === revDevId)
+      assert.equal(wipedDev.token, '')
+      assert.deepEqual(wipedDev.e2eeKeys, {})
+      assert.equal(wipedDev.e2eeKey, '')
+      assert.equal(wipedDev.username, 'alice')
+
+      // 5) Markdown external image SSRF / SVG data URI defenses
+      assert.equal(isExternalHttpImageUrl('https://cdn.example.com/pic.png'), true)
+      assert.equal(isExternalHttpImageUrl('blob:https://app.example.com/123'), false)
+      assert.equal(isPrivateOrLoopbackUrl('http://127.0.0.1:8787/secret'), true)
+      assert.equal(isPrivateOrLoopbackUrl('https://192.168.1.5/admin.png'), true)
+      assert.equal(isPrivateOrLoopbackUrl('https://[::ffff:127.0.0.1]/x.png'), true)
+      assert.equal(isPrivateOrLoopbackUrl('https://cdn.example.com/ok.png'), false)
+      assert.equal(resolveImageSrc('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4='), '')
     }
     pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & mobile config)')
 

@@ -8,6 +8,15 @@ if [[ ! "${SERVER_URL}" =~ ^https?://[A-Za-z0-9._:/\[\]-]+$ ]] || [[ "${SERVER_U
   echo "    Please set ALLINONE_SERVER to your real relay server URL (e.g. https://ai.example.com)."
   exit 1
 fi
+IS_LOOPBACK=0
+if [[ "${SERVER_URL}" =~ ^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
+  IS_LOOPBACK=1
+fi
+if [ "${IS_LOOPBACK}" -eq 0 ] && [[ ! "${SERVER_URL}" =~ ^https:// ]]; then
+  echo "[!] Refusing insecure non-HTTPS server URL: ${SERVER_URL}"
+  echo "    HTTPS is required for all non-localhost relay servers."
+  exit 1
+fi
 INSTALL_DIR="${HOME}/.allinone-bridge"
 BRIDGE_FILE="${INSTALL_DIR}/allinone-bridge.mjs"
 DOWNLOAD_URL="${SERVER_URL}/downloads/allinone-bridge.mjs"
@@ -56,7 +65,11 @@ chmod 700 "${INSTALL_DIR}" 2>/dev/null || true
 echo "[2/3] Downloading portable bridge bundle..."
 BRIDGE_TMP="${BRIDGE_FILE}.tmp.$$"
 trap 'rm -f "${BRIDGE_TMP}" 2>/dev/null || true' EXIT
-curl --proto '=https,http' --proto-redir '=https,http' -fsSL "${DOWNLOAD_URL}" -o "${BRIDGE_TMP}"
+if [ "${IS_LOOPBACK}" -eq 1 ]; then
+  curl --proto '=https,http' --proto-redir '=https,http' -fsSL "${DOWNLOAD_URL}" -o "${BRIDGE_TMP}"
+else
+  curl --proto '=https' --proto-redir '=https' -fsSL "${DOWNLOAD_URL}" -o "${BRIDGE_TMP}"
+fi
 chmod 600 "${BRIDGE_TMP}" 2>/dev/null || true
 mv -f "${BRIDGE_TMP}" "${BRIDGE_FILE}"
 trap - EXIT

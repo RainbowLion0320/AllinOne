@@ -1,6 +1,17 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { chmod as chmodAsync, rename as renameAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from 'node:fs/promises'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs'
+import { chmod as chmodAsync, open as openAsync, unlink as unlinkAsync } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { safeEqual } from './auth.js'
 
@@ -9,8 +20,12 @@ const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;:"']{2,}$/
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
+const SCRYPT_MAX_CONCURRENT = 16
+const SCRYPT_MAX_QUEUE = 64
+const DUMMY_SCRYPT_SALT = '00112233445566778899aabbccddeeff'
 const MAX_DEVICES_PER_USER = 20
 const MAX_REVOKED_SIDS = 1024
+const MAX_INACTIVE_INVITES = 2000
 
 export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
 
@@ -47,12 +62,37 @@ function sha256Hex(val) {
   return createHash('sha256').update(String(val ?? ''), 'utf8').digest('hex')
 }
 
-function scryptAsync(password, salt) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    scrypt(String(password), String(salt), SCRYPT_KEYLEN, SCRYPT_OPTS, (err, derivedKey) => {
-      if (err) rejectPromise(err)
-      else resolvePromise(derivedKey)
+let scryptActive = 0
+const scryptQueue = []
+
+function pumpScryptQueue() {
+  while (scryptActive < SCRYPT_MAX_CONCURRENT && scryptQueue.length > 0) {
+    const job = scryptQueue.shift()
+    scryptActive += 1
+    scrypt(job.password, job.salt, SCRYPT_KEYLEN, SCRYPT_OPTS, (err, derivedKey) => {
+      scryptActive -= 1
+      pumpScryptQueue()
+      if (err) job.reject(err)
+      else job.resolve(derivedKey)
     })
+  }
+}
+
+function scryptAsync(password, salt) {
+  if (scryptActive >= SCRYPT_MAX_CONCURRENT && scryptQueue.length >= SCRYPT_MAX_QUEUE) {
+    const err = new Error('服务器认证队列繁忙，请稍后重试')
+    err.statusCode = 503
+    err.code = 'SCRYPT_OVERLOADED'
+    return Promise.reject(err)
+  }
+  return new Promise((resolvePromise, rejectPromise) => {
+    scryptQueue.push({
+      password: String(password),
+      salt: String(salt),
+      resolve: resolvePromise,
+      reject: rejectPromise,
+    })
+    pumpScryptQueue()
   })
 }
 
@@ -69,7 +109,8 @@ async function verifyPasswordHashAsync(password, salt, expectedHashHex) {
     const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
     if (derivedBuf.length !== expectedBuf.length) return false
     return timingSafeEqual(derivedBuf, expectedBuf)
-  } catch {
+  } catch (err) {
+    if (err?.statusCode === 503) throw err
     return false
   }
 }
@@ -207,6 +248,23 @@ export function createAccountStore({ filePath }) {
         tier,
       })
     }
+    pruneInactiveInvites()
+  }
+
+  function pruneInactiveInvites() {
+    const inactive = []
+    for (const inv of invitesById.values()) {
+      if (inv.status !== 'active') inactive.push(inv)
+    }
+    if (inactive.length <= MAX_INACTIVE_INVITES) return
+    inactive.sort((a, b) => {
+      const ta = Number(a.usedAt || a.revokedAt || a.createdAt || 0)
+      const tb = Number(b.usedAt || b.revokedAt || b.createdAt || 0)
+      return tb - ta
+    })
+    for (const old of inactive.slice(MAX_INACTIVE_INVITES)) {
+      invitesById.delete(old.id)
+    }
   }
 
   let saveTimer = null
@@ -235,14 +293,26 @@ export function createAccountStore({ filePath }) {
     const targetGen = ++saveGen
     const payload = serializeAccountsPayload()
     const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+    let fd = null
     try {
-      writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+      fd = openSync(tmpPath, 'w', 0o600)
+      const buf = Buffer.from(payload, 'utf8')
+      let written = 0
+      while (written < buf.length) {
+        written += writeSync(fd, buf, written, buf.length - written)
+      }
+      fsyncSync(fd)
+      closeSync(fd)
+      fd = null
       try { chmodSync(tmpPath, 0o600) } catch {}
       renameSync(tmpPath, filePath)
       try { chmodSync(filePath, 0o600) } catch {}
       persistedGen = Math.max(persistedGen, targetGen)
       saveDirty = persistedGen < saveGen
     } catch (err) {
+      if (fd !== null) {
+        try { closeSync(fd) } catch {}
+      }
       saveDirty = true
       try { unlinkSync(tmpPath) } catch {}
       throw err
@@ -257,8 +327,13 @@ export function createAccountStore({ filePath }) {
         saveDirty = false
         const payload = serializeAccountsPayload()
         const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
+        let fh = null
         try {
-          await writeFileAsync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 })
+          fh = await openAsync(tmpPath, 'w', 0o600)
+          await fh.writeFile(payload, 'utf8')
+          await fh.sync()
+          await fh.close()
+          fh = null
           try { await chmodAsync(tmpPath, 0o600) } catch {}
           // Perform generation check + atomic rename synchronously on the main thread
           // so a concurrent sync save() (gen N+1) can never be overwritten by a stale libuv renameAsync(gen N).
@@ -270,6 +345,9 @@ export function createAccountStore({ filePath }) {
           try { chmodSync(filePath, 0o600) } catch {}
           persistedGen = Math.max(persistedGen, targetGen)
         } catch (err) {
+          if (fh !== null) {
+            try { await fh.close() } catch {}
+          }
           try { await unlinkAsync(tmpPath) } catch {}
           saveDirty = persistedGen < saveGen
           console.error(`[accounts] Async save failed: ${err?.message || err}`)
@@ -378,6 +456,7 @@ export function createAccountStore({ filePath }) {
       invitesById.set(record.id, record)
       created.push({ ...record })
     }
+    pruneInactiveInvites()
     save()
     return created
   }
@@ -407,6 +486,7 @@ export function createAccountStore({ filePath }) {
     }
     target.status = 'revoked'
     target.revokedAt = Date.now()
+    pruneInactiveInvites()
     save()
     return { ok: true, invite: { ...target } }
   }
@@ -445,6 +525,25 @@ export function createAccountStore({ filePath }) {
     emailVerified = false,
     isBootstrapAdmin = false,
   } = {}) {
+    // Validate invite/bootstrap eligibility BEFORE checking username or email availability
+    // to prevent unauthenticated account/email enumeration.
+    const normalizedInvite = isBootstrapAdmin ? '' : normalizeInviteCode(inviteCode)
+    if (!isBootstrapAdmin) {
+      if (!normalizedInvite) {
+        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
+      }
+      let preMatched = null
+      for (const inv of invitesById.values()) {
+        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
+          preMatched = inv
+          break
+        }
+      }
+      if (!preMatched) {
+        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
+      }
+    }
+
     const uCheck = validateUsername(username)
     if (!uCheck.ok) return uCheck
     const pCheck = validatePassword(password)
@@ -464,23 +563,6 @@ export function createAccountStore({ filePath }) {
       }
       cleanEmail = eCheck.email
       cleanEmailLower = eCheck.emailLower
-    }
-
-    const normalizedInvite = isBootstrapAdmin ? '' : normalizeInviteCode(inviteCode)
-    if (!isBootstrapAdmin) {
-      if (!normalizedInvite) {
-        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
-      }
-      let preMatched = null
-      for (const inv of invitesById.values()) {
-        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
-          preMatched = inv
-          break
-        }
-      }
-      if (!preMatched) {
-        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
-      }
     }
 
     // Offload expensive scrypt hashing to libuv worker pool so event loop never stalls
@@ -520,6 +602,7 @@ export function createAccountStore({ filePath }) {
       matchedInvite.usedByUserId = userId
       matchedInvite.usedByUsername = uCheck.username
       matchedInvite.usedAt = now
+      pruneInactiveInvites()
     }
 
     const record = {
@@ -567,7 +650,7 @@ export function createAccountStore({ filePath }) {
     if (!userId && lower.includes('@')) {
       userId = userIdByEmailLower.get(lower)
     }
-    return userId || lower
+    return userId || ''
   }
 
   function markUserLogin(userId) {
@@ -578,6 +661,13 @@ export function createAccountStore({ filePath }) {
     return sanitizeUser(record)
   }
 
+  async function verifyUserPasswordAsync(userId, password) {
+    const record = usersById.get(userId)
+    const pw = String(password ?? '')
+    if (!record || !pw) return false
+    return verifyPasswordHashAsync(pw, record.passwordSalt, record.passwordHash)
+  }
+
   async function authenticateUserAsync(identifier, password, { recordLogin = true } = {}) {
     const lower = String(identifier || '').trim().toLowerCase()
     if (!lower || !password) return null
@@ -585,9 +675,12 @@ export function createAccountStore({ filePath }) {
     if (!userId && lower.includes('@')) {
       userId = userIdByEmailLower.get(lower)
     }
-    if (!userId) return null
-    const record = usersById.get(userId)
-    if (!record) return null
+    const record = userId ? usersById.get(userId) : null
+    if (!record) {
+      // Constant-time mitigation: spend equivalent scrypt CPU time for unknown identifiers
+      await scryptAsync(String(password), DUMMY_SCRYPT_SALT)
+      return null
+    }
     const origSalt = record.passwordSalt
     const origHash = record.passwordHash
     const ok = await verifyPasswordHashAsync(password, origSalt, origHash)
@@ -639,8 +732,11 @@ export function createAccountStore({ filePath }) {
     if (!record) {
       return { ok: false, error: '账号不存在' }
     }
+    if (record.emailVerified !== true) {
+      return { ok: false, error: '该邮箱尚未完成验证，无法用于重置密码' }
+    }
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
-    if (usersById.get(userId) !== record) {
+    if (usersById.get(userId) !== record || record.emailVerified !== true) {
       return { ok: false, error: '账号状态已变更，请重试' }
     }
     record.passwordSalt = salt
@@ -1042,7 +1138,11 @@ export function createAccountStore({ filePath }) {
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid || !Array.isArray(record.sessions)) return false
-    return record.sessions.some((s) => s?.sid === cleanSid)
+    if (record.revokedSids?.[cleanSid]) return false
+    const entry = record.sessions.find((s) => s?.sid === cleanSid)
+    if (!entry) return false
+    if (Date.now() - (Number(entry.createdAt) || 0) > SESSION_TTL_MS) return false
+    return true
   }
 
   function recordUserSession(
@@ -1108,15 +1208,8 @@ export function createAccountStore({ filePath }) {
     const cleanIp = String(ip || '').trim().slice(0, 64)
     const cleanUid = normalizeClientUid(clientUid)
     if (!entry) {
-      recordUserSession(userId, {
-        sid: cleanSid,
-        deviceName: cleanName,
-        clientKind: cleanKind || 'web',
-        ip: cleanIp,
-        clientUid: cleanUid,
-        onlineSids,
-      })
-      return true
+      // Allowlist enforcement: never auto-admit unknown or previously evicted sids
+      return false
     }
     let changed = false
     if (cleanName && entry.deviceName !== cleanName) {
@@ -1180,12 +1273,12 @@ export function createAccountStore({ filePath }) {
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return false
+    const existed = Array.isArray(record.sessions) && record.sessions.some((s) => s?.sid === cleanSid)
+    if (!existed) return false
     if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
     const now = Date.now()
     record.revokedSids[cleanSid] = now
-    if (Array.isArray(record.sessions)) {
-      record.sessions = record.sessions.filter((s) => s.sid !== cleanSid)
-    }
+    record.sessions = record.sessions.filter((s) => s.sid !== cleanSid)
     pruneUserSessionData(record, now)
     save()
     return true
@@ -1203,7 +1296,7 @@ export function createAccountStore({ filePath }) {
     return { ok: true, user: sanitizeUser(record) }
   }
 
-  function checkAndRememberLoginContext(userId, { deviceName = '', ip = '', clientUid = '' } = {}) {
+  function checkAndRememberLoginContext(userId, { deviceName = '', ip = '', clientUid = '', skipSave = false } = {}) {
     const record = usersById.get(userId)
     if (!record) return { isNewContext: false }
     const cleanIp = String(ip || '').trim()
@@ -1223,7 +1316,7 @@ export function createAccountStore({ filePath }) {
     const isNewContext = Boolean(hadHistory && cleanIp && !knownByIp && !knownBySession)
     if (cleanIp) {
       record.knownLoginIps = [cleanIp, ...record.knownLoginIps.filter((x) => x !== cleanIp)].slice(0, 12)
-      save()
+      if (!skipSave) save()
     }
     return { isNewContext }
   }
@@ -1287,6 +1380,7 @@ export function createAccountStore({ filePath }) {
     registerUserAsync,
     resolveAccountKey,
     markUserLogin,
+    verifyUserPasswordAsync,
     authenticateUserAsync,
     setUserEmail,
     setLoginEmail2fa,

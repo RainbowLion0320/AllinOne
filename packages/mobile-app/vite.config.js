@@ -51,11 +51,20 @@ export default defineConfig({
         navigateFallback: null,
         runtimeCaching: [
           {
-            urlPattern: ({ request, url }) => request.mode === 'navigate' && !/\/admin(?:\/|$)/i.test(url.pathname),
+            urlPattern: ({ request, url }) =>
+              request.mode === 'navigate' &&
+              !/\/admin(?:\/|$)/i.test(url.pathname) &&
+              !/\/api(?:\/|$)/i.test(url.pathname) &&
+              !url.searchParams.has('invite') &&
+              !/[?&]invite=/i.test(url.search),
             handler: 'NetworkFirst',
             options: {
               cacheName: 'pages-cache',
               networkTimeoutSeconds: 4,
+              expiration: {
+                maxEntries: 32,
+                maxAgeSeconds: 86400,
+              },
             },
           },
         ],

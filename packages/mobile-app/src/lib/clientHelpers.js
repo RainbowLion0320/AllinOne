@@ -6,6 +6,24 @@ export const RELEASES_URL =
 
 const CONFIGURED_APK_URL = String(import.meta.env?.VITE_APK_URL || '').trim()
 
+const SAFE_SETUP_BASE_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
+
+export function formatSafeSetupCmd(baseUrl, os = 'unix') {
+  const cleanBase = String(baseUrl || '').trim().replace(/\/+$/, '')
+  if (!cleanBase || !SAFE_SETUP_BASE_RE.test(cleanBase)) return ''
+  let parsed
+  try {
+    parsed = new URL(cleanBase)
+  } catch {
+    return ''
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return ''
+  if (os === 'win' || os === 'windows' || os === 'ps1') {
+    return `irm '${cleanBase}/setup.ps1' | iex`
+  }
+  return `curl -fsSL '${cleanBase}/setup.sh' | bash`
+}
+
 export function resolveApkUrl(base) {
   if (!CONFIGURED_APK_URL) return ''
   if (/^https?:\/\//i.test(CONFIGURED_APK_URL)) return CONFIGURED_APK_URL

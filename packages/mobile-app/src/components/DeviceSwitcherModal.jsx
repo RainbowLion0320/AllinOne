@@ -23,7 +23,7 @@ import {
 import { probeDeviceStatus } from '../lib/wsClient.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { translate } from '../lib/i18n.js'
-import { copyTextToClipboard } from '../lib/clientHelpers.js'
+import { copyTextToClipboard, formatSafeSetupCmd } from '../lib/clientHelpers.js'
 
 function StatusPill({ status, onlineCount = 0 }) {
   const { bi, t } = useI18n()
@@ -194,10 +194,12 @@ export function DeviceSwitcherModal({
   const activeUsername = activeEntry
     ? `@${activeEntry.username || activeEntry.label?.replace(/^@/, '') || activeEntry.roomId}`
     : ''
-  const bindCmdRows = acctServerBase
+  const unixBindCmd = formatSafeSetupCmd(acctServerBase, 'unix')
+  const winBindCmd = formatSafeSetupCmd(acctServerBase, 'win')
+  const bindCmdRows = unixBindCmd && winBindCmd
     ? [
-        { key: 'unix', label: 'Mac/Linux', cmd: `curl -fsSL ${acctServerBase}/setup.sh | bash` },
-        { key: 'win', label: 'Windows', cmd: `irm ${acctServerBase}/setup.ps1 | iex` },
+        { key: 'unix', label: 'Mac/Linux', cmd: unixBindCmd },
+        { key: 'win', label: 'Windows', cmd: winBindCmd },
       ]
     : []
 

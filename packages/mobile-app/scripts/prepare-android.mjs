@@ -4,9 +4,8 @@
  *  1. Builds the latest Vite mobile PWA bundle (baking VITE_RELAY_URL if configured)
  *  2. Runs `cap sync android` so Capacitor Gradle bindings and bundled assets stay current
  *  3. Writes the runtime `android/app/src/main/assets/capacitor.config.json`:
- *     - When PUBLIC_RELAY_URL / VITE_RELAY_URL is set (and ANDROID_BUNDLED_UI !== '1'),
- *       configures remote HTTPS hot-update (`server.url = "<relayUrl>/"`)
- *     - Otherwise omits `server.url` so the APK serves the bundled `dist/` locally at `https://localhost`
+ *     - By default omits `server.url` so the APK runs signed bundled local assets at `https://localhost`
+ *     - Only enables remote HTTPS UI (`server.url = "<relayUrl>/"`) when explicitly opted in via `ANDROID_REMOTE_UI=1`
  *     Never mutates the tracked `packages/mobile-app/capacitor.config.json` template.
  */
 
@@ -79,7 +78,6 @@ function runCapSync(env) {
 
 function main() {
   const relayUrl = resolveRelayUrl()
-  const forceBundled = String(process.env.ANDROID_BUNDLED_UI || '').trim() === '1'
   const buildEnv = {
     ...process.env,
     ...(relayUrl ? { VITE_RELAY_URL: relayUrl } : {}),
@@ -92,13 +90,16 @@ function main() {
   runCapSync(buildEnv)
 
   // 3. Write clean runtime assets/capacitor.config.json (gitignored)
-  const useRemoteHotUpdate = Boolean(relayUrl && /^https:\/\//i.test(relayUrl) && !forceBundled)
+  // Default to signed bundled local assets; remote HTTPS UI requires explicit ANDROID_REMOTE_UI=1 opt-in.
+  const useRemoteUrl =
+    String(process.env.ANDROID_REMOTE_UI || '').trim() === '1' &&
+    Boolean(relayUrl && /^https:\/\//i.test(relayUrl))
   const runtimeCapConfig = {
     appId: 'com.allinone.dshmobile',
     appName: 'All in One',
     webDir: 'dist',
     server: {
-      ...(useRemoteHotUpdate ? { url: `${relayUrl}/` } : {}),
+      ...(useRemoteUrl ? { url: `${relayUrl}/` } : {}),
       androidScheme: 'https',
       cleartext: false,
     },
@@ -116,7 +117,7 @@ function main() {
 
   const pkg = JSON.parse(readFileSync(join(MOBILE_ROOT, 'package.json'), 'utf8'))
   console.log(
-    `[prepare-android] Ready v${pkg.version}: mode=${useRemoteHotUpdate ? `remote-hot-update (${relayUrl}/)` : 'bundled-local (https://localhost)'}`,
+    `[prepare-android] Ready v${pkg.version}: mode=${useRemoteUrl ? `remote-hot-update (${relayUrl}/)` : 'bundled-local (https://localhost)'}`,
   )
 }
 

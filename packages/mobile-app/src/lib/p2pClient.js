@@ -111,6 +111,7 @@ export class P2PPeerSession {
   constructor({
     bridgeId,
     roomId,
+    getClientId,
     getE2eeContext,
     getIceServers,
     sendSignal,
@@ -119,6 +120,7 @@ export class P2PPeerSession {
   }) {
     this.bridgeId = String(bridgeId || '').trim()
     this.roomId = String(roomId || '').trim()
+    this.getClientId = typeof getClientId === 'function' ? getClientId : () => ''
     this.getE2eeContext = getE2eeContext
     this.getIceServers = getIceServers || (() => [])
     this.sendSignal = sendSignal
@@ -236,7 +238,14 @@ export class P2PPeerSession {
   async _sendEncryptedSignal(inner, { allowWhenClosing = false } = {}) {
     if (this.closed && !allowWhenClosing) return
     const ctx = this._getRequiredE2ee()
-    const e2ee = await encryptJson(ctx.key, inner, { kind: 'p2p.signal', roomId: this.roomId })
+    const clientId = String(this.getClientId?.() || '').trim()
+    const payload = {
+      ...inner,
+      ...(clientId ? { clientId } : {}),
+      sessionId: this.sessionId,
+      ts: Date.now(),
+    }
+    const e2ee = await encryptJson(ctx.key, payload, { kind: 'p2p.signal', roomId: this.roomId })
     if (this.closed && !allowWhenClosing) return
     this.sendSignal({
       bridgeId: this.bridgeId,
@@ -582,6 +591,7 @@ export class P2PPeerSession {
       return
     }
     if (this.closed || !this.pc || !inner || typeof inner !== 'object') return
+    if (inner.sessionId && String(inner.sessionId) !== this.sessionId) return
 
     if (inner.kind === 'close') {
       this._failAndTeardown(new Error(L('电脑端已关闭 P2P 连接', 'Computer closed the P2P connection')), 'failed')

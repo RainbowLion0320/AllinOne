@@ -6,6 +6,7 @@ const DEFAULT_COOLDOWN_MS = 60 * 1000 // 60 seconds between sends per (purpose, 
 const MAX_VERIFY_ATTEMPTS = 5
 const MAX_EMAIL_SENDS_PER_HOUR = 6
 const MAX_IP_SENDS_PER_HOUR = 12
+const DEFAULT_MAX_GLOBAL_EMAILS_PER_HOUR = 300
 const HOUR_MS = 60 * 60 * 1000
 const MAX_TRACKED_KEYS = 2000
 
@@ -21,20 +22,31 @@ function normalizeKeyEmail(email) {
  * In-memory 6-digit email verification code manager with strict anti-abuse limits:
  * - Codes are hashed with a per-code random salt (never stored plaintext)
  * - 10-minute expiration, single-use consumption, 5-attempt brute-force lockout
- * - 60-second resend cooldown + hourly per-email and per-IP send caps (protects free SMTP quotas)
+ * - 60-second resend cooldown + unified per-email, per-user (bind), per-IP, and global hourly caps
  */
 export function createEmailCodeStore(options = {}) {
   const ttlMs = Number(options.ttlMs) > 0 ? Number(options.ttlMs) : CODE_TTL_MS
   const cooldownMs = Number(options.cooldownMs) >= 0 ? Number(options.cooldownMs) : DEFAULT_COOLDOWN_MS
   const maxEmailPerHour = Number(options.maxEmailPerHour) > 0 ? Number(options.maxEmailPerHour) : MAX_EMAIL_SENDS_PER_HOUR
   const maxIpPerHour = Number(options.maxIpPerHour) > 0 ? Number(options.maxIpPerHour) : MAX_IP_SENDS_PER_HOUR
+  const envGlobalMax = Number(process.env.MAX_EMAILS_PER_HOUR)
+  const maxGlobalPerHour =
+    Number(options.maxGlobalPerHour) > 0
+      ? Number(options.maxGlobalPerHour)
+      : Number.isFinite(envGlobalMax) && envGlobalMax > 0
+        ? Math.floor(envGlobalMax)
+        : DEFAULT_MAX_GLOBAL_EMAILS_PER_HOUR
 
   /** key `${purpose}:${emailLower}` -> { salt, hash, userId, issuedAt, expiresAt, attempts } */
   const codes = new Map()
-  /** key `${purpose}:${emailLower}` -> timestamps[] */
+  /** key `emailLower` -> timestamps[] (unified across all purposes) */
   const emailSendLog = new Map()
+  /** key `bind:${userId}` -> timestamps[] (caps per-user bind sends across arbitrary emails) */
+  const userSendLog = new Map()
   /** ip -> timestamps[] */
   const ipSendLog = new Map()
+  /** Global outbound verification timestamps within the last hour */
+  let globalSendLog = []
 
   function pruneMap(map, maxSize) {
     if (map.size < maxSize) return
@@ -64,6 +76,32 @@ export function createEmailCodeStore(options = {}) {
     return fresh
   }
 
+  function getConfig() {
+    return {
+      cooldownSec: Math.ceil(cooldownMs / 1000),
+      expiresInSec: Math.ceil(ttlMs / 1000),
+    }
+  }
+
+  /**
+   * Enforce and record per-IP send quota without mutating `codes`, `emailSendLog`, or `globalSendLog`.
+   * Used for non-existent password-reset targets so random probes cannot evict valid OTPs.
+   */
+  function checkIpSendLimit(ip = 'unknown') {
+    const cleanIp = String(ip || 'unknown').trim() || 'unknown'
+    const now = Date.now()
+    pruneMap(ipSendLog, MAX_TRACKED_KEYS)
+    const recentIp = getRecentTimestamps(ipSendLog, cleanIp, now)
+    if (recentIp.length >= maxIpPerHour) {
+      return {
+        ok: false,
+        error: '当前网络请求验证码过于频繁，请稍后再试',
+      }
+    }
+    ipSendLog.set(cleanIp, [...recentIp, now])
+    return { ok: true }
+  }
+
   /**
    * Issue a fresh 6-digit code if rate limits pass.
    * Returns `{ ok, code, cooldownSec, expiresInSec, rollback }` or `{ ok: false, error, retryAfterSec? }`.
@@ -72,6 +110,7 @@ export function createEmailCodeStore(options = {}) {
     const cleanPurpose = String(purpose || '').trim()
     const emailLower = normalizeKeyEmail(email)
     const cleanIp = String(ip || 'unknown').trim() || 'unknown'
+    const cleanUserId = String(userId || '').trim()
     if (!cleanPurpose || !emailLower) {
       return { ok: false, error: '邮箱地址无效' }
     }
@@ -79,6 +118,7 @@ export function createEmailCodeStore(options = {}) {
     const now = Date.now()
     pruneMap(codes, MAX_TRACKED_KEYS)
     pruneMap(emailSendLog, MAX_TRACKED_KEYS)
+    pruneMap(userSendLog, MAX_TRACKED_KEYS)
     pruneMap(ipSendLog, MAX_TRACKED_KEYS)
 
     const key = `${cleanPurpose}:${emailLower}`
@@ -92,11 +132,20 @@ export function createEmailCodeStore(options = {}) {
       }
     }
 
-    const recentEmail = getRecentTimestamps(emailSendLog, key, now)
+    const recentEmail = getRecentTimestamps(emailSendLog, emailLower, now)
     if (recentEmail.length >= maxEmailPerHour) {
       return {
         ok: false,
         error: '该邮箱发送验证码次数过多，请 1 小时后再试',
+      }
+    }
+
+    const bindUserKey = cleanPurpose === 'bind' && cleanUserId ? `bind:${cleanUserId}` : ''
+    const recentUser = bindUserKey ? getRecentTimestamps(userSendLog, bindUserKey, now) : []
+    if (bindUserKey && recentUser.length >= maxEmailPerHour) {
+      return {
+        ok: false,
+        error: '当前账号发送绑定验证码次数过多，请 1 小时后再试',
       }
     }
 
@@ -108,20 +157,30 @@ export function createEmailCodeStore(options = {}) {
       }
     }
 
+    globalSendLog = globalSendLog.filter((t) => now - t < HOUR_MS)
+    if (globalSendLog.length >= maxGlobalPerHour) {
+      return {
+        ok: false,
+        error: '服务器邮件发送已达本小时上限，请稍后再试',
+      }
+    }
+
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
     const salt = randomBytes(12).toString('hex')
     const entry = {
       salt,
       hash: sha256Hex(`${cleanPurpose}:${emailLower}:${salt}:${code}`),
-      userId: String(userId || ''),
+      userId: cleanUserId,
       issuedAt: now,
       expiresAt: now + ttlMs,
       attempts: 0,
     }
 
     codes.set(key, entry)
-    emailSendLog.set(key, [...recentEmail, now])
+    emailSendLog.set(emailLower, [...recentEmail, now])
+    if (bindUserKey) userSendLog.set(bindUserKey, [...recentUser, now])
     ipSendLog.set(cleanIp, [...recentIp, now])
+    globalSendLog.push(now)
 
     const removeOneTimestamp = (map, mapKey, ts) => {
       const cur = map.get(mapKey)
@@ -143,8 +202,11 @@ export function createEmailCodeStore(options = {}) {
         if (prev && prev.expiresAt > Date.now()) codes.set(key, prev)
         else codes.delete(key)
       }
-      removeOneTimestamp(emailSendLog, key, now)
+      removeOneTimestamp(emailSendLog, emailLower, now)
+      if (bindUserKey) removeOneTimestamp(userSendLog, bindUserKey, now)
       removeOneTimestamp(ipSendLog, cleanIp, now)
+      const gIdx = globalSendLog.lastIndexOf(now)
+      if (gIdx !== -1) globalSendLog.splice(gIdx, 1)
     }
 
     return {
@@ -203,6 +265,8 @@ export function createEmailCodeStore(options = {}) {
   }
 
   return {
+    getConfig,
+    checkIpSendLimit,
     issueCode,
     verifyCode,
     consumeCode,

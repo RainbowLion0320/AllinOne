@@ -153,7 +153,7 @@ export function HtmlPreviewModal({ state, onClose }) {
           title={filename}
           src="./sandbox-preview.html"
           onLoad={handleIframeLoad}
-          sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+          sandbox="allow-scripts allow-forms"
           referrerPolicy="no-referrer"
           className="h-full w-full border-0 bg-white"
         />
