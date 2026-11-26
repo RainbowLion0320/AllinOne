@@ -423,9 +423,10 @@ export async function loadE2eeImageUrl(item, imageContext = {}, { forceRefresh =
 
     const client = imageContext?.client
     if (!client) throw new Error(L('未连接到电脑端', 'Not connected to computer'))
+    const sessionId = String(imageContext?.sessionId || '').trim()
     const result = await client.rpc(
       RPC.FILE_READ,
-      { path: target, cwd },
+      { path: target, cwd, ...(sessionId ? { sessionId } : {}) },
       120_000,
       bridgeId ? { bridgeId } : {},
     )

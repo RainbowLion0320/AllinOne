@@ -60,6 +60,16 @@ function toWsUrl(httpBase, path, queryParams = {}) {
   return u.toString()
 }
 
+const DEFAULT_BOOTSTRAP_STATUS = {
+  hasUsers: true,
+  hasAdmin: true,
+  needsBootstrapToken: false,
+  emailEnabled: false,
+  dailyRegistrationLimit: 0,
+  dailyRegistrationsUsed: 0,
+  dailyRegistrationRemaining: null,
+}
+
 export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
   const base = normalizeBaseUrl(serverUrl)
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
@@ -69,10 +79,26 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
       ...(controller ? { signal: controller.signal } : {}),
     })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok || !data.ok) return { hasUsers: true, emailEnabled: false }
-    return { hasUsers: Boolean(data.hasUsers), emailEnabled: Boolean(data.emailEnabled) }
+    if (!res.ok || !data.ok) return { ...DEFAULT_BOOTSTRAP_STATUS }
+    const hasUsers = typeof data.hasUsers === 'boolean' ? data.hasUsers : Boolean(data.hasAdmin)
+    const hasAdmin = typeof data.hasAdmin === 'boolean' ? data.hasAdmin : hasUsers
+    const dailyRegistrationLimit = Math.max(0, Number(data.dailyRegistrationLimit) || 0)
+    const dailyRegistrationsUsed = Math.max(0, Number(data.dailyRegistrationsUsed) || 0)
+    const dailyRegistrationRemaining =
+      data.dailyRegistrationRemaining === null || data.dailyRegistrationRemaining === undefined
+        ? (dailyRegistrationLimit > 0 ? Math.max(0, dailyRegistrationLimit - dailyRegistrationsUsed) : null)
+        : Math.max(0, Number(data.dailyRegistrationRemaining) || 0)
+    return {
+      hasUsers,
+      hasAdmin,
+      needsBootstrapToken: Boolean(data.needsBootstrapToken),
+      emailEnabled: Boolean(data.emailEnabled),
+      dailyRegistrationLimit,
+      dailyRegistrationsUsed,
+      dailyRegistrationRemaining,
+    }
   } catch {
-    return { hasUsers: true, emailEnabled: false }
+    return { ...DEFAULT_BOOTSTRAP_STATUS }
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -203,8 +229,9 @@ export async function setAccountLogin2fa(baseUrl, token, enabled, currentPasswor
   return data.user
 }
 
-export async function registerAccount(serverUrl, { username, password, inviteCode, email = '', emailCode = '' }) {
+export async function registerAccount(serverUrl, { username, password, bootstrapToken = '', email = '', emailCode = '' }) {
   const base = normalizeBaseUrl(serverUrl)
+  const cleanBootstrapToken = String(bootstrapToken || '').trim()
   const cleanEmail = String(email || '').trim()
   const devMeta = detectClientDeviceMeta()
   const res = await fetch(`${base}/api/account/register`, {
@@ -213,7 +240,7 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
     body: JSON.stringify({
       username: String(username || '').trim(),
       password: String(password ?? ''),
-      inviteCode: String(inviteCode || '').trim(),
+      ...(cleanBootstrapToken ? { bootstrapToken: cleanBootstrapToken } : {}),
       ...(cleanEmail ? { email: cleanEmail, emailCode: String(emailCode || '').trim() } : {}),
       deviceName: devMeta.deviceName,
       clientKind: devMeta.clientKind,
@@ -238,8 +265,9 @@ export async function registerAccount(serverUrl, { username, password, inviteCod
   }
 }
 
-export async function sendEmailVerificationCode(serverUrl, { purpose, email, inviteCode = '', token = '' }) {
+export async function sendEmailVerificationCode(serverUrl, { purpose, email, bootstrapToken = '', token = '' }) {
   const base = normalizeBaseUrl(serverUrl)
+  const cleanBootstrapToken = String(bootstrapToken || '').trim()
   const headers = { 'Content-Type': 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
   const res = await fetch(`${base}/api/account/email/send-code`, {
@@ -248,7 +276,7 @@ export async function sendEmailVerificationCode(serverUrl, { purpose, email, inv
     body: JSON.stringify({
       purpose,
       email: String(email || '').trim(),
-      ...(inviteCode ? { inviteCode: String(inviteCode).trim() } : {}),
+      ...(cleanBootstrapToken ? { bootstrapToken: cleanBootstrapToken } : {}),
     }),
   })
   const data = await res.json().catch(() => ({}))
@@ -350,102 +378,6 @@ export async function removeAccountDevice(baseUrl, token, { deviceId }) {
     throw new Error(data.error || L(`解绑失败 (HTTP ${res.status})`, `Unlink failed (HTTP ${res.status})`))
   }
   return Array.isArray(data.devices) ? data.devices : []
-}
-
-export async function adminListInvites(baseUrl, token) {
-  const base = normalizeBaseUrl(baseUrl)
-  const res = await fetch(`${base}/api/admin/invites`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`获取邀请码失败 (HTTP ${res.status})`, `Failed to load invite codes (HTTP ${res.status})`))
-  }
-  return {
-    invites: Array.isArray(data.invites) ? data.invites : [],
-    stats: data.stats || { total: 0, active: 0, used: 0, revoked: 0 },
-    users: Array.isArray(data.users) ? data.users : [],
-  }
-}
-
-export async function adminCreateInvites(baseUrl, token, { count = 1, note = '', tier = 'free' } = {}) {
-  const base = normalizeBaseUrl(baseUrl)
-  const normTier = String(tier || 'free').trim().toLowerCase()
-  const res = await fetch(`${base}/api/admin/invites`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      count,
-      note,
-      tier: normTier,
-    }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`生成邀请码失败 (HTTP ${res.status})`, `Failed to create invite codes (HTTP ${res.status})`))
-  }
-  return Array.isArray(data.invites) ? data.invites : []
-}
-
-export async function adminSetUserTier(baseUrl, token, { userId, tier }) {
-  const base = normalizeBaseUrl(baseUrl)
-  const res = await fetch(`${base}/api/admin/users/set-tier`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ userId, tier }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`更新用户等级失败 (HTTP ${res.status})`, `Failed to update user tier (HTTP ${res.status})`))
-  }
-  return {
-    user: data.user || null,
-    tier: String(data.tier || tier || 'free'),
-    turnQuota: data.turnQuota || null,
-  }
-}
-
-export async function adminResetTurnUsage(baseUrl, token, { userId }) {
-  const base = normalizeBaseUrl(baseUrl)
-  const res = await fetch(`${base}/api/admin/users/reset-turn-usage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ userId }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`清零中继流量失败 (HTTP ${res.status})`, `Failed to reset relay usage (HTTP ${res.status})`))
-  }
-  return {
-    user: data.user || null,
-    turnQuota: data.turnQuota || null,
-  }
-}
-
-export async function adminRevokeInvite(baseUrl, token, { id }) {
-  const base = normalizeBaseUrl(baseUrl)
-  const res = await fetch(`${base}/api/admin/invites/revoke`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ id }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || L(`作废邀请码失败 (HTTP ${res.status})`, `Failed to revoke invite code (HTTP ${res.status})`))
-  }
-  return data.invite
 }
 
 export async function probeDeviceStatus(device, timeoutMs = 5000) {

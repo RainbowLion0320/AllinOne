@@ -6,7 +6,7 @@ import { basename, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
-import { createAccountStore, VALID_TIERS, validateEmail, validatePassword } from './accounts.js'
+import { createAccountStore, normalizeMaxDailyRegistrations, validateEmail, validatePassword } from './accounts.js'
 import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
@@ -322,6 +322,8 @@ export function createRelayServer(options = {}) {
   const host = String(firstNonEmptyEnv(options.host, process.env.HOST, '0.0.0.0')).trim()
   const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '').trim()
   const adminBootstrapToken = String(options.adminBootstrapToken ?? process.env.ADMIN_BOOTSTRAP_TOKEN ?? '').trim()
+  const rawMaxDaily = options.maxDailyRegistrations ?? process.env.MAX_DAILY_REGISTRATIONS
+  const maxDailyRegistrations = normalizeMaxDailyRegistrations(rawMaxDaily, 20)
   const publicRelayUrl = String(options.publicRelayUrl ?? process.env.PUBLIC_RELAY_URL ?? '').trim().replace(/\/+$/, '')
   const allowedOrigins = buildAllowedOriginsSet(
     publicRelayUrl,
@@ -674,7 +676,7 @@ export function createRelayServer(options = {}) {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id, X-Invite-Code',
+      'Content-Type, Authorization, X-Bridge-Secret, X-Room-Id',
     )
   }
 
@@ -935,12 +937,21 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Account bootstrap check (tiny status so UI knows whether an admin exists & whether SMTP email is enabled)
+    // Account bootstrap check (status so UI knows whether an admin exists, SMTP availability & daily registration quota)
     if (pathname === '/api/account/bootstrap-status' && req.method === 'GET') {
+      const hasAdmin = accounts.hasAnyUser()
+      const dailyStats = accounts.getDailyRegistrationStats(maxDailyRegistrations)
       sendJson(res, 200, {
         ok: true,
-        hasUsers: accounts.userCount() > 0,
+        hasAdmin,
+        hasUsers: hasAdmin,
+        userCount: accounts.getUserCount(),
+        needsBootstrapToken: !hasAdmin && Boolean(adminBootstrapToken),
         emailEnabled: mailer.isConfigured(),
+        openRegistration: true,
+        dailyRegistrationLimit: maxDailyRegistrations,
+        dailyRegistrationsUsed: dailyStats.used,
+        dailyRegistrationRemaining: dailyStats.remaining,
       })
       return
     }
@@ -974,13 +985,23 @@ export function createRelayServer(options = {}) {
         let shouldDeliver = true
 
         if (purpose === 'register') {
-          const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
-          const isBootstrapAdmin =
-            accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAdminBootstrapToken(inviteCode)
-          if (!isBootstrapAdmin && !accounts.hasActiveInviteCode(inviteCode)) {
-            auth.recordFailure(ip)
-            sendJson(res, 400, { ok: false, error: '请先填写有效的一次性邀请码，再获取邮箱验证码' })
-            return
+          if (accounts.hasAnyUser()) {
+            const dailyStats = accounts.getDailyRegistrationStats(maxDailyRegistrations)
+            if (dailyStats.exceeded) {
+              sendJson(res, 429, {
+                ok: false,
+                code: 'DAILY_REGISTRATION_LIMIT',
+                error: `今日新用户注册名额已满（每日上限 ${dailyStats.limit} 人），请明天再试`,
+              })
+              return
+            }
+          } else if (adminBootstrapToken) {
+            const bootstrapToken = String(body.bootstrapToken || '').trim()
+            if (!auth.verifyAdminBootstrapToken(bootstrapToken)) {
+              auth.recordFailure(ip)
+              sendJson(res, 400, { ok: false, error: '管理员初始化密钥无效' })
+              return
+            }
           }
           if (accounts.isEmailTaken(eCheck.email)) {
             sendJson(res, 400, { ok: false, error: '该邮箱已被其他账号绑定' })
@@ -1084,9 +1105,9 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Account registration (strictly requires an admin-issued single-use invite code;
+    // Account registration (open registration with configurable daily cap;
     // email binding is strictly optional when SMTP is configured;
-    // when 0 users exist yet, optional ADMIN_BOOTSTRAP_TOKEN works once to bootstrap the first admin account)
+    // when 0 users exist yet, first user becomes admin and requires ADMIN_BOOTSTRAP_TOKEN if configured)
     if (pathname === '/api/account/register' && req.method === 'POST') {
       const ip = getClientIp(req)
       if (!auth.checkRateLimit(ip)) {
@@ -1095,13 +1116,21 @@ export function createRelayServer(options = {}) {
       }
       try {
         const body = await readJsonBody(req)
-        const inviteCode = String(body.inviteCode || req.headers['x-invite-code'] || '').trim()
-        const isBootstrapAdmin =
-          accounts.userCount() === 0 && Boolean(inviteCode) && auth.verifyAdminBootstrapToken(inviteCode)
-        // Strictly validate invite / bootstrap token BEFORE email or username checks to prevent enumeration
-        if (!isBootstrapAdmin && !accounts.hasActiveInviteCode(inviteCode)) {
+        const bootstrapToken = String(body.bootstrapToken || '').trim()
+
+        if (accounts.hasAnyUser()) {
+          const dailyStats = accounts.getDailyRegistrationStats(maxDailyRegistrations)
+          if (dailyStats.exceeded) {
+            sendJson(res, 429, {
+              ok: false,
+              code: 'DAILY_REGISTRATION_LIMIT',
+              error: `今日新用户注册名额已满（每日上限 ${dailyStats.limit} 人），请明天再试`,
+            })
+            return
+          }
+        } else if (adminBootstrapToken && !auth.verifyAdminBootstrapToken(bootstrapToken)) {
           auth.recordFailure(ip)
-          sendJson(res, 400, { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' })
+          sendJson(res, 400, { ok: false, error: '管理员初始化密钥无效' })
           return
         }
 
@@ -1138,14 +1167,20 @@ export function createRelayServer(options = {}) {
         const result = await accounts.registerUserAsync({
           username: body.username,
           password: body.password,
-          inviteCode,
+          bootstrapToken,
+          expectedBootstrapToken: adminBootstrapToken,
           email: verifiedEmail,
           emailVerified: Boolean(verifiedEmail),
-          isBootstrapAdmin,
+          maxDailyRegistrations,
         })
         if (!result.ok) {
-          auth.recordFailure(ip)
-          sendJson(res, 400, { ok: false, error: result.error })
+          const statusCode = result.statusCode || 400
+          if (statusCode !== 429) auth.recordFailure(ip)
+          sendJson(res, statusCode, {
+            ok: false,
+            ...(result.code ? { code: result.code } : {}),
+            error: result.error,
+          })
           return
         }
         if (verifiedEmail) {
@@ -1832,90 +1867,11 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Admin: List all single-use invite codes + registered user summary
-    if (pathname === '/api/admin/invites' && req.method === 'GET') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      const invites = accounts.listInvites()
-      const stats = {
-        total: invites.length,
-        active: invites.filter((i) => i.status === 'active').length,
-        used: invites.filter((i) => i.status === 'used').length,
-        revoked: invites.filter((i) => i.status === 'revoked').length,
-      }
-      const usersWithQuota = accounts.listUsers().map((u) => ({
-        ...u,
-        turnQuota: buildUserTurnQuota(u.userId),
-      }))
-      sendJson(res, 200, { ok: true, invites, stats, users: usersWithQuota })
-      return
-    }
-
-    // Admin: Generate N single-use registration invite codes (each usable by strictly 1 user)
-    if (pathname === '/api/admin/invites' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const rawTier = body.tier === undefined || body.tier === null ? '' : String(body.tier).trim().toLowerCase()
-        if (rawTier && !VALID_TIERS.has(rawTier)) {
-          sendJson(res, 400, { ok: false, error: '无效的用户等级，仅支持 free / pro / ultra / admin' })
-          return
-        }
-        const created = accounts.createInvites({
-          count: body.count ?? 1,
-          note: body.note || '',
-          createdBy: payload.uname || payload.sub || 'admin',
-          tier: rawTier || 'free',
-        })
-        const createdTier = created[0]?.tier || 'free'
-        hub.recordActivity({
-          type: 'admin.invite',
-          roomId: payload.room,
-          label: payload.uname ? `@${payload.uname}` : 'admin',
-          detail: `Created ${created.length} ${createdTier.toUpperCase()} invite(s)${body.note ? ` · ${String(body.note).slice(0, 32)}` : ''}`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, invites: created })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin: Revoke an unused invite code
-    if (pathname === '/api/admin/invites/revoke' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const resRevoke = accounts.revokeInvite(body.id || body.code)
-        if (!resRevoke) {
-          sendJson(res, 404, { ok: false, error: '找不到该邀请码' })
-          return
-        }
-        if (!resRevoke.ok) {
-          sendJson(res, 400, { ok: false, error: resRevoke.error })
-          return
-        }
-        hub.recordActivity({
-          type: 'admin.invite',
-          roomId: payload.room,
-          label: payload.uname ? `@${payload.uname}` : 'admin',
-          detail: `Revoked ${resRevoke.invite.code}`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, invite: resRevoke.invite })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
     // Admin Monitor: On-demand full server & all-users status snapshot (zero idle overhead)
     if (pathname === '/api/admin/overview' && req.method === 'GET') {
       const payload = requireAdmin(req, res)
       if (!payload) return
+      const dailyRegistration = accounts.getDailyRegistrationStats(maxDailyRegistrations)
       const serverHealth = collectServerHealth({
         mailer,
         stun: stunServer?.getStats?.() || null,
@@ -1933,7 +1889,7 @@ export function createRelayServer(options = {}) {
             adminMb: turnQuotaConfig.adminMb,
           },
         },
-        registerInviteGated: true,
+        dailyRegistration,
         startedAt,
         version: RELAY_VERSION,
       })
@@ -1941,6 +1897,7 @@ export function createRelayServer(options = {}) {
         accounts,
         hub,
         serverHealth,
+        dailyRegistration,
         getTurnQuota: (uid) => buildUserTurnQuota(uid),
         currentAdminRoom: payload.room || '',
         currentAdminSid: payload.sid || '',
@@ -2722,6 +2679,7 @@ export function createRelayServer(options = {}) {
           }
           console.log(`[control] Admin Monitor Dashboard: ${publicRelayUrl ? `${publicRelayUrl}/admin` : `http://${host}:${boundPort}/admin`}`)
           console.log(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
+          console.log(`[control] Registration: Open registration (daily limit: ${maxDailyRegistrations || 'unlimited'})`)
           console.log(`[control] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
           if (jwtSecret.length < 16) {
             console.warn('[control] WARNING: JWT_SECRET is not set — using an ephemeral random signing key. Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')

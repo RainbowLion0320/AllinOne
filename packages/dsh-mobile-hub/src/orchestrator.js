@@ -49,6 +49,9 @@ export class MultiAppOrchestrator {
     this.dispatches = new Map()
     /** @type {Map<string, { clientId: string, localPath: string, filename: string, mimeType: string, size: number, createdAt: number }>} */
     this.p2pUploads = new Map()
+    /** @type {Map<string, string>} Authoritative local project roots discovered from real native adapter sessions */
+    this.knownSessionRoots = new Map()
+    this._sessionRootsSyncedAt = 0
     this._lastInboundPruneAt = 0
 
     const emitEvent = (event, payload) => {
@@ -161,12 +164,40 @@ export class MultiAppOrchestrator {
     return results
   }
 
+  rememberSessionRoot(rawCwd) {
+    const clean = String(rawCwd || '').trim()
+    if (!clean) return
+    try {
+      const safe = assertSafeWorkspaceCwd(clean, { allowEmpty: true })
+      if (!safe || !existsSync(safe)) return
+      const real = realpathSync(safe)
+      const key = process.platform === 'win32' || process.platform === 'darwin' ? real.toLowerCase() : real
+      if (!key || key === '/' || key === '\\' || /^[a-z]:[\\/]?$/i.test(key)) return
+      let homeNorm = ''
+      try {
+        const hr = realpathSync(homedir())
+        homeNorm = process.platform === 'win32' || process.platform === 'darwin' ? hr.toLowerCase() : hr
+      } catch {}
+      if (homeNorm && key === homeNorm) return
+      this.knownSessionRoots.delete(key)
+      this.knownSessionRoots.set(key, real)
+      while (this.knownSessionRoots.size > 500) {
+        const oldest = this.knownSessionRoots.keys().next().value
+        if (!oldest) break
+        this.knownSessionRoots.delete(oldest)
+      }
+    } catch {}
+  }
+
   async listWorkspaces() {
+    const needSessionDiscovery =
+      this.knownSessionRoots.size === 0 || Date.now() - this._sessionRootsSyncedAt > 60_000
     const [dshWs, claudeWs] = await Promise.all([
       this.adapters[APPS.DSH].listWorkspaces().catch(() => []),
       typeof this.adapters[APPS.CLAUDE]?.listWorkspaces === 'function'
         ? this.adapters[APPS.CLAUDE].listWorkspaces().catch(() => [])
         : Promise.resolve([]),
+      needSessionDiscovery ? this.listSessions({ app: 'all', limit: 160 }).catch(() => []) : Promise.resolve([]),
     ])
     // Deduplicate by normalized path
     const map = new Map()
@@ -174,6 +205,16 @@ export class MultiAppOrchestrator {
       if (w?.path) {
         const k = w.path.toLowerCase()
         if (!map.has(k)) map.set(k, w)
+      }
+    }
+    for (const rootPath of this.knownSessionRoots.values()) {
+      const k = rootPath.toLowerCase()
+      if (!map.has(k) && existsSync(rootPath)) {
+        map.set(k, {
+          name: basename(rootPath) || rootPath,
+          path: rootPath,
+          source: 'session',
+        })
       }
     }
     if (this.config.cwd && existsSync(this.config.cwd)) {
@@ -201,8 +242,14 @@ export class MultiAppOrchestrator {
     const all = []
     for (const r of settled) {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-        all.push(...r.value)
+        for (const s of r.value) {
+          if (s?.cwd) this.rememberSessionRoot(s.cwd)
+          all.push(s)
+        }
       }
+    }
+    if (isAll) {
+      this._sessionRootsSyncedAt = Date.now()
     }
     all.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
     return isAll ? all : all.slice(0, limit)
@@ -211,7 +258,9 @@ export class MultiAppOrchestrator {
   async readSession({ id, app, sessionId, limit = 25, cursor = null } = {}) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
-    return this.getAdapter(parsed.app).readSession(parsed.sessionId, { limit, cursor })
+    const session = await this.getAdapter(parsed.app).readSession(parsed.sessionId, { limit, cursor })
+    if (session?.cwd) this.rememberSessionRoot(session.cwd)
+    return session
   }
 
   async listModels({ app = 'all' } = {}) {
@@ -574,7 +623,7 @@ export class MultiAppOrchestrator {
    * - Document mode (`mode: 'document'`): deliverable extensions only (HTML/PDF/Word/Excel/PPT/CSV/MD/TXT/RTF/EPUB/ZIP),
    *   <= 2 GB, max 4 concurrent inline reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
    */
-  async readLocalFile({ path: rawPath, cwd = '', mode = 'image' } = {}) {
+  async readLocalFile({ path: rawPath, cwd = '', mode = 'image', sessionId = '' } = {}) {
     const IMAGE_MIMES = {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
@@ -788,10 +837,22 @@ export class MultiAppOrchestrator {
         join(home, '.gemini'),
       ]
       let inAllowedRoot = checkRoots(fastRoots)
+      if (!inAllowedRoot && this.knownSessionRoots.size > 0) {
+        inAllowedRoot = checkRoots([...this.knownSessionRoots.values()])
+      }
       if (!inAllowedRoot) {
         try {
           const workspaces = await this.listWorkspaces()
           inAllowedRoot = checkRoots(workspaces.map((w) => w?.path))
+        } catch {}
+      }
+      // Authoritative single-session lookup (covers Codex/Antigravity/Claude/DSH projects even for older sessions)
+      if (!inAllowedRoot && sessionId) {
+        try {
+          const sess = await this.readSession({ id: String(sessionId).trim(), limit: 1 })
+          if (sess?.cwd) {
+            inAllowedRoot = checkRoots([sess.cwd])
+          }
         } catch {}
       }
       if (!inAllowedRoot) {

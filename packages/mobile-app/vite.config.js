@@ -54,9 +54,7 @@ export default defineConfig({
             urlPattern: ({ request, url }) =>
               request.mode === 'navigate' &&
               !/\/admin(?:\/|$)/i.test(url.pathname) &&
-              !/\/api(?:\/|$)/i.test(url.pathname) &&
-              !url.searchParams.has('invite') &&
-              !/[?&]invite=/i.test(url.search),
+              !/\/api(?:\/|$)/i.test(url.pathname),
             handler: 'NetworkFirst',
             options: {
               cacheName: 'pages-cache',

@@ -22,4 +22,4 @@ A clear and concise description of what happened.
 What you expected to happen.
 
 ## Logs / Screenshots
-Please **redact** any personal server URLs, IPs, invite codes, tokens, or credentials before pasting logs.
+Please **redact** any personal server URLs, IPs, bootstrap tokens, API keys, or credentials before pasting logs.

@@ -137,10 +137,6 @@
               <span data-i18n="tab.connections">实时连接</span>
               <span class="nav-badge emerald" id="badge-live">0</span>
             </button>
-            <button type="button" class="nav-tab" data-tab="invites">
-              <span data-i18n="tab.invites">邀请码</span>
-              <span class="nav-badge" id="badge-invites">0</span>
-            </button>
             <button type="button" class="nav-tab" data-tab="activity">
               <span data-i18n="tab.activity">事件日志</span>
               <span class="nav-badge" id="badge-activity">0</span>
@@ -210,40 +206,7 @@
           </div>
         </section>
 
-        <!-- TAB 3: Invite Codes -->
-        <section id="tab-invites" class="tab-panel hidden">
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <h2 class="card-title" id="invites-title">一次性注册邀请码</h2>
-                <p class="muted-text" id="invites-subtitle">一码一人，注册成功后立即核销</p>
-              </div>
-              <div id="invite-stats-pills" class="inline-pills"></div>
-            </div>
-
-            <form id="invite-create-form" class="invite-form">
-              <div class="qty-group" id="invite-qty-group">
-                <button type="button" class="qty-btn active" data-qty="1">1</button>
-                <button type="button" class="qty-btn" data-qty="3">3</button>
-                <button type="button" class="qty-btn" data-qty="5">5</button>
-                <button type="button" class="qty-btn" data-qty="10">10</button>
-              </div>
-              <input id="invite-note" type="text" maxlength="60" placeholder="备注（如：给朋友 / 测试账号）" class="invite-note-input" />
-              <select id="invite-role" class="select-compact" aria-label="邀请等级">
-                <option value="free">Free (中继 1 GB/月 · P2P 无限)</option>
-                <option value="pro">Pro (中继 10 GB/月 · P2P 无限)</option>
-                <option value="ultra">Ultra (中继 50 GB/月 · P2P 无限)</option>
-                <option value="admin">Admin (中继 50 GB/月 · 管理员)</option>
-              </select>
-              <button type="submit" id="btn-create-invite" class="btn btn-primary btn-sm">生成邀请码</button>
-            </form>
-
-            <div id="invite-filter-pills" class="filter-pills"></div>
-            <div id="invites-list" class="invites-grid"></div>
-          </div>
-        </section>
-
-        <!-- TAB 4: Activity Feed -->
+        <!-- TAB 3: Activity Feed -->
         <section id="tab-activity" class="tab-panel hidden">
           <div class="card">
             <div class="card-header">

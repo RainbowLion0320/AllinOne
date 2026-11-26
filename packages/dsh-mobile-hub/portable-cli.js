@@ -358,7 +358,7 @@ async function interactiveAccountLogin(serverUrl, label) {
   console.log(`  本机名称   : ${label}`)
   console.log('  提示：登录后本机仅保存单机专属密钥（绝不保存密码），')
   console.log('        手机端登录同一账号即可自动连接你名下全部电脑！')
-  console.log(`  没有账号？请先用管理员分享的一次性邀请码在 ${serverUrl}/ 注册`)
+  console.log(`  没有账号？请先在 ${serverUrl}/ 直接注册账号`)
   console.log('--------------------------------------------------------------')
 
   for (let attempt = 1; attempt <= 5; attempt += 1) {

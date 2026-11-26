@@ -15,9 +15,9 @@ import { chmod as chmodAsync, open as openAsync, unlink as unlinkAsync } from 'n
 import { dirname } from 'node:path'
 import { safeEqual } from './auth.js'
 
-const INVITE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ' // No 0/O/1/I ambiguity
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;:"']{2,}$/
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
 const SCRYPT_MAX_CONCURRENT = 16
@@ -25,9 +25,23 @@ const SCRYPT_MAX_QUEUE = 64
 const DUMMY_SCRYPT_SALT = '00112233445566778899aabbccddeeff'
 const MAX_DEVICES_PER_USER = 20
 const MAX_REVOKED_SIDS = 1024
-const MAX_INACTIVE_INVITES = 2000
+const MAX_DAILY_REG_DAYS = 14
+const DEFAULT_MAX_DAILY_REGISTRATIONS = 20
 
 export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
+
+export function getLocalDayKey(ts = Date.now()) {
+  const d = ts instanceof Date ? ts : new Date(ts)
+  if (Number.isNaN(d.getTime())) return getLocalDayKey(Date.now())
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+export function normalizeMaxDailyRegistrations(raw, fallback = DEFAULT_MAX_DAILY_REGISTRATIONS) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return fallback
+  return Math.min(100_000, Math.floor(n))
+}
 
 export function getCurrentTurnMonth(now = new Date()) {
   const d = now instanceof Date ? now : new Date(now)
@@ -115,25 +129,6 @@ async function verifyPasswordHashAsync(password, salt, expectedHashHex) {
   }
 }
 
-function generateInviteCode() {
-  const bytes = randomBytes(8)
-  let raw = ''
-  for (let i = 0; i < 8; i += 1) {
-    raw += INVITE_ALPHABET[bytes[i] % INVITE_ALPHABET.length]
-  }
-  return `INV-${raw.slice(0, 4)}-${raw.slice(4)}`
-}
-
-function normalizeInviteCode(input) {
-  let clean = String(input || '')
-    .trim()
-    .toUpperCase()
-    .replace(/^INV[-_\s]*/i, '')
-    .replace(/[^A-Z0-9]/g, '')
-  if (clean.length !== 8) return ''
-  return `INV-${clean.slice(0, 4)}-${clean.slice(4)}`
-}
-
 function sanitizeBridgeSlug(raw) {
   const slug = String(raw || '')
     .trim()
@@ -175,11 +170,11 @@ export function validatePassword(raw) {
 }
 
 /**
- * Lightweight, zero-dependency account + single-use invite code + per-PC device credential store.
+ * Lightweight, zero-dependency account + daily registration cap + per-PC device credential store.
  * Persists to JSON with `0600` permissions using atomic temp-file rename:
  *  - Passwords stored strictly as salted `scrypt` hashes (never plaintext)
  *  - Per-PC `deviceSecret` stored strictly as salted SHA-256 hashes (never plaintext)
- *  - Invite codes are strictly single-use: burned synchronously inside `registerUserAsync()`
+ *  - Open registration enforced atomically with a configurable daily registration cap
  */
 export function createAccountStore({ filePath }) {
   mkdirSync(dirname(filePath), { recursive: true })
@@ -190,10 +185,26 @@ export function createAccountStore({ filePath }) {
   const userIdByLower = new Map()
   /** @type {Map<string, string>} */
   const userIdByEmailLower = new Map()
-  /** @type {Map<string, any>} */
-  const invitesById = new Map()
+  /** @type {Record<string, number>} */
+  let dailyRegistrations = {}
   /** @type {Set<string>} */
   const changingPasswordUsers = new Set()
+
+  function normalizeDailyRegistrations(raw, now = Date.now()) {
+    const out = {}
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+    const cutoffKey = getLocalDayKey(now - (MAX_DAILY_REG_DAYS - 1) * 24 * 60 * 60 * 1000)
+    const entries = Object.entries(raw)
+      .filter(([k]) => DAY_KEY_RE.test(k) && k >= cutoffKey)
+      .map(([k, v]) => [k, Math.max(0, Math.floor(Number(v) || 0))])
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => (a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0))
+      .slice(0, MAX_DAILY_REG_DAYS)
+    for (const [k, count] of entries) {
+      out[k] = count
+    }
+    return out
+  }
 
   function load() {
     if (!existsSync(filePath)) return
@@ -211,7 +222,7 @@ export function createAccountStore({ filePath }) {
     }
     for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
       if (!u?.userId || !u?.username) continue
-      const { plan: legacyPlan, ...restUser } = u
+      const { plan: legacyPlan, invitedBy: _legacyInvitedBy, inviteId: _legacyInviteId, ...restUser } = u
       const rawEmail = String(u.email || '').trim()
       const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
       const tier = normalizeTier(u.tier || (u.role === 'admin' ? 'admin' : legacyPlan || 'free'))
@@ -239,32 +250,8 @@ export function createAccountStore({ filePath }) {
         userIdByEmailLower.set(normalized.emailLower, normalized.userId)
       }
     }
-    for (const inv of Array.isArray(parsed?.invites) ? parsed.invites : []) {
-      if (!inv?.id || !inv?.code) continue
-      const { grantAdmin: legacyGrantAdmin, plan: legacyPlan, ...restInv } = inv
-      const tier = normalizeTier(inv.tier || (legacyGrantAdmin ? 'admin' : legacyPlan || 'free'))
-      invitesById.set(inv.id, {
-        ...restInv,
-        tier,
-      })
-    }
-    pruneInactiveInvites()
-  }
-
-  function pruneInactiveInvites() {
-    const inactive = []
-    for (const inv of invitesById.values()) {
-      if (inv.status !== 'active') inactive.push(inv)
-    }
-    if (inactive.length <= MAX_INACTIVE_INVITES) return
-    inactive.sort((a, b) => {
-      const ta = Number(a.usedAt || a.revokedAt || a.createdAt || 0)
-      const tb = Number(b.usedAt || b.revokedAt || b.createdAt || 0)
-      return tb - ta
-    })
-    for (const old of inactive.slice(MAX_INACTIVE_INVITES)) {
-      invitesById.delete(old.id)
-    }
+    // Gracefully ignore any legacy `parsed.invites` array (dropped on next save)
+    dailyRegistrations = normalizeDailyRegistrations(parsed?.dailyRegistrations)
   }
 
   let saveTimer = null
@@ -274,11 +261,12 @@ export function createAccountStore({ filePath }) {
   let asyncSaveInFlight = null
 
   function serializeAccountsPayload() {
+    dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations)
     return JSON.stringify(
       {
         version: 1,
         users: [...usersById.values()],
-        invites: [...invitesById.values()],
+        dailyRegistrations,
       },
       null,
       2,
@@ -426,80 +414,29 @@ export function createAccountStore({ filePath }) {
     }
   }
 
-  function createInvites({ count = 1, note = '', createdBy = 'admin', tier = 'free' } = {}) {
-    const n = Math.max(1, Math.min(50, Math.floor(Number(count) || 1)))
-    const cleanNote = String(note || '').trim().slice(0, 80)
-    const resolvedTier = normalizeTier(tier)
-    const existingCodes = new Set([...invitesById.values()].map((i) => i.code))
-    const created = []
-    const now = Date.now()
-
-    for (let i = 0; i < n; i += 1) {
-      let code = generateInviteCode()
-      while (existingCodes.has(code)) {
-        code = generateInviteCode()
+  function getTodayRegistrationCount(now = Date.now()) {
+    const todayKey = getLocalDayKey(now)
+    const persisted = Math.max(0, Math.floor(Number(dailyRegistrations[todayKey]) || 0))
+    let counted = 0
+    for (const u of usersById.values()) {
+      if (u?.createdAt && getLocalDayKey(u.createdAt) === todayKey) {
+        counted += 1
       }
-      existingCodes.add(code)
-      const record = {
-        id: `inv_${randomBytes(6).toString('hex')}`,
-        code,
-        note: cleanNote,
-        tier: resolvedTier,
-        createdBy: String(createdBy || 'admin').slice(0, 64),
-        createdAt: now,
-        status: 'active', // 'active' | 'used' | 'revoked'
-        usedByUserId: '',
-        usedByUsername: '',
-        usedAt: 0,
-        revokedAt: 0,
-      }
-      invitesById.set(record.id, record)
-      created.push({ ...record })
     }
-    pruneInactiveInvites()
-    save()
-    return created
+    return Math.max(persisted, counted)
   }
 
-  function listInvites() {
-    return [...invitesById.values()]
-      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-      .map((inv) => ({ ...inv, tier: normalizeTier(inv.tier) }))
-  }
-
-  function revokeInvite(idOrCode) {
-    const raw = String(idOrCode || '').trim()
-    if (!raw) return null
-    const normalizedCode = normalizeInviteCode(raw)
-    let target = invitesById.get(raw) || null
-    if (!target && normalizedCode) {
-      for (const inv of invitesById.values()) {
-        if (safeEqual(inv.code, normalizedCode)) {
-          target = inv
-          break
-        }
-      }
+  function getDailyRegistrationStats(maxDaily = DEFAULT_MAX_DAILY_REGISTRATIONS, now = Date.now()) {
+    const todayKey = getLocalDayKey(now)
+    const used = getTodayRegistrationCount(now)
+    const cleanLimit = normalizeMaxDailyRegistrations(maxDaily, DEFAULT_MAX_DAILY_REGISTRATIONS)
+    return {
+      date: todayKey,
+      used,
+      limit: cleanLimit,
+      remaining: cleanLimit > 0 ? Math.max(0, cleanLimit - used) : null,
+      exceeded: cleanLimit > 0 && used >= cleanLimit,
     }
-    if (!target) return null
-    if (target.status !== 'active') {
-      return { ok: false, error: target.status === 'used' ? '该邀请码已被使用，无法作废' : '该邀请码已经作废', invite: { ...target } }
-    }
-    target.status = 'revoked'
-    target.revokedAt = Date.now()
-    pruneInactiveInvites()
-    save()
-    return { ok: true, invite: { ...target } }
-  }
-
-  function hasActiveInviteCode(inviteCode) {
-    const normalized = normalizeInviteCode(inviteCode)
-    if (!normalized) return false
-    for (const inv of invitesById.values()) {
-      if (inv.status === 'active' && safeEqual(inv.code, normalized)) {
-        return true
-      }
-    }
-    return false
   }
 
   function isEmailTaken(email, excludeUserId = '') {
@@ -520,46 +457,46 @@ export function createAccountStore({ filePath }) {
   async function registerUserAsync({
     username,
     password,
-    inviteCode = '',
+    bootstrapToken = '',
+    expectedBootstrapToken = '',
     email = '',
     emailVerified = false,
-    isBootstrapAdmin = false,
+    maxDailyRegistrations = DEFAULT_MAX_DAILY_REGISTRATIONS,
   } = {}) {
-    // Validate invite/bootstrap eligibility BEFORE checking username or email availability
-    // to prevent unauthenticated account/email enumeration.
-    const normalizedInvite = isBootstrapAdmin ? '' : normalizeInviteCode(inviteCode)
-    if (!isBootstrapAdmin) {
-      if (!normalizedInvite) {
-        return { ok: false, error: '请输入有效的一次性邀请码（格式如 INV-XXXX-XXXX）' }
+    const uCheck = validateUsername(username)
+    if (!uCheck.ok) return { ...uCheck, statusCode: 400 }
+    const pCheck = validatePassword(password)
+    if (!pCheck.ok) return { ...pCheck, statusCode: 400 }
+
+    const isBootstrap = usersById.size === 0
+    const expectedBoot = String(expectedBootstrapToken || '').trim()
+    const providedBoot = String(bootstrapToken || '').trim()
+    const cleanLimit = normalizeMaxDailyRegistrations(maxDailyRegistrations, DEFAULT_MAX_DAILY_REGISTRATIONS)
+
+    if (isBootstrap) {
+      if (expectedBoot && !safeEqual(providedBoot, expectedBoot)) {
+        return { ok: false, statusCode: 400, error: '管理员初始化密钥无效' }
       }
-      let preMatched = null
-      for (const inv of invitesById.values()) {
-        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
-          preMatched = inv
-          break
-        }
-      }
-      if (!preMatched) {
-        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
+    } else if (cleanLimit > 0 && getTodayRegistrationCount() >= cleanLimit) {
+      return {
+        ok: false,
+        statusCode: 429,
+        code: 'DAILY_REGISTRATION_LIMIT',
+        error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
       }
     }
 
-    const uCheck = validateUsername(username)
-    if (!uCheck.ok) return uCheck
-    const pCheck = validatePassword(password)
-    if (!pCheck.ok) return pCheck
-
     if (userIdByLower.has(uCheck.usernameLower)) {
-      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+      return { ok: false, statusCode: 400, error: '该用户名已被注册，请换一个用户名' }
     }
 
     let cleanEmail = ''
     let cleanEmailLower = ''
     if (String(email || '').trim()) {
       const eCheck = validateEmail(email)
-      if (!eCheck.ok) return eCheck
+      if (!eCheck.ok) return { ...eCheck, statusCode: 400 }
       if (userIdByEmailLower.has(eCheck.emailLower)) {
-        return { ok: false, error: '该邮箱已被其他账号绑定' }
+        return { ok: false, statusCode: 400, error: '该邮箱已被其他账号绑定' }
       }
       cleanEmail = eCheck.email
       cleanEmailLower = eCheck.emailLower
@@ -568,42 +505,32 @@ export function createAccountStore({ filePath }) {
     // Offload expensive scrypt hashing to libuv worker pool so event loop never stalls
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
 
-    // Re-verify uniqueness & single-use invite state synchronously after await (prevents TOCTOU races)
-    if (isBootstrapAdmin && usersById.size > 0) {
-      return { ok: false, error: '管理员账号已初始化，请使用邀请码注册' }
+    // Re-verify bootstrap state, daily cap, and uniqueness synchronously after await (prevents TOCTOU races)
+    if (isBootstrap && usersById.size > 0) {
+      return { ok: false, statusCode: 400, error: '管理员账号已初始化，请重新提交注册' }
+    }
+    const finalIsBootstrap = isBootstrap && usersById.size === 0
+    if (!finalIsBootstrap && cleanLimit > 0 && getTodayRegistrationCount() >= cleanLimit) {
+      return {
+        ok: false,
+        statusCode: 429,
+        code: 'DAILY_REGISTRATION_LIMIT',
+        error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
+      }
     }
     if (userIdByLower.has(uCheck.usernameLower)) {
-      return { ok: false, error: '该用户名已被注册，请换一个用户名' }
+      return { ok: false, statusCode: 400, error: '该用户名已被注册，请换一个用户名' }
     }
     if (cleanEmailLower && userIdByEmailLower.has(cleanEmailLower)) {
-      return { ok: false, error: '该邮箱已被其他账号绑定' }
-    }
-
-    let matchedInvite = null
-    if (!isBootstrapAdmin) {
-      for (const inv of invitesById.values()) {
-        if (inv.status === 'active' && safeEqual(inv.code, normalizedInvite)) {
-          matchedInvite = inv
-          break
-        }
-      }
-      if (!matchedInvite) {
-        return { ok: false, error: '邀请码无效、已被使用或已作废，请联系管理员获取新邀请码' }
-      }
+      return { ok: false, statusCode: 400, error: '该邮箱已被其他账号绑定' }
     }
 
     const now = Date.now()
+    const todayKey = getLocalDayKey(now)
+    const nextTodayCount = getTodayRegistrationCount(now) + 1
     const userId = `usr_${randomBytes(8).toString('hex')}`
-    const tier = isBootstrapAdmin ? 'admin' : normalizeTier(matchedInvite?.tier)
-    const role = tier === 'admin' ? 'admin' : 'user'
-
-    if (matchedInvite) {
-      matchedInvite.status = 'used'
-      matchedInvite.usedByUserId = userId
-      matchedInvite.usedByUsername = uCheck.username
-      matchedInvite.usedAt = now
-      pruneInactiveInvites()
-    }
+    const tier = finalIsBootstrap ? 'admin' : 'free'
+    const role = finalIsBootstrap ? 'admin' : 'user'
 
     const record = {
       userId,
@@ -617,13 +544,12 @@ export function createAccountStore({ filePath }) {
       knownLoginIps: [],
       tier,
       role,
+      turnUsage: normalizeTurnUsageRecord(null, now),
       passwordSalt: salt,
       passwordHash: hash,
       tokenVersion: 0,
       createdAt: now,
       lastLoginAt: now,
-      invitedBy: isBootstrapAdmin ? 'bootstrap' : matchedInvite?.createdBy || '',
-      inviteId: matchedInvite?.id || '',
       devices: [],
       sessions: [],
       revokedSids: {},
@@ -634,6 +560,8 @@ export function createAccountStore({ filePath }) {
     if (record.emailLower) {
       userIdByEmailLower.set(record.emailLower, userId)
     }
+    dailyRegistrations[todayKey] = nextTodayCount
+    dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations, now)
     save()
 
     return {
@@ -1361,8 +1289,6 @@ export function createAccountStore({ filePath }) {
           }))
         return {
           ...sanitizeUser(u),
-          invitedBy: u.invitedBy || '',
-          inviteId: u.inviteId || '',
           devices: (Array.isArray(u.devices) ? u.devices : []).map(sanitizeDeviceRecord),
           sessions: activeSessions,
         }
@@ -1371,10 +1297,10 @@ export function createAccountStore({ filePath }) {
 
   return {
     userCount: () => usersById.size,
-    createInvites,
-    listInvites,
-    revokeInvite,
-    hasActiveInviteCode,
+    getUserCount: () => usersById.size,
+    hasAnyUser: () => usersById.size > 0,
+    getTodayRegistrationCount,
+    getDailyRegistrationStats,
     isEmailTaken,
     getUserByEmail,
     registerUserAsync,

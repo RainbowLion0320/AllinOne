@@ -22,7 +22,6 @@ import {
   ShieldCheck,
   Smartphone,
   Sun,
-  Ticket,
   Trash2,
   User,
   Wifi,
@@ -153,7 +152,6 @@ export function SettingsModal({
   onDownloadUpdate = null,
   onCancelUpdate = null,
   onInstallUpdate = null,
-  onOpenInviteManager = null,
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
   onToggleLogin2fa = null,
@@ -389,9 +387,7 @@ export function SettingsModal({
       updateState.status === 'installing' ||
       updateState.status === 'error')
 
-  const hasAdminTools = Boolean(
-    isAdmin && (onOpenInviteManager || activeDevice?.baseUrl),
-  )
+  const hasAdminTools = Boolean(isAdmin && activeDevice?.baseUrl)
 
   return (
     <div
@@ -1006,22 +1002,6 @@ export function SettingsModal({
                 {bi('管理', 'Admin')}
               </div>
               <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200/80 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-[#22252E]">
-                {onOpenInviteManager && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onClose()
-                      onOpenInviteManager()
-                    }}
-                    className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-800/60"
-                  >
-                    <span className="inline-flex items-center gap-2">
-                      <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                      <span>{bi('邀请码管理', 'Invite Codes')}</span>
-                    </span>
-                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                  </button>
-                )}
                 {activeDevice?.baseUrl && (
                   <a
                     href={`${String(activeDevice.baseUrl).replace(/\/+$/, '')}/admin`}

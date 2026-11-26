@@ -18,7 +18,7 @@ Because **All in One** allows remote control of AI coding agents running on your
 - **Account & Credential Storage**:
   - Account passwords are stored as salted `scrypt` hashes (`N=16384, r=8, p=1`) verified with `crypto.timingSafeEqual`.
   - Per-PC `deviceSecret` values are stored server-side only as salted SHA-256 hashes.
-  - Registration invite codes are strictly single-use and burned synchronously on registration.
+  - Open self-registration enforces an atomic server-side daily registration cap (`MAX_DAILY_REGISTRATIONS`, default `20` new accounts/day; `0` = unlimited) to prevent automated sign-up abuse. On a brand-new server, the first registered account becomes Admin; operators may configure `ADMIN_BOOTSTRAP_TOKEN` to require a bootstrap secret when registering that first Admin account.
   - Persistent store files (`accounts.json`) are written atomically with `0600` permissions.
 
 ## 2. Local Agent Execution Permissions
@@ -32,7 +32,7 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 | **DeepSeek Harness** (`dsh.js`) | `permissionPreset: 'danger-full-access'` | Change `permissionPreset` in `cordis.patch.yml` (e.g., `'workspace-write'` or `'read-only'`); note that the auto-installed `allinone-dsh-ipc` plugin manages `~/.dsh/profiles/desktop/node_modules/allinone-dsh-ipc/cordis.patch.yml` unless `ALLINONE_NO_AUTOFIX=1` is set |
 | **Codex** (`codex.js`) | Uses your local Codex CLI approval/sandbox configuration | Configure sandbox/approval policy in your local `~/.codex/config.toml` |
 
-**Implication**: Anyone who obtains valid credentials for your All in One account can instruct AI agents on your online computers to read, edit, or execute code in your local projects. Protect your account password, restrict who receives invite codes, and keep your relay server locked down.
+**Implication**: Anyone who obtains valid credentials for your All in One account can instruct AI agents on your online computers to read, edit, or execute code in your local projects. Protect your account password (enable Email 2FA where possible), configure `ADMIN_BOOTSTRAP_TOKEN` and an appropriate `MAX_DAILY_REGISTRATIONS` cap on self-hosted servers, and keep your relay server locked down.
 
 ## 3. Built-In Server & Bridge Defenses
 
@@ -50,7 +50,8 @@ To provide frictionless remote coding from mobile/desktop clients, adapters defa
 - [ ] Set `PUBLIC_RELAY_URL` to your exact HTTPS origin.
 - [ ] Keep `capacitor.config.json` with `"cleartext": false` and `"allowMixedContent": false` for production mobile builds.
 - [ ] If enabling self-hosted `coturn` or Cloudflare TURN, keep `TURN_SECRET` / `CF_TURN_API_TOKEN` exclusively in `0600` `.env`, and configure `coturn` `denied-peer-ip` rules to block loopback and private RFC 1918/link-local ranges (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`).
-- [ ] Periodically review registered users, tiers, and unused invite codes via `npm run admin -- invite list` / `npm run admin -- users`.
+- [ ] Set `ADMIN_BOOTSTRAP_TOKEN` before exposing a brand-new server (to guard first-admin bootstrap) and tune `MAX_DAILY_REGISTRATIONS` (default `20`/day) for your deployment's abuse-prevention needs.
+- [ ] Periodically review registered users, tiers, and daily registration counts via `/admin` or `npm run admin -- users`.
 
 ## 5. Reporting a Vulnerability
 

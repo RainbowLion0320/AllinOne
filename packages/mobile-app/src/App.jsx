@@ -22,7 +22,6 @@ import { compressImageForUpload } from './lib/imageCompress.js'
 import {
   MobileRelayClient,
   bindAccountEmail,
-  detectDefaultServerUrl,
   fetchAuthSessions,
   listAccountDevices,
   logoutDeviceSession,
@@ -87,9 +86,6 @@ const HtmlPreviewModal = React.lazy(() =>
 const DeviceSwitcherModal = React.lazy(() =>
   import('./components/DeviceSwitcherModal.jsx').then((m) => ({ default: m.DeviceSwitcherModal })),
 )
-const InviteManagerModal = React.lazy(() =>
-  import('./components/InviteManagerModal.jsx').then((m) => ({ default: m.InviteManagerModal })),
-)
 const SettingsModal = React.lazy(() =>
   import('./components/SettingsModal.jsx').then((m) => ({ default: m.SettingsModal })),
 )
@@ -103,7 +99,7 @@ const E2eeGrantApproveModal = React.lazy(() =>
 export function App() {
   const { lang, bi, t } = useI18n()
   const [deviceState, setDeviceState] = useState(() => loadDeviceState())
-  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
+  const [addingDevice, setAddingDevice] = useState({ open: false, serverUrl: '' })
   const [toastMsg, setToastMsg] = useState('')
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('allinone_dark') === '1')
   const [relayDataSaver, setRelayDataSaver] = useState(() => localStorage.getItem('allinone_relay_data_saver') !== '0')
@@ -132,7 +128,6 @@ export function App() {
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deviceSwitcherOpen, setDeviceSwitcherOpen] = useState(false)
-  const [inviteManagerOpen, setInviteManagerOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [newChatCwd, setNewChatCwd] = useState('')
   const [newChatApp, setNewChatApp] = useState('')
@@ -378,7 +373,6 @@ export function App() {
         if (action === 'new-chat') openNewChatModal(activeSessionRef.current?.cwd || '')
         else if (action === 'devices') setDeviceSwitcherOpen(true)
         else if (action === 'settings') setSettingsOpen(true)
-        else if (action === 'invites') setInviteManagerOpen(true)
         else if (action === 'toggle-dark') setDarkMode((v) => !v)
       })
     }
@@ -502,13 +496,12 @@ export function App() {
         else if (newChatOpen) setNewChatOpen(false)
         else if (settingsOpen) setSettingsOpen(false)
         else if (deviceSwitcherOpen) setDeviceSwitcherOpen(false)
-        else if (inviteManagerOpen) setInviteManagerOpen(false)
         else if (drawerOpen) setDrawerOpen(false)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeDevice, openNewChatModal, selectedDraftCwd, htmlPreviewState, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, inviteManagerOpen, drawerOpen])
+  }, [activeDevice, openNewChatModal, selectedDraftCwd, htmlPreviewState, lightboxState, pendingGrantPopup, e2eeModal.open, modelPickerOpen, newChatOpen, settingsOpen, deviceSwitcherOpen, drawerOpen])
 
   // Persist multi-device state whenever it changes
   useEffect(() => {
@@ -587,7 +580,7 @@ export function App() {
     setBridges(Array.isArray(payload.bridges) ? payload.bridges : [])
     setAccountDevices(Array.isArray(payload.devices) ? payload.devices : [])
     setDeviceState((prev) => upsertDevice(prev, payload).state)
-    setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
+    setAddingDevice({ open: false, serverUrl: '' })
     setDeviceSwitcherOpen(false)
     if (preview.device) {
       const curLang = getCurrentLang()
@@ -600,27 +593,6 @@ export function App() {
       )
     }
   }, [resetTransientWorkspace, showToast])
-
-  // Auto-handle Invite Registration link (?invite=INV-XXXX-XXXX)
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    const params = new URLSearchParams(window.location.search)
-    const inviteCode = (params.get('invite') || '').trim()
-    if (!inviteCode) return
-
-    // Strip invite param from address bar immediately
-    params.delete('invite')
-    const cleanQuery = params.toString()
-    const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash || ''}`
-    try { window.history.replaceState({}, '', cleanUrl) } catch {}
-
-    setAddingDevice({
-      open: true,
-      serverUrl: detectDefaultServerUrl(),
-      openScanner: false,
-      inviteCode,
-    })
-  }, [])
 
   // Sync live hostname / platform / selectedBridgeId back to saved device metadata
   useEffect(() => {
@@ -801,6 +773,7 @@ export function App() {
     )
     return {
       roomId: activeDevice?.roomId || '',
+      sessionId: activeSession?.id || '',
       cwd: activeSession?.cwd || '',
       bridgeId: activeBridgeId,
       client: clientRef.current,
@@ -820,6 +793,7 @@ export function App() {
   }, [
     activeDevice?.id,
     activeDevice?.roomId,
+    activeSession?.id,
     activeSession?.cwd,
     activeBridgeId,
     connState,
@@ -2632,14 +2606,12 @@ export function App() {
       <LoginScreen
         isAddingDevice={Boolean(activeDevice && addingDevice.open)}
         initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
-        initialInviteCode={addingDevice.inviteCode || ''}
-        autoOpenScanner={Boolean(addingDevice.open && addingDevice.openScanner)}
         darkMode={darkMode}
         onToggleDark={() => setDarkMode((v) => !v)}
         onCancel={
           activeDevice
             ? () => {
-                setAddingDevice({ open: false, serverUrl: '', openScanner: false, inviteCode: '' })
+                setAddingDevice({ open: false, serverUrl: '' })
               }
             : null
         }
@@ -2837,7 +2809,7 @@ export function App() {
           <span>{bi('登录已过期', 'Session expired')}</span>
           <button
             type="button"
-            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl, openScanner: false, inviteCode: '' })}
+            onClick={() => setAddingDevice({ open: true, serverUrl: activeDevice.baseUrl })}
             className="rounded-lg bg-rose-500 px-2.5 py-0.5 text-[11px] font-semibold text-white active:scale-95"
           >
             {bi('重新登录', 'Sign In Again')}
@@ -3230,12 +3202,10 @@ export function App() {
             activeConnState={connState}
             accountDevices={accountDevices}
             onSelectDevice={handleSelectDevice}
-            onAddDevice={(prefillServerUrl = '', opts = {}) => {
+            onAddDevice={(prefillServerUrl = '') => {
               setAddingDevice({
                 open: true,
                 serverUrl: prefillServerUrl || activeDevice?.baseUrl || '',
-                openScanner: Boolean(opts?.openScanner),
-                inviteCode: '',
               })
             }}
             onRemoveDevice={handleRemoveDevice}
@@ -3243,15 +3213,6 @@ export function App() {
             onRenameAccountDevice={handleRenameAccountDevice}
             onRemoveAccountDevice={handleRemoveAccountDevice}
             onRefreshAccountDevices={handleRefreshAccountDevices}
-          />
-        )}
-
-        {inviteManagerOpen && (
-          <InviteManagerModal
-            open={inviteManagerOpen}
-            onClose={() => setInviteManagerOpen(false)}
-            baseUrl={activeDevice?.baseUrl}
-            token={activeDevice?.token}
           />
         )}
 
@@ -3350,7 +3311,6 @@ export function App() {
             onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
             onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
             onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-            onOpenInviteManager={() => setInviteManagerOpen(true)}
             onSendBindEmailCode={handleSendBindEmailCode}
             onBindAccountEmail={handleBindAccountEmail}
             onToggleLogin2fa={handleToggleLoginEmail2fa}

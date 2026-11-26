@@ -1,7 +1,7 @@
 /**
  * All in One — Streamlined v1.x End-to-End Smoke & Security Test Suite (16 modules)
  *
- *  1. Account Bootstrap, Single-Use Invites, Multi-Tenant Isolation, Device Lifecycle & Portable CLI
+ *  1. Account Bootstrap, Open Registration, Daily Cap, Multi-Tenant Isolation, Device Lifecycle & Portable CLI
  *  2. Live E2EE PC Bridge & 4-App RPC Routing (DSH, Codex, Claude, Antigravity)
  *  3. Core Control Plane & Bridge Security Hardening
  *  4. Full-Duplex Zero-Knowledge E2EE & Direct WebRTC P2P (`aio-ctrl` + `aio-bulk` + Instant Revocation)
@@ -809,11 +809,17 @@ async function main() {
 
   try {
     // =========================================================================
-    // 1. Account Bootstrap, Single-Use Invites, Multi-Tenant Isolation, Device Lifecycle & Portable CLI
+    // 1. Account Bootstrap, Open Registration, Daily Cap, Multi-Tenant Isolation, Device Lifecycle & Portable CLI
     // =========================================================================
     const bootBefore = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
     assert.equal(bootBefore.ok, true)
     assert.equal(bootBefore.hasUsers, false, 'Fresh server should report hasUsers=false')
+    assert.equal(bootBefore.hasAdmin, false, 'Fresh server should report hasAdmin=false')
+    assert.equal(bootBefore.needsBootstrapToken, true, 'Server with ADMIN_BOOTSTRAP_TOKEN must require bootstrapToken')
+    assert.equal(bootBefore.openRegistration, true)
+    assert.equal(bootBefore.dailyRegistrationLimit, 20, 'Default daily registration limit must be 20')
+    assert.equal(bootBefore.dailyRegistrationsUsed, 0)
+    assert.equal(bootBefore.dailyRegistrationRemaining, 20)
     assert.equal(bootBefore.emailEnabled, false, 'Unconfigured relay must report emailEnabled=false')
 
     const noEmailSendRes = await fetch(`${httpBase}/api/account/email/send-code`, {
@@ -826,9 +832,9 @@ async function main() {
     const badReg = await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'nobody', password: 'Password123!', inviteCode: 'INV-AAAA-BBBB' }),
+      body: JSON.stringify({ username: 'nobody', password: 'Password123!', bootstrapToken: 'WRONG-TOKEN' }),
     })
-    assert.equal(badReg.status, 400, 'Registration with invalid invite code must fail')
+    assert.equal(badReg.status, 400, 'First-admin registration with invalid bootstrapToken must fail')
 
     const smokeAdmin = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
@@ -836,7 +842,7 @@ async function main() {
       body: JSON.stringify({
         username: 'smoke_admin',
         password: SMOKE_ADMIN_PASS,
-        inviteCode: TEST_BOOTSTRAP_TOKEN,
+        bootstrapToken: TEST_BOOTSTRAP_TOKEN,
         deviceName: 'smoke-phone',
       }),
     })).json()
@@ -846,12 +852,10 @@ async function main() {
 
     const bootAfter = await (await fetch(`${httpBase}/api/account/bootstrap-status`)).json()
     assert.equal(bootAfter.hasUsers, true)
-    const secondBootTry = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'intruder', password: 'Password123!', inviteCode: TEST_BOOTSTRAP_TOKEN }),
-    })
-    assert.equal(secondBootTry.status, 400, 'ADMIN_BOOTSTRAP_TOKEN must only work for the first user')
+    assert.equal(bootAfter.hasAdmin, true)
+    assert.equal(bootAfter.needsBootstrapToken, false)
+    assert.equal(bootAfter.dailyRegistrationsUsed, 1)
+    assert.equal(bootAfter.dailyRegistrationRemaining, 19)
     assert.equal(readFileSync(accountsFile, 'utf8').includes(SMOKE_ADMIN_PASS), false, 'accounts.json must never store plaintext password')
 
     // Login & wrong-password rejection
@@ -885,56 +889,100 @@ async function main() {
     assert.equal(pubHealthRes.headers.get('referrer-policy'), 'no-referrer')
     assert.ok(String(pubHealthRes.headers.get('permissions-policy') || '').includes('camera=(self)'))
 
-    // Single-use invites, non-admin 403 & invite revocation
-    const invBatch = await (await fetch(`${httpBase}/api/admin/invites`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
-      body: JSON.stringify({ count: 3, note: 'multi-tenant' }),
-    })).json()
-    assert.equal(invBatch.ok, true)
-    assert.equal(invBatch.invites.length, 3)
-    assert.match(invBatch.invites[0].code, /^INV-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/)
+    // Removed legacy invite endpoints must return 404
+    assert.equal((await fetch(`${httpBase}/api/admin/invites`, { headers: { Authorization: `Bearer ${loginData.token}` } })).status, 404)
+    assert.equal(
+      (await fetch(`${httpBase}/api/admin/invites`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+        body: JSON.stringify({ count: 1 }),
+      })).status,
+      404,
+    )
+    assert.equal(
+      (await fetch(`${httpBase}/api/admin/invites/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+        body: JSON.stringify({ id: 'inv_1' }),
+      })).status,
+      404,
+    )
 
+    // Open registration creates regular free users with isolated rooms; admin routes reject non-admins (403)
     const friendA = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'friend_a', password: 'FriendAPass99!', inviteCode: invBatch.invites[0].code.toLowerCase() }),
+      body: JSON.stringify({ username: 'friend_a', password: 'FriendAPass99!' }),
     })).json()
     assert.equal(friendA.ok, true)
     assert.equal(friendA.user.role, 'user')
+    assert.equal(friendA.user.tier, 'free')
 
-    const reuseInv = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'reuse_try', password: 'Password123!', inviteCode: invBatch.invites[0].code }),
-    })
-    assert.equal(reuseInv.status, 400, 'Single-use invite must reject a 2nd user')
-
-    const nonAdminInv = await fetch(`${httpBase}/api/admin/invites`, {
+    const nonAdminOv = await fetch(`${httpBase}/api/admin/overview`, {
       headers: { Authorization: `Bearer ${friendA.token}` },
     })
-    assert.equal(nonAdminInv.status, 403, 'Non-admin user must receive 403 on /api/admin/invites')
+    assert.equal(nonAdminOv.status, 403, 'Non-admin user must receive 403 on /api/admin/overview')
 
     const friendB = await (await fetch(`${httpBase}/api/account/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'friend_b', password: 'FriendBPass99!', inviteCode: invBatch.invites[1].code }),
+      body: JSON.stringify({ username: 'friend_b', password: 'FriendBPass99!' }),
     })).json()
     assert.equal(friendB.ok, true)
+    assert.equal(friendB.user.role, 'user')
     assert.notEqual(friendA.roomId, friendB.roomId)
 
-    const revokedInv = await (await fetch(`${httpBase}/api/admin/invites/revoke`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
-      body: JSON.stringify({ id: invBatch.invites[2].id }),
-    })).json()
-    assert.equal(revokedInv.invite.status, 'revoked')
-    const revokedTry = await fetch(`${httpBase}/api/account/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'charlie', password: 'Password123!', inviteCode: invBatch.invites[2].code }),
-    })
-    assert.equal(revokedTry.status, 400, 'Revoked invite code must be rejected')
+    // Daily registration cap enforcement + first-user auto-admin (no bootstrap token) + concurrent burst race defense
+    {
+      const capRelay = createRelayServer({
+        port: 0,
+        host: '127.0.0.1',
+        jwtSecret: 'smoke-cap-jwt-secret-0123456',
+        accountsFile: join(tmpDir, 'cap-accounts.json'),
+        stunEnabled: false,
+        maxDailyRegistrations: 2,
+      })
+      const { port: capPort } = await capRelay.start()
+      const capBase = `http://127.0.0.1:${capPort}`
+      try {
+        const capBoot = await (await fetch(`${capBase}/api/account/bootstrap-status`)).json()
+        assert.equal(capBoot.hasAdmin, false)
+        assert.equal(capBoot.needsBootstrapToken, false)
+        assert.equal(capBoot.dailyRegistrationLimit, 2)
+        assert.equal(capBoot.dailyRegistrationsUsed, 0)
+        assert.equal(capBoot.dailyRegistrationRemaining, 2)
+
+        const firstAutoAdmin = await (await fetch(`${capBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'cap_admin', password: 'CapPassword123!' }),
+        })).json()
+        assert.equal(firstAutoAdmin.ok, true)
+        assert.equal(firstAutoAdmin.user.role, 'admin')
+
+        // Fire 4 concurrent open registrations when only 1 daily slot remains -> strictly 1 succeeds, 3 hit 429
+        const burstResults = await Promise.all(
+          [1, 2, 3, 4].map(async (i) => {
+            const r = await fetch(`${capBase}/api/account/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: `cap_user_${i}`, password: 'CapPassword123!' }),
+            })
+            return { status: r.status, body: await r.json() }
+          }),
+        )
+        const okCount = burstResults.filter((x) => x.status === 200 && x.body.ok === true).length
+        const cap429 = burstResults.filter((x) => x.status === 429 && x.body.code === 'DAILY_REGISTRATION_LIMIT')
+        assert.equal(okCount, 1, 'Exactly 1 concurrent open registration must fill the last daily slot')
+        assert.equal(cap429.length, 3, 'All excess concurrent registrations must fail with 429 DAILY_REGISTRATION_LIMIT')
+
+        const capBootFull = await (await fetch(`${capBase}/api/account/bootstrap-status`)).json()
+        assert.equal(capBootFull.dailyRegistrationsUsed, 2)
+        assert.equal(capBootFull.dailyRegistrationRemaining, 0)
+      } finally {
+        await capRelay.close()
+      }
+    }
 
     // Device registration (`app://allinone` CORS), `device-login`, rename, unbind & multi-tenant bridge isolation
     const smokeDevRes = await fetch(`${httpBase}/api/account/devices/register`, {
@@ -1054,7 +1102,7 @@ async function main() {
         try { child.kill() } catch {}
       }
     }
-    pass(1, 'Account bootstrap, single-use invites, multi-tenant isolation, device lifecycle & portable CLI')
+    pass(1, 'Account bootstrap, open registration, daily cap, multi-tenant isolation, device lifecycle & portable CLI')
 
     // =========================================================================
     // 2. Live E2EE PC Bridge, Multi-PC Presence & 4-App RPC Routing
@@ -1278,7 +1326,7 @@ async function main() {
       assert.equal(badBridge.reconnectTimer, null, 'Unauthorized bridge must not schedule reconnect')
       badBridge.stop()
 
-      // 3e. Malformed HTTP Host crash defense & unauthenticated /api/admin/invites 401
+      // 3e. Malformed HTTP Host crash defense & unauthenticated /api/admin/overview 401
       const badHostStatus = await new Promise((resolveStatus, rejectStatus) => {
         const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
           sock.write('GET /api/health HTTP/1.1\r\nHost: bad:port\r\nConnection: close\r\n\r\n')
@@ -1290,7 +1338,7 @@ async function main() {
       })
       assert.match(badHostStatus, /400/)
       assert.equal((await (await fetch(`${httpBase}/api/health`)).json()).ok, true)
-      assert.equal((await fetch(`${httpBase}/api/admin/invites`)).status, 401)
+      assert.equal((await fetch(`${httpBase}/api/admin/overview`)).status, 401)
 
       // 3f. SSRF, forged p2pToken, symlink bypass, session ID path traversal & CLI arg injection
       let attackerHits = 0
@@ -1335,15 +1383,10 @@ async function main() {
       assert.equal(throttled.status, 429)
 
       // 3h. changePasswordAsync TOCTOU protection against concurrent revoke-all
-      const invToctou = await (await fetch(`${httpBase}/api/admin/invites`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
-        body: JSON.stringify({ note: 'toctou' }),
-      })).json()
       const regToctou = await (await fetch(`${httpBase}/api/account/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'toctou_u', password: 'InitPassword25!', inviteCode: invToctou.invites[0].code }),
+        body: JSON.stringify({ username: 'toctou_u', password: 'InitPassword25!' }),
       })).json()
       const [pwRaceRes, revokeRaceRes] = await Promise.all([
         fetch(`${httpBase}/api/account/password`, {
@@ -1821,18 +1864,12 @@ async function main() {
     // 6. Active Client Sessions Monitor, Live WS Push, Per-Device Kick, Revoke-Others & Revoke-All
     // =========================================================================
     {
-      const invSess = await (await fetch(`${httpBase}/api/admin/invites`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
-        body: JSON.stringify({ note: 'sessions-test' }),
-      })).json()
       const regA = await (await fetch(`${httpBase}/api/account/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           username: 'sess_alice',
           password: 'Password123!',
-          inviteCode: invSess.invites[0].code,
           deviceName: 'Windows Desktop',
           clientKind: 'desktop',
         }),
@@ -2006,6 +2043,7 @@ async function main() {
         host: '127.0.0.1',
         jwtSecret: 'email-jwt-secret-0123456789',
         adminBootstrapToken: 'email-bootstrap-secret-99',
+        maxDailyRegistrations: 3,
         staticDir: secStaticDir,
         stunEnabled: false,
         accountsFile: join(tmpDir, 'email-accounts.json'),
@@ -2031,38 +2069,31 @@ async function main() {
         const bsEmail = await (await fetch(`${eBase}/api/account/bootstrap-status`)).json()
         assert.equal(bsEmail.emailEnabled, true)
 
-        // Optional email: bootstrap admin WITHOUT email
-        const evaReg = await (await fetch(`${eBase}/api/account/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'eva', password: 'EvaAdminPassword1!', inviteCode: 'email-bootstrap-secret-99' }),
-        })).json()
-        assert.equal(evaReg.user.email, '')
-        assert.equal(evaReg.user.emailVerified, false)
-
-        const invBatch = await (await fetch(`${eBase}/api/admin/invites`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${evaReg.token}` },
-          body: JSON.stringify({ count: 2, note: 'email-test' }),
-        })).json()
-        const [inv1, inv2] = invBatch.invites
-
-        // Invalid invite must NEVER consume SMTP quota
+        // Invalid bootstrapToken must NEVER consume SMTP quota while 0 users exist
         assert.equal(
           (await fetch(`${eBase}/api/account/email/send-code`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: 'INV-FAKE-0000' }),
+            body: JSON.stringify({ purpose: 'register', email: 'eva@example.com', bootstrapToken: 'WRONG-BOOT' }),
           })).status,
           400,
         )
         assert.equal(smtp.inbox.length, 0)
 
-        // Valid invite -> SMTP AUTH LOGIN delivery + 429 cooldown + register with verified email
+        // Optional email: bootstrap admin WITHOUT email
+        const evaReg = await (await fetch(`${eBase}/api/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'eva', password: 'EvaAdminPassword1!', bootstrapToken: 'email-bootstrap-secret-99' }),
+        })).json()
+        assert.equal(evaReg.user.email, '')
+        assert.equal(evaReg.user.emailVerified, false)
+
+        // Open registration -> SMTP AUTH LOGIN delivery + 429 cooldown + register with verified email
         const regCode = await (await fetch(`${eBase}/api/account/email/send-code`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: inv1.code }),
+          body: JSON.stringify({ purpose: 'register', email: 'dave@example.com' }),
         })).json()
         assert.equal(regCode.ok, true)
         assert.equal(smtp.inbox.length, 1)
@@ -2074,7 +2105,7 @@ async function main() {
           (await fetch(`${eBase}/api/account/email/send-code`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ purpose: 'register', email: 'dave@example.com', inviteCode: inv1.code }),
+            body: JSON.stringify({ purpose: 'register', email: 'dave@example.com' }),
           })).status,
           429,
         )
@@ -2085,7 +2116,6 @@ async function main() {
           body: JSON.stringify({
             username: 'dave',
             password: 'DavePassword123!',
-            inviteCode: inv1.code,
             email: 'dave@example.com',
             emailCode: smtp.inbox[0].code,
             deviceName: 'MacBook-Pro',
@@ -2111,12 +2141,24 @@ async function main() {
         })).json()
         assert.equal(daveDevLogin.username, 'dave')
 
-        // Post-login email bind + duplicate email rejection
+        // Post-login email bind + duplicate email rejection + daily registration cap pre-SMTP rejection
         const frankReg = await (await fetch(`${eBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'frank', password: 'FrankPassword123!', inviteCode: inv2.code }),
+          body: JSON.stringify({ username: 'frank', password: 'FrankPassword123!' }),
         })).json()
+        assert.equal(frankReg.ok, true)
+
+        // Daily cap (3/3) reached: register send-code must reject with 429 before touching SMTP
+        const inboxCountBeforeCap = smtp.inbox.length
+        const cappedSendRes = await fetch(`${eBase}/api/account/email/send-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ purpose: 'register', email: 'capped@example.com' }),
+        })
+        assert.equal(cappedSendRes.status, 429, 'Daily registration cap must block register send-code with 429')
+        assert.equal((await cappedSendRes.json()).code, 'DAILY_REGISTRATION_LIMIT')
+        assert.equal(smtp.inbox.length, inboxCountBeforeCap, 'Capped register send-code must not consume SMTP quota')
         assert.equal(
           (await fetch(`${eBase}/api/account/email/send-code`, {
             method: 'POST',
@@ -2339,22 +2381,17 @@ async function main() {
         const admReg = await (await fetch(`${mBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'mon_admin', password: 'Password123!', inviteCode: 'mon-owner-secret' }),
-        })).json()
-        const invRes = await (await fetch(`${mBase}/api/admin/invites`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admReg.token}` },
-          body: JSON.stringify({ count: 2, note: 'monitor' }),
+          body: JSON.stringify({ username: 'mon_admin', password: 'Password123!', bootstrapToken: 'mon-owner-secret' }),
         })).json()
         const bobReg = await (await fetch(`${mBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'mon_bob', password: 'Password123!', inviteCode: invRes.invites[0].code }),
+          body: JSON.stringify({ username: 'mon_bob', password: 'Password123!' }),
         })).json()
         await fetch(`${mBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'mon_carol', password: 'Password123!', inviteCode: invRes.invites[1].code }),
+          body: JSON.stringify({ username: 'mon_carol', password: 'Password123!' }),
         })
         assert.equal((await fetch(`${mBase}/api/admin/overview`, { headers: { Authorization: `Bearer ${bobReg.token}` } })).status, 403)
 
@@ -2404,6 +2441,9 @@ async function main() {
         assert.equal(ov.summary.offlineUsers, 1)
         assert.equal(ov.summary.onlineBridges, 2)
         assert.equal(ov.summary.onlineClients, 1)
+        assert.equal(ov.summary.dailyRegistration.used, 3)
+        assert.equal(ov.summary.dailyRegistration.limit, 20)
+        assert.equal(ov.server.config.openRegistration, true)
         assert.equal(ov.distributions.apps.codex.writable, 1)
         assert.equal(ov.distributions.apps.antigravity.writable, 1)
         assert.equal(ov.distributions.bridgePlatforms.darwin, 1)
@@ -2489,7 +2529,7 @@ async function main() {
         const sAdmin = await (await fetch(`${sBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'stun_admin', password: 'StunPassword123!', inviteCode: 'STUN-BOOT-1' }),
+          body: JSON.stringify({ username: 'stun_admin', password: 'StunPassword123!', bootstrapToken: 'STUN-BOOT-1' }),
         })).json()
         const sCli = await openTicketClientWs(sBase, sPort, sAdmin.token, { deviceName: 'stun-check' })
         try {
@@ -2558,26 +2598,21 @@ async function main() {
         const qAdmin = await (await fetch(`${qBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'quota_admin', password: 'QuotaPassword123!', inviteCode: 'QUOTA-BOOT-1' }),
-        })).json()
-        assert.equal(
-          (await fetch(`${qBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'enterprise' }),
-          })).status,
-          400,
-        )
-        const invFree = await (await fetch(`${qBase}/api/admin/invites`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
-          body: JSON.stringify({ count: 1, tier: 'free' }),
+          body: JSON.stringify({ username: 'quota_admin', password: 'QuotaPassword123!', bootstrapToken: 'QUOTA-BOOT-1' }),
         })).json()
         const qFree = await (await fetch(`${qBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'quota_free', password: 'QuotaPassword123!', inviteCode: invFree.invites[0].code }),
+          body: JSON.stringify({ username: 'quota_free', password: 'QuotaPassword123!' }),
         })).json()
+        assert.equal(
+          (await fetch(`${qBase}/api/admin/users/set-tier`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${qAdmin.token}` },
+            body: JSON.stringify({ userId: qFree.roomId, tier: 'enterprise' }),
+          })).status,
+          400,
+        )
 
         // Non-admin blocked from tier/reset routes
         assert.equal(
@@ -2752,17 +2787,12 @@ async function main() {
         const cfAdmin = await (await fetch(`${cfBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'cf_admin', password: 'CfPassword123!', inviteCode: 'CF-BOOT-1' }),
-        })).json()
-        const invCf = await (await fetch(`${cfBase}/api/admin/invites`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfAdmin.token}` },
-          body: JSON.stringify({ count: 1, tier: 'free' }),
+          body: JSON.stringify({ username: 'cf_admin', password: 'CfPassword123!', bootstrapToken: 'CF-BOOT-1' }),
         })).json()
         const cfFree = await (await fetch(`${cfBase}/api/account/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'cf_free', password: 'CfPassword123!', inviteCode: invCf.invites[0].code }),
+          body: JSON.stringify({ username: 'cf_free', password: 'CfPassword123!' }),
         })).json()
 
         const freeMe = await (await fetch(`${cfBase}/api/auth/me`, { headers: { Authorization: `Bearer ${cfFree.token}` } })).json()
@@ -2813,17 +2843,12 @@ async function main() {
           const fbAdmin = await (await fetch(`${fbBase}/api/account/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'fb_admin', password: 'FbPassword123!', inviteCode: 'CFB-BOOT-1' }),
-          })).json()
-          const fbInv = await (await fetch(`${fbBase}/api/admin/invites`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fbAdmin.token}` },
-            body: JSON.stringify({ count: 1, tier: 'free' }),
+            body: JSON.stringify({ username: 'fb_admin', password: 'FbPassword123!', bootstrapToken: 'CFB-BOOT-1' }),
           })).json()
           const fbFree = await (await fetch(`${fbBase}/api/account/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'fb_free', password: 'FbPassword123!', inviteCode: fbInv.invites[0].code }),
+            body: JSON.stringify({ username: 'fb_free', password: 'FbPassword123!' }),
           })).json()
           const fbMe = await (await fetch(`${fbBase}/api/auth/me`, { headers: { Authorization: `Bearer ${fbFree.token}` } })).json()
           assert.equal(fbMe.turnQuota.provider, 'self-hosted')
@@ -4500,7 +4525,10 @@ async function main() {
           getMetricsSummary: () => ({ onlineBridgeCount: 1, onlineClientCount: 0, totalSignals: 0, totalBridgeConnects: 1, totalClientConnects: 0 }),
           getActivityLog: () => [],
         },
-        accounts: { listUsersForAdmin: () => [], listInvites: () => [] },
+        accounts: {
+          listUsersForAdmin: () => [],
+          getDailyRegistrationStats: () => ({ date: '2026-11-26', used: 0, limit: 20, remaining: 20, exceeded: false }),
+        },
         serverHealth: { ok: true },
       })
       assert.equal(({}).available, protoBefore, 'Object.prototype must never be polluted by bridge.meta.apps')
@@ -4573,6 +4601,31 @@ async function main() {
       assert.equal(compareMobileSemver('1.0.21', '1.0.20'), 1)
       assert.equal(compareMobileSemver('1.0.20', '1.0.20'), 0)
       assert.equal(compareMobileSemver('1.0.19', '1.0.20'), -1)
+
+      // 7) FILE_READ recognizes authoritative Codex/Antigravity/Claude session project roots (not only DSH workspaces)
+      const codexProjDir = join(tmpDir, 'codex-real-project')
+      const unlinkedDir = join(tmpDir, 'unlinked-random-dir')
+      mkdirSync(join(codexProjDir, 'outputs'), { recursive: true })
+      mkdirSync(unlinkedDir, { recursive: true })
+      const codexDeliverable = join(codexProjDir, 'outputs', 'report.md')
+      const unlinkedFile = join(unlinkedDir, 'other.md')
+      writeFileSync(codexDeliverable, '# Codex Deliverable\n')
+      writeFileSync(unlinkedFile, '# Unlinked\n')
+      const rootOrch = new MultiAppOrchestrator({ config: { cwd: join(tmpDir, 'unrelated-bridge-cwd') }, log: { info() {}, warn() {}, error() {} } })
+      rootOrch.adapters.codex.readSession = async (sid) => ({ id: `codex:${sid}`, app: 'codex', cwd: codexProjDir, messages: [] })
+      rootOrch.adapters.codex.listSessions = async () => [{ id: 'codex:t1', app: 'codex', cwd: codexProjDir, updatedAt: Date.now() }]
+      rootOrch.adapters.dsh.listWorkspaces = async () => []
+      rootOrch.adapters.claude.listWorkspaces = async () => []
+      rootOrch.adapters.dsh.listSessions = async () => []
+      rootOrch.adapters.claude.listSessions = async () => []
+      rootOrch.adapters.antigravity.listSessions = async () => []
+      const okRead = await rootOrch.readLocalFile({ path: 'outputs/report.md', cwd: codexProjDir, mode: 'document', sessionId: 'codex:t1' })
+      assert.equal(okRead.filename, 'report.md')
+      await assert.rejects(
+        () => rootOrch.readLocalFile({ path: unlinkedFile, cwd: unlinkedDir, mode: 'document' }),
+        /出于安全限制/,
+      )
+      await rootOrch.dispose()
     }
     pass(17, 'Audit regression guards (env scrubbing, ACL, binary mux, compression, coalescing, ETags, proxy idle & mobile config)')
 

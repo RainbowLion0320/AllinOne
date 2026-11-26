@@ -25,7 +25,7 @@
     tokenSource: '', // 'admin' | 'main_app' | ''
     lang: loadInitialLang(),
     theme: loadInitialTheme(), // 'dark' | 'light'
-    activeTab: 'overview', // 'overview' | 'connections' | 'invites' | 'activity'
+    activeTab: 'overview', // 'overview' | 'connections' | 'activity'
     data: null,
     loading: false,
     pendingRefresh: false,
@@ -35,8 +35,6 @@
     userSearch: '',
     userSort: 'status',
     expandedUsers: new Set(),
-    inviteQty: 1,
-    inviteFilter: 'all',
     activityFilter: 'all',
     confirmKey: '',
     confirmTimer: null,
@@ -223,25 +221,11 @@
     return Number(turn?.port) > 0 ? `STUN+TURN :${turn.port}` : 'CF TURN'
   }
 
-  function updateInviteRoleOptions(quotas = null) {
-    const invRoleSel = document.getElementById('invite-role')
-    if (!invRoleSel) return
-    const q = getTurnQuotaLabels(quotas)
-    const perMo = bi('/月', '/mo')
-    const labels = {
-      free: `Free · ${q.free}${q.freeUnlimited ? '' : perMo}`,
-      pro: `Pro · ${q.pro}${q.proUnlimited ? '' : perMo}`,
-      ultra: `Ultra · ${q.ultra}${q.ultraUnlimited ? '' : perMo}`,
-      admin: bi(
-        `Admin · ${q.admin}${q.adminUnlimited ? '' : '/月'} (管理员)`,
-        `Admin · ${q.admin}${q.adminUnlimited ? '' : '/mo'}`,
-      ),
-    }
-    for (const opt of invRoleSel.options) {
-      if (Object.hasOwn(labels, opt.value)) {
-        opt.textContent = labels[opt.value]
-      }
-    }
+  function fmtDailyRegQuota(dailyReg) {
+    if (!dailyReg) return ''
+    const used = Number(dailyReg.used) || 0
+    const limit = Number(dailyReg.limit) || 0
+    return limit > 0 ? `${used} / ${limit}` : bi(`${used} / 不限`, `${used} / Unlim`)
   }
 
   function showToast(msg) {
@@ -319,7 +303,6 @@
     const navMap = {
       'tab.overview': ['用户与总览', 'Users & Overview'],
       'tab.connections': ['实时连接', 'Live Connections'],
-      'tab.invites': ['邀请码', 'Invite Codes'],
       'tab.activity': ['事件日志', 'Activity Log'],
     }
     document.querySelectorAll('[data-i18n]').forEach((el) => {
@@ -347,11 +330,6 @@
     setPh('user-search', '搜索用户名、邮箱、电脑、IP...', 'Search username, email, PC, IP...')
     setText('live-bridges-title', '在线电脑桥接 (PC Bridges)', 'Online PC Bridges')
     setText('live-clients-title', '在线控制终端 (Mobile / Desktop / Web)', 'Online Controlling Terminals')
-    setText('invites-title', '一次性注册邀请码', 'Single-Use Invite Codes')
-    setText('invites-subtitle', '一码一人，注册成功后立即核销', 'One code per user, burned immediately on registration')
-    setPh('invite-note', '备注（如：给朋友 / 测试账号）', 'Note (optional)')
-    updateInviteRoleOptions(state.data?.server?.turn?.quotas || null)
-    setText('btn-create-invite', '生成邀请码', 'Generate')
     setText('activity-title', '近期运行事件（纯内存环形缓存）', 'Recent Activity (In-Memory Ring Buffer)')
     setText(
       'activity-subtitle',
@@ -611,13 +589,15 @@
         : stun.enabled
           ? `STUN UDP :${stun.port || 3478} (${stun.requests || 0})`
           : bi('STUN 关', 'STUN Off')
+      const dailyReg = sum.dailyRegistration || srv.config?.dailyRegistration || null
+      const regText = dailyReg
+        ? bi(`今日注册 ${fmtDailyRegQuota(dailyReg)}`, `Today's Sign-ups ${fmtDailyRegQuota(dailyReg)}`)
+        : ''
       subEl.textContent = bi(
-        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · ${iceText} · 纯控制面 (P2P 优先)`,
-        `Host ${hostName} · Up ${up} · RSS ${rss} · ${iceText} · Control Plane (P2P-first)`,
+        `主机 ${hostName} · 运行 ${up} · 内存 ${rss} · ${iceText}${regText ? ` · ${regText}` : ''} · 纯控制面 (P2P 优先)`,
+        `Host ${hostName} · Up ${up} · RSS ${rss} · ${iceText}${regText ? ` · ${regText}` : ''} · Control Plane (P2P-first)`,
       )
     }
-
-    updateInviteRoleOptions(srv.turn?.quotas || null)
 
     const luEl = document.getElementById('last-updated')
     if (luEl) {
@@ -627,14 +607,12 @@
     // Tab counters
     document.getElementById('badge-users').textContent = `${sum.onlineUsers || 0}/${sum.totalUsers || 0}`
     document.getElementById('badge-live').textContent = String((sum.onlineBridges || 0) + (sum.onlineClients || 0))
-    document.getElementById('badge-invites').textContent = String(d.inviteStats?.active || 0)
     document.getElementById('badge-activity').textContent = String((d.activity || []).length)
 
     renderKpis(d)
     renderInsights(d)
     renderUsersSection(d)
     renderLiveConnections(d)
-    renderInvites(d)
     renderActivity(d)
   }
 
@@ -643,6 +621,7 @@
     const dist = d.distributions || {}
     const plat = dist.bridgePlatforms || {}
     const kinds = dist.clientKinds || {}
+    const dailyReg = sum.dailyRegistration || d.server?.config?.dailyRegistration || null
 
     const platSummary = [
       plat.win32 ? `Win ${plat.win32}` : '',
@@ -657,6 +636,13 @@
       kinds.web ? `${bi('网页', 'Web')} ${kinds.web}` : '',
     ].filter(Boolean).join(' · ') || bi('暂无在线终端', 'No active terminals')
 
+    const regMeta = dailyReg
+      ? bi(
+          ` · 今日注册 ${fmtDailyRegQuota(dailyReg)}${dailyReg.exceeded ? '（已满）' : ''}`,
+          ` · Today's Sign-ups ${fmtDailyRegQuota(dailyReg)}${dailyReg.exceeded ? ' (Full)' : ''}`,
+        )
+      : ''
+
     const cards = [
       {
         accent: '#10b981',
@@ -667,8 +653,8 @@
         value: sum.onlineUsers || 0,
         total: `/ ${sum.totalUsers || 0}`,
         meta: bi(
-          `24h 活跃 ${sum.recent24hUsers || 0} 人 · 离线 ${sum.offlineUsers || 0} 人`,
-          `${sum.recent24hUsers || 0} active in 24h · ${sum.offlineUsers || 0} offline`,
+          `24h 活跃 ${sum.recent24hUsers || 0} 人 · 离线 ${sum.offlineUsers || 0} 人${regMeta}`,
+          `${sum.recent24hUsers || 0} active in 24h · ${sum.offlineUsers || 0} offline${regMeta}`,
         ),
       },
       {
@@ -825,12 +811,12 @@
           <span class="mini-chip">macOS: ${esc(dist.bridgePlatforms?.darwin || 0)}</span>
           <span class="mini-chip">Linux: ${esc(dist.bridgePlatforms?.linux || 0)}</span>
           ${dist.bridgePlatforms?.other ? `<span class="mini-chip">${esc(bi('其他', 'Other'))}: ${esc(dist.bridgePlatforms.other)}</span>` : ''}
-          <span class="mini-chip">${esc(bi('邀请注册门控', 'Room Invite'))}: ${esc(feat.registerInviteGated ? bi('开', 'On') : bi('关', 'Off'))}</span>
         </div>
       </div>
     `
 
     // Card 3: Server Health (On-Demand)
+    const dailyReg = sum.dailyRegistration || srv.config?.dailyRegistration || null
     const hostMemPct = Math.min(100, Math.max(0, Number(host.memUsagePct) || 0))
     const heapPct = node.heapTotalBytes > 0
       ? Math.min(100, Math.round((node.heapUsedBytes / node.heapTotalBytes) * 100))
@@ -884,6 +870,7 @@
           ${srv.turn?.cloudflare?.enabled ? `<span class="mini-chip">CF TURN (${esc((srv.turn.cloudflare.tiers || []).join('/'))}): ${esc(srv.turn.cloudflare.ready ? bi('就绪', 'Ready') : bi('预热中', 'Warming'))}</span>` : ''}
           ${srv.turn?.quotas ? `<span class="mini-chip">Free ${esc(fmtQuotaMb(srv.turn.quotas.freeMb))} · Pro ${esc(fmtQuotaMb(srv.turn.quotas.proMb))} · Ultra/Admin ${esc(fmtQuotaMb(srv.turn.quotas.ultraMb))}</span>` : ''}
           <span class="mini-chip">${esc(bi('邮件服务', 'Mail'))}: ${esc(feat.emailEnabled ? feat.emailProvider.toUpperCase() : bi('未开启', 'Off'))}</span>
+          ${dailyReg ? `<span class="mini-chip" style="${dailyReg.exceeded ? 'color:var(--rose-text);border-color:rgba(244,63,94,0.35)' : ''}">${esc(bi(`今日注册 ${fmtDailyRegQuota(dailyReg)}${dailyReg.exceeded ? ' · 已满' : ''}`, `Today's Sign-ups ${fmtDailyRegQuota(dailyReg)}${dailyReg.exceeded ? ' · Full' : ''}`))}</span>` : ''}
           <span class="mini-chip">${esc(bi('系统运行', 'Host Up'))}: ${esc(fmtUptime(host.uptimeSec || 0))}</span>
         </div>
       </div>
@@ -1162,7 +1149,6 @@
             <span>${esc(bi('本月中继', 'Monthly Relay'))}: <strong>${esc(quotaText)}</strong></span>
             <span>${esc(bi('注册时间', 'Registered'))}: ${esc(fmtDateShort(u.createdAt))}</span>
             <span>${esc(bi('上次登录', 'Last login'))}: ${esc(fmtDateShort(u.lastLoginAt))}</span>
-            ${u.invitedBy ? `<span>${esc(bi('邀请人', 'Invited by'))}: ${esc(u.invitedBy)}</span>` : ''}
           </div>
           <div class="inline-pills">
             ${!u.isCurrentAdmin ? `
@@ -1298,81 +1284,6 @@
     }
   }
 
-  function renderInvites(d) {
-    const invites = d.invites || []
-    const st = d.inviteStats || { total: 0, active: 0, used: 0, revoked: 0 }
-
-    document.getElementById('invite-stats-pills').innerHTML = `
-      <span class="pill pill-emerald num">${esc(bi(`可用 ${st.active}`, `${st.active} Active`))}</span>
-      <span class="pill pill-subtle num">${esc(bi(`已用 ${st.used}`, `${st.used} Used`))}</span>
-      <span class="pill pill-muted num">${esc(bi(`作废 ${st.revoked}`, `${st.revoked} Revoked`))}</span>
-    `
-
-    const filters = [
-      { id: 'all', label: bi('全部', 'All'), count: st.total },
-      { id: 'active', label: bi('可用', 'Active'), count: st.active },
-      { id: 'used', label: bi('已用', 'Used'), count: st.used },
-      { id: 'revoked', label: bi('已作废', 'Revoked'), count: st.revoked },
-    ]
-    document.getElementById('invite-filter-pills').innerHTML = filters.map((f) => `
-      <button type="button" class="filter-pill ${state.inviteFilter === f.id ? 'active' : ''}" data-action="filter-invites" data-filter="${esc(f.id)}">
-        <span>${esc(f.label)}</span>
-        <span class="filter-count">${esc(f.count)}</span>
-      </button>
-    `).join('')
-
-    const list = state.inviteFilter === 'all' ? invites : invites.filter((i) => i.status === state.inviteFilter)
-    const grid = document.getElementById('invites-list')
-    if (list.length === 0) {
-      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">${esc(bi('暂无邀请码记录', 'No invite codes'))}</div>`
-      return
-    }
-
-    grid.innerHTML = list.map((inv) => {
-      const isActive = inv.status === 'active'
-      const isUsed = inv.status === 'used'
-      const key = `revoke-inv:${inv.id}`
-      const armed = state.confirmKey === key
-      const badge = isActive
-        ? `<span class="pill pill-emerald">${esc(bi('可用', 'Active'))}</span>`
-        : isUsed
-          ? `<span class="pill pill-subtle">${esc(bi('已使用', 'Used'))}</span>`
-          : `<span class="pill pill-rose">${esc(bi('已作废', 'Revoked'))}</span>`
-      const regUrl = `${RELAY_BASE_URL}/?invite=${encodeURIComponent(inv.code)}`
-      return `
-        <div class="invite-card ${isActive ? 'active' : 'inactive'}">
-          <div class="invite-code-row">
-            <span class="invite-code mono ${inv.status === 'revoked' ? 'revoked' : ''}">${esc(inv.code)}</span>
-            <div class="inline-pills">
-              ${(() => {
-                const it = String(inv.tier || 'free').toLowerCase()
-                if (it === 'admin') return '<span class="pill pill-brand">ADMIN</span>'
-                if (it === 'ultra') return '<span class="pill pill-amber">ULTRA</span>'
-                if (it === 'pro') return '<span class="pill pill-sky">PRO</span>'
-                return '<span class="pill pill-subtle">FREE</span>'
-              })()}
-              ${badge}
-            </div>
-          </div>
-          <div class="detail-item-meta">
-            ${inv.note ? `<span>${esc(inv.note)}</span>` : ''}
-            ${isUsed && inv.usedByUsername ? `<span>${esc(bi(`由 @${inv.usedByUsername} 注册`, `Used by @${inv.usedByUsername}`))}</span>` : ''}
-            <span>${esc(fmtDateShort(isUsed ? inv.usedAt : inv.createdAt))}</span>
-          </div>
-          ${isActive ? `
-            <div class="invite-actions">
-              <button type="button" class="btn btn-ghost btn-xs" data-action="copy-text" data-copy="${esc(inv.code)}">${esc(bi('复制码', 'Copy Code'))}</button>
-              <button type="button" class="btn btn-ghost btn-xs" data-action="copy-text" data-copy="${esc(regUrl)}">${esc(bi('复制注册链接', 'Copy Link'))}</button>
-              <button type="button" class="btn btn-xs ${armed ? 'btn-danger-confirm' : 'btn-danger-soft'}" data-action="revoke-invite" data-invite-id="${esc(inv.id)}">
-                ${esc(armed ? bi('确认作废?', 'Confirm?') : bi('作废', 'Revoke'))}
-              </button>
-            </div>
-          ` : ''}
-        </div>
-      `
-    }).join('')
-  }
-
   function activityMeta(type) {
     switch (type) {
       case 'bridge.online': return { label: bi('电脑上线', 'PC Online'), cls: 'pill-emerald' }
@@ -1382,7 +1293,6 @@
       case 'user.register': return { label: bi('新用户注册', 'Registered'), cls: 'pill-brand' }
       case 'user.login': return { label: bi('账号登录', 'Sign In'), cls: 'pill-subtle' }
       case 'admin.kick': return { label: bi('管理操作', 'Admin Kick'), cls: 'pill-rose' }
-      case 'admin.invite': return { label: bi('邀请码', 'Invite'), cls: 'pill-amber' }
       case 'admin.tier': return { label: bi('等级变更', 'Tier Change'), cls: 'pill-sky' }
       case 'admin.quota_reset': return { label: bi('流量重置', 'Quota Reset'), cls: 'pill-emerald' }
       case 'turn.quota_exceeded': return { label: bi('中继达上限', 'TURN Limit'), cls: 'pill-rose' }
@@ -1612,43 +1522,6 @@
       renderUsersSection(state.data)
     })
 
-    // Invite quantity selector & creation form
-    document.getElementById('invite-qty-group').addEventListener('click', (e) => {
-      const btn = e.target.closest('.qty-btn')
-      if (!btn) return
-      state.inviteQty = Number(btn.dataset.qty) || 1
-      document.querySelectorAll('.qty-btn').forEach((b) => b.classList.toggle('active', b === btn))
-    })
-
-    document.getElementById('invite-create-form').addEventListener('submit', async (e) => {
-      e.preventDefault()
-      const btn = document.getElementById('btn-create-invite')
-      const noteEl = document.getElementById('invite-note')
-      const roleEl = document.getElementById('invite-role')
-      const tier = roleEl ? String(roleEl.value || 'free').toLowerCase() : 'free'
-      btn.disabled = true
-      try {
-        const res = await apiFetch('/api/admin/invites', {
-          method: 'POST',
-          body: {
-            count: state.inviteQty,
-            note: noteEl.value.trim(),
-            tier,
-          },
-        })
-        noteEl.value = ''
-        if (roleEl) roleEl.value = 'free'
-        state.inviteFilter = 'active'
-        showToast(bi(`已生成 ${res.invites.length} 个邀请码`, `Generated ${res.invites.length} invite(s)`))
-        await loadOverview({ force: true })
-      } catch (err) {
-        if (handleAuthError(err)) return
-        showToast(String(err.message || err))
-      } finally {
-        btn.disabled = false
-      }
-    })
-
     document.getElementById('dashboard-view').addEventListener('change', async (e) => {
       const sel = e.target.closest('select[data-action="set-user-tier"]')
       if (!sel) return
@@ -1704,12 +1577,6 @@
       if (action === 'filter-users') {
         state.userFilter = target.dataset.filter || 'all'
         if (state.data) renderUsersSection(state.data)
-        return
-      }
-
-      if (action === 'filter-invites') {
-        state.inviteFilter = target.dataset.filter || 'all'
-        if (state.data) renderInvites(state.data)
         return
       }
 
@@ -1816,27 +1683,6 @@
           showToast(String(err.message || err))
         }
         return
-      }
-
-      if (action === 'revoke-invite') {
-        const id = target.dataset.inviteId || ''
-        const key = `revoke-inv:${id}`
-        if (state.confirmKey !== key) {
-          armConfirm(key)
-          return
-        }
-        clearConfirm()
-        try {
-          await apiFetch('/api/admin/invites/revoke', {
-            method: 'POST',
-            body: { id },
-          })
-          showToast(bi('已作废邀请码', 'Invite code revoked'))
-          await loadOverview({ force: true })
-        } catch (err) {
-          if (handleAuthError(err)) return
-          showToast(String(err.message || err))
-        }
       }
     })
 

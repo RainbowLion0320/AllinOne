@@ -45,7 +45,7 @@ export function collectServerHealth({
   mailer = null,
   stun = null,
   turn = null,
-  registerInviteGated = true,
+  dailyRegistration = null,
   startedAt = Date.now(),
   version = '1.0.21',
 } = {}) {
@@ -86,10 +86,14 @@ export function collectServerHealth({
     },
     stun: stun || { enabled: false, port: 0, requests: 0 },
     turn: turn || { enabled: false, host: '', port: 0 },
+    config: {
+      openRegistration: true,
+      dailyRegistration: dailyRegistration || null,
+    },
     features: {
       emailEnabled: Boolean(mailer?.isConfigured?.()),
       emailProvider: mailer?.getProvider?.() || 'none',
-      registerInviteGated: Boolean(registerInviteGated),
+      openRegistration: true,
       p2pOnly: true,
     },
   }
@@ -97,12 +101,13 @@ export function collectServerHealth({
 
 /**
  * Assemble a complete, read-only admin monitoring snapshot of all users, bound PCs,
- * controlling client sessions, live connections, invite codes, and recent events.
+ * controlling client sessions, live connections, daily registration quota, and recent events.
  */
 export function buildAdminOverview({
   accounts,
   hub,
   serverHealth,
+  dailyRegistration = null,
   getTurnQuota = null,
   currentAdminRoom = '',
   currentAdminSid = '',
@@ -295,7 +300,6 @@ export function buildAdminOverview({
       tokenVersion: u.tokenVersion,
       createdAt: u.createdAt || 0,
       lastLoginAt: u.lastLoginAt || 0,
-      invitedBy: u.invitedBy || '',
       status,
       onlineBridgeCount,
       totalDeviceCount: mergedDevices.length,
@@ -333,13 +337,11 @@ export function buildAdminOverview({
     isCurrentAdmin: Boolean(currentAdminRoom === c.roomId && currentAdminSid && c.sid === currentAdminSid),
   }))
 
-  const invites = accounts.listInvites()
-  const inviteStats = {
-    total: invites.length,
-    active: invites.filter((i) => i.status === 'active').length,
-    used: invites.filter((i) => i.status === 'used').length,
-    revoked: invites.filter((i) => i.status === 'revoked').length,
-  }
+  const resolvedDailyRegistration =
+    dailyRegistration ||
+    serverHealth?.config?.dailyRegistration ||
+    accounts?.getDailyRegistrationStats?.() ||
+    null
 
   const activity = hub.getActivityLog(80).map((item) => ({
     ...item,
@@ -367,6 +369,7 @@ export function buildAdminOverview({
       totalTurnUsedBytes,
       totalBridgeConnects: metrics.totalBridgeConnects,
       totalClientConnects: metrics.totalClientConnects,
+      dailyRegistration: resolvedDailyRegistration,
     },
     distributions: {
       userStatus: userStatusDist,
@@ -377,8 +380,6 @@ export function buildAdminOverview({
     users,
     liveBridges,
     liveClients,
-    invites,
-    inviteStats,
     activity,
   }
 }

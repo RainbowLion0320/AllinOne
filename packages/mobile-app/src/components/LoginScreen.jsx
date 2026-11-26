@@ -1,5 +1,6 @@
-import React, { Suspense, useCallback, useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Check,
@@ -9,16 +10,15 @@ import {
   Eye,
   EyeOff,
   Globe,
+  KeyRound,
   Lock,
   Mail,
   Moon,
-  ScanLine,
   Server,
   ShieldCheck,
   Sparkles,
   Sun,
   Terminal,
-  Ticket,
   User,
   UserPlus,
 } from 'lucide-react'
@@ -34,14 +34,15 @@ import {
 import { useI18n } from '../lib/i18n.jsx'
 import { copyTextToClipboard, formatSafeSetupCmd } from '../lib/clientHelpers.js'
 
-function isLoopbackHost(hostname) {
-  const h = String(hostname || '').trim().toLowerCase()
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+const DEFAULT_BOOTSTRAP_STATUS = {
+  hasUsers: true,
+  hasAdmin: true,
+  needsBootstrapToken: false,
+  emailEnabled: false,
+  dailyRegistrationLimit: 0,
+  dailyRegistrationsUsed: 0,
+  dailyRegistrationRemaining: null,
 }
-
-const QrScannerModal = React.lazy(() =>
-  import('./QrScannerModal.jsx').then((m) => ({ default: m.QrScannerModal })),
-)
 
 const LOGIN_INPUT_CLS =
   'w-full rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white focus:ring-2 focus:ring-[#4D6BFE]/15 dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26] dark:focus:ring-[#4D6BFE]/25'
@@ -50,17 +51,13 @@ export function LoginScreen({
   onSuccess,
   isAddingDevice = false,
   initialServerUrl = '',
-  initialInviteCode = '',
-  autoOpenScanner = false,
   darkMode = false,
   onToggleDark = null,
   onCancel = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
   // 'login' | 'register' | 'reset'
-  const [mode, setMode] = useState(() =>
-    initialInviteCode || autoOpenScanner ? 'register' : 'login',
-  )
+  const [mode, setMode] = useState('login')
   const [serverUrl, setServerUrl] = useState(() => initialServerUrl || detectDefaultServerUrl())
   const [showAdvancedServer, setShowAdvancedServer] = useState(() => {
     const init = String(initialServerUrl || detectDefaultServerUrl() || '')
@@ -69,16 +66,15 @@ export function LoginScreen({
   const [showSetupGuide, setShowSetupGuide] = useState(false)
   const [osTab, setOsTab] = useState('unix') // 'win' | 'unix'
   const [copiedCmd, setCopiedCmd] = useState(false)
-  const [scannerOpen, setScannerOpen] = useState(Boolean(autoOpenScanner))
-  const [hasUsers, setHasUsers] = useState(true)
-  const [emailEnabled, setEmailEnabled] = useState(false)
+  const [bootstrapStatus, setBootstrapStatus] = useState(DEFAULT_BOOTSTRAP_STATUS)
 
   // Account fields
   const [username, setUsername] = useState('')
   const [accountPassword, setAccountPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
-  const [inviteCode, setInviteCode] = useState(initialInviteCode || '')
+  const [bootstrapToken, setBootstrapToken] = useState('')
+  const [showBootstrapToken, setShowBootstrapToken] = useState(false)
   const [email, setEmail] = useState('')
   const [emailCode, setEmailCode] = useState('')
   const [login2fa, setLogin2fa] = useState({ required: false, maskedEmail: '' })
@@ -88,28 +84,35 @@ export function LoginScreen({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [infoMsg, setInfoMsg] = useState('')
-  const [pendingServerSwitch, setPendingServerSwitch] = useState(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     if (initialServerUrl) setServerUrl(initialServerUrl)
   }, [initialServerUrl])
 
-  useEffect(() => {
-    if (initialInviteCode) {
-      setInviteCode(initialInviteCode)
-      setMode('register')
-    }
-  }, [initialInviteCode])
-
   const effectiveServer = normalizeBaseUrl(serverUrl)
+  const emailEnabled = Boolean(bootstrapStatus.emailEnabled)
+  const needsBootstrapToken = !bootstrapStatus.hasAdmin && Boolean(bootstrapStatus.needsBootstrapToken)
+  const showFirstAdminNotice = !bootstrapStatus.hasAdmin && !bootstrapStatus.needsBootstrapToken
+  const dailyCapReached = Boolean(
+    bootstrapStatus.hasAdmin &&
+    bootstrapStatus.dailyRegistrationLimit > 0 &&
+    bootstrapStatus.dailyRegistrationRemaining === 0,
+  )
 
   useEffect(() => {
     let cancelled = false
     const timer = setTimeout(() => {
       fetchBootstrapStatus(effectiveServer).then((st) => {
         if (!cancelled) {
-          setHasUsers(st.hasUsers)
-          setEmailEnabled(Boolean(st.emailEnabled))
+          setBootstrapStatus(st)
         }
       })
     }, 350)
@@ -117,7 +120,7 @@ export function LoginScreen({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [effectiveServer])
+  }, [effectiveServer, mode])
 
   useEffect(() => {
     if (codeCooldown <= 0) return undefined
@@ -135,8 +138,22 @@ export function LoginScreen({
       setError(bi('请先输入有效的邮箱地址', 'Please enter a valid email address'))
       return
     }
-    if (purpose === 'register' && !inviteCode.trim()) {
-      setError(bi('请先填写邀请码，再获取邮箱验证码', 'Enter your invite code before requesting a verification code'))
+    if (purpose === 'register' && dailyCapReached) {
+      setError(
+        bi(
+          `今日新用户注册名额已满（每日上限 ${bootstrapStatus.dailyRegistrationLimit} 人），请明天再试`,
+          `Today's sign-up limit reached (${bootstrapStatus.dailyRegistrationLimit}/day). Please try again tomorrow.`,
+        ),
+      )
+      return
+    }
+    if (purpose === 'register' && needsBootstrapToken && !bootstrapToken.trim()) {
+      setError(
+        bi(
+          '请先填写管理员初始化密钥 (ADMIN_BOOTSTRAP_TOKEN)，再获取邮箱验证码',
+          'Enter the Admin Bootstrap Token before requesting a verification code',
+        ),
+      )
       return
     }
     setCodeSending(true)
@@ -144,7 +161,9 @@ export function LoginScreen({
       const res = await sendEmailVerificationCode(serverUrl, {
         purpose,
         email: cleanEmail,
-        inviteCode: purpose === 'register' ? inviteCode.trim() : '',
+        ...(purpose === 'register' && needsBootstrapToken && bootstrapToken.trim()
+          ? { bootstrapToken: bootstrapToken.trim() }
+          : {}),
       })
       setCodeCooldown(res.cooldownSec || 60)
       setInfoMsg(res.message || bi('验证码已发送，请查收邮件', 'Verification code sent. Please check your inbox.'))
@@ -173,67 +192,11 @@ export function LoginScreen({
     setInfoMsg('')
     setAccountPassword('')
     setConfirmPassword('')
+    setBootstrapToken('')
+    setShowBootstrapToken(false)
     setEmailCode('')
     setLogin2fa({ required: false, maskedEmail: '' })
   }
-
-  const handleQrDetected = useCallback((rawText) => {
-    setScannerOpen(false)
-    const trimmed = String(rawText || '').trim()
-    try {
-      if (/^https?:\/\//i.test(trimmed)) {
-        const u = new URL(trimmed)
-        const inv = u.searchParams.get('invite')
-        if (inv) {
-          const isHttps = u.protocol === 'https:'
-          const isLocalHttp = u.protocol === 'http:' && isLoopbackHost(u.hostname)
-          if (!isHttps && !isLocalHttp) {
-            setError(
-              bi(
-                '已拦截不安全的 HTTP 服务器地址（非本机服务器仅支持 HTTPS）',
-                'Blocked insecure HTTP server URL (HTTPS is required for remote servers).',
-              ),
-            )
-            return
-          }
-          const basePath = u.pathname.replace(/\/index\.html$/i, '').replace(/\/+$/, '')
-          const scannedServer = `${u.origin}${basePath}`
-          let currentOrigin = ''
-          try {
-            currentOrigin = new URL(effectiveServer).origin
-          } catch {}
-          if (currentOrigin && u.origin !== currentOrigin) {
-            setPendingServerSwitch({
-              serverUrl: scannedServer,
-              displayHost: `${u.protocol}//${u.host}${basePath}`,
-              inviteCode: inv.trim(),
-            })
-            setShowAdvancedServer(true)
-            setMode('register')
-            setError('')
-            return
-          }
-          setPendingServerSwitch(null)
-          setInviteCode(inv.trim())
-          setMode('register')
-          setError('')
-          return
-        }
-      }
-    } catch {}
-    if (/^INV-[A-Z0-9-]+$/i.test(trimmed)) {
-      setInviteCode(trimmed.toUpperCase())
-      setMode('register')
-      setError('')
-      return
-    }
-    setError(
-      bi(
-        '识别到的二维码不是有效的注册邀请码，请扫描管理员分享的邀请注册二维码',
-        'Invalid QR code. Please scan an invite registration QR code.',
-      ),
-    )
-  }, [bi, effectiveServer])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -283,8 +246,22 @@ export function LoginScreen({
     }
 
     if (mode === 'register') {
-      if (!inviteCode.trim()) {
-        setError(bi('请输入管理员提供的一次性邀请码', 'Please enter your single-use invite code'))
+      if (dailyCapReached) {
+        setError(
+          bi(
+            `今日新用户注册名额已满（每日上限 ${bootstrapStatus.dailyRegistrationLimit} 人），请明天再试`,
+            `Today's sign-up limit reached (${bootstrapStatus.dailyRegistrationLimit}/day). Please try again tomorrow.`,
+          ),
+        )
+        return
+      }
+      if (needsBootstrapToken && !bootstrapToken.trim()) {
+        setError(
+          bi(
+            '请输入管理员初始化密钥 (ADMIN_BOOTSTRAP_TOKEN)',
+            'Please enter the Admin Bootstrap Token',
+          ),
+        )
         return
       }
       if (!username.trim()) {
@@ -315,7 +292,7 @@ export function LoginScreen({
         const result = await registerAccount(serverUrl, {
           username: username.trim(),
           password: accountPassword,
-          inviteCode: inviteCode.trim(),
+          ...(needsBootstrapToken && bootstrapToken.trim() ? { bootstrapToken: bootstrapToken.trim() } : {}),
           ...(cleanEmail ? { email: cleanEmail, emailCode: emailCode.trim() } : {}),
         })
         onSuccess({
@@ -332,6 +309,11 @@ export function LoginScreen({
         })
       } catch (err) {
         setError(String(err?.message || err))
+        fetchBootstrapStatus(effectiveServer)
+          .then((st) => {
+            if (mountedRef.current) setBootstrapStatus(st)
+          })
+          .catch(() => {})
       } finally {
         setLoading(false)
       }
@@ -585,55 +567,63 @@ export function LoginScreen({
             </>
           )}
 
-          {/* Account Invite-Gated Register Form */}
+          {/* Account Open Registration Form */}
           {mode === 'register' && (
             <>
-              {!hasUsers && (
+              {showFirstAdminNotice && (
                 <div className="flex items-start gap-2 rounded-2xl border border-[#4D6BFE]/30 bg-[#F2F5FF] px-3 py-2 text-[11.5px] leading-relaxed text-[#2842C9] dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]">
                   <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span>
-                    {lang === 'en' ? (
-                      <>
-                        First-time setup: enter your server&apos;s <strong>Bootstrap Token (ADMIN_BOOTSTRAP_TOKEN)</strong> or CLI-generated admin invite code below to create the first admin account.
-                      </>
-                    ) : (
-                      <>
-                        首次初始化：填入服务器配置的 <strong>ADMIN_BOOTSTRAP_TOKEN</strong> 或 CLI 生成的管理员邀请码，即可注册首个管理员账号。
-                      </>
+                    {bi(
+                      '首次部署：注册的第一个账号将自动成为管理员',
+                      'First-time setup: the first account created becomes the admin',
                     )}
                   </span>
                 </div>
               )}
 
-              <div>
-                <div className="mb-1.5 flex items-center justify-between">
-                  <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
-                    <Ticket className="h-3.5 w-3.5 text-[#4D6BFE]" />
-                    <span>{bi('邀请码', 'Invite Code')}</span>
+              {needsBootstrapToken && (
+                <div>
+                  <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <KeyRound className="h-3.5 w-3.5 text-[#4D6BFE]" />
+                    <span>{bi('管理员初始化密钥 (ADMIN_BOOTSTRAP_TOKEN)', 'Admin Bootstrap Token')}</span>
                   </label>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setError('')
-                      setScannerOpen(true)
-                    }}
-                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#4D6BFE] hover:underline"
-                  >
-                    <ScanLine className="h-3 w-3" />
-                    <span>{bi('扫码填入', 'Scan QR')}</span>
-                  </button>
+                  <div className="relative">
+                    <input
+                      type={showBootstrapToken ? 'text' : 'password'}
+                      value={bootstrapToken}
+                      onChange={(e) => setBootstrapToken(e.target.value)}
+                      placeholder={bi('输入服务器配置的初始化密钥', 'Enter server bootstrap token')}
+                      autoComplete="off"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      className={`${LOGIN_INPUT_CLS} pr-10 font-mono placeholder:font-sans`}
+                    />
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() => setShowBootstrapToken((v) => !v)}
+                      aria-label={showBootstrapToken ? bi('隐藏初始化密钥', 'Hide bootstrap token') : bi('显示初始化密钥', 'Show bootstrap token')}
+                      className="absolute top-1/2 right-2.5 -translate-y-1/2 rounded-lg p-1.5 text-slate-400 transition hover:text-slate-600 dark:text-slate-400 dark:hover:text-slate-200"
+                    >
+                      {showBootstrapToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
                 </div>
-                <input
-                  type="text"
-                  value={inviteCode}
-                  onChange={(e) => setInviteCode(e.target.value)}
-                  placeholder="INV-XXXX-XXXX"
-                  autoCapitalize="characters"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  className={`${LOGIN_INPUT_CLS} font-mono font-semibold tracking-wider placeholder:font-sans placeholder:font-normal placeholder:tracking-normal`}
-                />
-              </div>
+              )}
+
+              {dailyCapReached && (
+                <div className="flex items-start gap-2 rounded-2xl border border-amber-300/80 bg-amber-50/90 px-3 py-2 text-[11.5px] leading-relaxed text-amber-800 dark:border-amber-600/50 dark:bg-amber-950/40 dark:text-amber-200">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <span>
+                    {bi(
+                      `今日新用户注册名额已满（每日上限 ${bootstrapStatus.dailyRegistrationLimit} 人），请明天再试`,
+                      `Today's sign-up limit reached (${bootstrapStatus.dailyRegistrationLimit}/day). Please try again tomorrow.`,
+                    )}
+                  </span>
+                </div>
+              )}
 
               <div>
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
@@ -720,7 +710,7 @@ export function LoginScreen({
                       />
                       <button
                         type="button"
-                        disabled={codeSending || codeCooldown > 0}
+                        disabled={codeSending || codeCooldown > 0 || dailyCapReached}
                         onClick={() => handleSendEmailCode('register')}
                         className="shrink-0 rounded-2xl border border-[#4D6BFE]/40 bg-[#F2F5FF] px-3 py-2.5 text-xs font-semibold text-[#2842C9] transition hover:bg-[#E7EEFF] disabled:opacity-55 dark:border-[#4D6BFE]/40 dark:bg-[#1E253A] dark:text-[#A9BDFF]"
                       >
@@ -907,63 +897,21 @@ export function LoginScreen({
               {showAdvancedServer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             </button>
             {showAdvancedServer && (
-              <div className="mt-1.5 space-y-2">
-                {pendingServerSwitch && (
-                  <div className="space-y-2 rounded-xl border border-amber-300/80 bg-amber-50/90 p-2.5 text-[11.5px] text-amber-900 dark:border-amber-600/50 dark:bg-amber-950/40 dark:text-amber-200">
-                    <div>
-                      {bi(
-                        '扫描到的邀请码指向与当前不同的服务器，请核对完整地址后再确认切换：',
-                        'This invite QR points to a different server. Verify the full URL before switching:',
-                      )}
-                    </div>
-                    <div className="break-all rounded-lg bg-white/80 px-2.5 py-1.5 font-mono text-[11px] font-semibold text-slate-900 dark:bg-[#14161D] dark:text-amber-100">
-                      {pendingServerSwitch.displayHost}
-                    </div>
-                    <div className="flex justify-end gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setPendingServerSwitch(null)}
-                        className="rounded-lg px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-amber-100 dark:text-slate-300 dark:hover:bg-amber-900/40"
-                      >
-                        {t('common.cancel')}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setServerUrl(pendingServerSwitch.serverUrl)
-                          setInviteCode(pendingServerSwitch.inviteCode)
-                          setPendingServerSwitch(null)
-                          setError('')
-                        }}
-                        className="rounded-lg bg-amber-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-amber-500 active:scale-95"
-                      >
-                        {bi('确认切换到此服务器', 'Confirm server switch')}
-                      </button>
-                    </div>
-                  </div>
-                )}
-                <div className="flex items-center gap-1.5">
-                  <input
-                    type="url"
-                    value={serverUrl}
-                    onChange={(e) => {
-                      setServerUrl(e.target.value)
-                      if (pendingServerSwitch) setPendingServerSwitch(null)
-                    }}
-                    placeholder={detectDefaultServerUrl()}
-                    className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setServerUrl(detectDefaultServerUrl())
-                      setPendingServerSwitch(null)
-                    }}
-                    className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-                  >
-                    {t('common.default')}
-                  </button>
-                </div>
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <input
+                  type="url"
+                  value={serverUrl}
+                  onChange={(e) => setServerUrl(e.target.value)}
+                  placeholder={detectDefaultServerUrl()}
+                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-[#4D6BFE] focus:bg-white dark:border-slate-700/90 dark:bg-[#14161D] dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-[#4D6BFE] dark:focus:bg-[#191C26]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setServerUrl(detectDefaultServerUrl())}
+                  className="shrink-0 rounded-xl px-2 py-2 text-[11px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                >
+                  {t('common.default')}
+                </button>
               </div>
             )}
           </div>
@@ -982,7 +930,7 @@ export function LoginScreen({
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || (mode === 'register' && dailyCapReached)}
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-60"
           >
             <span>
@@ -998,16 +946,6 @@ export function LoginScreen({
           </button>
         </form>
       </div>
-
-      <Suspense fallback={null}>
-        {scannerOpen && (
-          <QrScannerModal
-            open={scannerOpen}
-            onClose={() => setScannerOpen(false)}
-            onDetected={handleQrDetected}
-          />
-        )}
-      </Suspense>
     </div>
   )
 }

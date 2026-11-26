@@ -81,12 +81,13 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
 
   const bridgeId = String(context?.bridgeId || '').trim()
   const cwd = String(context?.cwd || '').trim()
+  const sessionId = String(context?.sessionId || '').trim()
   const epoch = fileCacheEpoch
 
   const job = (async () => {
     const result = await client.rpc(
       RPC.FILE_READ,
-      { path: target, cwd, mode: 'document' },
+      { path: target, cwd, mode: 'document', ...(sessionId ? { sessionId } : {}) },
       300_000,
       bridgeId ? { bridgeId } : {},
     )

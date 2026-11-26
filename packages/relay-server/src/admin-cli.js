@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 /**
- * Server-side Admin CLI for managing single-use registration invite codes & user tiers.
+ * Server-side Admin CLI for inspecting registered users, daily registration quota & user tiers.
  *
  * Usage:
- *   node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--tier free|pro|ultra|admin] [--admin]
- *   node packages/relay-server/src/admin-cli.js invite list
- *   node packages/relay-server/src/admin-cli.js invite revoke <id-or-code>
  *   node packages/relay-server/src/admin-cli.js users
  *   node packages/relay-server/src/admin-cli.js user tier <username-or-id> <free|pro|ultra|admin>
  */
@@ -13,7 +10,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createAccountStore, VALID_TIERS } from './accounts.js'
+import { createAccountStore, normalizeMaxDailyRegistrations } from './accounts.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
@@ -39,19 +36,10 @@ loadDotEnv(resolve(__dirname, '../../../.env'))
 
 const accountsFile = resolve(process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json'))
 const store = createAccountStore({ filePath: accountsFile })
-const publicUrl = String(process.env.PUBLIC_RELAY_URL || '').trim().replace(/\/+$/, '')
 
 const args = process.argv.slice(2)
 const cmd = args[0] || 'help'
 const sub = args[1] || ''
-
-function getFlag(name, fallback = '') {
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === name && args[i + 1]) return args[i + 1]
-    if (args[i].startsWith(`${name}=`)) return args[i].slice(name.length + 1)
-  }
-  return fallback
-}
 
 const TIER_LABELS = {
   free: 'Free (1 GB/月 · P2P 无限)',
@@ -60,58 +48,11 @@ const TIER_LABELS = {
   admin: 'Admin (50 GB/月 · 管理员)',
 }
 
-if (cmd === 'invite' && sub === 'create') {
-  const count = Number(getFlag('--count', getFlag('-n', '1'))) || 1
-  const note = getFlag('--note', '')
-  const rawTier = String(getFlag('--tier', '') || '').trim().toLowerCase()
-  if (rawTier && !VALID_TIERS.has(rawTier)) {
-    console.error(`无效的用户等级 "${rawTier}"，仅支持: free | pro | ultra | admin`)
-    process.exit(1)
-  }
-  const effectiveTier = args.includes('--admin') ? 'admin' : rawTier || 'free'
-  const created = store.createInvites({ count, note, createdBy: 'cli', tier: effectiveTier })
-  const tierLabel = TIER_LABELS[created[0]?.tier || 'free'] || 'Free'
-  console.log(`\n✓ 已生成 ${created.length} 个一次性邀请码 [${tierLabel}]：\n`)
-  for (const inv of created) {
-    const link = publicUrl ? `  ->  ${publicUrl}/?invite=${encodeURIComponent(inv.code)}` : ''
-    console.log(`  ${inv.code}${inv.note ? `  (${inv.note})` : ''}${link}`)
-  }
-  console.log('\n提示：如果中转服务正在运行，推荐直接在管理员监控后台 (/admin) 操作（即时生效）；使用离线 CLI 修改前请先停止中转服务（避免在线进程退出时 accounts.flush() 覆写磁盘变更），修改后再启动服务。\n')
-  process.exit(0)
-}
-
-if (cmd === 'invite' && sub === 'list') {
-  const list = store.listInvites()
-  if (list.length === 0) {
-    console.log('暂无邀请码记录。')
-    process.exit(0)
-  }
-  for (const inv of list) {
-    const usedInfo = inv.status === 'used' ? ` -> @${inv.usedByUsername}` : ''
-    const note = inv.note ? ` [${inv.note}]` : ''
-    const tierTag = inv.tier && inv.tier !== 'free' ? ` (${inv.tier.toUpperCase()})` : ''
-    console.log(`${inv.code}  ${inv.status.padEnd(7)}  ${inv.id}${tierTag}${note}${usedInfo}`)
-  }
-  process.exit(0)
-}
-
-if (cmd === 'invite' && sub === 'revoke') {
-  const target = args[2] || ''
-  const res = store.revokeInvite(target)
-  if (!res) {
-    console.error('找不到指定邀请码。')
-    process.exit(1)
-  }
-  if (!res.ok) {
-    console.error(res.error)
-    process.exit(1)
-  }
-  console.log(`✓ 已作废邀请码 ${res.invite.code}`)
-  console.log('提示：如中转服务正在运行，请先停服再运行离线 CLI（或直接用 /admin 后台即时作废），以免在线进程退出时覆写磁盘变更。')
-  process.exit(0)
-}
-
 if (cmd === 'users') {
+  const maxDaily = normalizeMaxDailyRegistrations(process.env.MAX_DAILY_REGISTRATIONS, 20)
+  const daily = store.getDailyRegistrationStats(maxDaily)
+  const limitLabel = daily.limit > 0 ? String(daily.limit) : '不限'
+  console.log(`今日注册: ${daily.used} / ${limitLabel} (${daily.date})`)
   const users = store.listUsers()
   if (users.length === 0) {
     console.log('暂无已注册用户。')
@@ -146,12 +87,9 @@ if (cmd === 'user' && sub === 'tier') {
   process.exit(0)
 }
 
-console.log(`All in One Account & Invite Admin CLI
+console.log(`All in One Account Admin CLI
 
 用法:
-  node packages/relay-server/src/admin-cli.js invite create [--count 3] [--note "给朋友"] [--tier free|pro|ultra|admin] [--admin]
-  node packages/relay-server/src/admin-cli.js invite list
-  node packages/relay-server/src/admin-cli.js invite revoke <id-or-code>
   node packages/relay-server/src/admin-cli.js users
   node packages/relay-server/src/admin-cli.js user tier <username-or-id> <free|pro|ultra|admin>
 `)

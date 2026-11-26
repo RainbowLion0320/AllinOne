@@ -95,15 +95,11 @@
 ## 🚀 Quick Start
 
 > [!TIP]
-> **Public Trial Invite Codes (Single-Use, First-Come First-Served)**
+> **Public Trial Relay (Open Self-Registration)**
 >
-> Want to try All in One right now? Connect to the trial relay **`https://123.206.218.214/dsh/`** (trusted Let's Encrypt HTTPS + mandatory zero-knowledge `AES-256-GCM` E2EE — the relay server cannot read any of your chats, code, or files) and register with any code below:
+> Want to try All in One right now? Open the web app or desktop client, set the server URL to **`https://123.206.218.214/dsh/`** (trusted Let's Encrypt HTTPS + mandatory zero-knowledge `AES-256-GCM` E2EE — the relay server cannot read any of your chats, code, or files), and **directly register your own account**.
 >
-> | Code 1 | Code 2 | Code 3 | Code 4 | Code 5 |
-> | :---: | :---: | :---: | :---: | :---: |
-> | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
->
-> If all codes are claimed, spin up your own private relay in one minute with [One-Click Self-Hosting](#-one-click-self-hosting-docker) or open an Issue to request a fresh code.
+> To prevent automated sign-up abuse, the server enforces a default daily cap of **20 new accounts/day** (`MAX_DAILY_REGISTRATIONS=20`). If today's cap is reached, it resets automatically the next day — or spin up your own private relay in one minute with [One-Click Self-Hosting](#-one-click-self-hosting-docker).
 
 ### Up and Running in 3 Steps
 
@@ -172,7 +168,7 @@ All in One is built around **6 layers of zero-knowledge defense-in-depth** — e
 | **3. Zero-Knowledge Device Grant** | Offline QR scan **or** `ECDH P-256` + `HKDF-SHA256` + **6-digit SAS** | Remote key sync derives an independent 6-digit verification code on both devices to prevent MITM attacks |
 | **4. Zero Open Inbound Ports** | PC bridges initiate **outbound WSS** control + **STUN UDP traversal** only | No router port forwarding, no public SSH/daemon exposure on your home or office machine |
 | **5. OS Hardware Key Storage** | macOS Keychain / Windows DPAPI (Electron `safeStorage`) | 256-bit E2EE keys are encrypted by your OS credential vault instead of plaintext files |
-| **6. Account & Instant P2P Revocation** | Single-use invites + optional Email 2FA + one-time WS tickets + live `client.revoked` push | Revoking any lost device immediately instructs PC bridges to tear down its P2P DataChannels in milliseconds (verified by 38 automated security & P2P/TURN test suites) |
+| **6. Registration Guard & Instant P2P Revocation** | Atomic daily registration cap (default 20/day) + optional `ADMIN_BOOTSTRAP_TOKEN` + optional Email 2FA + one-time WS tickets + live `client.revoked` push | Prevents bulk sign-up abuse; revoking any lost device immediately instructs PC bridges to tear down its P2P DataChannels in milliseconds (verified by 38 automated security & P2P/TURN test suites) |
 
 ### Architecture
 
@@ -217,7 +213,7 @@ The interactive wizard finishes everything in under a minute:
 - **3 Deployment Modes**: ① Custom Domain + automatic Let's Encrypt HTTPS via Caddy (Recommended) · ② **Bare Public IP + trusted Let's Encrypt IP HTTPS** (no domain required) · ③ Control Plane Container Only (binds `127.0.0.1:8787` for existing Nginx / Caddy / Cloudflare Tunnel setups).
 - **Built-In Stateless STUN (`UDP 3478`) + Optional Encrypted TURN**: The container exposes **`UDP 3478`** for zero-dependency RFC 5389 NAT discovery (open `UDP 3478` in your cloud firewall / security group). Direct **`⚡ P2P`** stays at 0 server traffic permanently; for strict double-symmetric NATs, optionally enable self-hosted `coturn` (with 4-tier monthly quotas) or Cloudflare Realtime TURN's free 1 TB/mo pool via `.env`.
 - **Secure Defaults**: Automatically generates a 256-bit `JWT_SECRET` (`chmod 600 .env`) with an optional Email 2FA / SMTP wizard (Gmail, QQ Mail, 163 Mail, or custom SMTP).
-- **Ready to Sign Up**: Runs a health check, automatically issues your first single-use admin invite code + clickable registration link, and supports zero-downtime upgrades via `--upgrade`.
+- **Open Registration & First-Admin Bootstrap**: Runs a health check and is immediately ready for sign-up — the first user registered on a brand-new server automatically becomes **Admin** (optionally guarded by `ADMIN_BOOTSTRAP_TOKEN`), while subsequent users can openly self-register under the built-in daily cap (`MAX_DAILY_REGISTRATIONS=20` by default, `0` = unlimited). Supports zero-downtime upgrades via `--upgrade`.
 
 ```bash
 # Non-interactive examples (great for automation / cloud-init)
@@ -225,7 +221,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --upgrade
 ```
 
-After registering your admin account, create or revoke single-use invite codes directly in **Settings → Invite Codes**, and open **`https://your-server/admin`** (or **Settings → Server Monitoring Dashboard**) to inspect online users, bridges, terminals, and live server health on demand (zero background polling overhead).
+After registering your admin account, open **`https://your-server/admin`** (or **Settings → Server Monitoring Dashboard**) to inspect online users, PC bridges, client terminals, daily sign-up stats, and live server health — and manage users and tiers (`free` / `pro` / `ultra` / `admin`) on demand with zero background polling overhead.
 
 <details>
 <summary>Manual Docker Compose deployment (or build from source)</summary>
@@ -242,6 +238,9 @@ cat > deploy/.env <<'EOF'
 JWT_SECRET=replace-with-32-plus-char-random-secret
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
+MAX_DAILY_REGISTRATIONS=20
+# Optional: require a bootstrap secret to register the first Admin on a brand-new server
+# ADMIN_BOOTSTRAP_TOKEN=replace-with-strong-bootstrap-secret
 EOF
 
 # 4. Pull the prebuilt ghcr.io image and start (or add --build to compile from source)
@@ -249,9 +248,8 @@ cd deploy
 docker compose --env-file .env pull
 docker compose --env-file .env up -d
 
-# 5. Create your first admin invite code
-docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
-docker compose restart allinone-relay
+# 5. Open https://ai.yourdomain.com to register the first account (automatically becomes Admin),
+#    then manage users, tiers, and live metrics at https://ai.yourdomain.com/admin
 ```
 
 </details>
@@ -270,7 +268,7 @@ SMTP_PASS=your-app-password
 SMTP_FROM=All in One <your-email@gmail.com>
 ```
 
-> Resend HTTPS API (`RESEND_API_KEY` + `RESEND_FROM`) is also supported. When omitted, accounts work with username + password + invite code.
+> Resend HTTPS API (`RESEND_API_KEY` + `RESEND_FROM`) is also supported. When omitted, accounts work with username + password self-registration (guarded by `MAX_DAILY_REGISTRATIONS`).
 
 </details>
 
@@ -304,16 +302,19 @@ Direct **`⚡ P2P`** connections always use **0 server traffic and are permanent
 </details>
 
 <details>
-<summary>Common admin CLI commands</summary>
+<summary>Common admin CLI commands &amp; registration env vars</summary>
 
 ```bash
-npm run admin -- invite create --count 3 --tier free --note "for friend"   # --tier: free|pro|ultra|admin
-npm run admin -- invite create --count 1 --tier pro --note "pro member"
-npm run admin -- invite list
-npm run admin -- invite revoke INV-XXXX-XXXX
+# List registered users, roles, and quota tiers
 npm run admin -- users
+
+# Update a user's quota tier / admin role (free | pro | ultra | admin)
 npm run admin -- user tier <username-or-id> <free|pro|ultra|admin>
 ```
+
+Registration &amp; bootstrap environment variables (add to `.env` and restart):
+- `MAX_DAILY_REGISTRATIONS=20`: Server-side daily cap on new self-registered accounts (default `20`, set `0` for unlimited).
+- `ADMIN_BOOTSTRAP_TOKEN`: Optional secret required to register the first Admin account on a brand-new server; when unset, the first registered user automatically becomes Admin.
 
 </details>
 
@@ -331,8 +332,8 @@ git clone https://github.com/RainbowLion0320/AllinOne.git
 cd AllinOne
 npm install
 npm run build
-npm run admin -- invite create --count 1 --admin --note "dev"
 npm run start:relay
+# Open http://127.0.0.1:8787 and register the first account (automatically becomes Admin)
 # In a second terminal:
 npm run dev:desktop
 ```

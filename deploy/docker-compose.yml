@@ -34,6 +34,8 @@ services:
       # 请在同目录创建 .env 文件或直接替换下面的密钥（勿提交到 Git）
       JWT_SECRET: ${JWT_SECRET:?请设置至少 16 位随机 JWT_SECRET（可用 openssl rand -hex 32 生成）}
       ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
+      # 开放注册每日上限（默认 20，防止暴力注册；设 0 为不限制）
+      MAX_DAILY_REGISTRATIONS: ${MAX_DAILY_REGISTRATIONS:-20}
       PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       TRUST_PROXY: ${TRUST_PROXY:-private}

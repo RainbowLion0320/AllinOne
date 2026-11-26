@@ -95,19 +95,15 @@
 ## 🚀 快速开始
 
 > [!TIP]
-> **公开体验邀请码（一码一人，先到先得）**
+> **公开体验节点（开放自助注册）**
 >
-> 想先直接体验？打开下方网页端或客户端，服务器地址填入 **`https://123.206.218.214/dsh/`**（正规 Let's Encrypt HTTPS + 强制零知识 `AES-256-GCM` 端到端加密，中转服务器无法查看你的任何对话、代码与文件），任选以下一个邀请码注册即可：
+> 想先直接体验？打开下方网页端或客户端，服务器地址填入 **`https://123.206.218.214/dsh/`**（正规 Let's Encrypt HTTPS + 强制零知识 `AES-256-GCM` 端到端加密，中转服务器无法查看你的任何对话、代码与文件），**开放注册，直接创建账号即可使用**。
 >
-> | 邀请码 1 | 邀请码 2 | 邀请码 3 | 邀请码 4 | 邀请码 5 |
-> | :---: | :---: | :---: | :---: | :---: |
-> | `INV-KXRR-6BNB` | `INV-DCMM-3WFY` | `INV-AFCC-SX2F` | `INV-NUER-YGDK` | `INV-3HXE-UGEK` |
->
-> 如已被领完，可按下方 [一键私有化部署](#-一键私有化部署docker) 1 分钟拥有独立私有中转，或提 Issue 留言获取新码。
+> 为防止恶意批量注册，服务端默认内置每日新注册上限 **20 个账号/天**（`MAX_DAILY_REGISTRATIONS=20`）；若当日名额已满，次日自动重置，也可按下方 [一键私有化部署](#-一键私有化部署docker) 1 分钟拥有独立私有中转。
 
 ### 3 步完成首次连接
 
-1. **电脑端安装登录**：在需要被远程操控的电脑上安装桌面端（或运行终端一行脚本），填入服务器地址并用邀请码注册 / 登录，自动绑定电脑并在托盘常驻。
+1. **电脑端安装登录**：在需要被远程操控的电脑上安装桌面端（或运行终端一行脚本），填入服务器地址并直接注册 / 登录账号，自动绑定电脑并在托盘常驻。
 2. **手机端打开登录**：扫码打开网页端（iOS 可「添加到主屏幕」）或安装 Android APK，登录**同一账号**即可看到名下所有在线电脑。
 3. **同步 E2EE 密钥**：首次使用新手机时，扫描电脑端离线二维码或核对 **6 位安全码**完成零知识密钥授权，立即开始加密续聊。
 
@@ -172,7 +168,7 @@ All in One 从协议层设计为 **六道零知识纵深防御**，即使中转�
 | **3. 零知识设备授权** | 离线二维码扫码 **或** `ECDH P-256` + `HKDF-SHA256` + **6 位安全码（SAS）** | 异地免扫码同步密钥时，双方独立派生 6 位安全码防中间人攻击，控制面全程盲转发 |
 | **4. 零公网开端口** | 电脑端仅发起**出站 WSS** 控制连接与 **STUN UDP 打洞**，拒绝公网直连本机监听端口 | 无需配置路由器端口转发或内网穿透，本机零暴露公网端口 |
 | **5. 本机硬件级密钥保护** | macOS Keychain / Windows DPAPI（Electron `safeStorage`） | 256-bit 密钥加密存储于系统保险库，不以明文落盘 |
-| **6. 账号与毫秒级设备吊销** | 一次性邀请码 + 可选邮箱 2FA + 一次性 WS Ticket + `client.revoked` 实时踢出 | 踢出异常终端时控制面毫秒级通知 PC 桥接器立刻销毁对应 WebRTC P2P 通道（38 项自动化安全与 P2P/TURN 冒烟测试持续覆盖） |
+| **6. 账号防护与毫秒级设备吊销** | 原子每日注册上限（默认 20/天）+ 可选 `ADMIN_BOOTSTRAP_TOKEN` + 可选邮箱 2FA + 一次性 WS Ticket + `client.revoked` 实时踢出 | 防止开放注册被批量滥用；踢出异常终端时控制面毫秒级通知 PC 桥接器立刻销毁对应 WebRTC P2P 通道（38 项自动化安全与 P2P/TURN 冒烟测试持续覆盖） |
 
 ### 架构概览
 
@@ -217,7 +213,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 - **三种接入模式任选**：① 自有域名 + Caddy 自动申请免费 Let's Encrypt HTTPS 证书（推荐） · ② **纯公网 IP + Let's Encrypt 正规 HTTPS 证书**（免域名） · ③ 仅启动控制面容器（不占 80/443，适配已有 Nginx / 宝塔 / 1Panel / Cloudflare Tunnel）。
 - **内置无状态 STUN + 可选加密 TURN**：容器默认映射 **`UDP 3478`** 端口提供自建 RFC 5389 STUN 服务（请在云厂商防火墙/安全组放行 `UDP 3478`），常规 **`⚡ P2P`** 直连 0 流量永久不限；如需穿透双对称 NAT，可在 `.env` 中按需启用自建 `coturn`（支持 4 档月配额）或免费 1 TB/月 Cloudflare Realtime TURN。
 - **零手动填密钥**：自动生成 256-bit 随机 `JWT_SECRET`（权限 `600`），可选引导配置免费邮箱 2FA（QQ / 163 / Gmail SMTP）。
-- **开箱即出邀请码**：健康检查通过后自动生成首个管理员一次性邀请码与注册链接，后续只需追加 `--upgrade` 即可无损升级镜像。
+- **开箱即用、开放注册**：全新服务器首个注册的账号**自动成为管理员**（亦可在 `.env` 中配置 `ADMIN_BOOTSTRAP_TOKEN` 保护首名管理员注册）；后续用户可直接自助注册，服务端内置默认每日注册上限（`MAX_DAILY_REGISTRATIONS=20`，设 `0` 为不限）；后续只需追加 `--upgrade` 即可无损升级镜像。
 
 ```bash
 # 常用非交互参数示例（也可直接用于 cloud-init / 自动化脚本）
@@ -225,7 +221,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --upgrade
 ```
 
-完成注册后，管理员可直接在客户端「**邀请码管理**」中随时签发或作废一次性邀请码，并可通过 **`https://你的服务器/admin`**（或客户端「**设置 → 服务器监控看板**」）按需查看在线用户、电脑桥接、终端连接与服务器资源快照（零额外进程与后台轮询开销）。
+完成注册后，管理员可通过 **`https://你的服务器/admin`**（或客户端「**设置 → 服务器监控看板**」）按需查看在线用户、电脑桥接、终端连接、每日注册统计与服务器资源快照，并统一管理用户与配额等级（`free` / `pro` / `ultra` / `admin`，零额外进程与后台轮询开销）。
 
 <details>
 <summary>手动 Docker Compose 部署（含源码本地构建）</summary>
@@ -237,11 +233,14 @@ cd AllinOne
 
 # 2. 将 deploy/Caddyfile 中的 ai.yourdomain.com 改为你的域名（DNS 已指向本机）
 
-# 3. 创建 deploy/.env，填入 32 位以上随机密钥
+# 3. 创建 deploy/.env，填入 32 位以上随机密钥（按需调整每日注册上限或首名管理员引导口令）
 cat > deploy/.env <<'EOF'
 JWT_SECRET=替换成32位以上随机串
 PUBLIC_RELAY_URL=https://ai.yourdomain.com
 VITE_RELAY_URL=https://ai.yourdomain.com
+MAX_DAILY_REGISTRATIONS=20
+# 可选：保护全新服务器首名管理员注册（未设置时首个注册用户自动成为管理员）
+# ADMIN_BOOTSTRAP_TOKEN=替换成自定义强口令
 EOF
 
 # 4. 直接拉取 ghcr.io 预构建镜像启动（或加 --build 本地源码构建）
@@ -249,9 +248,7 @@ cd deploy
 docker compose --env-file .env pull
 docker compose --env-file .env up -d
 
-# 5. 生成首个管理员邀请码
-docker exec allinone-relay node packages/relay-server/src/admin-cli.js invite create --count 1 --admin --note "owner"
-docker compose restart allinone-relay
+# 5. 访问 https://ai.yourdomain.com 注册首个账号（自动成为管理员），随后可在 /admin 查看监控并管理用户
 ```
 
 </details>
@@ -270,7 +267,7 @@ SMTP_PASS=邮箱设置里生成的SMTP授权码
 SMTP_FROM=All in One <你的邮箱@qq.com>
 ```
 
-> 也可使用 `RESEND_API_KEY` + `RESEND_FROM` 通过 Resend HTTPS API 发送；未配置时自动以用户名 + 密码 + 邀请码模式运行。
+> 也可使用 `RESEND_API_KEY` + `RESEND_FROM` 通过 Resend HTTPS API 发送；未配置时自动以用户名 + 密码自助注册 / 登录模式运行（受 `MAX_DAILY_REGISTRATIONS` 每日上限保护）。
 
 </details>
 
@@ -304,16 +301,19 @@ SMTP_FROM=All in One <你的邮箱@qq.com>
 </details>
 
 <details>
-<summary>常用管理员 CLI 命令</summary>
+<summary>常用管理员 CLI 命令与注册环境变量</summary>
 
 ```bash
-npm run admin -- invite create --count 3 --tier free --note "给朋友"   # --tier 支持 free|pro|ultra|admin
-npm run admin -- invite create --count 1 --tier pro --note "Pro 成员"
-npm run admin -- invite list
-npm run admin -- invite revoke INV-XXXX-XXXX
+# 查看已注册用户、角色与配额等级
 npm run admin -- users
+
+# 调整用户配额等级 / 管理员权限（支持 free | pro | ultra | admin）
 npm run admin -- user tier <username-or-id> <free|pro|ultra|admin>
 ```
+
+常用注册与权限环境变量（写入 `.env` 后重启生效）：
+- `MAX_DAILY_REGISTRATIONS=20`：服务端每日开放注册新账号上限（默认 `20`，设为 `0` 表示不限制）。
+- `ADMIN_BOOTSTRAP_TOKEN`：可选。配置后，全新服务器注册首个管理员账号需提供该引导口令；未设置时，首位注册用户自动成为管理员。
 
 </details>
 
@@ -332,8 +332,7 @@ cd AllinOne
 npm install
 npm run build
 
-# 生成管理员邀请码并启动本地中转服务 (http://127.0.0.1:8787)
-npm run admin -- invite create --count 1 --admin --note "dev"
+# 启动本地中转服务 (http://127.0.0.1:8787)，首次访问直接注册首个账号即自动成为管理员
 npm run start:relay
 
 # 新开终端启动 Electron 桌面端开发模式
