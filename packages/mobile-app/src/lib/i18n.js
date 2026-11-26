@@ -34,7 +34,7 @@ export function loadSavedLang(storage = getDefaultStorage()) {
 }
 
 export function saveLang(lang, storage = getDefaultStorage()) {
-  const normalized = normalizeLang(lang) || 'zh'
+  const normalized = normalizeLang(lang) || 'en'
   activeLangCache = normalized
   try {
     if (storage) storage.setItem(LANG_STORAGE_KEY, normalized)
@@ -69,8 +69,8 @@ export function detectInitialLang(
       return norm
     }
   }
-  activeLangCache = 'zh'
-  return 'zh'
+  activeLangCache = 'en'
+  return 'en'
 }
 
 export function getCurrentLang(storage = getDefaultStorage()) {
@@ -79,12 +79,12 @@ export function getCurrentLang(storage = getDefaultStorage()) {
 }
 
 export function setCurrentLangCache(lang) {
-  activeLangCache = normalizeLang(lang) || 'zh'
+  activeLangCache = normalizeLang(lang) || 'en'
   return activeLangCache
 }
 
 export function bi(lang, zh, en) {
-  return normalizeLang(lang) === 'en' ? en : zh
+  return normalizeLang(lang) === 'zh' ? zh : en
 }
 
 export const MESSAGES = {
@@ -169,9 +169,9 @@ export const MESSAGES = {
 }
 
 export function translate(lang, key, params = null) {
-  const code = normalizeLang(lang) || 'zh'
-  const dict = MESSAGES[code] || MESSAGES.zh
-  let text = dict[key] ?? MESSAGES.zh[key] ?? key
+  const code = normalizeLang(lang) || 'en'
+  const dict = MESSAGES[code] || MESSAGES.en
+  let text = dict[key] ?? MESSAGES.en[key] ?? key
   if (params && typeof params === 'object') {
     for (const [k, v] of Object.entries(params)) {
       text = text.replaceAll(`{${k}}`, String(v ?? ''))

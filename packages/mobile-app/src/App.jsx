@@ -2613,7 +2613,13 @@ export function App() {
         e2eeLocked={e2eeLocked}
         canShowMyQr={Boolean(!e2eeLocked && activeBridgeE2ee.shareableKey)}
         onShowMyQr={openDesktopQrModal}
-        onQuickScan={() => setE2eeModal({ open: true, tab: 'import', autoOpenScanner: true })}
+        onQuickScan={() =>
+          setE2eeModal({
+            open: true,
+            tab: desktopApi ? 'request' : 'import',
+            autoOpenScanner: !desktopApi,
+          })
+        }
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenDeviceSwitcher={() => setDeviceSwitcherOpen(true)}
       />
@@ -3256,23 +3262,11 @@ export function App() {
             onSendBindEmailCode={handleSendBindEmailCode}
             onBindAccountEmail={handleBindAccountEmail}
             onToggleLogin2fa={handleToggleLoginEmail2fa}
-            e2eeStatus={{
-              enabled: activeBridgeE2ee.active,
-              locked: activeBridgeE2ee.locked,
-              keyId: activeBridgeE2ee.shareableKeyId || activeBridgeE2ee.keyId,
-            }}
             turnQuota={turnQuota}
             relayDataSaver={relayDataSaver}
             onToggleRelayDataSaver={() => setRelayDataSaver((v) => !v)}
             smartImageCompress={smartImageCompress}
             onToggleSmartImageCompress={() => setSmartImageCompress((v) => !v)}
-            onOpenE2eeSync={() =>
-              setE2eeModal({
-                open: true,
-                tab: e2eeLocked ? (desktopApi ? 'request' : 'import') : 'auto',
-                autoOpenScanner: false,
-              })
-            }
             onRemoveDevice={handleRemoveDevice}
           />
         )}

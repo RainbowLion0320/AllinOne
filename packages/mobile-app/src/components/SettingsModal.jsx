@@ -12,7 +12,6 @@ import {
   HelpCircle,
   Laptop,
   Loader2,
-  Lock,
   LogOut,
   Mail,
   Moon,
@@ -33,7 +32,6 @@ import {
 } from 'lucide-react'
 import { clearSessionCache, formatBytesCompact, getSessionCacheStats } from '../lib/sessionCache.js'
 import { clearE2eeMediaCache, getPersistedMediaCacheStats } from '../lib/e2eeMedia.js'
-import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { useI18n } from '../lib/i18n.jsx'
 import { translate } from '../lib/i18n.js'
 import { RELEASES_URL, REPO_URL } from '../lib/clientHelpers.js'
@@ -161,13 +159,11 @@ export function SettingsModal({
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
   onToggleLogin2fa = null,
-  e2eeStatus = null,
   turnQuota = null,
   relayDataSaver = true,
   onToggleRelayDataSaver = null,
   smartImageCompress = true,
   onToggleSmartImageCompress = null,
-  onOpenE2eeSync = null,
   onRemoveDevice = null,
 }) {
   const { lang, setLang, bi, t } = useI18n()
@@ -640,45 +636,6 @@ export function SettingsModal({
                     </div>
                   )}
                 </div>
-              )}
-
-              {/* End-to-End Encryption */}
-              {activeDevice && onOpenE2eeSync && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose()
-                    onOpenE2eeSync()
-                  }}
-                  className="flex w-full items-center justify-between gap-2 border-t border-slate-100 px-3.5 py-2.5 text-left transition hover:bg-slate-50/80 dark:border-slate-800 dark:hover:bg-slate-800/50"
-                >
-                  <div className="flex min-w-0 items-center gap-2 text-xs text-slate-700 dark:text-slate-200">
-                    <Lock
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        e2eeStatus?.locked
-                          ? 'text-amber-500'
-                          : e2eeStatus?.enabled
-                            ? 'text-emerald-500'
-                            : 'text-slate-400'
-                      }`}
-                    />
-                    <span className="truncate">{bi('端到端加密', 'End-to-End Encryption')}</span>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {e2eeStatus?.locked ? (
-                      <span className="rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] font-semibold text-amber-600 dark:text-amber-400">
-                        {bi('需同步密钥', 'Sync Key')}
-                      </span>
-                    ) : e2eeStatus?.enabled || e2eeStatus?.keyId ? (
-                      <span className="rounded-md bg-emerald-500/12 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                        {formatE2eeFingerprint(e2eeStatus.keyId).slice(0, 9) || 'AES-256'}
-                      </span>
-                    ) : (
-                      <span className="text-[11px] text-slate-400">{bi('扫码同步', 'Sync')}</span>
-                    )}
-                    <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                </button>
               )}
 
               {/* Email */}

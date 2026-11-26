@@ -3019,6 +3019,8 @@ async function main() {
       const langStorage = { getItem: (k) => (langMem.has(k) ? langMem.get(k) : null), setItem: (k, v) => langMem.set(k, String(v)) }
       assert.equal(detectInitialLang(langStorage, { language: 'en-US' }), 'en')
       assert.equal(detectInitialLang(langStorage, { language: 'zh-Hans-CN' }), 'zh')
+      assert.equal(detectInitialLang(langStorage, { language: 'ja-JP' }), 'en')
+      assert.equal(detectInitialLang(langStorage, {}), 'en')
       saveLang('en', langStorage)
       assert.equal(langStorage.getItem(LANG_STORAGE_KEY), 'en')
       assert.equal(loadSavedLang(langStorage), 'en')
@@ -4230,7 +4232,7 @@ async function main() {
       assert.ok(sandboxHtml.includes("connect-src 'none'") && sandboxHtml.includes("form-action 'none'"))
 
       // 17i. Header workspace isolation (no draft fallback when session open), adapter workspace fields & effort slider guard
-      const appSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/App.jsx'), 'utf8')
+      const appSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/App.jsx'), 'utf8').replace(/\r\n/g, '\n')
       assert.ok(
         appSrc.includes("activeSession\n    ? (activeSession.workspace || '')"),
         'Header currentWorkspaceLabel must strictly read activeSession.workspace when open without falling back to draft workspace',

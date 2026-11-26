@@ -48,7 +48,15 @@
       const saved = localStorage.getItem(LANG_KEY)
       if (saved === 'en' || saved === 'zh') return saved
     } catch {}
-    return String(navigator.language || '').toLowerCase().startsWith('en') ? 'en' : 'zh'
+    const langs = Array.isArray(navigator.languages) && navigator.languages.length
+      ? navigator.languages
+      : [navigator.language]
+    for (const c of langs) {
+      const s = String(c || '').trim().toLowerCase()
+      if (s.startsWith('zh')) return 'zh'
+      if (s.startsWith('en')) return 'en'
+    }
+    return 'en'
   }
 
   function loadInitialTheme() {

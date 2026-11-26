@@ -105,14 +105,14 @@ function loadSavedLangPref() {
     }
   } catch {}
   try {
-    return normalizeLang(app.getLocale()) || 'zh'
+    return normalizeLang(app.getLocale()) || 'en'
   } catch {
-    return 'zh'
+    return 'en'
   }
 }
 
 function saveLangPref(lang) {
-  const norm = normalizeLang(lang) || 'zh'
+  const norm = normalizeLang(lang) || 'en'
   try {
     const dir = app.getPath('userData')
     mkdirSync(dir, { recursive: true })
@@ -145,9 +145,9 @@ function loadOrCreateDesktopClientUid() {
   }
 }
 
-let currentLang = 'zh'
+let currentLang = 'en'
 function bi(zh, en) {
-  return currentLang === 'en' ? en : zh
+  return currentLang === 'zh' ? zh : en
 }
 
 function getAutoLaunchEnabled() {
