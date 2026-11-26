@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
@@ -8,6 +9,7 @@ import {
   Folder,
   FolderOpen,
   Monitor,
+  MoreHorizontal,
   Plus,
   QrCode,
   RefreshCw,
@@ -19,6 +21,7 @@ import {
   X,
 } from 'lucide-react'
 import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { computeSidebarVendorLayout } from '../lib/sidebarVendors.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang, translate } from '../lib/i18n.js'
 
@@ -26,10 +29,10 @@ function getFilterTabs(lang) {
   return [
     { id: 'all', label: translate(lang, 'common.all'), color: '#4D6BFE' },
     { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
-    { id: 'codex', label: 'Codex', color: '#10A37F' },
+    { id: 'codex', label: 'Codex', color: '#6366F1' },
     { id: 'claude', label: 'Claude', color: '#D97757' },
-    { id: 'antigravity', label: 'Antigravity', color: '#7C5CFF' },
-    { id: 'workbuddy', label: 'WorkBuddy', color: '#00B8D9' },
+    { id: 'antigravity', label: 'Antigravity', color: '#3186FF' },
+    { id: 'workbuddy', label: 'WorkBuddy', color: '#06C798' },
   ]
 }
 
@@ -257,6 +260,8 @@ export function SidebarDrawer({
   const [searchOpen, setSearchOpen] = useState(false)
   const [search, setSearch] = useState('')
   const searchInputRef = useRef(null)
+  const [moreVendorsOpen, setMoreVendorsOpen] = useState(false)
+  const moreVendorsRef = useRef(null)
   // Map of projectKey -> boolean (explicitly expanded or collapsed by user)
   const [expandedMap, setExpandedMap] = useState({})
 
@@ -269,6 +274,33 @@ export function SidebarDrawer({
       requestAnimationFrame(() => searchInputRef.current?.focus())
     }
   }, [searchOpen])
+
+  useEffect(() => {
+    if (!open) setMoreVendorsOpen(false)
+  }, [open])
+
+  useEffect(() => {
+    if (!moreVendorsOpen) return undefined
+    const handlePointerDown = (e) => {
+      if (moreVendorsRef.current && !moreVendorsRef.current.contains(e.target)) {
+        setMoreVendorsOpen(false)
+      }
+    }
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setMoreVendorsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('touchstart', handlePointerDown, { passive: true })
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('touchstart', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [moreVendorsOpen])
 
   const closeSearch = () => {
     setSearch('')
@@ -289,32 +321,36 @@ export function SidebarDrawer({
     })
   }, [sessions, filterApp, search])
 
-  const { filterTabs, soleQuotaTab } = useMemo(() => {
+  const { showFilterBar, allTab, visibleVendors, overflowVendors, soleQuotaTab } = useMemo(() => {
     const allTabs = getFilterTabs(lang)
-    const allTab = allTabs[0]
-    const sessionApps = new Set()
-    for (const s of sessions) {
-      if (s?.app) sessionApps.add(s.app)
-    }
-    const vendorTabs = allTabs.slice(1).filter((tab) => {
-      if (sessionApps.has(tab.id)) return true
-      const info = appsStatus.find((a) => a?.app === tab.id)
-      return Boolean(info?.available || info?.writable)
+    const layout = computeSidebarVendorLayout({
+      vendorTabs: allTabs.slice(1),
+      sessions,
+      appsStatus,
     })
-    if (vendorTabs.length >= 2) {
-      return { filterTabs: [allTab, ...vendorTabs], soleQuotaTab: null }
+    return {
+      showFilterBar: layout.showBar,
+      allTab: allTabs[0],
+      visibleVendors: layout.visibleVendors,
+      overflowVendors: layout.overflowVendors,
+      soleQuotaTab: layout.soleQuotaTab,
     }
-    if (vendorTabs.length === 1) {
-      const sole = vendorTabs[0]
-      const info = appsStatus.find((a) => a?.app === sole.id)
-      const hasQuota =
-        info?.quota &&
-        typeof info.quota.remainingPercent === 'number' &&
-        Number.isFinite(info.quota.remainingPercent)
-      return { filterTabs: [], soleQuotaTab: hasQuota ? { tab: sole, quota: info.quota } : null }
-    }
-    return { filterTabs: [], soleQuotaTab: null }
   }, [lang, sessions, appsStatus])
+
+  useEffect(() => {
+    if (overflowVendors.length === 0 && moreVendorsOpen) {
+      setMoreVendorsOpen(false)
+    }
+  }, [overflowVendors.length, moreVendorsOpen])
+
+  const activeOverflowVendor = useMemo(
+    () => overflowVendors.find((v) => v.id === filterApp) || null,
+    [overflowVendors, filterApp],
+  )
+  const hasRunningOverflow = useMemo(
+    () => overflowVendors.some((v) => v.hasRunning),
+    [overflowVendors],
+  )
   const projectGroups = useMemo(() => groupByProject(filtered, lang), [filtered, lang])
   const timeGroups = useMemo(() => groupByTime(filtered, lang), [filtered, lang])
 
@@ -501,94 +537,253 @@ export function SidebarDrawer({
           </div>
         )}
 
-        {/* Dynamic Vendor Filter & Subscription Quota Bar (only shows detected or active tools) */}
-        {filterTabs.length > 0 ? (
-          <div className="px-4 pb-2">
-            <div
-              className="grid gap-1.5"
-              style={{ gridTemplateColumns: `repeat(${filterTabs.length}, minmax(0, 1fr))` }}
-            >
-              {filterTabs.map((tab) => {
-                const active = filterApp === tab.id
-                const appInfo = tab.id !== 'all' ? appsStatus.find((a) => a?.app === tab.id) : null
-                const quota =
-                  appInfo?.quota &&
-                  typeof appInfo.quota.remainingPercent === 'number' &&
-                  Number.isFinite(appInfo.quota.remainingPercent)
-                    ? appInfo.quota
-                    : null
-                const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
-                const tone = pct !== null ? getQuotaTone(pct) : null
-                const tooltip = formatQuotaTooltip(tab.label, quota, lang)
+        {/* Dynamic Vendor Filter & Subscription Quota Bar (smart-sorted top 3 + "..." overflow switcher) */}
+        {showFilterBar ? (() => {
+          const inlineTabs = [allTab, ...visibleVendors]
+          const totalCols = inlineTabs.length + (overflowVendors.length > 0 ? 1 : 0)
+          const overflowNames = overflowVendors.map((v) => v.label).join(lang === 'zh' ? '、' : ', ')
+          const activeOverflowQuota = activeOverflowVendor?.quota || null
+          const activeOverflowPct = activeOverflowQuota
+            ? Math.max(0, Math.min(100, Math.round(activeOverflowQuota.remainingPercent)))
+            : null
+          const activeOverflowTone = activeOverflowPct !== null ? getQuotaTone(activeOverflowPct) : null
+          const moreTooltip = activeOverflowVendor
+            ? `${formatQuotaTooltip(activeOverflowVendor.label, activeOverflowQuota, lang)} · ${bi('点击切换更多厂商', 'Click to switch more tools')}`
+            : bi(`更多厂商（${overflowNames}）`, `More tools (${overflowNames})`)
 
-                // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
-                if (pct !== null && tone) {
+          return (
+            <div ref={moreVendorsRef} className="relative px-4 pb-2">
+              <div
+                className="grid gap-1.5"
+                style={{ gridTemplateColumns: `repeat(${totalCols}, minmax(0, 1fr))` }}
+              >
+                {inlineTabs.map((tab) => {
+                  const active = filterApp === tab.id
+                  const quota = tab.id !== 'all' ? tab.quota || null : null
+                  const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent))) : null
+                  const tone = pct !== null ? getQuotaTone(pct) : null
+                  const tooltip = formatQuotaTooltip(tab.label, quota, lang)
+
+                  // Tiles WITH subscription quota: the rounded-square border itself is the clockwise progress ring!
+                  if (pct !== null && tone) {
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        title={tooltip}
+                        aria-label={tooltip}
+                        onClick={() => {
+                          setMoreVendorsOpen(false)
+                          setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
+                        }}
+                        className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
+                          active ? 'shadow-xs' : ''
+                        }`}
+                        style={{
+                          background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
+                        }}
+                      >
+                        <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
+                          {active && (
+                            <span
+                              aria-hidden="true"
+                              className="pointer-events-none absolute inset-0"
+                              style={{ backgroundColor: `${tab.color}24` }}
+                            />
+                          )}
+                          <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
+                            <VendorIcon app={tab.id} size={16} />
+                            <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
+                              {pct}%
+                            </span>
+                          </span>
+                        </span>
+                      </button>
+                    )
+                  }
+
                   return (
                     <button
                       key={tab.id}
                       type="button"
                       title={tooltip}
                       aria-label={tooltip}
-                      onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                      className={`group relative h-11 rounded-xl p-[2px] transition active:scale-95 ${
-                        active ? 'shadow-xs' : ''
+                      onClick={() => {
+                        setMoreVendorsOpen(false)
+                        setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
+                      }}
+                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                        active
+                          ? 'border-transparent shadow-xs'
+                          : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
                       }`}
+                      style={
+                        active
+                          ? {
+                              backgroundColor: `${tab.color}1F`,
+                              borderColor: `${tab.color}66`,
+                              color: tab.color,
+                            }
+                          : undefined
+                      }
+                    >
+                      <VendorIcon
+                        app={tab.id}
+                        size={tab.id === 'all' ? 17 : 19}
+                        mono={tab.id === 'all'}
+                      />
+                    </button>
+                  )
+                })}
+
+                {overflowVendors.length > 0 && (
+                  activeOverflowVendor && activeOverflowPct !== null && activeOverflowTone ? (
+                    <button
+                      type="button"
+                      title={moreTooltip}
+                      aria-label={moreTooltip}
+                      aria-haspopup="menu"
+                      aria-expanded={moreVendorsOpen}
+                      onClick={() => setMoreVendorsOpen((v) => !v)}
+                      className="group relative h-11 rounded-xl p-[2px] shadow-xs transition active:scale-95"
                       style={{
-                        background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
+                        background: `conic-gradient(from 0deg, ${activeOverflowTone.ring} 0% ${activeOverflowPct}%, var(--quota-track) ${activeOverflowPct}% 100%)`,
                       }}
                     >
                       <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
-                        {active && (
-                          <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute inset-0"
-                            style={{ backgroundColor: `${tab.color}24` }}
-                          />
-                        )}
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute inset-0"
+                          style={{ backgroundColor: `${activeOverflowVendor.color}24` }}
+                        />
                         <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                          <VendorIcon app={tab.id} size={16} />
-                          <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
-                            {pct}%
+                          <VendorIcon app={activeOverflowVendor.id} size={16} />
+                          <span className={`text-[10px] leading-none font-semibold tabular-nums ${activeOverflowTone.text}`}>
+                            {activeOverflowPct}%
                           </span>
+                        </span>
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute top-0.5 right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-slate-900/12 text-slate-600 dark:bg-white/15 dark:text-slate-200"
+                        >
+                          <MoreHorizontal className="h-2.5 w-2.5" />
                         </span>
                       </span>
                     </button>
+                  ) : activeOverflowVendor ? (
+                    <button
+                      type="button"
+                      title={moreTooltip}
+                      aria-label={moreTooltip}
+                      aria-haspopup="menu"
+                      aria-expanded={moreVendorsOpen}
+                      onClick={() => setMoreVendorsOpen((v) => !v)}
+                      className="relative flex h-11 flex-col items-center justify-center rounded-xl border shadow-xs transition active:scale-95"
+                      style={{
+                        backgroundColor: `${activeOverflowVendor.color}1F`,
+                        borderColor: `${activeOverflowVendor.color}66`,
+                        color: activeOverflowVendor.color,
+                      }}
+                    >
+                      <VendorIcon app={activeOverflowVendor.id} size={19} />
+                      <span
+                        aria-hidden="true"
+                        className="pointer-events-none absolute top-0.5 right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-slate-900/12 text-slate-600 dark:bg-white/15 dark:text-slate-200"
+                      >
+                        <MoreHorizontal className="h-2.5 w-2.5" />
+                      </span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      title={moreTooltip}
+                      aria-label={moreTooltip}
+                      aria-haspopup="menu"
+                      aria-expanded={moreVendorsOpen}
+                      onClick={() => setMoreVendorsOpen((v) => !v)}
+                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
+                        moreVendorsOpen
+                          ? 'border-[#4D6BFE]/50 bg-[#4D6BFE]/12 text-[#4D6BFE] shadow-xs dark:border-[#4D6BFE]/60 dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
+                          : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
+                      }`}
+                    >
+                      <MoreHorizontal className="h-4.5 w-4.5" />
+                      {hasRunningOverflow && (
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse-dot"
+                        />
+                      )}
+                    </button>
                   )
-                }
+                )}
+              </div>
 
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    title={tooltip}
-                    aria-label={tooltip}
-                    onClick={() => setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)}
-                    className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
-                      active
-                        ? 'border-transparent shadow-xs'
-                        : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
-                    }`}
-                    style={
-                      active
-                        ? {
-                            backgroundColor: `${tab.color}1F`,
-                            borderColor: `${tab.color}66`,
-                            color: tab.color,
-                          }
-                        : undefined
-                    }
-                  >
-                    <VendorIcon
-                      app={tab.id}
-                      size={tab.id === 'all' ? 17 : 19}
-                      mono={tab.id === 'all'}
-                    />
-                  </button>
-                )
-              })}
+              {moreVendorsOpen && overflowVendors.length > 0 && (
+                <div
+                  role="menu"
+                  aria-label={bi('更多厂商', 'More tools')}
+                  className="absolute top-full right-4 z-30 mt-1 w-56 rounded-2xl border border-slate-200/90 bg-white/98 p-1.5 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#232631]/98"
+                >
+                  <div className="px-2.5 pt-1 pb-1 text-[10.5px] font-medium text-slate-400 dark:text-slate-500">
+                    {bi('更多厂商', 'More tools')}
+                  </div>
+                  <div className="space-y-0.5">
+                    {overflowVendors.map((tab) => {
+                      const active = filterApp === tab.id
+                      const pct = tab.quota
+                        ? Math.max(0, Math.min(100, Math.round(tab.quota.remainingPercent)))
+                        : null
+                      const tone = pct !== null ? getQuotaTone(pct) : null
+                      const tooltip = formatQuotaTooltip(tab.label, tab.quota, lang)
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={active}
+                          title={tooltip}
+                          onClick={() => {
+                            setFilterApp(active ? 'all' : tab.id)
+                            setMoreVendorsOpen(false)
+                          }}
+                          className={`flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs transition ${
+                            active
+                              ? 'font-semibold text-slate-900 dark:text-white'
+                              : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800/80'
+                          }`}
+                          style={active ? { backgroundColor: `${tab.color}1A` } : undefined}
+                        >
+                          <VendorIcon app={tab.id} size={17} />
+                          <span className="min-w-0 flex-1 truncate">{tab.label}</span>
+                          {tab.hasRunning && (
+                            <span
+                              title={bi('运行中', 'Running')}
+                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
+                            />
+                          )}
+                          {pct !== null && tone && (
+                            <span className={`shrink-0 text-[10.5px] font-semibold tabular-nums ${tone.text}`}>
+                              {pct}%
+                            </span>
+                          )}
+                          {tab.sessionCount > 0 && (
+                            <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                              {tab.sessionCount}
+                            </span>
+                          )}
+                          {active && (
+                            <Check className="h-3.5 w-3.5 shrink-0" style={{ color: tab.color }} />
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
-        ) : soleQuotaTab ? (() => {
+          )
+        })() : soleQuotaTab ? (() => {
           const pct = Math.max(0, Math.min(100, Math.round(soleQuotaTab.quota.remainingPercent)))
           const tone = getQuotaTone(pct)
           const tooltip = formatQuotaTooltip(soleQuotaTab.tab.label, soleQuotaTab.quota, lang)

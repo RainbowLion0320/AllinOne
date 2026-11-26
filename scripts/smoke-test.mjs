@@ -78,6 +78,7 @@ import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
 import {
   WorkBuddyAdapter,
+  cleanWorkbuddyUserText,
   hasStandaloneCodebuddyAuth,
   isSafeWorkbuddyAuthUrl,
   parseWorkbuddyJsonlMessages,
@@ -116,6 +117,7 @@ import {
 } from '../packages/dsh-mobile-hub/src/adapters/claude.js'
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
 import { extractDeliverableRefsFromMessage } from '../packages/mobile-app/src/lib/deliverableFiles.js'
+import { computeSidebarVendorLayout } from '../packages/mobile-app/src/lib/sidebarVendors.js'
 import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
 import {
   parseCompositeId as hubParseCompositeId,
@@ -3276,8 +3278,66 @@ async function main() {
       assert.equal(loadLastSessionId('dev1::pc1'), '')
       assert.equal(resolveImageSrc('https://example.com/demo.png'), 'https://example.com/demo.png')
       assert.equal(resolveImageSrc('/tmp/shot.png'), '')
+
+      // 11f. Smart sidebar vendor filter bar (activity-sorted top 3 + "..." overflow from 4th vendor)
+      const allVendorDefs = [
+        { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
+        { id: 'codex', label: 'Codex', color: '#6366F1' },
+        { id: 'claude', label: 'Claude', color: '#D97757' },
+        { id: 'antigravity', label: 'Antigravity', color: '#3186FF' },
+        { id: 'workbuddy', label: 'WorkBuddy', color: '#06C798' },
+      ]
+      const layout5 = computeSidebarVendorLayout({
+        vendorTabs: allVendorDefs,
+        sessions: [
+          { app: 'dsh', updatedAt: 1000 },
+          { app: 'workbuddy', updatedAt: 5000, status: 'running' },
+          { app: 'codex', updatedAt: 4000 },
+          { app: 'antigravity', updatedAt: 3000 },
+          { app: 'claude', updatedAt: 2000 },
+          { app: 'workbuddy', updatedAt: 1500 },
+        ],
+        appsStatus: [
+          { app: 'codex', available: true, writable: true, quota: { remainingPercent: 45 } },
+          { app: 'antigravity', available: true, writable: true, quota: { remainingPercent: 99 } },
+          { app: 'dsh', available: true, writable: true },
+          { app: 'claude', available: true, writable: true },
+          { app: 'workbuddy', available: true, writable: false },
+        ],
+      })
+      assert.equal(layout5.showBar, true)
+      assert.deepEqual(layout5.visibleVendors.map((v) => v.id), ['workbuddy', 'codex', 'antigravity'])
+      assert.deepEqual(layout5.overflowVendors.map((v) => v.id), ['claude', 'dsh'])
+      assert.equal(layout5.visibleVendors[0].sessionCount, 2)
+      assert.equal(layout5.visibleVendors[0].hasRunning, true)
+      assert.equal(layout5.visibleVendors[1].quota.remainingPercent, 45)
+
+      const layout3 = computeSidebarVendorLayout({
+        vendorTabs: allVendorDefs,
+        sessions: [
+          { app: 'claude', updatedAt: 200 },
+          { app: 'codex', updatedAt: 500 },
+        ],
+        appsStatus: [
+          { app: 'workbuddy', available: true, writable: true },
+          { app: 'codex', available: true, writable: true },
+          { app: 'claude', available: true, writable: true },
+        ],
+      })
+      assert.equal(layout3.showBar, true)
+      assert.deepEqual(layout3.visibleVendors.map((v) => v.id), ['codex', 'claude', 'workbuddy'])
+      assert.equal(layout3.overflowVendors.length, 0)
+
+      const layout1 = computeSidebarVendorLayout({
+        vendorTabs: allVendorDefs,
+        sessions: [{ app: 'codex', updatedAt: 100 }],
+        appsStatus: [{ app: 'codex', available: true, writable: true, quota: { remainingPercent: 88 } }],
+      })
+      assert.equal(layout1.showBar, false)
+      assert.equal(layout1.soleQuotaTab?.tab?.id, 'codex')
+      assert.equal(layout1.soleQuotaTab?.quota?.remainingPercent, 88)
     }
-    pass(11, 'Frontend guards (React Hooks, i18n parity, deviceStore LRU, scoped sessionCache & drafts)')
+    pass(11, 'Frontend guards (React Hooks, i18n parity, deviceStore LRU, scoped sessionCache, drafts & smart vendor bar)')
 
     // =========================================================================
     // 12. Deliverable Documents E2EE Download, Security Guards & Sandbox HTML Preview
@@ -4706,6 +4766,18 @@ async function main() {
           assert.equal(stRo.available, true)
           assert.equal(stRo.writable, false)
           assert.equal(stRo.mode, 'readonly')
+
+          // WorkBuddy Desktop XML wrapper cleanup (<system-reminder>, <user_query>, <image_local_path>, <cb_summary>)
+          assert.equal(
+            cleanWorkbuddyUserText(
+              '<system-reminder data-role="user-context">\nOS: win32\n</system-reminder>\n<system-reminder data-role="additional-data">\n<current_time>now</current_time>\n</system-reminder>\n<user_query>给电脑截个屏发给我</user_query>\n<image_local_path>C:\\a.png</image_local_path>',
+            ),
+            '给电脑截个屏发给我',
+          )
+          assert.equal(
+            cleanWorkbuddyUserText('<cb_summary>\nSummary of the conversation so far\n</cb_summary>'),
+            '',
+          )
 
           const parsed = parseWorkbuddyJsonlMessages(wbJsonlPath)
           assert.equal(parsed.messages.length, 2)

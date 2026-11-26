@@ -232,13 +232,27 @@ function extractTextFromBlocks(content) {
       }
       if (b.type === 'thinking' && typeof b.thinking === 'string') return b.thinking
       if (b.type === 'image_blob_ref') {
-        const label = String(b.filename || b.name || '').trim()
+        const label = String(b.original_filename || b.filename || b.name || '').trim()
         return label ? `[图片: ${label}]` : '[图片]'
       }
       return ''
     })
     .filter(Boolean)
     .join('\n')
+}
+
+/**
+ * Strip WorkBuddy Desktop's injected XML wrappers (`<system-reminder>`, `<image_local_path>`,
+ * internal compaction `<cb_summary>`) and unwrap `<user_query>` so user turns display cleanly.
+ */
+export function cleanWorkbuddyUserText(raw) {
+  let text = String(raw || '')
+  if (!text) return ''
+  text = text.replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/gi, '')
+  text = text.replace(/<image_local_path\b[^>]*>[\s\S]*?<\/image_local_path>/gi, '')
+  text = text.replace(/<cb_summary\b[^>]*>[\s\S]*?<\/cb_summary>/gi, '')
+  text = text.replace(/<user_query\b[^>]*>([\s\S]*?)<\/user_query>/gi, '$1')
+  return text.replace(/\n{3,}/g, '\n\n').trim()
 }
 
 function extractToolOutputText(output) {
@@ -486,7 +500,9 @@ export function probeWorkbuddyTranscriptTail(filePath, { now = Date.now(), maxId
         continue
       }
       if (type === 'message') {
-        const txt = extractTextFromBlocks(obj.content).trim()
+        const txt = role === 'user'
+          ? cleanWorkbuddyUserText(extractTextFromBlocks(obj.content))
+          : extractTextFromBlocks(obj.content).trim()
         if (role === 'user') {
           if (txt) {
             signal = 'active'
@@ -528,7 +544,7 @@ export function probeWorkbuddyTranscriptTail(filePath, { now = Date.now(), maxId
         continue
       }
       if (type === 'user' && !obj.isMeta) {
-        const txt = extractTextFromBlocks(obj.message?.content).trim()
+        const txt = cleanWorkbuddyUserText(extractTextFromBlocks(obj.message?.content))
         if (txt) {
           signal = 'active'
           seenSignal = true
@@ -674,7 +690,7 @@ function scanWorkbuddySessionSummary(filePath, fallbackProjectName) {
     if (typeof pdModel === 'string' && pdModel.trim()) model = pdModel.trim()
 
     if (obj.type === 'message' && obj.role === 'user') {
-      const txt = extractTextFromBlocks(obj.content).trim()
+      const txt = cleanWorkbuddyUserText(extractTextFromBlocks(obj.content))
       if (txt && !firstUserText) {
         firstUserText = txt
         if (obj.timestamp) createdAt = toEpochMs(obj.timestamp) || createdAt
@@ -683,7 +699,7 @@ function scanWorkbuddySessionSummary(filePath, fallbackProjectName) {
       const txt = extractTextFromBlocks(obj.content).trim()
       if (txt) lastAssistantText = txt
     } else if (obj.type === 'user' && !obj.isMeta && !obj.isSidechain) {
-      const txt = extractTextFromBlocks(obj.message?.content).trim()
+      const txt = cleanWorkbuddyUserText(extractTextFromBlocks(obj.message?.content))
       if (txt && !firstUserText) {
         firstUserText = txt
         if (obj.timestamp) createdAt = toEpochMs(obj.timestamp) || createdAt
@@ -789,7 +805,7 @@ export function parseWorkbuddyJsonlMessages(filePath) {
 
       // Format 1: WorkBuddy OpenAI-Responses-style JSONL
       if (obj.type === 'message' && obj.role === 'user') {
-        const text = extractTextFromBlocks(obj.content).trim()
+        const text = cleanWorkbuddyUserText(extractTextFromBlocks(obj.content))
         if (!text) continue
         if (!title) title = text.replace(/\s+/g, ' ').slice(0, 56)
         pendingThinking = ''
@@ -879,7 +895,7 @@ export function parseWorkbuddyJsonlMessages(filePath) {
           }
           if (handledToolResult) continue
         }
-        const text = extractTextFromBlocks(content).trim()
+        const text = cleanWorkbuddyUserText(extractTextFromBlocks(content))
         if (!text) continue
         if (!title) title = text.replace(/\s+/g, ' ').slice(0, 56)
         pendingThinking = ''

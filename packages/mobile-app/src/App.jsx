@@ -3253,12 +3253,12 @@ export function App() {
           const needsCli = wbStatus?.setupState === 'needs_cli' || !wbStatus?.cliInstalled
           return (
             <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
-              <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2.5 rounded-2xl border border-[#00B8D9]/30 bg-[#F0FAFC] px-3.5 py-2.5 lg:max-w-3xl dark:border-[#00B8D9]/30 dark:bg-[#17232A]">
+              <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2.5 rounded-2xl border border-[#06C798]/30 bg-[#EEFBF7] px-3.5 py-2.5 lg:max-w-3xl dark:border-[#06C798]/30 dark:bg-[#142522]">
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   <span
                     className={`h-2 w-2 shrink-0 rounded-full ${
                       isWorking || isAwaiting || activeSession?.syncState?.externalRunning
-                        ? 'bg-[#00B8D9] animate-pulse-dot'
+                        ? 'bg-[#06C798] animate-pulse-dot'
                         : 'bg-amber-400'
                     }`}
                   />
@@ -3280,7 +3280,7 @@ export function App() {
                       href={workbuddySetup.authUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 rounded-full bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#00A2C0] active:scale-95"
+                      className="inline-flex items-center gap-1.5 rounded-full bg-[#06C798] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#05B187] active:scale-95"
                     >
                       <ExternalLink className="h-3.5 w-3.5" />
                       <span>{bi('打开官方授权页', 'Open Sign-In Page')}</span>
@@ -3291,7 +3291,7 @@ export function App() {
                         type="button"
                         disabled={isWorking || !bridgeOnline || connState !== 'connected'}
                         onClick={() => handleSetupWorkbuddy('internal')}
-                        className="inline-flex items-center gap-1.5 rounded-full bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#00A2C0] active:scale-95 disabled:opacity-60"
+                        className="inline-flex items-center gap-1.5 rounded-full bg-[#06C798] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#05B187] active:scale-95 disabled:opacity-60"
                       >
                         {isWorking ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />

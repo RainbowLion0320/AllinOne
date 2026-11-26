@@ -415,7 +415,7 @@ export function NewChatModal({
             </div>
 
             {app === 'workbuddy' && !selectedAppStatus?.writable && onSetupWorkbuddy && (
-              <div className="rounded-2xl border border-[#00B8D9]/35 bg-[#F0FAFC] p-3 text-xs dark:border-[#00B8D9]/30 dark:bg-[#17232A]">
+              <div className="rounded-2xl border border-[#06C798]/35 bg-[#EEFBF7] p-3 text-xs dark:border-[#06C798]/30 dark:bg-[#142522]">
                 <div className="mb-2 text-[11.5px] leading-relaxed text-slate-700 dark:text-slate-200">
                   {workbuddySetup?.status === 'working'
                     ? bi('正在后台自动安装官方原生引擎并拉起登录页，全程无需命令行…', 'Installing official WorkBuddy CLI & launching sign-in…')
@@ -429,7 +429,7 @@ export function NewChatModal({
                       href={workbuddySetup.authUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#00A2C0]"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#06C798] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#05B187]"
                     >
                       <ExternalLink className="h-3.5 w-3.5" />
                       <span>{bi('打开官方授权页', 'Open Sign-In Page')}</span>
@@ -440,7 +440,7 @@ export function NewChatModal({
                         type="button"
                         disabled={workbuddySetup?.status === 'working'}
                         onClick={() => onSetupWorkbuddy('internal')}
-                        className="inline-flex items-center gap-1.5 rounded-xl bg-[#00B8D9] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#00A2C0] disabled:opacity-60"
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[#06C798] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#05B187] disabled:opacity-60"
                       >
                         {workbuddySetup?.status === 'working' ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
