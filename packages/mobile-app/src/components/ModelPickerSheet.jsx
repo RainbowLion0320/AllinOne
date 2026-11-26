@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { APP_META } from '@allinone/shared'
 import { Check, Loader2, Sparkles, X } from 'lucide-react'
-import { EffortSignalIcon, VendorBadge, formatEffortLabel, getEffortMeta } from './VendorIcon.jsx'
+import { VendorBadge, formatEffortLabel, getEffortMeta } from './VendorIcon.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 
 function ReasoningEffortSlider({ efforts = [], value = '', lang = 'zh', bi, onChange }) {
@@ -15,7 +15,7 @@ function ReasoningEffortSlider({ efforts = [], value = '', lang = 'zh', bi, onCh
   const rawIdx = efforts.indexOf(value)
   const activeIdx = rawIdx >= 0 ? rawIdx : 0
   const activeEffort = efforts[activeIdx] || ''
-  const meta = getEffortMeta(activeEffort, lang)
+  const meta = getEffortMeta(activeEffort)
   const isMuted = meta.level === 0
 
   const snappedRatio = maxIdx > 0 ? activeIdx / maxIdx : 1
@@ -101,20 +101,10 @@ function ReasoningEffortSlider({ efforts = [], value = '', lang = 'zh', bi, onCh
     : `linear-gradient(90deg, #38BDF8 0%, #4D6BFE 55%, ${meta.color} 100%)`
 
   return (
-    <div className="mb-3 rounded-2xl border border-slate-200/80 bg-white/95 px-3.5 pt-3 pb-2.5 shadow-2xs dark:border-slate-700/75 dark:bg-[#222530]/95">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
-          <Sparkles className="h-3.5 w-3.5 shrink-0" style={{ color: meta.color }} />
-          <span>{bi('推理强度', 'Reasoning Effort')}</span>
-        </div>
-        <div
-          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition-colors ${meta.pillClass}`}
-        >
-          <EffortSignalIcon effort={activeEffort} className="shrink-0" />
-          <span>{formatEffortLabel(activeEffort, lang)}</span>
-          <span className="opacity-45">·</span>
-          <span className="font-medium opacity-85">{meta.hint}</span>
-        </div>
+    <div className="mb-3 rounded-2xl border border-slate-200/80 bg-white/95 px-3.5 pt-2.5 pb-2 shadow-2xs dark:border-slate-700/75 dark:bg-[#222530]/95">
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
+        <Sparkles className="h-3.5 w-3.5 shrink-0" style={{ color: meta.color }} />
+        <span>{bi('推理强度', 'Reasoning Effort')}</span>
       </div>
 
       {/* Interactive Slider Track */}
