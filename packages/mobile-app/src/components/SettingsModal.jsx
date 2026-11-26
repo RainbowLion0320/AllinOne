@@ -148,6 +148,8 @@ export function SettingsModal({
   onToggleDesktopAutoLaunch = null,
   onOpenDesktopLog = null,
   updateState = null,
+  otaInfo = null,
+  onResetOtaBundle = null,
   onCheckUpdate = null,
   onDownloadUpdate = null,
   onCancelUpdate = null,
@@ -207,10 +209,8 @@ export function SettingsModal({
       setDisable2faBusy(false)
       setDisable2faError('')
       setConfirmLogout(false)
-      return
     }
-    onRefreshClientSessions?.().catch(() => {})
-  }, [open, onRefreshClientSessions])
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -246,7 +246,7 @@ export function SettingsModal({
   const appVersion =
     desktopApi?.version ||
     (typeof __APP_VERSION__ === 'string' && __APP_VERSION__) ||
-    '1.0.29'
+    ''
 
   const displayUser = activeDevice?.username
     ? `@${activeDevice.username}`
@@ -1212,8 +1212,13 @@ export function SettingsModal({
                   <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-white">
                     <span>All in One</span>
                     <span className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                      v{appVersion}
+                      {appVersion ? `v${appVersion}` : 'dev'}
                     </span>
+                    {otaInfo?.isOtaActive && otaInfo?.nativeVersion && (
+                      <span className="rounded-md bg-[#4D6BFE]/10 px-1.5 py-0.5 font-mono text-[9.5px] font-semibold text-[#4D6BFE]">
+                        {bi(`内置 v${otaInfo.nativeVersion}`, `APK v${otaInfo.nativeVersion}`)}
+                      </span>
+                    )}
                     {onCheckUpdate && updateState?.status === 'up-to-date' && (
                       <span className="inline-flex items-center gap-0.5 rounded-md bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                         <Check className="h-2.5 w-2.5" />
@@ -1374,6 +1379,20 @@ export function SettingsModal({
                       </div>
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* OTA recovery button when running a hot-updated Android bundle */}
+              {otaInfo?.isOtaActive && onResetOtaBundle && (
+                <div className="flex items-center justify-between gap-2 px-3.5 py-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span>{bi('当前正在运行热更新版本', 'Running OTA web bundle')}</span>
+                  <button
+                    type="button"
+                    onClick={() => void onResetOtaBundle()}
+                    className="shrink-0 font-semibold text-amber-600 hover:underline dark:text-amber-400"
+                  >
+                    {bi('恢复内置版本', 'Reset to bundled')}
+                  </button>
                 </div>
               )}
 

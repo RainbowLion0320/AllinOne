@@ -12,14 +12,17 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getClaudeCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
-import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
+import { BaseAdapter } from './base-adapter.js'
+import { atomicWriteJsonSync, isPidAlive } from '../primitives/io-utils.js'
+import { SessionExternalWatcher } from '../primitives/session-watcher.js'
+import { StreamJsonCliRunner } from '../primitives/stream-json-runner.js'
 
 const claudeParseCache = createFileParseCache(24)
 
@@ -27,7 +30,7 @@ const CLAUDE_EXTERNAL_MAX_IDLE_MS = 15 * 60_000
 const CLAUDE_WATCH_POLL_MS = 2_000
 const CLAUDE_WATCH_TTL_MS = 10 * 60_000
 const CLAUDE_LIST_WATCH_TTL_MS = 10 * 60_000
-const CLAUDE_LIST_DISCOVERY_INTERVAL_MS = 15_000
+const CLAUDE_LIST_DISCOVERY_INTERVAL_MS = 30_000
 const CLAUDE_TRACKED_LIST_LIMIT = 20
 const CLAUDE_TAIL_PROBE_BYTES = 64 * 1024
 const CLAUDE_TAIL_PROBE_MAX_BYTES = 512 * 1024
@@ -71,18 +74,6 @@ function resolveEffectiveClaudePermissionMode(requestedMode, hostConfiguredMode,
 function getClaudeHome(configuredHome = '') {
   const custom = String(configuredHome || '').trim()
   return custom || join(homedir(), '.claude')
-}
-
-function isPidAlive(pid) {
-  const n = Number(pid)
-  if (!Number.isInteger(n) || n <= 0) return false
-  try {
-    process.kill(n, 0)
-    return true
-  } catch (err) {
-    // EPERM means the process exists but belongs to another privilege context
-    return err?.code === 'EPERM'
-  }
 }
 
 /**
@@ -1045,21 +1036,44 @@ function readDiskClaudeQuota(cachePath, now = Date.now()) {
 function writeDiskClaudeQuota(cachePath, weekly, shortWin) {
   if (!cachePath || (!weekly && !shortWin)) return
   try {
-    mkdirSync(dirname(cachePath), { recursive: true })
-    writeFileSync(cachePath, JSON.stringify({ weekly: weekly || null, short: shortWin || null }), {
-      encoding: 'utf8',
-      mode: 0o600,
-    })
+    atomicWriteJsonSync(cachePath, { weekly: weekly || null, short: shortWin || null }, { mode: 0o600 })
+  } catch {}
+}
+
+function sweepStaleClaudeSettingsFiles(dir, maxAgeMs = 10 * 60_000) {
+  try {
+    if (!dir || !existsSync(dir)) return
+    const now = Date.now()
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith('allinone-claude-settings-') || !name.endsWith('.json')) continue
+      const fp = join(dir, name)
+      try {
+        const st = statSync(fp)
+        if (st.isFile() && now - st.mtimeMs > maxAgeMs) unlinkSync(fp)
+      } catch {}
+    }
   } catch {}
 }
 
 /**
  * Claude Code / Claude Desktop (Cowork + Desktop Code) Sessions Adapter.
- * - Claude Code CLI & Desktop Code sessions: full read/write streaming via `claude -p --output-format stream-json --verbose [--resume <id>]` + external running-state sync.
- * - Claude Desktop Cowork (`local-agent-mode-sessions`) sessions: full history reading + real-time live progress/status sync (read-only mirror so Desktop's HMAC-signed audit logs & live processes are never conflicted).
+ * - Claude Code CLI & Desktop Code sessions: full read/write streaming via `StreamJsonCliRunner` + external running-state sync.
+ * - Claude Desktop Cowork (`local-agent-mode-sessions`) sessions: full history reading + real-time live progress/status sync (read-only mirror).
  */
-export class ClaudeAdapter {
+export class ClaudeAdapter extends BaseAdapter {
   constructor({ config = {}, log = console, emitEvent, onApprovalRequest }) {
+    super(APPS.CLAUDE, {
+      config,
+      log,
+      emitEvent,
+      onApprovalRequest,
+      capabilities: {
+        supportsWorkspaces: true,
+        supportsApproval: true,
+        supportsMidChatSwitch: true,
+        supportsQuota: true,
+      },
+    })
     this.configuredBin = config.claudeBin
     this.claudeBin = findClaudeCommand(this.configuredBin)
     this.claudeHome = getClaudeHome(config.claudeHome)
@@ -1070,26 +1084,51 @@ export class ClaudeAdapter {
     this.externalMaxIdleMs = Number(config.claudeExternalMaxIdleMs) || CLAUDE_EXTERNAL_MAX_IDLE_MS
     this.watchPollMs = Number(config.claudeWatchPollMs) || CLAUDE_WATCH_POLL_MS
     this.checkPidAlive = typeof config.checkPidAlive === 'function' ? config.checkPidAlive : isPidAlive
-    this.log = log
-    this.emitEvent = emitEvent || (() => {})
-    this.onApprovalRequest = onApprovalRequest || (() => {})
-    this.activeProcs = new Map() // sessionId -> { proc, aborted }
-    this.pendingControlRequests = new Map() // approvalId -> { proc, requestId, toolName, toolInput, questions, sessionId }
-    this.pendingCreated = new Map() // sessionId -> summary (before first turn persists jsonl)
-    this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
-    this.sessionTaskStates = new Map() // sessionId -> normalized taskState | null
+
+    const stateBase =
+      String(config.stateDir || process.env.ALLINONE_HOME || '').trim() || join(homedir(), '.allinone-bridge')
+    this.tempSettingsDir = join(stateBase, 'tmp-claude')
+    sweepStaleClaudeSettingsFiles(this.tempSettingsDir)
+
+    this.runner = new StreamJsonCliRunner({
+      app: APPS.CLAUDE,
+      displayName: 'Claude',
+      idPrefix: 'cld',
+      emitEvent: this.emitEvent,
+      onApprovalRequest: this.onApprovalRequest,
+      sessionTaskStates: this.sessionTaskStates,
+      spawnFn: spawnClaude,
+      extractToolOutput: extractTextFromContent,
+      log: this.log,
+    })
+    this.activeProcs = this.runner.activeProcs
+    this.pendingControlRequests = this.runner.pendingControlRequests
+
     this.quotaCachePath = config.claudeQuotaCachePath || getClaudeQuotaCachePath()
     const cachedClaudeQuota = readDiskClaudeQuota(this.quotaCachePath)
     this.weeklyQuota = cachedClaudeQuota.weekly
     this.shortQuota = cachedClaudeQuota.short
     this.desktopEntriesById = new Map() // nativeId -> desktop entry descriptor
-    this.watchedSessions = new Map() // nativeId -> watch state
-    this.trackedListSessions = new Map() // nativeId -> tracked list state
-    this.watchTimer = null
-    this.watchPollInFlight = false
+
+    this.watcher = new SessionExternalWatcher({
+      pollMs: this.watchPollMs,
+      maxWatched: 8,
+      maxTracked: CLAUDE_TRACKED_LIST_LIMIT,
+      watchTtlMs: CLAUDE_WATCH_TTL_MS,
+      listWatchTtlMs: CLAUDE_LIST_WATCH_TTL_MS,
+      onPoll: (ctx) => this._pollExternalSessions(ctx),
+    })
+    this.watchedSessions = this.watcher.watched
+    this.trackedListSessions = this.watcher.tracked
     this.lastListDiscoveryAt = 0
-    this.lastClientListAt = 0
-    this.disposed = false
+  }
+
+  get lastClientListAt() {
+    return this.watcher.lastClientListAt
+  }
+
+  set lastClientListAt(val) {
+    this.watcher.lastClientListAt = Number(val) || 0
   }
 
   getDesktopRoots() {
@@ -1236,170 +1275,139 @@ export class ClaudeAdapter {
   }
 
   ensureWatchTimer() {
-    if (this.disposed || this.watchTimer) return
-    if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0) return
-    this.watchTimer = setInterval(() => {
-      void this.pollExternalSessions()
-    }, this.watchPollMs)
-    this.watchTimer.unref?.()
+    this.watcher.ensureRunning()
   }
 
   rememberWatchedSession(nativeId, descriptor) {
-    if (this.disposed || !nativeId) return
-    const now = Date.now()
-    this.watchedSessions.set(nativeId, {
-      ...descriptor,
-      nativeId,
-      lastSeenAt: now,
-    })
-    this.ensureWatchTimer()
+    this.watcher.rememberWatched(nativeId, descriptor)
   }
 
   rememberTrackedListSession(nativeId, descriptor) {
-    if (this.disposed || !nativeId) return
-    this.trackedListSessions.set(nativeId, {
-      ...descriptor,
-      nativeId,
-    })
-    if (this.trackedListSessions.size > CLAUDE_TRACKED_LIST_LIMIT * 2) {
-      const oldest = [...this.trackedListSessions.entries()]
-        .sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0))
-      while (this.trackedListSessions.size > CLAUDE_TRACKED_LIST_LIMIT) {
-        const next = oldest.shift()
-        if (!next) break
-        this.trackedListSessions.delete(next[0])
-      }
-    }
-    this.ensureWatchTimer()
+    this.watcher.rememberTracked(nativeId, descriptor)
   }
 
   async pollExternalSessions() {
-    if (this.disposed || this.watchPollInFlight) return
-    this.watchPollInFlight = true
-    try {
-      const now = Date.now()
-      const emittedIds = new Set()
+    return this.watcher.tick()
+  }
 
-      // 1. Poll opened / watched Claude sessions for real-time progress & completion
-      for (const [nativeId, entry] of [...this.watchedSessions.entries()]) {
-        if (this.activeProcs.has(nativeId)) continue
+  async _pollExternalSessions({ now, watched, tracked, isListExpired }) {
+    const emittedIds = new Set()
+
+    // 1. Poll opened / watched Claude sessions (capped LRU max 8)
+    for (const [nativeId, entry] of [...watched.entries()]) {
+      if (this.activeProcs.has(nativeId)) continue
+      const probe = this.probeEntryExternalStatus(entry, now)
+      if (!probe) continue
+      let projSize = entry.projSize || 0
+      let projMtime = entry.projMtime || 0
+      if (entry.projJsonlPath) {
+        try {
+          const st = statSync(entry.projJsonlPath)
+          projSize = st.size
+          projMtime = st.mtimeMs
+        } catch {}
+      }
+      const historyChanged =
+        probe.size !== entry.size ||
+        probe.mtimeMs > (entry.mtimeMs || 0) + 10 ||
+        projSize !== (entry.projSize || 0) ||
+        projMtime > (entry.projMtime || 0) + 10
+      const statusChanged =
+        Boolean(probe.running) !== Boolean(entry.externalRunning) ||
+        Boolean(probe.waitingPermission) !== Boolean(entry.waitingPermission)
+
+      if (historyChanged || statusChanged) {
+        entry.size = probe.size
+        entry.mtimeMs = probe.mtimeMs
+        entry.projSize = projSize
+        entry.projMtime = projMtime
+        entry.externalRunning = probe.running
+        entry.waitingPermission = probe.waitingPermission
+        entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0), Math.round(projMtime || 0))
+        if (historyChanged) {
+          const targetFile = entry.projJsonlPath || entry.filePath || entry.auditPath || ''
+          if (targetFile && existsSync(targetFile)) {
+            try {
+              entry.taskState = parseClaudeJsonlMessages(targetFile).taskState || null
+              this.sessionTaskStates.set(nativeId, entry.taskState)
+            } catch {}
+          }
+        }
+        if (probe.running) entry.lastSeenAt = now
+        emittedIds.add(nativeId)
+        this.emitEvent(EVENTS.SESSION_UPDATED, {
+          historyChanged,
+          statusChanged,
+          externalUpdate: true,
+          session: this.buildWatchPayload(entry, probe, probe.running),
+        })
+      } else if (!probe.running && now - (entry.lastSeenAt || 0) > CLAUDE_WATCH_TTL_MS) {
+        watched.delete(nativeId)
+      }
+    }
+
+    // 2. Poll sidebar tracked sessions for running <-> idle flips
+    const listExpired = isListExpired(now)
+    if (listExpired) {
+      tracked.clear()
+    } else {
+      for (const [nativeId, entry] of [...tracked.entries()]) {
+        if (emittedIds.has(nativeId) || this.activeProcs.has(nativeId)) continue
         const probe = this.probeEntryExternalStatus(entry, now)
         if (!probe) continue
-        let projSize = entry.projSize || 0
-        let projMtime = entry.projMtime || 0
-        if (entry.projJsonlPath) {
-          try {
-            const st = statSync(entry.projJsonlPath)
-            projSize = st.size
-            projMtime = st.mtimeMs
-          } catch {}
-        }
-        const historyChanged =
-          probe.size !== entry.size ||
-          probe.mtimeMs > (entry.mtimeMs || 0) + 10 ||
-          projSize !== (entry.projSize || 0) ||
-          projMtime > (entry.projMtime || 0) + 10
         const statusChanged =
           Boolean(probe.running) !== Boolean(entry.externalRunning) ||
           Boolean(probe.waitingPermission) !== Boolean(entry.waitingPermission)
-
-        if (historyChanged || statusChanged) {
+        if (statusChanged) {
           entry.size = probe.size
           entry.mtimeMs = probe.mtimeMs
-          entry.projSize = projSize
-          entry.projMtime = projMtime
           entry.externalRunning = probe.running
           entry.waitingPermission = probe.waitingPermission
-          entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0), Math.round(projMtime || 0))
-          if (historyChanged) {
-            const targetFile = entry.projJsonlPath || entry.filePath || entry.auditPath || ''
-            if (targetFile && existsSync(targetFile)) {
-              try {
-                entry.taskState = parseClaudeJsonlMessages(targetFile).taskState || null
-                this.sessionTaskStates.set(nativeId, entry.taskState)
-              } catch {}
-            }
-          }
-          if (probe.running) entry.lastSeenAt = now
+          entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0))
           emittedIds.add(nativeId)
           this.emitEvent(EVENTS.SESSION_UPDATED, {
-            historyChanged,
-            statusChanged,
+            historyChanged: false,
+            statusChanged: true,
             externalUpdate: true,
             session: this.buildWatchPayload(entry, probe, probe.running),
           })
-        } else if (!probe.running && now - (entry.lastSeenAt || 0) > CLAUDE_WATCH_TTL_MS) {
-          this.watchedSessions.delete(nativeId)
         }
       }
+    }
 
-      // 2. Poll sidebar tracked sessions for running <-> idle flips
-      const listExpired = now - this.lastClientListAt > CLAUDE_LIST_WATCH_TTL_MS
-      if (listExpired) {
-        this.trackedListSessions.clear()
-      } else {
-        for (const [nativeId, entry] of [...this.trackedListSessions.entries()]) {
-          if (emittedIds.has(nativeId) || this.activeProcs.has(nativeId)) continue
-          const probe = this.probeEntryExternalStatus(entry, now)
-          if (!probe) continue
-          const statusChanged =
-            Boolean(probe.running) !== Boolean(entry.externalRunning) ||
-            Boolean(probe.waitingPermission) !== Boolean(entry.waitingPermission)
-          if (statusChanged) {
-            entry.size = probe.size
-            entry.mtimeMs = probe.mtimeMs
-            entry.externalRunning = probe.running
-            entry.waitingPermission = probe.waitingPermission
-            entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0))
-            emittedIds.add(nativeId)
+    // 3. Throttled discovery of newly started Claude Desktop sessions (only check recent mtimes)
+    if (!listExpired && tracked.size > 0 && now - this.lastListDiscoveryAt >= CLAUDE_LIST_DISCOVERY_INTERVAL_MS) {
+      this.lastListDiscoveryAt = now
+      try {
+        const { entries } = this.refreshDesktopIndex()
+        const recentWindowMs = this.externalMaxIdleMs + 60_000
+        for (const dEntry of entries) {
+          if (emittedIds.has(dEntry.nativeId) || this.activeProcs.has(dEntry.nativeId)) continue
+          const prev = tracked.get(dEntry.nativeId)
+          // Skip probing old untouched desktop sessions that aren't already tracked
+          if (!prev && dEntry.updatedAt && now - dEntry.updatedAt > recentWindowMs) continue
+          const probe = this.probeEntryExternalStatus(dEntry, now)
+          const prevRunning = Boolean(prev?.externalRunning)
+          const isRunning = Boolean(probe?.running)
+          if ((!prev && isRunning) || (prev && prevRunning !== isRunning)) {
+            const trackedObj = {
+              ...dEntry,
+              preview: dEntry.initialMessage.slice(0, 120),
+              size: probe?.size || 0,
+              mtimeMs: probe?.mtimeMs || 0,
+              externalRunning: isRunning,
+              waitingPermission: Boolean(probe?.waitingPermission),
+            }
+            this.rememberTrackedListSession(dEntry.nativeId, trackedObj)
             this.emitEvent(EVENTS.SESSION_UPDATED, {
               historyChanged: false,
               statusChanged: true,
               externalUpdate: true,
-              session: this.buildWatchPayload(entry, probe, probe.running),
+              session: this.buildWatchPayload(trackedObj, probe, isRunning),
             })
           }
         }
-      }
-
-      // 3. Periodically discover newly started Claude Desktop sessions while clients are active
-      if (!listExpired && this.trackedListSessions.size > 0 && now - this.lastListDiscoveryAt >= CLAUDE_LIST_DISCOVERY_INTERVAL_MS) {
-        this.lastListDiscoveryAt = now
-        try {
-          const { entries } = this.refreshDesktopIndex()
-          for (const dEntry of entries) {
-            if (emittedIds.has(dEntry.nativeId) || this.activeProcs.has(dEntry.nativeId)) continue
-            const probe = this.probeEntryExternalStatus(dEntry, now)
-            const prev = this.trackedListSessions.get(dEntry.nativeId)
-            const prevRunning = Boolean(prev?.externalRunning)
-            const isRunning = Boolean(probe?.running)
-            if ((!prev && isRunning) || (prev && prevRunning !== isRunning)) {
-              const trackedObj = {
-                ...dEntry,
-                preview: dEntry.initialMessage.slice(0, 120),
-                size: probe?.size || 0,
-                mtimeMs: probe?.mtimeMs || 0,
-                externalRunning: isRunning,
-                waitingPermission: Boolean(probe?.waitingPermission),
-              }
-              this.rememberTrackedListSession(dEntry.nativeId, trackedObj)
-              this.emitEvent(EVENTS.SESSION_UPDATED, {
-                historyChanged: false,
-                statusChanged: true,
-                externalUpdate: true,
-                session: this.buildWatchPayload(trackedObj, probe, isRunning),
-              })
-            }
-          }
-        } catch {}
-      }
-
-      if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0 && this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
-      }
-    } finally {
-      this.watchPollInFlight = false
+      } catch {}
     }
   }
 
@@ -1458,7 +1466,7 @@ export class ClaudeAdapter {
       }
       let proc = null
       const timer = setTimeout(() => {
-        try { proc?.kill() } catch {}
+        if (proc) killProcessTree(proc, { force: true })
         done(false)
       }, 6_000)
       timer.unref?.()
@@ -1467,6 +1475,7 @@ export class ClaudeAdapter {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
+        this.trackChildProcess(proc)
         let out = ''
         proc.stdout.setEncoding('utf8')
         proc.stdout.on('data', (d) => { out += d })
@@ -1899,7 +1908,7 @@ export class ClaudeAdapter {
       args.push('--effort', effectiveEffort)
     }
     // Preserve live Windows/OS ANTHROPIC_BASE_URL & credentials over any stale ~/.claude/settings.json proxy
-    // Security: write ephemeral 0o600 temp file instead of passing API secrets on argv
+    // Security: write ephemeral 0o600 temp file inside private 0o700 stateDir instead of world-shared os.tmpdir()
     const envOverride = {}
     if (process.env.ANTHROPIC_BASE_URL) envOverride.ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL
     if (process.env.ANTHROPIC_AUTH_TOKEN) envOverride.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
@@ -1912,7 +1921,9 @@ export class ClaudeAdapter {
       try { unlinkSync(p) } catch {}
     }
     if (Object.keys(envOverride).length > 0) {
-      tempSettingsPath = join(tmpdir(), `allinone-claude-settings-${process.pid}-${randomUUID()}.json`)
+      mkdirSync(this.tempSettingsDir, { recursive: true, mode: 0o700 })
+      try { chmodSync(this.tempSettingsDir, 0o700) } catch {}
+      tempSettingsPath = join(this.tempSettingsDir, `allinone-claude-settings-${process.pid}-${randomUUID()}.json`)
       writeFileSync(tempSettingsPath, JSON.stringify({ env: envOverride }), { encoding: 'utf8', mode: 0o600 })
       try { chmodSync(tempSettingsPath, 0o600) } catch {}
       args.push('--settings', tempSettingsPath)
@@ -1924,574 +1935,40 @@ export class ClaudeAdapter {
     }
 
     const compositeId = makeCompositeId(APPS.CLAUDE, sessionId)
-    this.emitEvent(EVENTS.STREAM_START, {
-      sessionId: compositeId,
-      app: APPS.CLAUDE,
-      nativeId: sessionId,
-    })
-
-    return new Promise((resolvePromise, rejectPromise) => {
-      let proc
-      try {
-        proc = spawnClaude(this.claudeBin, args, {
-          cwd: targetCwd,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        })
-      } catch (err) {
-        cleanupTempSettings()
-        if (err && typeof err === 'object') err._streamErrorEmitted = true
-        this.emitEvent(EVENTS.STREAM_ERROR, {
-          sessionId: compositeId,
-          app: APPS.CLAUDE,
-          message: String(err?.message || err),
-        })
-        rejectPromise(err)
-        return
-      }
-      proc.stdout.setEncoding('utf8')
-      proc.stderr?.setEncoding('utf8')
-
-      const taskTracker = createTaskStateTracker(this.sessionTaskStates.get(sessionId) || null)
-      if (effectivePermissionMode === 'plan') {
-        taskTracker.setMode('plan', Date.now())
-      } else if (taskTracker.snapshot()?.mode === 'plan') {
-        taskTracker.setMode(null, Date.now())
-      }
-      const emitTaskState = () => {
-        const diff = taskTracker.consumeChanged()
-        if (!diff.changed) return
-        this.sessionTaskStates.set(sessionId, diff.taskState)
-        this.emitEvent(EVENTS.STREAM_TASK_STATE, {
-          sessionId: compositeId,
-          app: APPS.CLAUDE,
-          taskState: diff.taskState,
-        })
-      }
-
-      const state = { proc, aborted: false, taskTracker, emitTaskState, cleanupTempSettings }
-      this.activeProcs.set(sessionId, state)
-      emitTaskState()
-
-      let stdoutBuf = ''
-      let stderrBuf = ''
-      let finalText = ''
-      let seenResult = false
-      let settled = false
-      const emittedTextByMsg = new Map()
-      const emittedThinkByMsg = new Map()
-      let lastTextMsgId = null
-      let lastThinkMsgId = null
-      const seenToolIds = new Set()
-      let resultError = ''
-
-      const handleJsonLine = (line) => {
-        let obj
-        try {
-          obj = JSON.parse(line)
-        } catch {
-          return
+    return this.runner.runTurn({
+      sessionId,
+      compositeId,
+      bin: this.claudeBin,
+      args,
+      cwd: targetCwd,
+      prompt,
+      effectivePermissionMode,
+      onRateLimit: (info) => this.recordRateLimitInfo(info),
+      onCleanup: cleanupTempSettings,
+      onSessionPersisted: (sid, completed) => {
+        if (completed || this.findSessionFile(sid)) {
+          this.pendingCreated.delete(sid)
         }
-
-        if (obj.type === 'assistant') {
-          const msgId = String(obj.message?.id || '__default__')
-          const blocks = Array.isArray(obj.message?.content) ? obj.message.content : []
-          let fullText = ''
-          let fullThink = ''
-          for (const b of blocks) {
-            if (b?.type === 'thinking' && b.thinking) {
-              fullThink += b.thinking
-            } else if (b?.type === 'tool_use' && b.id && !seenToolIds.has(b.id)) {
-              seenToolIds.add(b.id)
-              this.emitEvent(EVENTS.STREAM_TOOL_START, {
-                sessionId: compositeId,
-                app: APPS.CLAUDE,
-                tool: { id: b.id, name: b.name || 'tool', input: b.input ?? {} },
-              })
-              if (taskTracker.applyClaudeTool(b.name || 'tool', b.input ?? {}, Date.now())) {
-                emitTaskState()
-              }
-            } else if (b?.type === 'text' && typeof b.text === 'string') {
-              fullText += b.text
-            }
-          }
-          const prevThink = emittedThinkByMsg.get(msgId) || ''
-          if (fullThink) {
-            if (prevThink && fullThink.startsWith(prevThink)) {
-              const rawThinkDelta = fullThink.slice(prevThink.length)
-              if (rawThinkDelta) {
-                emittedThinkByMsg.set(msgId, fullThink)
-                lastThinkMsgId = msgId
-                this.emitEvent(EVENTS.STREAM_THINKING, {
-                  sessionId: compositeId,
-                  app: APPS.CLAUDE,
-                  delta: rawThinkDelta,
-                })
-              }
-            } else if (fullThink !== prevThink) {
-              const thinkPrefix = lastThinkMsgId ? '\n\n' : ''
-              emittedThinkByMsg.set(msgId, fullThink)
-              lastThinkMsgId = msgId
-              this.emitEvent(EVENTS.STREAM_THINKING, {
-                sessionId: compositeId,
-                app: APPS.CLAUDE,
-                delta: `${thinkPrefix}${fullThink}`,
-              })
-            }
-          }
-          const prevText = emittedTextByMsg.get(msgId) || ''
-          if (fullText) {
-            if (prevText && fullText.startsWith(prevText)) {
-              const rawDelta = fullText.slice(prevText.length)
-              if (rawDelta) {
-                emittedTextByMsg.set(msgId, fullText)
-                lastTextMsgId = msgId
-                finalText += rawDelta
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.CLAUDE,
-                  delta: rawDelta,
-                })
-              }
-            } else if (fullText !== prevText) {
-              const textPrefix = finalText ? '\n\n' : ''
-              const delta = `${textPrefix}${fullText}`
-              emittedTextByMsg.set(msgId, fullText)
-              lastTextMsgId = msgId
-              finalText += delta
-              this.emitEvent(EVENTS.STREAM_DELTA, {
-                sessionId: compositeId,
-                app: APPS.CLAUDE,
-                delta,
-              })
-            }
-          }
-        } else if (obj.type === 'user' && Array.isArray(obj.message?.content)) {
-          for (const b of obj.message.content) {
-            if (b?.type === 'tool_result' && b.tool_use_id) {
-              this.emitEvent(EVENTS.STREAM_TOOL_END, {
-                sessionId: compositeId,
-                app: APPS.CLAUDE,
-                toolId: b.tool_use_id,
-                status: b.is_error ? 'error' : 'completed',
-                output: extractTextFromContent(b.content).slice(0, 3000),
-              })
-            }
-          }
-        } else if (obj.type === 'rate_limit_event' && obj.rate_limit_info) {
-          this.recordRateLimitInfo(obj.rate_limit_info)
-        } else if (obj.type === 'control_request' && obj.request_id && obj.request) {
-          this.handleControlRequest(proc, sessionId, compositeId, targetCwd, obj)
-        } else if (obj.type === 'result') {
-          seenResult = true
-          if (obj.is_error) {
-            resultError = String(obj.result || obj.error || 'Claude 执行返回错误')
-          } else if (typeof obj.result === 'string' && obj.result.length > 0) {
-            const trimmedResult = obj.result.trim()
-            if (!lastTextMsgId) {
-              finalText = obj.result
-              this.emitEvent(EVENTS.STREAM_DELTA, {
-                sessionId: compositeId,
-                app: APPS.CLAUDE,
-                delta: obj.result,
-              })
-            } else if (trimmedResult && !finalText.trimEnd().endsWith(trimmedResult)) {
-              const lastEmitted = emittedTextByMsg.get(lastTextMsgId) || ''
-              if (
-                lastEmitted &&
-                obj.result.startsWith(lastEmitted) &&
-                obj.result.length > lastEmitted.length &&
-                finalText.endsWith(lastEmitted)
-              ) {
-                const suffix = obj.result.slice(lastEmitted.length)
-                emittedTextByMsg.set(lastTextMsgId, obj.result)
-                finalText += suffix
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.CLAUDE,
-                  delta: suffix,
-                })
-              } else {
-                const delta = `${finalText ? '\n\n' : ''}${obj.result}`
-                emittedTextByMsg.set(lastTextMsgId, obj.result)
-                finalText += delta
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.CLAUDE,
-                  delta,
-                })
-              }
-            }
-          }
-          // Close stdin cleanly once the turn finishes so the bidirectional stream-json process exits
-          try { proc.stdin.end() } catch {}
-        }
-      }
-
-      proc.stdin?.on('error', () => {})
-
-      proc.stdout.on('data', (chunk) => {
-        stdoutBuf += chunk
-        let idx
-        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
-          const line = stdoutBuf.slice(0, idx).trim()
-          stdoutBuf = stdoutBuf.slice(idx + 1)
-          if (line) handleJsonLine(line)
-        }
-      })
-
-      proc.stderr.on('data', (chunk) => {
-        stderrBuf = (stderrBuf + chunk).slice(-4096)
-      })
-
-      proc.on('exit', () => {
-        cleanupTempSettings()
-      })
-
-      proc.on('error', (err) => {
-        cleanupTempSettings()
-        if (settled) return
-        settled = true
-        if (this.activeProcs.get(sessionId) === state) {
-          this.activeProcs.delete(sessionId)
-        }
-        this.clearPendingControlRequests(proc)
-        if (err && typeof err === 'object') err._streamErrorEmitted = true
-        this.emitEvent(EVENTS.STREAM_ERROR, {
-          sessionId: compositeId,
-          app: APPS.CLAUDE,
-          message: String(err?.message || err),
-        })
-        rejectPromise(err)
-      })
-
-      proc.on('close', (code) => {
-        cleanupTempSettings()
-        if (settled) return
-        settled = true
-        if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
-        if (this.activeProcs.get(sessionId) === state) {
-          this.activeProcs.delete(sessionId)
-        }
-        this.clearPendingControlRequests(proc)
-
-        if (resultError && !state.aborted) {
-          if (this.findSessionFile(sessionId)) {
-            this.pendingCreated.delete(sessionId)
-          }
-          const err = new Error(resultError)
-          err._streamErrorEmitted = true
-          this.emitEvent(EVENTS.STREAM_ERROR, {
-            sessionId: compositeId,
-            app: APPS.CLAUDE,
-            message: resultError,
-          })
-          rejectPromise(err)
-          return
-        }
-
-        if (code !== 0 && !state.aborted && !seenResult) {
-          if (this.findSessionFile(sessionId)) {
-            this.pendingCreated.delete(sessionId)
-          }
-          const errMsg = stderrBuf.trim() || `claude 进程退出（code=${code}）`
-          const err = new Error(errMsg)
-          err._streamErrorEmitted = true
-          this.emitEvent(EVENTS.STREAM_ERROR, {
-            sessionId: compositeId,
-            app: APPS.CLAUDE,
-            message: errMsg,
-          })
-          rejectPromise(err)
-          return
-        }
-
-        if (!state.aborted || this.findSessionFile(sessionId)) {
-          this.pendingCreated.delete(sessionId)
-        }
-
-        this.emitEvent(EVENTS.STREAM_DONE, {
-          sessionId: compositeId,
-          app: APPS.CLAUDE,
-          nativeId: sessionId,
-          finalText,
-          aborted: state.aborted,
-        })
-        resolvePromise({
-          sessionId: compositeId,
-          nativeId: sessionId,
-          finalText,
-          aborted: state.aborted,
-        })
-      })
-
-      // Feed turn cleanly via bidirectional NDJSON stream-json protocol (keep stdin open for control_response!)
-      const userFrame = JSON.stringify({
-        type: 'user',
-        message: { role: 'user', content: prompt },
-      })
-      proc.stdin.write(`${userFrame}\n`, 'utf8')
-    })
-  }
-
-  clearPendingControlRequests(proc) {
-    for (const [aprId, entry] of this.pendingControlRequests.entries()) {
-      if (entry.proc === proc) {
-        this.pendingControlRequests.delete(aprId)
-        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CLAUDE, decision: 'cancel' })
-      }
-    }
-  }
-
-  writeControlResponse(proc, requestId, responseBody) {
-    if (!proc || !proc.stdin?.writable) return false
-    const frame = JSON.stringify({
-      type: 'control_response',
-      response: {
-        subtype: 'success',
-        request_id: requestId,
-        response: responseBody,
       },
     })
-    proc.stdin.write(`${frame}\n`, 'utf8')
-    return true
   }
 
   handleControlRequest(proc, sessionId, compositeId, cwd, obj) {
-    const requestId = String(obj.request_id)
-    const req = obj.request || {}
-    if (req.subtype !== 'can_use_tool') {
-      // Acknowledge non-tool control requests safely
-      this.writeControlResponse(proc, requestId, { behavior: 'allow' })
-      return
-    }
-
-    const toolName = String(req.tool_name || 'tool')
-    const toolInput = req.input && typeof req.input === 'object' ? req.input : {}
-
-    if (toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions) && toolInput.questions.length > 0) {
-      const aprId = `cld-q-${randomUUID().slice(0, 10)}`
-      const questions = toolInput.questions.map((q, idx) => {
-        const opts = Array.isArray(q?.options)
-          ? q.options
-              .filter((o) => o && typeof o.label === 'string')
-              .map((o) => ({
-                value: o.label,
-                label: o.label,
-                description: typeof o.description === 'string' ? o.description : '',
-              }))
-          : []
-        return {
-          id: String(q?.id || `q_${idx}`),
-          origQuestion: String(q?.question || ''),
-          header: String(q?.header || '').trim(),
-          question: String(q?.question || '').trim() || `问题 ${idx + 1}`,
-          description: '',
-          multiSelect: Boolean(q?.multiSelect),
-          allowOther: true,
-          inputType: opts.length > 0 ? 'select' : 'text',
-          required: true,
-          options: opts,
-        }
-      })
-
-      this.pendingControlRequests.set(aprId, {
-        proc,
-        requestId,
-        toolName,
-        toolInput,
-        questions,
-        sessionId,
-      })
-
-      this.onApprovalRequest({
-        id: aprId,
-        app: APPS.CLAUDE,
-        sessionId: compositeId,
-        kind: 'question',
-        title: 'Claude 需要你做选择',
-        detail: '',
-        questions: questions.map(({ origQuestion: _drop, ...publicQ }) => publicQ),
-        createdAt: Date.now(),
-      })
-      return
-    }
-
-    if (toolName === 'ExitPlanMode') {
-      const active = this.activeProcs.get(sessionId)
-      if (active?.taskTracker && active.taskTracker.applyClaudeTool('ExitPlanMode', toolInput, Date.now())) {
-        active.emitTaskState?.()
-      }
-      const aprId = `cld-plan-${randomUUID().slice(0, 10)}`
-      this.pendingControlRequests.set(aprId, {
-        proc,
-        requestId,
-        toolName,
-        toolInput,
-        sessionId,
-      })
-      this.onApprovalRequest({
-        id: aprId,
-        app: APPS.CLAUDE,
-        sessionId: compositeId,
-        kind: 'permissions',
-        title: 'Claude 计划已就绪',
-        detail: String(toolInput.plan || '是否批准当前计划并开始执行？').slice(0, 1500),
-        cwd,
-        options: [
-          { value: 'allow', label: '批准执行', style: 'primary' },
-          { value: 'deny', label: '拒绝', style: 'danger' },
-        ],
-        createdAt: Date.now(),
-      })
-      return
-    }
-
-    const aprId = `cld-apr-${randomUUID().slice(0, 10)}`
-    this.pendingControlRequests.set(aprId, {
-      proc,
-      requestId,
-      toolName,
-      toolInput,
-      sessionId,
-    })
-
-    const detail =
-      toolInput.command ||
-      toolInput.file_path ||
-      toolInput.path ||
-      toolInput.description ||
-      JSON.stringify(toolInput, null, 2)
-
-    this.onApprovalRequest({
-      id: aprId,
-      app: APPS.CLAUDE,
-      sessionId: compositeId,
-      kind: toolName === 'Edit' || toolName === 'Write' ? 'file_change' : 'command',
-      title: `Claude 请求使用 ${toolName}`,
-      detail: String(detail || toolName).slice(0, 1200),
-      cwd,
-      options: [
-        { value: 'allow', label: '允许', style: 'primary' },
-        { value: 'deny', label: '拒绝', style: 'danger' },
-      ],
-      createdAt: Date.now(),
-    })
+    return this.runner.handleControlRequest(proc, sessionId, compositeId, cwd, obj)
   }
 
   async resolveApproval(approvalId, decisionOrPayload) {
-    const entry = this.pendingControlRequests.get(approvalId)
-    if (!entry) return { resolved: false, reason: 'approval not found' }
-    this.pendingControlRequests.delete(approvalId)
-
-    const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
-
-    if (entry.toolName === 'AskUserQuestion') {
-      const cancelled = decision === 'cancel' || decision === 'decline' || decision === 'deny'
-      if (cancelled) {
-        this.writeControlResponse(entry.proc, entry.requestId, {
-          behavior: 'deny',
-          message: 'User cancelled the question',
-        })
-      } else {
-        const claudeAnswers = {}
-        for (const q of entry.questions || []) {
-          const ans = normalizeSingleAnswer(answers[q.id])
-          const key = q.origQuestion || q.question
-          claudeAnswers[key] = q.multiSelect
-            ? ans.combined.join(', ')
-            : (ans.selected[0] || ans.custom || '')
-        }
-        this.writeControlResponse(entry.proc, entry.requestId, {
-          behavior: 'allow',
-          updatedInput: {
-            ...entry.toolInput,
-            questions: entry.toolInput?.questions || [],
-            answers: claudeAnswers,
-          },
-        })
-      }
-      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
-        id: approvalId,
-        app: APPS.CLAUDE,
-        decision: cancelled ? 'cancel' : 'submit',
-      })
-      return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit' }
-    }
-
-    const allowed = decision === 'allow' || decision === 'accept' || decision === 'acceptForSession'
-    if (entry.toolName === 'ExitPlanMode' && allowed && entry.sessionId) {
-      const active = this.activeProcs.get(entry.sessionId)
-      if (active?.taskTracker) {
-        active.taskTracker.setMode(null, Date.now())
-        active.emitTaskState?.()
-      }
-    }
-    this.writeControlResponse(
-      entry.proc,
-      entry.requestId,
-      allowed
-        ? { behavior: 'allow', updatedInput: entry.toolInput || {} }
-        : { behavior: 'deny', message: 'User denied tool execution' },
-    )
-    this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
-      id: approvalId,
-      app: APPS.CLAUDE,
-      decision: allowed ? 'allow' : 'deny',
-    })
-    return { resolved: true, id: approvalId, decision: allowed ? 'allow' : 'deny' }
+    return this.runner.resolveApproval(approvalId, decisionOrPayload)
   }
 
   async interrupt(sessionId) {
     sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
-    const active = this.activeProcs.get(sessionId)
-    if (!active) return { interrupted: false, sessionId }
-    active.aborted = true
-    this.clearPendingControlRequests(active.proc)
-    const proc = active.proc
-    try {
-      proc.stdin?.end()
-    } catch {}
-    try {
-      proc.kill('SIGTERM')
-    } catch {}
-    if (proc.exitCode === null && proc.signalCode === null) {
-      const killTimer = setTimeout(() => {
-        if (proc.exitCode !== null || proc.signalCode !== null) return
-        if (process.platform === 'win32' && proc.pid) {
-          try {
-            const tk = spawnCrossPlatform('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
-              stdio: 'ignore',
-              windowsHide: true,
-            })
-            tk.on('error', () => {})
-          } catch {}
-        }
-        try { proc.kill('SIGKILL') } catch {}
-      }, 2_000)
-      killTimer.unref?.()
-      proc.once('close', () => clearTimeout(killTimer))
-    }
-    return { interrupted: true, sessionId }
+    return this.runner.interrupt(sessionId)
   }
 
   async dispose() {
-    this.disposed = true
-    if (this.watchTimer) {
-      clearInterval(this.watchTimer)
-      this.watchTimer = null
-    }
-    this.watchedSessions.clear()
-    this.trackedListSessions.clear()
-    for (const active of this.activeProcs.values()) {
-      active.aborted = true
-      try { active.cleanupTempSettings?.() } catch {}
-      if (typeof this.clearPendingControlRequests === 'function') {
-        try { this.clearPendingControlRequests(active.proc) } catch {}
-      }
-      killProcessTree(active.proc, { force: true })
-    }
-    this.activeProcs.clear()
-    this.pendingControlRequests?.clear?.()
+    this.watcher.dispose()
+    this.runner.dispose()
+    this.disposeBase()
   }
 }

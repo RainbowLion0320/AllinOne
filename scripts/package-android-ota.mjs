@@ -31,7 +31,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..')
 const DEFAULT_DIST_DIR = join(REPO_ROOT, 'packages', 'mobile-app', 'dist')
 const DEFAULT_OUT_DIR = join(REPO_ROOT, 'packages', 'mobile-app', 'release')
-const DEFAULT_MIN_NATIVE_VERSION = '1.0.26'
+
+function readDefaultMinNativeVersion() {
+  try {
+    const metaPath = join(REPO_ROOT, 'release-meta.json')
+    if (existsSync(metaPath)) {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+      const v = String(meta?.androidMinNativeVersion || '').trim().replace(/^v/i, '')
+      if (v) return v
+    }
+  } catch {}
+  return '1.0.26'
+}
+const DEFAULT_MIN_NATIVE_VERSION = readDefaultMinNativeVersion()
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256)
@@ -143,9 +155,10 @@ function collectDistFiles(rootDir) {
     for (const dirent of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, dirent.name)
       const rel = relative(rootDir, full).replace(/\\/g, '/')
-      // Exclude PC bridge downloads & shell installers not used inside the Android WebView
+      // Exclude PC bridge downloads, shell installers & Web PWA Service Workers not used inside Capacitor Android WebView
       if (rel === 'downloads' || rel.startsWith('downloads/')) continue
       if (rel === 'setup.ps1' || rel === 'setup.sh') continue
+      if (rel === 'sw.js' || rel === 'registerSW.js' || /^workbox-[^/]+\.js$/.test(rel)) continue
       if (rel.endsWith('.map')) continue
       if (dirent.isDirectory()) {
         walk(full)

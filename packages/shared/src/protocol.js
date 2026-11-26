@@ -116,6 +116,62 @@ export const EVENTS = Object.freeze({
 export const P2P_PROTOCOL_VERSION = 1
 
 /**
+ * Canonical control-plane WebSocket message types between Relay, Bridge, and Client.
+ */
+export const WS_MSG = Object.freeze({
+  HELLO: 'hello',
+  BRIDGE_WELCOME: 'bridge.welcome',
+  BRIDGE_META: 'bridge.meta',
+  BRIDGE_LIST: 'bridge.list',
+  PING: 'ping',
+  PONG: 'pong',
+  ICE_UPDATE: 'ice.update',
+  P2P_SIGNAL: 'p2p.signal',
+  P2P_SIGNAL_ERROR: 'p2p.signal.error',
+  E2EE_GRANT_REQ: 'e2ee.grant.req',
+  E2EE_GRANT_LIST: 'e2ee.grant.list',
+  E2EE_GRANT_LIST_RES: 'e2ee.grant.list.res',
+  E2EE_GRANT_OFFER: 'e2ee.grant.offer',
+  E2EE_GRANT_REVEAL: 'e2ee.grant.reveal',
+  E2EE_GRANT_APPROVE: 'e2ee.grant.approve',
+  E2EE_GRANT_REJECT: 'e2ee.grant.reject',
+  E2EE_GRANT_CANCEL: 'e2ee.grant.cancel',
+  E2EE_QR_NUDGE: 'e2ee.qr.nudge',
+})
+
+/**
+ * Protocol version & capability flags advertised during control-plane and P2P handshakes.
+ */
+export const PROTOCOL_VERSION = 1
+
+export const PROTOCOL_CAPABILITIES = Object.freeze([
+  'ctrl-bin-v1',
+  'deflate-raw',
+  'aio2-chunked',
+  'grant-v2',
+  'bulk-window-v1',
+  'event-sync-v1',
+])
+
+/**
+ * Canonical account tiers & default monthly TURN quotas (MB; 0 = unlimited).
+ */
+export const VALID_TIERS = Object.freeze(['free', 'pro', 'ultra'])
+export const DEFAULT_TURN_QUOTA_MB = Object.freeze({
+  free: 1024,
+  pro: 10240,
+  ultra: 51200,
+  admin: 51200,
+})
+
+/**
+ * Canonical Content-Security-Policy for sandboxed HTML deliverable previews
+ * (shared across Relay Server, Electron Desktop `app://`, and static fallback).
+ */
+export const SANDBOX_PREVIEW_CSP =
+  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
+
+/**
  * Build a unified composite key `<app>:<nativeId>`.
  * @param {string} app
  * @param {string} sessionId

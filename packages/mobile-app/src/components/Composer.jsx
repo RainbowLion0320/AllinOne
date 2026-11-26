@@ -148,7 +148,7 @@ function ComposerAttachmentChip({ att, onRemove }) {
   )
 }
 
-export function Composer({
+export const Composer = React.memo(function Composer({
   draftKey = '',
   activeApp,
   streaming,
@@ -651,7 +651,6 @@ export function Composer({
             onChange={(e) => {
               if (sendingRef.current) return
               updateText(e.target.value)
-              autoResize(e.target)
             }}
             onPaste={handlePaste}
             onKeyDown={handleKeyDown}
@@ -736,4 +735,4 @@ export function Composer({
       </div>
     </div>
   )
-}
+})

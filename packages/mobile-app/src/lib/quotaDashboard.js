@@ -168,6 +168,7 @@ function buildNormalizedWindow(w, { lang = 'zh', now = Date.now() } = {}) {
     health: getQuotaHealthLevel(pct),
     resetsAt,
     resetText: formatQuotaResetCountdown(resetsAt, { lang, now, compact: !isWeekly }),
+    shortResetText: formatQuotaResetCountdown(resetsAt, { lang, now, compact: true }),
     compactResetText: formatQuotaResetCompact(resetsAt, { lang, now }),
   }
 }

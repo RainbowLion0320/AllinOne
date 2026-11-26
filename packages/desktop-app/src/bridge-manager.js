@@ -12,22 +12,25 @@ import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
-  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { appendFile, readFile, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { generateE2eeKey, normalizeE2eeKey } from '@allinone/shared/e2ee'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MAX_LOG_BYTES = 1024 * 1024 // 1 MB rolling cap
+const MAX_STDIO_LINE_BUF = 64 * 1024
+const RESTART_CIRCUIT_WINDOW_MS = 2 * 60 * 1000
+const RESTART_CIRCUIT_MAX = 5
 
 function normalizeBaseUrl(raw) {
   return String(raw || '').trim().replace(/\/+$/, '')
@@ -42,33 +45,8 @@ function readJsonSafe(filePath) {
   }
 }
 
-function normalizeDesktopE2eeKey(raw) {
-  if (typeof raw !== 'string') return ''
-  const clean = raw.trim().replace(/\s+/g, '')
-  if (!clean || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) return ''
-  const eqIdx = clean.indexOf('=')
-  if (eqIdx !== -1 && clean.length % 4 !== 0) return ''
-  const unpadded = eqIdx !== -1 ? clean.slice(0, eqIdx) : clean
-  if (!unpadded || unpadded.length % 4 === 1) return ''
-  const std = unpadded.replace(/-/g, '+').replace(/_/g, '/')
-  const padLen = (4 - (std.length % 4)) % 4
-  try {
-    const buf = Buffer.from(`${std}${'='.repeat(padLen)}`, 'base64')
-    if (buf.length !== 32) return ''
-    const normalized = buf.toString('base64url')
-    if (normalized !== unpadded.replace(/\+/g, '-').replace(/\//g, '_')) return ''
-    return normalized
-  } catch {
-    return ''
-  }
-}
-
-function generateDesktopE2eeKey() {
-  return randomBytes(32).toString('base64url')
-}
-
 function computeDesktopE2eeKeyId(rawKey) {
-  const key = normalizeDesktopE2eeKey(rawKey)
+  const key = normalizeE2eeKey(rawKey)
   if (!key) return ''
   const rawBytes = Buffer.from(key, 'base64url')
   return createHash('sha256')
@@ -180,14 +158,14 @@ export function loadConfigWithStatus(filePath, secretStore = null) {
     }
     try {
       const dec = secretStore.decrypt(out.e2eeKeyEnc)
-      const norm = dec ? normalizeDesktopE2eeKey(dec) : ''
+      const norm = dec ? normalizeE2eeKey(dec) : ''
       if (!norm) return { status: 'decrypt-error', config: null }
       out.e2eeKey = norm
     } catch {
       return { status: 'decrypt-error', config: null }
     }
   } else if (out.e2eeKey) {
-    out.e2eeKey = normalizeDesktopE2eeKey(out.e2eeKey)
+    out.e2eeKey = normalizeE2eeKey(out.e2eeKey)
     if (out.e2eeKey && storeAvail) shouldMigrate = true
   }
 
@@ -235,6 +213,9 @@ export class DesktopBridgeManager extends EventEmitter {
     this.killPromise = null
     this.restartTimer = null
     this.restartAttempts = 0
+    this.restartTimestamps = []
+    this._logQueue = []
+    this._flushingLog = false
     this.disposed = false
     this.authRevoked = false
 
@@ -255,17 +236,37 @@ export class DesktopBridgeManager extends EventEmitter {
   }
 
   appendLog(line) {
+    const entry = `[${new Date().toISOString()}] ${line}\n`
+    if (this._logQueue.length < 256) {
+      this._logQueue.push(entry)
+    }
+    if (!this._flushingLog) {
+      this._flushingLog = true
+      void this._flushLogQueue()
+    }
+  }
+
+  async _flushLogQueue() {
     try {
       this.ensureStateDir()
-      if (existsSync(this.logPath)) {
-        const st = statSync(this.logPath)
-        if (st.size > MAX_LOG_BYTES) {
-          const tail = readFileSync(this.logPath, 'utf8').slice(-200_000)
-          writeFileSync(this.logPath, tail, 'utf8')
-        }
+      while (this._logQueue.length > 0) {
+        const batch = this._logQueue.splice(0, 64).join('')
+        try {
+          const st = await stat(this.logPath).catch(() => null)
+          if (st && st.size > MAX_LOG_BYTES) {
+            const existing = await readFile(this.logPath, 'utf8').catch(() => '')
+            await writeFile(this.logPath, existing.slice(-200_000), 'utf8')
+          }
+          await appendFile(this.logPath, batch, 'utf8')
+        } catch {}
       }
-      appendFileSync(this.logPath, `[${new Date().toISOString()}] ${line}\n`, 'utf8')
-    } catch {}
+    } catch {} finally {
+      this._flushingLog = false
+      if (this._logQueue.length > 0) {
+        this._flushingLog = true
+        void this._flushLogQueue()
+      }
+    }
   }
 
   getStatus() {
@@ -273,6 +274,7 @@ export class DesktopBridgeManager extends EventEmitter {
       state: this.state,
       enabled: this.enabled,
       autoLaunch: Boolean(this.getAutoLaunch?.()),
+      secretStoreWarning: !isSecretStoreAvailable(this.secretStore),
       label: this.deviceMeta?.label || os.hostname() || 'My PC',
       bridgeId: this.deviceMeta?.bridgeId || '',
       username: this.deviceMeta?.username || this.activeAccount?.username || '',
@@ -418,8 +420,8 @@ export class DesktopBridgeManager extends EventEmitter {
           }
           delete readyCfg.autoStartDisabled
           let needsSave = hadAutoStartDisabled
-          if (!normalizeDesktopE2eeKey(readyCfg.e2eeKey)) {
-            readyCfg.e2eeKey = generateDesktopE2eeKey()
+          if (!normalizeE2eeKey(readyCfg.e2eeKey)) {
+            readyCfg.e2eeKey = generateE2eeKey()
             needsSave = true
           }
           if (needsSave) {
@@ -431,7 +433,7 @@ export class DesktopBridgeManager extends EventEmitter {
       if (!readyCfg) {
         const sameRoomRebind = Boolean(cfg && cfg.mode === 'account' && cfg.roomId === roomId)
         const existingBridgeId = sameRoomRebind ? String(cfg.bridgeId || '').trim() : ''
-        const preservedE2eeKey = sameRoomRebind ? normalizeDesktopE2eeKey(cfg.e2eeKey) : ''
+        const preservedE2eeKey = sameRoomRebind ? normalizeE2eeKey(cfg.e2eeKey) : ''
         this.appendLog(
           `Auto-registering this PC into account @${username || roomId} on ${baseUrl}${existingBridgeId ? ` (rebind bridgeId=${existingBridgeId})` : ''}...`,
         )
@@ -446,7 +448,7 @@ export class DesktopBridgeManager extends EventEmitter {
           deviceId: bound.deviceId,
           bridgeId: bound.bridgeId,
           bridgeSecret: bound.deviceSecret,
-          e2eeKey: preservedE2eeKey || generateDesktopE2eeKey(),
+          e2eeKey: preservedE2eeKey || generateE2eeKey(),
           label: bound.label || os.hostname() || 'My-PC',
           createdAt: Date.now(),
         }
@@ -500,8 +502,8 @@ export class DesktopBridgeManager extends EventEmitter {
     ) {
       return this.getStatus()
     }
-    if (!normalizeDesktopE2eeKey(cfg.e2eeKey)) {
-      cfg.e2eeKey = generateDesktopE2eeKey()
+    if (!normalizeE2eeKey(cfg.e2eeKey)) {
+      cfg.e2eeKey = generateE2eeKey()
       saveConfigSecure(this.configPath, cfg, this.secretStore)
     }
     this.deviceMeta = {
@@ -528,6 +530,7 @@ export class DesktopBridgeManager extends EventEmitter {
   async handleSystemResume() {
     if (this.disposed || !this.enabled) return this.getStatus()
     this.restartAttempts = 0
+    this.restartTimestamps = []
     if (this.restartTimer) {
       clearTimeout(this.restartTimer)
       this.restartTimer = null
@@ -540,7 +543,7 @@ export class DesktopBridgeManager extends EventEmitter {
       // Prompt running embedded bridge to immediately probe/reconnect its control WS after OS wake
       try {
         if (this.proc.stdin && !this.proc.stdin.destroyed && this.proc.stdin.writable) {
-          this.proc.stdin.write('resume\n')
+          this.proc.stdin.write(`${JSON.stringify({ type: 'probe' })}\n`)
         }
       } catch {}
       return this.getStatus()
@@ -564,8 +567,8 @@ export class DesktopBridgeManager extends EventEmitter {
       cfg.serverUrl
     ) {
       this.appendLog('System resumed/unlocked; restarting embedded bridge...')
-      if (!normalizeDesktopE2eeKey(cfg.e2eeKey)) {
-        cfg.e2eeKey = generateDesktopE2eeKey()
+      if (!normalizeE2eeKey(cfg.e2eeKey)) {
+        cfg.e2eeKey = generateE2eeKey()
         saveConfigSecure(this.configPath, cfg, this.secretStore)
       }
       this.deviceMeta = {
@@ -616,6 +619,7 @@ export class DesktopBridgeManager extends EventEmitter {
         '--state-dir', this.stateDir,
         '--name', label,
         '--no-browser',
+        '--machine-ipc',
       ],
       {
         cwd: os.homedir(),
@@ -625,67 +629,85 @@ export class DesktopBridgeManager extends EventEmitter {
           ALLINONE_SERVER: serverUrl,
           ALLINONE_HOME: this.stateDir,
           ALLINONE_PC_NAME: label,
-          ...(cfg.bridgeSecret ? { ALLINONE_BRIDGE_SECRET: cfg.bridgeSecret } : {}),
-          ...(cfg.e2eeKey ? { ALLINONE_E2EE_KEY: cfg.e2eeKey } : {}),
-          ...(webrtcProxyInfo?.port && webrtcProxyInfo?.token
-            ? {
-                ALLINONE_WEBRTC_PROXY_PORT: String(webrtcProxyInfo.port),
-                ALLINONE_WEBRTC_PROXY_TOKEN: String(webrtcProxyInfo.token),
-              }
-            : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       },
     )
     child.stdin?.on('error', () => {})
+    // Deliver bootstrap secrets over private stdin pipe instead of process environment variables
+    try {
+      child.stdin?.write(
+        `${JSON.stringify({
+          type: 'bootstrap',
+          bridgeSecret: cfg.bridgeSecret || '',
+          e2eeKey: cfg.e2eeKey || '',
+          webrtcProxyPort: webrtcProxyInfo?.port || 0,
+          webrtcProxyToken: webrtcProxyInfo?.token || '',
+        })}\n`,
+      )
+    } catch {}
 
     this.proc = child
     let childAuthRevoked = false
 
+    const handleMachineEvent = (ev) => {
+      if (!ev || ev.type !== 'bridge.ipc') return false
+      if (ev.event === 'state') {
+        if (ev.state === 'connected') {
+          this.restartAttempts = 0
+          this.restartTimestamps = []
+          this.state = 'connected'
+          this.error = ''
+          this.emitStatus()
+        } else if (ev.state === 'disconnected') {
+          if (!childAuthRevoked && this.state !== 'error') {
+            this.state = 'starting'
+            this.emitStatus()
+          }
+        } else if (ev.state === 'unauthorized' || ev.state === 'fatal') {
+          childAuthRevoked = true
+          this.authRevoked = true
+          this.error = '本机绑定凭证已失效，请重新登录'
+          this.state = 'error'
+          this.emitStatus()
+        }
+        return true
+      }
+      if (ev.event === 'apps' && Array.isArray(ev.apps)) {
+        this.appsSummary = ev.apps
+          .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
+          .join(' | ')
+        this.emitStatus()
+        return true
+      }
+      if (ev.event === 'autofix') {
+        this.autofixText = ev.phase === 'installing' ? String(ev.message || '') : ''
+        this.emitStatus()
+        return true
+      }
+      if (ev.event === 'fatal') {
+        this.error = String(ev.message || '桥接发生异常')
+        this.state = 'error'
+        this.emitStatus()
+        return true
+      }
+      return true
+    }
+
     const handleLine = (raw) => {
       const line = String(raw || '').trim()
       if (!line) return
-      this.appendLog(line)
-      if (this.proc !== child) return
-      if (line.includes('已加密连接到中转服务器') || line.includes('网络已恢复，重新连接成功')) {
-        this.restartAttempts = 0
-        this.state = 'connected'
-        this.error = ''
-        this.emitStatus()
-      } else if (line.includes('连接暂时中断')) {
-        if (!childAuthRevoked && this.state !== 'error') {
-          this.state = 'starting'
-          this.emitStatus()
-        }
-      } else if (line.includes('本机 AI')) {
-        const idx = line.indexOf(':')
-        if (idx !== -1) {
-          this.appsSummary = line.slice(idx + 1).trim()
-          this.emitStatus()
-        }
-      } else if (line.includes('[autofix:progress]')) {
-        const idx = line.indexOf('[autofix:progress]')
-        this.autofixText = line.slice(idx + '[autofix:progress]'.length).trim()
-        this.emitStatus()
-      } else if (line.includes('[autofix:idle]')) {
-        if (this.autofixText) {
-          this.autofixText = ''
-          this.emitStatus()
-        }
-      } else if (
-        line.includes('已被解绑') ||
-        line.includes('凭证无效') ||
-        line.includes('凭证已失效') ||
-        line.includes('凭证失效') ||
-        line.includes('已在手机端解绑')
-      ) {
-        childAuthRevoked = true
-        this.authRevoked = true
-        this.error = '本机绑定凭证已失效，请重新登录'
-        this.state = 'error'
-        this.emitStatus()
+      if (line.startsWith('{') && line.includes('"bridge.ipc"')) {
+        try {
+          const parsed = JSON.parse(line)
+          if (parsed?.type === 'bridge.ipc') {
+            if (this.proc === child) handleMachineEvent(parsed)
+            return
+          }
+        } catch {}
       }
+      this.appendLog(line)
     }
 
     let outBuf = ''
@@ -695,6 +717,9 @@ export class DesktopBridgeManager extends EventEmitter {
       while ((nl = outBuf.indexOf('\n')) !== -1) {
         handleLine(outBuf.slice(0, nl))
         outBuf = outBuf.slice(nl + 1)
+      }
+      if (outBuf.length > MAX_STDIO_LINE_BUF) {
+        outBuf = outBuf.slice(-4096)
       }
     })
     child.stdout?.on('end', () => {
@@ -711,6 +736,9 @@ export class DesktopBridgeManager extends EventEmitter {
       while ((nl = errBuf.indexOf('\n')) !== -1) {
         handleLine(`[stderr] ${errBuf.slice(0, nl)}`)
         errBuf = errBuf.slice(nl + 1)
+      }
+      if (errBuf.length > MAX_STDIO_LINE_BUF) {
+        errBuf = errBuf.slice(-4096)
       }
     })
     child.stderr?.on('end', () => {
@@ -759,6 +787,17 @@ export class DesktopBridgeManager extends EventEmitter {
           this.error = '本机绑定凭证已失效，请重新登录'
         }
         this.appendLog('Bridge device credentials revoked/unbound; disabling auto-restart until re-login')
+        this.emitStatus()
+        return
+      }
+
+      const now = Date.now()
+      this.restartTimestamps = this.restartTimestamps.filter((ts) => now - ts < RESTART_CIRCUIT_WINDOW_MS)
+      this.restartTimestamps.push(now)
+      if (this.restartTimestamps.length >= RESTART_CIRCUIT_MAX) {
+        this.state = 'error'
+        this.error = '本机桥接连续异常退出，已暂停自动重启，请查看日志后重试'
+        this.appendLog(`Restart circuit breaker tripped (${this.restartTimestamps.length} exits in 2 min)`)
         this.emitStatus()
         return
       }
@@ -821,7 +860,7 @@ export class DesktopBridgeManager extends EventEmitter {
         const killTimer = setTimeout(() => {
           try { child.kill('SIGKILL') } catch {}
           forceTimer = setTimeout(done, 150)
-        }, 2500)
+        }, 6_000)
         try {
           child.kill('SIGTERM')
         } catch {
@@ -872,6 +911,7 @@ export class DesktopBridgeManager extends EventEmitter {
       return this.stop({ nextState: 'paused' })
     }
     this.restartAttempts = 0
+    this.restartTimestamps = []
     if (this.activeAccount) {
       return this.syncAccount(this.activeAccount)
     }
@@ -897,10 +937,10 @@ export class DesktopBridgeManager extends EventEmitter {
     if (cfg.roomId !== cleanExpected) {
       return { enabled: false, key: '', keyId: '', roomId: cfg.roomId }
     }
-    let key = normalizeDesktopE2eeKey(cfg.e2eeKey)
+    let key = normalizeE2eeKey(cfg.e2eeKey)
     let generatedNew = false
     if (!key) {
-      key = generateDesktopE2eeKey()
+      key = generateE2eeKey()
       cfg.e2eeKey = key
       saveConfigSecure(this.configPath, cfg, this.secretStore)
       generatedNew = true
@@ -932,7 +972,7 @@ export class DesktopBridgeManager extends EventEmitter {
       throw new Error('缺少有效的账号标识，无法更新端到端密钥')
     }
     this.syncSeq += 1
-    const normalized = normalizeDesktopE2eeKey(rawKey)
+    const normalized = normalizeE2eeKey(rawKey)
     if (!normalized) {
       throw new Error('无效的端到端密钥格式（应为 43 位 Base64URL 密钥）')
     }
@@ -996,7 +1036,7 @@ export class DesktopBridgeManager extends EventEmitter {
 
   async rotateE2eeKey(expectedRoomId = '') {
     this.syncSeq += 1
-    return this.setE2eeKey(expectedRoomId, generateDesktopE2eeKey())
+    return this.setE2eeKey(expectedRoomId, generateE2eeKey())
   }
 
   async dispose() {

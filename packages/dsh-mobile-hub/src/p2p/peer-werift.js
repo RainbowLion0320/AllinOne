@@ -34,8 +34,15 @@ export function createWeriftPeer({
   let lastTransport = ''
   let remoteDescSet = false
   const pendingIce = []
+  const detectTimers = new Set()
+
+  const clearDetectTimers = () => {
+    for (const t of detectTimers) clearTimeout(t)
+    detectTimers.clear()
+  }
 
   const teardown = () => {
+    clearDetectTimers()
     if (pcClosed) return teardownPromise || Promise.resolve()
     pcClosed = true
     teardownPromise = (async () => {
@@ -56,7 +63,20 @@ export function createWeriftPeer({
   const reportTransport = (nextTransport) => {
     if (closed || !nextTransport || nextTransport === lastTransport) return
     lastTransport = nextTransport
+    clearDetectTimers()
     try { onTransportChange?.(nextTransport) } catch {}
+  }
+
+  const scheduleTransportRetries = () => {
+    if (closed || lastTransport) return
+    for (const delay of [300, 1000, 2500]) {
+      const t = setTimeout(() => {
+        detectTimers.delete(t)
+        if (!closed && !lastTransport) void detectIceTransport()
+      }, delay)
+      t.unref?.()
+      detectTimers.add(t)
+    }
   }
 
   const detectIceTransport = async () => {
@@ -117,6 +137,7 @@ export function createWeriftPeer({
       return
     }
     void detectIceTransport()
+    if (st === 'connected' || st === 'completed') scheduleTransportRetries()
   })
 
   pc.connectionStateChange.subscribe((st) => {
@@ -127,6 +148,7 @@ export function createWeriftPeer({
       return
     }
     void detectIceTransport()
+    if (st === 'connected') scheduleTransportRetries()
   })
 
   const bindChannel = (dc) => {
@@ -137,6 +159,7 @@ export function createWeriftPeer({
         if (!closed) {
           try { onCtrlOpen?.() } catch {}
           void detectIceTransport()
+          scheduleTransportRetries()
         }
       }
       if (dc.readyState === 'open') notifyOpen()

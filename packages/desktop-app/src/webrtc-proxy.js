@@ -33,16 +33,34 @@ function encodeJsonFrame(obj) {
 
 function encodeBinFrame(peerId, role, bytes) {
   const pidBuf = Buffer.from(String(peerId || ''), 'utf8')
+  if (pidBuf.length > 255) {
+    throw new Error(`peerId exceeds 255 UTF-8 bytes (${pidBuf.length})`)
+  }
   const raw = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const bodyLen = 1 + 1 + pidBuf.length + 1 + raw.length
   const out = Buffer.allocUnsafe(4 + bodyLen)
   out.writeUInt32BE(bodyLen, 0)
   out[4] = FRAME_BIN
-  out[5] = pidBuf.length & 0xff
+  out[5] = pidBuf.length
   pidBuf.copy(out, 6)
   out[6 + pidBuf.length] = role === 'bulk' ? 1 : 0
   raw.copy(out, 7 + pidBuf.length)
   return out
+}
+
+const MAX_SOCKET_WRITE_BACKLOG = 8 * 1024 * 1024
+
+function writeSocketSafe(sock, frameBuf) {
+  if (!sock || sock.destroyed || !sock.writable) return false
+  if (sock.writableLength > MAX_SOCKET_WRITE_BACKLOG) {
+    return false
+  }
+  try {
+    sock.write(frameBuf)
+    return true
+  } catch {
+    return false
+  }
 }
 
 export class DesktopWebRtcProxy {
@@ -58,6 +76,7 @@ export class DesktopWebRtcProxy {
     this.workerWin = null
     this.workerReadyPromise = null
     this.activeSocket = null
+    this.sockets = new Set()
     this.activePeerIds = new Set()
     this.pendingReqIds = new Set()
     this.idleTimer = null
@@ -77,6 +96,9 @@ export class DesktopWebRtcProxy {
       srv.once('error', rejectStart)
       srv.listen(0, '127.0.0.1', () => {
         srv.off('error', rejectStart)
+        srv.on('error', (err) => {
+          this.log.warn?.(`[webrtc-proxy] server error: ${String(err?.message || err)}`)
+        })
         const addr = srv.address()
         this.server = srv
         this.port = typeof addr === 'object' && addr ? addr.port : 0
@@ -123,10 +145,15 @@ export class DesktopWebRtcProxy {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        webSecurity: true,
         backgroundThrottling: false,
       },
     })
     this.workerWin = win
+    win.webContents?.setWindowOpenHandler?.(() => ({ action: 'deny' }))
+    win.webContents?.on?.('will-navigate', (ev) => {
+      try { ev.preventDefault() } catch {}
+    })
 
     const readyPromise = new Promise((resolveReady, rejectReady) => {
       let settled = false
@@ -243,9 +270,7 @@ export class DesktopWebRtcProxy {
       if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
     }
     if (this.activeSocket && !this.activeSocket.destroyed) {
-      try {
-        this.activeSocket.write(encodeJsonFrame(msg))
-      } catch {}
+      writeSocketSafe(this.activeSocket, encodeJsonFrame(msg))
     }
   }
 
@@ -255,19 +280,56 @@ export class DesktopWebRtcProxy {
       return
     }
     try {
-      this.activeSocket.write(encodeBinFrame(payload.peerId, payload.role, payload.bytes))
+      writeSocketSafe(this.activeSocket, encodeBinFrame(payload.peerId, payload.role, payload.bytes))
     } catch {}
   }
 
   handleClientSocket(socket) {
+    this.sockets.add(socket)
     socket.setNoDelay(true)
     let authed = false
-    let buf = Buffer.alloc(0)
+    const chunks = []
+    let bufferedLen = 0
     let frameQueue = Promise.resolve()
     let queuedFrameBytes = 0
     let socketPaused = false
     const MAX_QUEUED_FRAME_BYTES = 4 * 1024 * 1024
     const RESUME_QUEUED_FRAME_BYTES = 1 * 1024 * 1024
+
+    const peekHeaderLen = () => {
+      if (bufferedLen < 4) return -1
+      if (chunks[0].length >= 4) return chunks[0].readUInt32BE(0)
+      const hdr = Buffer.allocUnsafe(4)
+      let off = 0
+      for (let i = 0; i < chunks.length && off < 4; i += 1) {
+        const take = Math.min(4 - off, chunks[i].length)
+        chunks[i].copy(hdr, off, 0, take)
+        off += take
+      }
+      return hdr.readUInt32BE(0)
+    }
+
+    const consumeBytes = (n) => {
+      if (chunks.length > 0 && chunks[0].length >= n) {
+        const out = Buffer.from(chunks[0].subarray(0, n))
+        if (chunks[0].length === n) chunks.shift()
+        else chunks[0] = chunks[0].subarray(n)
+        bufferedLen -= n
+        return out
+      }
+      const out = Buffer.allocUnsafe(n)
+      let off = 0
+      while (off < n && chunks.length > 0) {
+        const head = chunks[0]
+        const take = Math.min(n - off, head.length)
+        head.copy(out, off, 0, take)
+        off += take
+        if (take === head.length) chunks.shift()
+        else chunks[0] = head.subarray(take)
+      }
+      bufferedLen -= n
+      return out
+    }
 
     let authTimer = setTimeout(() => {
       authTimer = null
@@ -402,18 +464,20 @@ export class DesktopWebRtcProxy {
     }
 
     socket.on('data', (chunk) => {
-      buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk])
-      while (buf.length >= 4) {
-        const len = buf.readUInt32BE(0)
+      if (!chunk || chunk.length === 0) return
+      chunks.push(chunk)
+      bufferedLen += chunk.length
+      while (bufferedLen >= 4) {
+        const len = peekHeaderLen()
         if (len <= 0 || len > 16 * 1024 * 1024) {
           socket.destroy()
           return
         }
-        if (buf.length < 4 + len) break
-        const kind = buf[4]
-        const payload = Buffer.from(buf.subarray(5, 4 + len))
+        if (bufferedLen < 4 + len) break
+        const frame = consumeBytes(4 + len)
+        const kind = frame[4]
+        const payload = frame.subarray(5)
         const frameBytes = payload.length
-        buf = buf.subarray(4 + len)
         queuedFrameBytes += frameBytes
         if (!socketPaused && queuedFrameBytes >= MAX_QUEUED_FRAME_BYTES) {
           socketPaused = true
@@ -435,6 +499,7 @@ export class DesktopWebRtcProxy {
     })
 
     socket.on('close', () => {
+      this.sockets.delete(socket)
       clearAuthTimer()
       if (this.activeSocket === socket) {
         this.activeSocket = null
@@ -447,6 +512,7 @@ export class DesktopWebRtcProxy {
       }
     })
     socket.on('error', () => {
+      this.sockets.delete(socket)
       clearAuthTimer()
       try { socket.destroy() } catch {}
     })
@@ -459,10 +525,11 @@ export class DesktopWebRtcProxy {
     this.pendingReqIds.clear()
     this.ipcMain.removeListener('webrtc-worker:control', this._onWorkerControl)
     this.ipcMain.removeListener('webrtc-worker:binary', this._onWorkerBinary)
-    if (this.activeSocket) {
-      try { this.activeSocket.destroy() } catch {}
-      this.activeSocket = null
+    for (const sock of [...this.sockets]) {
+      try { sock.destroy() } catch {}
     }
+    this.sockets.clear()
+    this.activeSocket = null
     if (this.workerWin && !this.workerWin.isDestroyed()) {
       try { this.workerWin.destroy() } catch {}
       this.workerWin = null

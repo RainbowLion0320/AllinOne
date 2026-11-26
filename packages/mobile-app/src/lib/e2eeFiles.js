@@ -5,11 +5,15 @@ import { getDeliverableName, normalizeDeliverableKey } from './deliverableFiles.
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
 
 const MAX_FILE_CACHE = 16
+const MAX_FILE_CACHE_BYTES = 25 * 1024 * 1024 // 25 MB memory cap across cached deliverables
+const MAX_SINGLE_CACHED_FILE_BYTES = 12 * 1024 * 1024 // Skip caching >12 MB blobs in RAM
+const NATIVE_EXPORT_CHUNK_BYTES = 512 * 1024 // 512 KB base64 bridge chunks (~682 KB string) -> zero Android OOM!
 /** @type {Map<string, { blob: Blob, url: string, filename: string, mimeType: string, size: number, path: string, ts: number }>} */
 const deliverableCache = new Map()
 /** @type {Map<string, Promise<any>>} */
 const inflightFileLoads = new Map()
 let fileCacheEpoch = 0
+let deliverableCacheBytes = 0
 
 function makeCacheKey(rawPath, context = {}) {
   const norm = normalizeDeliverableKey(rawPath)
@@ -21,19 +25,30 @@ function makeCacheKey(rawPath, context = {}) {
 }
 
 function storeCachedDeliverable(cacheKey, entry) {
+  const entrySize = Number(entry?.size || entry?.blob?.size || 0)
+  if (entrySize > MAX_SINGLE_CACHED_FILE_BYTES) {
+    return
+  }
   const prev = deliverableCache.get(cacheKey)
-  if (prev?.url && prev.url !== entry.url) {
-    try { URL.revokeObjectURL(prev.url) } catch {}
+  if (prev) {
+    deliverableCacheBytes = Math.max(0, deliverableCacheBytes - Number(prev.size || prev.blob?.size || 0))
+    if (prev.url && prev.url !== entry.url) {
+      try { URL.revokeObjectURL(prev.url) } catch {}
+    }
   }
   deliverableCache.delete(cacheKey)
   deliverableCache.set(cacheKey, entry)
-  while (deliverableCache.size > MAX_FILE_CACHE) {
+  deliverableCacheBytes += entrySize
+  while (deliverableCache.size > MAX_FILE_CACHE || deliverableCacheBytes > MAX_FILE_CACHE_BYTES) {
     const oldestKey = deliverableCache.keys().next().value
     if (!oldestKey) break
     const oldest = deliverableCache.get(oldestKey)
     deliverableCache.delete(oldestKey)
-    if (oldest?.url) {
-      try { URL.revokeObjectURL(oldest.url) } catch {}
+    if (oldest) {
+      deliverableCacheBytes = Math.max(0, deliverableCacheBytes - Number(oldest.size || oldest.blob?.size || 0))
+      if (oldest.url) {
+        try { URL.revokeObjectURL(oldest.url) } catch {}
+      }
     }
   }
 }
@@ -46,6 +61,7 @@ export function clearE2eeDeliverableCache() {
     }
   }
   deliverableCache.clear()
+  deliverableCacheBytes = 0
   inflightFileLoads.clear()
 }
 
@@ -157,17 +173,117 @@ function blobToBase64(blob) {
   })
 }
 
+function uint8ToBase64(u8) {
+  const CHUNK = 0x8000
+  let binary = ''
+  for (let i = 0; i < u8.byteLength; i += CHUNK) {
+    binary += String.fromCharCode(...u8.subarray(i, Math.min(u8.byteLength, i + CHUNK)))
+  }
+  return btoa(binary)
+}
+
+function supportsStreamingAndroidExport(plugin) {
+  return Boolean(
+    plugin &&
+    typeof plugin.openExport === 'function' &&
+    typeof plugin.writeExportChunk === 'function' &&
+    typeof plugin.finishExport === 'function',
+  )
+}
+
 export async function saveOrShareBlobNatively(blob, { filename = 'document', mimeType = 'application/octet-stream', mode = 'save' } = {}) {
   const plugin = getNativeAndroidFilesPlugin()
   if (!plugin || !blob) return false
+  const cleanFilename = String(filename || 'document')
+  const cleanMime = String(mimeType || blob.type || 'application/octet-stream')
+  const cleanMode = mode === 'share' ? 'share' : 'save'
+
+  // Stream via chunked export bridge when available (prevents >250MB Base64 OOM crashes on Android!)
+  if (supportsStreamingAndroidExport(plugin) && blob.size > NATIVE_EXPORT_CHUNK_BYTES) {
+    const { exportId } = await plugin.openExport({
+      filename: cleanFilename,
+      mimeType: cleanMime,
+      mode: cleanMode,
+    })
+    try {
+      for (let off = 0; off < blob.size; off += NATIVE_EXPORT_CHUNK_BYTES) {
+        const sliceBuf = await blob.slice(off, Math.min(blob.size, off + NATIVE_EXPORT_CHUNK_BYTES)).arrayBuffer()
+        await plugin.writeExportChunk({
+          exportId,
+          chunkBase64: uint8ToBase64(new Uint8Array(sliceBuf)),
+        })
+      }
+      await plugin.finishExport({ exportId, cancel: false })
+      return true
+    } catch (err) {
+      await plugin.finishExport({ exportId, cancel: true }).catch(() => {})
+      throw err
+    }
+  }
+
   const dataBase64 = await blobToBase64(blob)
   await plugin.saveAndShare({
-    filename: String(filename || 'document'),
-    mimeType: String(mimeType || blob.type || 'application/octet-stream'),
+    filename: cleanFilename,
+    mimeType: cleanMime,
     dataBase64,
-    mode: mode === 'share' ? 'share' : 'save',
+    mode: cleanMode,
   })
   return true
+}
+
+/**
+ * Direct zero-OOM P2P -> Android MediaStore streaming export for huge deliverables (>12MB).
+ * Decrypts AIO2 chunks on-the-fly and writes 512 KB slices directly to native storage without buffering the full Blob.
+ */
+export async function streamExportDeliverableDirect(rawPath, context = {}, { mode = 'save', onProgress = null } = {}) {
+  const plugin = getNativeAndroidFilesPlugin()
+  if (!supportsStreamingAndroidExport(plugin)) return false
+  const client = context?.client
+  if (!client) throw new Error(L('未连接到电脑端，请先确认电脑在线', 'Not connected to computer'))
+
+  const target = String(rawPath || '').trim()
+  const bridgeId = String(context?.bridgeId || '').trim()
+  const cwd = String(context?.cwd || '').trim()
+  const sessionId = String(context?.sessionId || '').trim()
+
+  const result = await client.rpc(
+    RPC.FILE_READ,
+    { path: target, cwd, mode: 'document', ...(sessionId ? { sessionId } : {}) },
+    300_000,
+    bridgeId ? { bridgeId } : {},
+  )
+  if (result?.transferMode !== 'p2p-bulk' || !result?.streamId) {
+    throw new Error(L('未能读取到文件内容', 'Failed to read file bytes'))
+  }
+  const mimeType = String(result?.mimeType || 'application/octet-stream')
+  const filename = String(result?.filename || getDeliverableName(target, 'download'))
+  const { exportId } = await plugin.openExport({
+    filename,
+    mimeType,
+    mode: mode === 'share' ? 'share' : 'save',
+  })
+  try {
+    await client.downloadP2pBulk(result.streamId, {
+      mimeType,
+      size: Number(result?.size || 0),
+      bridgeId,
+      onProgress,
+      onPlainChunk: async (plainChunk) => {
+        for (let off = 0; off < plainChunk.byteLength; off += NATIVE_EXPORT_CHUNK_BYTES) {
+          const sub = plainChunk.subarray(off, Math.min(plainChunk.byteLength, off + NATIVE_EXPORT_CHUNK_BYTES))
+          await plugin.writeExportChunk({
+            exportId,
+            chunkBase64: uint8ToBase64(sub),
+          })
+        }
+      },
+    })
+    await plugin.finishExport({ exportId, cancel: false })
+    return true
+  } catch (err) {
+    await plugin.finishExport({ exportId, cancel: true }).catch(() => {})
+    throw err
+  }
 }
 
 export function canNativeShareFiles() {

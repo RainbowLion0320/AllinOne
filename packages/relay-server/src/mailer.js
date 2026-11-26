@@ -3,6 +3,8 @@ import tls from 'node:tls'
 import { randomBytes } from 'node:crypto'
 
 const DEFAULT_SMTP_TIMEOUT_MS = 15_000
+const MAX_SMTP_BUFFER_BYTES = 64 * 1024
+const MAX_CONCURRENT_MAILS = 8
 
 function sanitizeHeaderValue(val) {
   return String(val ?? '').replace(/[\r\n]+/g, ' ').trim()
@@ -203,6 +205,11 @@ async function sendViaSmtp({
     sock.setTimeout(timeoutMs)
     sock.on('data', (chunk) => {
       buffer += chunk
+      if (buffer.length > MAX_SMTP_BUFFER_BYTES) {
+        failPending(new Error('SMTP 响应超出安全缓冲区上限'))
+        try { sock.destroy() } catch {}
+        return
+      }
       processBuffer()
     })
     sock.on('timeout', () => {
@@ -364,6 +371,7 @@ async function sendViaSmtp({
 async function sendViaResend({ apiKey, from, to, subject, text, html, timeoutMs = DEFAULT_SMTP_TIMEOUT_MS }) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  timer?.unref?.()
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -482,38 +490,59 @@ export function createMailer(options = {}) {
     return getProvider() !== 'none'
   }
 
+  let inFlightMails = 0
+  const mailWaiters = []
+  async function acquireMailSlot() {
+    if (inFlightMails < MAX_CONCURRENT_MAILS) {
+      inFlightMails += 1
+      return
+    }
+    await new Promise((resolve) => mailWaiters.push(resolve))
+    inFlightMails += 1
+  }
+  function releaseMailSlot() {
+    inFlightMails = Math.max(0, inFlightMails - 1)
+    const next = mailWaiters.shift()
+    if (next) next()
+  }
+
   async function sendMail({ to, subject, text, html }) {
     const provider = getProvider()
     if (provider === 'none') {
       throw new Error('服务器尚未配置邮件服务（SMTP 或 Resend）')
     }
-    if (provider === 'custom') {
-      return customSend({ to, subject, text, html })
-    }
-    if (provider === 'smtp') {
-      return sendViaSmtp({
-        host: smtpHost,
-        port: smtpPort,
-        secure: smtpSecure,
-        starttls: smtpStarttls,
-        rejectUnauthorized: smtpRejectUnauthorized,
-        user: smtpUser,
-        pass: smtpPass,
-        from: smtpFrom || `All in One <${smtpUser}>`,
+    await acquireMailSlot()
+    try {
+      if (provider === 'custom') {
+        return await customSend({ to, subject, text, html })
+      }
+      if (provider === 'smtp') {
+        return await sendViaSmtp({
+          host: smtpHost,
+          port: smtpPort,
+          secure: smtpSecure,
+          starttls: smtpStarttls,
+          rejectUnauthorized: smtpRejectUnauthorized,
+          user: smtpUser,
+          pass: smtpPass,
+          from: smtpFrom || `All in One <${smtpUser}>`,
+          to,
+          subject,
+          text,
+          html,
+        })
+      }
+      return await sendViaResend({
+        apiKey: resendApiKey,
+        from: resendFrom,
         to,
         subject,
         text,
         html,
       })
+    } finally {
+      releaseMailSlot()
     }
-    return sendViaResend({
-      apiKey: resendApiKey,
-      from: resendFrom,
-      to,
-      subject,
-      text,
-      html,
-    })
   }
 
   async function sendVerificationCode({ to, code, purpose, username = '' }) {

@@ -36,6 +36,7 @@ export function apply(ctx, config = {}) {
     ctx,
     config,
     log,
+    onlyDsh: !enableDispatchTools,
     onEvent: (event, payload) => {
       ipcServer?.emitEvent?.(event, payload)
     },

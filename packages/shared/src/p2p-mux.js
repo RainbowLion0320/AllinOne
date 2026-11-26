@@ -5,20 +5,21 @@
  * and Node.js (`werift` RTCDataChannel) with zero external dependencies.
  *
  * Channels:
- *  - `aio-ctrl`: Ordered reliable JSON channel for E2EE RPCs, streaming events, and bulk control.
- *                Automatically fragments JSON strings > 48 KB into safe SCTP slices.
- *  - `aio-bulk`: Ordered reliable binary channel for E2EE file/image transfers (64 KB safe slices
- *                with strict bufferedAmount flow control).
+ *  - `aio-ctrl`: Ordered reliable binary channel (`AIOC`/`AIOF`) carrying JSON metadata plus an
+ *                optional zero-copy binary payload, auto-fragmented into <= 48 KB SCTP slices.
+ *  - `aio-bulk`: Ordered reliable binary channel (`AIOB`) for E2EE file/image transfers (60 KB safe
+ *                slices with bufferedAmount + credit-window flow control).
  */
 
 export const P2P_CTRL_LABEL = 'aio-ctrl'
 export const P2P_BULK_LABEL = 'aio-bulk'
 
 export const CTRL_FRAG_LIMIT_BYTES = 48 * 1024
-export const CTRL_FRAG_LIMIT_CHARS = CTRL_FRAG_LIMIT_BYTES
+export const CTRL_MAX_FRAGMENTS = 1024
 export const BULK_SLICE_BYTES = 60 * 1024
 export const BULK_HIGH_WATER_BYTES = 2 * 1024 * 1024
 export const BULK_LOW_WATER_BYTES = 512 * 1024
+export const BULK_DEFAULT_WINDOW_BYTES = 8 * 1024 * 1024
 
 export const BULK_HEADER_BYTES = 16
 export const BULK_FLAG_EOF = 1
@@ -32,7 +33,7 @@ const CTRL_SINGLE_MAGIC_3 = 0x43 // 'C' -> 'AIOC'
 const CTRL_FRAG_MAGIC_3 = 0x46   // 'F' -> 'AIOF'
 const CTRL_SINGLE_HEADER_BYTES = 4
 const CTRL_FRAG_HEADER_BYTES = 16
-const MAX_CTRL_REASSEMBLY_BYTES = 32 * 1024 * 1024
+export const MAX_CTRL_REASSEMBLY_BYTES = 32 * 1024 * 1024
 
 function toU8(data) {
   if (data instanceof Uint8Array && data.constructor === Uint8Array) return data
@@ -136,15 +137,12 @@ export async function waitForChannelDrain(
     }
 
     const timer = setTimeout(() => finish(new Error('DataChannel backpressure timeout')), timeoutMs)
+    timer.unref?.()
     cleanups.push(() => clearTimeout(timer))
 
-    const poll = setInterval(() => {
-      if (!isOpen()) return finish(new Error('DataChannel closed during transfer'))
-      if (getBuffered() <= lowWaterMark) finish()
-    }, 20)
-    cleanups.push(() => clearInterval(poll))
-
+    let hasNativeDrainEvent = false
     if (typeof dc.addEventListener === 'function') {
+      hasNativeDrainEvent = true
       const onLow = () => {
         if (getBuffered() <= lowWaterMark) finish()
       }
@@ -156,11 +154,21 @@ export async function waitForChannelDrain(
         dc.removeEventListener('close', onClose)
       })
     } else if (dc.bufferedAmountLow && typeof dc.bufferedAmountLow.subscribe === 'function') {
+      hasNativeDrainEvent = true
       const sub = dc.bufferedAmountLow.subscribe(() => {
         if (getBuffered() <= lowWaterMark) finish()
       })
       cleanups.push(() => sub?.unsubscribe?.())
     }
+
+    // Only poll at 50 Hz if the DataChannel lacks native low-water events; otherwise use a gentle 250ms safety check.
+    const pollMs = hasNativeDrainEvent ? 250 : 20
+    const poll = setInterval(() => {
+      if (!isOpen()) return finish(new Error('DataChannel closed during transfer'))
+      if (getBuffered() <= lowWaterMark) finish()
+    }, pollMs)
+    poll.unref?.()
+    cleanups.push(() => clearInterval(poll))
 
     if (signal) {
       const onAbort = () => {
@@ -184,6 +192,138 @@ export async function sendWithBackpressure(dc, bytes, opts = {}) {
     throw new Error('DataChannel closed')
   }
   dc.send(bytes)
+}
+
+/**
+ * Serialize async writes onto a single DataChannel so concurrent streams or fragmented
+ * control bursts cannot race on `bufferedAmountLowThreshold` or overshoot `highWaterMark`.
+ */
+export function createSerializedChannelWriter(dc = null, defaultOpts = {}) {
+  let chain = Promise.resolve()
+  let closed = false
+
+  function enqueue(fn) {
+    if (closed) return Promise.reject(new Error('DataChannel writer closed'))
+    const task = chain.then(() => {
+      if (closed) throw new Error('DataChannel writer closed')
+      return fn()
+    })
+    chain = task.catch(() => {})
+    return task
+  }
+
+  function send(bytes, opts = {}) {
+    if (!dc) return Promise.reject(new Error('DataChannel not bound to writer'))
+    const merged = { ...defaultOpts, ...opts }
+    return enqueue(() => sendWithBackpressure(dc, bytes, merged))
+  }
+
+  function close() {
+    closed = true
+  }
+
+  return { enqueue, send, close }
+}
+
+/**
+ * Credit-based receiver-driven window controller for `aio-bulk` streams.
+ * Prevents fast LAN senders from overflowing slow receivers' crypto/disk queues.
+ */
+export function createBulkWindowController({
+  initialWindowBytes = BULK_DEFAULT_WINDOW_BYTES,
+  timeoutMs = 45_000,
+} = {}) {
+  let creditBytes = Math.max(BULK_SLICE_BYTES, Number(initialWindowBytes) || BULK_DEFAULT_WINDOW_BYTES)
+  let closedErr = null
+  const waiters = []
+
+  function wakeAll() {
+    while (waiters.length > 0) {
+      const w = waiters[0]
+      if (closedErr) {
+        waiters.shift()
+        w.reject(closedErr)
+      } else if (creditBytes >= w.needed) {
+        waiters.shift()
+        creditBytes -= w.needed
+        w.resolve()
+      } else {
+        break
+      }
+    }
+  }
+
+  function grant(bytes) {
+    const n = Math.floor(Number(bytes) || 0)
+    if (n <= 0 || closedErr) return
+    creditBytes += n
+    wakeAll()
+  }
+
+  function consume(bytes, signal = null) {
+    const needed = Math.max(1, Math.floor(Number(bytes) || 0))
+    if (closedErr) return Promise.reject(closedErr)
+    if (signal?.aborted) {
+      const err = new Error('Transfer aborted')
+      err.name = 'AbortError'
+      return Promise.reject(err)
+    }
+    if (waiters.length === 0 && creditBytes >= needed) {
+      creditBytes -= needed
+      return Promise.resolve()
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        clearTimeout(timer)
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+        const idx = waiters.indexOf(entry)
+        if (idx !== -1) waiters.splice(idx, 1)
+      }
+      const entry = {
+        needed,
+        resolve: () => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve()
+        },
+        reject: (err) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          reject(err)
+        },
+      }
+      const timer = setTimeout(() => {
+        entry.reject(new Error('Bulk receive window timeout'))
+      }, timeoutMs)
+      timer.unref?.()
+      const onAbort = signal
+        ? () => {
+            const err = new Error('Transfer aborted')
+            err.name = 'AbortError'
+            entry.reject(err)
+          }
+        : null
+      if (signal && onAbort) signal.addEventListener('abort', onAbort, { once: true })
+      waiters.push(entry)
+    })
+  }
+
+  function abort(err) {
+    closedErr = err instanceof Error ? err : new Error(String(err || 'Bulk window aborted'))
+    wakeAll()
+  }
+
+  return {
+    grant,
+    consume,
+    abort,
+    get availableBytes() {
+      return creditBytes
+    },
+  }
 }
 
 const ctrlTextEncoder = new TextEncoder()
@@ -268,6 +408,11 @@ export function createCtrlCodec({
     const metaBytes = ctrlTextEncoder.encode(JSON.stringify(metaObj))
     const binLen = binBytes ? binBytes.byteLength : 0
     const logicalLen = 4 + metaBytes.byteLength + binLen
+    if (logicalLen > totalReassemblyCap) {
+      const err = new Error(`Control message (${logicalLen} B) exceeds maximum limit (${totalReassemblyCap} B)`)
+      err.code = 'CTRL_MESSAGE_TOO_LARGE'
+      throw err
+    }
     const logical = new Uint8Array(logicalLen)
     new DataView(logical.buffer, logical.byteOffset, 4).setUint32(0, metaBytes.byteLength, false)
     logical.set(metaBytes, 4)
@@ -286,6 +431,11 @@ export function createCtrlCodec({
     const fragId = fragSeq++ >>> 0
     const sliceCap = CTRL_FRAG_LIMIT_BYTES - CTRL_FRAG_HEADER_BYTES
     const total = Math.ceil(logicalLen / sliceCap)
+    if (total > CTRL_MAX_FRAGMENTS) {
+      const err = new Error(`Control message requires ${total} fragments (max ${CTRL_MAX_FRAGMENTS})`)
+      err.code = 'CTRL_MESSAGE_TOO_LARGE'
+      throw err
+    }
     const frames = new Array(total)
     for (let i = 0; i < total; i += 1) {
       const start = i * sliceCap
@@ -332,10 +482,18 @@ export function createCtrlCodec({
     const fragId = view.getUint32(4, false)
     const idx = view.getUint32(8, false)
     const total = view.getUint32(12, false)
-    if (total === 0 || total > 1024 || idx >= total) {
+    if (total === 0 || total > CTRL_MAX_FRAGMENTS || idx >= total) {
       return null
     }
-    const slice = bytes.subarray(CTRL_FRAG_HEADER_BYTES)
+    const rawSlice = bytes.subarray(CTRL_FRAG_HEADER_BYTES)
+    if (rawSlice.byteLength > CTRL_FRAG_LIMIT_BYTES) {
+      return null
+    }
+    // Detach from oversized/pooled backing ArrayBuffers so fragmented messages never pin large slabs
+    const slice =
+      rawSlice.buffer.byteLength > Math.max(CTRL_FRAG_LIMIT_BYTES * 2, rawSlice.byteLength * 2)
+        ? rawSlice.slice()
+        : rawSlice
     const now = Date.now()
     let entry = assemblies.get(fragId)
     if (entry && now - entry.createdAt > fragTimeoutMs) {

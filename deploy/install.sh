@@ -197,7 +197,7 @@ generate_secret() {
   elif [ -r /dev/urandom ]; then
     od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
   else
-    date +%s%N | sha256sum | awk '{print $1}'
+    die "无法安全生成高强度 JWT_SECRET：缺少 openssl 与 /dev/urandom，已拒绝降级为弱随机数。"
   fi
 }
 
@@ -343,6 +343,15 @@ services:
     image: ${ALLINONE_IMAGE:-ghcr.io/rainbowlion0320/allinone-relay:latest}
     container_name: allinone-relay
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 自动透传同目录 .env 中的全部配置（JWT_SECRET / PUBLIC_RELAY_URL / ALLOWED_ORIGINS /
     # MAX_DAILY_REGISTRATIONS / ADMIN_BOOTSTRAP_TOKEN / ICE_SERVERS / STUN_PORT / TURN_* / CF_TURN_* / SMTP_* / RESEND_*）
     env_file:
@@ -350,6 +359,7 @@ services:
     environment:
       PORT: 8787
       HOST: 0.0.0.0
+      TRUST_PROXY: ${TRUST_PROXY:-private}
       STUN_PORT: ${STUN_PORT:-3478}
     volumes:
       - relay_data:/app/packages/relay-server/data
@@ -364,6 +374,13 @@ services:
     image: caddy:2-alpine
     container_name: allinone-caddy
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "80:80"
       - "443:443"
@@ -372,7 +389,8 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - allinone-relay
+      allinone-relay:
+        condition: service_healthy
 
 volumes:
   relay_data:
@@ -396,6 +414,7 @@ services:
     environment:
       PORT: 8787
       HOST: 0.0.0.0
+      TRUST_PROXY: \${TRUST_PROXY:-private}
       STUN_PORT: \${STUN_PORT:-3478}
     volumes:
       - relay_data:/app/packages/relay-server/data
@@ -482,14 +501,29 @@ main() {
 
   if [ "$UPGRADE_ONLY" = "1" ]; then
     [ -f "$compose_file" ] || die "未找到 ${compose_file}，无法升级；请先运行首次部署。"
-    local saved_image
+    local saved_image prev_image_id backup_dir
     saved_image="$(read_env_val "$env_file" "ALLINONE_IMAGE")"
     [ -n "$saved_image" ] && IMAGE="$saved_image"
+    prev_image_id="$(docker inspect --format='{{.Image}}' allinone-relay 2>/dev/null || true)"
+    backup_dir="${INSTALL_DIR}/backups/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    if docker ps -q --filter 'name=^/allinone-relay$' | grep -q .; then
+      info "升级前备份账号数据到 ${backup_dir} ..."
+      docker cp allinone-relay:/app/packages/relay-server/data/. "$backup_dir/" 2>/dev/null || true
+      chmod -R go-rwx "$backup_dir" 2>/dev/null || true
+    fi
     prepare_image
     (cd "$INSTALL_DIR" && "${COMPOSE_CMD[@]}" --env-file "$env_file" up -d)
     info "等待服务健康检查..."
-    wait_relay_healthy || die "服务启动超时，请运行：cd ${INSTALL_DIR} && docker compose logs --tail=50"
-    ok "All in One 已无损升级并重启成功！"
+    if ! wait_relay_healthy; then
+      err "新镜像健康检查失败，尝试自动回滚到升级前镜像..."
+      if [ -n "$prev_image_id" ]; then
+        (cd "$INSTALL_DIR" && ALLINONE_IMAGE="$prev_image_id" "${COMPOSE_CMD[@]}" --env-file "$env_file" up -d) || true
+        wait_relay_healthy && err "已回滚到旧版本镜像，请检查日志排查新版本原因。"
+      fi
+      die "服务启动超时，请运行：cd ${INSTALL_DIR} && docker compose logs --tail=50"
+    fi
+    ok "All in One 已无损升级并重启成功！（升级前备份：${backup_dir}）"
     local saved_url
     saved_url="$(read_env_val "$env_file" "PUBLIC_RELAY_URL")"
     [ -n "$saved_url" ] && printf "访问地址：%s\n" "$saved_url"
@@ -635,7 +669,7 @@ EOF
   fi
   chmod 600 "$tmp_env"
   mv -f "$tmp_env" "$env_file"
-  ok "已写入加密配置文件：${env_file} (权限 600)"
+  ok "已写入受保护配置文件：${env_file} (权限 600)"
   if [ -n "$custom_env_lines" ]; then
     info "已保留原有 .env 中的自定义配置项（如 TURN_* / CF_TURN_* / STUN_PORT / RESEND_* 等）。"
   fi
@@ -696,7 +730,8 @@ EOF
   printf "    一键升级：   curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deploy/install.sh | bash -s -- --upgrade\n"
   printf "    用户列表：   docker exec allinone-relay node packages/relay-server/src/admin-cli.js users\n"
   printf "    调整等级：   docker exec allinone-relay node packages/relay-server/src/admin-cli.js user tier <用户名> <free|pro|ultra|admin>\n"
-  printf "    停止卸载：   cd %s && docker compose down -v\n\n" "$INSTALL_DIR"
+  printf "    停止服务：   cd %s && docker compose down （保留账号与证书数据）\n" "$INSTALL_DIR"
+  printf "    彻底清空：   cd %s && docker compose down -v （⚠️ 会永久删除账号数据与证书）\n\n" "$INSTALL_DIR"
 }
 
 main "$@"

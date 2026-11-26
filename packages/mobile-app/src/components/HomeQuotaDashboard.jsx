@@ -61,80 +61,73 @@ function getOtherVendorHint(card, bi) {
   return card.writable ? bi('读写就绪', 'Ready') : bi('只读模式', 'Read-only')
 }
 
-function getRingPalette(win, slot = 'outer') {
+function getRingPalette(win) {
   if (win?.health === 'critical') {
     return {
       from: '#F43F5E',
       to: '#FB7185',
-      text: 'text-rose-600 dark:text-rose-400',
-      solid: 'bg-rose-500',
-      ringBorder: 'border-rose-500 dark:border-rose-400',
+      valueText: 'text-rose-600 dark:text-rose-400',
     }
   }
   if (win?.health === 'warning') {
     return {
       from: '#F59E0B',
       to: '#FB923C',
-      text: 'text-amber-600 dark:text-amber-400',
-      solid: 'bg-amber-500',
-      ringBorder: 'border-amber-500 dark:border-amber-400',
+      valueText: 'text-amber-600 dark:text-amber-400',
     }
   }
-  if (slot === 'inner') {
+  if (win?.kind === 'short') {
     return {
       from: '#4D6BFE',
       to: '#38BDF8',
-      text: 'text-[#3B59ED] dark:text-[#78A6FF]',
-      solid: 'bg-[#4D6BFE] dark:bg-[#5E93FF]',
-      ringBorder: 'border-[#4D6BFE] dark:border-[#5E93FF]',
+      valueText: 'text-slate-800 dark:text-slate-100',
     }
   }
   return {
     from: '#10B981',
     to: '#2DD4BF',
-    text: 'text-emerald-600 dark:text-emerald-400',
-    solid: 'bg-emerald-500',
-    ringBorder: 'border-emerald-500 dark:border-emerald-400',
+    valueText: 'text-slate-800 dark:text-slate-100',
   }
 }
 
-function splitOuterInnerWindows(windows = []) {
-  const list = Array.isArray(windows) ? windows.filter(Boolean) : []
-  if (list.length === 0) return { outer: null, inner: null }
-  if (list.length === 1) return { outer: list[0], inner: null }
-  const weekly = list.find((w) => w.kind === 'weekly')
-  const short = list.find((w) => w.kind === 'short')
-  if (weekly && short) return { outer: weekly, inner: short }
-  return { outer: list[list.length - 1], inner: list[0] }
-}
-
 /**
- * Apple-Watch-style concentric dual-ring gauge ("大环套小环"):
- *  - Outer ring (大环, ○): 7-day weekly window (or sole window)
- *  - Inner ring (小环, ●): 5-hour rolling window
+ * Independent circular progress gauge for a single quota window (e.g. 5h or 7d),
+ * with the remaining percentage centered cleanly inside the ring.
  */
-function ConcentricQuotaRings({ outer, inner, size = 74, compact = false }) {
+function QuotaRing({ win, size = 60, compact = false }) {
   const rawUid = useId()
-  const uid = rawUid.replace(/[^a-zA-Z0-9_-]/g, '')
-  const outerGradId = `aio-ring-o-${uid}`
-  const innerGradId = `aio-ring-i-${uid}`
+  const gradId = `aio-ring-${rawUid.replace(/[^a-zA-Z0-9_-]/g, '')}`
 
-  const viewBoxSize = compact ? 64 : 80
+  const viewBoxSize = compact ? 56 : 72
   const center = viewBoxSize / 2
-  const strokeWidth = compact ? 5.5 : 6.8
-  const outerRadius = compact ? 26 : 33
-  const innerRadius = compact ? 17.5 : 22.8
+  const strokeWidth = compact ? 4.4 : 5.4
+  const radius = compact ? 22.8 : 29.5
+  const circumference = 2 * Math.PI * radius
 
-  const outerPalette = outer ? getRingPalette(outer, inner ? 'outer' : outer.kind === 'short' ? 'inner' : 'outer') : null
-  const innerPalette = inner ? getRingPalette(inner, 'inner') : null
+  const pct = Math.max(0, Math.min(100, Number(win?.remainingPercent) || 0))
+  const visualPct = pct > 0 && pct < 3 ? 3 : pct
+  const dashOffset = circumference * (1 - visualPct / 100)
+  const palette = getRingPalette(win)
 
-  const renderArc = (radius, pct, gradId) => {
-    const circumference = 2 * Math.PI * radius
-    const clamped = Math.max(0, Math.min(100, Number(pct) || 0))
-    const visualPct = clamped > 0 && clamped < 2 ? 2 : clamped
-    const dashOffset = circumference * (1 - visualPct / 100)
-    return (
-      <>
+  return (
+    <div
+      className="relative shrink-0"
+      style={{ width: size, height: size }}
+      role="img"
+      aria-label={`${win.label} ${pct}%`}
+    >
+      <svg
+        width={size}
+        height={size}
+        viewBox={`0 0 ${viewBoxSize} ${viewBoxSize}`}
+        className="-rotate-90 overflow-visible"
+      >
+        <defs>
+          <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor={palette.from} />
+            <stop offset="100%" stopColor={palette.to} />
+          </linearGradient>
+        </defs>
         <circle
           cx={center}
           cy={center}
@@ -142,7 +135,7 @@ function ConcentricQuotaRings({ outer, inner, size = 74, compact = false }) {
           fill="none"
           stroke="currentColor"
           strokeWidth={strokeWidth}
-          className="text-slate-200/80 dark:text-slate-700/70"
+          className="text-slate-200/80 dark:text-slate-700/65"
         />
         {visualPct > 0 && (
           <circle
@@ -158,147 +151,78 @@ function ConcentricQuotaRings({ outer, inner, size = 74, compact = false }) {
             className="transition-[stroke-dashoffset] duration-500 ease-out"
           />
         )}
-      </>
-    )
-  }
-
-  const ariaParts = []
-  if (inner) ariaParts.push(`${inner.label} ${inner.remainingPercent}%`)
-  if (outer) ariaParts.push(`${outer.label} ${outer.remainingPercent}%`)
-
-  return (
-    <div
-      className="relative shrink-0"
-      style={{ width: size, height: size }}
-      role="img"
-      aria-label={ariaParts.join(', ')}
-    >
-      <svg
-        width={size}
-        height={size}
-        viewBox={`0 0 ${viewBoxSize} ${viewBoxSize}`}
-        className="-rotate-90 overflow-visible"
-      >
-        <defs>
-          {outerPalette && (
-            <linearGradient id={outerGradId} x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor={outerPalette.from} />
-              <stop offset="100%" stopColor={outerPalette.to} />
-            </linearGradient>
-          )}
-          {innerPalette && (
-            <linearGradient id={innerGradId} x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor={innerPalette.from} />
-              <stop offset="100%" stopColor={innerPalette.to} />
-            </linearGradient>
-          )}
-        </defs>
-        {outer && renderArc(outerRadius, outer.remainingPercent, outerGradId)}
-        {inner && renderArc(innerRadius, inner.remainingPercent, innerGradId)}
       </svg>
 
-      {/* Single-ring cards center the bold remaining percentage cleanly inside the ring */}
-      {outer && !inner && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <span
-            className={`${compact ? 'text-[12px]' : 'text-[15px]'} leading-none font-extrabold tracking-tight tabular-nums ${outerPalette.text}`}
-          >
-            {outer.remainingPercent}%
-          </span>
-        </div>
-      )}
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <span
+          className={`inline-flex items-baseline leading-none font-extrabold tracking-tight tabular-nums ${palette.valueText}`}
+        >
+          <span className={compact ? 'text-[12.5px]' : 'text-[15.5px]'}>{pct}</span>
+          <span className={`ml-[0.5px] font-bold opacity-65 ${compact ? 'text-[8.5px]' : 'text-[10px]'}`}>%</span>
+        </span>
+      </div>
     </div>
   )
 }
 
-function RingLegendRow({ win, slot, compact = false }) {
-  const palette = getRingPalette(win, slot)
-  const isOuter = slot === 'outer'
-  const resetDisplay = compact ? win.compactResetText : win.resetText
-  const compactWindowLabel =
-    win.kind === 'short'
-      ? `${Math.max(1, Math.round((win.windowMinutes || 300) / 60))}h`
-      : win.shortLabel || win.label
+function QuotaRingItem({ win, compact = false, single = false }) {
   const fullTooltip = win.resetText
     ? `${win.label} ${win.remainingPercent}% · ${win.resetText}`
     : `${win.label} ${win.remainingPercent}%`
 
+  if (single) {
+    return (
+      <div
+        title={fullTooltip}
+        className="flex items-center gap-3.5 rounded-xl border border-slate-100/90 bg-slate-50/75 px-3 py-2.5 dark:border-slate-800/75 dark:bg-[#151821]/75"
+      >
+        <QuotaRing win={win} size={60} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[12.5px] font-semibold text-slate-700 dark:text-slate-200">
+            {win.label}
+          </div>
+          {win.resetText && (
+            <div className="mt-1 flex items-center gap-1 text-[10.5px] text-slate-400 tabular-nums dark:text-slate-500">
+              <Clock className="h-3 w-3 shrink-0 opacity-70" />
+              <span className="truncate">{win.resetText}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   if (compact) {
     return (
-      <div title={fullTooltip} className="min-w-0">
-        <div className="flex items-center justify-between gap-1">
-          <span className="flex min-w-0 items-center gap-1">
-            {isOuter ? (
-              <span className={`h-2 w-2 shrink-0 rounded-full border-[1.75px] ${palette.ringBorder}`} />
-            ) : (
-              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${palette.solid}`} />
-            )}
-            <span className="truncate text-[10.5px] font-semibold text-slate-600 dark:text-slate-300">
-              {compactWindowLabel}
-            </span>
-          </span>
-          <span className={`shrink-0 text-[12px] leading-none font-bold tabular-nums ${palette.text}`}>
-            {win.remainingPercent}%
-          </span>
+      <div title={fullTooltip} className="flex min-w-0 flex-col items-center text-center">
+        <QuotaRing win={win} size={48} compact />
+        <div className="mt-1.5 max-w-full truncate text-[10.5px] leading-tight font-semibold text-slate-600 dark:text-slate-300">
+          {win.shortLabel || win.label}
         </div>
-        {resetDisplay && (
-          <div className="mt-0.5 truncate pl-3 text-[9.5px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
-            {resetDisplay}
+        {win.compactResetText && (
+          <div className="mt-0.5 max-w-full truncate text-[9.5px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
+            {win.compactResetText}
           </div>
         )}
       </div>
     )
   }
 
+  const resetDisplay = win.shortResetText || win.resetText
   return (
-    <div title={fullTooltip} className="min-w-0">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          {isOuter ? (
-            <span className={`h-2.5 w-2.5 shrink-0 rounded-full border-[2px] ${palette.ringBorder}`} />
-          ) : (
-            <span className={`h-2 w-2 shrink-0 rounded-full ${palette.solid}`} />
-          )}
-          <span className="truncate text-[12px] leading-tight font-semibold text-slate-700 dark:text-slate-200">
-            {win.label}
-          </span>
-        </div>
-        <span className={`shrink-0 text-[13.5px] leading-none font-bold tabular-nums ${palette.text}`}>
-          {win.remainingPercent}%
-        </span>
+    <div
+      title={fullTooltip}
+      className="flex min-w-0 flex-col items-center rounded-xl border border-slate-100/90 bg-slate-50/75 px-2 py-2.5 text-center dark:border-slate-800/75 dark:bg-[#151821]/75"
+    >
+      <QuotaRing win={win} size={60} />
+      <div className="mt-1.5 max-w-full truncate text-[11.5px] leading-tight font-semibold text-slate-700 dark:text-slate-200">
+        {win.label}
       </div>
       {resetDisplay && (
-        <div className="mt-0.5 flex items-center gap-1 pl-4 text-[10px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
-          <Clock className="h-2.5 w-2.5 shrink-0 opacity-70" />
-          <span className="truncate">{resetDisplay}</span>
+        <div className="mt-0.5 max-w-full truncate text-[10px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
+          {resetDisplay}
         </div>
       )}
-    </div>
-  )
-}
-
-function RingCluster({ windows, compact = false }) {
-  const { outer, inner } = splitOuterInnerWindows(windows)
-  if (!outer) return null
-  const isDual = Boolean(inner)
-
-  return (
-    <div className={`flex items-center ${compact ? 'gap-2' : 'gap-3.5'}`}>
-      <ConcentricQuotaRings outer={outer} inner={inner} size={compact ? 48 : 74} compact={compact} />
-      <div className={`min-w-0 flex-1 ${compact ? 'space-y-1.5' : 'space-y-2'}`}>
-        {isDual ? (
-          <>
-            <RingLegendRow win={inner} slot="inner" compact={compact} />
-            <RingLegendRow win={outer} slot="outer" compact={compact} />
-          </>
-        ) : (
-          <RingLegendRow
-            win={outer}
-            slot={outer.kind === 'short' ? 'inner' : 'outer'}
-            compact={compact}
-          />
-        )}
-      </div>
     </div>
   )
 }
@@ -445,6 +369,7 @@ function BalanceMeterBody({ details, card, bi }) {
 function WindowsQuotaBody({ details, bi }) {
   const hasPools = Array.isArray(details?.pools) && details.pools.length > 1
   const hasExtras = Boolean(details?.extraCredits || details?.resetCredits)
+  const flatWindows = Array.isArray(details?.windows) ? details.windows : []
 
   return (
     <div className="space-y-2.5">
@@ -453,15 +378,15 @@ function WindowsQuotaBody({ details, bi }) {
           {details.pools.map((pool) => (
             <div
               key={pool.id}
-              className="rounded-xl border border-slate-100 bg-slate-50/80 px-2 py-2 dark:border-slate-800/75 dark:bg-[#151821]/80"
+              className="rounded-xl border border-slate-100/90 bg-slate-50/75 px-2 py-2.5 dark:border-slate-800/75 dark:bg-[#151821]/75"
             >
-              <div className="mb-1.5 flex items-center gap-1">
+              <div className="mb-2 flex items-center gap-1 px-0.5">
                 <span
                   className={`h-1.5 w-1.5 shrink-0 rounded-full ${
                     pool.id === '3p' ? 'bg-violet-500 dark:bg-violet-400' : 'bg-[#3186FF]'
                   }`}
                 />
-                <span className="truncate text-[10.5px] font-bold text-slate-600 dark:text-slate-300">
+                <span title={pool.label} className="truncate text-[10.5px] font-bold text-slate-600 dark:text-slate-300">
                   {pool.label}
                 </span>
                 {pool.badge && (
@@ -470,13 +395,21 @@ function WindowsQuotaBody({ details, bi }) {
                   </span>
                 )}
               </div>
-              <RingCluster windows={pool.windows} compact />
+              <div className={`grid gap-1.5 ${pool.windows.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                {pool.windows.map((win) => (
+                  <QuotaRingItem key={`${pool.id}-${win.id}`} win={win} compact />
+                ))}
+              </div>
             </div>
           ))}
         </div>
+      ) : flatWindows.length === 1 ? (
+        <QuotaRingItem win={flatWindows[0]} single />
       ) : (
-        <div className="py-0.5">
-          <RingCluster windows={details?.windows || []} />
+        <div className={`grid gap-2 ${flatWindows.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+          {flatWindows.map((win) => (
+            <QuotaRingItem key={win.id} win={win} />
+          ))}
         </div>
       )}
 
@@ -629,7 +562,7 @@ function OtherVendorCard({ card, selected, onSelect, bi }) {
   )
 }
 
-export function HomeQuotaDashboard({
+export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
   appsStatus = [],
   sessions = [],
   activeApp = 'dsh',
@@ -853,4 +786,4 @@ export function HomeQuotaDashboard({
       </div>
     </div>
   )
-}
+})

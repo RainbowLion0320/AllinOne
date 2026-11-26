@@ -4,12 +4,14 @@
  * automatically find Homebrew, NVM, fnm, Volta, bun, Codex.app, Antigravity.app, Claude CLI, etc.
  */
 
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 
 let pathEnriched = false
+let cachedLoginShellPath = null
+let loginShellPathPromise = null
 
 function listNewestVersionBins(baseDir, subPath = 'bin') {
   if (!existsSync(baseDir)) return []
@@ -28,29 +30,75 @@ function listNewestVersionBins(baseDir, subPath = 'bin') {
   }
 }
 
-function readUnixLoginShellPath() {
-  if (process.platform === 'win32') return ''
+function getUnixCandidateShells() {
   const shells = [
     process.env.SHELL,
     process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash',
     '/bin/zsh',
     '/bin/bash',
   ].filter(Boolean)
-
   const seen = new Set()
+  const out = []
   for (const sh of shells) {
     if (seen.has(sh) || !existsSync(sh)) continue
     seen.add(sh)
+    out.push(sh)
+  }
+  return out
+}
+
+function readUnixLoginShellPath(force = false) {
+  if (process.platform === 'win32') return ''
+  if (!force && cachedLoginShellPath !== null) return cachedLoginShellPath
+  for (const sh of getUnixCandidateShells()) {
     try {
       const out = execFileSync(sh, ['-lc', 'printf "%s" "$PATH"'], {
         timeout: 1500,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       }).trim()
-      if (out && out.includes('/')) return out
+      if (out && out.includes('/')) {
+        cachedLoginShellPath = out
+        return out
+      }
     } catch {}
   }
+  cachedLoginShellPath = ''
   return ''
+}
+
+/**
+ * Non-blocking login-shell PATH warmer for startup / background refreshes.
+ */
+export function warmLoginShellPathAsync({ force = false } = {}) {
+  if (process.platform === 'win32') return Promise.resolve(ensureRichPath(force))
+  if (!force && loginShellPathPromise) return loginShellPathPromise
+  const shells = getUnixCandidateShells()
+  loginShellPathPromise = (async () => {
+    for (const sh of shells) {
+      const out = await new Promise((resolveOut) => {
+        execFile(
+          sh,
+          ['-lc', 'printf "%s" "$PATH"'],
+          { timeout: 1500, encoding: 'utf8', maxBuffer: 256 * 1024 },
+          (err, stdout) => {
+            if (err) return resolveOut('')
+            const s = String(stdout || '').trim()
+            resolveOut(s && s.includes('/') ? s : '')
+          },
+        )
+      })
+      if (out) {
+        cachedLoginShellPath = out
+        break
+      }
+    }
+    if (cachedLoginShellPath === null) cachedLoginShellPath = ''
+    return ensureRichPath(true)
+  })().finally(() => {
+    loginShellPathPromise = null
+  })
+  return loginShellPathPromise
 }
 
 /**
@@ -268,11 +316,16 @@ export function spawnCmdShim(bin, args = [], options = {}) {
 }
 
 /**
- * Spawn an executable safely across platforms (wrapping `.cmd`/`.bat` on Windows via `spawnCmdShim`).
+ * Spawn an executable safely across platforms (wrapping `.cmd`/`.bat` on Windows via `spawnCmdShim`,
+ * and starting a dedicated POSIX process group on macOS/Linux so `killProcessTree` cleanly reaps grandchildren).
  */
 export function spawnCrossPlatform(bin, args = [], options = {}) {
   ensureRichPath()
-  const safeOpts = { ...options, env: sanitizeChildEnv(options.env || process.env) }
+  const safeOpts = {
+    ...options,
+    env: sanitizeChildEnv(options.env || process.env),
+    ...(process.platform !== 'win32' && options.detached === undefined ? { detached: true } : {}),
+  }
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
     return spawnCmdShim(bin, args, safeOpts)
   }
@@ -280,11 +333,13 @@ export function spawnCrossPlatform(bin, args = [], options = {}) {
 }
 
 /**
- * Terminate a child process (and its process tree on Windows via `taskkill /T /F` when forcing)
- * without leaving orphaned grandchildren or throwing on already-exited PIDs.
+ * Terminate a child process and its full process tree across platforms:
+ *  - Windows: `taskkill /T /F` when forcing, plus `proc.kill`
+ *  - POSIX: kills process group `-proc.pid` first (reaping spawned shells/subtools), falling back to `proc.kill`
  */
 export function killProcessTree(proc, { force = false } = {}) {
   if (!proc) return
+  const sig = force ? 'SIGKILL' : 'SIGTERM'
   if (process.platform === 'win32' && proc.pid) {
     if (force) {
       try {
@@ -295,11 +350,17 @@ export function killProcessTree(proc, { force = false } = {}) {
         tk.on('error', () => {})
       } catch {}
     }
-    try { proc.kill(force ? 'SIGKILL' : 'SIGTERM') } catch {}
+    try { proc.kill(sig) } catch {}
     return
   }
+  if (proc.pid && Number.isInteger(proc.pid) && proc.pid > 1) {
+    try {
+      process.kill(-proc.pid, sig)
+      return
+    } catch {}
+  }
   try {
-    proc.kill(force ? 'SIGKILL' : 'SIGTERM')
+    proc.kill(sig)
   } catch {}
 }
 

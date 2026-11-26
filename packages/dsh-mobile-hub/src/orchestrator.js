@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
@@ -7,25 +7,80 @@ import {
   APP_LIST,
   EVENTS,
   RPC,
+  assertSafeSessionId,
   assertSafeWorkspaceCwd,
   getWindowsSystemRootNorm,
   makeCompositeId,
   parseCompositeId,
 } from './protocol.js'
 import { ensureRichPath } from './helpers/bin-finder.js'
+import { InboundAttachmentStore } from './inbound-store.js'
+import { BoundedLruMap } from './primitives/lru.js'
 import { DshAdapter } from './adapters/dsh.js'
 import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
 import { WorkBuddyAdapter } from './adapters/workbuddy.js'
 
-const P2P_UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000 // 15 minutes
-const MAX_P2P_UPLOADS = 128
 const MAX_P2P_DOCUMENT_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local safety cap
 const MAX_P2P_IMAGE_BYTES = 100 * 1024 * 1024 // 100 MB image cap
+const ADAPTER_SCAN_TIMEOUT_MS = 10_000
+const ADAPTER_MODELS_TIMEOUT_MS = 25_000
+const DISPOSE_BUDGET_MS = 1_800
+
+const CODEX_SANDBOX_RANK = {
+  'read-only': 1,
+  'workspace-write': 2,
+  'danger-full-access': 3,
+}
+const CODEX_APPROVAL_RANK = {
+  'untrusted': 1,
+  'on-request': 2,
+  'on-failure': 3,
+  'never': 4,
+}
+
+function clampCodexSandbox(requested, hostConfigured) {
+  const host = String(hostConfigured || 'workspace-write').trim()
+  const req = String(requested || '').trim()
+  if (!req || !(req in CODEX_SANDBOX_RANK)) return undefined
+  const hostRank = CODEX_SANDBOX_RANK[host] ?? CODEX_SANDBOX_RANK['workspace-write']
+  return CODEX_SANDBOX_RANK[req] <= hostRank ? req : host
+}
+
+function clampCodexApprovalPolicy(requested, hostConfigured) {
+  const host = String(hostConfigured || 'on-request').trim()
+  const req = String(requested || '').trim()
+  if (!req || !(req in CODEX_APPROVAL_RANK)) return undefined
+  const hostRank = CODEX_APPROVAL_RANK[host] ?? CODEX_APPROVAL_RANK['on-request']
+  return CODEX_APPROVAL_RANK[req] <= hostRank ? req : host
+}
+
+function withTimeout(promise, ms, fallbackFn) {
+  let timer = null
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolveTimeout) => {
+      timer = setTimeout(() => resolveTimeout(typeof fallbackFn === 'function' ? fallbackFn() : fallbackFn), ms)
+      timer.unref?.()
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
 
 function computeRpcEtag(value) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16)
+}
+
+function getNormalizedHomeReal() {
+  try {
+    const h = existsSync(homedir()) ? realpathSync(homedir()) : homedir()
+    return process.platform === 'win32' || process.platform === 'darwin' ? h.toLowerCase() : h
+  } catch {
+    const h = homedir()
+    return process.platform === 'win32' || process.platform === 'darwin' ? h.toLowerCase() : h
+  }
 }
 
 /**
@@ -34,26 +89,31 @@ function computeRpcEtag(value) {
  *   2) DeepSeek Harness Master Dispatch Tools (`allinone_*`)
  */
 export class MultiAppOrchestrator {
-  constructor({ ctx = null, config = {}, log = console, onEvent } = {}) {
+  constructor({ ctx = null, config = {}, log = console, onEvent, onlyDsh = false } = {}) {
     this.ctx = ctx
     this.config = config
     this.log = log
     this.onEvent = onEvent || (() => {})
+    this.onlyDsh = Boolean(onlyDsh)
     this.inboundDir = config.inboundDir || join(
       String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh'),
       'allinone-uploads',
     )
+    this.inboundStore = new InboundAttachmentStore({
+      inboundDir: this.inboundDir,
+      maxDiskBytes: config.maxInboundDiskBytes,
+      log,
+    })
 
     /** @type {Map<string, any>} */
     this.pendingApprovals = new Map()
-    /** @type {Map<string, any>} */
-    this.dispatches = new Map()
-    /** @type {Map<string, { clientId: string, localPath: string, filename: string, mimeType: string, size: number, createdAt: number }>} */
-    this.p2pUploads = new Map()
-    /** @type {Map<string, string>} Authoritative local project roots discovered from real native adapter sessions */
-    this.knownSessionRoots = new Map()
+    /** @type {BoundedLruMap<string, any>} */
+    this.dispatches = new BoundedLruMap(200)
+    /** @type {BoundedLruMap<string, string>} Authoritative local project roots discovered from real native adapter sessions */
+    this.knownSessionRoots = new BoundedLruMap(500)
     this._sessionRootsSyncedAt = 0
-    this._lastInboundPruneAt = 0
+    this._inFlightAppsStatus = null
+    this._inFlightModels = null
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -70,76 +130,51 @@ export class MultiAppOrchestrator {
       emitEvent(EVENTS.APPROVAL_REQUEST, req)
     }
 
-    this.adapters = {
-      [APPS.DSH]: new DshAdapter({ ctx, config, log, emitEvent, onApprovalRequest }),
-      [APPS.CODEX]: new CodexAdapter({ config, log, emitEvent, onApprovalRequest }),
-      [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent, onApprovalRequest }),
-      [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent, onApprovalRequest }),
-      [APPS.WORKBUDDY]: new WorkBuddyAdapter({ config, log, emitEvent, onApprovalRequest }),
-    }
-  }
-
-  _isPathInsideInboundDir(filePath, { requireExists = true } = {}) {
-    const raw = String(filePath || '').trim()
-    if (!raw) return false
-    const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin'
-    const cmp = (p) => (caseInsensitive ? p.toLowerCase() : p)
-    const baseDir = resolve(this.inboundDir)
-    const cleanPath = resolve(raw)
-    const basePrefix = cmp(baseDir).endsWith(sep) ? cmp(baseDir) : `${cmp(baseDir)}${sep}`
-    if (!cmp(cleanPath).startsWith(basePrefix)) return false
-    if (existsSync(cleanPath)) {
-      try {
-        const realBase = realpathSync(baseDir)
-        const realPath = realpathSync(cleanPath)
-        const realPrefix = cmp(realBase).endsWith(sep) ? cmp(realBase) : `${cmp(realBase)}${sep}`
-        return cmp(realPath).startsWith(realPrefix)
-      } catch {
-        return false
+    if (this.onlyDsh) {
+      this.adapters = {
+        [APPS.DSH]: new DshAdapter({ ctx, config, log, emitEvent, onApprovalRequest }),
+      }
+    } else {
+      this.adapters = {
+        [APPS.DSH]: new DshAdapter({ ctx, config, log, emitEvent, onApprovalRequest }),
+        [APPS.CODEX]: new CodexAdapter({ config, log, emitEvent, onApprovalRequest }),
+        [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent, onApprovalRequest }),
+        [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent, onApprovalRequest }),
+        [APPS.WORKBUDDY]: new WorkBuddyAdapter({ config, log, emitEvent, onApprovalRequest }),
       }
     }
-    return !requireExists
+    this.enabledApps = Object.keys(this.adapters)
   }
 
-  /**
-   * Register a verified P2P uploaded file inside `inboundDir` and return an opaque token.
-   * Ensures callers can NEVER inject arbitrary local file paths in `RPC.SESSION_SEND`.
-   */
-  registerP2pUpload({ clientId = '', localPath, filename, mimeType = 'application/octet-stream', size = 0 } = {}) {
-    const now = Date.now()
-    for (const [tok, rec] of this.p2pUploads.entries()) {
-      if (now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS) this.p2pUploads.delete(tok)
-    }
-    while (this.p2pUploads.size >= MAX_P2P_UPLOADS) {
-      const oldest = this.p2pUploads.keys().next().value
-      if (!oldest) break
-      this.p2pUploads.delete(oldest)
-    }
-    const cleanPath = resolve(String(localPath || ''))
-    if (!this._isPathInsideInboundDir(cleanPath, { requireExists: false })) {
-      throw new Error('Rejected P2P upload path outside inbound directory')
-    }
-    const token = `p2p_${randomUUID().replace(/-/g, '')}`
-    this.p2pUploads.set(token, {
-      clientId: String(clientId || '').trim(),
-      localPath: cleanPath,
-      filename: String(filename || basename(cleanPath)),
-      mimeType: String(mimeType || 'application/octet-stream'),
-      size: Number(size || 0),
-      createdAt: now,
-    })
-    return token
+  get p2pUploads() {
+    return this.inboundStore.tokens
+  }
+
+  _isPathInsideInboundDir(filePath, opts) {
+    return this.inboundStore.isPathInside(filePath, opts)
+  }
+
+  registerP2pUpload(meta) {
+    return this.inboundStore.registerUpload(meta)
+  }
+
+  pruneInboundDir(maxAgeMs) {
+    return this.inboundStore.pruneExpiredFiles(maxAgeMs)
+  }
+
+  async materializeAttachments(attachments = [], opts = {}) {
+    return this.inboundStore.materializeAttachments(attachments, opts)
   }
 
   getAdapter(app) {
     const adapter = this.adapters[app]
-    if (!adapter) throw new Error(`不支持的应用类型：${app}（可选：${APP_LIST.join(', ')}）`)
+    if (!adapter) throw new Error(`不支持的应用类型：${app}（可选：${this.enabledApps.join(', ')}）`)
     return adapter
   }
 
   refreshEnvironment() {
     ensureRichPath(true)
-    for (const app of APP_LIST) {
+    for (const app of this.enabledApps) {
       try {
         this.adapters[app]?.refreshBinary?.()
       } catch {}
@@ -147,10 +182,24 @@ export class MultiAppOrchestrator {
   }
 
   async getAppsStatus({ forceQuota = false } = {}) {
-    const results = await Promise.all(
-      APP_LIST.map(async (app) => {
+    if (!forceQuota && this._inFlightAppsStatus) {
+      return this._inFlightAppsStatus
+    }
+    const run = Promise.all(
+      this.enabledApps.map(async (app) => {
         try {
-          return await this.adapters[app].getStatus({ forceQuota })
+          return await withTimeout(
+            this.adapters[app].getStatus({ forceQuota }),
+            ADAPTER_SCAN_TIMEOUT_MS,
+            () => ({
+              app,
+              available: false,
+              writable: false,
+              mode: 'timeout',
+              detail: '应用状态探测超时',
+              activeCount: 0,
+            }),
+          )
         } catch (err) {
           return {
             app,
@@ -163,7 +212,13 @@ export class MultiAppOrchestrator {
         }
       }),
     )
-    return results
+    if (!forceQuota) {
+      this._inFlightAppsStatus = run
+      run.finally(() => {
+        if (this._inFlightAppsStatus === run) this._inFlightAppsStatus = null
+      })
+    }
+    return run
   }
 
   rememberSessionRoot(rawCwd) {
@@ -175,45 +230,48 @@ export class MultiAppOrchestrator {
       const real = realpathSync(safe)
       const key = process.platform === 'win32' || process.platform === 'darwin' ? real.toLowerCase() : real
       if (!key || key === '/' || key === '\\' || /^[a-z]:[\\/]?$/i.test(key)) return
-      let homeNorm = ''
-      try {
-        const hr = realpathSync(homedir())
-        homeNorm = process.platform === 'win32' || process.platform === 'darwin' ? hr.toLowerCase() : hr
-      } catch {}
+      const homeNorm = getNormalizedHomeReal()
       if (homeNorm && key === homeNorm) return
-      this.knownSessionRoots.delete(key)
       this.knownSessionRoots.set(key, real)
-      while (this.knownSessionRoots.size > 500) {
-        const oldest = this.knownSessionRoots.keys().next().value
-        if (!oldest) break
-        this.knownSessionRoots.delete(oldest)
-      }
     } catch {}
   }
 
   async listWorkspaces() {
     const needSessionDiscovery =
       this.knownSessionRoots.size === 0 || Date.now() - this._sessionRootsSyncedAt > 60_000
-    const [dshWs, claudeWs, workbuddyWs] = await Promise.all([
-      this.adapters[APPS.DSH].listWorkspaces().catch(() => []),
-      typeof this.adapters[APPS.CLAUDE]?.listWorkspaces === 'function'
-        ? this.adapters[APPS.CLAUDE].listWorkspaces().catch(() => [])
-        : Promise.resolve([]),
-      typeof this.adapters[APPS.WORKBUDDY]?.listWorkspaces === 'function'
-        ? this.adapters[APPS.WORKBUDDY].listWorkspaces().catch(() => [])
-        : Promise.resolve([]),
-      needSessionDiscovery ? this.listSessions({ app: 'all', limit: 160 }).catch(() => []) : Promise.resolve([]),
-    ])
-    // Deduplicate by normalized path
+
+    // Query workspace providers dynamically via adapter capabilities instead of hardcoding app names
+    const workspacePromises = []
+    for (const app of this.enabledApps) {
+      const adapter = this.adapters[app]
+      if (typeof adapter?.listWorkspaces === 'function' && (adapter.capabilities?.supportsWorkspaces !== false)) {
+        workspacePromises.push(
+          withTimeout(adapter.listWorkspaces().catch(() => []), ADAPTER_SCAN_TIMEOUT_MS, () => []),
+        )
+      }
+    }
+    if (needSessionDiscovery) {
+      workspacePromises.push(
+        withTimeout(this.listSessions({ app: 'all', limit: 160 }).catch(() => []), ADAPTER_SCAN_TIMEOUT_MS, () => [])
+          .then(() => []),
+      )
+    }
+    const workspaceBatches = await Promise.all(workspacePromises)
+    const homeNorm = getNormalizedHomeReal()
+
     const map = new Map()
-    for (const w of [...dshWs, ...claudeWs, ...workbuddyWs]) {
-      if (w?.path) {
-        const k = w.path.toLowerCase()
-        if (!map.has(k)) map.set(k, w)
+    for (const batch of workspaceBatches) {
+      for (const w of batch || []) {
+        if (w?.path) {
+          const k = w.path.toLowerCase()
+          if (homeNorm && k === homeNorm) continue
+          if (!map.has(k)) map.set(k, w)
+        }
       }
     }
     for (const rootPath of this.knownSessionRoots.values()) {
       const k = rootPath.toLowerCase()
+      if (homeNorm && k === homeNorm) continue
       if (!map.has(k) && existsSync(rootPath)) {
         map.set(k, {
           name: basename(rootPath) || rootPath,
@@ -223,11 +281,13 @@ export class MultiAppOrchestrator {
       }
     }
     if (this.config.cwd && existsSync(this.config.cwd)) {
-      const k = this.config.cwd.toLowerCase()
-      if (!map.has(k)) {
+      let cfgReal = this.config.cwd
+      try { cfgReal = realpathSync(this.config.cwd) } catch {}
+      const k = cfgReal.toLowerCase()
+      if ((!homeNorm || k !== homeNorm) && !map.has(k)) {
         map.set(k, {
-          name: basename(this.config.cwd) || this.config.cwd,
-          path: this.config.cwd,
+          name: basename(cfgReal) || cfgReal,
+          path: cfgReal,
           source: 'default',
         })
       }
@@ -237,11 +297,13 @@ export class MultiAppOrchestrator {
 
   async listSessions({ app = 'all', limit = 100, search = '' } = {}) {
     const isAll = !app || app === 'all'
-    const targets = isAll ? APP_LIST : [app]
-    const perAppLimit = isAll ? Math.max(10, Math.ceil(limit / APP_LIST.length)) : limit
+    const targets = isAll ? this.enabledApps : [app]
+    const perAppLimit = isAll ? Math.max(10, Math.ceil(limit / Math.max(1, targets.length))) : limit
 
     const settled = await Promise.allSettled(
-      targets.map((a) => this.getAdapter(a).listSessions({ limit: perAppLimit, search })),
+      targets.map((a) =>
+        withTimeout(this.getAdapter(a).listSessions({ limit: perAppLimit, search }), ADAPTER_SCAN_TIMEOUT_MS, () => []),
+      ),
     )
 
     const all = []
@@ -269,132 +331,71 @@ export class MultiAppOrchestrator {
   }
 
   async listModels({ app = 'all' } = {}) {
-    const targets = app && app !== 'all' ? [app] : APP_LIST
-    const catalog = {}
-    await Promise.all(
-      targets.map(async (a) => {
-        try {
-          const adapter = this.getAdapter(a)
-          if (typeof adapter.listModels === 'function') {
-            catalog[a] = await adapter.listModels()
-          } else {
-            catalog[a] = { app: a, defaultModel: '', defaultEffort: '', supportsMidChatSwitch: false, models: [] }
+    const isAll = !app || app === 'all'
+    if (isAll && this._inFlightModels) return this._inFlightModels
+    const targets = isAll ? this.enabledApps : [app]
+    const run = (async () => {
+      const catalog = {}
+      await Promise.all(
+        targets.map(async (a) => {
+          try {
+            const adapter = this.getAdapter(a)
+            if (typeof adapter.listModels === 'function') {
+              catalog[a] = await withTimeout(
+                adapter.listModels(),
+                ADAPTER_MODELS_TIMEOUT_MS,
+                () => ({ app: a, defaultModel: '', defaultEffort: '', supportsMidChatSwitch: false, models: [], error: '模型列表查询超时' }),
+              )
+            } else {
+              catalog[a] = { app: a, defaultModel: '', defaultEffort: '', supportsMidChatSwitch: false, models: [] }
+            }
+          } catch (err) {
+            catalog[a] = {
+              app: a,
+              defaultModel: '',
+              defaultEffort: '',
+              supportsMidChatSwitch: false,
+              models: [],
+              error: String(err?.message || err),
+            }
           }
-        } catch (err) {
-          catalog[a] = {
-            app: a,
-            defaultModel: '',
-            defaultEffort: '',
-            supportsMidChatSwitch: false,
-            models: [],
-            error: String(err?.message || err),
-          }
-        }
-      }),
-    )
-    return catalog
+        }),
+      )
+      return catalog
+    })()
+    if (isAll) {
+      this._inFlightModels = run
+      run.finally(() => {
+        if (this._inFlightModels === run) this._inFlightModels = null
+      })
+    }
+    return run
   }
 
   async createSession({ app = APPS.DSH, cwd, title, model, provider, reasoningEffort, sandbox, approvalPolicy } = {}) {
     const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true }) || undefined
+    // Enforce host ceiling on Codex sandbox & approvalPolicy so remote callers cannot escalate privileges
+    const effectiveSandbox =
+      app === APPS.CODEX ? clampCodexSandbox(sandbox, this.config.codexSandbox) : undefined
+    const effectiveApproval =
+      app === APPS.CODEX ? clampCodexApprovalPolicy(approvalPolicy, this.config.codexApprovalPolicy) : undefined
+
     const created = await this.getAdapter(app).createSession({
       cwd: safeCwd,
       title,
       model,
       provider,
       reasoningEffort,
-      sandbox,
-      approvalPolicy,
+      sandbox: effectiveSandbox,
+      approvalPolicy: effectiveApproval,
     })
     this.onEvent(EVENTS.SESSION_UPDATED, { session: created })
     return created
   }
 
-  /**
-   * Prune expired inbound P2P attachment files from local PC disk.
-   */
-  pruneInboundDir(maxAgeMs = 24 * 60 * 60 * 1000) {
-    const now = Date.now()
-    if (now - this._lastInboundPruneAt < 10 * 60_000) return
-    this._lastInboundPruneAt = now
-    try {
-      if (!existsSync(this.inboundDir)) return
-      for (const name of readdirSync(this.inboundDir)) {
-        const fp = join(this.inboundDir, name)
-        try {
-          const st = statSync(fp)
-          if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
-            unlinkSync(fp)
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  /**
-   * Resolve P2P-uploaded attachments strictly from our verified `p2pUploads` registry.
-   * Security: NEVER trusts caller-supplied `localPath` or arbitrary URLs, and enforces
-   * single-use + uploading-client ownership (`clientId`) when present.
-   */
-  async materializeAttachments(attachments = [], { clientId = '', strict = false, _burnedOut = null } = {}) {
-    if (!Array.isArray(attachments) || attachments.length === 0) return []
-    this.pruneInboundDir()
-    const now = Date.now()
-    const callerClientId = String(clientId || '').trim()
-    const out = []
-    let rejectedTokens = 0
-
-    for (const att of attachments.slice(0, 12)) {
-      if (!att || typeof att !== 'object') continue
-      const token = String(att.p2pToken || '').trim()
-      if (!token || !token.startsWith('p2p_')) {
-        this.log.warn?.('mobile-hub: rejected untrusted attachment without valid p2pToken')
-        continue
-      }
-      const rec = this.p2pUploads.get(token)
-      if (!rec || now - rec.createdAt > P2P_UPLOAD_TOKEN_TTL_MS || !existsSync(rec.localPath)) {
-        this.p2pUploads.delete(token)
-        this.log.warn?.('mobile-hub: rejected expired or unknown p2pToken')
-        rejectedTokens += 1
-        continue
-      }
-      if (rec.clientId && rec.clientId !== callerClientId) {
-        this.log.warn?.('mobile-hub: rejected cross-client p2pToken attempt')
-        rejectedTokens += 1
-        continue
-      }
-      // Single-use token burn on materialization (can be restored by sendMessage on pre-turn rejection)
-      this.p2pUploads.delete(token)
-      if (Array.isArray(_burnedOut)) {
-        _burnedOut.push({ token, rec })
-      }
-      out.push({
-        id: att.id || token,
-        filename: rec.filename,
-        mimeType: rec.mimeType,
-        size: rec.size,
-        localPath: rec.localPath,
-      })
-    }
-    if (strict && rejectedTokens > 0) {
-      // Restore any tokens already consumed in this batch before throwing
-      if (Array.isArray(_burnedOut)) {
-        for (const item of _burnedOut) {
-          if (item?.token && item?.rec?.localPath && this._isPathInsideInboundDir(item.rec.localPath)) {
-            this.p2pUploads.set(item.token, item.rec)
-          }
-        }
-        _burnedOut.length = 0
-      }
-      const err = new Error('部分附件上传凭证已过期或失效，请重新上传附件后再发送')
-      err.code = 'ATTACHMENT_EXPIRED'
-      throw err
-    }
-    return out
-  }
-
   _isAdapterSessionBusy(adapter, sessionId) {
     if (!adapter || !sessionId) return false
+    if (typeof adapter.isSessionBusy === 'function') return adapter.isSessionBusy(sessionId)
     if (adapter.activeTurns instanceof Map && adapter.activeTurns.has(sessionId)) return true
     if (adapter.activeProcs instanceof Map && adapter.activeProcs.has(sessionId)) return true
     return false
@@ -432,7 +433,10 @@ export class MultiAppOrchestrator {
         cwd: safeCwd,
         title,
         attachments: materialized,
-        approvalPolicy,
+        approvalPolicy:
+          parsed.app === APPS.CODEX
+            ? clampCodexApprovalPolicy(approvalPolicy, this.config.codexApprovalPolicy)
+            : approvalPolicy,
         permissionMode,
         taskMode,
         model,
@@ -441,13 +445,8 @@ export class MultiAppOrchestrator {
       })
       return result
     } catch (err) {
-      // Restore single-use p2pTokens if the turn was rejected before execution (e.g. SESSION_BUSY)
       if (burned.length > 0 && (err?.code === 'SESSION_BUSY' || !err?._streamErrorEmitted)) {
-        for (const item of burned) {
-          if (item?.token && item?.rec?.localPath && this._isPathInsideInboundDir(item.rec.localPath)) {
-            this.p2pUploads.set(item.token, item.rec)
-          }
-        }
+        this.inboundStore.restoreTokens(burned)
       }
       throw err
     }
@@ -460,7 +459,6 @@ export class MultiAppOrchestrator {
   }
 
   async listApprovals() {
-    // Reconcile pending approvals currently held inside a live DSH IPC process (e.g. after reconnect or desktop resolution)
     const dshAdapter = this.adapters[APPS.DSH]
     if (typeof dshAdapter?.listPendingApprovals === 'function') {
       try {
@@ -496,7 +494,6 @@ export class MultiAppOrchestrator {
       try {
         return await adapter.resolveApproval(id, payload)
       } catch (err) {
-        // Do not resurrect zombie approval cards when the underlying CLI transport has already died
         if (err?.code !== 'APPROVAL_TRANSPORT_CLOSED') {
           this.pendingApprovals.set(id, req)
         }
@@ -506,10 +503,6 @@ export class MultiAppOrchestrator {
     return { resolved: true, id, decision }
   }
 
-  /**
-   * Dispatch a task to any app (used by BOTH DSH Master Dispatch Tools AND Mobile Dispatch Board).
-   * Supports synchronous wait (`wait: true`) or background fire-and-monitor (`wait: false`).
-   */
   async dispatchTask({
     app,
     sessionId = '',
@@ -520,7 +513,7 @@ export class MultiAppOrchestrator {
     issuedBy = 'mobile',
   }) {
     if (!app || !this.adapters[app]) {
-      throw new Error(`无效的目标应用：${app}（可选：${APP_LIST.join(', ')}）`)
+      throw new Error(`无效的目标应用：${app}（可选：${this.enabledApps.join(', ')}）`)
     }
     if (!String(prompt || '').trim()) {
       throw new Error('派单任务内容 prompt 不能为空')
@@ -559,18 +552,6 @@ export class MultiAppOrchestrator {
       completedAt: null,
     }
     this.dispatches.set(taskId, task)
-    const MAX_DISPATCHES = 200
-    if (this.dispatches.size > MAX_DISPATCHES) {
-      for (const [k, v] of this.dispatches.entries()) {
-        if (this.dispatches.size <= MAX_DISPATCHES) break
-        if (v.status !== 'running') this.dispatches.delete(k)
-      }
-      while (this.dispatches.size > MAX_DISPATCHES) {
-        const oldest = this.dispatches.keys().next().value
-        if (!oldest) break
-        this.dispatches.delete(oldest)
-      }
-    }
     this.onEvent(EVENTS.DISPATCH_UPDATED, { task })
 
     const runPromise = this.sendMessage({
@@ -602,7 +583,6 @@ export class MultiAppOrchestrator {
       return runPromise
     }
 
-    // Prevent unhandled rejection in background mode
     runPromise.catch(() => {})
     return task
   }
@@ -619,16 +599,7 @@ export class MultiAppOrchestrator {
     return task
   }
 
-  /**
-   * Read a local image or deliverable document file on the PC so the remote client
-   * can preview images/HTML or download office deliverables over direct E2EE P2P.
-   * - Files <= 128 KB return inline Base64 over `aio-ctrl`; larger files return a `p2p-bulk` descriptor
-   *   streamed over `aio-bulk` (AIO2 4 MB chunked E2EE + 60 KB SCTP slices).
-   * - Image mode (default): image extensions only, <= 100 MB.
-   * - Document mode (`mode: 'document'`): deliverable extensions only (HTML/PDF/Word/Excel/PPT/CSV/MD/TXT/RTF/EPUB/ZIP),
-   *   <= 2 GB, max 4 concurrent inline reads, sensitive-path blocklist, allowed-root scope guard, and symlink re-validation.
-   */
-  async readLocalFile({ path: rawPath, cwd = '', mode = 'image', sessionId = '' } = {}) {
+  async readLocalFile({ path: rawPath, cwd = '', mode = 'image', sessionId = '' } = {}, { mintDownloadTicket = null } = {}) {
     const IMAGE_MIMES = {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
@@ -664,12 +635,10 @@ export class MultiAppOrchestrator {
 
     let p = String(rawPath || '').trim()
     if (!p) throw new Error(isDocumentMode ? '缺少文件路径' : '缺少图片路径')
-    // Strip wrapping quotes or angle brackets
     if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
       p = p.slice(1, -1).trim()
     }
 
-    // Convert file:/// URI to native filesystem path (strip query/hash only for file:// URIs or nonexistent paths)
     if (/^file:\/\//i.test(p)) {
       p = p.replace(/[?#].*$/, '')
       p = p.replace(/^file:\/\/(?:localhost)?/i, '')
@@ -689,19 +658,16 @@ export class MultiAppOrchestrator {
         }
       }
       if (/%[0-9A-Fa-f]{2}/.test(p)) {
-        // Only decode percent-encoded paths if the raw path does not exist directly
         if (!existsSync(p)) {
           try { p = decodeURIComponent(p) } catch {}
         }
       }
     }
 
-    // Expand leading ~/ (in case file:// or decoded path had it)
     if (p.startsWith('~/') || p.startsWith('~\\')) {
       p = join(homedir(), p.slice(2))
     }
 
-    // Normalize slashes and resolve relative paths against session cwd
     let resolved = p
     if (process.platform === 'win32') {
       resolved = resolved.replace(/\//g, '\\')
@@ -725,7 +691,6 @@ export class MultiAppOrchestrator {
     if (!existsSync(resolved)) {
       throw new Error(isDocumentMode ? `找不到电脑端文件：${resolved}` : `找不到本机图片文件：${resolved}`)
     }
-    // Resolve symlinks and re-validate the real target's extension so `fake.pdf -> ~/.ssh/id_rsa` is blocked
     const realPath = realpathSync(resolved)
     const realExt = extname(realPath).toLowerCase()
     const realMimeType = ALLOWED_MIMES[realExt]
@@ -737,7 +702,6 @@ export class MultiAppOrchestrator {
       )
     }
 
-    // Enforce sensitive directory & credential blocklist for BOTH document and image modes
     const normReal = realPath.replace(/\\/g, '/').toLowerCase()
     const inInboundDir = this._isPathInsideInboundDir(realPath)
     const segments = inInboundDir
@@ -768,6 +732,8 @@ export class MultiAppOrchestrator {
       normReal.includes('/.gemini/config/') ||
       normReal.includes('/.codex/auth') ||
       normReal.includes('/.claude/.credentials') ||
+      normReal.includes('/.workbuddy/auth') ||
+      normReal.includes('/.codebuddy/auth') ||
       normReal.includes('/library/application support/google/chrome/') ||
       normReal.includes('/library/application support/microsoft edge/') ||
       normReal.includes('/library/application support/firefox/') ||
@@ -784,25 +750,19 @@ export class MultiAppOrchestrator {
       normReal.startsWith('c:/windows/')
     const isBlockedName =
       /^\.env(?:\.|$)/i.test(fileName) ||
-      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json|allinone-dsh-ipc\.json|e2ee-key\.html)(?:\.|$)/i.test(fileName) ||
+      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|shadow|passwd|accounts\.json|accounts\.db|allinone-dsh-ipc\.json|e2ee-key\.html)(?:\.|$)/i.test(fileName) ||
       /^(?:secrets?|credentials?|passwords?|tokens?)\.(?:txt|csv|md|zip)$/i.test(fileName) ||
       /\.(?:pem|key|p12|pfx|kdbx)$/i.test(fileName)
     if (isBlockedDir || isBlockedName) {
       throw new Error('出于安全限制，禁止远程下载系统敏感目录或凭据文件')
     }
 
-    // Enforce allowed-root scope guard for BOTH document and image modes
     {
       const caseInsensitiveFs = process.platform === 'win32' || process.platform === 'darwin'
       const cmpPath = (targetPath) => (caseInsensitiveFs ? targetPath.toLowerCase() : targetPath)
       const normTarget = cmpPath(realPath)
       const home = homedir()
-      let homeRealNorm = ''
-      try {
-        homeRealNorm = cmpPath(realpathSync(home))
-      } catch {
-        homeRealNorm = cmpPath(home)
-      }
+      const homeRealNorm = getNormalizedHomeReal()
       const isOverbroadRoot = (normRoot) => {
         if (!normRoot || normRoot === '/' || normRoot === '\\' || /^[a-z]:[\\/]?$/i.test(normRoot)) return true
         return Boolean(homeRealNorm && normRoot === homeRealNorm)
@@ -828,7 +788,7 @@ export class MultiAppOrchestrator {
         return false
       }
 
-      // Security: NEVER trust caller-supplied `cwd` or global `/tmp` as an allowed root
+      // Narrow fastRoots: only explicit artifact subdirectories under agent state homes (not entire ~/.codex or ~/.claude)
       const fastRoots = [
         this.config.cwd,
         this.inboundDir,
@@ -836,10 +796,8 @@ export class MultiAppOrchestrator {
         join(home, 'Downloads'),
         join(home, 'Documents'),
         ...(!isDocumentMode ? [join(home, 'Pictures')] : []),
-        join(home, '.dsh'),
-        join(home, '.codex'),
-        join(home, '.claude'),
-        join(home, '.gemini'),
+        join(home, '.gemini', 'antigravity', 'brain'),
+        join(home, '.dsh', 'allinone-uploads'),
         join(home, 'WorkBuddy'),
       ]
       let inAllowedRoot = checkRoots(fastRoots)
@@ -852,7 +810,6 @@ export class MultiAppOrchestrator {
           inAllowedRoot = checkRoots(workspaces.map((w) => w?.path))
         } catch {}
       }
-      // Authoritative single-session lookup (covers Codex/Antigravity/Claude/DSH projects even for older sessions)
       if (!inAllowedRoot && sessionId) {
         try {
           const sess = await this.readSession({ id: String(sessionId).trim(), limit: 1 })
@@ -887,18 +844,27 @@ export class MultiAppOrchestrator {
       )
     }
 
-    // All files & images stream directly peer-to-peer over binary `aio-bulk` (AIO2 chunked E2EE + conditional deflate-raw)
-    return {
+    const publicMeta = {
       ok: true,
       kind: isDocumentMode ? 'document' : 'image',
       transferMode: 'p2p-bulk',
-      _localRealPath: realPath,
       filename: basename(realPath),
       mimeType: realMimeType,
       size: st.size,
       mtimeMs: st.mtimeMs,
       path: realPath,
     }
+    if (typeof mintDownloadTicket === 'function') {
+      const streamId = mintDownloadTicket({
+        realPath,
+        size: st.size,
+        maxBytes: MAX_BYTES,
+        mimeType: realMimeType,
+        filename: publicMeta.filename,
+      })
+      return { ...publicMeta, streamId }
+    }
+    return publicMeta
   }
 
   /** Unified RPC handler for incoming direct P2P requests. */
@@ -907,7 +873,7 @@ export class MultiAppOrchestrator {
       case RPC.BRIDGE_PING:
         return { ok: true, ts: Date.now() }
       case RPC.FILE_READ:
-        return await this.readLocalFile(params)
+        return await this.readLocalFile(params, { mintDownloadTicket: ctx?.mintDownloadTicket || null })
       case RPC.APPS_STATUS:
         return { apps: await this.getAppsStatus({ forceQuota: Boolean(params?.forceQuota) }) }
       case RPC.APP_SETUP: {
@@ -975,11 +941,23 @@ export class MultiAppOrchestrator {
         return { session }
       }
       case RPC.SESSION_CREATE:
-        return { session: await this.createSession(params) }
+        // Strictly allowlist public fields on SESSION_CREATE
+        return {
+          session: await this.createSession({
+            app: params?.app,
+            cwd: params?.cwd,
+            title: params?.title,
+            model: params?.model,
+            provider: params?.provider,
+            reasoningEffort: params?.reasoningEffort,
+            sandbox: params?.sandbox,
+            approvalPolicy: params?.approvalPolicy,
+          }),
+        }
       case RPC.SESSION_SEND: {
         const targetId = params?.id || makeCompositeId(params?.app || APPS.DSH, params?.sessionId)
         const parsed = parseCompositeId(targetId)
-        // Strictly allowlist public fields (NEVER spread untrusted params with internal options)
+        assertSafeSessionId(parsed.sessionId, 'sessionId')
         const publicParams = {
           app: parsed.app,
           sessionId: parsed.sessionId,
@@ -997,9 +975,7 @@ export class MultiAppOrchestrator {
         if (publicParams.wait === true) {
           return await this.sendMessage(publicParams, { clientId: callerClientId })
         }
-        // Validate remote cwd synchronously before returning { accepted: true }
         assertSafeWorkspaceCwd(publicParams.cwd, { allowEmpty: true })
-        // Fail fast synchronously on busy sessions or expired attachment tokens BEFORE returning { accepted: true }
         const adapter = this.getAdapter(parsed.app)
         if (this._isAdapterSessionBusy(adapter, parsed.sessionId)) {
           const err = new Error('该对话正在运行中，请等待完成或先点击停止。')
@@ -1019,10 +995,7 @@ export class MultiAppOrchestrator {
         }).catch((err) => {
           const msg = String(err?.message || err)
           this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)
-          if (err?._streamErrorEmitted) {
-            return
-          }
-          // Guarantee mobile UI always exits the loading spinner even if an adapter threw early (including external SESSION_BUSY)
+          if (err?._streamErrorEmitted) return
           this.onEvent(EVENTS.STREAM_ERROR, {
             sessionId: targetId,
             app: parsed.app,
@@ -1040,7 +1013,18 @@ export class MultiAppOrchestrator {
       case RPC.DISPATCH_LIST:
         return { tasks: this.listDispatches(params) }
       case RPC.DISPATCH_CREATE:
-        return { task: await this.dispatchTask(params) }
+        // Strictly allowlist public fields on DISPATCH_CREATE
+        return {
+          task: await this.dispatchTask({
+            app: params?.app,
+            sessionId: params?.sessionId,
+            cwd: params?.cwd,
+            title: params?.title,
+            prompt: params?.prompt,
+            wait: Boolean(params?.wait),
+            issuedBy: 'mobile',
+          }),
+        }
       case RPC.DISPATCH_STATUS:
         return { task: this.getDispatchStatus(params.taskId) }
       default:
@@ -1049,10 +1033,11 @@ export class MultiAppOrchestrator {
   }
 
   async dispose() {
-    for (const adapter of Object.values(this.adapters)) {
-      try {
-        await adapter.dispose?.()
-      } catch {}
-    }
+    const adapterList = Object.values(this.adapters)
+    await withTimeout(
+      Promise.allSettled(adapterList.map((adapter) => Promise.resolve().then(() => adapter.dispose?.()))),
+      DISPOSE_BUDGET_MS,
+      () => undefined,
+    )
   }
 }

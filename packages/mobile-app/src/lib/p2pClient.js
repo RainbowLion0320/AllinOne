@@ -13,6 +13,7 @@ import {
   P2P_BULK_LABEL,
   P2P_CTRL_LABEL,
   createCtrlCodec,
+  createSerializedChannelWriter,
   decodeBulkFrame,
   encodeBulkFrame,
   sendWithBackpressure,
@@ -24,6 +25,9 @@ const L = (zh, en) => bi(getCurrentLang(), zh, en)
 const P2P_CONNECT_TIMEOUT_MS = 15_000
 const P2P_KEEPALIVE_MS = 20_000
 const P2P_KEEPALIVE_TIMEOUT_MS = 45_000
+const P2P_DISCONNECTED_RESTART_MS = 3_000
+const P2P_BULK_INITIAL_WINDOW_BYTES = 8 * 1024 * 1024 // 8 MB receiver credit window
+const P2P_BULK_WINDOW_REPLENISH_BYTES = 2 * 1024 * 1024 // Replenish every 2 MB consumed
 const MAX_P2P_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local disk safety cap (0 bytes via server)
 
 function createAsyncByteQueue() {
@@ -138,6 +142,7 @@ export class P2PPeerSession {
     this.ctrlDc = null
     this.bulkDc = null
     this.ctrlCodec = createCtrlCodec()
+    this.ctrlWriter = createSerializedChannelWriter()
     this.remoteIceQueue = []
     this.remoteDescSet = false
 
@@ -147,15 +152,19 @@ export class P2PPeerSession {
     this._readyReject = null
     this._connectTimer = null
     this._keepaliveTimer = null
+    this._wakeGraceTimer = null
+    this._disconnectTimer = null
     this._transportRecheckTimer = null
     this._lastPongAt = 0
+    this._lastEventSeq = 0
 
     this._reqSeq = 1
     this._uploadStreamSeq = 1
     this._pendingRpcs = new Map()
-    this._activeDownloads = new Map() // streamId -> { queue, headerResolve, headerReject, receivedBytes, totalSize, onProgress }
+    this._activeDownloads = new Map() // streamId -> { queue, headerResolve, headerReject, receivedBytes, unackedWindowBytes, totalSize, onProgress }
     this._activeUploads = new Map() // transferId -> { streamId, readyResolve, readyReject, doneResolve, doneReject }
     this._inboundEventQueue = Promise.resolve()
+    this._bulkCtrlQueue = Promise.resolve()
     this._ctrlDecodeQueue = Promise.resolve()
     this._bulkDecodeQueue = Promise.resolve()
   }
@@ -257,13 +266,15 @@ export class P2PPeerSession {
   _sendCtrlJson(obj) {
     if (this.closed || this.ctrlDc?.readyState !== 'open') return false
     const frames = this.ctrlCodec.encode(obj)
-    for (const f of frames) {
-      try {
-        this.ctrlDc.send(f)
-      } catch {
-        return false
-      }
-    }
+    void this.ctrlWriter
+      .enqueue(() => {
+        if (this.closed || this.ctrlDc?.readyState !== 'open') return false
+        for (const f of frames) {
+          this.ctrlDc.send(f)
+        }
+        return true
+      })
+      .catch(() => {})
     return true
   }
 
@@ -319,24 +330,17 @@ export class P2PPeerSession {
     this._stopKeepalive()
     this._lastPongAt = Date.now()
     this._lastKeepaliveTickAt = this._lastPongAt
-    this._wakeGraceUntil = 0
     this._keepaliveTimer = setInterval(() => {
       if (!this.isOpen()) return
       const now = Date.now()
       const tickGap = now - (this._lastKeepaliveTickAt || now)
       this._lastKeepaliveTickAt = now
-      // Detect OS/mobile sleep jump (> 2.5x keepalive interval): send a probe ping and grant 6s grace
-      // instead of immediately killing a healthy P2P link on wake.
+      // Detect OS/mobile sleep jump (> 2.5x keepalive interval): send probe ping and check liveness in 6s
       if (tickGap > P2P_KEEPALIVE_MS * 2.5) {
-        this._wakeGraceUntil = now + 6_000
-        this._sendCtrlJson({ type: 'ping', ts: now })
+        this.probeLiveness(6_000)
         return
       }
-      if (this._wakeGraceUntil > 0 && now < this._wakeGraceUntil) {
-        this._sendCtrlJson({ type: 'ping', ts: now })
-        return
-      }
-      this._wakeGraceUntil = 0
+      if (this._wakeGraceTimer) return
       if (this._lastPongAt > 0 && now - this._lastPongAt > P2P_KEEPALIVE_TIMEOUT_MS) {
         this._failAndTeardown(
           new Error(L('P2P 直连心跳超时，请重试连接', 'P2P keepalive timed out. Please reconnect.')),
@@ -348,10 +352,37 @@ export class P2PPeerSession {
     }, P2P_KEEPALIVE_MS)
   }
 
+  /**
+   * Immediately probe DataChannel liveness (e.g. after mobile app resume / OS wake) with a short one-shot deadline.
+   */
+  probeLiveness(graceMs = 6_000) {
+    if (!this.isOpen() || this._wakeGraceTimer) return
+    const prevPong = this._lastPongAt
+    this._sendCtrlJson({ type: 'ping', ts: Date.now() })
+    this._wakeGraceTimer = setTimeout(() => {
+      this._wakeGraceTimer = null
+      if (this.closed || !this.isOpen()) return
+      if (this._lastPongAt <= prevPong) {
+        this._failAndTeardown(
+          new Error(L('休眠唤醒后 P2P 直连已中断，请重试连接', 'P2P connection dropped after device wake.')),
+          'failed',
+        )
+      }
+    }, graceMs)
+  }
+
   _stopKeepalive() {
     if (this._keepaliveTimer) {
       clearInterval(this._keepaliveTimer)
       this._keepaliveTimer = null
+    }
+    if (this._wakeGraceTimer) {
+      clearTimeout(this._wakeGraceTimer)
+      this._wakeGraceTimer = null
+    }
+    if (this._disconnectTimer) {
+      clearTimeout(this._disconnectTimer)
+      this._disconnectTimer = null
     }
   }
 
@@ -539,7 +570,32 @@ export class P2PPeerSession {
       if (this.closed || !this.pc) return
       const st = this.pc.iceConnectionState
       if (st === 'connected' || st === 'completed') {
+        if (this._disconnectTimer) {
+          clearTimeout(this._disconnectTimer)
+          this._disconnectTimer = null
+        }
         void this._detectIceTransport()
+      } else if (st === 'disconnected') {
+        if (!this._disconnectTimer) {
+          this._disconnectTimer = setTimeout(() => {
+            this._disconnectTimer = null
+            if (this.closed || !this.pc) return
+            if (this.pc.iceConnectionState === 'disconnected') {
+              try {
+                if (typeof this.pc.restartIce === 'function') {
+                  this.pc.restartIce()
+                }
+              } catch {}
+              // If still disconnected after another 4s, fail cleanly so UI/auto-retry rebuilds the peer
+              this._disconnectTimer = setTimeout(() => {
+                this._disconnectTimer = null
+                if (!this.closed && this.pc?.iceConnectionState === 'disconnected') {
+                  this._failAndTeardown(makeUnreachableError('ICE disconnected'), 'failed')
+                }
+              }, 4_000)
+            }
+          }, P2P_DISCONNECTED_RESTART_MS)
+        }
       } else if (st === 'failed') {
         this._failAndTeardown(makeUnreachableError('ICE failed'), 'failed')
       }
@@ -587,7 +643,14 @@ export class P2PPeerSession {
     let inner
     try {
       inner = await decryptJson(ctx.key, e2ee, { kind: 'p2p.signal', roomId: this.roomId })
-    } catch {
+    } catch (decErr) {
+      try {
+        this.onEvent('p2p.signal.decrypt_error', {
+          bridgeId: this.bridgeId,
+          code: decErr?.code || 'E2EE_DECRYPT_FAILED',
+          message: String(decErr?.message || L('端到端信令解密失败，请核对密钥指纹', 'Failed to decrypt P2P signal')),
+        })
+      } catch {}
       return
     }
     if (this.closed || !this.pc || !inner || typeof inner !== 'object') return
@@ -698,6 +761,9 @@ export class P2PPeerSession {
           if (this.closed) return
           const inner = await decryptBinaryJson(key, binSnap, { kind: 'event', roomId: this.roomId })
           if (this.closed || !inner?.event) return
+          if (Number.isFinite(Number(inner.seq))) {
+            this._lastEventSeq = Math.max(this._lastEventSeq, Number(inner.seq))
+          }
           try {
             this.onEvent(inner.event, inner.payload, rawMsg)
           } catch {}
@@ -710,8 +776,11 @@ export class P2PPeerSession {
       const ctx = this.getE2eeContext(this.bridgeId)
       const key = ctx?.key || ''
       if (!key) return
-      decryptBinaryJson(key, msg.bin, { kind: 'p2p.bulk', roomId: this.roomId })
-        .then((inner) => {
+      const binSnap = msg.bin
+      this._bulkCtrlQueue = this._bulkCtrlQueue
+        .then(async () => {
+          if (this.closed) return
+          const inner = await decryptBinaryJson(key, binSnap, { kind: 'p2p.bulk', roomId: this.roomId })
           if (!this.closed && inner && typeof inner === 'object') {
             this._handleBulkCtrl(inner)
           }
@@ -789,7 +858,13 @@ export class P2PPeerSession {
     if (!dl) return
     if (frame.payload.byteLength > 0) {
       dl.receivedBytes += frame.payload.byteLength
+      dl.unackedWindowBytes = (dl.unackedWindowBytes || 0) + frame.payload.byteLength
       dl.queue.push(frame.payload)
+      if (dl.unackedWindowBytes >= P2P_BULK_WINDOW_REPLENISH_BYTES) {
+        const grantBytes = dl.unackedWindowBytes
+        dl.unackedWindowBytes = 0
+        void this._sendBulkCtrl({ action: 'window', streamId: frame.streamId, bytes: grantBytes }).catch(() => {})
+      }
       if (typeof dl.onProgress === 'function') {
         try {
           dl.onProgress({ loaded: dl.receivedBytes, total: dl.totalSize || 0 })
@@ -847,7 +922,7 @@ export class P2PPeerSession {
    */
   async downloadBulkStream(
     streamId,
-    { mimeType = 'application/octet-stream', size = 0, onProgress = null, signal = null } = {},
+    { mimeType = 'application/octet-stream', size = 0, onProgress = null, onPlainChunk = null, signal = null } = {},
   ) {
     const cleanId = Number(streamId)
     if (!Number.isInteger(cleanId) || cleanId <= 0) {
@@ -870,6 +945,7 @@ export class P2PPeerSession {
       headerResolve,
       headerReject,
       receivedBytes: 0,
+      unackedWindowBytes: 0,
       totalSize: Number(size || 0),
       onProgress,
     }
@@ -899,7 +975,7 @@ export class P2PPeerSession {
 
     let completedNormally = false
     try {
-      await this._sendBulkCtrl({ action: 'pull', streamId: cleanId })
+      await this._sendBulkCtrl({ action: 'pull', streamId: cleanId, windowBytes: P2P_BULK_INITIAL_WINDOW_BYTES })
 
       const headerTimer = setTimeout(() => {
         dl.headerReject?.(new Error(L('等待电脑端开始发送文件超时', 'Timed out waiting for computer file stream')))
@@ -923,11 +999,12 @@ export class P2PPeerSession {
         roomId: this.roomId,
         chunked: Boolean(header.e2ee.chunked),
         compressed: Boolean(header.e2ee.compressed),
+        ...(typeof onPlainChunk === 'function' ? { onPlainChunk } : {}),
       })
 
       completedNormally = true
       return {
-        blob: new Blob(dec.chunks || [], { type: mimeType || 'application/octet-stream' }),
+        blob: typeof onPlainChunk === 'function' ? null : new Blob(dec.chunks || [], { type: mimeType || 'application/octet-stream' }),
         size: dec.totalPlainBytes,
       }
     } finally {

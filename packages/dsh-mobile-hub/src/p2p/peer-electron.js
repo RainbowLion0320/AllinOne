@@ -15,12 +15,15 @@ function encodeJsonFrame(obj) {
 
 function encodeBinFrame(peerId, role, bytes) {
   const pidBuf = Buffer.from(String(peerId || ''), 'utf8')
+  if (pidBuf.length > 255) {
+    throw new RangeError(`ElectronWebRtcClient peerId exceeds 255 bytes (${pidBuf.length})`)
+  }
   const raw = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const bodyLen = 1 + 1 + pidBuf.length + 1 + raw.length
   const out = Buffer.allocUnsafe(4 + bodyLen)
   out.writeUInt32BE(bodyLen, 0)
   out[4] = FRAME_BIN
-  out[5] = pidBuf.length & 0xff
+  out[5] = pidBuf.length
   pidBuf.copy(out, 6)
   out[6 + pidBuf.length] = role === 'bulk' ? 1 : 0
   raw.copy(out, 7 + pidBuf.length)
@@ -59,7 +62,39 @@ export class ElectronWebRtcClient {
       sock.setNoDelay(true)
       let authed = false
       let settled = false
-      let buf = Buffer.alloc(0)
+      const rxChunks = []
+      let rxLen = 0
+      const pullBytes = (n) => {
+        if (rxChunks.length === 1 && rxChunks[0].length === n) {
+          const only = rxChunks.pop()
+          rxLen = 0
+          return only
+        }
+        const out = Buffer.allocUnsafe(n)
+        let off = 0
+        while (off < n && rxChunks.length > 0) {
+          const head = rxChunks[0]
+          const take = Math.min(head.length, n - off)
+          head.copy(out, off, 0, take)
+          off += take
+          if (take === head.length) rxChunks.shift()
+          else rxChunks[0] = head.subarray(take)
+        }
+        rxLen -= n
+        return out
+      }
+      const peekUInt32BE = () => {
+        if (rxChunks[0].length >= 4) return rxChunks[0].readUInt32BE(0)
+        const hdr = Buffer.allocUnsafe(4)
+        let off = 0
+        for (const c of rxChunks) {
+          const take = Math.min(c.length, 4 - off)
+          c.copy(hdr, off, 0, take)
+          off += take
+          if (off === 4) break
+        }
+        return hdr.readUInt32BE(0)
+      }
 
       const clearConnectRefs = () => {
         clearTimeout(timer)
@@ -107,17 +142,19 @@ export class ElectronWebRtcClient {
       })
 
       sock.on('data', (chunk) => {
-        buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk])
-        while (buf.length >= 4) {
-          const len = buf.readUInt32BE(0)
+        if (!chunk || chunk.length === 0) return
+        rxChunks.push(chunk)
+        rxLen += chunk.length
+        while (rxLen >= 4) {
+          const len = peekUInt32BE()
           if (len <= 0 || len > 16 * 1024 * 1024) {
             sock.destroy()
             return
           }
-          if (buf.length < 4 + len) break
-          const kind = buf[4]
-          const payload = buf.subarray(5, 4 + len)
-          buf = buf.subarray(4 + len)
+          if (rxLen < 4 + len) break
+          const frame = pullBytes(4 + len)
+          const kind = frame[4]
+          const payload = frame.subarray(5)
 
           if (kind === FRAME_JSON) {
             let msg
@@ -375,7 +412,7 @@ export class ElectronWebRtcClient {
             const onAbort = () => finishReject(makeAbortError())
             const timer = setTimeout(() => {
               finishReject(new Error('Bulk DataChannel backpressure stall timeout'))
-            }, 15_000)
+            }, 45_000)
             timer.unref?.()
             const entry = { resolve: finishResolve, reject: finishReject }
             drainWaiters.push(entry)

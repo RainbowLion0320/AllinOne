@@ -1,3 +1,7 @@
+import { compareSemver } from '@allinone/shared/semver'
+
+export { compareSemver }
+
 export const REPO_URL = 'https://github.com/RainbowLion0320/AllinOne'
 
 const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
@@ -8,24 +12,26 @@ export const RELEASES_URL =
 const SAFE_SHA256_RE = /^[a-f0-9]{64}$/i
 const MIN_NATIVE_MARKER_RE = /<!--\s*android-ota-min-native:\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\s*-->/i
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0'])
+const GH_RELEASE_CACHE_KEY = 'allinone_gh_release_cache_v1'
 
-export function compareSemver(a, b) {
-  const parse = (raw) => {
-    const clean = String(raw || '').trim().replace(/^v/i, '')
-    const m = clean.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/)
-    if (!m) return null
-    return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), pre: m[4] || '' }
+function loadGithubReleaseCache(url) {
+  try {
+    if (typeof localStorage === 'undefined') return null
+    const raw = localStorage.getItem(GH_RELEASE_CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed || parsed.url !== url || !parsed.data) return null
+    return parsed
+  } catch {
+    return null
   }
-  const pa = parse(a)
-  const pb = parse(b)
-  if (!pa || !pb) return 0
-  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1
-  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1
-  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1
-  if (pa.pre === pb.pre) return 0
-  if (!pa.pre) return 1
-  if (!pb.pre) return -1
-  return pa.pre.localeCompare(pb.pre)
+}
+
+function saveGithubReleaseCache(url, etag, data) {
+  try {
+    if (typeof localStorage === 'undefined' || !etag || !data) return
+    localStorage.setItem(GH_RELEASE_CACHE_KEY, JSON.stringify({ url, etag, data, savedAt: Date.now() }))
+  } catch {}
 }
 
 function parseSha256Digest(raw) {
@@ -314,12 +320,27 @@ export async function checkNativeMobileUpdate({
 
   const checkGithubRelease = async () => {
     try {
+      const cached = loadGithubReleaseCache(releasesApiUrl)
+      const headers = { Accept: 'application/vnd.github+json' }
+      if (cached?.etag) {
+        headers['If-None-Match'] = cached.etag
+      }
       const res = await fetchWithTimeout(releasesApiUrl, {
         cache: 'no-store',
-        headers: { Accept: 'application/vnd.github+json' },
+        headers,
       })
-      if (!res.ok) return
-      const data = await res.json().catch(() => null)
+      let data = null
+      if (res.status === 304 && cached?.data) {
+        data = cached.data
+      } else if (res.ok) {
+        data = await res.json().catch(() => null)
+        const nextEtag = res.headers?.get?.('etag') || ''
+        if (nextEtag && data) {
+          saveGithubReleaseCache(releasesApiUrl, nextEtag, data)
+        }
+      } else {
+        return
+      }
       const ghVer = String(data?.tag_name || '').trim().replace(/^v/i, '')
       if (!ghVer) return
       checkedAny = true
@@ -344,15 +365,41 @@ export async function checkNativeMobileUpdate({
           /^All-in-One-WebBundle.*\.zip$/i.test(String(a?.name || '')) &&
           /^https:\/\//i.test(String(a?.browser_download_url || '')),
       )
+      const manifestAsset = assets.find(
+        (a) =>
+          /^All-in-One-WebBundle\.json$/i.test(String(a?.name || '')) &&
+          /^https:\/\//i.test(String(a?.browser_download_url || '')),
+      )
       const bundleSha = parseSha256Digest(webBundleAsset?.digest)
-      if (webBundleAsset && SAFE_SHA256_RE.test(bundleSha)) {
+      let ghSignature = ''
+      let ghSigAlg = ''
+      let ghManifestSha = ''
+      let ghManifestMinNative = ''
+      if (hasNativeOta && manifestAsset) {
+        try {
+          const mRes = await fetchWithTimeout(manifestAsset.browser_download_url, { cache: 'no-store' })
+          if (mRes.ok) {
+            const mData = await mRes.json().catch(() => null)
+            const mSha = parseSha256Digest(mData?.sha256)
+            if (mSha && (!bundleSha || mSha === bundleSha)) {
+              ghManifestSha = mSha
+              ghSignature = String(mData?.signature || '').trim()
+              ghSigAlg = String(mData?.sigAlg || '').trim()
+              ghManifestMinNative = String(mData?.minNativeVersion || '').trim().replace(/^v/i, '')
+            }
+          }
+        } catch {}
+      }
+      const effectiveSha = bundleSha || ghManifestSha
+      // Require cryptographic signature for OTA bundles unconditionally (verified natively against APK cert)
+      if (webBundleAsset && SAFE_SHA256_RE.test(effectiveSha) && ghSignature && ghSigAlg) {
         githubOta = {
           version: ghVer,
           downloadUrl: webBundleAsset.browser_download_url,
-          expectedSha256: bundleSha,
-          signature: '',
-          sigAlg: '',
-          minNativeVersion: githubMinNative,
+          expectedSha256: effectiveSha,
+          signature: ghSignature,
+          sigAlg: ghSigAlg,
+          minNativeVersion: ghManifestMinNative || githubMinNative,
           size: Number(webBundleAsset.size || 0),
         }
       }

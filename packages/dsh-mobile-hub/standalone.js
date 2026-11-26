@@ -103,6 +103,7 @@ export function startStandaloneBridge(options = {}) {
       mode,
       e2eeKey,
       inboundDir: orchestrator.inboundDir,
+      inboundStore: orchestrator.inboundStore,
       log,
       onRpc: (method, params, ctx) => orchestrator.handleRpc(method, params, ctx),
       onRegisterP2pUpload: (info) => orchestrator.registerP2pUpload(info),

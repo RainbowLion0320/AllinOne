@@ -17,6 +17,7 @@ import {
 } from '../lib/imageUrls.js'
 import {
   getCachedE2eeImageUrl,
+  invalidateCachedE2eeImageUrl,
   loadE2eeImageUrl,
   loadPersistedE2eeImageUrl,
   needsE2eeMediaLoad,
@@ -42,10 +43,12 @@ function ChatImageCard({
   const [previewFailed, setPreviewFailed] = useState(false)
   const [manualLoadAllowed, setManualLoadAllowed] = useState(false)
   const imgRef = useRef(null)
+  const rehydrateAttemptedRef = useRef(false)
   const imageContextRef = useRef(imageContext)
   imageContextRef.current = imageContext
 
   useEffect(() => {
+    rehydrateAttemptedRef.current = false
     setPreviewFailed(false)
     setManualLoadAllowed(false)
     setRetryNonce(0)
@@ -387,6 +390,14 @@ function ChatImageCard({
                     setStatus('loading')
                     return
                   }
+                  if (needsE2ee && typeof src === 'string' && src.startsWith('blob:') && !rehydrateAttemptedRef.current) {
+                    rehydrateAttemptedRef.current = true
+                    invalidateCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+                    setE2eeSrc('')
+                    setStatus('loading')
+                    setRetryNonce((n) => n + 1)
+                    return
+                  }
                   setStatus('error')
                 }}
                 className={`max-h-[340px] w-full object-contain transition duration-200 ${
@@ -412,7 +423,7 @@ function ChatImageCard({
 /**
  * Renders a responsive gallery of images attached to or referenced by a chat message.
  */
-export function ChatImageGallery({ images = [], imageContext, compact = false }) {
+export const ChatImageGallery = React.memo(function ChatImageGallery({ images = [], imageContext, compact = false }) {
   if (!Array.isArray(images) || images.length === 0) return null
 
   const resolvedList = images.map((item) => {
@@ -456,4 +467,4 @@ export function ChatImageGallery({ images = [], imageContext, compact = false })
       ))}
     </div>
   )
-}
+})

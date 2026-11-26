@@ -1,8 +1,7 @@
 import { createHmac, randomInt } from 'node:crypto'
 import http from 'node:http'
-import net from 'node:net'
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
-import { basename, extname, join, normalize, resolve, sep } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import { createAuthManager } from './auth.js'
@@ -11,7 +10,6 @@ import { createEmailCodeStore } from './emailCodes.js'
 import { createMailer } from './mailer.js'
 import { RelayHub, parseClientDeviceInfo } from './hub.js'
 import { createStunServer } from './stun-server.js'
-import { buildAdminOverview, collectServerHealth } from './admin-monitor.js'
 import {
   buildTurnQuotaSnapshot,
   createTurnLogMeter,
@@ -20,6 +18,23 @@ import {
   resolveTurnQuotaConfig,
 } from './turn-meter.js'
 import { createCloudflareTurnProvider, normalizeCloudflareIceResponse, parseCfTurnTiers } from './cf-turn.js'
+import {
+  LOCAL_DEV_ORIGIN_RE,
+  buildAllowedOriginsSet,
+  createIpDailyRegistrationLimiter,
+  createLogger,
+  createOutboundEmailGate,
+  createTrustedProxyChecker,
+  loadDotEnv,
+  maskEmailAddress,
+  readJsonObjectBody,
+  resolveClientIp,
+  sendJson,
+  sendRouteError,
+  setSecurityHeaders,
+} from './http-utils.js'
+import { createAdminRoutes } from './routes/admin.js'
+import { createStaticHandler } from './routes/static.js'
 
 export {
   buildTurnQuotaSnapshot,
@@ -36,54 +51,14 @@ const ADMIN_DASHBOARD_DIR = resolve(__dirname, './admin')
 const RELAY_VERSION = (() => {
   try {
     const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))
-    return String(pkg?.version || '1.0.29')
+    return String(pkg?.version || '0.0.0')
   } catch {
-    return '1.0.29'
+    return '0.0.0'
   }
 })()
 
-/** Load simple .env file if present (no extra dependency needed). */
-function loadDotEnv(filePath) {
-  if (!existsSync(filePath)) return
-  const raw = readFileSync(filePath, 'utf8')
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eq = trimmed.indexOf('=')
-    if (eq === -1) continue
-    const key = trimmed.slice(0, eq).trim()
-    let val = trimmed.slice(eq + 1).trim()
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1)
-    }
-    if (!(key in process.env)) process.env[key] = val
-  }
-}
-
 loadDotEnv(resolve(__dirname, '../.env'))
 loadDotEnv(resolve(__dirname, '../../../.env'))
-
-const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.apk': 'application/vnd.android.package-archive',
-  '.dmg': 'application/octet-stream',
-  '.exe': 'application/octet-stream',
-  '.zip': 'application/zip',
-  '.ps1': 'text/plain; charset=utf-8',
-  '.sh': 'text/plain; charset=utf-8',
-}
 
 const DEFAULT_PUBLIC_STUN_SERVERS = [
   'stun:stun.chat.bilibili.com:3478',
@@ -104,212 +79,6 @@ export function buildTurnCredentials({ secret, userId = 'allinone', ttlSec = 86_
   const credential = createHmac('sha1', cleanSecret).update(username).digest('base64')
   return { username, credential, expiresAt: expiry * 1000 }
 }
-const APP_HTML_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-const SANDBOX_PREVIEW_CSP =
-  "sandbox allow-scripts allow-forms; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
-
-function maskEmailAddress(email) {
-  const clean = String(email || '').trim()
-  const at = clean.indexOf('@')
-  if (at <= 0) return clean
-  const local = clean.slice(0, at)
-  const domain = clean.slice(at)
-  const prefix = local.slice(0, Math.min(2, local.length))
-  return `${prefix}***${domain}`
-}
-
-const LOCAL_DEV_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i
-const CAPACITOR_ORIGINS = new Set([
-  'capacitor://localhost',
-  'ionic://localhost',
-  'https://localhost',
-  'http://localhost',
-  'app://allinone',
-])
-
-function normalizeIpForMatch(rawAddr) {
-  let addr = String(rawAddr || '').trim().toLowerCase()
-  if (!addr) return ''
-  if (addr.startsWith('[') && addr.endsWith(']')) addr = addr.slice(1, -1)
-  if (addr.startsWith('::ffff:')) addr = addr.slice(7)
-  return addr
-}
-
-function extractValidIp(raw) {
-  let clean = String(raw || '').trim()
-  if (!clean) return ''
-  if (clean.startsWith('[') && clean.endsWith(']')) clean = clean.slice(1, -1)
-  return net.isIP(clean) !== 0 ? clean : ''
-}
-
-function isLoopbackAddr(addr) {
-  return addr === '127.0.0.1' || addr === '::1'
-}
-
-function isPrivateAddr(addr) {
-  if (isLoopbackAddr(addr)) return true
-  if (addr.startsWith('10.') || addr.startsWith('192.168.') || addr.startsWith('fc') || addr.startsWith('fd')) {
-    return true
-  }
-  const m = addr.match(/^172\.(\d+)\./)
-  if (m) {
-    const second = Number(m[1])
-    if (second >= 16 && second <= 31) return true
-  }
-  return false
-}
-
-/**
- * Build a trusted reverse-proxy predicate from `TRUST_PROXY`:
- * - `'loopback'` (default): trusts ONLY `127.0.0.1` / `::1` / `::ffff:127.0.0.1`
- * - `'private'`: trusts loopback + RFC1918 / IPv6 ULA ranges (e.g. Docker bridge)
- * - `'none'` / `'false'` / `'0'` / `'off'`: never trusts forwarded headers
- * - comma-separated proxy IPs (optionally mixed with `'loopback'` / `'private'`)
- */
-function createTrustedProxyChecker(rawSpec = 'loopback') {
-  const clean = String(rawSpec ?? '').trim().toLowerCase() || 'loopback'
-  if (clean === 'false' || clean === 'none' || clean === '0' || clean === 'off') {
-    return () => false
-  }
-  const tokens = clean.split(',').map((s) => s.trim()).filter(Boolean)
-  let allowLoopback = false
-  let allowPrivate = false
-  const exactIps = new Set()
-  for (const tok of tokens) {
-    if (tok === 'loopback') allowLoopback = true
-    else if (tok === 'private') allowPrivate = true
-    else {
-      const norm = normalizeIpForMatch(tok)
-      if (norm && net.isIP(norm) !== 0) exactIps.add(norm)
-    }
-  }
-  if (!allowLoopback && !allowPrivate && exactIps.size === 0) {
-    allowLoopback = true
-  }
-  return (rawAddr) => {
-    const addr = normalizeIpForMatch(rawAddr)
-    if (!addr) return false
-    if (allowPrivate && isPrivateAddr(addr)) return true
-    if (allowLoopback && isLoopbackAddr(addr)) return true
-    return exactIps.has(addr)
-  }
-}
-
-function buildAllowedOriginsSet(publicRelayUrl, rawAllowedOrigins) {
-  const allowed = new Set(CAPACITOR_ORIGINS)
-  if (publicRelayUrl) {
-    try {
-      allowed.add(new URL(publicRelayUrl).origin.toLowerCase())
-    } catch {}
-  }
-  const extra = String(rawAllowedOrigins || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  for (const item of extra) {
-    try {
-      allowed.add(new URL(item).origin.toLowerCase())
-    } catch {
-      allowed.add(item.replace(/\/+$/, '').toLowerCase())
-    }
-  }
-  return allowed
-}
-
-function readJsonBody(req, maxBytes = 256 * 1024) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const chunks = []
-    let total = 0
-    req.on('data', (chunk) => {
-      total += chunk.length
-      if (total > maxBytes) {
-        rejectPromise(new Error('Body too large'))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      try {
-        const text = Buffer.concat(chunks).toString('utf8')
-        resolvePromise(text.length > 0 ? JSON.parse(text) : {})
-      } catch (err) {
-        rejectPromise(err)
-      }
-    })
-    req.on('error', rejectPromise)
-  })
-}
-
-function sendJson(res, status, data) {
-  const body = JSON.stringify(data)
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store',
-  })
-  res.end(body)
-}
-
-const SAFE_SCRIPT_URL_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
-const SAFE_PREFIX_RE = /^\/[A-Za-z0-9._\-\/]*$/
-
-function getTrustedForwardedProto(req, isTrustedProxy) {
-  if (!isTrustedProxy(req.socket?.remoteAddress)) return ''
-  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
-  return proto === 'https' || proto === 'http' ? proto : ''
-}
-
-function validateSafeScriptUrl(rawUrl) {
-  const trimmed = String(rawUrl || '').trim().replace(/\/+$/, '')
-  if (!trimmed || trimmed.length > 256) return ''
-  if (!SAFE_SCRIPT_URL_RE.test(trimmed)) return ''
-  try {
-    const parsed = new URL(trimmed)
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
-    if (parsed.username || parsed.password || parsed.search || parsed.hash) return ''
-    const cleanPath = parsed.pathname.replace(/\/+$/, '')
-    const candidate = `${parsed.origin}${cleanPath}`
-    return SAFE_SCRIPT_URL_RE.test(candidate) ? candidate : ''
-  } catch {
-    return ''
-  }
-}
-
-function resolveSafePublicScriptUrl(req, publicRelayUrl, isTrustedProxy) {
-  if (publicRelayUrl) {
-    return validateSafeScriptUrl(publicRelayUrl)
-  }
-  const trusted = isTrustedProxy(req.socket?.remoteAddress)
-  const proto = (trusted && getTrustedForwardedProto(req, isTrustedProxy)) || (req.socket?.encrypted ? 'https' : 'http')
-  const rawHost = String(req.headers.host || '').trim()
-  if (!rawHost) return ''
-  let prefix = ''
-  if (trusted) {
-    const rawPrefix = String(req.headers['x-forwarded-prefix'] || '').split(',')[0].trim()
-    if (rawPrefix) {
-      const normalized = rawPrefix.startsWith('/') ? rawPrefix : `/${rawPrefix}`
-      const stripped = normalized.replace(/\/+$/, '')
-      if (stripped && !stripped.includes('..') && SAFE_PREFIX_RE.test(stripped)) {
-        prefix = stripped
-      }
-    }
-  }
-  return validateSafeScriptUrl(`${proto}://${rawHost}${prefix}`)
-}
-
-function setSecurityHeaders(req, res, isTrustedProxy) {
-  res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.setHeader('X-Frame-Options', 'DENY')
-  res.setHeader('Referrer-Policy', 'no-referrer')
-  // Allow self camera so built-in QR scanner continues to work cleanly in PWA/WebView
-  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()')
-  const forwardedProto = getTrustedForwardedProto(req, isTrustedProxy)
-  if (forwardedProto === 'https' || req.socket?.encrypted) {
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
-  }
-}
 
 function firstNonEmptyEnv(explicit, envVal, fallback) {
   if (explicit !== undefined && explicit !== null && String(explicit).trim() !== '') return explicit
@@ -318,18 +87,25 @@ function firstNonEmptyEnv(explicit, envVal, fallback) {
 }
 
 export function createRelayServer(options = {}) {
+  const log = options.log || createLogger('control')
   const port = Number(firstNonEmptyEnv(options.port, process.env.PORT, 8787))
   const host = String(firstNonEmptyEnv(options.host, process.env.HOST, '0.0.0.0')).trim()
   const jwtSecret = String(options.jwtSecret ?? process.env.JWT_SECRET ?? '').trim()
+  const jwtSecretPrevious = String(options.jwtSecretPrevious ?? process.env.JWT_SECRET_PREVIOUS ?? '').trim()
   const adminBootstrapToken = String(options.adminBootstrapToken ?? process.env.ADMIN_BOOTSTRAP_TOKEN ?? '').trim()
   const rawMaxDaily = options.maxDailyRegistrations ?? process.env.MAX_DAILY_REGISTRATIONS
   const maxDailyRegistrations = normalizeMaxDailyRegistrations(rawMaxDaily, 20)
+  const maxRegPerIpPerDay = normalizeMaxDailyRegistrations(
+    options.maxRegistrationsPerIpPerDay ?? process.env.MAX_REGISTRATIONS_PER_IP_PER_DAY,
+    5,
+  )
   const publicRelayUrl = String(options.publicRelayUrl ?? process.env.PUBLIC_RELAY_URL ?? '').trim().replace(/\/+$/, '')
   const allowedOrigins = buildAllowedOriginsSet(
     publicRelayUrl,
     options.allowedOrigins ?? process.env.ALLOWED_ORIGINS ?? '',
   )
   const isTrustedProxy = createTrustedProxyChecker(options.trustProxy ?? process.env.TRUST_PROXY ?? 'loopback')
+  const trustProxyHeader = String(options.trustProxyHeader ?? process.env.TRUST_PROXY_HEADER ?? '').trim()
   const isProd = (options.nodeEnv ?? process.env.NODE_ENV) === 'production'
   if (isProd && !options.allowDevSecrets && jwtSecret.length < 16) {
     throw new Error(
@@ -344,21 +120,6 @@ export function createRelayServer(options = {}) {
     options.accountsFile ?? (process.env.ACCOUNTS_FILE || resolve(__dirname, '../data/accounts.json')),
   )
 
-  const rawStunPort = firstNonEmptyEnv(options.stunPort, process.env.STUN_PORT, '3478')
-  const stunDisabled =
-    options.stunEnabled === false ||
-    String(rawStunPort).trim().toLowerCase() === 'false' ||
-    String(rawStunPort).trim().toLowerCase() === 'off' ||
-    String(rawStunPort).trim() === '-1'
-  const stunPort = stunDisabled ? -1 : Number(rawStunPort)
-  const stunHost = String(
-    firstNonEmptyEnv(options.stunHost, process.env.STUN_HOST, options.host ? options.host : '0.0.0.0'),
-  ).trim()
-  const stunServer =
-    !stunDisabled && Number.isInteger(stunPort) && stunPort >= 0
-      ? createStunServer({ port: stunPort, host: stunHost })
-      : null
-
   const turnSecret = String(options.turnSecret ?? process.env.TURN_SECRET ?? '').trim()
   const turnHostExplicit = String(options.turnHost ?? process.env.TURN_HOST ?? '').trim()
   const turnPortRaw = firstNonEmptyEnv(options.turnPort, process.env.TURN_PORT, '3478')
@@ -366,10 +127,36 @@ export function createRelayServer(options = {}) {
   const turnTtlSec = Math.max(120, Number(firstNonEmptyEnv(options.turnTtlSec, process.env.TURN_TTL_SEC, 600)) || 600)
   const turnLogFile = String(options.turnLogFile ?? process.env.TURN_LOG_FILE ?? '').trim()
   const turnQuotaConfig = resolveTurnQuotaConfig(options, process.env)
+
+  const stunExplicitlyConfigured =
+    options.stunPort !== undefined ||
+    options.stunEnabled !== undefined ||
+    String(process.env.STUN_PORT ?? '').trim() !== ''
+  const rawStunPort = firstNonEmptyEnv(options.stunPort, process.env.STUN_PORT, '3478')
+  const stunDisabledByConfig =
+    options.stunEnabled === false ||
+    String(rawStunPort).trim().toLowerCase() === 'false' ||
+    String(rawStunPort).trim().toLowerCase() === 'off' ||
+    String(rawStunPort).trim() === '-1'
+  const candidateStunPort = stunDisabledByConfig ? -1 : Number(rawStunPort)
+  // Auto-disable built-in STUN when coturn is configured on the same port and STUN_PORT wasn't explicitly forced
+  const stunAutoDisabledForCoturn = Boolean(
+    !stunExplicitlyConfigured && turnSecret && candidateStunPort === turnPort,
+  )
+  const stunPort = stunDisabledByConfig || stunAutoDisabledForCoturn ? -1 : candidateStunPort
+  const stunHost = String(
+    firstNonEmptyEnv(options.stunHost, process.env.STUN_HOST, options.host ? options.host : '0.0.0.0'),
+  ).trim()
+  const stunServer =
+    Number.isInteger(stunPort) && stunPort >= 0
+      ? createStunServer({ port: stunPort, host: stunHost, log })
+      : null
+
   let hubRef = null
   const cfTurn = createCloudflareTurnProvider(
     {
       ...options,
+      log,
       onRecovered: () => {
         if (!hubRef) return
         for (const rid of hubRef.getActiveRoomIds()) {
@@ -385,7 +172,12 @@ export function createRelayServer(options = {}) {
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
   const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
+  const outboundEmailGate = createOutboundEmailGate({
+    maxGlobalPerHour: Number(process.env.MAX_EMAILS_PER_HOUR) || 120,
+  })
+  const ipDailyRegLimiter = createIpDailyRegistrationLimiter({ maxPerIpPerDay: maxRegPerIpPerDay })
   const startedAt = Date.now()
+  let isDraining = false
 
   function buildUserTurnQuota(roomId) {
     const rid = String(roomId || '').trim()
@@ -398,7 +190,7 @@ export function createRelayServer(options = {}) {
       usedBytes: usage.bytes,
       config: turnQuotaConfig,
     })
-    const cfActive = Boolean(cfTurn.appliesToTier(tier) && cfTurn.getIceEntry())
+    const cfActive = Boolean(cfTurn.appliesToTier(tier) && cfTurn.getIceEntry(rid))
     return {
       ...snap,
       ...(cfActive ? { exceeded: false } : {}),
@@ -413,7 +205,6 @@ export function createRelayServer(options = {}) {
         return new URL(publicRelayUrl).hostname
       } catch {}
     }
-    // Use per-request Host only for that specific request; never mutate global state across rooms
     if (req?.headers?.host) {
       try {
         const parsed = new URL(`http://${req.headers.host}`).hostname
@@ -442,10 +233,9 @@ export function createRelayServer(options = {}) {
     const stunStats = stunServer?.getStats?.()
     const quota = scopeId ? buildUserTurnQuota(scopeId) : null
 
-    // Mode 0: Tiered Cloudflare Realtime TURN (e.g. `free` tier -> Cloudflare 1 TB/mo free pool, 0 self-hosted VPS egress)
-    // Still puts our low-latency domestic STUN first when available so direct P2P stays fast & proxy-clean.
+    // Mode 0: Tiered Cloudflare Realtime TURN (isolated per-user credentials)
     if (cfTurn.enabled && quota && cfTurn.appliesToTier(quota.tier)) {
-      const cfEntry = cfTurn.getIceEntry()
+      const cfEntry = cfTurn.getIceEntry(scopeId)
       if (cfEntry && cfEntry.turnServers.length > 0) {
         const servers = []
         if (formattedHost && (turnSecret || (stunStats?.enabled && stunStats.port > 0))) {
@@ -457,9 +247,16 @@ export function createRelayServer(options = {}) {
         servers.push(...cfEntry.turnServers)
         return servers
       }
+      // If operator disabled fallback to self-hosted coturn, return STUN-only during CF outage
+      if (!cfTurn.fallbackSelfHosted) {
+        if (formattedHost && (turnSecret || (stunStats?.enabled && stunStats.port > 0))) {
+          return [{ urls: `stun:${formattedHost}:${turnSecret ? turnPort : stunStats.port}` }]
+        }
+        return DEFAULT_PUBLIC_STUN_SERVERS.map((u) => ({ urls: u }))
+      }
     }
 
-    // Mode 1: Hardened self-hosted coturn (handles BOTH STUN and TURN UDP+TCP cleanly with zero proxy-polluted public STUNs)
+    // Mode 1: Hardened self-hosted coturn
     if (turnSecret && formattedHost) {
       const servers = [{ urls: `stun:${formattedHost}:${turnPort}` }]
       if (!quota || !quota.exceeded) {
@@ -491,11 +288,13 @@ export function createRelayServer(options = {}) {
       return [{ urls: `stun:${formattedHost}:${stunStats.port}` }]
     }
 
-    // Mode 3: Public STUN fallback (only when neither TURN nor built-in STUN is active)
+    // Mode 3: Public STUN fallback
     return DEFAULT_PUBLIC_STUN_SERVERS.map((u) => ({ urls: u }))
   }
+
   const auth = createAuthManager({
     jwtSecret,
+    jwtSecretPrevious,
     adminBootstrapToken,
     getTokenVersion: (roomId) => accounts.getTokenVersion(roomId),
     isSessionRevoked: (roomId, sid) => accounts.isSessionRevoked(roomId, sid),
@@ -646,8 +445,10 @@ export function createRelayServer(options = {}) {
   const turnMeter = turnLogFile
     ? createTurnLogMeter({
         logPath: turnLogFile,
+        cursorPath: join(dirname(accounts.dbPath), 'turn-meter-cursor.json'),
         pollIntervalMs: options.turnMeterPollMs || 3_000,
         startFromBeginning: Boolean(options.turnMeterStartFromBeginning),
+        log,
         onUsage: ({ userId, billedBytes }) => {
           recordTurnUsageBytes(userId, billedBytes)
         },
@@ -687,24 +488,7 @@ export function createRelayServer(options = {}) {
   }
 
   function getClientIp(req) {
-    const remote = String(req.socket?.remoteAddress || 'unknown').trim()
-    if (isTrustedProxy(remote)) {
-      const realIp = String(req.headers['x-real-ip'] || '').trim()
-      if (realIp && !realIp.includes(',')) {
-        const validReal = extractValidIp(realIp)
-        if (validReal) return validReal
-      }
-      const xff = String(req.headers['x-forwarded-for'] || '').trim()
-      if (xff) {
-        const parts = xff.split(',').map((s) => s.trim()).filter(Boolean)
-        // Rightmost X-Forwarded-For entry is appended by the trusted reverse proxy (cannot be spoofed by client)
-        if (parts.length > 0) {
-          const validXff = extractValidIp(parts[parts.length - 1])
-          if (validXff) return validXff
-        }
-      }
-    }
-    return remote
+    return resolveClientIp(req, isTrustedProxy, { trustProxyHeader })
   }
 
   // Per-user mutation & API rate limiter (bounded map, 1-minute sliding window)
@@ -736,30 +520,8 @@ export function createRelayServer(options = {}) {
     return true
   }
 
-  // Per-(account, ip) 10-minute cooldown on login alert emails to prevent alert spam
-  const LOGIN_ALERT_COOLDOWN_MS = 10 * 60 * 1000
-  const MAX_LOGIN_ALERT_ENTRIES = 5000
-  const loginAlertCooldowns = new Map()
-  function shouldSendLoginAlert(userId, ip) {
-    const cleanUser = String(userId || '').trim()
-    const cleanIp = String(ip || '').trim() || 'unknown'
-    if (!cleanUser) return false
-    const now = Date.now()
-    const key = `${cleanUser}::${cleanIp}`
-    const lastAt = loginAlertCooldowns.get(key)
-    if (lastAt && now - lastAt < LOGIN_ALERT_COOLDOWN_MS) return false
-    if (loginAlertCooldowns.size >= MAX_LOGIN_ALERT_ENTRIES) {
-      for (const [k, ts] of loginAlertCooldowns.entries()) {
-        if (now - ts >= LOGIN_ALERT_COOLDOWN_MS) loginAlertCooldowns.delete(k)
-      }
-      while (loginAlertCooldowns.size >= MAX_LOGIN_ALERT_ENTRIES) {
-        const oldest = loginAlertCooldowns.keys().next().value
-        if (!oldest) break
-        loginAlertCooldowns.delete(oldest)
-      }
-    }
-    loginAlertCooldowns.set(key, now)
-    return true
+  function shouldSendSecurityEmail(userId, kind, ip = '') {
+    return outboundEmailGate.tryConsume({ userId, kind, ip })
   }
 
   // Global & per-IP concurrent WebSocket connection caps
@@ -894,6 +656,77 @@ export function createRelayServer(options = {}) {
     return true
   }
 
+  const adminRoutes = createAdminRoutes({
+    requireAdmin,
+    checkUserActionRateLimit,
+    getClientIp,
+    accounts,
+    hub,
+    mailer,
+    stunServer,
+    turnSecret,
+    turnPort,
+    turnTtlSec,
+    turnLogFile,
+    turnMeter,
+    turnQuotaConfig,
+    cfTurn,
+    maxDailyRegistrations,
+    startedAt,
+    relayVersion: RELAY_VERSION,
+    extractPublicHostname,
+    buildUserTurnQuota,
+    log,
+  })
+
+  const staticHandler = createStaticHandler({
+    staticDir,
+    adminDashboardDir: ADMIN_DASHBOARD_DIR,
+    relayVersion: RELAY_VERSION,
+    publicRelayUrl,
+    isTrustedProxy,
+  })
+
+  function renderPrometheusMetrics() {
+    const m = hub.getMetricsSummary()
+    const sc = accounts.getScryptStats()
+    const stunSt = stunServer?.getStats?.() || { enabled: false, requests: 0, dropped: 0 }
+    const mem = process.memoryUsage()
+    return [
+      '# HELP allinone_up Whether the relay server is healthy and not draining',
+      '# TYPE allinone_up gauge',
+      `allinone_up ${!isDraining && accounts.isHealthy() ? 1 : 0}`,
+      '# HELP allinone_online_bridges Currently connected PC bridges',
+      '# TYPE allinone_online_bridges gauge',
+      `allinone_online_bridges ${m.onlineBridgeCount}`,
+      '# HELP allinone_online_clients Currently connected client terminals',
+      '# TYPE allinone_online_clients gauge',
+      `allinone_online_clients ${m.onlineClientCount}`,
+      '# HELP allinone_active_ws_total Active WebSocket connections',
+      '# TYPE allinone_active_ws_total gauge',
+      `allinone_active_ws_total ${activeWsGlobal}`,
+      '# HELP allinone_signals_total Total WebRTC signaling frames relayed',
+      '# TYPE allinone_signals_total counter',
+      `allinone_signals_total ${m.totalSignals || 0}`,
+      '# HELP allinone_scrypt_active Active scrypt password hashing workers',
+      '# TYPE allinone_scrypt_active gauge',
+      `allinone_scrypt_active ${sc.active}`,
+      '# HELP allinone_scrypt_queued Queued scrypt password hashing jobs',
+      '# TYPE allinone_scrypt_queued gauge',
+      `allinone_scrypt_queued ${sc.queued}`,
+      '# HELP allinone_stun_requests_total Valid STUN binding requests served',
+      '# TYPE allinone_stun_requests_total counter',
+      `allinone_stun_requests_total ${stunSt.requests || 0}`,
+      '# HELP allinone_stun_dropped_total STUN packets dropped by rate limits',
+      '# TYPE allinone_stun_dropped_total counter',
+      `allinone_stun_dropped_total ${stunSt.dropped || 0}`,
+      '# HELP allinone_process_rss_bytes Node.js resident set size in bytes',
+      '# TYPE allinone_process_rss_bytes gauge',
+      `allinone_process_rss_bytes ${mem.rss}`,
+      '',
+    ].join('\n')
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       setSecurityHeaders(req, res, isTrustedProxy)
@@ -918,16 +751,52 @@ export function createRelayServer(options = {}) {
       }
       const pathname = urlObj.pathname
 
+    // Liveness probe
+    if (pathname === '/healthz' && req.method === 'GET') {
+      sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // Readiness probe (503 during drain, persistence error, or saturated scrypt queue)
+    if (pathname === '/readyz' && req.method === 'GET') {
+      const sc = accounts.getScryptStats()
+      const ready = !isDraining && accounts.isHealthy() && sc.queued < sc.maxQueue
+      sendJson(res, ready ? 200 : 503, {
+        ok: ready,
+        draining: isDraining,
+        storageHealthy: accounts.isHealthy(),
+      })
+      return
+    }
+
+    // OpenMetrics / Prometheus endpoint (loopback or authenticated admin only)
+    if (pathname === '/metrics' && req.method === 'GET') {
+      const remoteAddr = String(req.socket?.remoteAddress || '')
+      const isLocalScrape = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1'
+      if (!isLocalScrape) {
+        const adm = requireAdmin(req, res)
+        if (!adm) return
+      }
+      const body = renderPrometheusMetrics()
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+      })
+      res.end(body)
+      return
+    }
+
     // Health check (privacy-safe: unauthenticated callers only see `{ ok: true }`)
     if (pathname === '/api/health' && req.method === 'GET') {
       const user = auth.verifySessionToken(extractBearer(req))
       if (!user) {
-        sendJson(res, 200, { ok: true })
+        sendJson(res, isDraining ? 503 : 200, { ok: !isDraining })
         return
       }
       const bridges = hub.getBridgeList(user.room)
-      sendJson(res, 200, {
-        ok: true,
+      sendJson(res, isDraining ? 503 : 200, {
+        ok: !isDraining,
         version: RELAY_VERSION,
         roomId: user.room,
         bridges,
@@ -937,8 +806,13 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Account bootstrap check (status so UI knows whether an admin exists, SMTP availability & daily registration quota)
+    // Account bootstrap check (O(1) daily reg count + soft per-IP throttle)
     if (pathname === '/api/account/bootstrap-status' && req.method === 'GET') {
+      const ip = getClientIp(req)
+      if (!checkUserActionRateLimit('bootstrap', ip, 120)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return
+      }
       const hasAdmin = accounts.hasAnyUser()
       const dailyStats = accounts.getDailyRegistrationStats(maxDailyRegistrations)
       sendJson(res, 200, {
@@ -968,7 +842,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const purpose = String(body.purpose || '').trim()
         if (purpose !== 'register' && purpose !== 'bind' && purpose !== 'reset') {
           sendJson(res, 400, { ok: false, error: '不支持的验证码用途' })
@@ -1068,6 +942,18 @@ export function createRelayServer(options = {}) {
           userId: targetUserId,
         })
         if (!issued.ok) {
+          // Anti-enumeration for password reset: return uniform 200 during cooldown instead of 429 oracle
+          if (purpose === 'reset' && issued.retryAfterSec) {
+            const cfg = emailCodes.getConfig()
+            await new Promise((r) => setTimeout(r, 40 + randomInt(0, 60)))
+            sendJson(res, 200, {
+              ok: true,
+              cooldownSec: cfg.cooldownSec,
+              expiresInSec: cfg.expiresInSec,
+              message: '如果该邮箱已绑定账号，验证码已发送（10 分钟内有效）',
+            })
+            return
+          }
           sendJson(res, 429, {
             ok: false,
             error: issued.error,
@@ -1085,7 +971,7 @@ export function createRelayServer(options = {}) {
           })
         } catch (err) {
           issued.rollback()
-          console.error(`[relay] Failed to send ${purpose} verification email:`, err?.message || err)
+          log.error(`[relay] Failed to send ${purpose} verification email:`, { error: err?.message || String(err) })
           sendJson(res, 502, { ok: false, error: '验证码发送失败，请稍后重试或检查邮件服务配置' })
           return
         }
@@ -1099,8 +985,8 @@ export function createRelayServer(options = {}) {
               ? '如果该邮箱已绑定账号，验证码已发送（10 分钟内有效）'
               : '验证码已发送至邮箱（10 分钟内有效）',
         })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1115,16 +1001,25 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const bootstrapToken = String(body.bootstrapToken || '').trim()
+        const hadExistingUsers = accounts.hasAnyUser()
 
-        if (accounts.hasAnyUser()) {
+        if (hadExistingUsers) {
           const dailyStats = accounts.getDailyRegistrationStats(maxDailyRegistrations)
           if (dailyStats.exceeded) {
             sendJson(res, 429, {
               ok: false,
               code: 'DAILY_REGISTRATION_LIMIT',
               error: `今日新用户注册名额已满（每日上限 ${dailyStats.limit} 人），请明天再试`,
+            })
+            return
+          }
+          if (!ipDailyRegLimiter.check(ip)) {
+            sendJson(res, 429, {
+              ok: false,
+              code: 'IP_DAILY_REGISTRATION_LIMIT',
+              error: `当前网络今日注册次数已达上限（每日每 IP 最多 ${ipDailyRegLimiter.limit} 个账号），请明天再试`,
             })
             return
           }
@@ -1150,11 +1045,12 @@ export function createRelayServer(options = {}) {
             sendJson(res, 400, { ok: false, error: '该邮箱已被其他账号绑定' })
             return
           }
+          // Consume OTP atomically BEFORE async scrypt to prevent concurrent OTP replay
           const codeCheck = emailCodes.verifyCode({
             purpose: 'register',
             email: eCheck.email,
             code: body.emailCode,
-            consume: false,
+            consume: true,
           })
           if (!codeCheck.ok) {
             auth.recordFailure(ip)
@@ -1183,9 +1079,7 @@ export function createRelayServer(options = {}) {
           })
           return
         }
-        if (verifiedEmail) {
-          emailCodes.consumeCode({ purpose: 'register', email: verifiedEmail })
-        }
+        if (hadExistingUsers) ipDailyRegLimiter.record(ip)
         auth.clearFailure(ip)
         const user = result.user
         const devInfo = parseClientDeviceInfo(body.deviceName || '', req.headers['user-agent'] || '', body.clientKind || '')
@@ -1222,18 +1116,15 @@ export function createRelayServer(options = {}) {
           bridges: [],
         })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
 
     // Bind or replace verified email for an authenticated account (requires currentPassword re-authentication)
     if (pathname === '/api/account/email/bind' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
+      const bearerToken = extractBearer(req)
+      const payload = auth.verifySessionToken(bearerToken)
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
@@ -1252,7 +1143,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const currentPassword = String(body.currentPassword ?? '')
         if (!currentPassword) {
           sendJson(res, 403, { ok: false, error: '绑定或更换邮箱需要验证当前密码' })
@@ -1263,6 +1154,11 @@ export function createRelayServer(options = {}) {
           auth.recordFailure(ip)
           auth.recordAccountFailure(payload.room, ip)
           sendJson(res, 403, { ok: false, error: '绑定或更换邮箱需要验证当前密码' })
+          return
+        }
+        // Re-verify caller session after async scrypt (prevents revoked-session TOCTOU)
+        if (!auth.verifySessionToken(bearerToken)) {
+          sendJson(res, 401, { ok: false, error: '会话已失效，请重新登录' })
           return
         }
         auth.clearAccountFailure(payload.room, ip)
@@ -1290,7 +1186,7 @@ export function createRelayServer(options = {}) {
           return
         }
         emailCodes.consumeCode({ purpose: 'bind', email: eCheck.email })
-        if (prevEmail && prevEmail.toLowerCase() !== eCheck.emailLower) {
+        if (prevEmail && prevEmail.toLowerCase() !== eCheck.emailLower && shouldSendSecurityEmail(payload.room, 'email_change', ip)) {
           mailer
             .sendSecurityNotice({
               to: prevEmail,
@@ -1301,16 +1197,12 @@ export function createRelayServer(options = {}) {
               at: Date.now(),
             })
             .catch((err) => {
-              console.warn(`[relay] Failed to send email-change security notice for @${updated.user.username}: ${String(err?.message || err)}`)
+              log.warn(`[relay] Failed to send email-change security notice for @${updated.user.username}: ${String(err?.message || err)}`)
             })
         }
         sendJson(res, 200, { ok: true, user: updated.user })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1327,7 +1219,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const eCheck = validateEmail(body.email)
         if (!eCheck.ok) {
           sendJson(res, 400, { ok: false, error: eCheck.error })
@@ -1344,12 +1236,13 @@ export function createRelayServer(options = {}) {
           sendJson(res, 429, { ok: false, error: '该账号验证尝试过于频繁，请 15 分钟后再试' })
           return
         }
+        // Consume OTP atomically BEFORE async scrypt to prevent parallel OTP replay
         const codeCheck = emailCodes.verifyCode({
           purpose: 'reset',
           email: eCheck.email,
           code: body.code,
           userId: matchedUser?.userId || '',
-          consume: false,
+          consume: true,
         })
         if (!codeCheck.ok || !matchedUser || !matchedUser.emailVerified) {
           auth.recordFailure(ip)
@@ -1364,7 +1257,6 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: reset.error })
           return
         }
-        emailCodes.consumeCode({ purpose: 'reset', email: eCheck.email })
         auth.clearFailure(ip)
         if (accountRateKey) auth.clearResetFailure(accountRateKey)
         hub.disconnectRoomClients(reset.user.userId, 4401, 'Password reset')
@@ -1373,18 +1265,15 @@ export function createRelayServer(options = {}) {
           username: reset.user.username,
         })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
 
     // Toggle optional email login 2FA for authenticated account (disabling requires currentPassword re-authentication)
     if (pathname === '/api/account/security/2fa' && req.method === 'POST') {
-      const payload = auth.verifySessionToken(extractBearer(req))
+      const bearerToken = extractBearer(req)
+      const payload = auth.verifySessionToken(bearerToken)
       if (!payload || !String(payload.room || '').startsWith('usr_')) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
@@ -1395,7 +1284,7 @@ export function createRelayServer(options = {}) {
       }
       const ip = getClientIp(req)
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const nextEnabled = Boolean(body.enabled)
         if (nextEnabled && !mailer.isConfigured()) {
           sendJson(res, 503, { ok: false, error: '服务器尚未配置邮件服务（SMTP），无法开启邮箱二次验证' })
@@ -1419,6 +1308,11 @@ export function createRelayServer(options = {}) {
             sendJson(res, 403, { ok: false, error: '关闭邮箱二次验证需要验证当前密码' })
             return
           }
+          // Re-verify caller session after async scrypt
+          if (!auth.verifySessionToken(bearerToken)) {
+            sendJson(res, 401, { ok: false, error: '会话已失效，请重新登录' })
+            return
+          }
           auth.clearAccountFailure(payload.room, ip)
         }
         const updated = accounts.setLoginEmail2fa(payload.room, nextEnabled)
@@ -1426,7 +1320,14 @@ export function createRelayServer(options = {}) {
           sendJson(res, 400, { ok: false, error: updated.error })
           return
         }
-        if (nextEnabled === false && prevUser?.loginEmail2fa && mailer.isConfigured() && updated.user?.email && updated.user?.emailVerified) {
+        if (
+          nextEnabled === false &&
+          prevUser?.loginEmail2fa &&
+          mailer.isConfigured() &&
+          updated.user?.email &&
+          updated.user?.emailVerified &&
+          shouldSendSecurityEmail(payload.room, '2fa_disabled', ip)
+        ) {
           mailer
             .sendSecurityNotice({
               to: updated.user.email,
@@ -1437,16 +1338,12 @@ export function createRelayServer(options = {}) {
               at: Date.now(),
             })
             .catch((err) => {
-              console.warn(`[relay] Failed to send 2FA-disabled security notice for @${updated.user.username}: ${String(err?.message || err)}`)
+              log.warn(`[relay] Failed to send 2FA-disabled security notice for @${updated.user.username}: ${String(err?.message || err)}`)
             })
         }
         sendJson(res, 200, { ok: true, user: updated.user })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1459,7 +1356,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const identifier = String(body.username || '').trim()
         const accountRateKey = accounts.resolveAccountKey(identifier)
         if (accountRateKey && !auth.checkAccountRateLimit(accountRateKey, ip)) {
@@ -1504,7 +1401,7 @@ export function createRelayServer(options = {}) {
         for (const oldSid of recorded?.replacedSids || []) {
           hub.disconnectClient(user.userId, { sid: oldSid }, 4401, 'Replaced by new sign-in on same device')
         }
-        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendLoginAlert(user.userId, ip)) {
+        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendSecurityEmail(user.userId, 'login_alert', ip)) {
           mailer
             .sendLoginAlert({
               to: user.email,
@@ -1514,7 +1411,7 @@ export function createRelayServer(options = {}) {
               at: Date.now(),
             })
             .catch((err) => {
-              console.warn(`[relay] Failed to send login alert email for @${user.username}: ${String(err?.message || err)}`)
+              log.warn(`[relay] Failed to send login alert email for @${user.username}: ${String(err?.message || err)}`)
             })
         }
         hub.recordActivity({
@@ -1541,11 +1438,7 @@ export function createRelayServer(options = {}) {
           bridges,
         })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1558,7 +1451,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const identifier = String(body.username || '').trim()
         const accountRateKey = accounts.resolveAccountKey(identifier)
         if (accountRateKey && !auth.checkAccountRateLimit(accountRateKey, ip)) {
@@ -1591,8 +1484,11 @@ export function createRelayServer(options = {}) {
             bridgeId: body.bridgeId || '',
           })
         } catch (bindErr) {
-          sendJson(res, 400, { ok: false, error: String(bindErr?.message || '绑定电脑失败') })
-          return
+          if (bindErr?.code === 'MAX_DEVICES_EXCEEDED') {
+            sendJson(res, 400, { ok: false, error: String(bindErr.message) })
+            return
+          }
+          throw bindErr
         }
         if (!bound) {
           sendJson(res, 404, { ok: false, error: '账号不存在' })
@@ -1604,7 +1500,7 @@ export function createRelayServer(options = {}) {
           deviceName: deviceLabel,
           ip,
         })
-        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendLoginAlert(user.userId, ip)) {
+        if (isNewContext && mailer.isConfigured() && user.email && user.emailVerified && shouldSendSecurityEmail(user.userId, 'login_alert', ip)) {
           mailer
             .sendLoginAlert({
               to: user.email,
@@ -1614,7 +1510,7 @@ export function createRelayServer(options = {}) {
               at: Date.now(),
             })
             .catch((err) => {
-              console.warn(`[relay] Failed to send device-login alert email for @${user.username}: ${String(err?.message || err)}`)
+              log.warn(`[relay] Failed to send device-login alert email for @${user.username}: ${String(err?.message || err)}`)
             })
         }
         hub.recordActivity({
@@ -1627,11 +1523,7 @@ export function createRelayServer(options = {}) {
         hub.broadcastRoomDevices(user.userId)
         sendJson(res, 200, { ok: true, ...bound })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1640,14 +1532,14 @@ export function createRelayServer(options = {}) {
     if (pathname === '/api/account/device-status' && req.method === 'GET') {
       const ip = getClientIp(req)
       const requestedRoom = String(req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '').trim()
-      if (!auth.checkBridgeRateLimit(ip) || (requestedRoom && !auth.checkBridgeRateLimit(ip, requestedRoom))) {
+      const roomExists = Boolean(requestedRoom.startsWith('usr_') && accounts.getUserById(requestedRoom))
+      if (!auth.checkBridgeRateLimit(ip, requestedRoom, { roomExists })) {
         sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
         return
       }
       const info = authenticateBridgeInfo(req, urlObj)
       if (!info || !info.roomId.startsWith('usr_')) {
-        auth.recordBridgeFailure(ip)
-        if (requestedRoom) auth.recordBridgeFailure(ip, requestedRoom)
+        auth.recordBridgeFailure(ip, requestedRoom, { recordRoom: roomExists })
         sendJson(res, 401, { ok: false, error: '电脑绑定凭证无效或已被解绑' })
         return
       }
@@ -1672,6 +1564,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
         return
       }
+      if (!checkUserActionRateLimit('read', payload.room, 120)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return
+      }
       sendJson(res, 200, {
         ok: true,
         devices: getMergedAccountDevices(payload.room),
@@ -1692,14 +1588,23 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
-        const bound = accounts.bindDevice({
-          userId: payload.room,
-          label: body.label || body.hostname || 'My PC',
-          hostname: body.hostname || body.label || 'My-PC',
-          platform: body.platform || 'unknown',
-          bridgeId: body.bridgeId || '',
-        })
+        const body = await readJsonObjectBody(req)
+        let bound
+        try {
+          bound = accounts.bindDevice({
+            userId: payload.room,
+            label: body.label || body.hostname || 'My PC',
+            hostname: body.hostname || body.label || 'My-PC',
+            platform: body.platform || 'unknown',
+            bridgeId: body.bridgeId || '',
+          })
+        } catch (bindErr) {
+          if (bindErr?.code === 'MAX_DEVICES_EXCEEDED') {
+            sendJson(res, 400, { ok: false, error: String(bindErr.message) })
+            return
+          }
+          throw bindErr
+        }
         if (!bound) {
           sendJson(res, 404, { ok: false, error: '账号不存在' })
           return
@@ -1711,7 +1616,7 @@ export function createRelayServer(options = {}) {
           devices: getMergedAccountDevices(payload.room),
         })
       } catch (err) {
-        sendJson(res, 400, { ok: false, error: String(err?.message || '绑定电脑失败') })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1728,7 +1633,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const updated = accounts.renameUserDevice(payload.room, body.deviceId, body.label)
         if (!updated) {
           sendJson(res, 404, { ok: false, error: '找不到目标电脑或名称为空' })
@@ -1741,8 +1646,8 @@ export function createRelayServer(options = {}) {
           device: updated,
           devices: getMergedAccountDevices(payload.room),
         })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1759,7 +1664,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const removed = accounts.removeUserDevice(payload.room, body.deviceId)
         if (!removed) {
           sendJson(res, 404, { ok: false, error: '找不到目标电脑' })
@@ -1772,8 +1677,8 @@ export function createRelayServer(options = {}) {
           removed,
           devices: getMergedAccountDevices(payload.room),
         })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -1796,19 +1701,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
-        if (!auth.checkRateLimit(ip)) {
-          sendJson(res, 429, { ok: false, error: '尝试次数过多，请 10 分钟后再试' })
-          return
-        }
-        if (!auth.checkAccountRateLimit(payload.room, ip)) {
-          sendJson(res, 429, { ok: false, error: '该账号尝试次数过多，请 15 分钟后再试' })
-          return
-        }
-        if (!auth.verifySessionToken(bearerToken)) {
-          sendJson(res, 401, { ok: false, error: '会话已失效或密码已被更新，请重新登录' })
-          return
-        }
+        const body = await readJsonObjectBody(req)
         const changed = await accounts.changePasswordAsync(
           payload.room,
           body.currentPassword,
@@ -1858,229 +1751,13 @@ export function createRelayServer(options = {}) {
         )
         sendJson(res, 200, { ok: true, token: freshToken, user: changed.user })
       } catch (err) {
-        if (err?.statusCode === 503) {
-          sendJson(res, 503, { ok: false, error: err.message || '服务器繁忙，请稍后重试' })
-          return
-        }
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
 
-    // Admin Monitor: On-demand full server & all-users status snapshot (zero idle overhead)
-    if (pathname === '/api/admin/overview' && req.method === 'GET') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      const dailyRegistration = accounts.getDailyRegistrationStats(maxDailyRegistrations)
-      const serverHealth = collectServerHealth({
-        mailer,
-        stun: stunServer?.getStats?.() || null,
-        turn: {
-          enabled: Boolean((turnSecret && extractPublicHostname(req)) || cfTurn.enabled),
-          host: extractPublicHostname(req) || '',
-          port: turnSecret ? turnPort : 0,
-          ttlSec: turnTtlSec,
-          meteringEnabled: Boolean(turnLogFile),
-          cloudflare: cfTurn.getStats(),
-          quotas: {
-            freeMb: turnQuotaConfig.freeMb,
-            proMb: turnQuotaConfig.proMb,
-            ultraMb: turnQuotaConfig.ultraMb,
-            adminMb: turnQuotaConfig.adminMb,
-          },
-        },
-        dailyRegistration,
-        startedAt,
-        version: RELAY_VERSION,
-      })
-      const overview = buildAdminOverview({
-        accounts,
-        hub,
-        serverHealth,
-        dailyRegistration,
-        getTurnQuota: (uid) => buildUserTurnQuota(uid),
-        currentAdminRoom: payload.room || '',
-        currentAdminSid: payload.sid || '',
-      })
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, overview)
-      return
-    }
-
-    // Admin: Update a user's tier (`free` / `pro` / `ultra` / `admin`; `ultra` and `admin` share identical TURN quota rules)
-    if (pathname === '/api/admin/users/set-tier' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.userId || body.roomId || '').trim()
-        const targetTier = String(body.tier || '').trim().toLowerCase()
-        if (!targetRoom.startsWith('usr_') || !targetTier) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户或等级参数' })
-          return
-        }
-        const changed = accounts.setUserTier(targetRoom, targetTier, { actorUserId: payload.room })
-        if (!changed.ok) {
-          sendJson(res, 400, { ok: false, error: changed.error })
-          return
-        }
-        const turnQuota = buildUserTurnQuota(targetRoom)
-        hub.pushIceUpdate(targetRoom, { quotaExceeded: Boolean(turnQuota?.exceeded) })
-        hub.recordActivity({
-          type: 'admin.tier',
-          roomId: targetRoom,
-          label: `@${changed.user.username}`,
-          detail: `${String(changed.prevTier || 'free').toUpperCase()} -> ${String(changed.tier).toUpperCase()}`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, user: changed.user, tier: changed.tier, turnQuota })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin: Reset a user's current-month TURN relay usage to 0 bytes
-    if (pathname === '/api/admin/users/reset-turn-usage' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.userId || body.roomId || '').trim()
-        if (!targetRoom.startsWith('usr_')) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户标识' })
-          return
-        }
-        const reset = accounts.resetTurnUsage(targetRoom)
-        if (!reset.ok) {
-          sendJson(res, 404, { ok: false, error: reset.error })
-          return
-        }
-        const turnQuota = buildUserTurnQuota(targetRoom)
-        hub.pushIceUpdate(targetRoom, { quotaExceeded: false })
-        hub.recordActivity({
-          type: 'admin.quota_reset',
-          roomId: targetRoom,
-          label: `@${reset.user.username}`,
-          detail: `Monthly TURN usage reset (${reset.turnUsage.month})`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, user: reset.user, turnQuota })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin Monitor: Kick / revoke a single client session for any user
-    if (pathname === '/api/admin/users/kick-session' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.userId || body.roomId || '').trim()
-        const targetSid = String(body.sid || '').trim()
-        const targetClientId = String(body.clientId || '').trim()
-        if (!targetRoom.startsWith('usr_') || (!targetSid && !targetClientId)) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户或会话标识' })
-          return
-        }
-        if (targetRoom === payload.room && targetSid && payload.sid && targetSid === payload.sid) {
-          sendJson(res, 400, { ok: false, error: '不能踢出当前正在使用的管理员会话' })
-          return
-        }
-        const revokedPermanent = targetSid ? accounts.revokeUserSession(targetRoom, targetSid) : false
-        const kickedConnections = hub.disconnectClient(
-          targetRoom,
-          { clientId: targetClientId, sid: targetSid },
-          4401,
-          'Session revoked by admin',
-        )
-        const targetUser = accounts.getUserById(targetRoom)
-        hub.recordActivity({
-          type: 'admin.kick',
-          roomId: targetRoom,
-          label: targetUser ? `@${targetUser.username}` : targetRoom,
-          detail: `Admin revoked session (${kickedConnections} live)`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, revokedPermanent, kickedConnections })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin Monitor: Force sign-out ALL sessions for a user
-    if (pathname === '/api/admin/users/revoke-all' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.userId || body.roomId || '').trim()
-        if (!targetRoom.startsWith('usr_')) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户标识' })
-          return
-        }
-        if (targetRoom === payload.room) {
-          sendJson(res, 400, { ok: false, error: '不能在监控面板强制下线当前管理员自身' })
-          return
-        }
-        const revoked = accounts.revokeUserTokens(targetRoom)
-        if (!revoked) {
-          sendJson(res, 404, { ok: false, error: '找不到目标用户' })
-          return
-        }
-        const disconnectedClients = hub.disconnectRoomClients(targetRoom, 4401, 'All sessions revoked by admin')
-        const targetUser = accounts.getUserById(targetRoom)
-        hub.recordActivity({
-          type: 'admin.kick',
-          roomId: targetRoom,
-          label: targetUser ? `@${targetUser.username}` : targetRoom,
-          detail: `Admin signed out all terminals (${disconnectedClients} live)`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, {
-          ok: true,
-          roomId: revoked.roomId,
-          tokenVersion: revoked.tokenVersion,
-          disconnectedClients,
-        })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
-      return
-    }
-
-    // Admin Monitor: Soft-disconnect a live PC bridge WebSocket (non-destructive; keeps device bound)
-    if (pathname === '/api/admin/bridges/disconnect' && req.method === 'POST') {
-      const payload = requireAdmin(req, res)
-      if (!payload) return
-      try {
-        const body = await readJsonBody(req)
-        const targetRoom = String(body.roomId || body.userId || '').trim()
-        const targetBridgeId = String(body.bridgeId || '').trim()
-        if (!targetRoom.startsWith('usr_') || !targetBridgeId) {
-          sendJson(res, 400, { ok: false, error: '缺少目标用户或桥接标识' })
-          return
-        }
-        const disconnected = hub.disconnectBridge(targetRoom, targetBridgeId, 4000, 'Disconnected by admin')
-        if (!disconnected) {
-          sendJson(res, 404, { ok: false, error: '该电脑桥接当前不在线' })
-          return
-        }
-        const targetUser = accounts.getUserById(targetRoom)
-        hub.recordActivity({
-          type: 'admin.kick',
-          roomId: targetRoom,
-          label: targetUser ? `@${targetUser.username}` : targetRoom,
-          detail: `Admin disconnected bridge ${targetBridgeId}`,
-          ip: getClientIp(req),
-        })
-        sendJson(res, 200, { ok: true, disconnected })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
-      }
+    // Delegated Admin API routes (`/api/admin/*`)
+    if (await adminRoutes.handleAdminRoute(req, res, pathname)) {
       return
     }
 
@@ -2097,7 +1774,7 @@ export function createRelayServer(options = {}) {
       }
       let body = {}
       try {
-        body = await readJsonBody(req, 16 * 1024)
+        body = await readJsonObjectBody(req, 16 * 1024)
       } catch {
         body = {}
       }
@@ -2129,6 +1806,10 @@ export function createRelayServer(options = {}) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
         return
       }
+      if (!checkUserActionRateLimit('read', payload.room, 120)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return
+      }
       const currentClientId = String(urlObj.searchParams.get('clientId') || '').trim()
       const merged = getMergedClientSessions(payload.room, {
         currentSid: payload.sid || '',
@@ -2148,6 +1829,10 @@ export function createRelayServer(options = {}) {
       const payload = auth.verifySessionToken(extractBearer(req))
       if (!payload) {
         sendJson(res, 401, { ok: false, error: '登录已失效' })
+        return
+      }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
         return
       }
       const revokedPermanent = payload.sid ? accounts.revokeUserSession(payload.room, payload.sid) : false
@@ -2170,7 +1855,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const targetSid = String(body.sid || '').trim()
         const targetClientId = String(body.clientId || '').trim()
         const currentClientId = String(body.currentClientId || '').trim()
@@ -2181,7 +1866,6 @@ export function createRelayServer(options = {}) {
         if (targetSid) {
           const liveMatch = hub.getClientList(payload.room).some((c) => c.sid === targetSid)
           const knownSid = accounts.hasUserSession(payload.room, targetSid) || liveMatch
-          // Reject unknown/synthetic sids so attackers cannot bloat accounts.json
           if (targetSid.length > 64 || !knownSid) {
             sendJson(res, 404, { ok: false, error: '目标会话不存在或已失效' })
             return
@@ -2208,8 +1892,8 @@ export function createRelayServer(options = {}) {
           kickedConnections,
           ...merged,
         })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -2226,7 +1910,7 @@ export function createRelayServer(options = {}) {
         return
       }
       try {
-        const body = await readJsonBody(req)
+        const body = await readJsonObjectBody(req)
         const currentClientId = String(body.currentClientId || '').trim()
         const targetRoom = payload.room
         const ip = getClientIp(req)
@@ -2274,8 +1958,8 @@ export function createRelayServer(options = {}) {
           kickedConnections,
           ...merged,
         })
-      } catch {
-        sendJson(res, 400, { ok: false, error: '请求格式错误' })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
       }
       return
     }
@@ -2346,158 +2030,14 @@ export function createRelayServer(options = {}) {
       return
     }
 
-    // Standalone lightweight Admin Monitoring Dashboard (/admin, zero-dependency, on-demand)
-    if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/admin' || pathname === '/admin/' || pathname.startsWith('/admin/'))) {
-      const adminFiles = {
-        '/admin': 'index.html',
-        '/admin/': 'index.html',
-        '/admin/index.html': 'index.html',
-        '/admin/styles.css': 'styles.css',
-        '/admin/app.js': 'app.js',
-      }
-      const mapped = adminFiles[pathname]
-      const adminTarget = mapped ? join(ADMIN_DASHBOARD_DIR, mapped) : ''
-      if (adminTarget) {
-        try {
-          if (statSync(adminTarget).isFile()) {
-            const ext = extname(adminTarget).toLowerCase()
-            let buf = readFileSync(adminTarget)
-            if (ext === '.html' && pathname === '/admin') {
-              // Keep asset & back-to-app links subpath-safe when accessed without trailing slash (e.g. /subpath/admin)
-              const html = buf
-                .toString('utf8')
-                .replaceAll('href="./styles.css"', 'href="admin/styles.css"')
-                .replaceAll('src="./app.js"', 'src="admin/app.js"')
-                .replaceAll('href="../"', 'href="./"')
-              buf = Buffer.from(html, 'utf8')
-            }
-            const headers = {
-              'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-              'Content-Length': buf.length,
-              'Cache-Control': 'no-cache, no-store, must-revalidate',
-            }
-            if (ext === '.html') {
-              headers['Content-Security-Policy'] =
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-            }
-            res.writeHead(200, headers)
-            if (req.method === 'HEAD') res.end()
-            else res.end(buf)
-            return
-          }
-        } catch {}
-      }
-      sendJson(res, 404, { ok: false, error: 'Not Found' })
+    // Delegated Admin Dashboard & Async Static PWA / Setup Scripts
+    if (await staticHandler.handleStaticRequest(req, res, pathname)) {
       return
-    }
-
-    // Static PWA, installer scripts (.ps1/.sh/.mjs), & APK serving
-    if ((req.method === 'GET' || req.method === 'HEAD') && existsSync(staticDir)) {
-      let decodedPathname = pathname
-      try {
-        decodedPathname = decodeURIComponent(pathname)
-      } catch {
-        sendJson(res, 400, { ok: false, error: 'Bad Request' })
-        return
-      }
-      if (decodedPathname.includes('\0')) {
-        sendJson(res, 400, { ok: false, error: 'Bad Request' })
-        return
-      }
-      const rel = decodedPathname === '/' ? 'index.html' : decodedPathname.replace(/^\/+/, '')
-      const candidate = resolve(staticDir, normalize(rel))
-      let target = null
-      const withinStaticDir = candidate === staticDir || candidate.startsWith(`${staticDir}${sep}`)
-      if (withinStaticDir) {
-        try {
-          if (statSync(candidate).isFile()) target = candidate
-        } catch {}
-      }
-      if (!target && !decodedPathname.startsWith('/api/') && !decodedPathname.startsWith('/ws/') && !decodedPathname.startsWith('/downloads/') && !decodedPathname.startsWith('/admin')) {
-        const indexHtml = join(staticDir, 'index.html')
-        try {
-          if (statSync(indexHtml).isFile()) target = indexHtml
-        } catch {}
-      }
-      if (target) {
-        try {
-          const ext = extname(target).toLowerCase()
-          const isMutable =
-            ext === '.html' ||
-            ext === '.ps1' ||
-            ext === '.sh' ||
-            ext === '.mjs' ||
-            target.endsWith('sw.js') ||
-            target.endsWith('registerSW.js') ||
-            target.endsWith('manifest.webmanifest') ||
-            target.endsWith('All-in-One-WebBundle.json') ||
-            target.endsWith('All-in-One-WebBundle.zip')
-
-          // Dynamically inject this server's strictly validated public URL into setup.ps1 / setup.sh
-          if (ext === '.ps1' || ext === '.sh') {
-            const effectiveUrl = resolveSafePublicScriptUrl(req, publicRelayUrl, isTrustedProxy)
-            let scriptBody = readFileSync(target, 'utf8')
-            if (effectiveUrl) {
-              scriptBody = scriptBody.replaceAll('https://your-relay.example.com', effectiveUrl)
-            }
-            const buf = Buffer.from(scriptBody, 'utf8')
-            res.writeHead(200, {
-              'Content-Type': MIME_TYPES[ext] || 'text/plain; charset=utf-8',
-              'Content-Length': buf.length,
-              'Cache-Control': 'no-cache, no-store, must-revalidate',
-            })
-            if (req.method === 'HEAD') res.end()
-            else res.end(buf)
-            return
-          }
-
-          const st = statSync(target)
-          const staticHeaders = {
-            'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
-            'Content-Length': st.size,
-            'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
-          }
-          if (ext === '.html') {
-            const isSandboxPreview = basename(target).toLowerCase() === 'sandbox-preview.html'
-            staticHeaders['Content-Security-Policy'] = isSandboxPreview ? SANDBOX_PREVIEW_CSP : APP_HTML_CSP
-            if (isSandboxPreview) {
-              staticHeaders['X-Frame-Options'] = 'SAMEORIGIN'
-            }
-          }
-          if (req.method === 'HEAD') {
-            res.writeHead(200, staticHeaders)
-            res.end()
-            return
-          }
-
-          const stream = createReadStream(target)
-          stream.on('open', () => {
-            if (!res.headersSent) {
-              res.writeHead(200, staticHeaders)
-            }
-            stream.pipe(res)
-          })
-          stream.on('error', () => {
-            if (!res.headersSent) {
-              sendJson(res, 404, { ok: false, error: 'Not Found' })
-            } else {
-              try { res.destroy() } catch {}
-            }
-          })
-          res.on('close', () => {
-            if (!stream.destroyed) stream.destroy()
-          })
-          return
-        } catch {
-          sendJson(res, 404, { ok: false, error: 'Not Found' })
-          return
-        }
-      }
     }
 
     sendJson(res, 404, { ok: false, error: 'Not Found' })
     } catch (err) {
-      console.error('[relay] Unhandled HTTP request error:', err?.stack || err)
+      log.error('[relay] Unhandled HTTP request error:', { stack: err?.stack || String(err) })
       if (!res.headersSent) {
         try {
           sendJson(res, 500, { ok: false, error: 'Internal Server Error' })
@@ -2513,10 +2053,10 @@ export function createRelayServer(options = {}) {
   server.headersTimeout = 15_000
   server.keepAliveTimeout = 60_000
 
-  // Pure Control-Plane WebSocket server (strictly capped at 256 KB — zero data-plane relay)
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 })
+  // Pure Control-Plane WebSocket server (strictly capped at 72 KB — zero data-plane relay)
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 72 * 1024 })
   wss.on('error', (err) => {
-    console.warn('[control] WebSocketServer error:', err?.message || err)
+    log.warn(`[control] WebSocketServer error: ${err?.message || err}`)
   })
 
   server.on('upgrade', (req, socket, head) => {
@@ -2534,6 +2074,11 @@ export function createRelayServer(options = {}) {
       try { socket.destroy() } catch {}
     }
 
+    if (isDraining) {
+      rejectUpgrade('503 Service Unavailable')
+      return
+    }
+
     let urlObj
     try {
       urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
@@ -2548,20 +2093,23 @@ export function createRelayServer(options = {}) {
       const requestedRoom = String(
         req.headers['x-room-id'] || urlObj.searchParams.get('roomId') || '',
       ).trim()
-      if (!requestedRoom.startsWith('usr_')) {
-        rejectUpgrade('401 Unauthorized')
+      const roomExists = Boolean(requestedRoom.startsWith('usr_') && accounts.getUserById(requestedRoom))
+      if (!auth.checkBridgeRateLimit(bridgeIp, requestedRoom, { roomExists })) {
+        rejectUpgrade('429 Too Many Requests')
         return
       }
-      if (!auth.checkBridgeRateLimit(bridgeIp, requestedRoom)) {
-        rejectUpgrade('429 Too Many Requests')
+      if (!requestedRoom.startsWith('usr_')) {
+        auth.recordBridgeFailure(bridgeIp, '', { recordRoom: false })
+        rejectUpgrade('401 Unauthorized')
         return
       }
       const bridgeAuth = authenticateBridgeInfo(req, urlObj)
       if (!bridgeAuth) {
-        auth.recordBridgeFailure(bridgeIp, requestedRoom)
+        auth.recordBridgeFailure(bridgeIp, requestedRoom, { recordRoom: roomExists })
         rejectUpgrade('401 Unauthorized')
         return
       }
+      auth.clearBridgeFailure(bridgeIp)
       auth.clearBridgeFailure(bridgeIp, requestedRoom)
       const slot = tryAcquireWsSlot(bridgeIp)
       if (!slot.ok) {
@@ -2707,13 +2255,10 @@ export function createRelayServer(options = {}) {
   const close = async () => {
     if (closePromise) return closePromise
     closePromise = (async () => {
-      cfTurn.stop()
-      turnMeter?.stop?.()
-      accounts.flush()
+      // 1. Mark draining first so /readyz fails & new WS upgrades reject immediately
+      isDraining = true
       hub.shutdown()
-      if (stunServer) {
-        try { await stunServer.close() } catch {}
-      }
+      // 2. Drain HTTP & WS servers BEFORE closing DB so in-flight requests finish cleanly
       await new Promise((resolveClose) => {
         let settled = false
         const done = () => {
@@ -2732,6 +2277,13 @@ export function createRelayServer(options = {}) {
           server.close(() => done())
         })
       })
+      // 3. Stop background providers & flush + close SQLite WAL cleanly
+      cfTurn.stop()
+      turnMeter?.stop?.()
+      if (stunServer) {
+        try { await stunServer.close() } catch {}
+      }
+      accounts.close()
     })()
     return closePromise
   }
@@ -2745,14 +2297,25 @@ if (isMain) {
   const app = createRelayServer()
   app.start().catch((err) => {
     console.error(`[control] Failed to start server: ${err?.stack || err}`)
+    try { app.accounts.close() } catch {}
     process.exit(1)
   })
   let shuttingDown = false
-  const shutdown = () => {
+  const shutdown = (code = 0) => {
     if (shuttingDown) return
     shuttingDown = true
-    app.close().finally(() => process.exit(0))
+    app.close().finally(() => process.exit(code))
   }
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', () => shutdown(0))
+  process.on('SIGTERM', () => shutdown(0))
+  process.on('uncaughtException', (err) => {
+    console.error(`[control] FATAL uncaughtException: ${err?.stack || err}`)
+    try { app.accounts.flush() } catch {}
+    shutdown(1)
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[control] FATAL unhandledRejection: ${reason?.stack || reason}`)
+    try { app.accounts.flush() } catch {}
+    shutdown(1)
+  })
 }

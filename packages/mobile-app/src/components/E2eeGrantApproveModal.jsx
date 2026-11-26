@@ -46,6 +46,7 @@ export function E2eeGrantApproveModal({
   const [error, setError] = useState('')
   const pairRef = useRef(null)
   const approverNonceRef = useRef('')
+  const requesterNonceRef = useRef('')
   const closeTimerRef = useRef(null)
   const stepRef = useRef(step)
   stepRef.current = step
@@ -71,6 +72,7 @@ export function E2eeGrantApproveModal({
       setError('')
       pairRef.current = null
       approverNonceRef.current = ''
+      requesterNonceRef.current = ''
       return
     }
     setStep('prompt')
@@ -79,6 +81,7 @@ export function E2eeGrantApproveModal({
     setError('')
     pairRef.current = null
     approverNonceRef.current = ''
+    requesterNonceRef.current = ''
     return () => {
       clearCloseTimer()
       if ((stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') && !rejectedOrDoneRef.current) {
@@ -133,6 +136,7 @@ export function E2eeGrantApproveModal({
           approverNonce: appNonce,
         })
         if (cancelled) return
+        requesterNonceRef.current = reqNonce
         setSasCode(sas)
         stepRef.current = 'sas'
         setStep('sas')
@@ -194,39 +198,31 @@ export function E2eeGrantApproveModal({
     setBusy(true)
     setError('')
     try {
+      const commit = String(grant.commit || '').trim().toLowerCase()
+      if (!/^[0-9a-f]{64}$/.test(commit)) {
+        throw new Error(
+          bi(
+            '对方版本过旧或缺少安全承诺值，请将新设备更新到最新版 All in One 后重试',
+            'Requester is missing a valid cryptographic commitment; please update the new device and try again.',
+          ),
+        )
+      }
       const pair = await generateGrantKeyPair()
       const approverNonce = generateGrantNonce()
       pairRef.current = pair
       approverNonceRef.current = approverNonce
-      const hasCommit = Boolean(String(grant.commit || '').trim())
-      if (hasCommit) {
-        stepRef.current = 'waiting-reveal'
-        setStep('waiting-reveal')
-      }
+      requesterNonceRef.current = ''
+      stepRef.current = 'waiting-reveal'
+      setStep('waiting-reveal')
       const sent = client.sendGrantOffer({
         reqId: grant.reqId,
         approverPubKey: pair.publicKeyRaw,
         approverNonce,
       })
       if (!sent) {
-        if (hasCommit) {
-          stepRef.current = 'prompt'
-          setStep('prompt')
-        }
+        stepRef.current = 'prompt'
+        setStep('prompt')
         throw new Error(bi('当前未连接到中转服务器，请稍后重试', 'Not connected to relay server.'))
-      }
-      if (!hasCommit) {
-        const sas = await deriveGrantSas({
-          requesterPubKey: grant.pubKey,
-          approverPubKey: pair.publicKeyRaw,
-          reqId: grant.reqId,
-          roomId: grant.roomId,
-          requesterNonce: '',
-          approverNonce,
-        })
-        setSasCode(sas)
-        stepRef.current = 'sas'
-        setStep('sas')
       }
     } catch (err) {
       setError(String(err?.message || err))
@@ -265,6 +261,15 @@ export function E2eeGrantApproveModal({
         keyEntries[0]?.keyId ||
         ''
 
+      if (!qrVerified && (!requesterNonceRef.current || !approverNonceRef.current)) {
+        throw new Error(
+          bi(
+            '安全校验阶段未完成（缺少双端随机数），请拒绝并重新发起授权',
+            'Commit-then-reveal verification incomplete (missing nonces); please restart authorization.',
+          ),
+        )
+      }
+
       const envelope = await encryptGrantPayload({
         approverPrivateKey: pair.privateKey,
         approverPubKeyRaw: pair.publicKeyRaw,
@@ -272,6 +277,8 @@ export function E2eeGrantApproveModal({
         reqId: grant.reqId,
         roomId: grant.roomId,
         grantSecret: qrVerified ? String(grant.qrGrantSecret || '') : '',
+        requesterNonce: qrVerified ? '' : requesterNonceRef.current,
+        approverNonce: qrVerified ? '' : approverNonceRef.current,
         payload: {
           keys: keyEntries,
           preferredKeyId: resolvedPreferred,

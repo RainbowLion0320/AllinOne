@@ -21,6 +21,7 @@ export function safeEqual(a, b) {
  */
 export function createAuthManager({
   jwtSecret = '',
+  jwtSecretPrevious = '',
   adminBootstrapToken = '',
   getTokenVersion = null,
   isSessionRevoked = null,
@@ -30,6 +31,9 @@ export function createAuthManager({
   const signingKey = cleanJwtSecret.length >= 16
     ? cleanJwtSecret
     : randomBytes(32).toString('hex')
+  const cleanPrevSecret = String(jwtSecretPrevious || '').trim()
+  const previousSigningKey =
+    cleanPrevSecret.length >= 16 && cleanPrevSecret !== signingKey ? cleanPrevSecret : ''
 
   const bootstrapSecret = String(adminBootstrapToken || '').trim()
 
@@ -47,24 +51,42 @@ export function createAuthManager({
   // Separate per-account rate limit dedicated to password reset OTP verification
   const resetAccountFailures = new Map()
 
-  // Per-(IP, roomId) rate limit for /ws/bridge & device-status auth failures
+  // Per-(IP, roomId) + Per-IP-only rate limits for /ws/bridge & device-status auth failures.
+  // Nonexistent/invalid rooms collapse into one sentinel bucket per IP (`__invalid__`) so
+  // spraying random roomIds cannot pollute the Map or lock out valid rooms behind the same NAT IP.
   const bridgeFailures = new Map()
+  const bridgeIpFailures = new Map()
+  const INVALID_BRIDGE_ROOM_BUCKET = '__invalid__'
   const MAX_BRIDGE_FAILS = 15
+  const MAX_BRIDGE_IP_FAILS = 60
   const BRIDGE_WINDOW_MS = 10 * 60 * 1000
 
   // Short-lived single-use WS handshake tickets: ticket -> { user, exp }
   const wsTickets = new Map()
 
-  function pruneMap(map, ttlMs, now) {
+  function pruneMap(map, ttlMs, now, maxCountThreshold = Infinity) {
     if (map.size < MAX_RATE_LIMIT_ENTRIES) return
     for (const [k, v] of map.entries()) {
       if (now - v.firstAt > ttlMs) map.delete(k)
     }
-    while (map.size >= MAX_RATE_LIMIT_ENTRIES) {
-      const oldest = map.keys().next().value
-      if (!oldest) break
-      map.delete(oldest)
+    if (map.size < MAX_RATE_LIMIT_ENTRIES) return
+    // Never let an attacker flush active lockouts via FIFO: evict lowest-count non-locked entries first
+    let victimKey = null
+    let victimCount = Infinity
+    for (const [k, v] of map.entries()) {
+      if (v.count < maxCountThreshold && v.count < victimCount) {
+        victimKey = k
+        victimCount = v.count
+        if (victimCount <= 1) break
+      }
     }
+    if (victimKey !== null) {
+      map.delete(victimKey)
+      return
+    }
+    // All entries are actively locked out: evict the oldest lockout only as a hard memory cap
+    const oldest = map.keys().next().value
+    if (oldest !== undefined) map.delete(oldest)
   }
 
   function pruneExpiredWsTickets(now) {
@@ -86,7 +108,7 @@ export function createAuthManager({
 
   function recordFailure(ip) {
     const now = Date.now()
-    pruneMap(failures, WINDOW_MS, now)
+    pruneMap(failures, WINDOW_MS, now, MAX_FAILS)
     const entry = failures.get(ip)
     if (!entry || now - entry.firstAt > WINDOW_MS) {
       failures.set(ip, { count: 1, firstAt: now })
@@ -129,7 +151,7 @@ export function createAuthManager({
     const key = normalizeAccountKey(identifier, ip)
     if (!key) return
     const now = Date.now()
-    pruneMap(accountFailures, ACCT_WINDOW_MS, now)
+    pruneMap(accountFailures, ACCT_WINDOW_MS, now, MAX_ACCT_FAILS)
     const entry = accountFailures.get(key)
     if (!entry || now - entry.firstAt > ACCT_WINDOW_MS) {
       accountFailures.set(key, { count: 1, firstAt: now })
@@ -160,7 +182,7 @@ export function createAuthManager({
     const key = normalizeExistingAccountId(identifier)
     if (!key) return
     const now = Date.now()
-    pruneMap(resetAccountFailures, ACCT_WINDOW_MS, now)
+    pruneMap(resetAccountFailures, ACCT_WINDOW_MS, now, MAX_ACCT_FAILS)
     const entry = resetAccountFailures.get(key)
     if (!entry || now - entry.firstAt > ACCT_WINDOW_MS) {
       resetAccountFailures.set(key, { count: 1, firstAt: now })
@@ -174,15 +196,30 @@ export function createAuthManager({
     if (key) resetAccountFailures.delete(key)
   }
 
+  function normalizeBridgeIp(ip) {
+    return String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+  }
+
   function normalizeBridgeKey(ip, roomId) {
-    const cleanIp = String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+    const cleanIp = normalizeBridgeIp(ip)
     const cleanRoom = String(roomId || '').trim().slice(0, 64)
     return `${cleanIp}::${cleanRoom}`
   }
 
-  function checkBridgeRateLimit(ip, roomId) {
-    const key = normalizeBridgeKey(ip, roomId)
+  function checkBridgeRateLimit(ip, roomId = '', { roomExists = true } = {}) {
     const now = Date.now()
+    const ipKey = normalizeBridgeIp(ip)
+    const ipEntry = bridgeIpFailures.get(ipKey)
+    if (ipEntry) {
+      if (now - ipEntry.firstAt > BRIDGE_WINDOW_MS) {
+        bridgeIpFailures.delete(ipKey)
+      } else if (ipEntry.count >= MAX_BRIDGE_IP_FAILS) {
+        return false
+      }
+    }
+    const cleanRoom = String(roomId || '').trim()
+    const bucketRoom = roomExists && cleanRoom ? cleanRoom : INVALID_BRIDGE_ROOM_BUCKET
+    const key = normalizeBridgeKey(ip, bucketRoom)
     const entry = bridgeFailures.get(key)
     if (!entry) return true
     if (now - entry.firstAt > BRIDGE_WINDOW_MS) {
@@ -192,10 +229,20 @@ export function createAuthManager({
     return entry.count < MAX_BRIDGE_FAILS
   }
 
-  function recordBridgeFailure(ip, roomId) {
-    const key = normalizeBridgeKey(ip, roomId)
+  function recordBridgeFailure(ip, roomId = '', { recordRoom = true } = {}) {
     const now = Date.now()
-    pruneMap(bridgeFailures, BRIDGE_WINDOW_MS, now)
+    const ipKey = normalizeBridgeIp(ip)
+    pruneMap(bridgeIpFailures, BRIDGE_WINDOW_MS, now, MAX_BRIDGE_IP_FAILS)
+    const ipEntry = bridgeIpFailures.get(ipKey)
+    if (!ipEntry || now - ipEntry.firstAt > BRIDGE_WINDOW_MS) {
+      bridgeIpFailures.set(ipKey, { count: 1, firstAt: now })
+    } else {
+      ipEntry.count += 1
+    }
+    const cleanRoom = String(roomId || '').trim()
+    const bucketRoom = recordRoom && cleanRoom ? cleanRoom : INVALID_BRIDGE_ROOM_BUCKET
+    const key = normalizeBridgeKey(ip, bucketRoom)
+    pruneMap(bridgeFailures, BRIDGE_WINDOW_MS, now, MAX_BRIDGE_FAILS)
     const entry = bridgeFailures.get(key)
     if (!entry || now - entry.firstAt > BRIDGE_WINDOW_MS) {
       bridgeFailures.set(key, { count: 1, firstAt: now })
@@ -204,8 +251,13 @@ export function createAuthManager({
     }
   }
 
-  function clearBridgeFailure(ip, roomId) {
-    bridgeFailures.delete(normalizeBridgeKey(ip, roomId))
+  function clearBridgeFailure(ip, roomId = '') {
+    const cleanRoom = String(roomId || '').trim()
+    if (cleanRoom) {
+      bridgeFailures.delete(normalizeBridgeKey(ip, cleanRoom))
+    } else {
+      bridgeIpFailures.delete(normalizeBridgeIp(ip))
+    }
   }
 
   function signRawPayload(payload) {
@@ -220,8 +272,13 @@ export function createAuthManager({
     if (parts.length !== 2) return null
     const [body, sig] = parts
     if (!body || !sig) return null
-    const expected = createHmac('sha256', signingKey).update(body).digest('base64url')
-    if (!safeEqual(sig, expected)) return null
+    const expectedCurrent = createHmac('sha256', signingKey).update(body).digest('base64url')
+    let matched = safeEqual(sig, expectedCurrent)
+    if (!matched && previousSigningKey) {
+      const expectedPrev = createHmac('sha256', previousSigningKey).update(body).digest('base64url')
+      matched = safeEqual(sig, expectedPrev)
+    }
+    if (!matched) return null
     try {
       const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
       if (!payload || typeof payload !== 'object') return null
@@ -308,9 +365,25 @@ export function createAuthManager({
       }
     }
     while (wsTickets.size >= MAX_WS_TICKETS) {
-      const oldest = wsTickets.keys().next().value
-      if (!oldest) break
-      wsTickets.delete(oldest)
+      // Fair multi-tenant eviction: evict the oldest ticket from the room holding the most tickets
+      const roomCounts = new Map()
+      const roomOldest = new Map()
+      for (const [k, v] of wsTickets.entries()) {
+        const r = String(v.user?.room || '')
+        roomCounts.set(r, (roomCounts.get(r) || 0) + 1)
+        if (!roomOldest.has(r)) roomOldest.set(r, k)
+      }
+      let heaviestRoom = ''
+      let maxCount = 0
+      for (const [r, c] of roomCounts.entries()) {
+        if (c > maxCount) {
+          maxCount = c
+          heaviestRoom = r
+        }
+      }
+      const victim = roomOldest.get(heaviestRoom) || wsTickets.keys().next().value
+      if (!victim) break
+      wsTickets.delete(victim)
     }
     const ticket = `tk_${randomBytes(24).toString('hex')}`
     const exp = now + WS_TICKET_TTL_MS

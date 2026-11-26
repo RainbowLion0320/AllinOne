@@ -12,12 +12,14 @@
 import { spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import readline from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
 import { RelayBridgeLink } from './src/ws-client.js'
 import { renderQrSvg } from '@allinone/shared/qr-svg'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
+import { warmLoginShellPathAsync } from './src/helpers/bin-finder.js'
 import { ensureDshLocalIpcPlugin } from './src/helpers/dsh-ipc-installer.js'
 import {
   computeE2eeKeyId,
@@ -30,7 +32,20 @@ import {
 const DEFAULT_SERVER_URL =
   (typeof __ALLINONE_DEFAULT_SERVER__ === 'string' && __ALLINONE_DEFAULT_SERVER__) ||
   'http://127.0.0.1:8787'
-const BRIDGE_VERSION = '1.0.29'
+
+function resolveBridgeVersion() {
+  if (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) {
+    return __ALLINONE_VERSION__.trim()
+  }
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(resolve(here, 'package.json'), 'utf8'))
+    if (pkg?.version) return String(pkg.version).trim()
+  } catch {}
+  return '0.0.0'
+}
+
+const BRIDGE_VERSION = resolveBridgeVersion()
 
 // Capture sensitive bootstrap env vars once at process startup, then scrub them from process.env
 // so spawned AI CLIs (codex/claude/agy) and user shell commands never inherit decrypted secrets
@@ -113,6 +128,7 @@ function parseArgs(argv) {
     e2eeKey: BOOTSTRAP_ENV.e2eeKey || '',
     e2eeKeyFromCli: false,
     allowInsecureHttp: false,
+    machineIpc: false,
     logout: false,
     reset: false,
     noBrowser: false,
@@ -139,6 +155,7 @@ function parseArgs(argv) {
       opts.e2eeKey = a.slice('--e2ee-key='.length)
       opts.e2eeKeyFromCli = true
     } else if (a === '--allow-insecure-http') opts.allowInsecureHttp = true
+    else if (a === '--machine-ipc') opts.machineIpc = true
     else if (a === '--logout' || a === '--login') opts.logout = true
     else if (a === '--reset') opts.reset = true
     else if (a === '--no-browser') opts.noBrowser = true
@@ -495,6 +512,46 @@ function openFileInBrowser(filePath) {
   } catch {}
 }
 
+function readStdinBootstrapFrame(timeoutMs = 5_000) {
+  return new Promise((resolveFrame) => {
+    let settled = false
+    let buf = ''
+    const done = (val) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      process.stdin.off('data', onData)
+      process.stdin.off('end', onEnd)
+      resolveFrame(val)
+    }
+    const timer = setTimeout(() => done(null), timeoutMs)
+    timer.unref?.()
+    const onEnd = () => done(null)
+    const onData = (chunk) => {
+      buf += String(chunk || '')
+      if (buf.length > 64 * 1024) {
+        done(null)
+        return
+      }
+      const nl = buf.indexOf('\n')
+      if (nl === -1) return
+      const line = buf.slice(0, nl).trim()
+      try {
+        const parsed = JSON.parse(line)
+        if (parsed && parsed.type === 'bootstrap') {
+          done(parsed)
+          return
+        }
+      } catch {}
+      done(null)
+    }
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', onData)
+    process.stdin.once('end', onEnd)
+    process.stdin.resume()
+  })
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help) {
@@ -511,6 +568,7 @@ async function main() {
   -p, --password <p>  账号密码（仅用于首次换取单机密钥，绝不落盘）
   --e2ee-key <key>      指定 256-bit 端到端加密密钥（留空自动生成）
   --allow-insecure-http 允许通过明文 http:// 连接非本机服务器（仅限受信任局域网调试）
+  --machine-ipc         结构化 JSON-Lines IPC 模式（供桌面端内嵌管理）
   --logout              退出当前账号绑定并重新登录
   --reset               清除本地配置并重新绑定
   --no-browser          不自动打开本地二维码网页
@@ -519,6 +577,28 @@ async function main() {
     process.exit(0)
   }
 
+  const emitMachineEvent = (event, data = {}) => {
+    if (!opts.machineIpc) return
+    try {
+      process.stdout.write(`${JSON.stringify({ type: 'bridge.ipc', event, ...data })}\n`)
+    } catch {}
+  }
+
+  if (opts.machineIpc && !process.stdin.isTTY) {
+    const boot = await readStdinBootstrapFrame(5_000)
+    if (boot) {
+      if (boot.bridgeSecret) BOOTSTRAP_ENV.bridgeSecret = String(boot.bridgeSecret).trim()
+      if (boot.e2eeKey) {
+        BOOTSTRAP_ENV.e2eeKey = String(boot.e2eeKey).trim()
+        if (!opts.e2eeKey) opts.e2eeKey = BOOTSTRAP_ENV.e2eeKey
+      }
+      if (Number(boot.webrtcProxyPort || 0) > 0) BOOTSTRAP_ENV.webrtcProxyPort = Number(boot.webrtcProxyPort)
+      if (boot.webrtcProxyToken) BOOTSTRAP_ENV.webrtcProxyToken = String(boot.webrtcProxyToken).trim()
+      BOOTSTRAP_ENV.hadDesktopSecrets = true
+    }
+  }
+
+  void warmLoginShellPathAsync().catch(() => {})
   assertSecureServerUrl(opts.server, { allowInsecureHttp: opts.allowInsecureHttp })
 
   mkdirSync(opts.stateDir, { recursive: true })
@@ -782,9 +862,11 @@ async function main() {
     secret: cfg.bridgeSecret,
     roomId: cfg.roomId,
     bridgeId: cfg.bridgeId,
-    mode: 'portable',
+    mode: opts.machineIpc ? 'desktop' : 'portable',
+    bridgeVersion: BRIDGE_VERSION,
     e2eeKey: activeE2eeKey,
     inboundDir: orchestrator.inboundDir,
+    inboundStore: orchestrator.inboundStore,
     log: quietLog,
     onRpc: (method, params, ctx) => orchestrator.handleRpc(method, params, ctx),
     onRegisterP2pUpload: (info) => orchestrator.registerP2pUpload(info),
@@ -793,6 +875,7 @@ async function main() {
         ? { port: BOOTSTRAP_ENV.webrtcProxyPort, token: BOOTSTRAP_ENV.webrtcProxyToken }
         : null,
     onState: (state, detail) => {
+      emitMachineEvent('state', { state, detail: String(detail || '') })
       if (state === 'connected') {
         if (!connectedOnce) {
           connectedOnce = true
@@ -800,8 +883,8 @@ async function main() {
         } else {
           console.log('[allinone] ✓ 网络已恢复，重新连接成功。')
         }
-      } else if (state === 'unauthorized') {
-        console.error(`[allinone] ✖ 本机已被解绑或凭证失效 (${detail})，请加 --logout 重新登录账号绑定。`)
+      } else if (state === 'unauthorized' || state === 'fatal') {
+        console.error(`[allinone] ✖ 本机连接被服务器拒绝 (${detail})，退出码 41。`)
         void shutdown(41)
       } else if (state === 'disconnected') {
         console.log(`[allinone] ⚠ 连接暂时中断 (${detail})，正在自动重连...`)
@@ -815,6 +898,13 @@ async function main() {
     .getAppsStatus()
     .then((apps) => {
       link.setAppsMeta(apps)
+      emitMachineEvent('apps', {
+        apps: apps.map((a) => ({
+          app: a.app,
+          available: Boolean(a.available),
+          writable: Boolean(a.writable),
+        })),
+      })
       return apps
     })
     .catch(() => [])
@@ -856,6 +946,9 @@ async function main() {
         const freshApps = await orchestrator.getAppsStatus()
         detectedApps = freshApps
         link.setAppsMeta(freshApps)
+        emitMachineEvent('apps', {
+          apps: freshApps.map((a) => ({ app: a.app, available: Boolean(a.available), writable: Boolean(a.writable) })),
+        })
         const appSummary = freshApps
           .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
           .join(' | ')
@@ -886,8 +979,10 @@ async function main() {
         },
         onProgress: (ev) => {
           if (ev.phase === 'installing') {
+            emitMachineEvent('autofix', { phase: 'installing', message: `正在自动补全 ${ev.displayName}...` })
             console.log(`[allinone] [autofix:progress] 正在自动补全 ${ev.displayName}...`)
           } else if (ev.phase === 'idle') {
+            emitMachineEvent('autofix', { phase: 'idle', message: '' })
             console.log('[allinone] [autofix:idle]')
           }
         },
@@ -896,6 +991,9 @@ async function main() {
           const freshApps = await orchestrator.getAppsStatus()
           detectedApps = freshApps
           link.setAppsMeta(freshApps)
+          emitMachineEvent('apps', {
+            apps: freshApps.map((a) => ({ app: a.app, available: Boolean(a.available), writable: Boolean(a.writable) })),
+          })
           const appSummary = freshApps
             .map((a) => `${a.app}:${a.available ? (a.writable ? '就绪' : '只读') : '未安装'}`)
             .join(' | ')
@@ -945,21 +1043,30 @@ async function main() {
         await shutdown(0)
       }
     })
-  } else if (BOOTSTRAP_ENV.hadDesktopSecrets) {
+  } else if (BOOTSTRAP_ENV.hadDesktopSecrets || opts.machineIpc) {
     // Embedded desktop-app control channel over piped stdin:
-    //  - "probe" / "resume" triggers immediate WS reconnect after OS sleep/wake
+    //  - JSON `{ type: 'probe' | 'quit' }` or plain text `"probe"`/`"quit"`
     //  - stdin EOF means parent Electron process died/crashed -> shut down cleanly (no orphan bridge!)
     let ctrlBuf = ''
     process.stdin.setEncoding('utf8')
     process.stdin.on('data', (chunk) => {
       ctrlBuf += chunk
+      if (ctrlBuf.length > 64 * 1024) ctrlBuf = ctrlBuf.slice(-4096)
       let nl
       while ((nl = ctrlBuf.indexOf('\n')) !== -1) {
-        const line = ctrlBuf.slice(0, nl).trim().toLowerCase()
+        const rawLine = ctrlBuf.slice(0, nl).trim()
         ctrlBuf = ctrlBuf.slice(nl + 1)
-        if (line === 'resume' || line === 'probe' || line === 'reconnect') {
+        if (!rawLine) continue
+        let cmd = rawLine.toLowerCase()
+        if (rawLine.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(rawLine)
+            cmd = String(parsed?.type || parsed?.cmd || '').trim().toLowerCase()
+          } catch {}
+        }
+        if (cmd === 'resume' || cmd === 'probe' || cmd === 'reconnect') {
           link.probeOrReconnect('system-resume')
-        } else if (line === 'quit' || line === 'stop') {
+        } else if (cmd === 'quit' || cmd === 'stop') {
           void shutdown(0)
         }
       }
@@ -972,10 +1079,12 @@ async function main() {
   process.on('SIGINT', () => void shutdown(0))
   process.on('SIGTERM', () => void shutdown(0))
   process.on('uncaughtException', (err) => {
-    console.error('[allinone] ⚠ 捕获到未处理异常（桥接保持在线）:', err?.stack || String(err))
+    console.error('[allinone] ✖ 捕获到未处理致命异常，正在安全退出:', err?.stack || String(err))
+    emitMachineEvent('fatal', { message: String(err?.message || err) })
+    void shutdown(1)
   })
   process.on('unhandledRejection', (reason) => {
-    console.error('[allinone] ⚠ 捕获到未处理的异步异常（桥接保持在线）:', reason?.stack || String(reason))
+    console.error('[allinone] ⚠ 捕获到未处理的异步异常:', reason?.stack || String(reason))
   })
 }
 

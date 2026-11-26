@@ -15,8 +15,33 @@ permissions:
   contents: read
 
 jobs:
+  test-gate:
+    name: Build & Smoke Test Gate
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify version sync across workspace
+        run: node scripts/bump-version.mjs --check
+
+      - name: Build & run all unit + E2E smoke tests
+        run: npm run build && npm test
+
   build-desktop:
     name: Build Desktop (${{ matrix.os }})
+    needs: [test-gate]
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +104,7 @@ jobs:
 
   build-android:
     name: Build Android APK
+    needs: [test-gate]
     runs-on: ubuntu-latest
     env:
       PUBLIC_RELAY_URL: ${{ inputs.relay_url || vars.DEFAULT_RELAY_URL || '' }}
@@ -179,11 +205,34 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Download all installer artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
           merge-multiple: true
+
+      - name: Sign desktop installer manifest (Ed25519)
+        env:
+          DESKTOP_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.DESKTOP_UPDATE_ED25519_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          DESKTOP_FILES=(release-artifacts/*.dmg release-artifacts/*.exe)
+          if [ ${#DESKTOP_FILES[@]} -gt 0 ]; then
+            node scripts/sign-desktop-release.mjs \
+              --version "${GITHUB_REF_NAME#v}" \
+              --out release-artifacts/All-in-One-Desktop-Release.json \
+              "${DESKTOP_FILES[@]}"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

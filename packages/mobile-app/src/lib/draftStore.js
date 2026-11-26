@@ -14,6 +14,33 @@ const memoryLastSessions = new Map()
 const memoryLastWorkspaces = new Map()
 const hydratedScopeMaps = new WeakSet()
 let hydrated = false
+let persistTimer = null
+let flushHooked = false
+
+function flushDraftPersistence() {
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
+  persistDrafts()
+}
+
+function schedulePersistDrafts() {
+  if (typeof window !== 'undefined' && !flushHooked) {
+    flushHooked = true
+    window.addEventListener('pagehide', flushDraftPersistence)
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') flushDraftPersistence()
+      })
+    }
+  }
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    persistDrafts()
+  }, 350)
+}
 
 function readRawStorage() {
   try {
@@ -126,7 +153,7 @@ export function saveDraft(draftKey, { text = '', attachments = [] } = {}) {
   const safeAttachments = sanitizeDraftAttachments(attachments)
   if (!safeText && safeAttachments.length === 0) {
     if (memoryDrafts.delete(draftKey)) {
-      persistDrafts()
+      flushDraftPersistence()
     }
     return
   }
@@ -136,14 +163,14 @@ export function saveDraft(draftKey, { text = '', attachments = [] } = {}) {
     updatedAt: Date.now(),
   })
   pruneExcessDrafts()
-  persistDrafts()
+  schedulePersistDrafts()
 }
 
 export function clearDraft(draftKey) {
   hydrateOnce()
   if (!draftKey) return
   if (memoryDrafts.delete(draftKey)) {
-    persistDrafts()
+    flushDraftPersistence()
   }
 }
 
@@ -156,7 +183,7 @@ export function clearDraftsForScope(scopePrefix) {
     memoryLastWorkspaces.clear()
     hydratedScopeMaps.add(memoryLastSessions)
     hydratedScopeMaps.add(memoryLastWorkspaces)
-    persistDrafts()
+    flushDraftPersistence()
     persistScopeMap(LAST_SESSION_STORAGE_KEY, memoryLastSessions)
     persistScopeMap(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces)
     return
@@ -168,7 +195,7 @@ export function clearDraftsForScope(scopePrefix) {
       changed = true
     }
   }
-  if (changed) persistDrafts()
+  if (changed) flushDraftPersistence()
 
   clearScopeMapPrefix(LAST_SESSION_STORAGE_KEY, memoryLastSessions, prefix)
   clearScopeMapPrefix(LAST_WORKSPACE_STORAGE_KEY, memoryLastWorkspaces, prefix)

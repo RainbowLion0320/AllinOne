@@ -68,12 +68,15 @@ public class AllinOneUpdaterPlugin extends Plugin {
     private static final String KEY_APK_VERSION_CODE = "apkVersionCode";
     private static final String KEY_ACTIVE_VERSION = "activeVersion";
     private static final String KEY_ACTIVE_PATH = "activePath";
+    private static final String KEY_PREVIOUS_VERSION = "previousVersion";
     private static final String KEY_PREVIOUS_PATH = "previousPath";
     private static final String KEY_STAGED_VERSION = "stagedVersion";
     private static final String KEY_STAGED_PATH = "stagedPath";
     private static final String KEY_PENDING_VERSION = "pendingVersion";
     private static final String KEY_PENDING_PATH = "pendingPath";
     private static final String KEY_PENDING_ATTEMPTS = "pendingBootAttempts";
+
+    private static final String GITHUB_RELEASE_PATH_PREFIX = "/rainbowlion0320/allinone/releases/download/";
 
     private static final String BUNDLES_DIR_NAME = "ota_bundles";
     private static final String TMP_DIR_NAME = "ota_tmp";
@@ -131,11 +134,12 @@ public class AllinOneUpdaterPlugin extends Plugin {
             long currentCode = readApkVersionCode(ctx);
             long savedCode = otaPrefs.getLong(KEY_APK_VERSION_CODE, -1L);
             if (savedCode > 0L && currentCode > 0L && savedCode != currentCode) {
-                // Native APK was upgraded — discard older OTA bundles so new built-in assets load cleanly.
+                // Native APK was upgraded — discard older OTA bundles & stale WebView SW/CacheStorage.
                 otaPrefs.edit().clear().putLong(KEY_APK_VERSION_CODE, currentCode).commit();
                 capPrefs.edit().remove(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH).commit();
                 deleteRecursively(new File(ctx.getFilesDir(), BUNDLES_DIR_NAME));
                 deleteRecursively(new File(ctx.getFilesDir(), TMP_DIR_NAME));
+                purgeWebViewServiceWorkerStorage(ctx);
                 return;
             }
             if (savedCode <= 0L && currentCode > 0L) {
@@ -148,9 +152,11 @@ public class AllinOneUpdaterPlugin extends Plugin {
                 if (attempts > MAX_PENDING_BOOT_ATTEMPTS) {
                     // Roll back to previous working bundle (or built-in APK assets if none).
                     String prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
+                    String prevVer = otaPrefs.getString(KEY_PREVIOUS_VERSION, "");
                     String badPath = otaPrefs.getString(KEY_PENDING_PATH, "");
+                    boolean hasValidPrev = prevPath != null && !prevPath.isEmpty() && isValidBundleDir(new File(prevPath));
                     SharedPreferences.Editor capEd = capPrefs.edit();
-                    if (prevPath != null && !prevPath.isEmpty() && isValidBundleDir(new File(prevPath))) {
+                    if (hasValidPrev) {
                         capEd.putString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, prevPath);
                     } else {
                         capEd.remove(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH);
@@ -161,13 +167,19 @@ public class AllinOneUpdaterPlugin extends Plugin {
                     otaEd.remove(KEY_PENDING_VERSION);
                     otaEd.remove(KEY_PENDING_PATH);
                     otaEd.remove(KEY_PENDING_ATTEMPTS);
-                    otaEd.remove(KEY_ACTIVE_VERSION);
-                    if (prevPath != null && !prevPath.isEmpty()) {
+                    if (hasValidPrev) {
                         otaEd.putString(KEY_ACTIVE_PATH, prevPath);
+                        if (prevVer != null && !prevVer.isEmpty()) {
+                            otaEd.putString(KEY_ACTIVE_VERSION, prevVer);
+                        } else {
+                            otaEd.remove(KEY_ACTIVE_VERSION);
+                        }
                     } else {
                         otaEd.remove(KEY_ACTIVE_PATH);
+                        otaEd.remove(KEY_ACTIVE_VERSION);
                     }
                     otaEd.commit();
+                    purgeWebViewServiceWorkerStorage(ctx);
 
                     if (badPath != null && !badPath.isEmpty()) {
                         File badDir = new File(badPath);
@@ -241,12 +253,64 @@ public class AllinOneUpdaterPlugin extends Plugin {
         target.delete();
     }
 
+    private static void purgeWebViewServiceWorkerStorage(Context ctx) {
+        try {
+            File appData = ctx.getFilesDir().getParentFile();
+            if (appData == null) return;
+            File webViewDefault = new File(new File(appData, "app_webview"), "Default");
+            deleteRecursively(new File(webViewDefault, "Service Worker"));
+            deleteRecursively(new File(webViewDefault, "CacheStorage"));
+        } catch (Exception ignored) {}
+    }
+
+    private static int compareSemver(String rawA, String rawB) {
+        String a = rawA == null ? "" : rawA.trim().replaceFirst("^[vV]", "");
+        String b = rawB == null ? "" : rawB.trim().replaceFirst("^[vV]", "");
+        String[] aSplit = a.split("-", 2);
+        String[] bSplit = b.split("-", 2);
+        String[] aNums = aSplit[0].split("\\.");
+        String[] bNums = bSplit[0].split("\\.");
+        if (aNums.length < 3 || bNums.length < 3) return 0;
+        try {
+            for (int i = 0; i < 3; i++) {
+                int na = Integer.parseInt(aNums[i]);
+                int nb = Integer.parseInt(bNums[i]);
+                if (na != nb) return Integer.compare(na, nb);
+            }
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+        String aPre = aSplit.length > 1 ? aSplit[1] : "";
+        String bPre = bSplit.length > 1 ? bSplit[1] : "";
+        if (aPre.equals(bPre)) return 0;
+        if (aPre.isEmpty()) return 1;
+        if (bPre.isEmpty()) return -1;
+        return aPre.compareTo(bPre);
+    }
+
     private static boolean isTrustedGithubHost(String rawHost) {
         if (rawHost == null) return false;
         String host = rawHost.trim().toLowerCase(Locale.ROOT);
         if (host.isEmpty()) return false;
         if (TRUSTED_GITHUB_HOSTS.contains(host)) return true;
         return host.endsWith(".githubusercontent.com") || host.endsWith(".github.com");
+    }
+
+    private static boolean isAllowedGithubUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
+            String host = uri.getHost();
+            if (!isTrustedGithubHost(host)) return false;
+            if ("github.com".equalsIgnoreCase(host)) {
+                String path = uri.getRawPath() != null ? uri.getRawPath().toLowerCase(Locale.ROOT) : "";
+                return path.startsWith(GITHUB_RELEASE_PATH_PREFIX);
+            }
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static String extractHttpsHost(String rawUrl) {
@@ -570,12 +634,20 @@ public class AllinOneUpdaterPlugin extends Plugin {
             stagedPath = "";
         }
 
+        String activeServerPath = bridge != null ? bridge.getServerBasePath() : "";
+        boolean isOtaActive = false;
+        if (activeServerPath != null && !activeServerPath.isEmpty()) {
+            File bundlesRoot = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
+            isOtaActive = isDirectChildOf(new File(activeServerPath), bundlesRoot);
+        }
+
         JSObject ret = new JSObject();
         ret.put("supportsOta", true);
         ret.put("nativeVersion", readApkVersionName(ctx));
         ret.put("nativeVersionCode", readApkVersionCode(ctx));
         ret.put("activeBundleVersion", otaPrefs.getString(KEY_ACTIVE_VERSION, ""));
-        ret.put("activeServerPath", bridge != null ? bridge.getServerBasePath() : "");
+        ret.put("activeServerPath", activeServerPath);
+        ret.put("isOtaActive", isOtaActive);
         ret.put("stagedVersion", stagedVer);
         call.resolve(ret);
     }
@@ -605,20 +677,45 @@ public class AllinOneUpdaterPlugin extends Plugin {
             return;
         }
 
+        // Enforce native minimum shell version & strict anti-downgrade in native Java
+        final Context checkCtx = getContext();
+        final String apkVersionName = readApkVersionName(checkCtx).replaceFirst("^[vV]", "");
+        if (!minNativeVersion.isEmpty() && SAFE_SEMVER_RE.matcher(minNativeVersion).matches()
+            && SAFE_SEMVER_RE.matcher(apkVersionName).matches()
+            && compareSemver(minNativeVersion, apkVersionName) > 0) {
+            call.reject("Update requires native APK >= " + minNativeVersion + " (installed: " + apkVersionName + ")");
+            return;
+        }
+        SharedPreferences curPrefs = checkCtx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+        String activeVer = curPrefs.getString(KEY_ACTIVE_VERSION, "");
+        String baselineVer = apkVersionName;
+        if (activeVer != null && SAFE_SEMVER_RE.matcher(activeVer).matches()
+            && (!SAFE_SEMVER_RE.matcher(baselineVer).matches() || compareSemver(activeVer, baselineVer) > 0)) {
+            baselineVer = activeVer;
+        }
+        if (SAFE_SEMVER_RE.matcher(baselineVer).matches() && compareSemver(version, baselineVer) <= 0) {
+            call.reject("Blocked OTA downgrade or replay (" + version + " <= " + baselineVer + ")");
+            return;
+        }
+
         final String primaryHost = extractHttpsHost(primaryUrl);
         if (primaryHost == null) {
             call.reject("Invalid HTTPS download URL");
             return;
         }
         final boolean primaryIsGithub = isTrustedGithubHost(primaryHost);
-        final boolean hasSignature = !signature.isEmpty() && !sigAlg.isEmpty();
-
-        // Pre-verify signature if provided (and require it immediately for any non-GitHub mirror!)
-        if (!primaryIsGithub && !hasSignature) {
-            call.reject("Non-GitHub mirror requires a cryptographic release signature");
+        if (primaryIsGithub && !isAllowedGithubUrl(primaryUrl)) {
+            call.reject("Blocked untrusted GitHub release path");
             return;
         }
-        if (hasSignature && expectedSize > 0L) {
+        final boolean hasSignature = !signature.isEmpty() && !sigAlg.isEmpty();
+
+        // Unconditionally require APK-cert asymmetric signature verification for ALL OTA sources
+        if (!hasSignature) {
+            call.reject("OTA update bundle requires a cryptographic APK-cert signature");
+            return;
+        }
+        if (expectedSize > 0L) {
             if (!verifyBundleSignature(version, minNativeVersion, expectedSha256, expectedSize, signature, sigAlg)) {
                 call.reject("Release signature verification failed against APK signing certificate");
                 return;
@@ -666,7 +763,6 @@ public class AllinOneUpdaterPlugin extends Plugin {
                 emitProgress("downloading", version, 0L, Math.max(0L, expectedSize), 0);
 
                 DownloadResult res;
-                boolean downloadedFromGithub = primaryIsGithub;
                 try {
                     res = streamDownloadToFile(
                         primaryUrl,
@@ -684,12 +780,11 @@ public class AllinOneUpdaterPlugin extends Plugin {
                         throw primaryErr;
                     }
                     boolean fbIsGithub = isTrustedGithubHost(fbHost);
-                    if (!fbIsGithub && !hasSignature) {
+                    if (fbIsGithub && !isAllowedGithubUrl(fallbackUrl)) {
                         throw primaryErr;
                     }
                     // Clean partial file before fallback attempt
                     deleteRecursively(partFile);
-                    downloadedFromGithub = fbIsGithub;
                     res = streamDownloadToFile(
                         fallbackUrl,
                         fbIsGithub,
@@ -708,12 +803,10 @@ public class AllinOneUpdaterPlugin extends Plugin {
                     throw new SecurityException("SHA-256 verification failed");
                 }
 
-                // Mandatory cryptographic signature verification for non-GitHub mirrors (and whenever provided)
-                if (!downloadedFromGithub || hasSignature) {
-                    long sigSize = expectedSize > 0L ? expectedSize : res.bytes;
-                    if (!verifyBundleSignature(version, minNativeVersion, res.sha256, sigSize, signature, sigAlg)) {
-                        throw new SecurityException("Release signature verification failed");
-                    }
+                // Unconditional cryptographic signature verification against the APK's own signing cert
+                long sigSize = expectedSize > 0L ? expectedSize : res.bytes;
+                if (!verifyBundleSignature(version, minNativeVersion, res.sha256, sigSize, signature, sigAlg)) {
+                    throw new SecurityException("Release signature verification failed");
                 }
 
                 extractZipSafely(partFile, stageDir);
@@ -782,7 +875,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
             Activity.MODE_PRIVATE
         );
 
-        String requestedVersion = call.getString("version", "").trim().replaceFirst("^[vV]", "");
+        String requestedVersion = optTrimString(call, "version").replaceFirst("^[vV]", "");
         String stagedVersion = otaPrefs.getString(KEY_STAGED_VERSION, "");
         String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
 
@@ -803,19 +896,22 @@ public class AllinOneUpdaterPlugin extends Plugin {
         }
 
         String prevPath = capPrefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, "");
+        String prevVersion = otaPrefs.getString(KEY_ACTIVE_VERSION, "");
         if (prevPath == null) prevPath = "";
         if (prevPath.equals(targetDir.getAbsolutePath())) {
             prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
+            prevVersion = otaPrefs.getString(KEY_PREVIOUS_VERSION, "");
         }
 
         otaPrefs.edit()
             .putLong(KEY_APK_VERSION_CODE, readApkVersionCode(ctx))
             .putString(KEY_PREVIOUS_PATH, prevPath != null ? prevPath : "")
+            .putString(KEY_PREVIOUS_VERSION, prevVersion != null ? prevVersion : "")
             .putString(KEY_ACTIVE_VERSION, stagedVersion)
             .putString(KEY_ACTIVE_PATH, targetDir.getAbsolutePath())
             .putString(KEY_PENDING_VERSION, stagedVersion)
             .putString(KEY_PENDING_PATH, targetDir.getAbsolutePath())
-            .putInt(KEY_PENDING_ATTEMPTS, 0)
+            .putInt(KEY_PENDING_ATTEMPTS, 1)
             .commit();
 
         capPrefs.edit()

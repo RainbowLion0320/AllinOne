@@ -1,14 +1,13 @@
-import { openSync, readSync, closeSync, statSync, watch } from 'node:fs'
+import { openSync, readSync, closeSync, statSync, watch, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
+import { DEFAULT_TURN_QUOTA_MB } from '@allinone/shared'
 
 const MB = 1024 * 1024
 const MAX_BYTES_PER_TICK = 512 * 1024
 const MAX_REMAINDER_BYTES = 64 * 1024
 
-export const DEFAULT_TURN_QUOTA_MB = Object.freeze({
-  free: 1024,    // 1 GB / month
-  pro: 10240,    // 10 GB / month
-  ultra: 51200,  // 50 GB / month (shared identically by admin)
-})
+export { DEFAULT_TURN_QUOTA_MB }
 
 function parseNonNegNumber(raw, fallback) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
@@ -101,22 +100,55 @@ export function parseCoturnUsageLine(line) {
  */
 export function createTurnLogMeter({
   logPath = '',
+  cursorPath = '',
   onUsage = null,
   pollIntervalMs = 3_000,
   startFromBeginning = false,
   log = console,
 } = {}) {
   const cleanPath = String(logPath || '').trim()
+  const cleanCursorPath = String(cursorPath || '').trim()
   let offset = 0
   let currentIno = null
   let hadInitialStat = false
   let remainder = ''
+  let utf8Decoder = new StringDecoder('utf8')
   let watcher = null
   let timer = null
   let catchupTimer = null
   let reading = false
   let started = false
   let stopped = false
+  let lastError = ''
+  let lastCursorSavedAt = 0
+
+  function loadPersistedCursor() {
+    if (!cleanCursorPath) return null
+    try {
+      const raw = JSON.parse(readFileSync(cleanCursorPath, 'utf8'))
+      if (raw && raw.logPath === cleanPath && raw.ino != null && Number.isFinite(Number(raw.offset))) {
+        return { ino: BigInt(String(raw.ino)), offset: Math.max(0, Math.floor(Number(raw.offset))) }
+      }
+    } catch {}
+    return null
+  }
+
+  function persistCursor(force = false) {
+    if (!cleanCursorPath || currentIno === null) return
+    const now = Date.now()
+    if (!force && now - lastCursorSavedAt < 5_000) return
+    lastCursorSavedAt = now
+    try {
+      mkdirSync(dirname(cleanCursorPath), { recursive: true })
+      const tmp = `${cleanCursorPath}.tmp.${process.pid}`
+      writeFileSync(
+        tmp,
+        JSON.stringify({ logPath: cleanPath, ino: currentIno.toString(), offset, updatedAt: now }),
+        { mode: 0o600 },
+      )
+      renameSync(tmp, cleanCursorPath)
+    } catch {}
+  }
 
   function clearCatchupTimer() {
     if (catchupTimer) {
@@ -153,12 +185,23 @@ export function createTurnLogMeter({
     try {
       const st = statSync(cleanPath, { bigint: true })
       hadInitialStat = true
-      currentIno = st.ino
-      offset = startFromBeginning ? 0 : Number(st.size)
-    } catch {
+      const persisted = loadPersistedCursor()
+      if (!startFromBeginning && persisted && persisted.ino === st.ino && persisted.offset <= Number(st.size)) {
+        currentIno = st.ino
+        offset = persisted.offset
+      } else {
+        currentIno = st.ino
+        offset = startFromBeginning ? 0 : Number(st.size)
+      }
+      lastError = ''
+    } catch (err) {
       hadInitialStat = false
       currentIno = null
       offset = 0
+      if (err?.code && err.code !== 'ENOENT') {
+        lastError = String(err.message || err.code)
+        log.warn?.(`[turn-meter] Unable to stat ${cleanPath}: ${lastError}`)
+      }
     }
   }
 
@@ -184,6 +227,7 @@ export function createTurnLogMeter({
     reading = true
     let fd = null
     let hasMoreBacklog = false
+    let progressed = false
     try {
       const st = statSync(cleanPath, { bigint: true })
       const size = Number(st.size)
@@ -191,22 +235,28 @@ export function createTurnLogMeter({
         currentIno = st.ino
         offset = !hadInitialStat || startFromBeginning ? 0 : size
         remainder = ''
+        utf8Decoder = new StringDecoder('utf8')
         hadInitialStat = true
         if (started && !watcher) attachWatcher()
       } else if (st.ino !== currentIno) {
-        // Log rotated via `create` (new inode) — reset cleanly and re-attach watcher to new file
+        // Flush any buffered UTF-8 remainder before resetting for rotated inode
+        const tail = utf8Decoder.end()
+        if (tail) processChunkText(`${tail}\n`)
         currentIno = st.ino
         offset = 0
         remainder = ''
+        utf8Decoder = new StringDecoder('utf8')
         if (started) attachWatcher()
       } else if (size < offset) {
         // Log truncated in place (`copytruncate`) — reset cleanly to start of file
         offset = 0
         remainder = ''
+        utf8Decoder = new StringDecoder('utf8')
         if (started && !watcher) attachWatcher()
       } else if (started && !watcher) {
         attachWatcher()
       }
+      lastError = ''
       if (size <= offset) return
 
       fd = openSync(cleanPath, 'r')
@@ -219,17 +269,25 @@ export function createTurnLogMeter({
         if (bytesRead <= 0) break
         offset += bytesRead
         tickBytes += bytesRead
-        processChunkText(buf.subarray(0, bytesRead).toString('utf8'))
+        progressed = true
+        processChunkText(utf8Decoder.write(buf.subarray(0, bytesRead)))
       }
       hasMoreBacklog = offset < size
-    } catch {
-      // Log file may not exist yet or be mid-rotation
+    } catch (err) {
+      if (err?.code && err.code !== 'ENOENT') {
+        const msg = String(err.message || err.code)
+        if (msg !== lastError) {
+          lastError = msg
+          log.warn?.(`[turn-meter] Read error on ${cleanPath}: ${msg}`)
+        }
+      }
     } finally {
       if (fd !== null) {
         try { closeSync(fd) } catch {}
       }
       reading = false
     }
+    if (progressed) persistCursor(false)
     if (hasMoreBacklog && started && !stopped && !catchupTimer) {
       catchupTimer = setTimeout(() => {
         catchupTimer = null
@@ -246,7 +304,7 @@ export function createTurnLogMeter({
     if (currentIno !== null) {
       attachWatcher()
     }
-    if (startFromBeginning) {
+    if (startFromBeginning || (currentIno !== null && offset >= 0)) {
       pollOnce()
     }
     timer = setInterval(pollOnce, Math.max(500, Number(pollIntervalMs) || 3_000))
@@ -262,7 +320,17 @@ export function createTurnLogMeter({
       timer = null
     }
     closeWatcher()
+    persistCursor(true)
   }
 
-  return { start, stop, pollOnce }
+  function getStats() {
+    return {
+      enabled: Boolean(cleanPath),
+      healthy: Boolean(cleanPath && !lastError),
+      lastError,
+      offset,
+    }
+  }
+
+  return { start, stop, pollOnce, getStats }
 }

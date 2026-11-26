@@ -1,39 +1,34 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeSync,
-} from 'node:fs'
-import { chmod as chmodAsync, open as openAsync, unlink as unlinkAsync } from 'node:fs/promises'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { VALID_TIERS as SHARED_TIERS } from '@allinone/shared'
 import { safeEqual } from './auth.js'
 
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"']+@[^\s@<>()[\]\\,;:"']+\.[^\s@<>()[\]\\,;:"']{2,}$/
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const SCRYPT_KEYLEN = 64
-const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
-const SCRYPT_MAX_CONCURRENT = 16
+const CURRENT_SCRYPT_OPTS = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }
+const LEGACY_SCRYPT_OPTS = { N: 16384, r: 8, p: 1 }
+const PHC_SCRYPT_RE = /^\$scrypt\$N=(\d+),r=(\d+),p=(\d+)\$([a-f0-9]+)\$([a-f0-9]+)$/i
+const UV_POOL_SIZE = Math.max(4, Number(process.env.UV_THREADPOOL_SIZE) || 4)
+// Keep at least half of libuv's threadpool free for disk/DNS/static I/O
+const SCRYPT_MAX_CONCURRENT = Math.max(2, Math.min(8, Math.floor(UV_POOL_SIZE / 2)))
 const SCRYPT_MAX_QUEUE = 64
 const DUMMY_SCRYPT_SALT = '00112233445566778899aabbccddeeff'
 const MAX_DEVICES_PER_USER = 20
-const MAX_REVOKED_SIDS = 1024
 const MAX_DAILY_REG_DAYS = 14
 const DEFAULT_MAX_DAILY_REGISTRATIONS = 20
+const SCHEMA_VERSION = 1
 
-export const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
+export const VALID_TIERS = new Set([...SHARED_TIERS, 'admin'])
 
 export function getLocalDayKey(ts = Date.now()) {
   const d = ts instanceof Date ? ts : new Date(ts)
   if (Number.isNaN(d.getTime())) return getLocalDayKey(Date.now())
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  // Deterministic UTC day boundary (immune to DST or host timezone drift)
+  return d.toISOString().slice(0, 10)
 }
 
 export function normalizeMaxDailyRegistrations(raw, fallback = DEFAULT_MAX_DAILY_REGISTRATIONS) {
@@ -45,9 +40,7 @@ export function normalizeMaxDailyRegistrations(raw, fallback = DEFAULT_MAX_DAILY
 
 export function getCurrentTurnMonth(now = new Date()) {
   const d = now instanceof Date ? now : new Date(now)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  return `${y}-${m}`
+  return d.toISOString().slice(0, 7)
 }
 
 function normalizeTurnUsageRecord(raw, now = new Date()) {
@@ -83,7 +76,7 @@ function pumpScryptQueue() {
   while (scryptActive < SCRYPT_MAX_CONCURRENT && scryptQueue.length > 0) {
     const job = scryptQueue.shift()
     scryptActive += 1
-    scrypt(job.password, job.salt, SCRYPT_KEYLEN, SCRYPT_OPTS, (err, derivedKey) => {
+    scrypt(job.password, job.salt, SCRYPT_KEYLEN, job.opts, (err, derivedKey) => {
       scryptActive -= 1
       pumpScryptQueue()
       if (err) job.reject(err)
@@ -92,7 +85,7 @@ function pumpScryptQueue() {
   }
 }
 
-function scryptAsync(password, salt) {
+function scryptAsync(password, salt, opts = CURRENT_SCRYPT_OPTS) {
   if (scryptActive >= SCRYPT_MAX_CONCURRENT && scryptQueue.length >= SCRYPT_MAX_QUEUE) {
     const err = new Error('服务器认证队列繁忙，请稍后重试')
     err.statusCode = 503
@@ -103,6 +96,7 @@ function scryptAsync(password, salt) {
     scryptQueue.push({
       password: String(password),
       salt: String(salt),
+      opts,
       resolve: resolvePromise,
       reject: rejectPromise,
     })
@@ -112,20 +106,52 @@ function scryptAsync(password, salt) {
 
 async function hashPasswordAsync(password, saltHex) {
   const salt = saltHex || randomBytes(16).toString('hex')
-  const derived = (await scryptAsync(password, salt)).toString('hex')
-  return { salt, hash: derived }
+  const derivedHex = (await scryptAsync(password, salt, CURRENT_SCRYPT_OPTS)).toString('hex')
+  const phc = `$scrypt$N=${CURRENT_SCRYPT_OPTS.N},r=${CURRENT_SCRYPT_OPTS.r},p=${CURRENT_SCRYPT_OPTS.p}$${salt}$${derivedHex}`
+  return { salt, hash: phc }
 }
 
-async function verifyPasswordHashAsync(password, salt, expectedHashHex) {
-  if (!password || !salt || !expectedHashHex) return false
+function parseStoredPasswordHash(salt, storedHash) {
+  const str = String(storedHash || '')
+  const m = PHC_SCRYPT_RE.exec(str)
+  if (m) {
+    const N = Number(m[1])
+    const r = Number(m[2])
+    const p = Number(m[3])
+    if (
+      Number.isInteger(N) && N >= 1024 && N <= 1048576 &&
+      Number.isInteger(r) && r >= 1 && r <= 64 &&
+      Number.isInteger(p) && p >= 1 && p <= 16
+    ) {
+      return {
+        salt: m[4],
+        expectedHex: m[5],
+        opts: { N, r, p, maxmem: Math.max(64 * 1024 * 1024, 256 * N * r) },
+        needsUpgrade: N < CURRENT_SCRYPT_OPTS.N || r !== CURRENT_SCRYPT_OPTS.r || p !== CURRENT_SCRYPT_OPTS.p,
+      }
+    }
+  }
+  return {
+    salt: String(salt || ''),
+    expectedHex: str,
+    opts: LEGACY_SCRYPT_OPTS,
+    needsUpgrade: true,
+  }
+}
+
+async function verifyPasswordHashAsync(password, salt, storedHash) {
+  if (!password || !storedHash) return { ok: false, needsUpgrade: false }
+  const parsed = parseStoredPasswordHash(salt, storedHash)
+  if (!parsed.salt || !parsed.expectedHex) return { ok: false, needsUpgrade: false }
   try {
-    const derivedBuf = await scryptAsync(password, salt)
-    const expectedBuf = Buffer.from(String(expectedHashHex), 'hex')
-    if (derivedBuf.length !== expectedBuf.length) return false
-    return timingSafeEqual(derivedBuf, expectedBuf)
+    const derivedBuf = await scryptAsync(password, parsed.salt, parsed.opts)
+    const expectedBuf = Buffer.from(parsed.expectedHex, 'hex')
+    if (derivedBuf.length !== expectedBuf.length) return { ok: false, needsUpgrade: false }
+    const ok = timingSafeEqual(derivedBuf, expectedBuf)
+    return { ok, needsUpgrade: ok && parsed.needsUpgrade }
   } catch (err) {
     if (err?.statusCode === 503) throw err
-    return false
+    return { ok: false, needsUpgrade: false }
   }
 }
 
@@ -169,15 +195,136 @@ export function validatePassword(raw) {
   return { ok: true, password: p }
 }
 
+function safeJsonParse(raw, fallback) {
+  try {
+    const parsed = JSON.parse(String(raw || ''))
+    return parsed ?? fallback
+  } catch {
+    return fallback
+  }
+}
+
+export function resolveAccountsDbPath(filePath) {
+  const clean = String(filePath || '').trim()
+  if (/\.json$/i.test(clean)) return clean.replace(/\.json$/i, '.db')
+  return clean
+}
+
 /**
- * Lightweight, zero-dependency account + daily registration cap + per-PC device credential store.
- * Persists to JSON with `0600` permissions using atomic temp-file rename:
- *  - Passwords stored strictly as salted `scrypt` hashes (never plaintext)
- *  - Per-PC `deviceSecret` stored strictly as salted SHA-256 hashes (never plaintext)
- *  - Open registration enforced atomically with a configurable daily registration cap
+ * ACID SQLite (WAL) Account, Device Credential, Session & Monthly TURN Metering Store.
+ *
+ * Uses Node.js 22+ built-in `node:sqlite` (zero external dependencies):
+ *  - Per-row transactional writes (`<0.1ms`, eliminates event-loop-blocking full-DB JSON rewrites)
+ *  - Commit-before-memory-mutate semantics (zero memory/disk divergence on disk failure)
+ *  - Automatic one-time migration from legacy `accounts.json` preserving `.bak` snapshot
+ *  - Cross-process `PRAGMA data_version` detection so live `admin-cli.js` edits take effect safely
+ *  - Upgradable PHC-format scrypt password hashes (`$scrypt$N=32768,r=8,p=1$...`)
  */
 export function createAccountStore({ filePath }) {
-  mkdirSync(dirname(filePath), { recursive: true })
+  const dbPath = resolveAccountsDbPath(filePath)
+  mkdirSync(dirname(dbPath), { recursive: true })
+
+  const db = new DatabaseSync(dbPath)
+  try { chmodSync(dbPath, 0o600) } catch {}
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA foreign_keys = ON;
+  `)
+
+  const currentSchemaVer = Number(db.prepare('PRAGMA user_version').get()?.user_version || 0)
+  if (currentSchemaVer < SCHEMA_VERSION) {
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS users (
+          user_id TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          username_lower TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL DEFAULT '',
+          email_lower TEXT NOT NULL DEFAULT '',
+          email_verified INTEGER NOT NULL DEFAULT 0,
+          email_verified_at INTEGER NOT NULL DEFAULT 0,
+          login_email_2fa INTEGER NOT NULL DEFAULT 0,
+          tier TEXT NOT NULL DEFAULT 'free',
+          role TEXT NOT NULL DEFAULT 'user',
+          password_salt TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          token_version INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          last_login_at INTEGER NOT NULL,
+          known_login_ips_json TEXT NOT NULL DEFAULT '[]',
+          turn_usage_json TEXT NOT NULL DEFAULT '{}',
+          devices_json TEXT NOT NULL DEFAULT '[]',
+          sessions_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(email_lower) WHERE email_lower != '';
+        CREATE TABLE IF NOT EXISTS daily_registrations (
+          day_key TEXT PRIMARY KEY,
+          count INTEGER NOT NULL DEFAULT 0
+        );
+        PRAGMA user_version = ${SCHEMA_VERSION};
+      `)
+      db.exec('COMMIT')
+    } catch (err) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw err
+    }
+  }
+
+  const stmtUpsertUser = db.prepare(`
+    INSERT INTO users (
+      user_id, username, username_lower, email, email_lower,
+      email_verified, email_verified_at, login_email_2fa, tier, role,
+      password_salt, password_hash, token_version, created_at, last_login_at,
+      known_login_ips_json, turn_usage_json, devices_json, sessions_json
+    ) VALUES (
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?
+    )
+    ON CONFLICT(user_id) DO UPDATE SET
+      username = excluded.username,
+      username_lower = excluded.username_lower,
+      email = excluded.email,
+      email_lower = excluded.email_lower,
+      email_verified = excluded.email_verified,
+      email_verified_at = excluded.email_verified_at,
+      login_email_2fa = excluded.login_email_2fa,
+      tier = excluded.tier,
+      role = excluded.role,
+      password_salt = excluded.password_salt,
+      password_hash = excluded.password_hash,
+      token_version = excluded.token_version,
+      last_login_at = excluded.last_login_at,
+      known_login_ips_json = excluded.known_login_ips_json,
+      turn_usage_json = excluded.turn_usage_json,
+      devices_json = excluded.devices_json,
+      sessions_json = excluded.sessions_json
+  `)
+
+  // Telemetry-only update never clobbers tier/role/password/email modified by concurrent admin-cli.js
+  const stmtUpdateTelemetry = db.prepare(`
+    UPDATE users SET
+      last_login_at = ?,
+      turn_usage_json = ?,
+      devices_json = ?,
+      sessions_json = ?
+    WHERE user_id = ?
+  `)
+
+  const stmtUpsertDaily = db.prepare(`
+    INSERT INTO daily_registrations (day_key, count) VALUES (?, ?)
+    ON CONFLICT(day_key) DO UPDATE SET count = excluded.count
+  `)
+
+  const stmtPruneDaily = db.prepare('DELETE FROM daily_registrations WHERE day_key < ?')
+  const stmtAllUsers = db.prepare('SELECT * FROM users')
+  const stmtAllDaily = db.prepare('SELECT day_key, count FROM daily_registrations')
+  const stmtDataVersion = db.prepare('PRAGMA data_version')
+  const stmtUserCount = db.prepare('SELECT COUNT(*) AS cnt FROM users')
 
   /** @type {Map<string, any>} */
   const usersById = new Map()
@@ -189,6 +336,13 @@ export function createAccountStore({ filePath }) {
   let dailyRegistrations = {}
   /** @type {Set<string>} */
   const changingPasswordUsers = new Set()
+  /** @type {Set<string>} */
+  const dirtyTelemetryUsers = new Set()
+
+  let closed = false
+  let lastDataVersion = 0
+  let lastPersistError = ''
+  let flushTimer = null
 
   function normalizeDailyRegistrations(raw, now = Date.now()) {
     const out = {}
@@ -206,181 +360,227 @@ export function createAccountStore({ filePath }) {
     return out
   }
 
-  function load() {
-    if (!existsSync(filePath)) return
+  function rowToUserRecord(row) {
+    const rawEmail = String(row.email || '').trim()
+    const emailLower = rawEmail ? String(row.email_lower || rawEmail).trim().toLowerCase() : ''
+    const tier = normalizeTier(row.tier || (row.role === 'admin' ? 'admin' : 'free'))
+    const role = tier === 'admin' ? 'admin' : 'user'
+    return {
+      userId: String(row.user_id),
+      username: String(row.username),
+      usernameLower: String(row.username_lower || row.username).toLowerCase(),
+      email: rawEmail,
+      emailLower,
+      emailVerified: Boolean(rawEmail && row.email_verified),
+      emailVerifiedAt: Number(row.email_verified_at) || 0,
+      loginEmail2fa: Boolean(rawEmail && row.email_verified && row.login_email_2fa),
+      tier,
+      role,
+      passwordSalt: String(row.password_salt || ''),
+      passwordHash: String(row.password_hash || ''),
+      tokenVersion: Number.isFinite(Number(row.token_version)) ? Math.max(0, Math.floor(Number(row.token_version))) : 0,
+      createdAt: Number(row.created_at) || 0,
+      lastLoginAt: Number(row.last_login_at) || 0,
+      knownLoginIps: Array.isArray(safeJsonParse(row.known_login_ips_json, []))
+        ? safeJsonParse(row.known_login_ips_json, []).filter(Boolean).slice(0, 12)
+        : [],
+      turnUsage: normalizeTurnUsageRecord(safeJsonParse(row.turn_usage_json, null)),
+      devices: Array.isArray(safeJsonParse(row.devices_json, [])) ? safeJsonParse(row.devices_json, []) : [],
+      sessions: Array.isArray(safeJsonParse(row.sessions_json, [])) ? safeJsonParse(row.sessions_json, []) : [],
+    }
+  }
+
+  function persistUserRow(record) {
+    stmtUpsertUser.run(
+      record.userId,
+      record.username,
+      record.usernameLower,
+      record.email || '',
+      record.emailLower || '',
+      record.emailVerified ? 1 : 0,
+      Number(record.emailVerifiedAt) || 0,
+      record.loginEmail2fa ? 1 : 0,
+      record.tier,
+      record.role,
+      record.passwordSalt || '',
+      record.passwordHash || '',
+      Number(record.tokenVersion) || 0,
+      Number(record.createdAt) || 0,
+      Number(record.lastLoginAt) || 0,
+      JSON.stringify(Array.isArray(record.knownLoginIps) ? record.knownLoginIps.slice(0, 12) : []),
+      JSON.stringify(record.turnUsage || normalizeTurnUsageRecord(null)),
+      JSON.stringify(Array.isArray(record.devices) ? record.devices : []),
+      JSON.stringify(Array.isArray(record.sessions) ? record.sessions : []),
+    )
+  }
+
+  function runTx(fn) {
+    if (closed) throw new Error('AccountStore is closed')
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const res = fn()
+      db.exec('COMMIT')
+      lastPersistError = ''
+      lastDataVersion = Number(stmtDataVersion.get()?.data_version || lastDataVersion)
+      return res
+    } catch (err) {
+      try { db.exec('ROLLBACK') } catch {}
+      lastPersistError = String(err?.message || err)
+      throw err
+    }
+  }
+
+  function migrateLegacyJsonIfPresent() {
+    if (!/\.json$/i.test(String(filePath || '')) || !existsSync(filePath)) return
+    const existingCount = Number(stmtUserCount.get()?.cnt || 0)
+    if (existingCount > 0) return
+
     let parsed
     try {
       parsed = JSON.parse(readFileSync(filePath, 'utf8'))
     } catch (err) {
-      console.error(`[relay] CRITICAL: Failed to read/parse accounts file (${filePath}):`, err?.message || err)
+      console.error(`[relay] CRITICAL: Failed to read/parse legacy accounts file (${filePath}):`, err?.message || err)
       throw err
     }
     if (!parsed || typeof parsed !== 'object') {
-      const err = new Error(`Invalid accounts file format: ${filePath}`)
-      console.error(`[relay] CRITICAL: ${err.message}`)
-      throw err
+      throw new Error(`Invalid legacy accounts file format: ${filePath}`)
     }
-    for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
-      if (!u?.userId || !u?.username) continue
-      const { plan: legacyPlan, invitedBy: _legacyInvitedBy, inviteId: _legacyInviteId, ...restUser } = u
-      const rawEmail = String(u.email || '').trim()
-      const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
-      const tier = normalizeTier(u.tier || (u.role === 'admin' ? 'admin' : legacyPlan || 'free'))
-      const role = tier === 'admin' ? 'admin' : 'user'
-      const normalized = {
-        ...restUser,
-        usernameLower: String(u.usernameLower || u.username).toLowerCase(),
-        email: rawEmail,
-        emailLower,
-        emailVerified: Boolean(rawEmail && u.emailVerified),
-        emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
-        loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
-        knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
-        tier,
-        role,
-        turnUsage: normalizeTurnUsageRecord(u.turnUsage),
-        tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
-        devices: Array.isArray(u.devices) ? u.devices : [],
-        sessions: Array.isArray(u.sessions) ? u.sessions : [],
-        revokedSids: u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {},
+
+    runTx(() => {
+      for (const u of Array.isArray(parsed?.users) ? parsed.users : []) {
+        if (!u?.userId || !u?.username) continue
+        const rawEmail = String(u.email || '').trim()
+        const emailLower = rawEmail ? String(u.emailLower || rawEmail).trim().toLowerCase() : ''
+        const tier = normalizeTier(u.tier || (u.role === 'admin' ? 'admin' : u.plan || 'free'))
+        const role = tier === 'admin' ? 'admin' : 'user'
+        const revoked = u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {}
+        const cleanSessions = (Array.isArray(u.sessions) ? u.sessions : []).filter((s) => s?.sid && !revoked[s.sid])
+        persistUserRow({
+          userId: String(u.userId),
+          username: String(u.username),
+          usernameLower: String(u.usernameLower || u.username).toLowerCase(),
+          email: rawEmail,
+          emailLower,
+          emailVerified: Boolean(rawEmail && u.emailVerified),
+          emailVerifiedAt: Number(u.emailVerifiedAt) || 0,
+          loginEmail2fa: Boolean(rawEmail && u.emailVerified && u.loginEmail2fa),
+          tier,
+          role,
+          passwordSalt: String(u.passwordSalt || ''),
+          passwordHash: String(u.passwordHash || ''),
+          tokenVersion: Number.isFinite(Number(u.tokenVersion)) ? Math.max(0, Math.floor(Number(u.tokenVersion))) : 0,
+          createdAt: Number(u.createdAt) || Date.now(),
+          lastLoginAt: Number(u.lastLoginAt) || Date.now(),
+          knownLoginIps: Array.isArray(u.knownLoginIps) ? u.knownLoginIps.filter(Boolean).slice(0, 12) : [],
+          turnUsage: normalizeTurnUsageRecord(u.turnUsage),
+          devices: Array.isArray(u.devices) ? u.devices : [],
+          sessions: cleanSessions,
+        })
       }
+      const normDaily = normalizeDailyRegistrations(parsed?.dailyRegistrations)
+      for (const [dayKey, count] of Object.entries(normDaily)) {
+        stmtUpsertDaily.run(dayKey, count)
+      }
+    })
+
+    try {
+      const backupPath = `${filePath}.migrated.${Date.now()}.bak`
+      renameSync(filePath, backupPath)
+      try { chmodSync(backupPath, 0o600) } catch {}
+    } catch {}
+  }
+
+  function loadAllFromDb() {
+    usersById.clear()
+    userIdByLower.clear()
+    userIdByEmailLower.clear()
+
+    const rows = stmtAllUsers.all()
+    const countedByDay = {}
+    for (const row of rows) {
+      const normalized = rowToUserRecord(row)
       usersById.set(normalized.userId, normalized)
       userIdByLower.set(normalized.usernameLower, normalized.userId)
       if (normalized.emailLower) {
         userIdByEmailLower.set(normalized.emailLower, normalized.userId)
       }
+      if (normalized.createdAt) {
+        const dk = getLocalDayKey(normalized.createdAt)
+        countedByDay[dk] = (countedByDay[dk] || 0) + 1
+      }
     }
-    // Gracefully ignore any legacy `parsed.invites` array (dropped on next save)
-    dailyRegistrations = normalizeDailyRegistrations(parsed?.dailyRegistrations)
+
+    const rawDaily = {}
+    for (const dRow of stmtAllDaily.all()) {
+      rawDaily[String(dRow.day_key)] = Number(dRow.count) || 0
+    }
+    for (const [dk, cnt] of Object.entries(countedByDay)) {
+      rawDaily[dk] = Math.max(rawDaily[dk] || 0, cnt)
+    }
+    dailyRegistrations = normalizeDailyRegistrations(rawDaily)
+    lastDataVersion = Number(stmtDataVersion.get()?.data_version || 0)
   }
 
-  let saveTimer = null
-  let saveDirty = false
-  let saveGen = 0
-  let persistedGen = 0
-  let asyncSaveInFlight = null
-
-  function serializeAccountsPayload() {
-    dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations)
-    return JSON.stringify(
-      {
-        version: 1,
-        users: [...usersById.values()],
-        dailyRegistrations,
-      },
-      null,
-      2,
-    )
-  }
-
-  function save() {
-    if (saveTimer) {
-      clearTimeout(saveTimer)
-      saveTimer = null
-    }
-    const targetGen = ++saveGen
-    const payload = serializeAccountsPayload()
-    const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
-    let fd = null
+  function syncExternalChangesIfNeeded() {
+    if (closed) return
     try {
-      fd = openSync(tmpPath, 'w', 0o600)
-      const buf = Buffer.from(payload, 'utf8')
-      let written = 0
-      while (written < buf.length) {
-        written += writeSync(fd, buf, written, buf.length - written)
+      const dv = Number(stmtDataVersion.get()?.data_version || 0)
+      if (dv !== lastDataVersion) {
+        loadAllFromDb()
       }
-      fsyncSync(fd)
-      closeSync(fd)
-      fd = null
-      try { chmodSync(tmpPath, 0o600) } catch {}
-      renameSync(tmpPath, filePath)
-      try { chmodSync(filePath, 0o600) } catch {}
-      persistedGen = Math.max(persistedGen, targetGen)
-      saveDirty = persistedGen < saveGen
-    } catch (err) {
-      if (fd !== null) {
-        try { closeSync(fd) } catch {}
-      }
-      saveDirty = true
-      try { unlinkSync(tmpPath) } catch {}
-      throw err
-    }
+    } catch {}
   }
 
-  async function drainAsyncSave() {
-    if (asyncSaveInFlight) return asyncSaveInFlight
-    asyncSaveInFlight = (async () => {
-      while (saveDirty || persistedGen < saveGen) {
-        const targetGen = saveGen
-        saveDirty = false
-        const payload = serializeAccountsPayload()
-        const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`
-        let fh = null
-        try {
-          fh = await openAsync(tmpPath, 'w', 0o600)
-          await fh.writeFile(payload, 'utf8')
-          await fh.sync()
-          await fh.close()
-          fh = null
-          try { await chmodAsync(tmpPath, 0o600) } catch {}
-          // Perform generation check + atomic rename synchronously on the main thread
-          // so a concurrent sync save() (gen N+1) can never be overwritten by a stale libuv renameAsync(gen N).
-          if (persistedGen >= targetGen) {
-            try { await unlinkAsync(tmpPath) } catch {}
-            continue
-          }
-          renameSync(tmpPath, filePath)
-          try { chmodSync(filePath, 0o600) } catch {}
-          persistedGen = Math.max(persistedGen, targetGen)
-        } catch (err) {
-          if (fh !== null) {
-            try { await fh.close() } catch {}
-          }
-          try { await unlinkAsync(tmpPath) } catch {}
-          saveDirty = persistedGen < saveGen
-          console.error(`[accounts] Async save failed: ${err?.message || err}`)
-          break
-        }
-      }
-    })().finally(() => {
-      asyncSaveInFlight = null
-      if (saveDirty || persistedGen < saveGen) {
-        scheduleSave(1000, { bumpGen: false })
-      }
-    })
-    return asyncSaveInFlight
-  }
-
-  /**
-   * Coalesce high-frequency non-critical metadata writes (e.g. lastSeenAt heartbeats)
-   * into a single serialized non-blocking disk write every few seconds.
-   */
-  function scheduleSave(delayMs = 5000, { bumpGen = true } = {}) {
-    if (bumpGen) saveGen += 1
-    saveDirty = true
-    if (saveTimer) return
-    saveTimer = setTimeout(() => {
-      saveTimer = null
-      void drainAsyncSave()
+  function scheduleTelemetryFlush(userId, delayMs = 3000) {
+    if (closed) return
+    if (userId) dirtyTelemetryUsers.add(userId)
+    if (flushTimer) return
+    flushTimer = setTimeout(() => {
+      flushTimer = null
+      flush()
     }, delayMs)
-    saveTimer.unref?.()
+    flushTimer.unref?.()
   }
 
   function flush() {
-    if (saveTimer) {
-      clearTimeout(saveTimer)
-      saveTimer = null
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
     }
-    if (saveDirty || persistedGen < saveGen) {
-      try {
-        save()
-      } catch (err) {
-        console.error(`[accounts] Flush save failed: ${err?.message || err}`)
-      }
+    if (closed || dirtyTelemetryUsers.size === 0) return
+    const ids = [...dirtyTelemetryUsers]
+    dirtyTelemetryUsers.clear()
+    try {
+      runTx(() => {
+        for (const uid of ids) {
+          const rec = usersById.get(uid)
+          if (!rec) continue
+          stmtUpdateTelemetry.run(
+            Number(rec.lastLoginAt) || 0,
+            JSON.stringify(rec.turnUsage || normalizeTurnUsageRecord(null)),
+            JSON.stringify(Array.isArray(rec.devices) ? rec.devices : []),
+            JSON.stringify(Array.isArray(rec.sessions) ? rec.sessions : []),
+            uid,
+          )
+        }
+      })
+    } catch (err) {
+      for (const uid of ids) dirtyTelemetryUsers.add(uid)
+      console.error(`[accounts] Deferred telemetry flush failed: ${err?.message || err}`)
     }
   }
 
-  load()
+  function close() {
+    if (closed) return
+    flush()
+    closed = true
+    try {
+      db.close()
+    } catch {}
+  }
+
+  migrateLegacyJsonIfPresent()
+  loadAllFromDb()
 
   function sanitizeDeviceRecord(d) {
     return {
@@ -414,16 +614,11 @@ export function createAccountStore({ filePath }) {
     }
   }
 
+  // O(1) lookup (maintained incrementally on every registration & DB load)
   function getTodayRegistrationCount(now = Date.now()) {
+    syncExternalChangesIfNeeded()
     const todayKey = getLocalDayKey(now)
-    const persisted = Math.max(0, Math.floor(Number(dailyRegistrations[todayKey]) || 0))
-    let counted = 0
-    for (const u of usersById.values()) {
-      if (u?.createdAt && getLocalDayKey(u.createdAt) === todayKey) {
-        counted += 1
-      }
-    }
-    return Math.max(persisted, counted)
+    return Math.max(0, Math.floor(Number(dailyRegistrations[todayKey]) || 0))
   }
 
   function getDailyRegistrationStats(maxDaily = DEFAULT_MAX_DAILY_REGISTRATIONS, now = Date.now()) {
@@ -440,6 +635,7 @@ export function createAccountStore({ filePath }) {
   }
 
   function isEmailTaken(email, excludeUserId = '') {
+    syncExternalChangesIfNeeded()
     const lower = String(email || '').trim().toLowerCase()
     if (!lower) return false
     const ownerId = userIdByEmailLower.get(lower)
@@ -447,6 +643,7 @@ export function createAccountStore({ filePath }) {
   }
 
   function getUserByEmail(email) {
+    syncExternalChangesIfNeeded()
     const lower = String(email || '').trim().toLowerCase()
     if (!lower) return null
     const userId = userIdByEmailLower.get(lower)
@@ -463,6 +660,7 @@ export function createAccountStore({ filePath }) {
     emailVerified = false,
     maxDailyRegistrations = DEFAULT_MAX_DAILY_REGISTRATIONS,
   } = {}) {
+    syncExternalChangesIfNeeded()
     const uCheck = validateUsername(username)
     if (!uCheck.ok) return { ...uCheck, statusCode: 400 }
     const pCheck = validatePassword(password)
@@ -502,10 +700,9 @@ export function createAccountStore({ filePath }) {
       cleanEmailLower = eCheck.emailLower
     }
 
-    // Offload expensive scrypt hashing to libuv worker pool so event loop never stalls
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
 
-    // Re-verify bootstrap state, daily cap, and uniqueness synchronously after await (prevents TOCTOU races)
+    syncExternalChangesIfNeeded()
     if (isBootstrap && usersById.size > 0) {
       return { ok: false, statusCode: 400, error: '管理员账号已初始化，请重新提交注册' }
     }
@@ -528,6 +725,7 @@ export function createAccountStore({ filePath }) {
     const now = Date.now()
     const todayKey = getLocalDayKey(now)
     const nextTodayCount = getTodayRegistrationCount(now) + 1
+    const cutoffKey = getLocalDayKey(now - (MAX_DAILY_REG_DAYS - 1) * 24 * 60 * 60 * 1000)
     const userId = `usr_${randomBytes(8).toString('hex')}`
     const tier = finalIsBootstrap ? 'admin' : 'free'
     const role = finalIsBootstrap ? 'admin' : 'user'
@@ -552,8 +750,14 @@ export function createAccountStore({ filePath }) {
       lastLoginAt: now,
       devices: [],
       sessions: [],
-      revokedSids: {},
     }
+
+    // Commit to SQLite BEFORE updating in-memory maps so disk errors never diverge state
+    runTx(() => {
+      persistUserRow(record)
+      stmtUpsertDaily.run(todayKey, nextTodayCount)
+      stmtPruneDaily.run(cutoffKey)
+    })
 
     usersById.set(userId, record)
     userIdByLower.set(record.usernameLower, userId)
@@ -562,7 +766,6 @@ export function createAccountStore({ filePath }) {
     }
     dailyRegistrations[todayKey] = nextTodayCount
     dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations, now)
-    save()
 
     return {
       ok: true,
@@ -572,6 +775,7 @@ export function createAccountStore({ filePath }) {
   }
 
   function resolveAccountKey(identifier) {
+    syncExternalChangesIfNeeded()
     const lower = String(identifier || '').trim().toLowerCase()
     if (!lower) return ''
     let userId = userIdByLower.get(lower)
@@ -582,21 +786,25 @@ export function createAccountStore({ filePath }) {
   }
 
   function markUserLogin(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
     record.lastLoginAt = Date.now()
-    scheduleSave()
+    scheduleTelemetryFlush(userId)
     return sanitizeUser(record)
   }
 
   async function verifyUserPasswordAsync(userId, password) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const pw = String(password ?? '')
     if (!record || !pw) return false
-    return verifyPasswordHashAsync(pw, record.passwordSalt, record.passwordHash)
+    const res = await verifyPasswordHashAsync(pw, record.passwordSalt, record.passwordHash)
+    return res.ok
   }
 
   async function authenticateUserAsync(identifier, password, { recordLogin = true } = {}) {
+    syncExternalChangesIfNeeded()
     const lower = String(identifier || '').trim().toLowerCase()
     if (!lower || !password) return null
     let userId = userIdByLower.get(lower)
@@ -605,18 +813,31 @@ export function createAccountStore({ filePath }) {
     }
     const record = userId ? usersById.get(userId) : null
     if (!record) {
-      // Constant-time mitigation: spend equivalent scrypt CPU time for unknown identifiers
-      await scryptAsync(String(password), DUMMY_SCRYPT_SALT)
+      await scryptAsync(String(password), DUMMY_SCRYPT_SALT, CURRENT_SCRYPT_OPTS)
       return null
     }
     const origSalt = record.passwordSalt
     const origHash = record.passwordHash
-    const ok = await verifyPasswordHashAsync(password, origSalt, origHash)
-    if (!ok) return null
+    const verifyRes = await verifyPasswordHashAsync(password, origSalt, origHash)
+    if (!verifyRes.ok) return null
     if (usersById.get(userId) !== record || record.passwordHash !== origHash) return null
+
+    // Transparently upgrade legacy N=16384 password hashes to N=32768 PHC format on login
+    if (verifyRes.needsUpgrade) {
+      try {
+        const upgraded = await hashPasswordAsync(password)
+        if (usersById.get(userId) === record && record.passwordHash === origHash) {
+          const next = { ...record, passwordSalt: upgraded.salt, passwordHash: upgraded.hash }
+          runTx(() => persistUserRow(next))
+          record.passwordSalt = upgraded.salt
+          record.passwordHash = upgraded.hash
+        }
+      } catch {}
+    }
+
     if (recordLogin) {
       record.lastLoginAt = Date.now()
-      scheduleSave()
+      scheduleTelemetryFlush(userId)
     }
     return {
       user: sanitizeUser(record),
@@ -625,6 +846,7 @@ export function createAccountStore({ filePath }) {
   }
 
   function setUserEmail(userId, email, { verified = true } = {}) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
     const eCheck = validateEmail(email)
@@ -633,21 +855,26 @@ export function createAccountStore({ filePath }) {
     if (existingOwner && existingOwner !== userId) {
       return { ok: false, error: '该邮箱已被其他账号绑定' }
     }
-    if (record.emailLower && record.emailLower !== eCheck.emailLower) {
-      if (userIdByEmailLower.get(record.emailLower) === userId) {
-        userIdByEmailLower.delete(record.emailLower)
-      }
+    const prevEmailLower = record.emailLower
+    const next = {
+      ...record,
+      email: eCheck.email,
+      emailLower: eCheck.emailLower,
+      emailVerified: Boolean(verified),
+      emailVerifiedAt: verified ? Date.now() : 0,
     }
-    record.email = eCheck.email
-    record.emailLower = eCheck.emailLower
-    record.emailVerified = Boolean(verified)
-    record.emailVerifiedAt = verified ? Date.now() : 0
+    runTx(() => persistUserRow(next))
+
+    if (prevEmailLower && prevEmailLower !== eCheck.emailLower && userIdByEmailLower.get(prevEmailLower) === userId) {
+      userIdByEmailLower.delete(prevEmailLower)
+    }
+    Object.assign(record, next)
     userIdByEmailLower.set(record.emailLower, userId)
-    save()
     return { ok: true, user: sanitizeUser(record) }
   }
 
   async function resetPasswordByEmailAsync(email, newPassword) {
+    syncExternalChangesIfNeeded()
     const eCheck = validateEmail(email)
     if (!eCheck.ok) return eCheck
     const pCheck = validatePassword(newPassword)
@@ -664,19 +891,30 @@ export function createAccountStore({ filePath }) {
       return { ok: false, error: '该邮箱尚未完成验证，无法用于重置密码' }
     }
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
-    if (usersById.get(userId) !== record || record.emailVerified !== true) {
+    syncExternalChangesIfNeeded()
+    // Re-verify email ownership after async scrypt (prevents mid-reset email swap TOCTOU)
+    if (
+      usersById.get(userId) !== record ||
+      record.emailVerified !== true ||
+      record.emailLower !== eCheck.emailLower
+    ) {
       return { ok: false, error: '账号状态已变更，请重试' }
     }
-    record.passwordSalt = salt
-    record.passwordHash = hash
-    record.tokenVersion = Number(record.tokenVersion || 0) + 1
-    record.sessions = []
-    record.revokedSids = {}
-    save()
+    const next = {
+      ...record,
+      passwordSalt: salt,
+      passwordHash: hash,
+      tokenVersion: Number(record.tokenVersion || 0) + 1,
+      sessions: [],
+    }
+    runTx(() => persistUserRow(next))
+    Object.assign(record, next)
+    dirtyTelemetryUsers.delete(userId)
     return { ok: true, user: sanitizeUser(record) }
   }
 
   async function changePasswordAsync(userId, currentPassword, newPassword, { validateSession } = {}) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
     if (changingPasswordUsers.has(userId)) {
@@ -687,13 +925,14 @@ export function createAccountStore({ filePath }) {
     const origTv = Number(record.tokenVersion || 0)
     changingPasswordUsers.add(userId)
     try {
-      const valid = await verifyPasswordHashAsync(currentPassword, origSalt, origHash)
+      const valid = (await verifyPasswordHashAsync(currentPassword, origSalt, origHash)).ok
       if (!valid) {
         return { ok: false, error: '当前密码不正确' }
       }
       const pCheck = validatePassword(newPassword)
       if (!pCheck.ok) return pCheck
       const { salt, hash } = await hashPasswordAsync(pCheck.password)
+      syncExternalChangesIfNeeded()
       const sessionValid = typeof validateSession === 'function' ? Boolean(validateSession()) : true
       if (
         usersById.get(userId) !== record ||
@@ -704,12 +943,16 @@ export function createAccountStore({ filePath }) {
       ) {
         return { ok: false, error: '会话已失效或密码已被更新，请重新登录', code: 'stale_session' }
       }
-      record.passwordSalt = salt
-      record.passwordHash = hash
-      record.tokenVersion = origTv + 1
-      record.sessions = []
-      record.revokedSids = {}
-      save()
+      const next = {
+        ...record,
+        passwordSalt: salt,
+        passwordHash: hash,
+        tokenVersion: origTv + 1,
+        sessions: [],
+      }
+      runTx(() => persistUserRow(next))
+      Object.assign(record, next)
+      dirtyTelemetryUsers.delete(userId)
       return { ok: true, user: sanitizeUser(record) }
     } finally {
       changingPasswordUsers.delete(userId)
@@ -717,9 +960,10 @@ export function createAccountStore({ filePath }) {
   }
 
   function bindDevice({ userId, label = '', hostname = '', platform = 'unknown', bridgeId = '' } = {}) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
-    if (!Array.isArray(record.devices)) record.devices = []
+    const devices = Array.isArray(record.devices) ? record.devices.map((d) => ({ ...d })) : []
     const now = Date.now()
     const cleanHost = String(hostname || label || 'My-PC').trim().slice(0, 64) || 'My-PC'
     const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
@@ -729,17 +973,16 @@ export function createAccountStore({ filePath }) {
     const hostKey = cleanHost.toLowerCase()
     const platKey = cleanPlatform.toLowerCase()
 
-    // Rebind existing PC in-place by explicit bridgeId OR same non-generic (hostname, platform)
-    // so reinstalling desktop / re-running setup on the same PC never creates duplicate PC entries
     const existingDevice =
-      (explicitBridgeSlug ? record.devices.find((d) => d.bridgeId === explicitBridgeSlug) : null) ||
+      (explicitBridgeSlug ? devices.find((d) => d.bridgeId === explicitBridgeSlug) : null) ||
       (!explicitBridgeSlug && !GENERIC_HOSTS.has(hostKey)
-        ? record.devices.find(
+        ? devices.find(
             (d) =>
               String(d.hostname || '').trim().toLowerCase() === hostKey &&
               String(d.platform || '').trim().toLowerCase() === platKey,
           )
         : null)
+
     if (existingDevice) {
       const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
       const hadCustomLabel =
@@ -752,7 +995,9 @@ export function createAccountStore({ filePath }) {
       existingDevice.platform = cleanPlatform
       existingDevice.secretHash = sha256Hex(`${userId}:${existingDevice.deviceId}:${deviceSecret}`)
       existingDevice.lastSeenAt = now
-      save()
+      const next = { ...record, devices }
+      runTx(() => persistUserRow(next))
+      record.devices = devices
       return {
         userId: record.userId,
         username: record.username,
@@ -766,7 +1011,7 @@ export function createAccountStore({ filePath }) {
       }
     }
 
-    if (record.devices.length >= MAX_DEVICES_PER_USER) {
+    if (devices.length >= MAX_DEVICES_PER_USER) {
       const err = new Error(`每个账号最多绑定 ${MAX_DEVICES_PER_USER} 台电脑，请先解绑旧设备后再试`)
       err.code = 'MAX_DEVICES_EXCEEDED'
       throw err
@@ -776,7 +1021,7 @@ export function createAccountStore({ filePath }) {
     const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
     const baseSlug = sanitizeBridgeSlug(bridgeId || cleanHost || cleanLabel)
 
-    const existingBridgeIds = new Set(record.devices.map((d) => d.bridgeId))
+    const existingBridgeIds = new Set(devices.map((d) => d.bridgeId))
     let finalBridgeId = baseSlug
     if (existingBridgeIds.has(finalBridgeId)) {
       finalBridgeId = `${baseSlug.slice(0, 24)}-${deviceId.slice(4, 10)}`
@@ -792,8 +1037,10 @@ export function createAccountStore({ filePath }) {
       createdAt: now,
       lastSeenAt: now,
     }
-    record.devices.push(devRecord)
-    save()
+    devices.push(devRecord)
+    const next = { ...record, devices }
+    runTx(() => persistUserRow(next))
+    record.devices = devices
 
     return {
       userId: record.userId,
@@ -809,6 +1056,7 @@ export function createAccountStore({ filePath }) {
   }
 
   function verifyDeviceBridge(userId, deviceSecret) {
+    syncExternalChangesIfNeeded()
     if (!userId || !deviceSecret) return null
     const record = usersById.get(userId)
     if (!record || !Array.isArray(record.devices)) return null
@@ -816,10 +1064,9 @@ export function createAccountStore({ filePath }) {
       const candidate = sha256Hex(`${userId}:${dev.deviceId}:${deviceSecret}`)
       if (safeEqual(candidate, dev.secretHash)) {
         const now = Date.now()
-        // Throttle disk writes for heartbeat/reconnect bursts (update persisted lastSeenAt at most once/min)
         const shouldPersist = now - (dev.lastSeenAt || 0) > 60_000
         dev.lastSeenAt = now
-        if (shouldPersist) scheduleSave()
+        if (shouldPersist) scheduleTelemetryFlush(userId)
         return {
           roomId: record.userId,
           userId: record.userId,
@@ -836,39 +1083,48 @@ export function createAccountStore({ filePath }) {
   }
 
   function listUserDevices(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return []
     return record.devices.map(sanitizeDeviceRecord)
   }
 
   function renameUserDevice(userId, deviceId, newLabel) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
-    const target = record.devices.find((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+    const devices = record.devices.map((d) => ({ ...d }))
+    const target = devices.find((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
     if (!target) return null
     const clean = String(newLabel || '').trim().slice(0, 48)
     if (!clean) return null
     target.label = clean
-    save()
+    runTx(() => persistUserRow({ ...record, devices }))
+    record.devices = devices
     return sanitizeDeviceRecord(target)
   }
 
   function removeUserDevice(userId, deviceId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
-    const idx = record.devices.findIndex((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+    const devices = record.devices.slice()
+    const idx = devices.findIndex((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
     if (idx === -1) return null
-    const [removed] = record.devices.splice(idx, 1)
-    save()
+    const [removed] = devices.splice(idx, 1)
+    runTx(() => persistUserRow({ ...record, devices }))
+    record.devices = devices
     return sanitizeDeviceRecord(removed)
   }
 
   function getUserById(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     return sanitizeUser(record)
   }
 
   function findUserByIdentifier(identifier) {
+    syncExternalChangesIfNeeded()
     const clean = String(identifier || '').trim()
     if (!clean) return null
     if (usersById.has(clean)) return sanitizeUser(usersById.get(clean))
@@ -878,11 +1134,13 @@ export function createAccountStore({ filePath }) {
   }
 
   function getUserTier(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     return resolveUserTier(record)
   }
 
   function setUserTier(userId, targetTier, { actorUserId = '' } = {}) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
     const raw = String(targetTier || '').trim().toLowerCase()
@@ -902,22 +1160,26 @@ export function createAccountStore({ filePath }) {
       }
     }
     const prevTier = resolveUserTier(record)
-    record.tier = raw
-    record.role = raw === 'admin' ? 'admin' : 'user'
-    const nextTier = resolveUserTier(record)
+    const nextRole = raw === 'admin' ? 'admin' : 'user'
+    const nextTier = normalizeTier(raw)
     if (prevTier !== nextTier) {
-      save()
+      const next = { ...record, tier: nextTier, role: nextRole }
+      runTx(() => persistUserRow(next))
+      record.tier = nextTier
+      record.role = nextRole
     }
     return { ok: true, prevTier, tier: nextTier, user: sanitizeUser(record) }
   }
 
   function getTurnUsage(userId, now = new Date()) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { month: getCurrentTurnMonth(now), bytes: 0, updatedAt: 0 }
     return normalizeTurnUsageRecord(record.turnUsage, now)
   }
 
   function addTurnUsage(userId, deltaBytes, now = new Date()) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const add = Math.max(0, Math.floor(Number(deltaBytes) || 0))
     if (!record || add <= 0) return null
@@ -929,7 +1191,7 @@ export function createAccountStore({ filePath }) {
       updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
     }
     record.turnUsage = next
-    scheduleSave(3000)
+    scheduleTelemetryFlush(userId, 2000)
     return {
       userId: record.userId,
       tier: resolveUserTier(record),
@@ -941,19 +1203,22 @@ export function createAccountStore({ filePath }) {
   }
 
   function resetTurnUsage(userId, now = new Date()) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
     const curMonth = getCurrentTurnMonth(now)
-    record.turnUsage = {
+    const nextUsage = {
       month: curMonth,
       bytes: 0,
       updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
     }
-    save()
-    return { ok: true, user: sanitizeUser(record), turnUsage: { ...record.turnUsage } }
+    runTx(() => persistUserRow({ ...record, turnUsage: nextUsage }))
+    record.turnUsage = nextUsage
+    return { ok: true, user: sanitizeUser(record), turnUsage: { ...nextUsage } }
   }
 
   function getTokenVersion(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return -1
     return Number(record.tokenVersion || 0)
@@ -972,54 +1237,28 @@ export function createAccountStore({ filePath }) {
     const b = String(newName || '').trim().toLowerCase()
     if (!a || !b) return false
     if (a === b) return true
-    // Match legacy generic "Windows Desktop" when upgraded to "Windows Desktop · Work37" (or vice versa)
     if (b.startsWith(`${a} · `) || a.startsWith(`${b} · `)) return true
     return false
   }
 
-  function pruneUserSessionData(record, now = Date.now()) {
-    if (!Array.isArray(record.sessions)) record.sessions = []
-    if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
-    const sorted = record.sessions
-      .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !record.revokedSids[s.sid])
+  function pruneSessionsArray(rawSessions, now = Date.now()) {
+    const sorted = (Array.isArray(rawSessions) ? rawSessions : [])
+      .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS)
       .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
-    // Keep only the newest session per unique non-empty clientUid
     const seenUids = new Set()
     const active = []
     for (const s of sorted) {
       const uid = normalizeClientUid(s.clientUid)
       if (uid) {
-        if (seenUids.has(uid)) {
-          record.revokedSids[s.sid] = now
-          continue
-        }
+        if (seenUids.has(uid)) continue
         seenUids.add(uid)
       }
       active.push(s)
     }
-    if (active.length > MAX_USER_SESSIONS) {
-      for (const evicted of active.slice(MAX_USER_SESSIONS)) {
-        if (evicted?.sid) record.revokedSids[evicted.sid] = now
-      }
-    }
-    record.sessions = active.slice(0, MAX_USER_SESSIONS)
-    for (const [sid, ts] of Object.entries(record.revokedSids)) {
-      if (now - Number(ts || 0) > SESSION_TTL_MS) {
-        delete record.revokedSids[sid]
-      }
-    }
-    const revokedEntries = Object.entries(record.revokedSids)
-    if (revokedEntries.length > MAX_REVOKED_SIDS) {
-      revokedEntries.sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
-      const kept = {}
-      for (const [sid, ts] of revokedEntries.slice(0, MAX_REVOKED_SIDS)) {
-        kept[sid] = ts
-      }
-      record.revokedSids = kept
-    }
+    return active.slice(0, MAX_USER_SESSIONS)
   }
 
-  function evictDuplicateSessions(record, { keepSid, deviceName, clientKind, ip, clientUid, onlineSids, now }) {
+  function evictDuplicateSessionsFromList(sessions, { keepSid, deviceName, clientKind, ip, clientUid, onlineSids }) {
     const onlineSet = onlineSids instanceof Set ? onlineSids : new Set(Array.isArray(onlineSids) ? onlineSids : [])
     const replacedSids = []
     const kept = []
@@ -1030,16 +1269,14 @@ export function createAccountStore({ filePath }) {
     const isAdminMonitor = cleanName.toLowerCase() === 'admin monitor'
     const isNamedDesktop = cleanKind === 'desktop' && cleanName.includes(' · ')
 
-    for (const s of record.sessions) {
+    for (const s of sessions) {
       if (!s?.sid) continue
       if (s.sid === keepSid) {
         kept.push(s)
         continue
       }
       const existingUid = normalizeClientUid(s.clientUid)
-      // 1. Exact clientUid match -> definitively the same device/installation (survives IP switches & re-logins)
       const sameUid = Boolean(cleanUid && existingUid && existingUid === cleanUid)
-      // 2. Offline ghost dedup (reinstalled APK / cleared storage / legacy pre-clientUid entry / named PC / Admin Monitor)
       const isOffline = !onlineSet.has(s.sid)
       const sameKind = (s.clientKind || 'web') === cleanKind
       const sameName = isSameDeviceNameOrLegacyUpgrade(s.deviceName, cleanName)
@@ -1052,21 +1289,19 @@ export function createAccountStore({ filePath }) {
         (isLegacyWithoutUid || isSameIp || isAdminMonitor || isNamedDesktop),
       )
       if (sameUid || isOfflineGhost) {
-        record.revokedSids[s.sid] = now
         replacedSids.push(s.sid)
         continue
       }
       kept.push(s)
     }
-    record.sessions = kept
-    return replacedSids
+    return { kept, replacedSids }
   }
 
   function hasUserSession(userId, sid) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid || !Array.isArray(record.sessions)) return false
-    if (record.revokedSids?.[cleanSid]) return false
     const entry = record.sessions.find((s) => s?.sid === cleanSid)
     if (!entry) return false
     if (Date.now() - (Number(entry.createdAt) || 0) > SESSION_TTL_MS) return false
@@ -1077,25 +1312,25 @@ export function createAccountStore({ filePath }) {
     userId,
     { sid, deviceName = '', clientKind = 'web', ip = '', clientUid = '', onlineSids = null } = {},
   ) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return null
     const now = Date.now()
-    pruneUserSessionData(record, now)
+    const pruned = pruneSessionsArray(record.sessions, now).map((s) => ({ ...s }))
     const cleanName = String(deviceName || '').trim().slice(0, 64)
     const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
     const cleanIp = String(ip || '').trim().slice(0, 64)
     const cleanUid = normalizeClientUid(clientUid)
-    const replacedSids = evictDuplicateSessions(record, {
+    const { kept, replacedSids } = evictDuplicateSessionsFromList(pruned, {
       keepSid: cleanSid,
       deviceName: cleanName,
       clientKind: cleanKind,
       ip: cleanIp,
       clientUid: cleanUid,
       onlineSids,
-      now,
     })
-    let entry = record.sessions.find((s) => s.sid === cleanSid)
+    let entry = kept.find((s) => s.sid === cleanSid)
     if (entry) {
       if (cleanName) entry.deviceName = cleanName
       entry.clientKind = cleanKind
@@ -1112,10 +1347,11 @@ export function createAccountStore({ filePath }) {
         createdAt: now,
         lastSeenAt: now,
       }
-      record.sessions.unshift(entry)
+      kept.unshift(entry)
     }
-    pruneUserSessionData(record, now)
-    save()
+    const finalSessions = pruneSessionsArray(kept, now)
+    runTx(() => persistUserRow({ ...record, sessions: finalSessions }))
+    record.sessions = finalSessions
     return { ...entry, replacedSids }
   }
 
@@ -1124,21 +1360,19 @@ export function createAccountStore({ filePath }) {
     sid,
     { deviceName = '', clientKind = '', ip = '', clientUid = '', onlineSids = null } = {},
   ) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return false
-    if (record.revokedSids?.[cleanSid]) return false
     const now = Date.now()
     if (!Array.isArray(record.sessions)) record.sessions = []
-    let entry = record.sessions.find((s) => s.sid === cleanSid)
+    const entry = record.sessions.find((s) => s.sid === cleanSid)
+    if (!entry) return false
+
     const cleanName = String(deviceName || '').trim().slice(0, 64)
     const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' || clientKind === 'web' ? clientKind : ''
     const cleanIp = String(ip || '').trim().slice(0, 64)
     const cleanUid = normalizeClientUid(clientUid)
-    if (!entry) {
-      // Allowlist enforcement: never auto-admit unknown or previously evicted sids
-      return false
-    }
     let changed = false
     if (cleanName && entry.deviceName !== cleanName) {
       entry.deviceName = cleanName
@@ -1156,31 +1390,34 @@ export function createAccountStore({ filePath }) {
       entry.clientUid = cleanUid
       changed = true
     }
-    // Retroactively clean up any offline duplicate / legacy ghost from the same device once clientUid is attached
     if (cleanUid && onlineSids) {
-      const swept = evictDuplicateSessions(record, {
+      const { kept, replacedSids } = evictDuplicateSessionsFromList(record.sessions, {
         keepSid: cleanSid,
         deviceName: entry.deviceName,
         clientKind: entry.clientKind || 'web',
         ip: entry.ip,
         clientUid: cleanUid,
         onlineSids,
-        now,
       })
-      if (swept.length > 0) changed = true
+      if (replacedSids.length > 0) {
+        record.sessions = kept
+        changed = true
+      }
     }
     const stale = now - (Number(entry.lastSeenAt) || 0) > 60_000
     entry.lastSeenAt = now
-    if (changed || stale) scheduleSave()
+    if (changed || stale) scheduleTelemetryFlush(userId)
     return true
   }
 
   function listUserSessions(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return []
     const now = Date.now()
-    pruneUserSessionData(record, now)
-    return record.sessions.map((s) => ({
+    const active = pruneSessionsArray(record.sessions, now)
+    record.sessions = active
+    return active.map((s) => ({
       sid: s.sid,
       deviceName: s.deviceName || '',
       clientKind: s.clientKind || 'web',
@@ -1190,49 +1427,50 @@ export function createAccountStore({ filePath }) {
     }))
   }
 
-  function isSessionRevoked(userId, sid) {
-    const record = usersById.get(userId)
-    const cleanSid = String(sid || '').trim()
-    if (!record || !cleanSid) return false
-    return Boolean(record.revokedSids?.[cleanSid])
+  // Allowlist in `record.sessions` strictly enforces session revocation without persisting unbounded revokedSids
+  function isSessionRevoked() {
+    return false
   }
 
   function revokeUserSession(userId, sid) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
     if (!record || !cleanSid) return false
     const existed = Array.isArray(record.sessions) && record.sessions.some((s) => s?.sid === cleanSid)
     if (!existed) return false
-    if (!record.revokedSids || typeof record.revokedSids !== 'object') record.revokedSids = {}
-    const now = Date.now()
-    record.revokedSids[cleanSid] = now
-    record.sessions = record.sessions.filter((s) => s.sid !== cleanSid)
-    pruneUserSessionData(record, now)
-    save()
+    const nextSessions = pruneSessionsArray(
+      record.sessions.filter((s) => s.sid !== cleanSid),
+      Date.now(),
+    )
+    runTx(() => persistUserRow({ ...record, sessions: nextSessions }))
+    record.sessions = nextSessions
     return true
   }
 
   function setLoginEmail2fa(userId, enabled) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { ok: false, error: '用户不存在' }
     const next = Boolean(enabled)
     if (next && (!record.email || !record.emailVerified)) {
       return { ok: false, error: '请先绑定并验证邮箱，再开启登录二次验证' }
     }
+    runTx(() => persistUserRow({ ...record, loginEmail2fa: next }))
     record.loginEmail2fa = next
-    save()
     return { ok: true, user: sanitizeUser(record) }
   }
 
   function checkAndRememberLoginContext(userId, { deviceName = '', ip = '', clientUid = '', skipSave = false } = {}) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return { isNewContext: false }
     const cleanIp = String(ip || '').trim()
     const cleanName = String(deviceName || '').trim()
     const cleanUid = normalizeClientUid(clientUid)
-    if (!Array.isArray(record.knownLoginIps)) record.knownLoginIps = []
-    const hadHistory = record.knownLoginIps.length > 0 || (Array.isArray(record.sessions) && record.sessions.length > 0)
-    const knownByIp = Boolean(cleanIp && record.knownLoginIps.includes(cleanIp))
+    const existingIps = Array.isArray(record.knownLoginIps) ? record.knownLoginIps : []
+    const hadHistory = existingIps.length > 0 || (Array.isArray(record.sessions) && record.sessions.length > 0)
+    const knownByIp = Boolean(cleanIp && existingIps.includes(cleanIp))
     const knownBySession = Boolean(
       Array.isArray(record.sessions) &&
       record.sessions.some(
@@ -1243,40 +1481,42 @@ export function createAccountStore({ filePath }) {
     )
     const isNewContext = Boolean(hadHistory && cleanIp && !knownByIp && !knownBySession)
     if (cleanIp) {
-      record.knownLoginIps = [cleanIp, ...record.knownLoginIps.filter((x) => x !== cleanIp)].slice(0, 12)
-      if (!skipSave) save()
+      const nextIps = [cleanIp, ...existingIps.filter((x) => x !== cleanIp)].slice(0, 12)
+      if (!skipSave) {
+        runTx(() => persistUserRow({ ...record, knownLoginIps: nextIps }))
+      }
+      record.knownLoginIps = nextIps
     }
     return { isNewContext }
   }
 
   function revokeUserTokens(userId) {
+    syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
-    record.tokenVersion = Number(record.tokenVersion || 0) + 1
+    const nextTv = Number(record.tokenVersion || 0) + 1
+    runTx(() => persistUserRow({ ...record, tokenVersion: nextTv, sessions: [] }))
+    record.tokenVersion = nextTv
     record.sessions = []
-    record.revokedSids = {}
-    save()
-    return { roomId: record.userId, tokenVersion: record.tokenVersion }
+    dirtyTelemetryUsers.delete(userId)
+    return { roomId: record.userId, tokenVersion: nextTv }
   }
 
   function listUsers() {
+    syncExternalChangesIfNeeded()
     return [...usersById.values()]
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
       .map(sanitizeUser)
   }
 
-  /**
-   * Read-only sanitized user snapshot for the admin monitoring dashboard.
-   * Never mutates persisted state or exposes password / deviceSecret hashes.
-   */
   function listUsersForAdmin() {
+    syncExternalChangesIfNeeded()
     const now = Date.now()
     return [...usersById.values()]
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
       .map((u) => {
-        const revoked = u.revokedSids && typeof u.revokedSids === 'object' ? u.revokedSids : {}
         const activeSessions = (Array.isArray(u.sessions) ? u.sessions : [])
-          .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS && !revoked[s.sid])
+          .filter((s) => s?.sid && now - (Number(s.createdAt) || 0) <= SESSION_TTL_MS)
           .sort((a, b) => (b.lastSeenAt || b.createdAt || 0) - (a.lastSeenAt || a.createdAt || 0))
           .slice(0, MAX_USER_SESSIONS)
           .map((s) => ({
@@ -1295,10 +1535,32 @@ export function createAccountStore({ filePath }) {
       })
   }
 
+  function getScryptStats() {
+    return {
+      active: scryptActive,
+      queued: scryptQueue.length,
+      maxConcurrent: SCRYPT_MAX_CONCURRENT,
+      maxQueue: SCRYPT_MAX_QUEUE,
+    }
+  }
+
   return {
-    userCount: () => usersById.size,
-    getUserCount: () => usersById.size,
-    hasAnyUser: () => usersById.size > 0,
+    dbPath,
+    isHealthy: () => !closed && !lastPersistError,
+    getLastError: () => lastPersistError,
+    getScryptStats,
+    userCount: () => {
+      syncExternalChangesIfNeeded()
+      return usersById.size
+    },
+    getUserCount: () => {
+      syncExternalChangesIfNeeded()
+      return usersById.size
+    },
+    hasAnyUser: () => {
+      syncExternalChangesIfNeeded()
+      return usersById.size > 0
+    },
     getTodayRegistrationCount,
     getDailyRegistrationStats,
     isEmailTaken,
@@ -1314,6 +1576,7 @@ export function createAccountStore({ filePath }) {
     resetPasswordByEmailAsync,
     changePasswordAsync,
     flush,
+    close,
     bindDevice,
     verifyDeviceBridge,
     listUserDevices,

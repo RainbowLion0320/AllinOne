@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, sta
 import { basename, dirname, join } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
-import { findExecutable, getCodexCandidates, isExecutableFile, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
+import { findExecutable, getCodexCandidates, isExecutableFile } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
   elicitationSchemaToQuestions,
@@ -13,6 +13,13 @@ import {
   normalizeSingleAnswer,
 } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
+import { BaseAdapter } from './base-adapter.js'
+import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
+import { BoundedLruMap } from '../primitives/lru.js'
+
+const CODEX_CLIENT_VERSION =
+  (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) || '0.0.0'
+const CODEX_TURN_INACTIVITY_TIMEOUT_MS = 20 * 60_000
 
 const UNTRUSTED_CODEX_DIR_PREFIXES = [
   '/tmp/',
@@ -754,11 +761,8 @@ export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limi
 }
 
 /**
- * Lightweight JSON-RPC 2.0 client wrapping a single `codex app-server --stdio` subprocess.
- * Used in two distinct roles:
- *   1) A persistent read-only `reader` (never calls thread/start or thread/resume -> NEVER locks any thread!)
- *   2) Short-lived per-thread `writer` instances that gracefully exit after each turn finishes,
- *      immediately releasing Codex's single-writer thread lock so Codex Desktop on PC can continue seamlessly!
+ * Thin Codex `app-server --stdio` client built on shared `JsonRpcStdioClient`.
+ * Used in two distinct roles: persistent read-only `reader` and short-lived per-thread `writer`.
  */
 class CodexRpcClient {
   constructor({ codexBin, log = console, label = 'codex', onServerRequest, onNotification, onExit }) {
@@ -768,258 +772,100 @@ class CodexRpcClient {
     this.onServerRequest = onServerRequest || null
     this.onNotification = onNotification || null
     this.onExit = onExit || null
-
-    this.proc = null
     this.readyPromise = null
-    this.nextRpcId = 1
-    this.pendingRpc = new Map()
-    this.stdoutBuf = ''
-    this.stderrTail = ''
-    this.closing = false
+    this.transport = null
+  }
+
+  get proc() {
+    return this.transport?.proc || null
+  }
+
+  get closing() {
+    return Boolean(this.transport?.closing)
   }
 
   async ensureStarted() {
-    if (this.proc && !this.proc.killed && this.readyPromise) {
+    if (this.transport?.isAlive() && this.readyPromise) {
       return this.readyPromise
     }
-
-    this.closing = false
-    this.stderrTail = ''
-    this.readyPromise = new Promise((resolveReady, rejectReady) => {
-      let proc
-      try {
-        proc = spawnCrossPlatform(this.codexBin, ['app-server', '--stdio'], {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        })
-      } catch (err) {
-        this.readyPromise = null
-        rejectReady(err)
-        return
-      }
-
-      this.proc = proc
-      this.stdoutBuf = ''
-      proc.stdout.setEncoding('utf8')
-      proc.stderr?.setEncoding('utf8')
-
-      // Prevent uncaught EPIPE if the child exits while a JSON-RPC line is being written
-      proc.stdin?.on('error', () => {})
-
-      proc.stdout.on('data', (chunk) => {
-        if (this.proc !== proc) return
-        this.stdoutBuf += chunk
-        let idx
-        while ((idx = this.stdoutBuf.indexOf('\n')) !== -1) {
-          const line = this.stdoutBuf.slice(0, idx).trim()
-          this.stdoutBuf = this.stdoutBuf.slice(idx + 1)
-          if (!line) continue
-          try {
-            const msg = JSON.parse(line)
-            this.handleMessage(msg)
-          } catch {}
-        }
-      })
-
-      proc.stderr.on('data', (chunk) => {
-        if (this.proc !== proc) return
-        const text = String(chunk)
-        this.stderrTail = `${this.stderrTail}${text}`.slice(-1200)
+    const transport = new JsonRpcStdioClient({
+      bin: this.codexBin,
+      args: ['app-server', '--stdio'],
+      label: `codex(${this.label})`,
+      maxStderrChars: 1200,
+      log: this.log,
+      onServerRequest: (_t, msg) => this.onServerRequest?.(this, msg),
+      onNotification: (method, params) => this.onNotification?.(method, params),
+      onStderrChunk: (text) => {
         const line = text.trim()
         if (line) this.log.debug?.(`[codex-${this.label}] ${line}`)
-      })
-
-      proc.on('error', (err) => {
-        if (this.proc !== proc) return
-        if (!this.closing) {
-          this.log.error?.(`mobile-hub: codex(${this.label}) failed: ${String(err)}`)
+      },
+      onExit: ({ error }) => {
+        if (this.transport === transport) {
+          this.readyPromise = null
         }
-        this.cleanup(err)
-        rejectReady(err)
-      })
-
-      proc.on('close', (code, signal) => {
-        if (this.proc !== proc) return
-        // Flush any trailing JSON-RPC line that arrived without a final newline before process close
-        const tail = this.stdoutBuf.trim()
-        this.stdoutBuf = ''
-        if (tail) {
-          try {
-            this.handleMessage(JSON.parse(tail))
-          } catch {}
-        }
-        if (!this.closing) {
-          this.log.warn?.(`mobile-hub: codex(${this.label}) exited (code=${code}, signal=${signal})`)
-        }
-        const stderrHint = !this.closing && this.stderrTail.trim()
-          ? ` — ${this.stderrTail.trim().split(/\r?\n/).slice(-2).join(' | ').slice(0, 240)}`
-          : ''
-        const err = new Error(`codex(${this.label}) exited (code=${code}${signal ? `, signal=${signal}` : ''})${stderrHint}`)
-        this.cleanup(err)
         try {
-          this.onExit?.(err, this)
+          this.onExit?.(error, this)
         } catch (cbErr) {
           this.log.error?.(`mobile-hub: codex(${this.label}) onExit error: ${String(cbErr)}`)
         }
-      })
+      },
+    })
+    this.transport = transport
 
-      const initClientInfo = { name: 'allinone-dsh-mobile', version: '1.0.29' }
-      this.callRaw('initialize', {
-        clientInfo: initClientInfo,
-        capabilities: { experimentalApi: true },
-      })
-        .catch((firstErr) => {
-          if (this.proc !== proc || this.closing) throw firstErr
-          return this.callRaw('initialize', {
-            clientInfo: initClientInfo,
-            capabilities: null,
-          })
+    const ready = (async () => {
+      transport.spawnProcess()
+      const initClientInfo = { name: 'allinone-dsh-mobile', version: CODEX_CLIENT_VERSION }
+      let res
+      try {
+        res = await transport.callRaw('initialize', {
+          clientInfo: initClientInfo,
+          capabilities: { experimentalApi: true },
         })
-        .then((res) => {
-          if (this.proc !== proc) {
-            rejectReady(new Error(`codex(${this.label}) closed during initialization`))
-            return
-          }
-          this.sendRaw({ jsonrpc: '2.0', method: 'initialized', params: {} })
-          resolveReady(res)
+      } catch (firstErr) {
+        if (this.transport !== transport || transport.closing) throw firstErr
+        res = await transport.callRaw('initialize', {
+          clientInfo: initClientInfo,
+          capabilities: null,
         })
-        .catch((err) => {
-          killProcessTree(proc, { force: true })
-          if (this.proc === proc) {
-            this.cleanup(err)
-          }
-          rejectReady(err)
-        })
+      }
+      if (this.transport !== transport || !transport.isAlive()) {
+        throw new Error(`codex(${this.label}) closed during initialization`)
+      }
+      transport.notify('initialized', {})
+      return res
+    })().catch((err) => {
+      transport.killImmediate(String(err?.message || err))
+      if (this.transport === transport) {
+        this.readyPromise = null
+      }
+      throw err
     })
 
-    return this.readyPromise
-  }
-
-  cleanup(err) {
-    this.proc = null
-    this.readyPromise = null
-    for (const pending of this.pendingRpc.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(err)
-    }
-    this.pendingRpc.clear()
+    this.readyPromise = ready
+    return ready
   }
 
   sendRaw(msg) {
-    if (!this.proc || !this.proc.stdin.writable) {
-      throw new Error(`codex(${this.label}) is not running`)
-    }
-    this.proc.stdin.write(`${JSON.stringify(msg)}\n`)
-  }
-
-  callRaw(method, params = {}, timeoutMs = 45_000) {
-    return new Promise((resolvePromise, rejectPromise) => {
-      const id = this.nextRpcId++
-      const timer = setTimeout(() => {
-        if (!this.pendingRpc.has(id)) return
-        this.pendingRpc.delete(id)
-        rejectPromise(new Error(`codex RPC "${method}" timed out`))
-      }, timeoutMs)
-      this.pendingRpc.set(id, { resolve: resolvePromise, reject: rejectPromise, timer })
-      try {
-        this.sendRaw({ jsonrpc: '2.0', id, method, params })
-      } catch (err) {
-        clearTimeout(timer)
-        this.pendingRpc.delete(id)
-        rejectPromise(err)
-      }
-    })
+    if (!this.transport) throw new Error(`codex(${this.label}) is not running`)
+    this.transport.sendRaw(msg)
   }
 
   async rpc(method, params = {}, timeoutMs = 45_000) {
     await this.ensureStarted()
-    return this.callRaw(method, params, timeoutMs)
-  }
-
-  handleMessage(msg) {
-    if (msg.id !== undefined && !msg.method) {
-      const pending = this.pendingRpc.get(msg.id)
-      if (!pending) return
-      clearTimeout(pending.timer)
-      this.pendingRpc.delete(msg.id)
-      if (msg.error) {
-        pending.reject(new Error(msg.error.message || JSON.stringify(msg.error)))
-      } else {
-        pending.resolve(msg.result)
-      }
-      return
-    }
-
-    if (msg.id !== undefined && msg.method) {
-      if (this.onServerRequest) {
-        this.onServerRequest(this, msg)
-      } else {
-        try {
-          this.sendRaw({
-            jsonrpc: '2.0',
-            id: msg.id,
-            error: { code: -32601, message: `Unsupported serverRequest on ${this.label}: ${msg.method}` },
-          })
-        } catch {}
-      }
-      return
-    }
-
-    if (msg.method && this.onNotification) {
-      this.onNotification(msg.method, msg.params || {})
-    }
+    return this.transport.callRaw(method, params, timeoutMs)
   }
 
   async closeGracefully() {
-    this.closing = true
-    const proc = this.proc
-    if (!proc) return
-    await new Promise((resolveDone) => {
-      let settled = false
-      let forceTimer = null
-      let doneTimer = null
-      const finish = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(killTimer)
-        if (forceTimer) clearTimeout(forceTimer)
-        if (doneTimer) clearTimeout(doneTimer)
-        resolveDone()
-      }
-      proc.once('close', finish)
-      const killTimer = setTimeout(() => {
-        killProcessTree(proc, { force: false })
-        forceTimer = setTimeout(() => {
-          killProcessTree(proc, { force: true })
-          doneTimer = setTimeout(finish, 150)
-          doneTimer.unref?.()
-        }, 500)
-        forceTimer.unref?.()
-      }, 600)
-      killTimer.unref?.()
-      try {
-        proc.stdin.end()
-      } catch {
-        killProcessTree(proc, { force: true })
-        finish()
-      }
-    })
+    this.readyPromise = null
+    if (this.transport) {
+      await this.transport.closeGracefully({ graceMs: 600, forceAfterMs: 500 })
+    }
   }
 
   killImmediate() {
-    this.closing = true
-    const proc = this.proc
-    this.proc = null
     this.readyPromise = null
-    if (proc) {
-      killProcessTree(proc, { force: true })
-    }
-    const err = new Error(`codex(${this.label}) disposed`)
-    for (const pending of this.pendingRpc.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(err)
-    }
-    this.pendingRpc.clear()
+    this.transport?.killImmediate(`codex(${this.label}) disposed`)
   }
 }
 
@@ -1179,14 +1025,22 @@ export function normalizeCodexQuota(raw, now = Date.now()) {
  *  - Auto-releasing per-thread writer process that gracefully shuts down after each turn completes,
  *    ensuring Codex Desktop on PC NEVER gets stuck on "已在另一个应用中打开"!
  */
-export class CodexAdapter {
+export class CodexAdapter extends BaseAdapter {
   constructor({ config = {}, log = console, emitEvent, onApprovalRequest }) {
+    super(APPS.CODEX, {
+      config,
+      log,
+      emitEvent,
+      onApprovalRequest,
+      capabilities: {
+        supportsApproval: true,
+        supportsMidChatSwitch: true,
+        supportsQuota: true,
+      },
+    })
     this.configuredBin = config.codexBin
     this.codexBin = findCodexBinary(this.configuredBin)
     this.defaultCwd = config.cwd || process.cwd()
-    this.log = log
-    this.emitEvent = emitEvent || (() => {})
-    this.onApprovalRequest = onApprovalRequest || (() => {})
 
     this.reader = new CodexRpcClient({
       codexBin: this.codexBin,
@@ -1207,21 +1061,20 @@ export class CodexAdapter {
         }
       },
     })
-    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled }
+    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled, inactivityTimer }
     this.releasingWriters = new Map() // threadId -> Promise<void> (in-flight writer release before next thread/resume)
+    this.releasingWriterClients = new Set() // live writer instances mid-release so dispose() can force-kill them
     this.pendingNewWriters = new Map() // threadId -> { writer, summary, timer }
     this.pendingServerRequests = new Map() // approvalId -> { writer, rpcId, method, threadId }
-    this.dismissedAsyncQuestions = new Set() // callId skipped locally by user on idle threads
-    this.answeredAsyncQuestions = new Set() // callId already answered via All in One
-    this.sessionPrefs = new Map() // threadId -> { model, reasoningEffort }
-    this.sessionModes = new Map() // threadId -> 'plan' | 'default'
-    this.sessionTaskStates = new Map() // threadId -> normalized taskState | null
+    this.dismissedAsyncQuestions = new BoundedLruMap(256)
+    this.answeredAsyncQuestions = new BoundedLruMap(256)
+    this.sessionModes = new BoundedLruMap(256)
     this.modelsCache = null
     this.modelsCacheAt = 0
     this.quotaCache = null
     this.quotaCacheAt = 0
-    this.watchedSessions = new Map() // threadId -> live open-chat external watch snapshot
-    this.trackedListSessions = new Map() // threadId -> recent sidebar thread external status snapshot
+    this.watchedSessions = new BoundedLruMap(8) // capped LRU live open-chat watch snapshots
+    this.trackedListSessions = new BoundedLruMap(40) // capped LRU recent sidebar thread snapshots
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || CODEX_WATCH_POLL_INTERVAL_MS)
     this.externalMaxIdleMs = Math.max(1000, Number(config.codexExternalMaxIdleMs) || CODEX_EXTERNAL_MAX_IDLE_MS)
     this.watchTimer = null
@@ -1269,12 +1122,15 @@ export class CodexAdapter {
 
   async releaseWriter(writer, threadId) {
     if (!writer) return
+    this.releasingWriterClients.add(writer)
     try {
-      if (threadId && writer.proc && !writer.proc.killed) {
+      if (threadId && writer.proc && !writer.proc.killed && !this.disposed) {
         await writer.rpc('thread/unsubscribe', { threadId }, 3_000).catch(() => {})
       }
-    } catch {}
-    await writer.closeGracefully().catch(() => {})
+      await writer.closeGracefully().catch(() => {})
+    } finally {
+      this.releasingWriterClients.delete(writer)
+    }
   }
 
   async listModels() {
@@ -1582,7 +1438,7 @@ export class CodexAdapter {
           this.pendingServerRequests.set(approvalId, entry)
           throw err
         }
-        this.answeredAsyncQuestions.add(entry.callId)
+        this.answeredAsyncQuestions.set(entry.callId, true)
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.CODEX,
@@ -1592,7 +1448,7 @@ export class CodexAdapter {
       }
 
       if (cancelled) {
-        this.dismissedAsyncQuestions.add(entry.callId)
+        this.dismissedAsyncQuestions.set(entry.callId, true)
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.CODEX,
@@ -1610,7 +1466,7 @@ export class CodexAdapter {
         }
       }
 
-      this.answeredAsyncQuestions.add(entry.callId)
+      this.answeredAsyncQuestions.set(entry.callId, true)
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.CODEX,
@@ -2693,12 +2549,36 @@ export class CodexAdapter {
       }
       turnState.turnId = startRes?.turn?.id || null
 
-      // If interrupt() was called while turn/start was in flight, immediately send turn/interrupt now that turnId is known
       if (turnState.aborted && turnState.turnId) {
         await writer.rpc('turn/interrupt', { threadId, turnId: turnState.turnId }, 5_000).catch(() => {})
       }
 
-      return await turnDone
+      // Guard against hung writer turns with a sliding inactivity timeout (paused while awaiting approval)
+      let turnTimer = null
+      const resetTurnTimeout = () => {
+        if (turnTimer) clearTimeout(turnTimer)
+        if (turnState.settled) return
+        turnTimer = setTimeout(() => {
+          if (turnState.settled) return
+          for (const req of this.pendingServerRequests.values()) {
+            if (req.writer === writer) {
+              resetTurnTimeout()
+              return
+            }
+          }
+          turnState.settled = true
+          turnState.reject?.(new Error('Codex 回合响应超时（长时间无输出），已自动释放锁'))
+        }, CODEX_TURN_INACTIVITY_TIMEOUT_MS)
+        turnTimer.unref?.()
+      }
+      turnState.touchActivity = resetTurnTimeout
+      resetTurnTimeout()
+
+      try {
+        return await turnDone
+      } finally {
+        if (turnTimer) clearTimeout(turnTimer)
+      }
     } catch (err) {
       if (!err?._streamErrorEmitted) {
         if (err && typeof err === 'object') err._streamErrorEmitted = true
@@ -2724,7 +2604,7 @@ export class CodexAdapter {
         for (const [aprId, entry] of this.pendingServerRequests.entries()) {
           if (entry.writer === writer) {
             this.pendingServerRequests.delete(aprId)
-            this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+            this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, sessionId: compositeId, decision: 'cancel' })
           }
         }
       }
@@ -2793,6 +2673,7 @@ export class CodexAdapter {
   }
 
   async dispose() {
+    this.disposed = true
     if (this.watchTimer) {
       clearInterval(this.watchTimer)
       this.watchTimer = null
@@ -2815,7 +2696,12 @@ export class CodexAdapter {
       active.writer?.killImmediate()
       this.activeTurns.delete(tid)
     }
+    for (const relWriter of [...this.releasingWriterClients]) {
+      relWriter.killImmediate()
+    }
+    this.releasingWriterClients.clear()
     this.releasingWriters.clear()
     this.reader.killImmediate()
+    this.disposeBase()
   }
 }

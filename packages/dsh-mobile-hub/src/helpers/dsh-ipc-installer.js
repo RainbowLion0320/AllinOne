@@ -19,7 +19,20 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PLUGIN_NAME = 'allinone-dsh-ipc'
-const PLUGIN_VERSION = '1.0.29'
+
+function resolvePluginVersion() {
+  if (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) {
+    return __ALLINONE_VERSION__.trim()
+  }
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(resolve(here, '..', '..', 'package.json'), 'utf8'))
+    if (pkg?.version) return String(pkg.version).trim()
+  } catch {}
+  return '0.0.0'
+}
+
+const PLUGIN_VERSION = resolvePluginVersion()
 
 const CORDIS_PATCH_YML = [
   '# Managed automatically by All in One Desktop App (authenticated 127.0.0.1 IPC only)',

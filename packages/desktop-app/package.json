@@ -1,6 +1,6 @@
 {
   "name": "@allinone/desktop-app",
-  "version": "1.0.29",
+  "version": "1.0.30",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,9 @@
     "pack:mac-dir": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --mac --dir",
     "pack:win": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --win && node scripts/clean-release.mjs --prune",
     "pack:all": "node scripts/clean-release.mjs --all && node scripts/prepare-assets.mjs && electron-builder --mac --win && node scripts/clean-release.mjs --prune"
+  },
+  "dependencies": {
+    "@allinone/shared": "*"
   },
   "devDependencies": {
     "electron": "35.7.5",

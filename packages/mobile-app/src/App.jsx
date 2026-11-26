@@ -18,39 +18,17 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
+import { formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
-import {
-  checkNativeMobileUpdate,
-  clearWebCachesAndServiceWorkers,
-  isHotReloadableWebOrigin,
-  performWebHotReload,
-} from './lib/clientHelpers.js'
 import { compressImageForUpload } from './lib/imageCompress.js'
-import {
-  MobileRelayClient,
-  bindAccountEmail,
-  fetchAuthSessions,
-  listAccountDevices,
-  logoutDeviceSession,
-  probeDeviceStatus,
-  removeAccountDevice,
-  renameAccountDevice,
-  revokeAuthSession,
-  revokeDeviceSessions,
-  revokeOtherAuthSessions,
-  sendEmailVerificationCode,
-  setAccountLogin2fa,
-} from './lib/wsClient.js'
+import { MobileRelayClient } from './lib/wsClient.js'
 import {
   clearDeviceCredentials,
   getActiveDevice,
   getCacheScopeKey,
   getDeviceDisplayName,
   loadDeviceState,
-  removeDevice,
   saveDeviceState,
-  selectDevice,
   updateDeviceMeta,
   upsertDevice,
   upsertDeviceE2eeKey,
@@ -69,13 +47,34 @@ import {
   makeDraftKey,
   saveLastWorkspace,
 } from './lib/draftStore.js'
-import { LoginScreen } from './components/LoginScreen.jsx'
+import {
+  appendStreamDelta,
+  appendStreamThinking,
+  clearAllStreams,
+  clearStream,
+  failStream,
+  finishStream,
+  getRawStream,
+  isStaleStreamForIdle,
+  isStreamActive,
+  startStream,
+  streamToolEnd,
+  streamToolStart,
+  useSessionStreamingActive,
+} from './state/streamingStore.js'
+import { useOtaUpdater } from './hooks/useOtaUpdater.js'
+import { useE2eeActions } from './hooks/useE2eeActions.js'
+import { useAccountDevices } from './hooks/useAccountDevices.js'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
 import { Composer } from './components/Composer.jsx'
 import { VendorBadge } from './components/VendorIcon.jsx'
 import { useI18n } from './lib/i18n.jsx'
 import { bi as biLang, getCurrentLang } from './lib/i18n.js'
+
+const LoginScreen = React.lazy(() =>
+  import('./components/LoginScreen.jsx').then((m) => ({ default: m.LoginScreen })),
+)
 
 const NewChatModal = React.lazy(() =>
   import('./components/NewChatModal.jsx').then((m) => ({ default: m.NewChatModal })),
@@ -165,21 +164,11 @@ export function App() {
   const [loadingSession, setLoadingSession] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
 
-  const [streamingBySession, setStreamingBySession] = useState({})
   const [approvals, setApprovals] = useState([])
   const [desktopBridge, setDesktopBridge] = useState(null)
-  const [updateState, setUpdateState] = useState(null)
-  const updateStateRef = useRef(null)
-  updateStateRef.current = updateState
 
   const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
   const isMacDesktop = desktopApi?.platform === 'darwin'
-  const isNativeMobile =
-    typeof window !== 'undefined' && !desktopApi && Boolean(window.Capacitor?.isNativePlatform?.())
-  const nativeOtaPlugin = isNativeMobile ? window.Capacitor?.Plugins?.AllinOneUpdater || null : null
-  const isWebHotUpdatable =
-    typeof window !== 'undefined' && !desktopApi && isHotReloadableWebOrigin(window.location)
-  const canCheckMobileUpdate = !desktopApi && (isNativeMobile || isWebHotUpdatable)
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
@@ -251,9 +240,6 @@ export function App() {
   const workspaceLoadSeqRef = useRef(0)
   const olderReqSeqRef = useRef(0)
   const loadingOlderLockRef = useRef(false)
-  const streamingRef = useRef(streamingBySession)
-  streamingRef.current = streamingBySession
-  const liveStreamMapRef = useRef({})
   const sentPreviewUrlsRef = useRef(new Set())
   const activeBridgeIdRef = useRef(activeBridgeId)
   activeBridgeIdRef.current = activeBridgeId
@@ -289,25 +275,6 @@ export function App() {
     }
   }, [])
 
-  const clearLiveStreamEntry = useCallback((sid) => {
-    if (!sid) return
-    delete liveStreamMapRef.current[sid]
-    setStreamingBySession((prev) => {
-      if (!(sid in prev)) return prev
-      const next = { ...prev }
-      delete next[sid]
-      return next
-    })
-  }, [])
-
-  const isStaleStreamForIdle = useCallback((sid) => {
-    if (!sid) return false
-    const entry = liveStreamMapRef.current[sid] || streamingRef.current[sid]
-    if (!entry?.active) return false
-    const lastActivity = Number(entry.lastDeltaAt || entry.startedAt || 0)
-    return Date.now() - lastActivity >= 3_000
-  }, [])
-
   const showToast = useCallback((text) => {
     if (!text) return
     setToastMsg(text)
@@ -317,6 +284,19 @@ export function App() {
       setToastMsg('')
     }, 2600)
   }, [])
+
+  const {
+    updateState,
+    setUpdateState,
+    otaInfo,
+    nativeOtaPlugin,
+    canCheckMobileUpdate,
+    handleCheckNativeMobileUpdate,
+    handleDownloadMobileUpdate,
+    handleCancelMobileUpdate,
+    handleInstallMobileUpdate,
+    handleResetOtaBundle,
+  } = useOtaUpdater({ desktopApi, activeDevice, showToast })
 
   const [workbuddySetup, setWorkbuddySetup] = useState({
     status: 'idle', // 'idle' | 'working' | 'awaiting_login' | 'error'
@@ -504,23 +484,16 @@ export function App() {
     }
   }, [])
 
-  // Electron Desktop App integration: live local bridge status + auto-updater + menu shortcuts
+  // Electron Desktop App integration: live local bridge status + menu shortcuts
   useEffect(() => {
     if (!desktopApi) return
     let unsubStatus = null
     let unsubMenu = null
-    let unsubUpdate = null
     desktopApi.getBridgeStatus?.().then((st) => {
       if (st) setDesktopBridge(st)
     }).catch(() => {})
-    desktopApi.getUpdateState?.().then((st) => {
-      if (st) setUpdateState(st)
-    }).catch(() => {})
     if (typeof desktopApi.onBridgeStatus === 'function') {
       unsubStatus = desktopApi.onBridgeStatus((st) => setDesktopBridge(st))
-    }
-    if (typeof desktopApi.onUpdateState === 'function') {
-      unsubUpdate = desktopApi.onUpdateState((st) => setUpdateState(st))
     }
     if (typeof desktopApi.onMenuAction === 'function') {
       unsubMenu = desktopApi.onMenuAction((action) => {
@@ -532,188 +505,9 @@ export function App() {
     }
     return () => {
       try { unsubStatus?.() } catch {}
-      try { unsubUpdate?.() } catch {}
       try { unsubMenu?.() } catch {}
     }
   }, [desktopApi, openNewChatModal])
-
-  // Native Android OTA plugin: confirm healthy boot & subscribe to live download progress
-  useEffect(() => {
-    if (!nativeOtaPlugin) return
-    const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
-    try {
-      void nativeOtaPlugin.confirmBoot?.({ version: currentVersion })?.catch?.(() => {})
-    } catch {}
-
-    let handlePromise = null
-    if (typeof nativeOtaPlugin.addListener === 'function') {
-      try {
-        handlePromise = Promise.resolve(
-          nativeOtaPlugin.addListener('otaProgress', (ev) => {
-            if (!ev || typeof ev !== 'object') return
-            if (ev.status === 'downloading') {
-              setUpdateState((prev) => ({
-                ...(prev || {}),
-                status: 'downloading',
-                hotUpdate: true,
-                mode: 'capacitor-ota',
-                latestVersion: ev.version || prev?.latestVersion || '',
-                downloadedBytes: Number(ev.downloadedBytes || 0),
-                totalBytes: Number(ev.totalBytes || prev?.assetSize || 0),
-                percent: Number(ev.percent || 0),
-                error: '',
-              }))
-            }
-          }),
-        )
-      } catch {}
-    }
-    return () => {
-      handlePromise
-        ?.then((h) => h?.remove?.())
-        ?.catch?.(() => {})
-    }
-  }, [nativeOtaPlugin])
-
-  const handleDownloadMobileUpdate = useCallback(
-    async (explicitCandidate = null) => {
-      const target = explicitCandidate || updateStateRef.current
-      if (!nativeOtaPlugin?.downloadBundle || !target?.downloadUrl || !target?.expectedSha256) return null
-      const curStatus = updateStateRef.current?.status
-      if (curStatus === 'downloading' || curStatus === 'installing') return updateStateRef.current
-
-      setUpdateState({
-        ...target,
-        status: 'downloading',
-        hotUpdate: true,
-        mode: 'capacitor-ota',
-        percent: 0,
-        downloadedBytes: 0,
-        totalBytes: Number(target.assetSize || 0),
-        error: '',
-      })
-
-      try {
-        const res = await nativeOtaPlugin.downloadBundle({
-          version: target.latestVersion || '',
-          minNativeVersion: target.minNativeVersion || '',
-          url: target.downloadUrl,
-          fallbackUrl: target.fallbackUrl || '',
-          expectedSha256: target.expectedSha256,
-          expectedSize: Number(target.assetSize || 0),
-          signature: target.signature || '',
-          sigAlg: target.sigAlg || '',
-        })
-        if (res?.status === 'cancelled') {
-          const next = { ...target, status: 'available', percent: 0, error: '' }
-          setUpdateState(next)
-          return next
-        }
-        const next = {
-          ...target,
-          status: 'downloaded',
-          hotUpdate: true,
-          mode: 'capacitor-ota',
-          latestVersion: res?.version || target.latestVersion || '',
-          percent: 100,
-          error: '',
-        }
-        setUpdateState(next)
-        return next
-      } catch (err) {
-        const msg = String(err?.message || err || biLang(getCurrentLang(), '热更新下载失败', 'Hot update download failed'))
-        const next = { ...target, status: 'error', error: msg }
-        setUpdateState(next)
-        return next
-      }
-    },
-    [nativeOtaPlugin],
-  )
-
-  const handleCancelMobileUpdate = useCallback(async () => {
-    try {
-      await nativeOtaPlugin?.cancelDownload?.()
-    } catch {}
-    setUpdateState((prev) =>
-      prev && prev.status === 'downloading'
-        ? { ...prev, status: 'available', percent: 0, error: '' }
-        : prev,
-    )
-  }, [nativeOtaPlugin])
-
-  const handleInstallMobileUpdate = useCallback(async () => {
-    const cur = updateStateRef.current
-    if (!cur || cur.status === 'installing') return
-    setUpdateState((prev) => ({ ...(prev || {}), status: 'installing', error: '' }))
-    try {
-      if (cur.mode === 'capacitor-ota' && nativeOtaPlugin?.applyUpdate) {
-        // Clear any Service Worker / CacheStorage before switching Capacitor's local bundle root
-        await clearWebCachesAndServiceWorkers()
-        await nativeOtaPlugin.applyUpdate({ version: cur.latestVersion || '' })
-        return
-      }
-      await performWebHotReload()
-    } catch (err) {
-      const msg = String(err?.message || err || biLang(getCurrentLang(), '热更重启失败', 'Hot restart failed'))
-      setUpdateState((prev) => ({ ...(prev || {}), status: 'error', error: msg }))
-    }
-  }, [nativeOtaPlugin])
-
-  const handleCheckNativeMobileUpdate = useCallback(
-    async ({ silent = false } = {}) => {
-      if (!canCheckMobileUpdate) return null
-      const curStatus = updateStateRef.current?.status
-      if (curStatus === 'downloading' || curStatus === 'installing') {
-        return updateStateRef.current
-      }
-      const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
-      if (!silent) {
-        setUpdateState((prev) => ({ ...(prev || {}), status: 'checking', currentVersion, error: '' }))
-      }
-      let nativeVersion = ''
-      let stagedVersion = ''
-      if (nativeOtaPlugin?.getAppInfo) {
-        try {
-          const info = await nativeOtaPlugin.getAppInfo()
-          nativeVersion = String(info?.nativeVersion || '').trim()
-          stagedVersion = String(info?.stagedVersion || '').trim()
-        } catch {}
-      }
-      const next = await checkNativeMobileUpdate({
-        currentVersion,
-        nativeVersion,
-        stagedVersion,
-        hasNativeOta: Boolean(nativeOtaPlugin),
-        baseUrl: activeDevice?.baseUrl || '',
-        token: activeDevice?.token || '',
-      })
-      if (silent && next.status === 'error') {
-        return next
-      }
-      // On manual check, if a small signed OTA hot-update bundle is available, start downloading in-app right away
-      if (!silent && next.status === 'available' && next.hotUpdate && next.mode === 'capacitor-ota' && nativeOtaPlugin) {
-        return handleDownloadMobileUpdate(next)
-      }
-      setUpdateState(next)
-      return next
-    },
-    [canCheckMobileUpdate, nativeOtaPlugin, activeDevice?.baseUrl, activeDevice?.token, handleDownloadMobileUpdate],
-  )
-
-  // Mobile (Android APK & Mobile PWA) automatic silent update check shortly after launch + every 4 hours
-  useEffect(() => {
-    if (!canCheckMobileUpdate) return
-    const startupTimer = setTimeout(() => {
-      void handleCheckNativeMobileUpdate({ silent: true })
-    }, 5_000)
-    const periodicTimer = setInterval(() => {
-      void handleCheckNativeMobileUpdate({ silent: true })
-    }, 4 * 60 * 60 * 1000)
-    return () => {
-      clearTimeout(startupTimer)
-      clearInterval(periodicTimer)
-    }
-  }, [canCheckMobileUpdate, handleCheckNativeMobileUpdate])
 
   const hadDesktopAccountRef = useRef(false)
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
@@ -838,7 +632,7 @@ export function App() {
     activeQuietSyncSeqRef.current = 0
     quietSyncPendingRef.current = ''
     loadingOlderLockRef.current = false
-    liveStreamMapRef.current = {}
+    clearAllStreams()
     activeSessionRef.current = null
     messagesRef.current = []
     modelsEtagRef.current = { bridgeId: '', etag: '' }
@@ -858,7 +652,6 @@ export function App() {
     setSelectedDraftCwd('')
     setWorkspaces([])
     setSessions([])
-    setStreamingBySession({})
     setApprovals([])
     setNewChatOpen(false)
     setNewChatCwd('')
@@ -1107,7 +900,7 @@ export function App() {
     const client = clientRef.current
     const targetId = sessionId || activeSessionRef.current?.id || ''
     if (!client || !targetId) return
-    if (liveStreamMapRef.current[targetId]?.active || loadingOlderLockRef.current) return
+    if (isStreamActive(targetId) || loadingOlderLockRef.current) return
     if (activeQuietSyncSeqRef.current !== 0) {
       quietSyncPendingRef.current = targetId
       return
@@ -1135,7 +928,7 @@ export function App() {
         quietSyncSeqRef.current !== seq ||
         deviceGenRef.current !== gen ||
         activeSessionRef.current?.id !== targetId ||
-        liveStreamMapRef.current[targetId]?.active
+        isStreamActive(targetId)
       ) {
         return
       }
@@ -1211,7 +1004,7 @@ export function App() {
           quietSyncSeqRef.current === seq &&
           deviceGenRef.current === gen &&
           activeSessionRef.current?.id === pendingId &&
-          !liveStreamMapRef.current[pendingId]?.active
+          !isStreamActive(pendingId)
         ) {
           void syncActiveSessionQuietly(pendingId)
         }
@@ -1277,7 +1070,7 @@ export function App() {
             }
           }
           if (s?.id && s.status === 'idle' && isStaleStreamForIdle(s.id)) {
-            clearLiveStreamEntry(s.id)
+            clearStream(s.id)
             if (activeSessionRef.current?.id === s.id) {
               void syncActiveSessionQuietly(s.id)
             }
@@ -1303,7 +1096,7 @@ export function App() {
         setRefreshing(false)
       }
     }
-  }, [clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+  }, [syncActiveSessionQuietly])
 
   // Trigger workspace load whenever connected target device/bridge is ready or E2EE unlocks
   useEffect(() => {
@@ -1312,6 +1105,24 @@ export function App() {
     clientRef.current?.setE2eeKeys(activeDevice?.e2eeKeys || {})
     void loadWorkspaceData(activeBridgeId)
   }, [connState, activeDevice?.id, activeBridgeId, e2eeLocked, loadWorkspaceData])
+
+  // Recover workspace data automatically if P2P becomes connected while workspace lists are still empty
+  const prevP2pStateRef = useRef('idle')
+  useEffect(() => {
+    const prevP2p = prevP2pStateRef.current
+    prevP2pStateRef.current = p2pState
+    if (
+      p2pState === 'connected' &&
+      prevP2p !== 'connected' &&
+      connState === 'connected' &&
+      activeBridgeId &&
+      !e2eeLocked &&
+      appsStatus.length === 0 &&
+      sessions.length === 0
+    ) {
+      void loadWorkspaceData(activeBridgeId)
+    }
+  }, [p2pState, connState, activeBridgeId, e2eeLocked, appsStatus.length, sessions.length, loadWorkspaceData])
 
   // Auto-sync app readiness & model catalog whenever the active bridge broadcasts updated meta.apps
   // (e.g. after background auto-completion finishes installing a missing CLI like `agy` / `claude` / `codex`).
@@ -1453,7 +1264,7 @@ export function App() {
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
       if (res?.unchanged) {
         if (cached?.meta?.status === 'idle' && isStaleStreamForIdle(id)) {
-          clearLiveStreamEntry(id)
+          clearStream(id)
         }
         if (res.etag && activeSessionRef.current?.id === id && activeSessionRef.current.etag !== res.etag) {
           const mergedMeta = { ...activeSessionRef.current, etag: res.etag }
@@ -1464,7 +1275,7 @@ export function App() {
       }
       if (res?.session) {
         if (res.session.status === 'idle' && isStaleStreamForIdle(id)) {
-          clearLiveStreamEntry(id)
+          clearStream(id)
         }
         const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
         const reconciled = reconcileCachedWithFreshPage(cached, {
@@ -1535,31 +1346,22 @@ export function App() {
       }
     } catch (err) {
       if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
-      if ((!cached || !cached.messages?.length) && !liveStreamMapRef.current[id]?.active) {
-        const errEntry = {
-          active: false,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: String(err?.message || err),
-        }
-        liveStreamMapRef.current[id] = errEntry
-        setStreamingBySession((prev) => ({
-          ...prev,
-          [id]: errEntry,
-        }))
+      if ((!cached || !cached.messages?.length) && !isStreamActive(id)) {
+        failStream(id, String(err?.message || err), { keepPartial: false })
       }
     } finally {
       if (openRequestSeqRef.current === reqSeq && deviceGenRef.current === gen) {
         setLoadingSession(false)
       }
     }
-  }, [clearLiveStreamEntry, isStaleStreamForIdle, pruneUnusedSentPreviewUrls])
+  }, [pruneUnusedSentPreviewUrls])
 
   // Return cleanly to the empty All in One home screen (without disturbing background streams)
   const returnToHome = useCallback(() => {
     openRequestSeqRef.current += 1
-    activeQuietSyncSeqRef.current += 1
+    quietSyncSeqRef.current += 1
+    activeQuietSyncSeqRef.current = 0
+    quietSyncPendingRef.current = ''
     loadingOlderLockRef.current = false
     activeSessionRef.current = null
     messagesRef.current = []
@@ -1592,7 +1394,7 @@ export function App() {
       if (now - lastFocusSyncAtRef.current < 1_500) return
       lastFocusSyncAtRef.current = now
       const curId = activeSessionRef.current?.id
-      if (curId && !liveStreamMapRef.current[curId]?.active) {
+      if (curId && !isStreamActive(curId)) {
         void syncActiveSessionQuietly(curId)
       }
     }
@@ -1854,7 +1656,7 @@ export function App() {
         const updated = payload.session
         let clearedStaleStream = false
         if (updated.status === 'idle' && isStaleStreamForIdle(updated.id)) {
-          clearLiveStreamEntry(updated.id)
+          clearStream(updated.id)
           clearedStaleStream = true
         }
         setSessions((prev) => {
@@ -1878,7 +1680,7 @@ export function App() {
           }
           if (
             (payload.historyChanged || payload.statusChanged || clearedStaleStream) &&
-            !liveStreamMapRef.current[updated.id]?.active
+            !isStreamActive(updated.id)
           ) {
             void syncActiveSessionQuietly(updated.id)
           }
@@ -1906,91 +1708,22 @@ export function App() {
       const sid = payload?.sessionId
       if (!sid) return
 
-      const normalizeStreamBase = (raw, now) => ({
-        active: true,
-        text: typeof raw?.text === 'string' ? raw.text : '',
-        thinking: typeof raw?.thinking === 'string' ? raw.thinking : '',
-        tools: Array.isArray(raw?.tools) ? raw.tools : [],
-        error: '',
-        startedAt: Number(raw?.startedAt) || now,
-        lastDeltaAt: now,
-      })
-
       if (event === EVENTS.STREAM_START) {
-        const now = Date.now()
-        const entry = {
-          active: true,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: '',
-          startedAt: now,
-          lastDeltaAt: now,
-        }
-        liveStreamMapRef.current[sid] = entry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: entry }))
+        startStream(sid)
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'running' } : s)))
       } else if (event === EVENTS.STREAM_DELTA) {
-        const now = Date.now()
-        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
-        const nextEntry = {
-          ...cur,
-          text: cur.text + (payload.delta || ''),
-        }
-        liveStreamMapRef.current[sid] = nextEntry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
+        appendStreamDelta(sid, payload.delta || '')
       } else if (event === EVENTS.STREAM_THINKING) {
-        const now = Date.now()
-        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
-        const nextEntry = {
-          ...cur,
-          thinking: cur.thinking + (payload.delta || ''),
-        }
-        liveStreamMapRef.current[sid] = nextEntry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
+        appendStreamThinking(sid, payload.delta || '')
       } else if (event === EVENTS.STREAM_TOOL_START && payload.tool) {
-        const now = Date.now()
-        const cur = normalizeStreamBase(liveStreamMapRef.current[sid], now)
-        const exists = cur.tools.some((t) => t.id === payload.tool.id)
-        const tools = exists
-          ? cur.tools
-          : [...cur.tools, { ...payload.tool, status: 'running', output: '' }]
-        const nextEntry = { ...cur, tools }
-        liveStreamMapRef.current[sid] = nextEntry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
+        streamToolStart(sid, payload.tool)
       } else if (event === EVENTS.STREAM_TOOL_END && payload.toolId) {
-        const now = Date.now()
-        const prevRaw = liveStreamMapRef.current[sid]
-        const cur = normalizeStreamBase(prevRaw, now)
-        const tools = cur.tools.map((t) =>
-          t.id === payload.toolId
-            ? { ...t, status: payload.status || 'completed', output: payload.output || '' }
-            : t,
-        )
-        const nextEntry = { ...cur, active: prevRaw?.active ?? true, tools }
-        liveStreamMapRef.current[sid] = nextEntry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
+        streamToolEnd(sid, payload.toolId, payload.status || 'completed', payload.output || '')
       } else if (event === EVENTS.STREAM_ERROR) {
-        const prevRaw = liveStreamMapRef.current[sid]
-        const nextEntry = {
-          active: false,
-          text: typeof prevRaw?.text === 'string' ? prevRaw.text : '',
-          thinking: typeof prevRaw?.thinking === 'string' ? prevRaw.thinking : '',
-          tools: Array.isArray(prevRaw?.tools) ? prevRaw.tools : [],
-          error: payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error'),
-        }
-        liveStreamMapRef.current[sid] = nextEntry
-        setStreamingBySession((prev) => ({ ...prev, [sid]: nextEntry }))
+        failStream(sid, payload.message || biLang(getCurrentLang(), '执行出错', 'Execution error'))
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
       } else if (event === EVENTS.STREAM_DONE) {
-        const cur = liveStreamMapRef.current[sid] || streamingRef.current[sid]
-        delete liveStreamMapRef.current[sid]
-        setStreamingBySession((prev) => {
-          if (!(sid in prev)) return prev
-          const next = { ...prev }
-          delete next[sid]
-          return next
-        })
+        const cur = finishStream(sid)
         if (
           activeSessionRef.current?.id === sid &&
           (payload.finalText || cur?.text || cur?.thinking || cur?.tools?.length)
@@ -2003,13 +1736,11 @@ export function App() {
             tools: cur?.tools?.length ? cur.tools : undefined,
             ts: Date.now(),
           }
-          const cacheList = [...messagesRef.current, committed]
+          const cacheList = messagesRef.current.some((m) => m.id === committed.id)
+            ? messagesRef.current
+            : [...messagesRef.current, committed]
           messagesRef.current = cacheList
-          setMessages((prev) => {
-            const next = prev.some((m) => m.id === committed.id) ? prev : [...prev, committed]
-            messagesRef.current = next
-            return next
-          })
+          setMessages((prev) => (prev.some((m) => m.id === committed.id) ? prev : [...prev, committed]))
           void saveCachedSession(
             sid,
             {
@@ -2028,7 +1759,7 @@ export function App() {
         // Reconcile optimistic msg-u/msg-a IDs with authoritative disk transcript & syncState shortly after turn settles
         const doneGen = deviceGenRef.current
         setTimeout(() => {
-          if (activeSessionRef.current?.id === sid && !liveStreamMapRef.current[sid]?.active) {
+          if (activeSessionRef.current?.id === sid && !isStreamActive(sid)) {
             void syncActiveSessionQuietly(sid)
           }
           // Quietly refresh E2EE subscription quota / readiness after a turn finishes
@@ -2070,7 +1801,7 @@ export function App() {
         clientRef.current = null
       }
     }
-  }, [activeDevice?.id, activeDevice?.baseUrl, hasActiveToken, clearLiveStreamEntry, isStaleStreamForIdle, syncActiveSessionQuietly])
+  }, [activeDevice?.id, activeDevice?.baseUrl, hasActiveToken, syncActiveSessionQuietly])
 
   // On confirmed 401 / WS 4401 remote revocation, immediately wipe local secrets, caches, drafts & in-memory state
   useEffect(() => {
@@ -2115,445 +1846,108 @@ export function App() {
     }
   }, [activeDevice?.token])
 
-  const handleSelectDevice = useCallback((deviceId, bridgeId = '') => {
-    const cleanBridgeId = String(bridgeId || '').trim()
-    const isSameDevice = activeDevice?.id === deviceId
-    const curSelectedBridge = activeDevice?.selectedBridgeId || activeBridgeIdRef.current
-    const isSameBridge = isSameDevice && (!cleanBridgeId || cleanBridgeId === curSelectedBridge)
-    if (isSameBridge) return
-
-    resetTransientWorkspace()
-    if (!isSameDevice) {
-      setBridges([])
-    } else if (cleanBridgeId) {
-      clientRef.current?.setTargetBridgeId(cleanBridgeId)
-    }
-
-    const target = devices.find((d) => d.id === deviceId)
-    setDeviceState((prev) => selectDevice(prev, deviceId, cleanBridgeId || undefined))
-
-    if (target) {
-      const targetAcctPc = isSameDevice
-        ? accountDevices.find((d) => d.bridgeId === cleanBridgeId) || null
-        : null
-      const targetBridgeObj = isSameDevice
-        ? onlineBridges.find((b) => b.bridgeId === cleanBridgeId) || null
-        : null
-      const name =
-        isSameDevice && (targetAcctPc || targetBridgeObj)
-          ? targetAcctPc?.label || targetBridgeObj?.label || targetBridgeObj?.hostname || cleanBridgeId
-          : getDeviceDisplayName(target, null, getCurrentLang())
-      showToast(biLang(getCurrentLang(), `已切换到 ${name}`, `Switched to ${name}`))
-    }
-  }, [activeDevice?.id, activeDevice?.selectedBridgeId, devices, accountDevices, onlineBridges, resetTransientWorkspace, showToast])
-
-  const handleSyncDeviceMeta = useCallback((deviceId, patch) => {
-    setDeviceState((prev) => updateDeviceMeta(prev, deviceId, patch))
-  }, [])
-
-  const handleRenameAccountDevice = useCallback(async (pcDeviceId, newLabel) => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token) return
-    try {
-      const nextList = await renameAccountDevice(activeDevice.baseUrl, activeDevice.token, {
-        deviceId: pcDeviceId,
-        label: newLabel,
-      })
-      setAccountDevices(nextList)
-      showToast(biLang(getCurrentLang(), `已重命名为 ${newLabel}`, `Renamed to ${newLabel}`))
-    } catch (err) {
-      showToast(String(err?.message || err))
-    }
-  }, [activeDevice?.baseUrl, activeDevice?.token, showToast])
-
-  const handleRemoveAccountDevice = useCallback(async (pcDeviceId, pcBridgeId = '') => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token) return
-    try {
-      const nextList = await removeAccountDevice(activeDevice.baseUrl, activeDevice.token, {
-        deviceId: pcDeviceId,
-      })
-      setAccountDevices(nextList)
-      if (pcBridgeId && activeBridgeIdRef.current === pcBridgeId) {
-        resetTransientWorkspace()
-        setDeviceState((prev) =>
-          updateDeviceMeta(prev, activeDevice.id, { selectedBridgeId: '' }),
-        )
-      }
-      showToast(biLang(getCurrentLang(), '已解绑并断开该电脑', 'Computer unlinked and disconnected'))
-    } catch (err) {
-      showToast(String(err?.message || err))
-    }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, resetTransientWorkspace, showToast])
-
-  const handleRefreshClientSessions = useCallback(async () => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token) return
-    const gen = deviceGenRef.current
-    try {
-      const res = await fetchAuthSessions(
-        activeDevice.baseUrl,
-        activeDevice.token,
-        clientRef.current?.clientId || '',
-      )
-      if (deviceGenRef.current !== gen) return
-      setClientSessions(res)
-      setLiveOnlineClientCount(res.onlineCount)
-    } catch {}
-  }, [activeDevice?.baseUrl, activeDevice?.token])
-
-  // Auto-refresh detailed client session list whenever live client count changes while settings is open or on connect
+  // Android hardware back button handling: close topmost modal/drawer, or return to home
   useEffect(() => {
-    if (!activeDevice?.baseUrl || !activeDevice?.token || connState !== 'connected') return
-    void handleRefreshClientSessions()
+    const onBackButton = (e) => {
+      if (htmlPreviewState) {
+        setHtmlPreviewState(null)
+        e.preventDefault()
+      } else if (lightboxState) {
+        setLightboxState(null)
+        e.preventDefault()
+      } else if (pendingGrantPopup) {
+        setPendingGrantPopup(null)
+        e.preventDefault()
+      } else if (modelPickerOpen) {
+        setModelPickerOpen(false)
+        e.preventDefault()
+      } else if (e2eeModal.open) {
+        setE2eeModal((prev) => ({ ...prev, open: false, autoOpenScanner: false }))
+        e.preventDefault()
+      } else if (newChatOpen) {
+        setNewChatOpen(false)
+        e.preventDefault()
+      } else if (settingsOpen) {
+        setSettingsOpen(false)
+        e.preventDefault()
+      } else if (deviceSwitcherOpen) {
+        setDeviceSwitcherOpen(false)
+        e.preventDefault()
+      } else if (drawerOpen) {
+        setDrawerOpen(false)
+        e.preventDefault()
+      } else if (activeSessionRef.current) {
+        returnToHome()
+        e.preventDefault()
+      }
+    }
+    window.addEventListener('allinone:backbutton', onBackButton)
+    return () => window.removeEventListener('allinone:backbutton', onBackButton)
   }, [
-    activeDevice?.baseUrl,
-    activeDevice?.token,
-    connState,
-    liveOnlineClientCount,
+    htmlPreviewState,
+    lightboxState,
+    pendingGrantPopup,
+    modelPickerOpen,
+    e2eeModal.open,
+    newChatOpen,
     settingsOpen,
-    handleRefreshClientSessions,
+    deviceSwitcherOpen,
+    drawerOpen,
+    returnToHome,
   ])
 
-  const handleRevokeClientSession = useCallback(
-    async ({ sid = '', clientId = '' } = {}) => {
-      if (!activeDevice?.baseUrl || !activeDevice?.token) return
-      try {
-        const res = await revokeAuthSession(activeDevice.baseUrl, activeDevice.token, {
-          sid,
-          clientId,
-          currentClientId: clientRef.current?.clientId || '',
-        })
-        setClientSessions(res)
-        setLiveOnlineClientCount(res.onlineCount)
-        showToast(biLang(getCurrentLang(), '已将该设备踢下线', 'Signed out device'))
-      } catch (err) {
-        showToast(String(err?.message || err))
-      }
-    },
-    [activeDevice?.baseUrl, activeDevice?.token, showToast],
-  )
+  const {
+    handleSelectDevice,
+    handleSyncDeviceMeta,
+    handleRenameAccountDevice,
+    handleRemoveAccountDevice,
+    handleRefreshClientSessions,
+    handleRevokeClientSession,
+    handleRevokeOtherClientSessions,
+    handleRefreshAccountDevices,
+    handleSendBindEmailCode,
+    handleBindAccountEmail,
+    handleToggleLoginEmail2fa,
+    handleRemoveDevice,
+  } = useAccountDevices({
+    devices,
+    activeDevice,
+    activeDeviceRef,
+    activeBridgeIdRef,
+    deviceGenRef,
+    clientRef,
+    connState,
+    accountDevices,
+    onlineBridges,
+    liveOnlineClientCount,
+    settingsOpen,
+    setDeviceState,
+    setBridges,
+    setAccountDevices,
+    setClientSessions,
+    setLiveOnlineClientCount,
+    setServerEmailEnabled,
+    setTurnQuota,
+    setDeviceSwitcherOpen,
+    setDrawerOpen,
+    resetTransientWorkspace,
+    showToast,
+  })
 
-  const handleRevokeOtherClientSessions = useCallback(async () => {
-    if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) return
-    try {
-      const res = await revokeOtherAuthSessions(
-        activeDevice.baseUrl,
-        activeDevice.token,
-        clientRef.current?.clientId || '',
-      )
-      if (res.token) {
-        clientRef.current?.updateToken(res.token)
-        setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { token: res.token }))
-      }
-      setClientSessions(res)
-      setLiveOnlineClientCount(res.onlineCount)
-      showToast(biLang(getCurrentLang(), '已下线其他全部登录设备，仅保留本机', 'Signed out all other devices'))
-    } catch (err) {
-      showToast(String(err?.message || err))
-    }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast])
-
-  const handleRefreshAccountDevices = useCallback(async () => {
-    const targetDeviceId = activeDevice?.id
-    const baseUrl = activeDevice?.baseUrl
-    const token = activeDevice?.token
-    const roomId = activeDevice?.roomId || ''
-    if (!targetDeviceId || !baseUrl || !token) return
-    const gen = deviceGenRef.current
-    try {
-      const [devRes, meRes] = await Promise.all([
-        listAccountDevices(baseUrl, token).catch(() => null),
-        probeDeviceStatus({ baseUrl, token, roomId }, 5000).catch(() => null),
-      ])
-      if (deviceGenRef.current !== gen) return
-      if (devRes) setAccountDevices(devRes.devices)
-      if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
-        if (!devRes && Array.isArray(meRes.devices)) setAccountDevices(meRes.devices)
-        setServerEmailEnabled(Boolean(meRes.emailEnabled))
-        if (meRes.turnQuota) setTurnQuota(meRes.turnQuota)
-        setDeviceState((prev) =>
-          updateDeviceMeta(prev, targetDeviceId, {
-            ...(meRes.username ? { username: meRes.username } : {}),
-            ...(meRes.role ? { role: meRes.role } : {}),
-            ...(meRes.tier ? { tier: meRes.tier } : {}),
-            email: meRes.email || '',
-            loginEmail2fa: Boolean(meRes.loginEmail2fa),
-          }),
-        )
-      }
-    } catch {}
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId])
-
-  // Single unified account status probe on mount/switch/token refresh/settings open (keeps TURN quota usage fresh)
-  useEffect(() => {
-    const devId = activeDevice?.id
-    const baseUrl = activeDevice?.baseUrl
-    const token = activeDevice?.token
-    const roomId = activeDevice?.roomId || ''
-    if (!devId || !baseUrl || !token) {
-      setServerEmailEnabled(false)
-      return
-    }
-    let cancelled = false
-    probeDeviceStatus({ baseUrl, token, roomId }, 5000)
-      .then((res) => {
-        if (cancelled || !res || res.status === 'expired' || res.status === 'unreachable') return
-        if (Array.isArray(res.devices)) setAccountDevices(res.devices)
-        setServerEmailEnabled(Boolean(res.emailEnabled))
-        if (res.turnQuota) setTurnQuota(res.turnQuota)
-        setDeviceState((prev) =>
-          updateDeviceMeta(prev, devId, {
-            ...(res.username ? { username: res.username } : {}),
-            ...(res.role ? { role: res.role } : {}),
-            ...(res.tier ? { tier: res.tier } : {}),
-            email: res.email || '',
-            loginEmail2fa: Boolean(res.loginEmail2fa),
-          }),
-        )
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, activeDevice?.roomId, settingsOpen])
-
-  const handleSendBindEmailCode = useCallback(
-    async (targetEmail) => {
-      if (!activeDevice?.baseUrl || !activeDevice?.token) {
-        throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
-      }
-      return sendEmailVerificationCode(activeDevice.baseUrl, {
-        purpose: 'bind',
-        email: targetEmail,
-        token: activeDevice.token,
-      })
-    },
-    [activeDevice?.baseUrl, activeDevice?.token],
-  )
-
-  const handleBindAccountEmail = useCallback(
-    async (targetEmail, code, currentPassword = '') => {
-      if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) {
-        throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
-      }
-      const user = await bindAccountEmail(activeDevice.baseUrl, activeDevice.token, {
-        email: targetEmail,
-        code,
-        currentPassword,
-      })
-      const boundEmail = user?.email || targetEmail
-      setDeviceState((prev) => updateDeviceMeta(prev, activeDevice.id, { email: boundEmail }))
-      showToast(biLang(getCurrentLang(), `已绑定邮箱 ${boundEmail}`, `Linked email ${boundEmail}`))
-      return user
-    },
-    [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
-  )
-
-  const handleToggleLoginEmail2fa = useCallback(
-    async (enabled, currentPassword = '') => {
-      if (!activeDevice?.id || !activeDevice?.baseUrl || !activeDevice?.token) return
-      try {
-        const user = await setAccountLogin2fa(
-          activeDevice.baseUrl,
-          activeDevice.token,
-          enabled,
-          currentPassword,
-        )
-        setDeviceState((prev) =>
-          updateDeviceMeta(prev, activeDevice.id, { loginEmail2fa: Boolean(user?.loginEmail2fa) }),
-        )
-        const curLang = getCurrentLang()
-        showToast(
-          user?.loginEmail2fa
-            ? biLang(curLang, '已开启登录邮箱二次验证', 'Email login 2FA enabled')
-            : biLang(curLang, '已关闭登录邮箱二次验证', 'Email login 2FA disabled'),
-        )
-      } catch (err) {
-        if (!enabled) {
-          throw err
-        }
-        showToast(String(err?.message || err))
-      }
-    },
-    [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, showToast],
-  )
-
-  const handleImportE2eeKey = useCallback(
-    async (rawKey, keyId, { applyToDesktopBridge = false } = {}) => {
-      if (!activeDevice?.id || !rawKey || !keyId) return
-      let finalKey = rawKey
-      let finalKeyId = String(keyId).trim().toLowerCase()
-      if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId) {
-        const res = await desktopApi.setE2eeKey(activeDevice.roomId, rawKey)
-        if (res?.key && res?.keyId) {
-          finalKey = res.key
-          finalKeyId = String(res.keyId).trim().toLowerCase()
-        }
-        const st = await desktopApi.getBridgeStatus?.().catch(() => null)
-        if (st) setDesktopBridge(st)
-      }
-      const nextKeys = {
-        ...(activeDevice.e2eeKeys || {}),
-        [finalKeyId]: finalKey,
-      }
-      clientRef.current?.setE2eeKeys(nextKeys)
-      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, finalKeyId, finalKey))
-      showToast(
-        biLang(
-          getCurrentLang(),
-          `端到端密钥已同步 (${formatE2eeFingerprint(finalKeyId).slice(0, 9)})`,
-          `E2EE key synced (${formatE2eeFingerprint(finalKeyId).slice(0, 9)})`,
-        ),
-      )
-    },
-    [activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, desktopApi, showToast],
-  )
-
-  const handleImportE2eeKeyring = useCallback(
-    async (entries = [], preferredKeyId = '', { applyToDesktopBridge = false, approverName = '' } = {}) => {
-      if (!activeDevice?.id || !Array.isArray(entries) || entries.length === 0) return
-      const validEntries = entries
-        .filter((e) => e?.keyId && e?.key)
-        .map((e) => ({ keyId: String(e.keyId).trim().toLowerCase(), key: e.key }))
-      if (validEntries.length === 0) return
-
-      const normPreferred = String(preferredKeyId || '').trim().toLowerCase()
-      const preferred =
-        validEntries.find((e) => e.keyId === normPreferred) || validEntries[0]
-
-      const nextKeys = { ...(activeDevice.e2eeKeys || {}) }
-      for (const item of validEntries) {
-        delete nextKeys[item.keyId]
-        nextKeys[item.keyId] = item.key
-      }
-
-      let desktopKeyEntry = null
-      if (applyToDesktopBridge && desktopApi?.setE2eeKey && activeDevice?.roomId && preferred?.key) {
-        const res = await desktopApi.setE2eeKey(activeDevice.roomId, preferred.key)
-        if (res?.key && res?.keyId) {
-          const desktopKid = String(res.keyId).trim().toLowerCase()
-          delete nextKeys[desktopKid]
-          nextKeys[desktopKid] = res.key
-          desktopKeyEntry = { keyId: desktopKid, key: res.key }
-        }
-        const st = await desktopApi.getBridgeStatus?.().catch(() => null)
-        if (st) setDesktopBridge(st)
-      }
-
-      clientRef.current?.setE2eeKeys(nextKeys)
-      setDeviceState((prev) => {
-        let next = prev
-        for (const item of validEntries) {
-          next = upsertDeviceE2eeKey(next, activeDevice.id, item.keyId, item.key)
-        }
-        if (desktopKeyEntry) {
-          next = upsertDeviceE2eeKey(next, activeDevice.id, desktopKeyEntry.keyId, desktopKeyEntry.key)
-        }
-        if (preferred?.keyId && preferred?.key) {
-          next = upsertDeviceE2eeKey(next, activeDevice.id, preferred.keyId, preferred.key)
-        }
-        return next
-      })
-      showToast(
-        approverName
-          ? biLang(
-              getCurrentLang(),
-              `已通过「${approverName}」安全同步 ${validEntries.length} 把端到端密钥`,
-              `Synced ${validEntries.length} E2EE key(s) via ${approverName}`,
-            )
-          : biLang(
-              getCurrentLang(),
-              `已安全同步 ${validEntries.length} 把端到端密钥`,
-              `Synced ${validEntries.length} E2EE key(s)`,
-            ),
-      )
-    },
-    [activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, desktopApi, showToast],
-  )
-
-  const handleScanGrantQr = useCallback(
-    async (grantQr) => {
-      if (!grantQr?.reqId || !grantQr?.pubKeyFp || !clientRef.current) return false
-      const list = await clientRef.current.listGrantRequests(5000)
-      const match = (Array.isArray(list) ? list : []).find((g) => g.reqId === grantQr.reqId)
-      if (!match || !match.pubKey) return false
-      if (activeDevice?.roomId && match.roomId && match.roomId !== activeDevice.roomId) {
-        throw new Error(biLang(getCurrentLang(), '该授权请求属于其他账号', 'Grant request belongs to a different account'))
-      }
-      const computedFp = await computeGrantPubKeyFp(match.pubKey)
-      if (computedFp !== String(grantQr.pubKeyFp).toLowerCase()) {
-        throw new Error(
-          biLang(
-            getCurrentLang(),
-            '安全校验失败：二维码公钥指纹不匹配，可能存在中间人攻击，已拒绝授权！',
-            'Security verification failed: QR public key fingerprint mismatch!',
-          ),
-        )
-      }
-      setPendingGrantPopup({
-        ...match,
-        qrVerified: true,
-        qrPubKeyFp: grantQr.pubKeyFp,
-        qrGrantSecret: grantQr.grantSecret || '',
-      })
-      return true
-    },
-    [activeDevice?.roomId],
-  )
-
-  const handleRotateDesktopE2eeKey = useCallback(async () => {
-    if (!desktopApi?.rotateE2eeKey || !activeDevice?.id || !activeDevice?.roomId) return
-    const res = await desktopApi.rotateE2eeKey(activeDevice.roomId)
-    if (res?.key && res?.keyId) {
-      const nextKid = String(res.keyId).trim().toLowerCase()
-      const nextKeys = {
-        ...(activeDevice.e2eeKeys || {}),
-        [nextKid]: res.key,
-      }
-      clientRef.current?.setE2eeKeys(nextKeys)
-      setDeviceState((prev) => upsertDeviceE2eeKey(prev, activeDevice.id, nextKid, res.key))
-    }
-    const st = await desktopApi.getBridgeStatus?.().catch(() => null)
-    if (st) setDesktopBridge(st)
-    void clearE2eeMediaCache({ persistent: true, roomId: activeDevice.roomId })
-    showToast(biLang(getCurrentLang(), '已轮换端到端密钥并重启本机桥接', 'Rotated E2EE key and restarted local bridge'))
-  }, [desktopApi, activeDevice?.id, activeDevice?.roomId, activeDevice?.e2eeKeys, showToast])
-
-  const handleRemoveDevice = useCallback(async (deviceId, { revokeAll = false } = {}) => {
-    const target = devices.find((d) => d.id === deviceId)
-    if (target?.baseUrl && target?.token) {
-      try {
-        if (revokeAll) {
-          await revokeDeviceSessions(target.baseUrl, target.token)
-        } else {
-          await logoutDeviceSession(target.baseUrl, target.token)
-        }
-      } catch {}
-    }
-    const removingActive = activeDevice?.id === deviceId
-    const removingLast = devices.length <= 1
-    void clearSessionCache(deviceId, { prefix: true })
-    if (target?.roomId) {
-      void clearE2eeMediaCache({ persistent: true, roomId: target.roomId })
-    }
-    clearDraftsForScope(deviceId)
-    if (removingActive) {
-      resetTransientWorkspace()
-      setBridges([])
-    }
-    if (removingLast) {
-      setDeviceSwitcherOpen(false)
-      setDrawerOpen(false)
-    }
-    setDeviceState((prev) => removeDevice(prev, deviceId))
-    if (target) {
-      const curLang = getCurrentLang()
-      const name = getDeviceDisplayName(target, null, curLang)
-      showToast(
-        revokeAll
-          ? biLang(curLang, `已吊销 ${name} 全部设备凭证并移除`, `Revoked all sessions and removed ${name}`)
-          : biLang(curLang, `已移除 ${name}`, `Removed ${name}`),
-      )
-    }
-  }, [activeDevice?.id, devices, resetTransientWorkspace, showToast])
+  const {
+    handleImportE2eeKey,
+    handleImportE2eeKeyring,
+    handleScanGrantQr,
+    handleRotateDesktopE2eeKey,
+  } = useE2eeActions({
+    activeDeviceRef,
+    clientRef,
+    desktopApi,
+    setDeviceState,
+    setDesktopBridge,
+    setPendingGrantPopup,
+    showToast,
+  })
 
   const handleCreateSession = async ({ app, cwd, title, model, provider, reasoningEffort }) => {
     const client = clientRef.current
@@ -2718,45 +2112,50 @@ export function App() {
       ts: Date.now(),
     }
     const wireAttachments = validAtts.map(({ localPreviewUrl: _drop, ...rest }) => rest)
-    const baseMessages = createdJustNow ? [] : messagesRef.current
+    const isTargetStillActive = activeSessionRef.current?.id === target.id
     const baseHistoryMeta = createdJustNow
       ? { hasMore: false, nextCursor: null, totalCount: 0 }
-      : historyMetaRef.current
-    const nextWithUser = [...baseMessages, userMsg]
-    messagesRef.current = nextWithUser
-    setMessages((prev) => {
-      const base = createdJustNow ? [] : prev
-      const next = base.some((m) => m.id === userMsg.id) ? base : [...base, userMsg]
-      messagesRef.current = next
-      return next
-    })
-    void saveCachedSession(
-      target.id,
-      {
-        meta: target,
-        messages: nextWithUser,
-        hasMore: baseHistoryMeta.hasMore,
-        nextCursor: baseHistoryMeta.nextCursor,
-        totalCount: baseHistoryMeta.totalCount,
-      },
-      scope,
-    )
+      : isTargetStillActive
+        ? historyMetaRef.current
+        : { hasMore: false, nextCursor: null, totalCount: null }
 
-    const startNow = Date.now()
-    const initStream = {
-      active: true,
-      text: '',
-      thinking: '',
-      tools: [],
-      error: '',
-      startedAt: startNow,
-      lastDeltaAt: startNow,
+    if (isTargetStillActive) {
+      const baseMessages = createdJustNow ? [] : messagesRef.current
+      const nextWithUser = baseMessages.some((m) => m.id === userMsg.id)
+        ? baseMessages
+        : [...baseMessages, userMsg]
+      messagesRef.current = nextWithUser
+      setMessages((prev) => {
+        const base = createdJustNow ? [] : prev
+        return base.some((m) => m.id === userMsg.id) ? base : [...base, userMsg]
+      })
+      void saveCachedSession(
+        target.id,
+        {
+          meta: target,
+          messages: nextWithUser,
+          hasMore: baseHistoryMeta.hasMore,
+          nextCursor: baseHistoryMeta.nextCursor,
+          totalCount: baseHistoryMeta.totalCount,
+        },
+        scope,
+      )
+    } else {
+      // User switched sessions while SESSION_CREATE was in flight: persist optimistic bubble to target's cache only
+      void saveCachedSession(
+        target.id,
+        {
+          meta: target,
+          messages: [userMsg],
+          hasMore: false,
+          nextCursor: null,
+          totalCount: 1,
+        },
+        scope,
+      )
     }
-    liveStreamMapRef.current[target.id] = initStream
-    setStreamingBySession((prev) => ({
-      ...prev,
-      [target.id]: initStream,
-    }))
+
+    const initStream = startStream(target.id)
 
     try {
       await client.rpc(
@@ -2777,20 +2176,9 @@ export function App() {
       return true
     } catch (err) {
       if (deviceGenRef.current !== gen) return true
-      const streamUntouched = liveStreamMapRef.current[target.id] === initStream
+      const streamUntouched = getRawStream(target.id) === initStream
       if (streamUntouched) {
-        const errEntry = {
-          active: false,
-          text: '',
-          thinking: '',
-          tools: [],
-          error: String(err?.message || err),
-        }
-        liveStreamMapRef.current[target.id] = errEntry
-        setStreamingBySession((prev) => ({
-          ...prev,
-          [target.id]: errEntry,
-        }))
+        failStream(target.id, String(err?.message || err), { keepPartial: false })
         // Return preview URL ownership back to Composer and roll back unsent optimistic bubble
         for (const a of imgAtts) {
           if (a?.localPreviewUrl) sentPreviewUrlsRef.current.delete(a.localPreviewUrl)
@@ -2799,11 +2187,7 @@ export function App() {
         if (stillOnTarget) {
           const rolledBack = messagesRef.current.filter((m) => m?.id !== userMsg.id)
           messagesRef.current = rolledBack
-          setMessages((prev) => {
-            const next = prev.filter((m) => m?.id !== userMsg.id)
-            messagesRef.current = next
-            return next
-          })
+          setMessages((prev) => prev.filter((m) => m?.id !== userMsg.id))
           void saveCachedSession(
             target.id,
             {
@@ -2856,13 +2240,13 @@ export function App() {
       )
       if (deviceGenRef.current !== gen) return
       if (res?.interrupted === false) {
-        clearLiveStreamEntry(sid)
+        clearStream(sid)
         setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
         void syncActiveSessionQuietly(sid)
       }
     } catch {
       if (deviceGenRef.current !== gen) return
-      clearLiveStreamEntry(sid)
+      clearStream(sid)
       setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, status: 'idle' } : s)))
       void syncActiveSessionQuietly(sid)
     }
@@ -2913,22 +2297,27 @@ export function App() {
     }
   }
 
+  // Subscribe ONLY to active boolean transitions (start/stop) — zero App re-renders per streamed token!
+  const activeSessionStreaming = useSessionStreamingActive(activeSession?.id || '')
+
   if (!activeDevice || addingDevice.open) {
     return (
-      <LoginScreen
-        isAddingDevice={Boolean(activeDevice && addingDevice.open)}
-        initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
-        darkMode={darkMode}
-        onToggleDark={() => setDarkMode((v) => !v)}
-        onCancel={
-          activeDevice
-            ? () => {
-                setAddingDevice({ open: false, serverUrl: '' })
-              }
-            : null
-        }
-        onSuccess={handleDeviceAuthenticated}
-      />
+      <Suspense fallback={null}>
+        <LoginScreen
+          isAddingDevice={Boolean(activeDevice && addingDevice.open)}
+          initialServerUrl={addingDevice.serverUrl || activeDevice?.baseUrl || ''}
+          darkMode={darkMode}
+          onToggleDark={() => setDarkMode((v) => !v)}
+          onCancel={
+            activeDevice
+              ? () => {
+                  setAddingDevice({ open: false, serverUrl: '' })
+                }
+              : null
+          }
+          onSuccess={handleDeviceAuthenticated}
+        />
+      </Suspense>
     )
   }
 
@@ -2940,7 +2329,6 @@ export function App() {
       m.id === activeModelPref.model &&
       (!activeModelPref.provider || !m.provider || m.provider === activeModelPref.provider),
   ) || (activeCatalog?.models || []).find((m) => m.id === activeModelPref.model)
-  const currentStream = activeSession ? streamingBySession[activeSession.id] : null
 
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const currentWorkspaceLabel = activeSession
@@ -3034,7 +2422,7 @@ export function App() {
                 app={activeApp}
                 size="xs"
                 active={Boolean(
-                  currentStream?.active ||
+                  activeSessionStreaming ||
                     activeSession?.status === 'running' ||
                     activeSession?.syncState?.externalRunning,
                 )}
@@ -3412,7 +2800,6 @@ export function App() {
       <ChatView
         session={activeSession}
         messages={messages}
-        streamingState={currentStream}
         loadingSession={loadingSession}
         hasMoreHistory={historyMeta.hasMore}
         loadingOlder={loadingOlder}
@@ -3561,7 +2948,7 @@ export function App() {
             key={activeDevice?.id || 'none'}
             draftKey={makeDraftKey(cacheScope, activeSession?.id, activeApp)}
             activeApp={activeApp}
-            streaming={Boolean(currentStream?.active)}
+            streaming={activeSessionStreaming}
             disabled={!bridgeOnline || connState !== 'connected' || e2eeLocked}
             needsWorkspace={!activeSession && !selectedDraftCwd}
             targetWorkspaceName={!activeSession ? (selectedDraftWorkspaceObj?.name || '') : ''}
@@ -3726,6 +3113,8 @@ export function App() {
             }
             onOpenDesktopLog={desktopApi ? () => { void desktopApi.openLog?.() } : null}
             updateState={updateState}
+            otaInfo={otaInfo}
+            onResetOtaBundle={handleResetOtaBundle}
             onCheckUpdate={
               desktopApi
                 ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) }

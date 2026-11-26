@@ -21,6 +21,7 @@ import {
   fetchE2eeDeliverableFile,
   getCachedDeliverableFile,
   shareDeliverableFile,
+  streamExportDeliverableDirect,
   triggerDeliverableDownload,
 } from '../lib/e2eeFiles.js'
 import { formatBytesCompact } from '../lib/sessionCache.js'
@@ -100,6 +101,16 @@ function DeliverableCard({ file, imageContext }) {
     setErrorMsg('')
     setDoneAction('')
     try {
+      // On Android with native streaming export, stream uncached download/share directly to MediaStore (zero JS heap OOM!)
+      if (action !== 'preview' && !getCachedDeliverableFile(file.path, imageContext)) {
+        const streamed = await streamExportDeliverableDirect(file.path, imageContext, {
+          mode: action === 'share' ? 'share' : 'save',
+        })
+        if (streamed) {
+          setDoneAction(action === 'share' ? 'share' : 'download')
+          return
+        }
+      }
       const entry = await fetchE2eeDeliverableFile(file.path, imageContext)
       if (entry.size) setSizeBytes(entry.size)
       if (action === 'preview') {
@@ -286,7 +297,7 @@ function DeliverableCard({ file, imageContext }) {
  * Renders lightweight on-demand E2EE deliverable file cards below assistant messages.
  * Zero automatic file transfer on render — bytes are only fetched when the user taps Download/Preview.
  */
-export function ChatDeliverableList({ files = [], imageContext }) {
+export const ChatDeliverableList = React.memo(function ChatDeliverableList({ files = [], imageContext }) {
   if (!Array.isArray(files) || files.length === 0) return null
   return (
     <div className="mt-2.5 space-y-2">
@@ -295,4 +306,4 @@ export function ChatDeliverableList({ files = [], imageContext }) {
       ))}
     </div>
   )
-}
+})

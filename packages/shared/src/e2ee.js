@@ -163,9 +163,9 @@ export async function inflateRawBytes(input, maxBytes = MAX_INFLATE_JSON_BYTES) 
   return concatUint8Arrays(parts, total)
 }
 
-async function packJsonBytes(data) {
+async function packJsonBytes(data, { compress = true } = {}) {
   const utf8 = textEncoder.encode(JSON.stringify(data))
-  if (utf8.byteLength >= COMPRESS_MIN_BYTES && isDeflateAvailable()) {
+  if (compress && utf8.byteLength >= COMPRESS_MIN_BYTES && isDeflateAvailable()) {
     try {
       const deflated = await deflateRawBytes(utf8)
       if (deflated.byteLength + 16 < utf8.byteLength) {
@@ -217,6 +217,13 @@ async function unpackJsonBytes(plainBytes) {
 /** @type {Map<string, Promise<{ cryptoKey: CryptoKey, keyId: string, keyIdBytes: Uint8Array }>>} */
 const keyCache = new Map()
 const MAX_KEY_CACHE = 32
+
+/**
+ * Evict all cached CryptoKey handles (e.g. on logout or key rotation).
+ */
+export function clearKeyCache() {
+  keyCache.clear()
+}
 
 export function isE2eeCryptoAvailable() {
   return Boolean(globalThis.crypto?.subtle && globalThis.crypto?.getRandomValues)
@@ -332,41 +339,48 @@ async function importCachedKey(rawKeyStr) {
     err.code = 'E2EE_UNAVAILABLE'
     throw err
   }
-  let entry = keyCache.get(normalized)
-  if (!entry) {
-    if (keyCache.size >= MAX_KEY_CACHE) {
-      const oldest = keyCache.keys().next().value
-      if (oldest) keyCache.delete(oldest)
-    }
-    entry = (async () => {
-      const rawBytes = base64UrlToBytes(normalized)
-      const prefix = textEncoder.encode('allinone-e2ee-v1-id:')
-      const idInput = new Uint8Array(prefix.length + rawBytes.length)
-      idInput.set(prefix, 0)
-      idInput.set(rawBytes, prefix.length)
-      try {
-        const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', idInput))
-        const keyIdBytes = digest.slice(0, 8)
-        const keyId = bytesToHex(keyIdBytes)
-        const cryptoKey = await globalThis.crypto.subtle.importKey(
-          'raw',
-          rawBytes,
-          { name: 'AES-GCM', length: 256 },
-          false,
-          ['encrypt', 'decrypt'],
-        )
-        return { cryptoKey, keyId, keyIdBytes }
-      } finally {
-        rawBytes.fill(0)
-        idInput.fill(0)
+  const rawBytes = base64UrlToBytes(normalized)
+  const prefix = textEncoder.encode('allinone-e2ee-v1-id:')
+  const idInput = new Uint8Array(prefix.length + rawBytes.length)
+  idInput.set(prefix, 0)
+  idInput.set(rawBytes, prefix.length)
+  try {
+    // Key cache is indexed by non-reversible SHA-256 digest — never retains plaintext key strings
+    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', idInput))
+    const cacheKey = bytesToHex(digest)
+    let entry = keyCache.get(cacheKey)
+    if (!entry) {
+      if (keyCache.size >= MAX_KEY_CACHE) {
+        const oldest = keyCache.keys().next().value
+        if (oldest) keyCache.delete(oldest)
       }
-    })()
-    keyCache.set(normalized, entry)
-    entry.catch(() => {
-      if (keyCache.get(normalized) === entry) keyCache.delete(normalized)
-    })
+      const keyIdBytes = digest.slice(0, 8)
+      const keyId = bytesToHex(keyIdBytes)
+      const keyBytesCopy = rawBytes.slice()
+      entry = (async () => {
+        try {
+          const cryptoKey = await globalThis.crypto.subtle.importKey(
+            'raw',
+            keyBytesCopy,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt', 'decrypt'],
+          )
+          return { cryptoKey, keyId, keyIdBytes }
+        } finally {
+          keyBytesCopy.fill(0)
+        }
+      })()
+      keyCache.set(cacheKey, entry)
+      entry.catch(() => {
+        if (keyCache.get(cacheKey) === entry) keyCache.delete(cacheKey)
+      })
+    }
+    return await entry
+  } finally {
+    rawBytes.fill(0)
+    idInput.fill(0)
   }
-  return entry
 }
 
 export async function computeE2eeKeyId(rawKeyStr) {
@@ -803,10 +817,21 @@ export async function decryptChunkedStream(
 /**
  * Automatically decrypt either v1 single-shot AES-GCM (`encryptBytes`) or v2 `AIO2` chunked streams.
  */
+const DEFAULT_MAX_NON_CHUNKED_BYTES = 64 * 1024 * 1024
+
 export async function decryptAutoStream(
   rawKeyStr,
   streamOrBytes,
-  { iv, kid = '', kind = 'upload', roomId = '', chunked = false, compressed = false, onPlainChunk = null } = {},
+  {
+    iv,
+    kid = '',
+    kind = 'upload',
+    roomId = '',
+    chunked = false,
+    compressed = false,
+    maxNonChunkedBytes = DEFAULT_MAX_NON_CHUNKED_BYTES,
+    onPlainChunk = null,
+  } = {},
 ) {
   if (chunked) {
     return decryptChunkedStream(rawKeyStr, streamOrBytes, { iv, kid, kind, roomId, compressed, onPlainChunk })
@@ -871,9 +896,18 @@ export async function decryptAutoStream(
 
     const parts = []
     let total = 0
+    const nonChunkedCap =
+      Number.isFinite(Number(maxNonChunkedBytes)) && Number(maxNonChunkedBytes) > 0
+        ? Math.floor(Number(maxNonChunkedBytes))
+        : DEFAULT_MAX_NON_CHUNKED_BYTES
     for await (const c of replayStream) {
-      parts.push(c)
       total += c.byteLength
+      if (total > nonChunkedCap) {
+        const err = new Error('单块端到端密文超出安全内存上限，请使用 AIO2 分块传输')
+        err.code = 'E2EE_DECRYPT_FAILED'
+        throw err
+      }
+      parts.push(c)
     }
     const full = new Uint8Array(total)
     let pos = 0
@@ -892,8 +926,10 @@ export async function decryptAutoStream(
   }
 }
 
-export async function encryptJson(rawKeyStr, data, { kind = 'msg', roomId = '' } = {}) {
-  const plainBytes = await packJsonBytes(data)
+export async function encryptJson(rawKeyStr, data, { kind = 'msg', roomId = '', compress } = {}) {
+  // Never compress relay-visible signaling envelopes (avoids CRIME/BREACH length side-channels)
+  const allowCompress = compress !== undefined ? Boolean(compress) : kind !== 'p2p.signal'
+  const plainBytes = await packJsonBytes(data, { compress: allowCompress })
   const { v, kid, iv, ciphertext } = await encryptBytes(rawKeyStr, plainBytes, { kind, roomId })
   return {
     v,
@@ -948,11 +984,12 @@ export function parseBinaryE2eeHeader(rawBytes) {
  * Compress (`deflate-raw` when >= 512 B) and AES-256-GCM encrypt a JSON payload into a raw binary
  * envelope with ZERO Base64URL overhead (used over P2P `aio-ctrl`).
  */
-export async function encryptBinaryJson(rawKeyStr, data, { kind = 'msg', roomId = '' } = {}) {
+export async function encryptBinaryJson(rawKeyStr, data, { kind = 'msg', roomId = '', compress } = {}) {
   const { cryptoKey, keyId, keyIdBytes } = await importCachedKey(rawKeyStr)
   const iv = new Uint8Array(E2EE_IV_BYTES)
   globalThis.crypto.getRandomValues(iv)
-  const plainBytes = await packJsonBytes(data)
+  const allowCompress = compress !== undefined ? Boolean(compress) : kind !== 'p2p.signal'
+  const plainBytes = await packJsonBytes(data, { compress: allowCompress })
   const aad = buildAad({ kind, roomId, keyId })
   const cipherBuf = await globalThis.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
@@ -1146,8 +1183,8 @@ async function importGrantPublicKey(publicKeyRaw) {
 }
 
 /**
- * Derive a 6-digit Short Authentication String (SAS, e.g. "482-917") bound to BOTH
- * ephemeral public keys, the one-shot request ID, and the account room ID.
+ * Derive an unbiased 6-digit Short Authentication String (SAS, e.g. "482-917") bound to BOTH
+ * ephemeral public keys, both commit-then-reveal nonces, the one-shot request ID, and the account room ID.
  * Both devices compute this independently; matching codes defeat active MITM by a compromised relay.
  */
 export async function deriveGrantSas({
@@ -1164,15 +1201,33 @@ export async function deriveGrantSas({
   const cleanReq = String(reqId || '').trim()
   const cleanReqNonce = String(requesterNonce || '').trim()
   const cleanAppNonce = String(approverNonce || '').trim()
+  if (!cleanReqNonce || !cleanAppNonce) {
+    const err = new Error('安全码校验要求双端 Commit-then-Reveal 随机数（不再支持旧版降级）')
+    err.code = 'E2EE_GRANT_NONCE_REQUIRED'
+    throw err
+  }
   const material = textEncoder.encode(
-    cleanReqNonce || cleanAppNonce
-      ? `allinone-e2ee-grant-sas-v2|${cleanRoom}|${cleanReq}|${reqFp}|${appFp}|${cleanReqNonce}|${cleanAppNonce}`
-      : `allinone-e2ee-grant-sas-v1|${cleanRoom}|${cleanReq}|${reqFp}|${appFp}`,
+    `allinone-e2ee-grant-sas-v2|${cleanRoom}|${cleanReq}|${reqFp}|${appFp}|${cleanReqNonce}|${cleanAppNonce}`,
   )
-  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', material))
-  // Uniformly map 32-bit unsigned integer into 6 decimal digits (000000..999999)
-  const num =
-    (((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0) % 1_000_000
+  // Rejection sampling across 32-bit unsigned chunks eliminates modulo bias (< 4_294_000_000)
+  const REJECTION_LIMIT = 4_294_000_000
+  let digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', material))
+  let num = -1
+  for (let round = 0; round < 8 && num === -1; round += 1) {
+    if (round > 0) {
+      digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', digest))
+    }
+    for (let off = 0; off <= digest.length - 4; off += 4) {
+      const u32 = ((digest[off] << 24) | (digest[off + 1] << 16) | (digest[off + 2] << 8) | digest[off + 3]) >>> 0
+      if (u32 < REJECTION_LIMIT) {
+        num = u32 % 1_000_000
+        break
+      }
+    }
+  }
+  if (num === -1) {
+    num = (((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0) % 1_000_000
+  }
   const digits = String(num).padStart(6, '0')
   return `${digits.slice(0, 3)}-${digits.slice(3)}`
 }
@@ -1185,6 +1240,8 @@ async function deriveGrantAesKey({
   reqFp,
   appFp,
   grantSecret = '',
+  requesterNonce = '',
+  approverNonce = '',
 }) {
   const peerPub = await importGrantPublicKey(peerPublicKeyRaw)
   const sharedBits = await globalThis.crypto.subtle.deriveBits(
@@ -1192,25 +1249,33 @@ async function deriveGrantAesKey({
     localPrivateKey,
     256,
   )
-  const hkdfBase = await globalThis.crypto.subtle.importKey(
-    'raw',
-    sharedBits,
-    { name: 'HKDF' },
-    false,
-    ['deriveKey'],
-  )
-  const cleanSecret = String(grantSecret || '').trim()
-  const salt = textEncoder.encode(`allinone-e2ee-grant-salt-v1|${String(reqId || '').trim()}`)
-  const info = textEncoder.encode(
-    `allinone-e2ee-grant-aes-v1|${String(roomId || '').trim()}|${reqFp}|${appFp}${cleanSecret ? `|qr:${cleanSecret}` : ''}`,
-  )
-  return globalThis.crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info },
-    hkdfBase,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt'],
-  )
+  const sharedView = new Uint8Array(sharedBits)
+  try {
+    const hkdfBase = await globalThis.crypto.subtle.importKey(
+      'raw',
+      sharedView,
+      { name: 'HKDF' },
+      false,
+      ['deriveKey'],
+    )
+    const cleanSecret = String(grantSecret || '').trim()
+    const cleanReqNonce = String(requesterNonce || '').trim()
+    const cleanAppNonce = String(approverNonce || '').trim()
+    const nonceSuffix = cleanReqNonce && cleanAppNonce ? `|n:${cleanReqNonce}|${cleanAppNonce}` : ''
+    const salt = textEncoder.encode(`allinone-e2ee-grant-salt-v1|${String(reqId || '').trim()}`)
+    const info = textEncoder.encode(
+      `allinone-e2ee-grant-aes-v1|${String(roomId || '').trim()}|${reqFp}|${appFp}${cleanSecret ? `|qr:${cleanSecret}` : ''}${nonceSuffix}`,
+    )
+    return await globalThis.crypto.subtle.deriveKey(
+      { name: 'HKDF', hash: 'SHA-256', salt, info },
+      hkdfBase,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt'],
+    )
+  } finally {
+    sharedView.fill(0)
+  }
 }
 
 export async function encryptGrantPayload({
@@ -1221,10 +1286,14 @@ export async function encryptGrantPayload({
   roomId = '',
   payload,
   grantSecret = '',
+  requesterNonce = '',
+  approverNonce = '',
 }) {
   const cleanReqId = String(reqId || '').trim()
   const cleanRoomId = String(roomId || '').trim()
   const cleanSecret = String(grantSecret || '').trim()
+  const cleanReqNonce = String(requesterNonce || '').trim()
+  const cleanAppNonce = String(approverNonce || '').trim()
   const reqFp = await computeGrantPubKeyFp(requesterPubKeyRaw)
   const appFp = await computeGrantPubKeyFp(approverPubKeyRaw)
   const aesKey = await deriveGrantAesKey({
@@ -1235,11 +1304,14 @@ export async function encryptGrantPayload({
     reqFp,
     appFp,
     grantSecret: cleanSecret,
+    requesterNonce: cleanReqNonce,
+    approverNonce: cleanAppNonce,
   })
   const iv = new Uint8Array(E2EE_IV_BYTES)
   globalThis.crypto.getRandomValues(iv)
+  const nonceAad = cleanReqNonce && cleanAppNonce ? `|n:${cleanReqNonce}|${cleanAppNonce}` : ''
   const aad = textEncoder.encode(
-    `allinone-e2ee-grant-aad-v1|${cleanRoomId}|${cleanReqId}|${reqFp}|${appFp}${cleanSecret ? '|qr' : ''}`,
+    `allinone-e2ee-grant-aad-v1|${cleanRoomId}|${cleanReqId}|${reqFp}|${appFp}${cleanSecret ? '|qr' : ''}${nonceAad}`,
   )
   const plainBytes = textEncoder.encode(JSON.stringify(payload))
   const cipherBuf = await globalThis.crypto.subtle.encrypt(
@@ -1265,6 +1337,8 @@ export async function decryptGrantPayload({
   expectedReqId = '',
   expectedApproverPubKey = '',
   grantSecret = '',
+  requesterNonce = '',
+  approverNonce = '',
 }) {
   if (!envelope || typeof envelope !== 'object' || envelope.v !== E2EE_VERSION || !envelope.approverPubKey || !envelope.iv || !envelope.ct) {
     const err = new Error('无效的设备授权密文包')
@@ -1285,6 +1359,8 @@ export async function decryptGrantPayload({
   }
   const cleanRoomId = String(roomId || '').trim()
   const cleanSecret = String(grantSecret || '').trim()
+  const cleanReqNonce = String(requesterNonce || '').trim()
+  const cleanAppNonce = String(approverNonce || '').trim()
   const reqFp = await computeGrantPubKeyFp(requesterPubKeyRaw)
   const appFp = await computeGrantPubKeyFp(envelope.approverPubKey)
   const aesKey = await deriveGrantAesKey({
@@ -1295,6 +1371,8 @@ export async function decryptGrantPayload({
     reqFp,
     appFp,
     grantSecret: cleanSecret,
+    requesterNonce: cleanReqNonce,
+    approverNonce: cleanAppNonce,
   })
   const ivBytes = typeof envelope.iv === 'string' ? base64UrlToBytes(envelope.iv, E2EE_IV_BYTES) : null
   const ctBytes = base64UrlToBytes(envelope.ct)
@@ -1303,8 +1381,9 @@ export async function decryptGrantPayload({
     err.code = 'E2EE_GRANT_DECRYPT_FAILED'
     throw err
   }
+  const nonceAad = cleanReqNonce && cleanAppNonce ? `|n:${cleanReqNonce}|${cleanAppNonce}` : ''
   const aad = textEncoder.encode(
-    `allinone-e2ee-grant-aad-v1|${cleanRoomId}|${cleanReqId}|${reqFp}|${appFp}${cleanSecret ? '|qr' : ''}`,
+    `allinone-e2ee-grant-aad-v1|${cleanRoomId}|${cleanReqId}|${reqFp}|${appFp}${cleanSecret ? '|qr' : ''}${nonceAad}`,
   )
   try {
     const plainBuf = await globalThis.crypto.subtle.decrypt(

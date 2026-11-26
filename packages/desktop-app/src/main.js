@@ -23,9 +23,11 @@ import {
 } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { readFile, stat } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { SANDBOX_PREVIEW_CSP } from '@allinone/shared'
 import { DesktopBridgeManager } from './bridge-manager.js'
 import { DesktopUpdater } from './updater.js'
 import { DesktopWebRtcProxy } from './webrtc-proxy.js'
@@ -210,14 +212,21 @@ const bridgeManager = new DesktopBridgeManager({
 function disposeBridgeOnce() {
   if (isDisposed) return Promise.resolve()
   if (!disposePromise) {
-    disposePromise = (async () => {
+    const work = (async () => {
       try {
         await bridgeManager.dispose()
       } catch {}
       try {
         await webrtcProxy.dispose()
       } catch {}
-    })().finally(() => {
+    })()
+    let timeoutHandle = null
+    const hardTimeout = new Promise((resolveTimeout) => {
+      timeoutHandle = setTimeout(resolveTimeout, 6_000)
+      timeoutHandle.unref?.()
+    })
+    disposePromise = Promise.race([work, hardTimeout]).finally(() => {
+      if (timeoutHandle) clearTimeout(timeoutHandle)
       isDisposed = true
     })
   }
@@ -275,13 +284,28 @@ function loadWindowBounds() {
   return { width: 1180, height: 780 }
 }
 
-function saveWindowBounds(win) {
+let boundsSaveTimer = null
+function saveWindowBoundsNow(win) {
+  if (boundsSaveTimer) {
+    clearTimeout(boundsSaveTimer)
+    boundsSaveTimer = null
+  }
   if (!win || win.isDestroyed() || win.isMinimized() || win.isFullScreen()) return
   try {
     const dir = app.getPath('userData')
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'window-bounds.json'), JSON.stringify(win.getBounds()), 'utf8')
   } catch {}
+}
+
+function saveWindowBounds(win) {
+  if (!win || win.isDestroyed() || win.isMinimized() || win.isFullScreen()) return
+  if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
+  boundsSaveTimer = setTimeout(() => {
+    boundsSaveTimer = null
+    saveWindowBoundsNow(win)
+  }, 300)
+  boundsSaveTimer.unref?.()
 }
 
 function showMainWindow() {
@@ -366,7 +390,7 @@ function createMainWindow({ showOnReady = true } = {}) {
 
   // Keep local PC bridge alive when closing window (hide to tray instead of quitting)
   win.on('close', (e) => {
-    saveWindowBounds(win)
+    saveWindowBoundsNow(win)
     if (!isQuitting) {
       e.preventDefault()
       win.hide()
@@ -375,6 +399,30 @@ function createMainWindow({ showOnReady = true } = {}) {
 
   win.on('resized', () => saveWindowBounds(win))
   win.on('moved', () => saveWindowBounds(win))
+
+  // Recover gracefully from Chromium renderer crashes / hangs (capped to prevent crash loops)
+  let crashReloads = 0
+  let lastCrashAt = 0
+  win.webContents.on('render-process-gone', (_ev, details) => {
+    if (isQuitting || win.isDestroyed()) return
+    const reason = String(details?.reason || 'gone')
+    if (reason === 'clean-exit') return
+    const now = Date.now()
+    if (now - lastCrashAt > 60_000) crashReloads = 0
+    lastCrashAt = now
+    crashReloads += 1
+    console.warn(`[desktop] renderer process ${reason} (attempt ${crashReloads})`)
+    if (crashReloads <= 3) {
+      setTimeout(() => {
+        if (!isQuitting && !win.isDestroyed()) {
+          void win.loadURL(devUrl || 'app://allinone/index.html').catch(() => {})
+        }
+      }, 600)
+    }
+  })
+  win.on('unresponsive', () => {
+    console.warn('[desktop] main window became unresponsive')
+  })
 
   let devUrl = ''
   let devOrigin = ''
@@ -607,7 +655,9 @@ function buildAppMenu() {
       label: bi('视图', 'View'),
       submenu: [
         { role: 'reload', label: bi('重新加载', 'Reload') },
-        { role: 'toggleDevTools', label: bi('开发者工具', 'Developer Tools') },
+        ...(!app.isPackaged || process.env.ALLINONE_DEBUG === '1'
+          ? [{ role: 'toggleDevTools', label: bi('开发者工具', 'Developer Tools') }]
+          : []),
         { type: 'separator' },
         { role: 'resetZoom', label: bi('实际大小', 'Actual Size') },
         { role: 'zoomIn', label: bi('放大', 'Zoom In') },
@@ -628,7 +678,7 @@ function buildAppMenu() {
 }
 
 function registerStaticProtocol() {
-  protocol.handle('app', (request) => {
+  protocol.handle('app', async (request) => {
     try {
       const url = new URL(request.url)
       if (url.hostname !== 'allinone') {
@@ -643,21 +693,25 @@ function registerStaticProtocol() {
       }
       let isFile = false
       try {
-        isFile = existsSync(target) && statSync(target).isFile()
+        isFile = (await stat(target)).isFile()
       } catch {
         isFile = false
       }
       if (!isFile) {
         if (extname(reqPath) === '') {
           target = join(RENDERER_DIR, 'index.html')
-          if (!existsSync(target) || !statSync(target).isFile()) {
+          try {
+            if (!(await stat(target)).isFile()) {
+              return new Response('Not Found', { status: 404 })
+            }
+          } catch {
             return new Response('Not Found', { status: 404 })
           }
         } else {
           return new Response('Not Found', { status: 404 })
         }
       }
-      const buf = readFileSync(target)
+      const buf = await readFile(target)
       const mime = MIME_TYPES[extname(target).toLowerCase()] || 'application/octet-stream'
       const headers = {
         'Content-Type': mime,
@@ -666,7 +720,7 @@ function registerStaticProtocol() {
       if (extname(target).toLowerCase() === '.html') {
         const isSandboxFrame = basename(target).toLowerCase() === 'sandbox-preview.html'
         headers['Content-Security-Policy'] = isSandboxFrame
-          ? "sandbox allow-scripts allow-forms; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'"
+          ? `sandbox allow-scripts allow-forms; ${SANDBOX_PREVIEW_CSP}`
           : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
       }
       return new Response(buf, {
@@ -901,13 +955,53 @@ function registerIpc() {
     if (!isFile) {
       return { ok: false, error: '目标路径不是文件' }
     }
-    return { ok: true, realPath }
+    // Constrain deliverable opens to cwd or user home/temp while blocking sensitive dot-directories & OS roots
+    const isUnderDir = (candidate, root) => {
+      if (!root) return false
+      try {
+        const rr = realpathSync(root)
+        const normC = process.platform === 'win32' ? candidate.toLowerCase() : candidate
+        const normR = process.platform === 'win32' ? rr.toLowerCase() : rr
+        return normC === normR || normC.startsWith(normR + sep)
+      } catch {
+        return false
+      }
+    }
+    const homeDir = homedir()
+    const sensitiveSubdirs = [
+      '.ssh',
+      '.gnupg',
+      '.aws',
+      '.kube',
+      '.allinone-bridge',
+      '.dsh',
+      '.codex',
+      '.claude',
+      '.workbuddy',
+      '.codebuddy',
+      '.gemini',
+    ]
+    for (const sub of sensitiveSubdirs) {
+      if (isUnderDir(realPath, join(homeDir, sub))) {
+        return { ok: false, error: '出于安全限制，禁止直接打开敏感配置目录中的文件' }
+      }
+    }
+    const allowedRoots = [cwd ? String(cwd).trim() : '', homeDir, app.getPath('temp')].filter(Boolean)
+    if (!allowedRoots.some((r) => isUnderDir(realPath, r))) {
+      return { ok: false, error: '出于安全限制，仅允许打开工作区或用户目录内的交付文件' }
+    }
+    return { ok: true, realPath, ext: realExt }
   }
 
   ipcMain.handle('desktop:open-deliverable', async (event, rawPath, cwd = '') => {
     assertTrustedIpcEvent(event)
     const check = resolveSafeDesktopDeliverable(rawPath, cwd, { allowHtml: false })
     if (!check.ok) return check
+    // Reveal archives in Finder/Explorer instead of auto-extracting untrusted .zip payloads
+    if (check.ext === '.zip') {
+      shell.showItemInFolder(check.realPath)
+      return { ok: true, path: check.realPath, revealed: true }
+    }
     const err = await shell.openPath(check.realPath)
     return err ? { ok: false, error: err } : { ok: true, path: check.realPath }
   })

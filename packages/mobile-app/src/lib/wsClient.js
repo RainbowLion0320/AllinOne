@@ -583,6 +583,8 @@ export class MobileRelayClient {
     this.attempt = 0
     this.reconnectTimer = null
     this.pingTimer = null
+    this.pongTimeoutTimer = null
+    this.lastPongAt = 0
     this.reqSeq = 1
     this.eventListeners = new Set()
     this.statusListeners = new Set()
@@ -607,7 +609,6 @@ export class MobileRelayClient {
 
     this._onWindowOnline = () => {
       if (this.closed) return
-      // Expedite control WS reconnect immediately if we were waiting on backoff when connectivity returned
       if (this.connectionState === 'disconnected') {
         this.attempt = 0
         void this.openSocket()
@@ -621,8 +622,46 @@ export class MobileRelayClient {
         void this.retryP2p().catch(() => {})
       }
     }
+    this._onResumeProbe = () => {
+      if (this.closed) return
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      this.probeConnection()
+    }
+    this._onAppState = (ev) => {
+      if (this.closed) return
+      if (ev?.detail?.isActive) this.probeConnection()
+    }
     if (typeof window !== 'undefined') {
       window.addEventListener('online', this._onWindowOnline)
+      window.addEventListener('allinone:appstate', this._onAppState)
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this._onResumeProbe)
+    }
+  }
+
+  probeConnection() {
+    if (this.closed) return
+    if (this.connectionState === 'disconnected') {
+      this.attempt = 0
+      void this.openSocket()
+      return
+    }
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const wsRef = this.ws
+      const prevPong = this.lastPongAt
+      try { wsRef.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+      setTimeout(() => {
+        if (this.closed || this.ws !== wsRef) return
+        if (this.lastPongAt <= prevPong) {
+          try { wsRef.close(4000, 'resume probe timeout') } catch {}
+        }
+      }, 3_000)
+    }
+    const targetId = this._resolveTargetBridgeId()
+    const activePeer = targetId ? this.p2pPeers.get(targetId) : null
+    if (activePeer?.isOpen?.()) {
+      activePeer.probeLiveness(4_000)
     }
   }
 
@@ -826,12 +865,27 @@ export class MobileRelayClient {
     const next = String(bridgeId || '').trim()
     if (next === this.targetBridgeId) return
     this.targetBridgeId = next
+    // Close non-target bridge peers so switching PCs doesn't keep stale WebRTC sockets alive
+    for (const [bid, peer] of [...this.p2pPeers.entries()]) {
+      if (next && bid !== next) {
+        this.p2pPeers.delete(bid)
+        try { peer.close(true) } catch {}
+      }
+    }
     this._syncActiveP2pStatus()
     this._maybeAutoConnectP2p(next)
   }
 
   setE2eeKeys(keysMap) {
     this.e2eeKeys = normalizeE2eeKeysMap(keysMap)
+    // Clear prior failed peers so newly synced keys immediately trigger auto-connect
+    for (const [bid, peer] of [...this.p2pPeers.entries()]) {
+      if (peer.state === 'failed') {
+        this.p2pPeers.delete(bid)
+        try { peer.close(false) } catch {}
+      }
+    }
+    this._syncActiveP2pStatus()
     this._maybeAutoConnectP2p()
   }
 
@@ -911,6 +965,10 @@ export class MobileRelayClient {
     this.connectGen += 1
     if (typeof window !== 'undefined') {
       window.removeEventListener('online', this._onWindowOnline)
+      window.removeEventListener('allinone:appstate', this._onAppState)
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this._onResumeProbe)
     }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
@@ -941,7 +999,9 @@ export class MobileRelayClient {
 
   scheduleNextReconnect() {
     if (this.closed || this.reconnectTimer) return
-    const delay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
+    const baseDelay = Math.min(15_000, 1_200 * Math.pow(1.5, Math.min(this.attempt, 6)))
+    const jitter = 0.75 + Math.random() * 0.5 // ±25% jitter avoids reconnect thundering herd
+    const delay = Math.round(baseDelay * jitter)
     this.attempt += 1
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
@@ -1010,7 +1070,17 @@ export class MobileRelayClient {
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
 
+      if (msg.type === 'pong') {
+        this.lastPongAt = Date.now()
+        if (this.pongTimeoutTimer) {
+          clearTimeout(this.pongTimeoutTimer)
+          this.pongTimeoutTimer = null
+        }
+        return
+      }
+
       if (msg.type === 'hello') {
+        this.lastPongAt = Date.now()
         if (msg.clientId) this.clientId = String(msg.clientId)
         if (msg.roomId && !this.roomId) this.roomId = String(msg.roomId)
         if (Array.isArray(msg.iceServers)) this.iceServers = msg.iceServers
@@ -1211,9 +1281,18 @@ export class MobileRelayClient {
 
   startPing() {
     this.stopPing()
+    this.lastPongAt = Date.now()
     this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        try { this.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+      const wsRef = this.ws
+      if (wsRef?.readyState === WebSocket.OPEN) {
+        try { wsRef.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+        if (this.pongTimeoutTimer) clearTimeout(this.pongTimeoutTimer)
+        this.pongTimeoutTimer = setTimeout(() => {
+          this.pongTimeoutTimer = null
+          if (!this.closed && this.ws === wsRef && wsRef.readyState === WebSocket.OPEN) {
+            try { wsRef.close(4000, 'pong timeout') } catch {}
+          }
+        }, 10_000)
       }
     }, 25_000)
   }
@@ -1222,6 +1301,10 @@ export class MobileRelayClient {
     if (this.pingTimer) {
       clearInterval(this.pingTimer)
       this.pingTimer = null
+    }
+    if (this.pongTimeoutTimer) {
+      clearTimeout(this.pongTimeoutTimer)
+      this.pongTimeoutTimer = null
     }
   }
 
@@ -1239,9 +1322,12 @@ export class MobileRelayClient {
   /**
    * Pull an E2EE bulk file stream directly from PC over WebRTC P2P `aio-bulk` (0 bytes via server!).
    */
-  async downloadP2pBulk(streamId, { mimeType = 'application/octet-stream', size = 0, bridgeId = '', onProgress = null, signal = null } = {}) {
+  async downloadP2pBulk(
+    streamId,
+    { mimeType = 'application/octet-stream', size = 0, bridgeId = '', onProgress = null, onPlainChunk = null, signal = null } = {},
+  ) {
     const peer = await this.ensureP2pConnected(bridgeId || this.targetBridgeId)
-    return peer.downloadBulkStream(streamId, { mimeType, size, onProgress, signal })
+    return peer.downloadBulkStream(streamId, { mimeType, size, onProgress, onPlainChunk, signal })
   }
 
   /**

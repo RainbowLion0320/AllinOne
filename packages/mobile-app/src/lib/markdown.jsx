@@ -32,6 +32,12 @@ import {
 } from './deliverableFiles.js'
 import { fetchE2eeDeliverableFile, triggerDeliverableDownload } from './e2eeFiles.js'
 import { copyTextToClipboard } from './clientHelpers.js'
+import {
+  ImageContextProvider,
+  StreamingFlagProvider,
+  useImageContext,
+  useStreamingFlag,
+} from '../state/ImageContext.jsx'
 
 const HLJS_ALIASES = {
   bash: 'bash',
@@ -233,8 +239,9 @@ function extractPlainText(node) {
   return ''
 }
 
-function CodeBlock({ language, code }) {
+const CodeBlock = React.memo(function CodeBlock({ language, code }) {
   const { t, bi } = useI18n()
+  const isStreaming = useStreamingFlag()
   const [copied, setCopied] = useState(false)
   const [wrap, setWrap] = useState(false)
   const canonicalLang = resolveCanonicalHljsLang(language)
@@ -258,15 +265,17 @@ function CodeBlock({ language, code }) {
     }
   }, [canonicalLang])
 
+  // Avoid O(N^2) synchronous syntax highlighting on every streamed token delta;
+  // highlight once streaming completes or for static/historical messages.
   const highlightedHtml = useMemo(() => {
-    if (!code || !canonicalLang || !langReady) return ''
+    if (isStreaming || !code || !canonicalLang || !langReady) return ''
     try {
       if (hljs.getLanguage(canonicalLang)) {
         return hljs.highlight(code, { language: canonicalLang, ignoreIllegals: true }).value
       }
     } catch {}
     return ''
-  }, [canonicalLang, code, langReady])
+  }, [canonicalLang, code, isStreaming, langReady])
 
   const handleCopy = () => {
     void copyTextToClipboard(code).then((ok) => {
@@ -318,7 +327,7 @@ function CodeBlock({ language, code }) {
       </pre>
     </div>
   )
-}
+})
 
 function ImageChip({ target, label, imageContext }) {
   const { bi } = useI18n()
@@ -455,6 +464,232 @@ function RichBlockquote({ children }) {
   )
 }
 
+function MarkdownCode({ className, children }) {
+  const imageContext = useImageContext()
+  const textVal = extractPlainText(children)
+  if (className && /language-/i.test(className)) {
+    return <code className={className}>{children}</code>
+  }
+  if (imageContext && isImageTarget(textVal)) {
+    return <ImageChip target={textVal} label={getImageLabel(textVal)} imageContext={imageContext} />
+  }
+  return (
+    <code className="rounded-md bg-slate-100/95 px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#242836] dark:text-[#9AB0FF]">
+      {children}
+    </code>
+  )
+}
+
+function MarkdownLink({ href, children }) {
+  const imageContext = useImageContext()
+  const dest = String(href || '').trim()
+  const label = extractPlainText(children).trim()
+  if (imageContext && isImageTarget(dest)) {
+    return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageContext} />
+  }
+  if (imageContext && isDeliverableTarget(dest)) {
+    return <DeliverableChip target={dest} label={label || getDeliverableName(dest)} imageContext={imageContext} />
+  }
+  if (/^(?:https?:\/\/|mailto:|tel:)/i.test(dest)) {
+    return (
+      <a
+        href={dest}
+        target="_blank"
+        rel="noreferrer"
+        className="break-all font-medium text-[#4D6BFE] underline decoration-[#4D6BFE]/40 underline-offset-2 transition hover:decoration-[#4D6BFE] dark:text-[#7F98FF]"
+      >
+        {children}
+      </a>
+    )
+  }
+  // Local file links (e.g. [app.js](file:///...)) -> clean inline code badge
+  return (
+    <code className="rounded-md bg-[#EEF2FF] px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#232B45] dark:text-[#9AB0FF]">
+      {label || dest}
+    </code>
+  )
+}
+
+function MarkdownImg({ src, alt }) {
+  const imageContext = useImageContext()
+  const target = String(src || '').trim()
+  if (!target) return null
+  if (imageContext) {
+    return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageContext} />
+  }
+  const safeSrc = resolveImageSrc(target)
+  if (!safeSrc) return null
+  if (isExternalHttpImageUrl(safeSrc)) {
+    if (isPrivateOrLoopbackUrl(safeSrc)) return null
+    return (
+      <a
+        href={safeSrc}
+        target="_blank"
+        rel="noreferrer"
+        className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] dark:bg-[#273154] dark:text-[#96AEFF]"
+      >
+        <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">{alt || getImageLabel(safeSrc)}</span>
+      </a>
+    )
+  }
+  return (
+    <img
+      src={safeSrc}
+      alt={alt || ''}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      className="my-2 max-h-80 max-w-full rounded-xl border border-slate-200/80 object-contain dark:border-slate-700/80"
+    />
+  )
+}
+
+/**
+ * 100% static component table shared across every MarkdownView instance so React
+ * never unmounts/remounts DOM subtrees when connection/transport context updates.
+ */
+const STATIC_MARKDOWN_COMPONENTS = {
+  h1: ({ children }) => (
+    <h1 className="mt-4 mb-2 border-b border-slate-200/80 pb-1.5 text-[18px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/70 dark:text-white">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-3.5 mb-2 border-b border-slate-200/60 pb-1 text-[16.5px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/60 dark:text-white">
+      {children}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1.5 text-[15.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:text-white">
+      {children}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-2.5 mb-1 text-[14.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 dark:text-slate-100">
+      {children}
+    </h4>
+  ),
+  h5: ({ children }) => (
+    <h5 className="mt-2 mb-1 text-sm font-semibold break-words [overflow-wrap:anywhere] text-slate-700 dark:text-slate-200">
+      {children}
+    </h5>
+  ),
+  h6: ({ children }) => (
+    <h6 className="mt-2 mb-1 text-xs font-semibold uppercase tracking-wide break-words [overflow-wrap:anywhere] text-slate-500 dark:text-slate-400">
+      {children}
+    </h6>
+  ),
+  p: ({ children }) => (
+    <p className="my-2 text-[15px] leading-[1.72] break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 last:mb-0 dark:text-slate-100">
+      {children}
+    </p>
+  ),
+  strong: ({ children }) => (
+    <strong className="font-semibold text-slate-950 dark:text-white">{children}</strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic text-slate-700 dark:text-slate-200">{children}</em>
+  ),
+  del: ({ children }) => (
+    <del className="text-slate-400 line-through dark:text-slate-500">{children}</del>
+  ),
+  hr: () => <hr className="my-3.5 border-slate-200/90 dark:border-slate-700/80" />,
+  ul: ({ className, children }) => (
+    <ul
+      className={`my-2 space-y-1.5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 dark:text-slate-100 ${
+        String(className || '').includes('contains-task-list')
+          ? 'list-none pl-1'
+          : 'list-disc pl-5 marker:text-slate-400 dark:marker:text-slate-500'
+      }`}
+    >
+      {children}
+    </ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="my-2 list-decimal space-y-1.5 pl-5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 marker:font-medium marker:text-slate-400 dark:text-slate-100 dark:marker:text-slate-500">
+      {children}
+    </ol>
+  ),
+  li: ({ className, children }) => (
+    <li
+      className={
+        String(className || '').includes('task-list-item')
+          ? 'flex items-start gap-2'
+          : 'pl-0.5 [&>ul]:my-1 [&>ol]:my-1 [&>p]:my-0.5'
+      }
+    >
+      {children}
+    </li>
+  ),
+  input: ({ type, checked }) => {
+    if (type === 'checkbox') {
+      return (
+        <span
+          aria-checked={Boolean(checked)}
+          role="checkbox"
+          className={`mt-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] ${
+            checked
+              ? 'border-[#4D6BFE] bg-[#4D6BFE] text-white'
+              : 'border-slate-300 bg-white dark:border-slate-600 dark:bg-[#16171A]'
+          }`}
+        >
+          {checked ? <Check className="h-3 w-3 stroke-[3]" /> : null}
+        </span>
+      )
+    }
+    return null
+  },
+  blockquote: ({ children }) => <RichBlockquote>{children}</RichBlockquote>,
+  table: ({ children }) => (
+    <div className="my-3 max-w-full overflow-x-auto rounded-2xl border border-slate-200/90 bg-white shadow-2xs dark:border-slate-700/80 dark:bg-[#1A1C24]">
+      <table className="w-full min-w-full border-collapse text-[13px] leading-snug">
+        {children}
+      </table>
+    </div>
+  ),
+  thead: ({ children }) => (
+    <thead className="bg-slate-50/95 text-slate-600 dark:bg-[#232633] dark:text-slate-200">
+      {children}
+    </thead>
+  ),
+  tbody: ({ children }) => (
+    <tbody className="divide-y divide-slate-200/70 text-slate-700 dark:divide-slate-700/60 dark:text-slate-200">
+      {children}
+    </tbody>
+  ),
+  tr: ({ children }) => (
+    <tr className="even:bg-slate-50/45 hover:bg-[#4D6BFE]/[0.04] dark:even:bg-white/[0.015] dark:hover:bg-white/[0.03]">
+      {children}
+    </tr>
+  ),
+  th: ({ style, children }) => (
+    <th
+      style={style}
+      className="border-b border-slate-200/90 px-3 py-2.5 text-left font-semibold whitespace-nowrap dark:border-slate-700/80"
+    >
+      {children}
+    </th>
+  ),
+  td: ({ style, children }) => (
+    <td
+      style={style}
+      className="max-w-[260px] px-3 py-2 align-top break-words [overflow-wrap:anywhere]"
+    >
+      {children}
+    </td>
+  ),
+  pre: ({ children }) => {
+    const codeEl = React.Children.toArray(children).find((c) => React.isValidElement(c))
+    const className = String(codeEl?.props?.className || '')
+    const langMatch = className.match(/language-([\w+-]+)/i)
+    const rawCode = extractPlainText(codeEl?.props?.children ?? children).replace(/\n$/, '')
+    return <CodeBlock language={langMatch ? langMatch[1] : ''} code={rawCode} />
+  },
+  code: MarkdownCode,
+  a: MarkdownLink,
+  img: MarkdownImg,
+}
+
 /**
  * Full GFM-compliant, XSS-safe Markdown renderer styled for both Mobile & Desktop:
  * - GFM tables (locally scrollable rounded cards with alignment & inline formatting)
@@ -462,236 +697,28 @@ function RichBlockquote({ children }) {
  * - Nested lists, GFM task checklists, GitHub Alert callouts, strikethrough, italic, bold+code
  * - E2EE local image lightbox chips & safe local file path pills
  */
-export function MarkdownView({ text, streaming = false, imageContext = null }) {
+export const MarkdownView = React.memo(function MarkdownView({ text, streaming = false, imageContext = null }) {
+  const parentCtx = useImageContext()
   const prepared = useMemo(() => preprocessMarkdown(text), [text])
-
-  const components = useMemo(
-    () => ({
-      h1: ({ children }) => (
-        <h1 className="mt-4 mb-2 border-b border-slate-200/80 pb-1.5 text-[18px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/70 dark:text-white">
-          {children}
-        </h1>
-      ),
-      h2: ({ children }) => (
-        <h2 className="mt-3.5 mb-2 border-b border-slate-200/60 pb-1 text-[16.5px] font-bold tracking-tight break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:border-slate-700/60 dark:text-white">
-          {children}
-        </h2>
-      ),
-      h3: ({ children }) => (
-        <h3 className="mt-3 mb-1.5 text-[15.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-900 first:mt-0 dark:text-white">
-          {children}
-        </h3>
-      ),
-      h4: ({ children }) => (
-        <h4 className="mt-2.5 mb-1 text-[14.5px] font-semibold break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 dark:text-slate-100">
-          {children}
-        </h4>
-      ),
-      h5: ({ children }) => (
-        <h5 className="mt-2 mb-1 text-sm font-semibold break-words [overflow-wrap:anywhere] text-slate-700 dark:text-slate-200">
-          {children}
-        </h5>
-      ),
-      h6: ({ children }) => (
-        <h6 className="mt-2 mb-1 text-xs font-semibold uppercase tracking-wide break-words [overflow-wrap:anywhere] text-slate-500 dark:text-slate-400">
-          {children}
-        </h6>
-      ),
-      p: ({ children }) => (
-        <p className="my-2 text-[15px] leading-[1.72] break-words [overflow-wrap:anywhere] text-slate-800 first:mt-0 last:mb-0 dark:text-slate-100">
-          {children}
-        </p>
-      ),
-      strong: ({ children }) => (
-        <strong className="font-semibold text-slate-950 dark:text-white">{children}</strong>
-      ),
-      em: ({ children }) => (
-        <em className="italic text-slate-700 dark:text-slate-200">{children}</em>
-      ),
-      del: ({ children }) => (
-        <del className="text-slate-400 line-through dark:text-slate-500">{children}</del>
-      ),
-      hr: () => <hr className="my-3.5 border-slate-200/90 dark:border-slate-700/80" />,
-      ul: ({ className, children }) => (
-        <ul
-          className={`my-2 space-y-1.5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 dark:text-slate-100 ${
-            String(className || '').includes('contains-task-list')
-              ? 'list-none pl-1'
-              : 'list-disc pl-5 marker:text-slate-400 dark:marker:text-slate-500'
-          }`}
-        >
-          {children}
-        </ul>
-      ),
-      ol: ({ children }) => (
-        <ol className="my-2 list-decimal space-y-1.5 pl-5 text-[15px] leading-[1.68] break-words [overflow-wrap:anywhere] text-slate-800 marker:font-medium marker:text-slate-400 dark:text-slate-100 dark:marker:text-slate-500">
-          {children}
-        </ol>
-      ),
-      li: ({ className, children }) => (
-        <li
-          className={
-            String(className || '').includes('task-list-item')
-              ? 'flex items-start gap-2'
-              : 'pl-0.5 [&>ul]:my-1 [&>ol]:my-1 [&>p]:my-0.5'
-          }
-        >
-          {children}
-        </li>
-      ),
-      input: ({ type, checked }) => {
-        if (type === 'checkbox') {
-          return (
-            <span
-              aria-checked={Boolean(checked)}
-              role="checkbox"
-              className={`mt-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] ${
-                checked
-                  ? 'border-[#4D6BFE] bg-[#4D6BFE] text-white'
-                  : 'border-slate-300 bg-white dark:border-slate-600 dark:bg-[#16171A]'
-              }`}
-            >
-              {checked ? <Check className="h-3 w-3 stroke-[3]" /> : null}
-            </span>
-          )
-        }
-        return null
-      },
-      blockquote: ({ children }) => <RichBlockquote>{children}</RichBlockquote>,
-      table: ({ children }) => (
-        <div className="my-3 max-w-full overflow-x-auto rounded-2xl border border-slate-200/90 bg-white shadow-2xs dark:border-slate-700/80 dark:bg-[#1A1C24]">
-          <table className="w-full min-w-full border-collapse text-[13px] leading-snug">
-            {children}
-          </table>
-        </div>
-      ),
-      thead: ({ children }) => (
-        <thead className="bg-slate-50/95 text-slate-600 dark:bg-[#232633] dark:text-slate-200">
-          {children}
-        </thead>
-      ),
-      tbody: ({ children }) => (
-        <tbody className="divide-y divide-slate-200/70 text-slate-700 dark:divide-slate-700/60 dark:text-slate-200">
-          {children}
-        </tbody>
-      ),
-      tr: ({ children }) => (
-        <tr className="even:bg-slate-50/45 hover:bg-[#4D6BFE]/[0.04] dark:even:bg-white/[0.015] dark:hover:bg-white/[0.03]">
-          {children}
-        </tr>
-      ),
-      th: ({ style, children }) => (
-        <th
-          style={style}
-          className="border-b border-slate-200/90 px-3 py-2.5 text-left font-semibold whitespace-nowrap dark:border-slate-700/80"
-        >
-          {children}
-        </th>
-      ),
-      td: ({ style, children }) => (
-        <td
-          style={style}
-          className="max-w-[260px] px-3 py-2 align-top break-words [overflow-wrap:anywhere]"
-        >
-          {children}
-        </td>
-      ),
-      pre: ({ children }) => {
-        const codeEl = React.Children.toArray(children).find((c) => React.isValidElement(c))
-        const className = String(codeEl?.props?.className || '')
-        const langMatch = className.match(/language-([\w+-]+)/i)
-        const rawCode = extractPlainText(codeEl?.props?.children ?? children).replace(/\n$/, '')
-        return <CodeBlock language={langMatch ? langMatch[1] : ''} code={rawCode} />
-      },
-      code: ({ className, children }) => {
-        const textVal = extractPlainText(children)
-        if (className && /language-/i.test(className)) {
-          return <code className={className}>{children}</code>
-        }
-        if (imageContext && isImageTarget(textVal)) {
-          return <ImageChip target={textVal} label={getImageLabel(textVal)} imageContext={imageContext} />
-        }
-        return (
-          <code className="rounded-md bg-slate-100/95 px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#242836] dark:text-[#9AB0FF]">
-            {children}
-          </code>
-        )
-      },
-      a: ({ href, children }) => {
-        const dest = String(href || '').trim()
-        const label = extractPlainText(children).trim()
-        if (imageContext && isImageTarget(dest)) {
-          return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageContext} />
-        }
-        if (imageContext && isDeliverableTarget(dest)) {
-          return <DeliverableChip target={dest} label={label || getDeliverableName(dest)} imageContext={imageContext} />
-        }
-        if (/^(?:https?:\/\/|mailto:|tel:)/i.test(dest)) {
-          return (
-            <a
-              href={dest}
-              target="_blank"
-              rel="noreferrer"
-              className="break-all font-medium text-[#4D6BFE] underline decoration-[#4D6BFE]/40 underline-offset-2 transition hover:decoration-[#4D6BFE] dark:text-[#7F98FF]"
-            >
-              {children}
-            </a>
-          )
-        }
-        // Local file links (e.g. [app.js](file:///...)) -> clean inline code badge
-        return (
-          <code className="rounded-md bg-[#EEF2FF] px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#232B45] dark:text-[#9AB0FF]">
-            {label || dest}
-          </code>
-        )
-      },
-      img: ({ src, alt }) => {
-        const target = String(src || '').trim()
-        if (!target) return null
-        if (imageContext) {
-          return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageContext} />
-        }
-        const safeSrc = resolveImageSrc(target)
-        if (!safeSrc) return null
-        if (isExternalHttpImageUrl(safeSrc)) {
-          if (isPrivateOrLoopbackUrl(safeSrc)) return null
-          return (
-            <a
-              href={safeSrc}
-              target="_blank"
-              rel="noreferrer"
-              className="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-lg bg-[#EEF2FF] px-2 py-0.5 align-baseline text-[13px] font-medium text-[#3552E8] dark:bg-[#273154] dark:text-[#96AEFF]"
-            >
-              <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-              <span className="truncate">{alt || getImageLabel(safeSrc)}</span>
-            </a>
-          )
-        }
-        return (
-          <img
-            src={safeSrc}
-            alt={alt || ''}
-            loading="lazy"
-            referrerPolicy="no-referrer"
-            className="my-2 max-h-80 max-w-full rounded-xl border border-slate-200/80 object-contain dark:border-slate-700/80"
-          />
-        )
-      },
-    }),
-    [imageContext],
-  )
 
   if (!text) return null
 
-  return (
-    <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        urlTransform={safeUrlTransform}
-        components={components}
-      >
-        {prepared}
-      </ReactMarkdown>
-    </div>
+  const body = (
+    <StreamingFlagProvider streaming={streaming}>
+      <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
+        <ReactMarkdown
+          remarkPlugins={REMARK_PLUGINS}
+          urlTransform={safeUrlTransform}
+          components={STATIC_MARKDOWN_COMPONENTS}
+        >
+          {prepared}
+        </ReactMarkdown>
+      </div>
+    </StreamingFlagProvider>
   )
-}
+
+  if (imageContext && imageContext !== parentCtx) {
+    return <ImageContextProvider value={imageContext}>{body}</ImageContextProvider>
+  }
+  return body
+})

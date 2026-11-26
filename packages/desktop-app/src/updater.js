@@ -10,7 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   accessSync,
@@ -20,15 +20,20 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  readdirSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import os from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
+import { compareSemver, parseSemver } from '@allinone/shared/semver'
+
+export { compareSemver }
 
 const DEFAULT_GITHUB_REPO = 'RainbowLion0320/AllinOne'
+const DESKTOP_MANIFEST_NAME = 'All-in-One-Desktop-Release.json'
 const ALLOWED_DOWNLOAD_HOSTS = new Set([
   'github.com',
   'api.github.com',
@@ -37,29 +42,38 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
   'github-releases.githubusercontent.com',
 ])
 
-function parseSemver(raw) {
-  const clean = String(raw || '').trim().replace(/^v/i, '')
-  const m = clean.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/)
-  if (!m) return null
-  return {
-    major: Number(m[1]),
-    minor: Number(m[2]),
-    patch: Number(m[3]),
-    pre: m[4] || '',
-  }
+export function computeDesktopManifestPayload(version, assets = []) {
+  const cleanVer = String(version || '').trim().replace(/^v/i, '')
+  const lines = [...assets]
+    .filter((a) => a && a.name && a.sha256)
+    .map((a) => ({
+      name: String(a.name).trim(),
+      sha256: String(a.sha256).trim().toLowerCase(),
+      size: Number(a.size) || 0,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((a) => `${a.name}:${a.sha256}:${a.size}`)
+  return `allinone-desktop-release-v1\n${cleanVer}\n${lines.join('\n')}`
 }
 
-export function compareSemver(a, b) {
-  const pa = parseSemver(a)
-  const pb = parseSemver(b)
-  if (!pa || !pb) return 0
-  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1
-  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1
-  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1
-  if (pa.pre === pb.pre) return 0
-  if (!pa.pre) return 1
-  if (!pb.pre) return -1
-  return pa.pre.localeCompare(pb.pre)
+export function verifyManifestSignature(manifest, publicKeyPem) {
+  if (!manifest || typeof manifest !== 'object') return false
+  if (manifest.sigAlg !== 'Ed25519' || !manifest.signature || !manifest.version || !Array.isArray(manifest.assets)) {
+    return false
+  }
+  const trimmedPub = String(publicKeyPem || '').trim()
+  if (!trimmedPub) return false
+  try {
+    const pubKey = trimmedPub.includes('BEGIN PUBLIC KEY')
+      ? createPublicKey(trimmedPub)
+      : createPublicKey({ key: Buffer.from(trimmedPub, 'base64'), format: 'der', type: 'spki' })
+    const payload = computeDesktopManifestPayload(manifest.version, manifest.assets)
+    const sigBuf = Buffer.from(String(manifest.signature).trim(), 'base64')
+    if (sigBuf.length !== 64) return false
+    return verify(null, Buffer.from(payload, 'utf8'), pubKey, sigBuf)
+  } catch {
+    return false
+  }
 }
 
 export function pickReleaseAsset(assets = [], platform = process.platform, arch = process.arch) {
@@ -156,6 +170,7 @@ export function buildWindowsUpdateScripts({
   const escVbs = (s) => String(s || '').replace(/"/g, '""')
   const resolvedInstaller = resolve(installerPath)
   const resolvedExe = resolve(exePath)
+  const resolvedInstallDir = isPackaged && resolvedExe ? dirname(resolvedExe) : ''
   const resolvedLog = logPath ? resolve(logPath) : ''
   const resolvedPs1 = ps1Path ? resolve(ps1Path) : ''
   const cleanSha = /^[a-f0-9]{64}$/i.test(String(expectedSha256 || '').trim())
@@ -167,6 +182,7 @@ export function buildWindowsUpdateScripts({
     `$oldPid = ${safePid}`,
     `$installer = '${escPs(resolvedInstaller)}'`,
     `$exePath = '${escPs(resolvedExe)}'`,
+    `$installDir = '${escPs(resolvedInstallDir)}'`,
     `$relaunch = ${isPackaged ? 1 : 0}`,
     `$logPath = '${escPs(resolvedLog)}'`,
     `$expectedSha = '${cleanSha}'`,
@@ -203,7 +219,8 @@ export function buildWindowsUpdateScripts({
     '} else {',
     '  Start-Sleep -Milliseconds 800',
     '  Write-UpdLog ("Running silent NSIS installer: " + $installer)',
-    '  $proc = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru -WindowStyle Hidden',
+    '  $nsisArgs = if ($installDir) { "/S /D=$installDir" } else { "/S" }',
+    '  $proc = Start-Process -FilePath $installer -ArgumentList $nsisArgs -Wait -PassThru -WindowStyle Hidden',
     '  $exitCode = if ($null -ne $proc) { $proc.ExitCode } else { -1 }',
     '  Write-UpdLog ("Installer exited with code " + $exitCode)',
     '  if ($exitCode -ne 0) {',
@@ -242,6 +259,8 @@ export class DesktopUpdater extends EventEmitter {
     apiUrl = '',
     allowLocalhost = false,
     requireSha256 = true,
+    manifestPublicKey = '',
+    requireSignature = false,
     getLang = () => 'zh',
   } = {}) {
     super()
@@ -253,11 +272,15 @@ export class DesktopUpdater extends EventEmitter {
     this.apiUrl = apiUrl || `https://api.github.com/repos/${repo}/releases/latest`
     this.allowLocalhost = allowLocalhost
     this.requireSha256 = requireSha256 !== false
+    this.manifestPublicKey = String(manifestPublicKey || '').trim()
+    this.requireSignature = Boolean(requireSignature || this.manifestPublicKey)
     this.getLang = typeof getLang === 'function' ? getLang : () => 'zh'
     this.abortController = null
     this.isChecking = false
     this._installing = false
     this._downloadSeq = 0
+    this._releaseEtag = ''
+    this._cachedRelease = null
 
     this.state = {
       status: 'idle', // 'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'downloaded' | 'installing' | 'error'
@@ -310,11 +333,15 @@ export class DesktopUpdater extends EventEmitter {
       const timer = setTimeout(() => controller.abort(), 15_000)
       let res
       try {
+        const headers = {
+          Accept: 'application/vnd.github+json',
+          'User-Agent': `AllInOne-Desktop/${this.currentVersion}`,
+        }
+        if (this._releaseEtag && this._cachedRelease) {
+          headers['If-None-Match'] = this._releaseEtag
+        }
         res = await fetch(this.apiUrl, {
-          headers: {
-            Accept: 'application/vnd.github+json',
-            'User-Agent': `AllInOne-Desktop/${this.currentVersion}`,
-          },
+          headers,
           signal: controller.signal,
         })
       } finally {
@@ -323,10 +350,20 @@ export class DesktopUpdater extends EventEmitter {
 
       if (isBusy()) return this.getState()
 
-      if (!res.ok) {
-        throw new Error(this.bi(`GitHub API 返回 HTTP ${res.status}`, `GitHub API returned HTTP ${res.status}`))
+      let release = null
+      if (res.status === 304 && this._cachedRelease) {
+        release = this._cachedRelease
+      } else {
+        if (!res.ok) {
+          throw new Error(this.bi(`GitHub API 返回 HTTP ${res.status}`, `GitHub API returned HTTP ${res.status}`))
+        }
+        release = await res.json()
+        const nextEtag = res.headers?.get?.('etag') || ''
+        if (nextEtag && release) {
+          this._releaseEtag = nextEtag
+          this._cachedRelease = release
+        }
       }
-      const release = await res.json()
       if (isBusy()) return this.getState()
       const latestVersion = String(release.tag_name || '').trim().replace(/^v/i, '')
       if (!parseSemver(latestVersion)) {
@@ -368,7 +405,52 @@ export class DesktopUpdater extends EventEmitter {
         })
       }
 
-      const expectedSha256 = parseExpectedSha256(asset.digest)
+      let expectedSha256 = parseExpectedSha256(asset.digest)
+      if (this.manifestPublicKey) {
+        const manifestAsset = (Array.isArray(release.assets) ? release.assets : []).find(
+          (a) => a && a.name === DESKTOP_MANIFEST_NAME && isAllowedDownloadUrl(a.browser_download_url, this.allowLocalhost),
+        )
+        let manifestOk = false
+        if (manifestAsset) {
+          try {
+            const mCtrl = new AbortController()
+            const mTimer = setTimeout(() => mCtrl.abort(), 10_000)
+            try {
+              const mRes = await fetch(manifestAsset.browser_download_url, {
+                headers: { 'User-Agent': `AllInOne-Desktop/${this.currentVersion}` },
+                signal: mCtrl.signal,
+              })
+              if (mRes.ok) {
+                const manifest = await mRes.json().catch(() => null)
+                if (
+                  manifest &&
+                  String(manifest.version || '').trim().replace(/^v/i, '') === latestVersion &&
+                  verifyManifestSignature(manifest, this.manifestPublicKey)
+                ) {
+                  const mEntry = manifest.assets.find((a) => a && a.name === asset.name)
+                  if (mEntry && /^[a-f0-9]{64}$/i.test(String(mEntry.sha256 || ''))) {
+                    const signedSha = String(mEntry.sha256).toLowerCase()
+                    if (!expectedSha256 || expectedSha256 === signedSha) {
+                      expectedSha256 = signedSha
+                      manifestOk = true
+                    }
+                  }
+                }
+              }
+            } finally {
+              clearTimeout(mTimer)
+            }
+          } catch {}
+        }
+        if (this.requireSignature && !manifestOk) {
+          throw new Error(
+            this.bi(
+              '远端安装包缺少有效的 Ed25519 发布签名，已阻止自动更新',
+              'Remote release is missing a valid Ed25519 manifest signature; update blocked for security.',
+            ),
+          )
+        }
+      }
       const safeName = asset.name.replace(/[^a-zA-Z0-9._-]/g, '_')
       const cachedPath = join(this.downloadDir, safeName)
 
@@ -659,6 +741,17 @@ export class DesktopUpdater extends EventEmitter {
         await closeAndUnlinkPart()
         throw renameErr
       }
+
+      // Prune stale installers & leftover updater helper scripts in downloadDir
+      try {
+        const keepName = basename(finalPath)
+        for (const entry of readdirSync(this.downloadDir)) {
+          if (entry === keepName || entry === 'last-update.log') continue
+          if (/\.(?:dmg|exe|AppImage|part|ps1|vbs|sh)$/i.test(entry)) {
+            try { unlinkSync(join(this.downloadDir, entry)) } catch {}
+          }
+        }
+      } catch {}
 
       if (myDownloadSeq !== this._downloadSeq) {
         return this.getState()

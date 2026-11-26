@@ -8,7 +8,6 @@ import {
   readSync,
   statSync,
 } from 'node:fs'
-import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import {
@@ -28,10 +27,13 @@ import {
   spawnCrossPlatform,
 } from '../helpers/bin-finder.js'
 import { installSingleAppCli } from '../helpers/env-autofix.js'
-import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode, parseMaybeJson } from '../helpers/task-state.js'
-
-const require = createRequire(import.meta.url)
+import { BaseAdapter } from './base-adapter.js'
+import { getDatabaseSync, isPidAlive, runPythonSqliteJson } from '../primitives/io-utils.js'
+import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
+import { QuotaCacheManager } from '../primitives/quota-cache.js'
+import { SessionExternalWatcher } from '../primitives/session-watcher.js'
+import { StreamJsonCliRunner } from '../primitives/stream-json-runner.js'
 
 const workbuddyParseCache = createFileParseCache(24)
 
@@ -39,7 +41,7 @@ const WORKBUDDY_EXTERNAL_MAX_IDLE_MS = 15 * 60_000
 const WORKBUDDY_WATCH_POLL_MS = 2_000
 const WORKBUDDY_WATCH_TTL_MS = 10 * 60_000
 const WORKBUDDY_LIST_WATCH_TTL_MS = 10 * 60_000
-const WORKBUDDY_LIST_DISCOVERY_INTERVAL_MS = 15_000
+const WORKBUDDY_LIST_DISCOVERY_INTERVAL_MS = 30_000
 const WORKBUDDY_TRACKED_LIST_LIMIT = 20
 const WORKBUDDY_TAIL_PROBE_BYTES = 64 * 1024
 const WORKBUDDY_TAIL_PROBE_MAX_BYTES = 512 * 1024
@@ -47,6 +49,9 @@ const WORKBUDDY_QUOTA_CACHE_TTL_MS = 2 * 60 * 1_000
 const WORKBUDDY_QUOTA_TIMEOUT_MS = 4_500
 const WORKBUDDY_MAX_FULL_PARSE_BYTES = 32 * 1024 * 1024
 const WORKBUDDY_TAIL_FALLBACK_BYTES = 4 * 1024 * 1024
+
+const CLIENT_VERSION =
+  (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) || '0.0.0'
 
 const ALLOWED_WORKBUDDY_PERMISSION_MODES = Object.freeze([
   'plan',
@@ -79,18 +84,6 @@ const WORKBUDDY_BASE_MODELS = Object.freeze([
   { id: 'minimax-m2.7', name: 'MiniMax M2.7', efforts: WORKBUDDY_DEFAULT_EFFORTS, defaultEffort: 'high' },
 ])
 
-let sqliteModCache = undefined
-function getDatabaseSync() {
-  if (sqliteModCache !== undefined) return sqliteModCache
-  try {
-    const mod = require('node:sqlite')
-    sqliteModCache = typeof mod?.DatabaseSync === 'function' ? mod.DatabaseSync : null
-  } catch {
-    sqliteModCache = null
-  }
-  return sqliteModCache
-}
-
 function resolveEffectiveWorkbuddyPermissionMode(requestedMode, hostConfiguredMode, effectiveTaskMode) {
   const hostMode = ALLOWED_WORKBUDDY_PERMISSION_MODES.includes(hostConfiguredMode)
     ? hostConfiguredMode
@@ -119,17 +112,6 @@ function getWorkbuddyHome(configuredHome = '') {
 function getCodebuddyHome(configuredHome = '') {
   const custom = String(configuredHome || process.env.CODEBUDDY_CONFIG_DIR || '').trim()
   return custom || join(homedir(), '.codebuddy')
-}
-
-function isPidAlive(pid) {
-  const n = Number(pid)
-  if (!Number.isInteger(n) || n <= 0) return false
-  try {
-    process.kill(n, 0)
-    return true
-  } catch (err) {
-    return err?.code === 'EPERM'
-  }
 }
 
 function findCodebuddyCommand(configured) {
@@ -658,6 +640,91 @@ export function readWorkbuddyDbSnapshot(workbuddyHome) {
     try { db?.close?.() } catch {}
   }
 
+  return { exists: true, sessionsById, workspaces }
+}
+
+const WORKBUDDY_DB_PY_FALLBACK = [
+  'import sqlite3, json, sys',
+  'db_path = sys.argv[1]',
+  'out = {"sessions": [], "workspaces": [], "spaces": [], "space_folders": []}',
+  'conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.5)',
+  'conn.row_factory = sqlite3.Row',
+  'try:',
+  '  for key, sql in [',
+  '    ("sessions", "SELECT id, cwd, title, custom_title, status, model, mode, permission_mode, thought_level, created_at, updated_at, deleted_at, source_mode, transport FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 240"),',
+  '    ("workspaces", "SELECT path, last_opened_at FROM workspaces ORDER BY last_opened_at DESC LIMIT 60"),',
+  '    ("spaces", "SELECT id, name, primary_folder_path, create_folder_path FROM spaces LIMIT 60"),',
+  '    ("space_folders", "SELECT space_id, path FROM space_folders LIMIT 120"),',
+  '  ]:',
+  '    try:',
+  '      out[key] = [dict(r) for r in conn.execute(sql).fetchall()]',
+  '    except Exception:',
+  '      pass',
+  '  print(json.dumps(out))',
+  'finally:',
+  '  conn.close()',
+].join('\n')
+
+/**
+ * Electron-safe async WorkBuddy SQLite snapshot reader: uses native `node:sqlite` when available,
+ * and seamlessly falls back to read-only Python `sqlite3` when running under Electron.
+ */
+async function readWorkbuddyDbSnapshotAsync(workbuddyHome) {
+  const dbPath = join(workbuddyHome, 'workbuddy.db')
+  if (!existsSync(dbPath)) return { exists: false, sessionsById: new Map(), workspaces: [] }
+  if (getDatabaseSync()) {
+    return readWorkbuddyDbSnapshot(workbuddyHome)
+  }
+  const raw = await runPythonSqliteJson(WORKBUDDY_DB_PY_FALLBACK, [dbPath], null, 3_000)
+  const sessionsById = new Map()
+  const workspaces = []
+  const seenWs = new Set()
+  const addWorkspace = (rawPath, nameHint = '', source = 'workbuddy') => {
+    const s = String(rawPath || '').trim()
+    if (!s) return
+    let clean = s
+    try { clean = resolve(s) } catch {}
+    if (!existsSync(clean)) return
+    const key = process.platform === 'win32' || process.platform === 'darwin' ? clean.toLowerCase() : clean
+    if (seenWs.has(key)) return
+    seenWs.add(key)
+    const name = String(nameHint || '').trim()
+    workspaces.push({ name: name && !/[\\/]/.test(name) ? name : basename(clean) || clean, path: clean, source })
+  }
+  if (raw && typeof raw === 'object') {
+    for (const row of raw.sessions || []) {
+      const sid = String(row?.id || '').trim()
+      if (!sid) continue
+      try { assertSafeSessionId(sid, 'WorkBuddy sessionId') } catch { continue }
+      const cwd = String(row.cwd || '').trim()
+      sessionsById.set(sid, {
+        id: sid,
+        cwd,
+        title: String(row.custom_title || row.title || '').trim(),
+        status: String(row.status || '').trim(),
+        model: String(row.model || '').trim(),
+        mode: String(row.mode || row.source_mode || '').trim(),
+        permissionMode: String(row.permission_mode || '').trim(),
+        thoughtLevel: String(row.thought_level || '').trim(),
+        transport: String(row.transport || 'local').trim(),
+        createdAt: toEpochMs(row.created_at || 0),
+        updatedAt: toEpochMs(row.updated_at || 0),
+      })
+      if (cwd) addWorkspace(cwd, '', 'workbuddy')
+    }
+    for (const r of raw.workspaces || []) {
+      if (r?.path) addWorkspace(r.path, '', 'workbuddy')
+    }
+    const spaceNames = new Map()
+    for (const sp of raw.spaces || []) {
+      if (sp?.id && sp?.name) spaceNames.set(String(sp.id), String(sp.name))
+      if (sp?.primary_folder_path) addWorkspace(sp.primary_folder_path, sp.name || '', 'workbuddy')
+      if (sp?.create_folder_path) addWorkspace(sp.create_folder_path, sp.name || '', 'workbuddy')
+    }
+    for (const sf of raw.space_folders || []) {
+      if (sf?.path) addWorkspace(sf.path, spaceNames.get(String(sf.space_id)) || '', 'workbuddy')
+    }
+  }
   return { exists: true, sessionsById, workspaces }
 }
 
@@ -1191,12 +1258,21 @@ export function parseWorkbuddyJsonlMessages(filePath) {
  *    and interactive approvals when the official standalone `@tencent-ai/codebuddy-code` CLI (`codebuddy` / `cbc`)
  *    is installed and signed in (same Tencent account & shared Credits quota as WorkBuddy Desktop).
  */
-export class WorkBuddyAdapter {
+export class WorkBuddyAdapter extends BaseAdapter {
   constructor({ config = {}, log = console, emitEvent, onApprovalRequest } = {}) {
-    this.config = config
-    this.log = log
-    this.emitEvent = emitEvent || (() => {})
-    this.onApprovalRequest = onApprovalRequest || (() => {})
+    super(APPS.WORKBUDDY, {
+      config,
+      log,
+      emitEvent,
+      onApprovalRequest,
+      capabilities: {
+        supportsWorkspaces: true,
+        supportsSetup: true,
+        supportsApproval: true,
+        supportsMidChatSwitch: true,
+        supportsQuota: true,
+      },
+    })
     this.workbuddyHome = getWorkbuddyHome(config.workbuddyHome)
     this.codebuddyHome = getCodebuddyHome(config.codebuddyHome)
     this.authDir = getCodebuddyAuthDir({ configuredDir: config.workbuddyAuthDir || '' })
@@ -1214,31 +1290,34 @@ export class WorkBuddyAdapter {
       ? config.installWorkbuddyCli
       : () => installSingleAppCli('workbuddy', { log: this.log })
 
-    /** @type {Map<string, any>} */
-    this.activeProcs = new Map()
-    /** @type {Map<string, any>} */
-    this.pendingCreated = new Map()
-    /** @type {Map<string, { model: string, reasoningEffort: string }>} */
-    this.sessionPrefs = new Map()
-    /** @type {Map<string, any>} */
-    this.pendingControlRequests = new Map()
-    /** @type {Map<string, any>} */
-    this.sessionTaskStates = new Map()
-    /** @type {Map<string, any>} */
-    this.watchedSessions = new Map()
-    /** @type {Map<string, any>} */
-    this.trackedListSessions = new Map()
-    this.watchTimer = null
-    this.watchPollInFlight = false
-    this.lastClientListAt = 0
+    this.runner = new StreamJsonCliRunner({
+      app: APPS.WORKBUDDY,
+      displayName: 'WorkBuddy',
+      idPrefix: 'wb',
+      emitEvent: this.emitEvent,
+      onApprovalRequest: this.onApprovalRequest,
+      sessionTaskStates: this.sessionTaskStates,
+      extractToolOutput: extractToolOutputText,
+      log: this.log,
+    })
+    this.activeProcs = this.runner.activeProcs
+    this.pendingControlRequests = this.runner.pendingControlRequests
+
+    this.watcher = new SessionExternalWatcher({
+      pollMs: this.watchPollMs,
+      maxWatched: 8,
+      maxTracked: WORKBUDDY_TRACKED_LIST_LIMIT,
+      watchTtlMs: WORKBUDDY_WATCH_TTL_MS,
+      listWatchTtlMs: WORKBUDDY_LIST_WATCH_TTL_MS,
+      onPoll: (ctx) => this._pollExternalSessions(ctx),
+    })
+    this.watchedSessions = this.watcher.watched
+    this.trackedListSessions = this.watcher.tracked
     this.lastListDiscoveryAt = 0
     this.cliAvailableCache = null
     this.cliCheckedAt = 0
     this.cliAuthenticated = false
     this.activeLoginSession = null
-    this.quotaCache = null
-    this.quotaCacheAt = 0
-    this.quotaFetchInFlight = null
     this.quotaEndpointOverride = String(config.workbuddyQuotaEndpoint || '').trim()
     this.fetchQuotaFn = typeof config.fetchWorkbuddyQuota === 'function'
       ? config.fetchWorkbuddyQuota
@@ -1246,7 +1325,43 @@ export class WorkBuddyAdapter {
           authDir: this.authDir,
           endpointOverride: this.quotaEndpointOverride,
         })
-    this.disposed = false
+    this.quotaManager = new QuotaCacheManager({
+      app: APPS.WORKBUDDY,
+      ttlMs: WORKBUDDY_QUOTA_CACHE_TTL_MS,
+      errorBackoffMs: 15_000,
+      emitEvent: this.emitEvent,
+      fetcher: () => this.fetchQuotaFn(),
+      isValid: (q) => Boolean(q),
+    })
+    this._dbSnapCache = null
+    this._dbSnapAt = 0
+  }
+
+  get quotaCache() {
+    return this.quotaManager.quota
+  }
+
+  set quotaCache(val) {
+    this.quotaManager.quota = val
+  }
+
+  get lastClientListAt() {
+    return this.watcher.lastClientListAt
+  }
+
+  set lastClientListAt(val) {
+    this.watcher.lastClientListAt = Number(val) || 0
+  }
+
+  async _getDbSnapshot({ force = false } = {}) {
+    const now = Date.now()
+    if (!force && this._dbSnapCache && now - this._dbSnapAt < 1_500) {
+      return this._dbSnapCache
+    }
+    const snap = await readWorkbuddyDbSnapshotAsync(this.workbuddyHome)
+    this._dbSnapCache = snap
+    this._dbSnapAt = Date.now()
+    return snap
   }
 
   refreshBinary() {
@@ -1290,7 +1405,7 @@ export class WorkBuddyAdapter {
       }
       let proc = null
       const timer = setTimeout(() => {
-        try { proc?.kill() } catch {}
+        if (proc) killProcessTree(proc, { force: true })
         done(false)
       }, 6_000)
       timer.unref?.()
@@ -1299,6 +1414,7 @@ export class WorkBuddyAdapter {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
+        this.trackChildProcess(proc)
         let out = ''
         proc.stdout.setEncoding('utf8')
         proc.stdout.on('data', (d) => { out += d })
@@ -1324,39 +1440,13 @@ export class WorkBuddyAdapter {
   }
 
   async refreshQuotaInBackground({ force = false } = {}) {
-    if (this.disposed) return this.quotaCache
-    const now = Date.now()
-    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < WORKBUDDY_QUOTA_CACHE_TTL_MS) {
-      return this.quotaCache
-    }
-    if (this.quotaFetchInFlight) return this.quotaFetchInFlight
-    const task = Promise.resolve()
-      .then(() => this.fetchQuotaFn())
-      .then((fresh) => {
-        if (this.disposed) return null
-        this.quotaCacheAt = Date.now()
-        if (fresh) {
-          this.quotaCache = fresh
-          this.emitEvent(EVENTS.BRIDGE_STATUS, {
-            type: 'quota.updated',
-            app: APPS.WORKBUDDY,
-            quota: fresh,
-          })
-        }
-        return this.quotaCache
-      })
-      .catch(() => this.quotaCache)
-      .finally(() => {
-        if (this.quotaFetchInFlight === task) this.quotaFetchInFlight = null
-      })
-    this.quotaFetchInFlight = task
-    return task
+    return this.quotaManager.refreshInBackground({ force })
   }
 
   async getStatus(opts = {}) {
     const forceQuota = Boolean(opts?.forceQuota)
     const cliVersion = await this.probeCliVersion({ force: true })
-    const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
+    const dbSnap = await this._getDbSnapshot({ force: true })
     const projectRoots = this.getProjectsRoots()
     const hasLocalData = dbSnap.exists || projectRoots.length > 0 || dbSnap.sessionsById.size > 0
     const cliInstalled = Boolean(cliVersion)
@@ -1425,8 +1515,7 @@ export class WorkBuddyAdapter {
     if (!cur) return
     this.activeLoginSession = null
     if (cur.timer) clearTimeout(cur.timer)
-    try { cur.proc?.stdin?.end?.() } catch {}
-    if (cur.proc) killProcessTree(cur.proc, { force: true })
+    if (cur.client) cur.client.killImmediate('WorkBuddy login stopped')
   }
 
   /**
@@ -1503,57 +1592,93 @@ export class WorkBuddyAdapter {
       CODEBUDDY_INTERNET_ENVIRONMENT: cleanMethod,
     }
 
-    let proc
-    try {
-      proc = spawnCrossPlatform(this.codebuddyBin, ['--acp'], {
-        cwd: existsSync(this.defaultCwd) ? this.defaultCwd : homedir(),
-        env: spawnEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
-    } catch (err) {
-      return {
-        ok: false,
-        status: 'login_failed',
-        writable: false,
-        setupState: 'needs_login',
-        error: `无法启动官方登录流程：${String(err?.message || err)}`,
-      }
-    }
-
-    proc.stdout.setEncoding('utf8')
-    proc.stderr?.setEncoding('utf8')
-    proc.stdin?.on('error', () => {})
-
-    const loginState = {
-      proc,
-      methodId: cleanMethod,
-      authUrl: '',
-      startedAt: Date.now(),
-      timer: null,
-    }
-    this.activeLoginSession = loginState
-
-    // Auto-expire login ACP process after 3 minutes so no orphan lingers
-    loginState.timer = setTimeout(() => {
-      if (this.activeLoginSession === loginState) {
-        this.stopActiveLoginSession()
-      }
-    }, 180_000)
-    loginState.timer.unref?.()
-
     return new Promise((resolvePromise) => {
       let settled = false
-      let stdoutBuf = ''
-      let stderrBuf = ''
-      let authSent = false
-
       const settle = (payload) => {
         if (settled) return
         settled = true
         clearTimeout(waitUrlTimer)
         resolvePromise(payload)
       }
+
+      const captureAuthUrl = (rawUrl) => {
+        const cleanUrl = String(rawUrl || '').trim()
+        if (!cleanUrl || !isSafeWorkbuddyAuthUrl(cleanUrl) || loginState.authUrl) return
+        loginState.authUrl = cleanUrl
+        settle({
+          ok: true,
+          status: 'awaiting_login',
+          writable: false,
+          setupState: 'needs_login',
+          authUrl: loginState.authUrl,
+          methodId: cleanMethod,
+          message: '请在打开的腾讯官方授权页面完成扫码登录，完成后自动解锁发送',
+        })
+      }
+
+      const client = new JsonRpcStdioClient({
+        bin: this.codebuddyBin,
+        args: ['--acp'],
+        cwd: existsSync(this.defaultCwd) ? this.defaultCwd : homedir(),
+        env: spawnEnv,
+        label: 'codebuddy-acp-login',
+        maxStderrChars: 2048,
+        log: this.log,
+        onNotification: (_method, params, msg) => {
+          captureAuthUrl(params?.authUrl || msg?.result?.authUrl || '')
+        },
+        onNonJsonLine: (line) => {
+          const m = line.match(/https:\/\/[^\s"'<>]+/i)
+          if (m) captureAuthUrl(m[0])
+        },
+        onStderrChunk: (text) => {
+          const m = text.match(/https:\/\/[^\s"'<>]+/i)
+          if (m) captureAuthUrl(m[0])
+        },
+        onExit: ({ code, error, stderrTail }) => {
+          if (this.activeLoginSession === loginState) {
+            if (loginState.timer) clearTimeout(loginState.timer)
+            this.activeLoginSession = null
+          }
+          if (this.isCliAuthenticated()) {
+            this.cliAuthenticated = true
+            void this.refreshQuotaInBackground({ force: true })
+            this.emitEvent(EVENTS.SESSION_UPDATED, {
+              externalUpdate: true,
+              authReady: true,
+              app: APPS.WORKBUDDY,
+            })
+            settle({
+              ok: true,
+              status: 'ready',
+              writable: true,
+              setupState: 'ready',
+              message: 'WorkBuddy 授权成功，已解锁远程发送！',
+            })
+            return
+          }
+          settle({
+            ok: false,
+            status: 'login_failed',
+            writable: false,
+            setupState: 'needs_login',
+            error: stderrTail.trim() || String(error?.message || `官方登录流程提前退出（code=${code}）`),
+          })
+        },
+      })
+
+      const loginState = {
+        client,
+        methodId: cleanMethod,
+        authUrl: '',
+        startedAt: Date.now(),
+        timer: null,
+      }
+      this.activeLoginSession = loginState
+      loginState.timer = setTimeout(() => {
+        if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
+      }, 180_000)
+      loginState.timer.unref?.()
 
       const waitUrlTimer = setTimeout(() => {
         settle({
@@ -1570,139 +1695,35 @@ export class WorkBuddyAdapter {
       }, 8_000)
       waitUrlTimer.unref?.()
 
-      const handleLine = (line) => {
-        let msg
-        try {
-          msg = JSON.parse(line)
-        } catch {
-          // Fallback: scan plain URLs in case a CLI build prints the official auth URL directly
-          const m = line.match(/https:\/\/[^\s"'<>]+/i)
-          if (m && isSafeWorkbuddyAuthUrl(m[0]) && !loginState.authUrl) {
-            loginState.authUrl = m[0]
-            settle({
-              ok: true,
-              status: 'awaiting_login',
-              writable: false,
-              setupState: 'needs_login',
-              authUrl: loginState.authUrl,
-              methodId: cleanMethod,
-              message: '请在打开的腾讯官方授权页面完成扫码登录，完成后自动解锁发送',
-            })
-          }
-          return
-        }
-
-        // Capture official ACP `_codebuddy.ai/authUrl` notification
-        const candUrl = msg?.params?.authUrl || msg?.result?.authUrl || ''
-        if (candUrl && isSafeWorkbuddyAuthUrl(candUrl)) {
-          loginState.authUrl = String(candUrl).trim()
-          settle({
-            ok: true,
-            status: 'awaiting_login',
-            writable: false,
-            setupState: 'needs_login',
-            authUrl: loginState.authUrl,
-            methodId: cleanMethod,
-            message: '请在打开的腾讯官方授权页面完成扫码登录，完成后自动解锁发送',
-          })
-          return
-        }
-
-        // Initialize response -> trigger official ACP `authenticate`
-        if (msg?.id === 1 && !authSent) {
-          authSent = true
-          try {
-            proc.stdin.write(
-              `${JSON.stringify({
-                jsonrpc: '2.0',
-                id: 2,
-                method: 'authenticate',
-                params: { methodId: cleanMethod },
-              })}\n`,
-              'utf8',
-            )
-          } catch {}
-          return
-        }
-
-        // Authenticate finished!
-        if (msg?.id === 2) {
-          if (msg.error) {
-            const errMsg = String(msg.error?.message || '官方登录授权未完成或已取消')
-            if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
-            settle({
-              ok: false,
-              status: 'login_failed',
-              writable: false,
-              setupState: 'needs_login',
-              error: errMsg,
-            })
-          } else {
-            this.cliAuthenticated = true
-            if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
-            this.emitEvent(EVENTS.SESSION_UPDATED, {
-              externalUpdate: true,
-              authReady: true,
-              app: APPS.WORKBUDDY,
-            })
-            settle({
-              ok: true,
-              status: 'ready',
-              writable: true,
-              setupState: 'ready',
-              message: 'WorkBuddy 授权成功，已解锁远程发送！',
-            })
-          }
-        }
-      }
-
-      proc.stdout.on('data', (chunk) => {
-        stdoutBuf += chunk
-        let idx
-        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
-          const line = stdoutBuf.slice(0, idx).trim()
-          stdoutBuf = stdoutBuf.slice(idx + 1)
-          if (line) handleLine(line)
-        }
-      })
-
-      proc.stderr?.on('data', (chunk) => {
-        const text = String(chunk || '')
-        stderrBuf = (stderrBuf + text).slice(-2048)
-        const m = text.match(/https:\/\/[^\s"'<>]+/i)
-        if (m && isSafeWorkbuddyAuthUrl(m[0]) && !loginState.authUrl) {
-          loginState.authUrl = m[0]
-          settle({
-            ok: true,
-            status: 'awaiting_login',
-            writable: false,
-            setupState: 'needs_login',
-            authUrl: loginState.authUrl,
-            methodId: cleanMethod,
-            message: '请在打开的腾讯官方授权页面完成扫码登录，完成后自动解锁发送',
-          })
-        }
-      })
-
-      proc.on('error', (err) => {
+      try {
+        client.spawnProcess()
+      } catch (err) {
         if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
         settle({
           ok: false,
           status: 'login_failed',
           writable: false,
           setupState: 'needs_login',
-          error: `登录进程异常：${String(err?.message || err)}`,
+          error: `无法启动官方登录流程：${String(err?.message || err)}`,
         })
-      })
+        return
+      }
 
-      proc.on('close', (code) => {
-        if (this.activeLoginSession === loginState) {
-          if (loginState.timer) clearTimeout(loginState.timer)
-          this.activeLoginSession = null
-        }
-        if (this.isCliAuthenticated()) {
+      void client
+        .callRaw(
+          'initialize',
+          {
+            protocolVersion: 1,
+            clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+            clientInfo: { name: 'allinone', version: CLIENT_VERSION },
+          },
+          25_000,
+        )
+        .then(() => client.callRaw('authenticate', { methodId: cleanMethod }, 175_000))
+        .then((res) => {
+          if (res?.authUrl) captureAuthUrl(res.authUrl)
           this.cliAuthenticated = true
-          void this.refreshQuotaInBackground({ force: true })
+          if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
           this.emitEvent(EVENTS.SESSION_UPDATED, {
             externalUpdate: true,
             authReady: true,
@@ -1715,47 +1736,22 @@ export class WorkBuddyAdapter {
             setupState: 'ready',
             message: 'WorkBuddy 授权成功，已解锁远程发送！',
           })
-          return
-        }
-        settle({
-          ok: false,
-          status: 'login_failed',
-          writable: false,
-          setupState: 'needs_login',
-          error: stderrBuf.trim() || `官方登录流程提前退出（code=${code}）`,
         })
-      })
-
-      // Kick off ACP handshake
-      try {
-        proc.stdin.write(
-          `${JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-              protocolVersion: 1,
-              clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-              clientInfo: { name: 'allinone', version: '1.0.29' },
-            },
-          })}\n`,
-          'utf8',
-        )
-      } catch (err) {
-        if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
-        settle({
-          ok: false,
-          status: 'login_failed',
-          writable: false,
-          setupState: 'needs_login',
-          error: String(err?.message || err),
+        .catch((err) => {
+          if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
+          settle({
+            ok: false,
+            status: 'login_failed',
+            writable: false,
+            setupState: 'needs_login',
+            error: String(err?.message || '官方登录授权未完成或已取消'),
+          })
         })
-      }
     })
   }
 
   async listWorkspaces() {
-    const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
+    const dbSnap = await this._getDbSnapshot()
     return dbSnap.workspaces
   }
 
@@ -1845,53 +1841,72 @@ export class WorkBuddyAdapter {
   }
 
   ensureWatchTimer() {
-    if (this.disposed || this.watchTimer) return
-    if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0) return
-    this.watchTimer = setInterval(() => {
-      void this.pollExternalSessions()
-    }, this.watchPollMs)
-    this.watchTimer.unref?.()
+    this.watcher.ensureRunning()
   }
 
   rememberWatchedSession(nativeId, descriptor) {
-    if (this.disposed || !nativeId) return
-    this.watchedSessions.set(nativeId, {
-      ...descriptor,
-      nativeId,
-      lastSeenAt: Date.now(),
-    })
-    this.ensureWatchTimer()
+    this.watcher.rememberWatched(nativeId, descriptor)
   }
 
   rememberTrackedListSession(nativeId, descriptor) {
-    if (this.disposed || !nativeId) return
-    this.trackedListSessions.set(nativeId, {
-      ...descriptor,
-      nativeId,
-    })
-    if (this.trackedListSessions.size > WORKBUDDY_TRACKED_LIST_LIMIT * 2) {
-      const oldest = [...this.trackedListSessions.entries()]
-        .sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0))
-      while (this.trackedListSessions.size > WORKBUDDY_TRACKED_LIST_LIMIT) {
-        const next = oldest.shift()
-        if (!next) break
-        this.trackedListSessions.delete(next[0])
-      }
-    }
-    this.ensureWatchTimer()
+    this.watcher.rememberTracked(nativeId, descriptor)
   }
 
   async pollExternalSessions() {
-    if (this.disposed || this.watchPollInFlight) return
-    this.watchPollInFlight = true
-    try {
-      const now = Date.now()
-      const emittedIds = new Set()
-      const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
-      const pidDir = join(this.workbuddyHome, 'sessions')
+    return this.watcher.tick()
+  }
 
-      for (const [nativeId, entry] of [...this.watchedSessions.entries()]) {
-        if (this.activeProcs.has(nativeId)) continue
+  async _pollExternalSessions({ now, watched, tracked, isListExpired }) {
+    const emittedIds = new Set()
+    const dbSnap = await this._getDbSnapshot({ force: true })
+    const pidDir = join(this.workbuddyHome, 'sessions')
+
+    for (const [nativeId, entry] of [...watched.entries()]) {
+      if (this.activeProcs.has(nativeId)) continue
+      const dbRow = dbSnap.sessionsById.get(nativeId) || null
+      const probe = probeWorkbuddyExternalStatus({
+        pidSessionsDir: pidDir,
+        targetSessionId: nativeId,
+        transcriptPath: entry.filePath || '',
+        dbStatus: dbRow?.status || '',
+        dbUpdatedAt: dbRow?.updatedAt || 0,
+        now,
+        maxIdleMs: this.externalMaxIdleMs,
+        checkPidAlive: this.checkPidAlive,
+      })
+      const historyChanged = probe.size !== entry.size || probe.mtimeMs > (entry.mtimeMs || 0) + 10
+      const statusChanged = Boolean(probe.running) !== Boolean(entry.externalRunning)
+      if (historyChanged || statusChanged) {
+        entry.size = probe.size
+        entry.mtimeMs = probe.mtimeMs
+        entry.externalRunning = probe.running
+        entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0))
+        if (dbRow?.title) entry.title = dbRow.title
+        if (historyChanged && entry.filePath && existsSync(entry.filePath)) {
+          try {
+            entry.taskState = parseWorkbuddyJsonlMessages(entry.filePath).taskState || null
+            this.sessionTaskStates.set(nativeId, entry.taskState)
+          } catch {}
+        }
+        if (probe.running) entry.lastSeenAt = now
+        emittedIds.add(nativeId)
+        this.emitEvent(EVENTS.SESSION_UPDATED, {
+          historyChanged,
+          statusChanged,
+          externalUpdate: true,
+          session: this.buildWatchPayload(entry, probe, probe.running),
+        })
+      } else if (!probe.running && now - (entry.lastSeenAt || 0) > WORKBUDDY_WATCH_TTL_MS) {
+        watched.delete(nativeId)
+      }
+    }
+
+    const listExpired = isListExpired(now)
+    if (listExpired) {
+      tracked.clear()
+    } else {
+      for (const [nativeId, entry] of [...tracked.entries()]) {
+        if (emittedIds.has(nativeId) || this.activeProcs.has(nativeId)) continue
         const dbRow = dbSnap.sessionsById.get(nativeId) || null
         const probe = probeWorkbuddyExternalStatus({
           pidSessionsDir: pidDir,
@@ -1903,126 +1918,77 @@ export class WorkBuddyAdapter {
           maxIdleMs: this.externalMaxIdleMs,
           checkPidAlive: this.checkPidAlive,
         })
-        const historyChanged = probe.size !== entry.size || probe.mtimeMs > (entry.mtimeMs || 0) + 10
         const statusChanged = Boolean(probe.running) !== Boolean(entry.externalRunning)
-        if (historyChanged || statusChanged) {
+        if (statusChanged) {
           entry.size = probe.size
           entry.mtimeMs = probe.mtimeMs
           entry.externalRunning = probe.running
           entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0))
           if (dbRow?.title) entry.title = dbRow.title
-          if (historyChanged && entry.filePath && existsSync(entry.filePath)) {
-            try {
-              entry.taskState = parseWorkbuddyJsonlMessages(entry.filePath).taskState || null
-              this.sessionTaskStates.set(nativeId, entry.taskState)
-            } catch {}
-          }
-          if (probe.running) entry.lastSeenAt = now
           emittedIds.add(nativeId)
           this.emitEvent(EVENTS.SESSION_UPDATED, {
-            historyChanged,
-            statusChanged,
+            historyChanged: false,
+            statusChanged: true,
             externalUpdate: true,
             session: this.buildWatchPayload(entry, probe, probe.running),
           })
-        } else if (!probe.running && now - (entry.lastSeenAt || 0) > WORKBUDDY_WATCH_TTL_MS) {
-          this.watchedSessions.delete(nativeId)
         }
       }
 
-      const listExpired = now - this.lastClientListAt > WORKBUDDY_LIST_WATCH_TTL_MS
-      if (listExpired) {
-        this.trackedListSessions.clear()
-      } else {
-        for (const [nativeId, entry] of [...this.trackedListSessions.entries()]) {
-          if (emittedIds.has(nativeId) || this.activeProcs.has(nativeId)) continue
-          const dbRow = dbSnap.sessionsById.get(nativeId) || null
+      // Incremental discovery: ONLY inspect DB rows whose status is active or updated within 2 min (no O(N) disk storm!)
+      if (tracked.size > 0 && now - this.lastListDiscoveryAt >= WORKBUDDY_LIST_DISCOVERY_INTERVAL_MS) {
+        this.lastListDiscoveryAt = now
+        for (const [sid, dbRow] of dbSnap.sessionsById.entries()) {
+          if (emittedIds.has(sid) || this.activeProcs.has(sid) || tracked.has(sid)) continue
+          if (dbRow.transport === 'cloud' && !dbRow.cwd) continue
+          const recentlyUpdated = dbRow.updatedAt > 0 && now - dbRow.updatedAt <= 2 * 60_000
+          if (!isDbStatusActive(dbRow.status) && !recentlyUpdated) continue
+          const found = this.findSessionFile(sid)
+          if (!found) continue
           const probe = probeWorkbuddyExternalStatus({
             pidSessionsDir: pidDir,
-            targetSessionId: nativeId,
-            transcriptPath: entry.filePath || '',
-            dbStatus: dbRow?.status || '',
-            dbUpdatedAt: dbRow?.updatedAt || 0,
+            targetSessionId: sid,
+            transcriptPath: found.filePath,
+            dbStatus: dbRow.status,
+            dbUpdatedAt: dbRow.updatedAt,
             now,
             maxIdleMs: this.externalMaxIdleMs,
             checkPidAlive: this.checkPidAlive,
           })
-          const statusChanged = Boolean(probe.running) !== Boolean(entry.externalRunning)
-          if (statusChanged) {
-            entry.size = probe.size
-            entry.mtimeMs = probe.mtimeMs
-            entry.externalRunning = probe.running
-            entry.updatedAt = Math.max(entry.updatedAt || 0, Math.round(probe.mtimeMs || 0))
-            if (dbRow?.title) entry.title = dbRow.title
-            emittedIds.add(nativeId)
+          if (probe.running) {
+            const cliReady = Boolean(this.cliAvailableCache) && this.isCliAuthenticated()
+            const entry = {
+              nativeId: sid,
+              filePath: found.filePath,
+              title: dbRow.title || sid,
+              preview: probe.lastTextPreview || '',
+              cwd: dbRow.cwd || '',
+              workspace: dbRow.cwd ? basename(dbRow.cwd) : 'WorkBuddy',
+              model: dbRow.model || 'auto',
+              source: 'workbuddy-desktop',
+              writable: cliReady,
+              updatedAt: Math.max(dbRow.updatedAt || 0, probe.mtimeMs || 0),
+              size: probe.size,
+              mtimeMs: probe.mtimeMs,
+              externalRunning: true,
+            }
+            this.rememberTrackedListSession(sid, entry)
             this.emitEvent(EVENTS.SESSION_UPDATED, {
               historyChanged: false,
               statusChanged: true,
               externalUpdate: true,
-              session: this.buildWatchPayload(entry, probe, probe.running),
+              session: this.buildWatchPayload(entry, probe, true),
             })
           }
         }
-
-        if (this.trackedListSessions.size > 0 && now - this.lastListDiscoveryAt >= WORKBUDDY_LIST_DISCOVERY_INTERVAL_MS) {
-          this.lastListDiscoveryAt = now
-          for (const [sid, dbRow] of dbSnap.sessionsById.entries()) {
-            if (emittedIds.has(sid) || this.activeProcs.has(sid) || this.trackedListSessions.has(sid)) continue
-            if (dbRow.transport === 'cloud' && !dbRow.cwd) continue
-            const found = this.findSessionFile(sid)
-            if (!found) continue
-            const probe = probeWorkbuddyExternalStatus({
-              pidSessionsDir: pidDir,
-              targetSessionId: sid,
-              transcriptPath: found.filePath,
-              dbStatus: dbRow.status,
-              dbUpdatedAt: dbRow.updatedAt,
-              now,
-              maxIdleMs: this.externalMaxIdleMs,
-              checkPidAlive: this.checkPidAlive,
-            })
-            if (probe.running) {
-              const cliReady = Boolean(this.cliAvailableCache) && this.isCliAuthenticated()
-              const entry = {
-                nativeId: sid,
-                filePath: found.filePath,
-                title: dbRow.title || sid,
-                preview: probe.lastTextPreview || '',
-                cwd: dbRow.cwd || '',
-                workspace: dbRow.cwd ? basename(dbRow.cwd) : 'WorkBuddy',
-                model: dbRow.model || 'auto',
-                source: 'workbuddy-desktop',
-                writable: cliReady,
-                updatedAt: Math.max(dbRow.updatedAt || 0, probe.mtimeMs || 0),
-                size: probe.size,
-                mtimeMs: probe.mtimeMs,
-                externalRunning: true,
-              }
-              this.rememberTrackedListSession(sid, entry)
-              this.emitEvent(EVENTS.SESSION_UPDATED, {
-                historyChanged: false,
-                statusChanged: true,
-                externalUpdate: true,
-                session: this.buildWatchPayload(entry, probe, true),
-              })
-            }
-          }
-        }
       }
-
-      if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0 && this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
-      }
-    } finally {
-      this.watchPollInFlight = false
     }
   }
 
   async listSessions({ limit = 80, search = '' } = {}) {
     const now = Date.now()
     const cliReady = await this.isWritableReady()
-    const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
+    const dbSnap = await this._getDbSnapshot({ force: true })
     const pidDir = join(this.workbuddyHome, 'sessions')
     const results = []
     const seen = new Set()
@@ -2157,7 +2123,7 @@ export class WorkBuddyAdapter {
     const now = Date.now()
     const cliReady = await this.isWritableReady()
     const found = this.findSessionFile(sessionId)
-    const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
+    const dbSnap = await this._getDbSnapshot()
     const dbRow = dbSnap.sessionsById.get(sessionId) || null
 
     if (!found) {
@@ -2302,644 +2268,181 @@ export class WorkBuddyAdapter {
   async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, taskMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'WorkBuddy sessionId')
     let effectiveTaskMode = normalizeTaskMode(taskMode)
-    if (this.activeProcs.has(sessionId)) {
-      const err = new Error('该 WorkBuddy 会话正在运行中，请等待完成或先点击停止。')
-      err.code = 'SESSION_BUSY'
-      throw err
-    }
+    // Reserve activeProcs slot synchronously BEFORE any `await` (eliminates TOCTOU double-spawn race)
+    const reservationToken = this.runner.reserveSession(
+      sessionId,
+      '该 WorkBuddy 会话正在运行中，请等待完成或先点击停止。',
+    )
 
-    const cliReady = Boolean(await this.probeCliVersion())
-    if (!cliReady || !this.codebuddyBin) {
-      const err = new Error('WorkBuddy 远程发送引擎尚未安装，请点击下方「一键启用 WorkBuddy」自动安装并微信扫码登录（全程免命令行）。')
-      err.code = 'SESSION_READONLY'
-      throw err
-    }
-    if (!this.isCliAuthenticated()) {
-      const err = new Error('请先点击「一键微信扫码登录 WorkBuddy」完成初次授权（与桌面端同账号共用额度），随后即可正常发送消息。')
-      err.code = 'SESSION_READONLY'
-      throw err
-    }
-
-    const found = this.findSessionFile(sessionId)
-    const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
-    const dbRow = dbSnap.sessionsById.get(sessionId) || null
-
-    if (found) {
-      const extProbe = probeWorkbuddyExternalStatus({
-        pidSessionsDir: join(this.workbuddyHome, 'sessions'),
-        targetSessionId: sessionId,
-        transcriptPath: found.filePath,
-        dbStatus: dbRow?.status || '',
-        dbUpdatedAt: dbRow?.updatedAt || 0,
-        maxIdleMs: this.externalMaxIdleMs,
-        checkPidAlive: this.checkPidAlive,
-      })
-      if (extProbe.running) {
-        const err = new Error('该 WorkBuddy 会话正在电脑端运行中（手机端实时同步中），请等待电脑端完成后再发消息。')
-        err.code = 'SESSION_BUSY'
+    let args
+    let targetCwd
+    let spawnEnv
+    let prompt
+    let effectivePermissionMode
+    try {
+      const cliReady = Boolean(await this.probeCliVersion())
+      if (!cliReady || !this.codebuddyBin) {
+        const err = new Error('WorkBuddy 远程发送引擎尚未安装，请点击下方「一键启用 WorkBuddy」自动安装并微信扫码登录（全程免命令行）。')
+        err.code = 'SESSION_READONLY'
         throw err
       }
-    }
-
-    let targetCwd = String(cwd || '').trim()
-    if (!targetCwd && dbRow?.cwd) targetCwd = dbRow.cwd
-    if (!targetCwd && found) {
-      const sum = scanWorkbuddySessionSummary(found.filePath, '')
-      targetCwd = sum?.cwd || ''
-    }
-    if (!targetCwd) {
-      targetCwd = this.pendingCreated.get(sessionId)?.cwd || this.defaultCwd
-    }
-    if (!existsSync(targetCwd)) targetCwd = this.defaultCwd
-
-    let prompt = String(text || '').trim()
-    if (!effectiveTaskMode && prompt) {
-      const planMatch = /^\/plan(?:\s+([\s\S]*))?$/i.exec(prompt)
-      if (planMatch) {
-        effectiveTaskMode = 'plan'
-        const rest = String(planMatch[1] || '').trim()
-        if (rest) prompt = rest
+      if (!this.isCliAuthenticated()) {
+        const err = new Error('请先点击「一键微信扫码登录 WorkBuddy」完成初次授权（与桌面端同账号共用额度），随后即可正常发送消息。')
+        err.code = 'SESSION_READONLY'
+        throw err
       }
-    }
-    if (attachments.length > 0) {
-      const lines = attachments.map((a) => `- 附件文件：${a.localPath || a.filename}`)
-      prompt = `${prompt}\n\n[手机端上传的附件，可直接读取]\n${lines.join('\n')}`
-    }
-    if (!prompt) throw new Error('消息内容不能为空')
 
-    const pref = this.sessionPrefs.get(sessionId)
-    const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
-    const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
-    const effectivePermissionMode = resolveEffectiveWorkbuddyPermissionMode(
-      permissionMode,
-      this.permissionMode,
-      effectiveTaskMode,
-    )
-    if (effectiveModel || effectiveEffort) {
-      this.sessionPrefs.set(sessionId, {
-        model: effectiveModel || 'auto',
-        reasoningEffort: effectiveEffort || '',
-      })
+      const found = this.findSessionFile(sessionId)
+      const dbSnap = await this._getDbSnapshot()
+      const dbRow = dbSnap.sessionsById.get(sessionId) || null
+
+      if (found) {
+        const extProbe = probeWorkbuddyExternalStatus({
+          pidSessionsDir: join(this.workbuddyHome, 'sessions'),
+          targetSessionId: sessionId,
+          transcriptPath: found.filePath,
+          dbStatus: dbRow?.status || '',
+          dbUpdatedAt: dbRow?.updatedAt || 0,
+          maxIdleMs: this.externalMaxIdleMs,
+          checkPidAlive: this.checkPidAlive,
+        })
+        if (extProbe.running) {
+          const err = new Error('该 WorkBuddy 会话正在电脑端运行中（手机端实时同步中），请等待电脑端完成后再发消息。')
+          err.code = 'SESSION_BUSY'
+          throw err
+        }
+      }
+
+      targetCwd = String(cwd || '').trim()
+      if (!targetCwd && dbRow?.cwd) targetCwd = dbRow.cwd
+      if (!targetCwd && found) {
+        const sum = scanWorkbuddySessionSummary(found.filePath, '')
+        targetCwd = sum?.cwd || ''
+      }
+      if (!targetCwd) {
+        targetCwd = this.pendingCreated.get(sessionId)?.cwd || this.defaultCwd
+      }
+      if (!existsSync(targetCwd)) targetCwd = this.defaultCwd
+
+      prompt = String(text || '').trim()
+      if (!effectiveTaskMode && prompt) {
+        const planMatch = /^\/plan(?:\s+([\s\S]*))?$/i.exec(prompt)
+        if (planMatch) {
+          effectiveTaskMode = 'plan'
+          const rest = String(planMatch[1] || '').trim()
+          if (rest) prompt = rest
+        }
+      }
+      if (attachments.length > 0) {
+        const lines = attachments.map((a) => `- 附件文件：${a.localPath || a.filename}`)
+        prompt = `${prompt}\n\n[手机端上传的附件，可直接读取]\n${lines.join('\n')}`
+      }
+      if (!prompt) throw new Error('消息内容不能为空')
+
+      const pref = this.sessionPrefs.get(sessionId)
+      const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
+      const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
+      effectivePermissionMode = resolveEffectiveWorkbuddyPermissionMode(
+        permissionMode,
+        this.permissionMode,
+        effectiveTaskMode,
+      )
+      if (effectiveModel || effectiveEffort) {
+        this.sessionPrefs.set(sessionId, {
+          model: effectiveModel || 'auto',
+          reasoningEffort: effectiveEffort || '',
+        })
+      }
+
+      args = [
+        '-p',
+        '--input-format',
+        'stream-json',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--permission-mode',
+        effectivePermissionMode,
+      ]
+      if (effectiveModel && effectiveModel !== 'default' && effectiveModel !== 'auto') {
+        args.push('--model', effectiveModel)
+      }
+      if (effectiveEffort && effectiveEffort !== 'off') {
+        args.push('--effort', effectiveEffort)
+      }
+      if (found) {
+        args.push('--resume', sessionId)
+      } else {
+        args.push('--session-id', sessionId)
+      }
+
+      const targetConfigDir = found?.configDir || (existsSync(this.workbuddyHome) ? this.workbuddyHome : this.codebuddyHome)
+      spawnEnv = {
+        ...process.env,
+        CODEBUDDY_CONFIG_DIR: targetConfigDir,
+        WORKBUDDY_CONFIG_DIR: this.workbuddyHome,
+      }
+    } catch (preErr) {
+      this.runner.releaseReservation(sessionId, reservationToken)
+      throw preErr
     }
 
-    const args = [
-      '-p',
-      '--input-format',
-      'stream-json',
-      '--output-format',
-      'stream-json',
-      '--verbose',
-      '--permission-mode',
-      effectivePermissionMode,
-    ]
-    if (effectiveModel && effectiveModel !== 'default' && effectiveModel !== 'auto') {
-      args.push('--model', effectiveModel)
-    }
-    if (effectiveEffort && effectiveEffort !== 'off') {
-      args.push('--effort', effectiveEffort)
-    }
-    if (found) {
-      args.push('--resume', sessionId)
-    } else {
-      args.push('--session-id', sessionId)
-    }
-
-    // Align transcript directory with WorkBuddy when resuming a WorkBuddy session or when ~/.workbuddy exists
-    const targetConfigDir = found?.configDir || (existsSync(this.workbuddyHome) ? this.workbuddyHome : this.codebuddyHome)
-    const spawnEnv = {
-      ...process.env,
-      CODEBUDDY_CONFIG_DIR: targetConfigDir,
-      WORKBUDDY_CONFIG_DIR: this.workbuddyHome,
+    const formatFriendlyError = (raw) => {
+      const s = String(raw || '').trim()
+      if (/authentication required|authentication failed|\/login/i.test(s)) {
+        this.cliAuthenticated = false
+        return 'WorkBuddy 尚未完成授权登录：请点击底部「一键微信扫码登录 WorkBuddy」完成一次官方扫码授权（与桌面端同账号共用额度），授权后即可直接发送消息。'
+      }
+      return s || 'WorkBuddy 执行返回错误'
     }
 
     const compositeId = makeCompositeId(APPS.WORKBUDDY, sessionId)
-    this.emitEvent(EVENTS.STREAM_START, {
-      sessionId: compositeId,
-      app: APPS.WORKBUDDY,
-      nativeId: sessionId,
-    })
-
-    return new Promise((resolvePromise, rejectPromise) => {
-      let proc
-      try {
-        proc = spawnCrossPlatform(this.codebuddyBin, args, {
-          cwd: targetCwd,
-          env: spawnEnv,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        })
-      } catch (err) {
-        if (err && typeof err === 'object') err._streamErrorEmitted = true
-        this.emitEvent(EVENTS.STREAM_ERROR, {
-          sessionId: compositeId,
-          app: APPS.WORKBUDDY,
-          message: String(err?.message || err),
-        })
-        rejectPromise(err)
-        return
-      }
-      proc.stdout.setEncoding('utf8')
-      proc.stderr?.setEncoding('utf8')
-
-      const taskTracker = createTaskStateTracker(this.sessionTaskStates.get(sessionId) || null)
-      if (effectivePermissionMode === 'plan') {
-        taskTracker.setMode('plan', Date.now())
-      } else if (taskTracker.snapshot()?.mode === 'plan') {
-        taskTracker.setMode(null, Date.now())
-      }
-      const emitTaskState = () => {
-        const diff = taskTracker.consumeChanged()
-        if (!diff.changed) return
-        this.sessionTaskStates.set(sessionId, diff.taskState)
-        this.emitEvent(EVENTS.STREAM_TASK_STATE, {
-          sessionId: compositeId,
-          app: APPS.WORKBUDDY,
-          taskState: diff.taskState,
-        })
-      }
-
-      const state = { proc, aborted: false, taskTracker, emitTaskState }
-      this.activeProcs.set(sessionId, state)
-      emitTaskState()
-
-      let stdoutBuf = ''
-      let stderrBuf = ''
-      let finalText = ''
-      let seenResult = false
-      let settled = false
-      const emittedTextByMsg = new Map()
-      const emittedThinkByMsg = new Map()
-      let lastTextMsgId = null
-      let lastThinkMsgId = null
-      const seenToolIds = new Set()
-      let resultError = ''
-
-      const formatFriendlyError = (raw) => {
-        const s = String(raw || '').trim()
-        if (/authentication required|authentication failed|\/login/i.test(s)) {
-          this.cliAuthenticated = false
-          return 'WorkBuddy 尚未完成授权登录：请点击底部「一键微信扫码登录 WorkBuddy」完成一次官方扫码授权（与桌面端同账号共用额度），授权后即可直接发送消息。'
+    return this.runner.runTurn({
+      sessionId,
+      compositeId,
+      bin: this.codebuddyBin,
+      args,
+      cwd: targetCwd,
+      env: spawnEnv,
+      prompt,
+      effectivePermissionMode,
+      reservationToken,
+      onInspectAssistantText: (fullText, finalText) => {
+        if (/authentication required|authentication failed/i.test(fullText) && !finalText) {
+          return formatFriendlyError(fullText)
         }
-        return s || 'WorkBuddy 执行返回错误'
-      }
-
-      const handleJsonLine = (line) => {
-        let obj
-        try {
-          obj = JSON.parse(line)
-        } catch {
-          return
+        return ''
+      },
+      formatError: formatFriendlyError,
+      onSessionPersisted: (sid, completed) => {
+        if (completed || this.findSessionFile(sid)) {
+          this.pendingCreated.delete(sid)
         }
-
-        if (obj.type === 'assistant') {
-          const msgId = String(obj.message?.id || '__default__')
-          const blocks = Array.isArray(obj.message?.content) ? obj.message.content : []
-          let fullText = ''
-          let fullThink = ''
-          for (const b of blocks) {
-            if (b?.type === 'thinking' && b.thinking) {
-              fullThink += b.thinking
-            } else if (b?.type === 'tool_use' && b.id && !seenToolIds.has(b.id)) {
-              seenToolIds.add(b.id)
-              this.emitEvent(EVENTS.STREAM_TOOL_START, {
-                sessionId: compositeId,
-                app: APPS.WORKBUDDY,
-                tool: { id: b.id, name: b.name || 'tool', input: b.input ?? {} },
-              })
-              if (taskTracker.applyClaudeTool(b.name || 'tool', b.input ?? {}, Date.now())) {
-                emitTaskState()
-              }
-            } else if (b?.type === 'text' && typeof b.text === 'string') {
-              fullText += b.text
-            }
-          }
-          if (/authentication required|authentication failed/i.test(fullText) && !finalText) {
-            resultError = formatFriendlyError(fullText)
-            return
-          }
-          const prevThink = emittedThinkByMsg.get(msgId) || ''
-          if (fullThink) {
-            if (prevThink && fullThink.startsWith(prevThink)) {
-              const rawThinkDelta = fullThink.slice(prevThink.length)
-              if (rawThinkDelta) {
-                emittedThinkByMsg.set(msgId, fullThink)
-                lastThinkMsgId = msgId
-                this.emitEvent(EVENTS.STREAM_THINKING, {
-                  sessionId: compositeId,
-                  app: APPS.WORKBUDDY,
-                  delta: rawThinkDelta,
-                })
-              }
-            } else if (fullThink !== prevThink) {
-              const thinkPrefix = lastThinkMsgId ? '\n\n' : ''
-              emittedThinkByMsg.set(msgId, fullThink)
-              lastThinkMsgId = msgId
-              this.emitEvent(EVENTS.STREAM_THINKING, {
-                sessionId: compositeId,
-                app: APPS.WORKBUDDY,
-                delta: `${thinkPrefix}${fullThink}`,
-              })
-            }
-          }
-          const prevText = emittedTextByMsg.get(msgId) || ''
-          if (fullText) {
-            if (prevText && fullText.startsWith(prevText)) {
-              const rawDelta = fullText.slice(prevText.length)
-              if (rawDelta) {
-                emittedTextByMsg.set(msgId, fullText)
-                lastTextMsgId = msgId
-                finalText += rawDelta
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.WORKBUDDY,
-                  delta: rawDelta,
-                })
-              }
-            } else if (fullText !== prevText) {
-              const textPrefix = finalText ? '\n\n' : ''
-              const delta = `${textPrefix}${fullText}`
-              emittedTextByMsg.set(msgId, fullText)
-              lastTextMsgId = msgId
-              finalText += delta
-              this.emitEvent(EVENTS.STREAM_DELTA, {
-                sessionId: compositeId,
-                app: APPS.WORKBUDDY,
-                delta,
-              })
-            }
-          }
-        } else if (obj.type === 'user' && Array.isArray(obj.message?.content)) {
-          for (const b of obj.message.content) {
-            if (b?.type === 'tool_result' && b.tool_use_id) {
-              this.emitEvent(EVENTS.STREAM_TOOL_END, {
-                sessionId: compositeId,
-                app: APPS.WORKBUDDY,
-                toolId: b.tool_use_id,
-                status: b.is_error ? 'error' : 'completed',
-                output: extractToolOutputText(b.content).slice(0, 3000),
-              })
-            }
-          }
-        } else if (obj.type === 'control_request' && obj.request_id && obj.request) {
-          this.handleControlRequest(proc, sessionId, compositeId, targetCwd, obj)
-        } else if (obj.type === 'result') {
-          seenResult = true
-          if (obj.is_error) {
-            resultError = formatFriendlyError(resultError || obj.result || obj.error)
-          } else if (typeof obj.result === 'string' && obj.result.length > 0) {
-            const trimmedResult = obj.result.trim()
-            if (!lastTextMsgId) {
-              finalText = obj.result
-              this.emitEvent(EVENTS.STREAM_DELTA, {
-                sessionId: compositeId,
-                app: APPS.WORKBUDDY,
-                delta: obj.result,
-              })
-            } else if (trimmedResult && !finalText.trimEnd().endsWith(trimmedResult)) {
-              const lastEmitted = emittedTextByMsg.get(lastTextMsgId) || ''
-              if (
-                lastEmitted &&
-                obj.result.startsWith(lastEmitted) &&
-                obj.result.length > lastEmitted.length &&
-                finalText.endsWith(lastEmitted)
-              ) {
-                const suffix = obj.result.slice(lastEmitted.length)
-                emittedTextByMsg.set(lastTextMsgId, obj.result)
-                finalText += suffix
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.WORKBUDDY,
-                  delta: suffix,
-                })
-              } else {
-                const delta = `${finalText ? '\n\n' : ''}${obj.result}`
-                emittedTextByMsg.set(lastTextMsgId, obj.result)
-                finalText += delta
-                this.emitEvent(EVENTS.STREAM_DELTA, {
-                  sessionId: compositeId,
-                  app: APPS.WORKBUDDY,
-                  delta,
-                })
-              }
-            }
-          }
-          try { proc.stdin.end() } catch {}
-        }
-      }
-
-      proc.stdin?.on('error', () => {})
-
-      proc.stdout.on('data', (chunk) => {
-        stdoutBuf += chunk
-        let idx
-        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
-          const line = stdoutBuf.slice(0, idx).trim()
-          stdoutBuf = stdoutBuf.slice(idx + 1)
-          if (line) handleJsonLine(line)
-        }
-      })
-
-      proc.stderr.on('data', (chunk) => {
-        stderrBuf = (stderrBuf + chunk).slice(-4096)
-      })
-
-      proc.on('error', (err) => {
-        if (settled) return
-        settled = true
-        if (this.activeProcs.get(sessionId) === state) this.activeProcs.delete(sessionId)
-        this.clearPendingControlRequests(proc)
-        if (err && typeof err === 'object') err._streamErrorEmitted = true
-        this.emitEvent(EVENTS.STREAM_ERROR, {
-          sessionId: compositeId,
-          app: APPS.WORKBUDDY,
-          message: String(err?.message || err),
-        })
-        rejectPromise(err)
-      })
-
-      proc.on('close', (code) => {
-        if (settled) return
-        settled = true
-        if (stdoutBuf.trim()) handleJsonLine(stdoutBuf.trim())
-        if (this.activeProcs.get(sessionId) === state) this.activeProcs.delete(sessionId)
-        this.clearPendingControlRequests(proc)
-
-        if (resultError && !state.aborted) {
-          if (this.findSessionFile(sessionId)) this.pendingCreated.delete(sessionId)
-          const err = new Error(resultError)
-          err._streamErrorEmitted = true
-          this.emitEvent(EVENTS.STREAM_ERROR, {
-            sessionId: compositeId,
-            app: APPS.WORKBUDDY,
-            message: resultError,
-          })
-          rejectPromise(err)
-          return
-        }
-
-        if (code !== 0 && !state.aborted && !seenResult) {
-          if (this.findSessionFile(sessionId)) this.pendingCreated.delete(sessionId)
-          const errMsg = formatFriendlyError(stderrBuf.trim() || `codebuddy 进程退出（code=${code}）`)
-          const err = new Error(errMsg)
-          err._streamErrorEmitted = true
-          this.emitEvent(EVENTS.STREAM_ERROR, {
-            sessionId: compositeId,
-            app: APPS.WORKBUDDY,
-            message: errMsg,
-          })
-          rejectPromise(err)
-          return
-        }
-
-        if (!state.aborted || this.findSessionFile(sessionId)) {
-          this.pendingCreated.delete(sessionId)
-        }
-
-        this.emitEvent(EVENTS.STREAM_DONE, {
-          sessionId: compositeId,
-          app: APPS.WORKBUDDY,
-          nativeId: sessionId,
-          finalText,
-          aborted: state.aborted,
-        })
-        resolvePromise({
-          sessionId: compositeId,
-          nativeId: sessionId,
-          finalText,
-          aborted: state.aborted,
-        })
+      },
+      onAfterDone: () => {
         void this.refreshQuotaInBackground({ force: true })
-      })
-
-      const userFrame = JSON.stringify({
-        type: 'user',
-        message: { role: 'user', content: prompt },
-      })
-      proc.stdin.write(`${userFrame}\n`, 'utf8')
-    })
-  }
-
-  clearPendingControlRequests(proc) {
-    for (const [aprId, entry] of this.pendingControlRequests.entries()) {
-      if (entry.proc === proc) {
-        this.pendingControlRequests.delete(aprId)
-        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.WORKBUDDY, decision: 'cancel' })
-      }
-    }
-  }
-
-  writeControlResponse(proc, requestId, responseBody) {
-    if (!proc || !proc.stdin?.writable) return false
-    const frame = JSON.stringify({
-      type: 'control_response',
-      response: {
-        subtype: 'success',
-        request_id: requestId,
-        response: responseBody,
       },
     })
-    proc.stdin.write(`${frame}\n`, 'utf8')
-    return true
   }
 
   handleControlRequest(proc, sessionId, compositeId, cwd, obj) {
-    const requestId = String(obj.request_id)
-    const req = obj.request || {}
-    if (req.subtype !== 'can_use_tool') {
-      this.writeControlResponse(proc, requestId, { behavior: 'allow' })
-      return
-    }
-
-    const toolName = String(req.tool_name || 'tool')
-    const toolInput = req.input && typeof req.input === 'object' ? req.input : {}
-
-    if (toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions) && toolInput.questions.length > 0) {
-      const aprId = `wb-q-${randomUUID().slice(0, 10)}`
-      const questions = toolInput.questions.map((q, idx) => {
-        const opts = Array.isArray(q?.options)
-          ? q.options
-              .filter((o) => o && typeof o.label === 'string')
-              .map((o) => ({
-                value: o.label,
-                label: o.label,
-                description: typeof o.description === 'string' ? o.description : '',
-              }))
-          : []
-        return {
-          id: String(q?.id || `q_${idx}`),
-          origQuestion: String(q?.question || ''),
-          header: String(q?.header || '').trim(),
-          question: String(q?.question || '').trim() || `问题 ${idx + 1}`,
-          description: '',
-          multiSelect: Boolean(q?.multiSelect),
-          allowOther: true,
-          inputType: opts.length > 0 ? 'select' : 'text',
-          required: true,
-          options: opts,
-        }
-      })
-
-      this.pendingControlRequests.set(aprId, { proc, requestId, toolName, toolInput, questions, sessionId })
-      this.onApprovalRequest({
-        id: aprId,
-        app: APPS.WORKBUDDY,
-        sessionId: compositeId,
-        kind: 'question',
-        title: 'WorkBuddy 需要你做选择',
-        detail: '',
-        questions: questions.map(({ origQuestion: _drop, ...publicQ }) => publicQ),
-        createdAt: Date.now(),
-      })
-      return
-    }
-
-    if (toolName === 'ExitPlanMode') {
-      const active = this.activeProcs.get(sessionId)
-      if (active?.taskTracker && active.taskTracker.applyClaudeTool('ExitPlanMode', toolInput, Date.now())) {
-        active.emitTaskState?.()
-      }
-      const aprId = `wb-plan-${randomUUID().slice(0, 10)}`
-      this.pendingControlRequests.set(aprId, { proc, requestId, toolName, toolInput, sessionId })
-      this.onApprovalRequest({
-        id: aprId,
-        app: APPS.WORKBUDDY,
-        sessionId: compositeId,
-        kind: 'permissions',
-        title: 'WorkBuddy 计划已就绪',
-        detail: String(toolInput.plan || '是否批准当前计划并开始执行？').slice(0, 1500),
-        cwd,
-        options: [
-          { value: 'allow', label: '批准执行', style: 'primary' },
-          { value: 'deny', label: '拒绝', style: 'danger' },
-        ],
-        createdAt: Date.now(),
-      })
-      return
-    }
-
-    const aprId = `wb-apr-${randomUUID().slice(0, 10)}`
-    this.pendingControlRequests.set(aprId, { proc, requestId, toolName, toolInput, sessionId })
-    const detail =
-      toolInput.command ||
-      toolInput.file_path ||
-      toolInput.path ||
-      toolInput.description ||
-      JSON.stringify(toolInput, null, 2)
-
-    this.onApprovalRequest({
-      id: aprId,
-      app: APPS.WORKBUDDY,
-      sessionId: compositeId,
-      kind: toolName === 'Edit' || toolName === 'Write' ? 'file_change' : 'command',
-      title: `WorkBuddy 请求使用 ${toolName}`,
-      detail: String(detail || toolName).slice(0, 1200),
-      cwd,
-      options: [
-        { value: 'allow', label: '允许', style: 'primary' },
-        { value: 'deny', label: '拒绝', style: 'danger' },
-      ],
-      createdAt: Date.now(),
-    })
+    return this.runner.handleControlRequest(proc, sessionId, compositeId, cwd, obj)
   }
 
   async resolveApproval(approvalId, decisionOrPayload) {
-    const entry = this.pendingControlRequests.get(approvalId)
-    if (!entry) return { resolved: false, reason: 'approval not found' }
-    this.pendingControlRequests.delete(approvalId)
-
-    const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
-
-    if (entry.toolName === 'AskUserQuestion') {
-      const cancelled = decision === 'cancel' || decision === 'decline' || decision === 'deny'
-      if (cancelled) {
-        this.writeControlResponse(entry.proc, entry.requestId, {
-          behavior: 'deny',
-          message: 'User cancelled the question',
-        })
-      } else {
-        const wbAnswers = {}
-        for (const q of entry.questions || []) {
-          const ans = normalizeSingleAnswer(answers[q.id])
-          const key = q.origQuestion || q.question
-          wbAnswers[key] = q.multiSelect
-            ? ans.combined.join(', ')
-            : (ans.selected[0] || ans.custom || '')
-        }
-        this.writeControlResponse(entry.proc, entry.requestId, {
-          behavior: 'allow',
-          updatedInput: {
-            ...entry.toolInput,
-            questions: entry.toolInput?.questions || [],
-            answers: wbAnswers,
-          },
-        })
-      }
-      this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
-        id: approvalId,
-        app: APPS.WORKBUDDY,
-        decision: cancelled ? 'cancel' : 'submit',
-      })
-      return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit' }
-    }
-
-    const allowed = decision === 'allow' || decision === 'accept' || decision === 'acceptForSession'
-    if (entry.toolName === 'ExitPlanMode' && allowed && entry.sessionId) {
-      const active = this.activeProcs.get(entry.sessionId)
-      if (active?.taskTracker) {
-        active.taskTracker.setMode(null, Date.now())
-        active.emitTaskState?.()
-      }
-    }
-    this.writeControlResponse(
-      entry.proc,
-      entry.requestId,
-      allowed
-        ? { behavior: 'allow', updatedInput: entry.toolInput || {} }
-        : { behavior: 'deny', message: 'User denied tool execution' },
-    )
-    this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
-      id: approvalId,
-      app: APPS.WORKBUDDY,
-      decision: allowed ? 'allow' : 'deny',
-    })
-    return { resolved: true, id: approvalId, decision: allowed ? 'allow' : 'deny' }
+    return this.runner.resolveApproval(approvalId, decisionOrPayload)
   }
 
   async interrupt(sessionId) {
     sessionId = assertSafeSessionId(sessionId, 'WorkBuddy sessionId')
-    const active = this.activeProcs.get(sessionId)
-    if (!active) return { interrupted: false, sessionId }
-    active.aborted = true
-    this.clearPendingControlRequests(active.proc)
-    const proc = active.proc
-    try { proc.stdin?.end() } catch {}
-    try { proc.kill('SIGTERM') } catch {}
-    if (proc.exitCode === null && proc.signalCode === null) {
-      const killTimer = setTimeout(() => {
-        if (proc.exitCode !== null || proc.signalCode !== null) return
-        killProcessTree(proc, { force: true })
-      }, 2_000)
-      killTimer.unref?.()
-      proc.once('close', () => clearTimeout(killTimer))
-    }
-    return { interrupted: true, sessionId }
+    return this.runner.interrupt(sessionId)
   }
 
   async dispose() {
-    this.disposed = true
     this.stopActiveLoginSession()
-    if (this.watchTimer) {
-      clearInterval(this.watchTimer)
-      this.watchTimer = null
-    }
-    this.watchedSessions.clear()
-    this.trackedListSessions.clear()
-    for (const active of this.activeProcs.values()) {
-      active.aborted = true
-      try { this.clearPendingControlRequests(active.proc) } catch {}
-      killProcessTree(active.proc, { force: true })
-    }
-    this.activeProcs.clear()
-    this.pendingControlRequests.clear()
+    this.quotaManager.dispose()
+    this.watcher.dispose()
+    this.runner.dispose()
+    this.disposeBase()
   }
 }

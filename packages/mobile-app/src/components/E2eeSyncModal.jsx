@@ -281,37 +281,20 @@ export function E2eeSyncModal({
       }
 
       if (event === 'e2ee.grant.cancel') {
-        if (payload.reopen) {
-          offerLockedReqIdRef.current = ''
-          setGrantState((prev) =>
-            prev && prev.reqId === cur.reqId
-              ? {
-                  ...prev,
-                  phase: 'waiting',
-                  sasCode: '',
-                  approverPubKey: '',
-                  approverNonce: '',
-                  approverDeviceName: '',
-                  approverIp: '',
-                }
-              : prev,
-          )
-        } else {
-          grantPrivateKeyRef.current = null
-          grantSecretRef.current = ''
-          offerLockedReqIdRef.current = ''
-          setGrantState((prev) =>
-            prev && prev.reqId === cur.reqId
-              ? {
-                  ...prev,
-                  phase: 'expired',
-                  sasCode: '',
-                  approverPubKey: '',
-                  approverNonce: '',
-                }
-              : prev,
-          )
-        }
+        grantPrivateKeyRef.current = null
+        grantSecretRef.current = ''
+        offerLockedReqIdRef.current = ''
+        setGrantState((prev) =>
+          prev && prev.reqId === cur.reqId
+            ? {
+                ...prev,
+                phase: 'expired',
+                sasCode: '',
+                approverPubKey: '',
+                approverNonce: '',
+              }
+            : prev,
+        )
         return
       }
 
@@ -341,8 +324,8 @@ export function E2eeSyncModal({
           setError(bi('缺少扫码防篡改凭证，已拒绝接收授权包', 'Missing QR verification secret; rejected authorization payload.'))
           return
         }
-        if (!isWaitingQrPath && !cur.approverPubKey) {
-          setError(bi('缺少已验证的授权方公钥，已拒绝接收授权包', 'Missing verified approver public key; rejected authorization payload.'))
+        if (!isWaitingQrPath && (!cur.approverPubKey || !cur.reqNonce || !cur.approverNonce)) {
+          setError(bi('缺少已验证的授权方公钥或安全随机数，已拒绝接收授权包', 'Missing verified approver public key or nonces; rejected authorization payload.'))
           return
         }
         setBusy(true)
@@ -356,6 +339,8 @@ export function E2eeSyncModal({
             expectedReqId: cur.reqId,
             expectedApproverPubKey: isWaitingQrPath ? '' : cur.approverPubKey,
             grantSecret: isWaitingQrPath ? qrSecret : '',
+            requesterNonce: isWaitingQrPath ? '' : cur.reqNonce,
+            approverNonce: isWaitingQrPath ? '' : cur.approverNonce,
           })
           const rawKeys = Array.isArray(decrypted?.keys) ? decrypted.keys : []
           const verifiedKeys = []

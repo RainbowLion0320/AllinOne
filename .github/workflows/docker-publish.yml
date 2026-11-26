@@ -15,8 +15,6 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/docker-publish.yml"
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -28,8 +26,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test-gate:
+    name: Test Gate Before Image Publish
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build & run tests
+        run: npm run build && npm test
+
   build-and-push:
     name: Build & Push Multi-Arch Image (GHCR)
+    needs: [test-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

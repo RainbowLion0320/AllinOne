@@ -1,5 +1,6 @@
 package com.allinone.dshmobile;
 
+import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -19,6 +20,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
@@ -29,6 +31,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Lightweight zero-dependency Capacitor bridge allowing decrypted E2EE deliverables & images
@@ -40,6 +43,30 @@ public class AllinOneFilesPlugin extends Plugin {
     private static final long STALE_CACHE_MS = 2L * 60L * 60L * 1000L;
     private static final int MAX_BASE64_LENGTH = 68 * 1024 * 1024; // ~50 MB decoded
     private static final int MAX_DECODED_BYTES = 50 * 1024 * 1024;
+    private static final int MAX_CONCURRENT_EXPORTS = 4;
+
+    private static class ExportSession {
+        final String filename;
+        final String mimeType;
+        final String mode;
+        final Uri mediaStoreUri;
+        final File tempDir;
+        final File tempFile;
+        final OutputStream stream;
+        long totalBytes = 0L;
+
+        ExportSession(String filename, String mimeType, String mode, Uri mediaStoreUri, File tempDir, File tempFile, OutputStream stream) {
+            this.filename = filename;
+            this.mimeType = mimeType;
+            this.mode = mode;
+            this.mediaStoreUri = mediaStoreUri;
+            this.tempDir = tempDir;
+            this.tempFile = tempFile;
+            this.stream = stream;
+        }
+    }
+
+    private final ConcurrentHashMap<String, ExportSession> activeExports = new ConcurrentHashMap<>();
 
     private static final Map<String, String> ALLOWED_EXT_MIME;
     private static final Set<String> BLOCKED_MIMES;
@@ -181,6 +208,214 @@ public class AllinOneFilesPlugin extends Plugin {
         }
     }
 
+    private void showToastSafe(Context ctx, String text) {
+        Activity act = getActivity();
+        if (act != null && !act.isFinishing()) {
+            act.runOnUiThread(() -> Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    private void abortExportSession(ExportSession session) {
+        if (session == null) return;
+        try { session.stream.close(); } catch (Exception ignored) {}
+        if (session.mediaStoreUri != null) {
+            try {
+                getContext().getContentResolver().delete(session.mediaStoreUri, null, null);
+            } catch (Exception ignored) {}
+        }
+        if (session.tempDir != null) {
+            deleteRecursively(session.tempDir);
+        }
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        for (String id : activeExports.keySet()) {
+            ExportSession s = activeExports.remove(id);
+            abortExportSession(s);
+        }
+        super.handleOnDestroy();
+    }
+
+    @PluginMethod
+    public void openExport(PluginCall call) {
+        if (activeExports.size() >= MAX_CONCURRENT_EXPORTS) {
+            call.reject("Too many concurrent exports in progress");
+            return;
+        }
+        String filename = sanitizeFilename(call.getString("filename", "document"));
+        String rawMime = call.getString("mimeType", "application/octet-stream");
+        String mimeType = resolveSafeMimeType(filename, rawMime);
+        if (mimeType == null) {
+            call.reject("Blocked or unsupported file type");
+            return;
+        }
+        String mode = "share".equals(call.getString("mode", "save")) ? "share" : "save";
+        Context ctx = getContext();
+
+        Uri mediaStoreUri = null;
+        File tempDir = null;
+        File tempFile = null;
+        OutputStream out = null;
+
+        try {
+            if ("save".equals(mode) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentResolver resolver = ctx.getContentResolver();
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AllinOne");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    OutputStream msOut = resolver.openOutputStream(uri);
+                    if (msOut != null) {
+                        mediaStoreUri = uri;
+                        out = new BufferedOutputStream(msOut, 65536);
+                    } else {
+                        try { resolver.delete(uri, null, null); } catch (Exception ignored) {}
+                    }
+                }
+            }
+            if (out == null) {
+                File shareDir = new File(ctx.getCacheDir(), "allinone_shared");
+                if (!shareDir.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    shareDir.mkdirs();
+                }
+                pruneShareCache(shareDir);
+                tempDir = new File(shareDir, UUID.randomUUID().toString());
+                if (!tempDir.mkdirs()) {
+                    throw new IllegalStateException("Could not create isolated export directory");
+                }
+                tempFile = new File(tempDir, filename);
+                out = new BufferedOutputStream(new FileOutputStream(tempFile), 65536);
+            }
+            String exportId = UUID.randomUUID().toString();
+            activeExports.put(exportId, new ExportSession(filename, mimeType, mode, mediaStoreUri, tempDir, tempFile, out));
+            JSObject ret = new JSObject();
+            ret.put("exportId", exportId);
+            call.resolve(ret);
+        } catch (Exception err) {
+            if (out != null) {
+                try { out.close(); } catch (Exception ignored) {}
+            }
+            if (mediaStoreUri != null) {
+                try { ctx.getContentResolver().delete(mediaStoreUri, null, null); } catch (Exception ignored) {}
+            }
+            if (tempDir != null) {
+                deleteRecursively(tempDir);
+            }
+            call.reject("Failed to open export stream: " + err.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void writeExportChunk(PluginCall call) {
+        String exportId = call.getString("exportId", "");
+        String chunkBase64 = call.getString("chunkBase64", "");
+        if (exportId == null || exportId.isEmpty()) {
+            call.reject("Missing exportId");
+            return;
+        }
+        ExportSession session = activeExports.get(exportId);
+        if (session == null) {
+            call.reject("Unknown or closed export session");
+            return;
+        }
+        if (chunkBase64 == null || chunkBase64.isEmpty()) {
+            JSObject ret = new JSObject();
+            ret.put("ok", true);
+            call.resolve(ret);
+            return;
+        }
+        byte[] bytes;
+        try {
+            bytes = Base64.decode(chunkBase64, Base64.DEFAULT);
+        } catch (IllegalArgumentException err) {
+            call.reject("Invalid base64 chunk");
+            return;
+        }
+        synchronized (session) {
+            if (session.totalBytes + bytes.length > MAX_DECODED_BYTES) {
+                activeExports.remove(exportId);
+                abortExportSession(session);
+                call.reject("File exceeds maximum allowed size (50 MB)");
+                return;
+            }
+            try {
+                session.stream.write(bytes);
+                session.totalBytes += bytes.length;
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                ret.put("totalBytes", session.totalBytes);
+                call.resolve(ret);
+            } catch (Exception err) {
+                activeExports.remove(exportId);
+                abortExportSession(session);
+                call.reject("Failed writing export chunk: " + err.getMessage());
+            }
+        }
+    }
+
+    @PluginMethod
+    public void finishExport(PluginCall call) {
+        String exportId = call.getString("exportId", "");
+        boolean cancel = Boolean.TRUE.equals(call.getBoolean("cancel", false));
+        ExportSession session = exportId != null ? activeExports.remove(exportId) : null;
+        if (session == null) {
+            if (cancel) {
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                call.resolve(ret);
+            } else {
+                call.reject("Unknown export session");
+            }
+            return;
+        }
+        synchronized (session) {
+            if (cancel) {
+                abortExportSession(session);
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                call.resolve(ret);
+                return;
+            }
+            Context ctx = getContext();
+            try {
+                session.stream.flush();
+                session.stream.close();
+                if (session.mediaStoreUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ContentValues doneVals = new ContentValues();
+                    doneVals.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    ctx.getContentResolver().update(session.mediaStoreUri, doneVals, null, null);
+                    showToastSafe(ctx, "Saved to Downloads/AllinOne/" + session.filename);
+                    JSObject ret = new JSObject();
+                    ret.put("ok", true);
+                    ret.put("uri", session.mediaStoreUri.toString());
+                    call.resolve(ret);
+                    return;
+                }
+                Uri contentUri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", session.tempFile);
+                Intent sendIntent = new Intent(Intent.ACTION_SEND);
+                sendIntent.setType(session.mimeType);
+                sendIntent.putExtra(Intent.EXTRA_STREAM, contentUri);
+                sendIntent.putExtra(Intent.EXTRA_SUBJECT, session.filename);
+                sendIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(sendIntent, session.filename);
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(chooser);
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                ret.put("uri", contentUri.toString());
+                call.resolve(ret);
+            } catch (Exception err) {
+                abortExportSession(session);
+                call.reject("Failed to finalize export: " + err.getMessage());
+            }
+        }
+    }
+
     @PluginMethod
     public void saveAndShare(PluginCall call) {
         String dataBase64 = call.getString("dataBase64", "");
@@ -228,10 +463,7 @@ public class AllinOneFilesPlugin extends Plugin {
                         out.write(bytes);
                         out.flush();
                     }
-                    final String savedName = filename;
-                    getActivity().runOnUiThread(() ->
-                        Toast.makeText(ctx, "Saved to Downloads/AllinOne/" + savedName, Toast.LENGTH_SHORT).show()
-                    );
+                    showToastSafe(ctx, "Saved to Downloads/AllinOne/" + filename);
                     JSObject ret = new JSObject();
                     ret.put("ok", true);
                     ret.put("uri", uri.toString());

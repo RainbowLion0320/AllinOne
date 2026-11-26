@@ -17,6 +17,7 @@ const MAX_CACHE_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
 
 const memoryFallback = new Map()
 let dbPromise = null
+let lastPruneAt = 0
 
 function estimateBytes(obj) {
   try {
@@ -43,9 +44,21 @@ function openDb() {
           store.createIndex('cachedAt', 'cachedAt', { unique: false })
         }
       }
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => resolve(null)
+      req.onsuccess = () => {
+        const db = req.result
+        db.onclose = () => { dbPromise = null }
+        db.onversionchange = () => {
+          try { db.close() } catch {}
+          dbPromise = null
+        }
+        resolve(db)
+      }
+      req.onerror = () => {
+        dbPromise = null
+        resolve(null)
+      }
     } catch {
+      dbPromise = null
       resolve(null)
     }
   })
@@ -219,10 +232,17 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
   const approxBytes = estimateBytes(baseRecord)
   const record = { ...baseRecord, approxBytes }
 
-  memoryFallback.set(cacheKey, record)
-
   const db = await openDb()
-  if (!db) return
+  if (!db) {
+    // Only use memoryFallback when IndexedDB is unavailable (eliminates 12MB write-only RAM mirror)
+    memoryFallback.set(cacheKey, record)
+    while (memoryFallback.size > MAX_CACHED_SESSIONS) {
+      const oldest = memoryFallback.keys().next().value
+      if (!oldest) break
+      memoryFallback.delete(oldest)
+    }
+    return
+  }
 
   await new Promise((resolve) => {
     try {
@@ -235,8 +255,12 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
     }
   })
 
-  // Background TTL + session count + total byte budget LRU prune
-  pruneCacheBudget(db).catch(() => {})
+  // Throttle budget pruning to at most once per 60s
+  const now = Date.now()
+  if (now - lastPruneAt >= 60_000) {
+    lastPruneAt = now
+    pruneCacheBudget(db).catch(() => {})
+  }
 }
 
 async function pruneCacheBudget(db) {
@@ -315,19 +339,24 @@ export async function getSessionCacheStats(scope = '') {
   return new Promise((resolve) => {
     try {
       const tx = db.transaction(STORE_NAME, 'readonly')
-      const req = tx.objectStore(STORE_NAME).getAll()
+      const store = tx.objectStore(STORE_NAME)
+      let sessionCount = 0
+      let messageCount = 0
+      let totalBytes = 0
+      const req = store.openCursor()
       req.onsuccess = () => {
-        const rows = Array.isArray(req.result) ? req.result : []
-        let sessionCount = 0
-        let messageCount = 0
-        let totalBytes = 0
-        for (const r of rows) {
-          if (!matchesScope(r, cleanScope, false)) continue
-          sessionCount += 1
-          messageCount += r.messages?.length || 0
-          totalBytes += Number(r.approxBytes) || estimateBytes(r)
+        const cur = req.result
+        if (!cur) {
+          resolve({ sessionCount, messageCount, totalBytes })
+          return
         }
-        resolve({ sessionCount, messageCount, totalBytes })
+        const r = cur.value
+        if (matchesScope(r, cleanScope, false)) {
+          sessionCount += 1
+          messageCount += r?.messages?.length || 0
+          totalBytes += Number(r?.approxBytes) || estimateBytes(r)
+        }
+        cur.continue()
       }
       req.onerror = () => resolve({ sessionCount: 0, messageCount: 0, totalBytes: 0 })
     } catch {

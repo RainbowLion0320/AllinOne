@@ -16,6 +16,9 @@ import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { normalizeResolvePayload, normalizeSingleAnswer } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker } from '../helpers/task-state.js'
 import { DshLocalIpcClient } from '../dsh-local-ipc.js'
+import { BaseAdapter } from './base-adapter.js'
+import { BoundedLruMap } from '../primitives/lru.js'
+import { QuotaCacheManager } from '../primitives/quota-cache.js'
 
 /**
  * Build a properly identified DSH UserMessage.
@@ -469,13 +472,21 @@ function attachDownstreamDesktopSignal(request) {
   }
 }
 
-export class DshAdapter {
+export class DshAdapter extends BaseAdapter {
   constructor({ ctx = null, config = {}, log = console, emitEvent, onApprovalRequest }) {
+    super(APPS.DSH, {
+      config,
+      log,
+      emitEvent,
+      onApprovalRequest,
+      capabilities: {
+        supportsWorkspaces: true,
+        supportsApproval: true,
+        supportsMidChatSwitch: true,
+        supportsQuota: true,
+      },
+    })
     this.ctx = ctx
-    this.config = config
-    this.log = log
-    this.emitEvent = emitEvent || (() => {})
-    this.onApprovalRequest = onApprovalRequest || (() => {})
     this.dshHome = String(config.dshHome ?? '').trim() || getDshHome()
     this.defaultCwd = resolve(
       String(config.cwd ?? '').trim() ||
@@ -484,21 +495,25 @@ export class DshAdapter {
     )
     this.permissionPreset = String(config.permissionPreset ?? 'danger-full-access').trim()
     this.agentPreset = String(config.agentPreset ?? '').trim() || undefined
-    this.activeTurns = new Map() // sessionId -> { agent, aborting, startedAt }
+    this.activeTurns = new Map() // sessionId -> { agent, aborted, pollTimer, startedAt }
     this.ownedHandles = new Map()
-    this.sessionModels = new Map() // sessionId -> { provider, model, reasoningEffort }
+    this.sessionModels = new BoundedLruMap(256)
     this.pendingApprovals = new Map() // id -> { req, resolveMobile, rejectMobile }
     this.cordisDisposers = []
-    this.disposed = false
-    this.quotaCache = null
-    this.quotaCacheAt = 0
-    this.quotaFetchInFlight = null
     this.fetchQuotaFn = typeof config.fetchDeepseekQuota === 'function'
       ? config.fetchDeepseekQuota
       : () => fetchDeepseekBalanceQuota({
           dshHome: this.dshHome,
           endpointOverride: String(config.deepseekBalanceEndpoint || '').trim(),
         })
+    this.quotaManager = new QuotaCacheManager({
+      app: APPS.DSH,
+      ttlMs: DSH_QUOTA_CACHE_TTL_MS,
+      errorBackoffMs: 15_000,
+      emitEvent: this.emitEvent,
+      fetcher: () => this.fetchQuotaFn(),
+      isValid: (q) => Boolean(q),
+    })
     this.ipcClient = this.ctx
       ? null
       : new DshLocalIpcClient({
@@ -515,6 +530,22 @@ export class DshAdapter {
     if (this.ctx) {
       this.attachCordisInteractiveHooks()
     }
+  }
+
+  get quotaCache() {
+    return this.quotaManager.quota
+  }
+
+  set quotaCache(val) {
+    this.quotaManager.quota = val
+  }
+
+  get quotaCacheAt() {
+    return this.quotaManager.fetchedAt
+  }
+
+  set quotaCacheAt(val) {
+    this.quotaManager.fetchedAt = Number(val) || 0
   }
 
   /**
@@ -1004,33 +1035,7 @@ export class DshAdapter {
   }
 
   async refreshQuotaInBackground({ force = false } = {}) {
-    if (this.disposed) return this.quotaCache
-    const now = Date.now()
-    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < DSH_QUOTA_CACHE_TTL_MS) {
-      return this.quotaCache
-    }
-    if (this.quotaFetchInFlight) return this.quotaFetchInFlight
-    const task = Promise.resolve()
-      .then(() => this.fetchQuotaFn())
-      .then((fresh) => {
-        if (this.disposed) return null
-        this.quotaCacheAt = Date.now()
-        if (fresh) {
-          this.quotaCache = fresh
-          this.emitEvent(EVENTS.BRIDGE_STATUS, {
-            type: 'quota.updated',
-            app: APPS.DSH,
-            quota: fresh,
-          })
-        }
-        return this.quotaCache
-      })
-      .catch(() => this.quotaCache)
-      .finally(() => {
-        if (this.quotaFetchInFlight === task) this.quotaFetchInFlight = null
-      })
-    this.quotaFetchInFlight = task
-    return task
+    return this.quotaManager.refreshInBackground({ force })
   }
 
   async resolveQuota({ forceQuota = false } = {}) {
@@ -1666,6 +1671,8 @@ export class DshAdapter {
       }
 
       pollTimer = setInterval(flushNewEvents, 250)
+      pollTimer.unref?.()
+      turnState.pollTimer = pollTimer
       agent.followup(buildDshUserMessage(prompt))
       await agent.whenIdle()
       flushNewEvents()
@@ -1745,6 +1752,20 @@ export class DshAdapter {
 
   async dispose() {
     this.disposed = true
+    this.quotaManager.dispose()
+    for (const active of this.activeTurns.values()) {
+      active.aborted = true
+      if (active.pollTimer) {
+        clearInterval(active.pollTimer)
+        active.pollTimer = null
+      }
+      try {
+        if (typeof active.agent?.abort === 'function') await active.agent.abort()
+        else if (typeof active.agent?.cancel === 'function') await active.agent.cancel()
+        else if (typeof active.agent?.interrupt === 'function') await active.agent.interrupt()
+      } catch {}
+    }
+    this.activeTurns.clear()
     for (const disposeFn of this.cordisDisposers) {
       try { disposeFn() } catch {}
     }
@@ -1758,5 +1779,6 @@ export class DshAdapter {
       try { await handle.dispose?.() } catch {}
     }
     this.ownedHandles.clear()
+    this.disposeBase()
   }
 }

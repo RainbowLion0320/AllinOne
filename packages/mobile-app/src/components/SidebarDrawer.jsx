@@ -187,7 +187,7 @@ function getQuotaTone(remainingPercent) {
   }
 }
 
-export function SidebarDrawer({
+export const SidebarDrawer = React.memo(function SidebarDrawer({
   open,
   onClose,
   sessions,
@@ -1016,4 +1016,4 @@ export function SidebarDrawer({
       </aside>
     </>
   )
-}
+})

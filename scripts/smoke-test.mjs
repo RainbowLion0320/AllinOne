@@ -59,7 +59,7 @@ import {
 import {
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
-  CTRL_FRAG_LIMIT_CHARS,
+  CTRL_FRAG_LIMIT_BYTES,
   P2P_BULK_LABEL,
   P2P_CTRL_LABEL,
   createCtrlCodec,
@@ -891,7 +891,18 @@ async function main() {
     assert.equal(bootAfter.needsBootstrapToken, false)
     assert.equal(bootAfter.dailyRegistrationsUsed, 1)
     assert.equal(bootAfter.dailyRegistrationRemaining, 19)
-    assert.equal(readFileSync(accountsFile, 'utf8').includes(SMOKE_ADMIN_PASS), false, 'accounts.json must never store plaintext password')
+    const accountsDbFile = accountsFile.replace(/\.json$/i, '.db')
+    const readAccountsStorageBytes = () =>
+      Buffer.concat(
+        [accountsDbFile, `${accountsDbFile}-wal`]
+          .filter((p) => existsSync(p))
+          .map((p) => readFileSync(p)),
+      )
+    assert.equal(
+      readAccountsStorageBytes().includes(Buffer.from(SMOKE_ADMIN_PASS)),
+      false,
+      'SQLite accounts.db must never store plaintext password',
+    )
 
     // Login & wrong-password rejection
     const loginRes = await fetch(`${httpBase}/api/account/login`, {
@@ -1034,7 +1045,11 @@ async function main() {
     const smokeDev = await smokeDevRes.json()
     assert.equal(smokeDev.ok, true)
     assert.ok(smokeDev.deviceSecret.startsWith('dv_'))
-    assert.equal(readFileSync(accountsFile, 'utf8').includes(smokeDev.deviceSecret), false, 'accounts.json must never store plaintext deviceSecret')
+    assert.equal(
+      readAccountsStorageBytes().includes(Buffer.from(smokeDev.deviceSecret)),
+      false,
+      'SQLite accounts.db must never store plaintext deviceSecret',
+    )
 
     const tempPc = await (await fetch(`${httpBase}/api/account/device-login`, {
       method: 'POST',
@@ -1499,7 +1514,7 @@ async function main() {
       assert.ok(frames.length >= 4)
       let reassembled = null
       for (const f of frames) {
-        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_CHARS)
+        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_BYTES)
         reassembled = decCodec.decode(f)
       }
       assert.deepEqual(reassembled, bigCtrl)
@@ -1694,13 +1709,14 @@ async function main() {
       assert.match(sasV2C, /^\d{3}-\d{3}$/)
       assert.equal(sasV2C, sasV2B)
 
-      const sasFromC = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId })
-      const sasFromB = await deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId })
-      assert.match(sasFromC, /^\d{3}-\d{3}$/)
-      assert.equal(sasFromC, sasFromB)
+      // v2 Commit-then-Reveal SAS enforces mandatory nonces (missing nonces MUST throw)
+      await assert.rejects(
+        () => deriveGrantSas({ requesterPubKey: pairC.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId }),
+        (err) => err?.code === 'E2EE_GRANT_NONCE_REQUIRED',
+      )
       assert.notEqual(
-        await deriveGrantSas({ requesterPubKey: pairEvil.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId }),
-        sasFromC,
+        await deriveGrantSas({ requesterPubKey: pairEvil.publicKeyRaw, approverPubKey: pairB.publicKeyRaw, reqId: reqId1, roomId: testRoomId, requesterNonce: reqNonce1, approverNonce: appNonce1 }),
+        sasV2C,
       )
 
       const env1 = await encryptGrantPayload({
@@ -1709,6 +1725,8 @@ async function main() {
         requesterPubKeyRaw: pairC.publicKeyRaw,
         reqId: reqId1,
         roomId: testRoomId,
+        requesterNonce: reqNonce1,
+        approverNonce: appNonce1,
         payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
       })
       assert.equal(JSON.stringify(env1).includes(roomKeyA), false)
@@ -1719,26 +1737,32 @@ async function main() {
         roomId: testRoomId,
         expectedReqId: reqId1,
         expectedApproverPubKey: pairB.publicKeyRaw,
+        requesterNonce: reqNonce1,
+        approverNonce: appNonce1,
       })
       assert.equal(dec1.keys[0].key, roomKeyA)
       await assert.rejects(
-        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedReqId: 'deadbeef00000000' }),
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedReqId: 'deadbeef00000000', requesterNonce: reqNonce1, approverNonce: appNonce1 }),
         (err) => err?.code === 'E2EE_GRANT_REQID_MISMATCH',
       )
       await assert.rejects(
-        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedApproverPubKey: pairEvil.publicKeyRaw }),
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, expectedApproverPubKey: pairEvil.publicKeyRaw, requesterNonce: reqNonce1, approverNonce: appNonce1 }),
         /E2EE_GRANT_PUBKEY_MISMATCH|安全码/,
       )
       await assert.rejects(
-        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, grantSecret: qrSec1 }),
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, grantSecret: qrSec1, requesterNonce: reqNonce1, approverNonce: appNonce1 }),
         /解密授权密钥包失败/,
       )
       await assert.rejects(
-        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: 'usr_wrong' }),
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: 'usr_wrong', requesterNonce: reqNonce1, approverNonce: appNonce1 }),
         /解密授权密钥包失败/,
       )
       await assert.rejects(
-        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: { ...env1, ct: `${env1.ct.slice(0, -2)}AA` }, roomId: testRoomId }),
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: { ...env1, ct: `${env1.ct.slice(0, -2)}AA` }, roomId: testRoomId, requesterNonce: reqNonce1, approverNonce: appNonce1 }),
+        /解密授权密钥包失败/,
+      )
+      await assert.rejects(
+        () => decryptGrantPayload({ requesterPrivateKey: pairC.privateKey, requesterPubKeyRaw: pairC.publicKeyRaw, envelope: env1, roomId: testRoomId, requesterNonce: generateGrantNonce(), approverNonce: appNonce1 }),
         /解密授权密钥包失败/,
       )
 
@@ -1791,6 +1815,8 @@ async function main() {
           requesterPubKeyRaw: cPair1.publicKeyRaw,
           reqId: liveReqId1,
           roomId: smokeAdmin.roomId,
+          requesterNonce: liveReqNonce1,
+          approverNonce: liveAppNonce1,
           payload: { keys: [{ keyId: roomKeyAId, key: roomKeyA }], preferredKeyId: roomKeyAId },
         })
         phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId: liveReqId1, envelope: liveEnv1 }))
@@ -1802,6 +1828,8 @@ async function main() {
           roomId: smokeAdmin.roomId,
           expectedReqId: liveReqId1,
           expectedApproverPubKey: offerEv.payload.approverPubKey,
+          requesterNonce: liveReqNonce1,
+          approverNonce: liveAppNonce1,
         })
         assert.equal(unlocked1.keys[0].key, roomKeyA)
 
@@ -1814,12 +1842,14 @@ async function main() {
         // Path B: Reverse-QR out-of-band 1-tap delivery bound to 128-bit grantSecret
         const cPair2 = await generateGrantKeyPair()
         const liveReqId2 = generateGrantReqId()
+        const liveReqNonce2 = generateGrantNonce()
+        const liveCommit2 = await computeGrantCommitment({ reqId: liveReqId2, roomId: smokeAdmin.roomId, pubKey: cPair2.publicKeyRaw, nonce: liveReqNonce2 })
         const liveQrSecret2 = generateGrantSecret()
         const parsedQr2 = parseE2eeGrantQrInput(
           encodeE2eeGrantQrUri({ reqId: liveReqId2, roomId: smokeAdmin.roomId, pubKeyFp: cPair2.publicKeyFp, grantSecret: liveQrSecret2 }),
         )
         assert.equal(parsedQr2.grantSecret, liveQrSecret2)
-        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId2, pubKey: cPair2.publicKeyRaw }))
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId2, pubKey: cPair2.publicKeyRaw, commit: liveCommit2 }))
         await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REQUEST && m.payload?.reqId === liveReqId2)
 
         phoneB.ws.send(JSON.stringify({ type: 'e2ee.grant.list', id: 'b-list-2' }))
@@ -1880,7 +1910,9 @@ async function main() {
         // Disconnect auto-cancel for pending grant + disconnect `done` nudge
         const cPair3 = await generateGrantKeyPair()
         const liveReqId3 = generateGrantReqId()
-        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId3, pubKey: cPair3.publicKeyRaw }))
+        const liveReqNonce3 = generateGrantNonce()
+        const liveCommit3 = await computeGrantCommitment({ reqId: liveReqId3, roomId: smokeAdmin.roomId, pubKey: cPair3.publicKeyRaw, nonce: liveReqNonce3 })
+        compC.ws.send(JSON.stringify({ type: 'e2ee.grant.req', reqId: liveReqId3, pubKey: cPair3.publicKeyRaw, commit: liveCommit3 }))
         await phoneB.waitFor((m) => m.event === EVENTS.E2EE_GRANT_REQUEST && m.payload?.reqId === liveReqId3)
         phoneB.ws.close()
         const nudgeDone = await compC.waitFor((m) => m.event === EVENTS.E2EE_QR_NUDGE && m.payload?.action === 'done')
@@ -2967,7 +2999,11 @@ async function main() {
         ps1Path: 'C:\\Users\\张三\\AppData\\Local\\Temp\\apply-update.ps1',
       })
       assert.ok(winScripts.vbsScript.includes('sh.Run cmd, 0, True'))
-      assert.ok(winScripts.psScript.includes('Get-Process -Id $oldPid') && winScripts.psScript.includes('ArgumentList "/S"'))
+      assert.ok(
+        winScripts.psScript.includes('Get-Process -Id $oldPid') &&
+          winScripts.psScript.includes('/S /D=$installDir') &&
+          winScripts.psScript.includes('-ArgumentList $nsisArgs'),
+      )
       assert.equal(winScripts.psScript.includes('tasklist'), false)
 
       const fakePayload = Buffer.alloc(64 * 1024, 0x5a)
@@ -3058,17 +3094,17 @@ async function main() {
       }
 
       // 10b-2. Mobile / Android OTA hot-update checks (remote web hot-reload, Capacitor OTA, staged reuse, minNativeVersion guard & ZIP bundler)
-      assert.equal(isHotReloadableWebOrigin({ protocol: 'https:', hostname: '123.206.218.214' }), true)
+      assert.equal(isHotReloadableWebOrigin({ protocol: 'https:', hostname: '203.0.113.10' }), true)
       assert.equal(isHotReloadableWebOrigin({ protocol: 'https:', hostname: 'localhost' }), false)
       assert.equal(isHotReloadableWebOrigin({ protocol: 'capacitor:', hostname: 'localhost' }), false)
       assert.equal(isHotReloadableWebOrigin({ protocol: 'app:', hostname: 'allinone' }), false)
       assert.equal(
-        resolveCurrentAppBaseUrl({ origin: 'https://123.206.218.214', pathname: '/dsh/' }),
-        'https://123.206.218.214/dsh',
+        resolveCurrentAppBaseUrl({ origin: 'https://203.0.113.10', pathname: '/dsh/' }),
+        'https://203.0.113.10/dsh',
       )
       assert.equal(
-        resolveCurrentAppBaseUrl({ origin: 'https://123.206.218.214', pathname: '/dsh/index.html' }),
-        'https://123.206.218.214/dsh',
+        resolveCurrentAppBaseUrl({ origin: 'https://203.0.113.10', pathname: '/dsh/index.html' }),
+        'https://203.0.113.10/dsh',
       )
 
       // Mode B: Remote-URL WebView APK or Mobile PWA MUST hot-reload in-place (never jump to GitHub download URL)
@@ -3076,16 +3112,16 @@ async function main() {
         let swUpdated = false
         const remoteHot = await checkNativeMobileUpdate({
           currentVersion: '1.0.25',
-          baseUrl: 'https://123.206.218.214/dsh',
+          baseUrl: 'https://203.0.113.10/dsh',
           token: 'tok-1',
-          locationLike: { protocol: 'https:', hostname: '123.206.218.214', origin: 'https://123.206.218.214', pathname: '/dsh/' },
+          locationLike: { protocol: 'https:', hostname: '203.0.113.10', origin: 'https://203.0.113.10', pathname: '/dsh/' },
           navigatorLike: {
             serviceWorker: {
               getRegistrations: async () => [{ update: async () => { swUpdated = true }, waiting: null }],
             },
           },
           fetchImpl: async (url) => {
-            assert.match(String(url), /^https:\/\/123\.206\.218\.214\/dsh\/api\/health\?_t=/)
+            assert.match(String(url), /^https:\/\/203\.0\.113\.10\/dsh\/api\/health\?_t=/)
             return { ok: true, json: async () => ({ ok: true, version: '1.0.26' }) }
           },
         })
@@ -3101,21 +3137,22 @@ async function main() {
       {
         const mockSha = 'a'.repeat(64)
         const localLoc = { protocol: 'https:', hostname: 'localhost', origin: 'https://localhost', pathname: '/' }
+        const signedOtaManifest = {
+          schema: 1,
+          version: '1.0.27',
+          minNativeVersion: '1.0.26',
+          bundleFile: 'All-in-One-WebBundle.zip',
+          sha256: mockSha,
+          size: 1_250_000,
+          sigAlg: 'SHA256withRSA',
+          signature: 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5',
+        }
         const mockFetch = async (url) => {
           const u = String(url)
-          if (u.includes('/downloads/ota/All-in-One-WebBundle.json')) {
+          if (u.includes('All-in-One-WebBundle.json')) {
             return {
               ok: true,
-              json: async () => ({
-                schema: 1,
-                version: '1.0.27',
-                minNativeVersion: '1.0.26',
-                bundleFile: 'All-in-One-WebBundle.zip',
-                sha256: mockSha,
-                size: 1_250_000,
-                sigAlg: 'SHA256withRSA',
-                signature: 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5',
-              }),
+              json: async () => signedOtaManifest,
             }
           }
           if (u.includes('/api/health')) {
@@ -3135,6 +3172,11 @@ async function main() {
                   browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-WebBundle.zip',
                 },
                 {
+                  name: 'All-in-One-WebBundle.json',
+                  size: 420,
+                  browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-WebBundle.json',
+                },
+                {
                   name: 'All-in-One-Android.apk',
                   size: 8_400_000,
                   browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-Android.apk',
@@ -3149,7 +3191,7 @@ async function main() {
           currentVersion: '1.0.26',
           nativeVersion: '1.0.26',
           hasNativeOta: true,
-          baseUrl: 'https://123.206.218.214/dsh',
+          baseUrl: 'https://203.0.113.10/dsh',
           token: 'tok-1',
           locationLike: localLoc,
           fetchImpl: mockFetch,
@@ -3158,7 +3200,7 @@ async function main() {
         assert.equal(capOta.hotUpdate, true)
         assert.equal(capOta.mode, 'capacitor-ota')
         assert.equal(capOta.latestVersion, '1.0.27')
-        assert.equal(capOta.downloadUrl, 'https://123.206.218.214/dsh/downloads/ota/All-in-One-WebBundle.zip')
+        assert.equal(capOta.downloadUrl, 'https://203.0.113.10/dsh/downloads/ota/All-in-One-WebBundle.zip')
         assert.equal(capOta.fallbackUrl, 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-WebBundle.zip')
         assert.equal(capOta.expectedSha256, mockSha)
         assert.equal(capOta.sigAlg, 'SHA256withRSA')
@@ -3169,7 +3211,7 @@ async function main() {
           nativeVersion: '1.0.26',
           stagedVersion: '1.0.27',
           hasNativeOta: true,
-          baseUrl: 'https://123.206.218.214/dsh',
+          baseUrl: 'https://203.0.113.10/dsh',
           token: 'tok-1',
           locationLike: localLoc,
           fetchImpl: mockFetch,
@@ -3183,7 +3225,7 @@ async function main() {
           currentVersion: '1.0.25',
           nativeVersion: '1.0.25',
           hasNativeOta: true,
-          baseUrl: 'https://123.206.218.214/dsh',
+          baseUrl: 'https://203.0.113.10/dsh',
           token: 'tok-1',
           locationLike: localLoc,
           fetchImpl: mockFetch,
@@ -3646,11 +3688,17 @@ async function main() {
 
       const docOrch = new MultiAppOrchestrator({ config: { cwd: docDir }, log: { info() {}, warn() {}, error() {} } })
       try {
-        const htmlRes = await docOrch.readLocalFile({ path: 'dashboard.html', cwd: docDir, mode: 'document' })
+        let mintedHtmlTicket = null
+        const htmlRes = await docOrch.readLocalFile(
+          { path: 'dashboard.html', cwd: docDir, mode: 'document' },
+          { mintDownloadTicket: (t) => { mintedHtmlTicket = t; return 101 } },
+        )
         assert.equal(htmlRes.mimeType, 'text/html; charset=utf-8')
         assert.equal(htmlRes.transferMode, 'p2p-bulk')
         assert.equal(htmlRes.dataBase64, undefined)
-        assert.ok(readFileSync(htmlRes._localRealPath, 'utf8').includes('Q4 KPI'))
+        assert.equal(htmlRes._localRealPath, undefined)
+        assert.equal(htmlRes.streamId, 101)
+        assert.ok(readFileSync(mintedHtmlTicket.realPath, 'utf8').includes('Q4 KPI'))
         assert.equal((await docOrch.readLocalFile({ path: `file://${xlsxPath}`, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         assert.equal((await docOrch.readLocalFile({ path: docxPath, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
         assert.equal((await docOrch.readLocalFile({ path: pptxPath, cwd: docDir, mode: 'document' })).mimeType, 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
@@ -3679,9 +3727,14 @@ async function main() {
         // Large deliverable (>10MB) switches cleanly to p2p-bulk
         const hugePpt = join(docDir, 'huge-deck.pptx')
         writeFileSync(hugePpt, Buffer.alloc(10 * 1024 * 1024 + 65536, 0x41))
-        const hugeRes = await docOrch.readLocalFile({ path: hugePpt, cwd: docDir, mode: 'document' })
+        let mintedHugeTicket = null
+        const hugeRes = await docOrch.readLocalFile(
+          { path: hugePpt, cwd: docDir, mode: 'document' },
+          { mintDownloadTicket: (t) => { mintedHugeTicket = t; return 102 } },
+        )
         assert.equal(hugeRes.transferMode, 'p2p-bulk')
-        assert.ok(hugeRes._localRealPath)
+        assert.equal(hugeRes._localRealPath, undefined)
+        assert.ok(mintedHugeTicket?.realPath)
 
         // Frontend deliverable extractor
         const extracted = extractDeliverableRefsFromMessage({
@@ -4369,8 +4422,10 @@ async function main() {
       assert.equal(agyMultiDash?.pools[1].badge, '含赠送')
       assert.equal(agyMultiDash?.pools[0].windows[0].shortLabel, '5小时')
       assert.equal(agyMultiDash?.pools[0].windows[1].shortLabel, '7天')
+      assert.ok(agyMultiDash?.pools[0].windows[1].shortResetText)
       const homeQuotaSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/components/HomeQuotaDashboard.jsx'), 'utf8')
-      assert.ok(homeQuotaSrc.includes('ConcentricQuotaRings') && homeQuotaSrc.includes('splitOuterInnerWindows'))
+      assert.ok(homeQuotaSrc.includes('function QuotaRing(') && homeQuotaSrc.includes('function QuotaRingItem('))
+      assert.equal(homeQuotaSrc.includes('ConcentricQuotaRings'), false)
 
       // DeepSeek Harness official balance normalization, .credentials.yaml parser & dashboard rendering
       const fakeDshHome = join(tmpDir, 'fake-dsh-balance-home')
@@ -4572,7 +4627,7 @@ async function main() {
       const cjkFrames = utf8Codec.encode(cjkPayload)
       assert.ok(cjkFrames.length >= 2, 'Large CJK payload must be fragmented')
       for (const f of cjkFrames) {
-        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_CHARS, 'Every control fragment must be <= 48KB binary bytes')
+        assert.ok(f instanceof Uint8Array && f.byteLength <= CTRL_FRAG_LIMIT_BYTES, 'Every control fragment must be <= 48KB binary bytes')
       }
       let decodedCjk = null
       for (const f of cjkFrames) decodedCjk = utf8Codec.decode(f)

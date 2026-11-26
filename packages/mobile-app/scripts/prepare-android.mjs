@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -80,14 +80,31 @@ function main() {
   const relayUrl = resolveRelayUrl()
   const buildEnv = {
     ...process.env,
+    CAPACITOR_BUILD: '1',
     ...(relayUrl ? { VITE_RELAY_URL: relayUrl } : {}),
   }
 
-  // 1. Build latest web bundle (always baked as offline/local asset)
+  // 1. Build latest web bundle without VitePWA Service Worker (always baked as offline/local asset)
   runNpmCmd(['run', 'build'], MOBILE_ROOT, buildEnv)
 
   // 2. Sync Capacitor Android project (updates Gradle bindings & copies dist/ -> assets/public)
   runCapSync(buildEnv)
+
+  // 2b. Strip PC-only downloads, shell installers & Service Workers from Android assets (~3.5 MB saved)
+  const androidPublicDir = join(ANDROID_ASSETS_DIR, 'public')
+  if (existsSync(androidPublicDir)) {
+    for (const rel of ['downloads', 'setup.sh', 'setup.ps1', 'sw.js', 'registerSW.js']) {
+      const target = join(androidPublicDir, rel)
+      if (existsSync(target)) {
+        rmSync(target, { recursive: true, force: true })
+      }
+    }
+    for (const name of readdirSync(androidPublicDir)) {
+      if (/^workbox-.*\.js$/.test(name) || name.endsWith('.map')) {
+        rmSync(join(androidPublicDir, name), { force: true })
+      }
+    }
+  }
 
   // 3. Write clean runtime assets/capacitor.config.json (gitignored)
   // Default to signed bundled local assets; remote HTTPS UI requires explicit ANDROID_REMOTE_UI=1 opt-in.

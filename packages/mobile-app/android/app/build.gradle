@@ -5,8 +5,8 @@ apply plugin: 'com.android.application'
 def pkgJsonFile = file('../../package.json')
 def pkgVersion = pkgJsonFile.exists() ? (new JsonSlurper().parseText(pkgJsonFile.text).version ?: '1.0.0') : '1.0.0'
 def verParts = pkgVersion.toString().split('-')[0].split('\\.').collect { it.isInteger() ? it.toInteger() : 0 }
-def computedVersionCode = (verParts.size() > 0 ? verParts[0] : 1) * 10000 +
-    (verParts.size() > 1 ? verParts[1] : 0) * 100 +
+def computedVersionCode = (verParts.size() > 0 ? verParts[0] : 1) * 1000000 +
+    (verParts.size() > 1 ? verParts[1] : 0) * 1000 +
     (verParts.size() > 2 ? verParts[2] : 0)
 
 def releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
@@ -40,8 +40,9 @@ android {
     }
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (hasReleaseKeystore) {
                 signingConfig signingConfigs.release
             }

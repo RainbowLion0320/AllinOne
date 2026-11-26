@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import React, { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   ArrowUp,
@@ -16,7 +16,6 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
-import { MarkdownView } from '../lib/markdown.jsx'
 import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js'
 import { extractDeliverableRefsFromMessage } from '../lib/deliverableFiles.js'
 import { ChatImageGallery } from './ChatImageGallery.jsx'
@@ -27,6 +26,27 @@ import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { TaskStateBar } from './TaskStateBar.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang } from '../lib/i18n.js'
+import { ImageContextProvider } from '../state/ImageContext.jsx'
+import { useSessionStream, useSessionStreamingActive } from '../state/streamingStore.js'
+
+const LazyMarkdownView = React.lazy(() =>
+  import('../lib/markdown.jsx').then((m) => ({ default: m.MarkdownView })),
+)
+
+function SafeMarkdown({ text, streaming = false, imageContext = null }) {
+  if (!text) return null
+  return (
+    <Suspense
+      fallback={
+        <div className="min-w-0 max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[15px] leading-[1.72] text-slate-800 dark:text-slate-100">
+          {text}
+        </div>
+      }
+    >
+      <LazyMarkdownView text={text} streaming={streaming} imageContext={imageContext} />
+    </Suspense>
+  )
+}
 
 function ThinkingBlock({ text, streaming }) {
   const { bi } = useI18n()
@@ -295,7 +315,7 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
         {Array.isArray(msg.tools) && msg.tools.length > 0 && (
           <ToolCallsGroup tools={msg.tools} totalToolCount={msg.toolCount} streaming={false} />
         )}
-        <MarkdownView text={msg.text} imageContext={imageContext} />
+        <SafeMarkdown text={msg.text} imageContext={imageContext} />
         {allImages.length > 0 && (
           <ChatImageGallery images={allImages} imageContext={imageContext} />
         )}
@@ -307,10 +327,75 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
   )
 })
 
-export function ChatView({
+/**
+ * Isolated streaming leaf component subscribed directly to `streamingStore`.
+ * Receiving high-frequency token deltas ONLY re-renders this leaf instead of `App` + `ChatView`!
+ */
+const StreamingAssistantTurn = React.memo(function StreamingAssistantTurn({
+  sessionId,
+  appId,
+  imageContext,
+  scrollRef,
+  isNearBottomRef,
+  pinnedToBottomRef,
+  userInteractedRef,
+}) {
+  const { bi } = useI18n()
+  const stream = useSessionStream(sessionId)
+
+  const streamingImages = useMemo(
+    () => (stream?.active && stream?.text ? extractImageRefsFromText(stream.text) : []),
+    [stream?.active, stream?.text],
+  )
+
+  useEffect(() => {
+    const el = scrollRef?.current
+    if (!el || !stream?.active) return
+    if (isNearBottomRef.current || (pinnedToBottomRef.current && !userInteractedRef.current)) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+      isNearBottomRef.current = true
+    }
+  }, [stream?.active, stream?.text, stream?.thinking, stream?.tools?.length, scrollRef, isNearBottomRef, pinnedToBottomRef, userInteractedRef])
+
+  if (!stream) return null
+
+  return (
+    <>
+      {stream.active && (
+        <div className="animate-msg-in flex items-start gap-2.5">
+          <VendorBadge app={appId || 'dsh'} size="md" active={true} className="mt-0.5 shadow-2xs" />
+          <div className="min-w-0 flex-1">
+            {stream.thinking && <ThinkingBlock text={stream.thinking} streaming={true} />}
+            {stream.tools?.length > 0 && <ToolCallsGroup tools={stream.tools} streaming={true} />}
+            {stream.text ? (
+              <>
+                <SafeMarkdown text={stream.text} streaming={true} imageContext={imageContext} />
+                {streamingImages.length > 0 && (
+                  <ChatImageGallery images={streamingImages} imageContext={imageContext} />
+                )}
+              </>
+            ) : (
+              <div className="inline-flex items-center gap-2 py-1 text-sm text-slate-400">
+                <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
+                <span>{bi('思考中...', 'Thinking...')}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {stream.error && (
+        <div className="flex items-start gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{stream.error}</span>
+        </div>
+      )}
+    </>
+  )
+})
+
+export const ChatView = React.memo(function ChatView({
   session,
   messages,
-  streamingState,
   loadingSession,
   hasMoreHistory = false,
   loadingOlder = false,
@@ -335,6 +420,7 @@ export function ChatView({
   onResolveApproval,
 }) {
   const { bi, t } = useI18n()
+  const isStreamingActive = useSessionStreamingActive(session?.id || '')
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
   const topSentinelRef = useRef(null)
@@ -367,10 +453,6 @@ export function ChatView({
   useEffect(() => cancelPendingRafs, [])
 
   const displayMessages = useMemo(() => mergeAssistantRuns(messages), [messages])
-  const streamingImages = useMemo(
-    () => (streamingState?.active && streamingState?.text ? extractImageRefsFromText(streamingState.text) : []),
-    [streamingState?.active, streamingState?.text],
-  )
 
   const captureVisibleAnchor = () => {
     const el = scrollRef.current
@@ -506,7 +588,7 @@ export function ChatView({
       setInitialScrollReady(false)
       setShowScrollBottom(false)
     } else if (pendingInitialScrollRef.current) {
-      if (count > 0 || streamingState?.active) {
+      if (count > 0 || isStreamingActive) {
         pendingInitialScrollRef.current = false
         pinnedToBottomRef.current = true
         pinUntilRef.current = Date.now() + 1000
@@ -577,7 +659,7 @@ export function ChatView({
 
     prevLastIdRef.current = lastId
     prevMsgCountRef.current = count
-  }, [session?.id, sessionOpenSeq, loadingSession, displayMessages, prependSeq, streamingState?.active])
+  }, [session?.id, sessionOpenSeq, loadingSession, displayMessages, prependSeq, isStreamingActive])
 
   // 4) Auto-backfill once if initial page didn't fill the screen height (so user can always scroll naturally!)
   useEffect(() => {
@@ -596,17 +678,6 @@ export function ChatView({
     if (!el || !approvals || approvals.length === 0) return
     el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [approvals?.length])
-
-  // Follow live streaming output only if user hasn't scrolled up reading history
-  // Uses pre-growth `isNearBottomRef` tracked in handleScroll so tall >=260px chunks never break auto-scroll
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el || !streamingState?.active) return
-    if (isNearBottomRef.current || (pinnedToBottomRef.current && !userInteractedRef.current)) {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
-      isNearBottomRef.current = true
-    }
-  }, [streamingState?.active, streamingState?.text, streamingState?.thinking, streamingState?.tools?.length])
 
   const handleScroll = () => {
     const el = scrollRef.current
@@ -700,14 +771,15 @@ export function ChatView({
   const [dismissedSyncWarnKey, setDismissedSyncWarnKey] = useState('')
   const syncWarnKey = session?.syncWarning ? `${session?.id || ''}::${session.syncWarning}` : ''
   const showSyncWarning = Boolean(session?.syncWarning && dismissedSyncWarnKey !== syncWarnKey)
-  const hasContent = displayMessages.length > 0 || streamingState?.active
+  const hasContent = displayMessages.length > 0 || isStreamingActive
 
   return (
+    <ImageContextProvider value={imageContext}>
     <div className="relative flex min-h-0 flex-1 flex-col">
       <TaskStateBar
         sessionId={session?.id || ''}
         taskState={session?.taskState || null}
-        running={Boolean(streamingState?.active || session?.syncState?.externalRunning)}
+        running={Boolean(isStreamingActive || session?.syncState?.externalRunning)}
         imageContext={imageContext}
       />
       <div
@@ -849,39 +921,21 @@ export function ChatView({
               />
             ))}
 
-            {/* Live streaming assistant message */}
-            {streamingState?.active && (
-              <div className="animate-msg-in flex items-start gap-2.5">
-                <VendorBadge app={session?.app || 'dsh'} size="md" active={true} className="mt-0.5 shadow-2xs" />
-                <div className="min-w-0 flex-1">
-                  {streamingState.thinking && (
-                    <ThinkingBlock text={streamingState.thinking} streaming={true} />
-                  )}
-                  {streamingState.tools?.length > 0 && (
-                    <ToolCallsGroup tools={streamingState.tools} streaming={true} />
-                  )}
-                  {streamingState.text ? (
-                    <>
-                      <MarkdownView text={streamingState.text} streaming={true} imageContext={imageContext} />
-                      {streamingImages.length > 0 && (
-                        <ChatImageGallery
-                          images={streamingImages}
-                          imageContext={imageContext}
-                        />
-                      )}
-                    </>
-                  ) : (
-                    <div className="inline-flex items-center gap-2 py-1 text-sm text-slate-400">
-                      <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-                      <span>{bi('思考中...', 'Thinking...')}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
+            {/* Live streaming assistant turn & stream error banner (isolated via useSyncExternalStore) */}
+            {session?.id && (
+              <StreamingAssistantTurn
+                sessionId={session.id}
+                appId={session.app || 'dsh'}
+                imageContext={imageContext}
+                scrollRef={scrollRef}
+                isNearBottomRef={isNearBottomRef}
+                pinnedToBottomRef={pinnedToBottomRef}
+                userInteractedRef={userInteractedRef}
+              />
             )}
 
             {/* External Desktop live-sync pulse (Antigravity / Codex / Claude Desktop currently generating) */}
-            {!streamingState?.active && session?.syncState?.externalRunning && (
+            {!isStreamingActive && session?.syncState?.externalRunning && (
               <div className="animate-msg-in space-y-1.5 py-1">
                 <div className="flex items-center gap-2 text-xs text-slate-400 dark:text-slate-500">
                   <VendorBadge app={session?.app || 'dsh'} size="xs" active={true} />
@@ -899,14 +953,6 @@ export function ChatView({
                     </span>
                   </div>
                 )}
-              </div>
-            )}
-
-            {/* Stream Error Banner */}
-            {streamingState?.error && (
-              <div className="flex items-start gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{streamingState.error}</span>
               </div>
             )}
           </div>
@@ -941,5 +987,6 @@ export function ChatView({
         </button>
       )}
     </div>
+    </ImageContextProvider>
   )
-}
+})

@@ -15,9 +15,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import http from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { isPidAlive } from './primitives/io-utils.js'
 
 const IPC_FILE_NAME = 'allinone-dsh-ipc.json'
 const MAX_SSE_CLIENTS = 16
+const IPC_BODY_READ_TIMEOUT_MS = 30_000
 const ALLOWED_METHODS = new Set([
   'listModels',
   'listWorkspaces',
@@ -42,40 +44,47 @@ function safeTokenEqual(a, b) {
   return timingSafeEqual(bufA, bufB)
 }
 
-function isPidAlive(pid) {
-  const n = Number(pid)
-  if (!Number.isInteger(n) || n <= 0) return false
-  try {
-    process.kill(n, 0)
-    return true
-  } catch (err) {
-    // EPERM means the process exists under another privilege level
-    return err?.code === 'EPERM'
-  }
-}
-
-function readJsonBody(req, maxBytes = 4 * 1024 * 1024) {
+function readJsonBody(req, maxBytes = 4 * 1024 * 1024, timeoutMs = IPC_BODY_READ_TIMEOUT_MS) {
   return new Promise((resolveBody, rejectBody) => {
     const chunks = []
     let total = 0
+    let done = false
+    const timer = setTimeout(() => {
+      if (done) return
+      done = true
+      const err = new Error('IPC request body timeout')
+      err.code = 'ETIMEDOUT'
+      rejectBody(err)
+      req.destroy()
+    }, timeoutMs)
+    timer.unref?.()
+    const finish = (err, val) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      if (err) rejectBody(err)
+      else resolveBody(val)
+    }
     req.on('data', (chunk) => {
+      if (done) return
       total += chunk.length
       if (total > maxBytes) {
-        rejectBody(new Error('IPC request body too large'))
+        finish(new Error('IPC request body too large'))
         req.destroy()
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
+      if (done) return
       try {
         const raw = Buffer.concat(chunks).toString('utf8')
-        resolveBody(raw ? JSON.parse(raw) : {})
+        finish(null, raw ? JSON.parse(raw) : {})
       } catch (err) {
-        rejectBody(err)
+        finish(err)
       }
     })
-    req.on('error', rejectBody)
+    req.on('error', (err) => finish(err))
   })
 }
 
@@ -352,6 +361,8 @@ export class DshLocalIpcClient {
     this.sseReadyPromise = null
     this.sseReconnectTimer = null
     this.sseReconnectAttempt = 0
+    /** @type {Set<import('node:http').ClientRequest>} */
+    this.inFlightReqs = new Set()
     this.disposed = false
   }
 
@@ -581,13 +592,20 @@ export class DshLocalIpcClient {
           if (settled) return
           settled = true
           if (timer) clearTimeout(timer)
+          if (req) this.inFlightReqs.delete(req)
           resolveCall(val)
         }
         const finishReject = (err) => {
           if (settled) return
           settled = true
           if (timer) clearTimeout(timer)
+          if (req) this.inFlightReqs.delete(req)
           rejectCall(err)
+        }
+
+        if (this.disposed) {
+          finishReject(new Error('DSH IPC client disposed'))
+          return
         }
 
         if (timeoutMs > 0) {
@@ -633,6 +651,7 @@ export class DshLocalIpcClient {
             res.on('error', finishReject)
           },
         )
+        this.inFlightReqs.add(req)
         // Disable Node's default socket idle timeout so long-running agentic turns (>5 min) obey ONLY caller timeoutMs
         req.setTimeout(0)
         req.on('error', finishReject)
@@ -652,6 +671,10 @@ export class DshLocalIpcClient {
     this.disposed = true
     this.clearSseReconnectTimer()
     this.closeSse()
+    for (const req of [...this.inFlightReqs]) {
+      try { req.destroy(new Error('DSH IPC client disposed')) } catch {}
+    }
+    this.inFlightReqs.clear()
     this.cachedEndpoint = null
   }
 }

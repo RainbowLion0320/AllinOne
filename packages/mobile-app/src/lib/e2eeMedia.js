@@ -19,6 +19,7 @@ const blobUrlCache = new Map()
 const inflightLoads = new Map()
 let cacheEpoch = 0
 let mediaDbPromise = null
+let lastMediaPruneAt = 0
 
 function openMediaDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null)
@@ -33,9 +34,21 @@ function openMediaDb() {
           store.createIndex('cachedAt', 'cachedAt', { unique: false })
         }
       }
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => resolve(null)
+      req.onsuccess = () => {
+        const db = req.result
+        db.onclose = () => { mediaDbPromise = null }
+        db.onversionchange = () => {
+          try { db.close() } catch {}
+          mediaDbPromise = null
+        }
+        resolve(db)
+      }
+      req.onerror = () => {
+        mediaDbPromise = null
+        resolve(null)
+      }
     } catch {
+      mediaDbPromise = null
       resolve(null)
     }
   })
@@ -147,7 +160,11 @@ async function persistMediaBlob(cacheKey, blob, { roomId = '', bridgeId = '', mi
       resolve()
     }
   })
-  prunePersistedMediaBudget(db).catch(() => {})
+  const now = Date.now()
+  if (now - lastMediaPruneAt >= 60_000) {
+    lastMediaPruneAt = now
+    prunePersistedMediaBudget(db).catch(() => {})
+  }
 }
 
 function matchesMediaScope(record, { roomId = '', bridgeId = '' } = {}) {
@@ -164,17 +181,22 @@ export async function getPersistedMediaCacheStats({ roomId = '', bridgeId = '' }
   return new Promise((resolve) => {
     try {
       const tx = db.transaction(MEDIA_STORE_NAME, 'readonly')
-      const req = tx.objectStore(MEDIA_STORE_NAME).getAll()
+      const store = tx.objectStore(MEDIA_STORE_NAME)
+      let imageCount = 0
+      let totalBytes = 0
+      const req = store.openCursor()
       req.onsuccess = () => {
-        const rows = Array.isArray(req.result) ? req.result : []
-        let imageCount = 0
-        let totalBytes = 0
-        for (const r of rows) {
-          if (!matchesMediaScope(r, { roomId, bridgeId })) continue
-          imageCount += 1
-          totalBytes += Number(r.size || r.blob?.size || 0)
+        const cur = req.result
+        if (!cur) {
+          resolve({ imageCount, totalBytes })
+          return
         }
-        resolve({ imageCount, totalBytes })
+        const r = cur.value
+        if (matchesMediaScope(r, { roomId, bridgeId })) {
+          imageCount += 1
+          totalBytes += Number(r?.size || r?.blob?.size || 0)
+        }
+        cur.continue()
       }
       req.onerror = () => resolve({ imageCount: 0, totalBytes: 0 })
     } catch {
@@ -334,6 +356,17 @@ export function getCachedE2eeImageUrl(item, imageContext = {}) {
   if (!target) return ''
   const hit = blobUrlCache.get(cacheKey)
   return hit?.url || ''
+}
+
+export function invalidateCachedE2eeImageUrl(item, imageContext = {}) {
+  if (!item) return
+  const { cacheKey } = resolveTargetAndKey(item, imageContext)
+  if (!cacheKey) return
+  const hit = blobUrlCache.get(cacheKey)
+  if (hit?.url) {
+    try { URL.revokeObjectURL(hit.url) } catch {}
+  }
+  blobUrlCache.delete(cacheKey)
 }
 
 /**

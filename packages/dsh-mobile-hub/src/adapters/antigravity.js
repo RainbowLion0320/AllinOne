@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getAgyCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
@@ -11,6 +11,10 @@ import {
   normalizeResolvePayload,
 } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
+import { BaseAdapter } from './base-adapter.js'
+import { atomicWriteJsonSync, queryReadOnlySqlite } from '../primitives/io-utils.js'
+import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
+import { BoundedLruMap } from '../primitives/lru.js'
 
 const AGY_APP_DATA_DIR = 'antigravity'
 const transcriptCache = createFileParseCache(16)
@@ -135,8 +139,7 @@ function readDiskAgyQuota(cachePath, now = Date.now()) {
 function writeDiskAgyQuota(cachePath, quota) {
   if (!cachePath || !quota) return
   try {
-    mkdirSync(dirname(cachePath), { recursive: true })
-    writeFileSync(cachePath, JSON.stringify(quota), { encoding: 'utf8', mode: 0o600 })
+    atomicWriteJsonSync(cachePath, quota, { mode: 0o600 })
   } catch {}
 }
 
@@ -395,9 +398,10 @@ async function isAntigravityDesktopRunning(force = false) {
     }
     let proc = null
     const timer = setTimeout(() => {
-      try { proc?.kill() } catch {}
+      if (proc) killProcessTree(proc, { force: true })
       done(false)
     }, 1_500)
+    timer.unref?.()
     try {
       if (process.platform === 'win32') {
         proc = spawnCrossPlatform('tasklist', ['/FI', 'IMAGENAME eq Antigravity.exe', '/NH'], {
@@ -455,71 +459,12 @@ const AGY_SQLITE_PY_SCRIPT = [
   '    con.close()',
 ].join('\n')
 
-function runPythonSqliteJson(pyCode, args, fallbackValue, timeoutMs = 3_000) {
-  const pyBin = findExecutable(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) ||
-    (process.platform === 'win32' ? 'python' : 'python3')
-  // Encode Python code as base64 on a single line so Windows .bat/.cmd shims never split on newlines or mangle quotes
-  const encoded = Buffer.from(String(pyCode || ''), 'utf8').toString('base64')
-  const launcher = `exec(__import__('base64').b64decode('${encoded}').decode('utf-8'))`
-  return new Promise((resolvePromise) => {
-    let settled = false
-    const done = (val) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolvePromise(val)
-    }
-    let proc = null
-    const timer = setTimeout(() => {
-      try { proc?.kill() } catch {}
-      done(fallbackValue)
-    }, timeoutMs)
-    timer.unref?.()
-    try {
-      proc = spawnCrossPlatform(pyBin, ['-c', launcher, ...args], {
-        stdio: ['ignore', 'pipe', 'ignore'],
-        windowsHide: true,
-        env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
-      })
-      let out = ''
-      proc.stdout.setEncoding('utf8')
-      proc.stdout.on('data', (d) => { out += d })
-      proc.on('close', () => {
-        try {
-          done(JSON.parse(out))
-        } catch {
-          done(fallbackValue)
-        }
-      })
-      proc.on('error', () => done(fallbackValue))
-    } catch {
-      done(fallbackValue)
-    }
-  })
-}
-
 /**
  * Shared read-only SQLite query helper for Antigravity's `conversation_summaries.db`.
- * Uses Node's built-in `node:sqlite` first; falls back to Python `sqlite3` for Electron compatibility.
+ * Delegates to unified `queryReadOnlySqlite` (`node:sqlite` + Python `sqlite3` Electron fallback).
  */
 async function runAgySqliteQuery(dbPath, { sql, params = [], single = false, fallbackValue = null }) {
-  if (!dbPath || !existsSync(dbPath)) return fallbackValue
-  try {
-    const sqlite = await import('node:sqlite')
-    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true, timeout: 1500 })
-    try {
-      const stmt = db.prepare(sql)
-      const res = single ? stmt.get(...params) : stmt.all(...params)
-      return res ?? fallbackValue
-    } finally {
-      db.close()
-    }
-  } catch {
-    // Fallback to Python sqlite3 read-only query
-  }
-
-  const payloadB64 = Buffer.from(JSON.stringify({ dbPath, sql, params, single }), 'utf8').toString('base64')
-  return runPythonSqliteJson(AGY_SQLITE_PY_SCRIPT, [payloadB64], fallbackValue)
+  return queryReadOnlySqlite(dbPath, { sql, params, single, fallbackValue, timeoutMs: 3_000 })
 }
 
 async function queryAgyConversationState(dbPath, conversationId) {
@@ -801,16 +746,19 @@ class AgyAcpClient {
     this.onSessionUpdate = onSessionUpdate || null
     this.onServerRequest = onServerRequest || null
     this.onExit = onExit || null
-    this.proc = null
-    this.nextId = 1
-    this.pending = new Map()
-    this.stdoutBuf = ''
-    this.stderrBuf = ''
-    this.closing = false
+    this.transport = null
+  }
+
+  get proc() {
+    return this.transport?.proc || null
+  }
+
+  get closing() {
+    return Boolean(this.transport?.closing)
   }
 
   isAlive() {
-    return Boolean(this.proc && !this.proc.killed && !this.closing && this.proc.stdin?.writable)
+    return Boolean(this.transport?.isAlive())
   }
 
   setSessionUpdateHandler(fn) {
@@ -822,61 +770,51 @@ class AgyAcpClient {
   }
 
   touchSlidingTimeouts() {
-    for (const [id, p] of this.pending.entries()) {
-      if (!p.sliding || !p.timeoutMs) continue
-      clearTimeout(p.timer)
-      p.timer = setTimeout(() => {
-        if (!this.pending.has(id)) return
-        this.pending.delete(id)
-        p.reject(new Error(`Antigravity ACP "${p.method}" 长时间无响应超时`))
-      }, p.timeoutMs)
-    }
+    this.transport?.touchSlidingTimeouts()
   }
 
   async start() {
     const args = ['acp', '--app-data-dir', AGY_APP_DATA_DIR]
     if (this.autoApprove) args.push('--dangerously-skip-permissions')
 
-    const proc = spawnCrossPlatform(this.agyBin, args, {
+    this.transport = new JsonRpcStdioClient({
+      bin: this.agyBin,
+      args,
       cwd: this.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
+      label: 'Antigravity ACP',
+      maxStderrChars: 4096,
+      log: this.log,
+      onNotification: (method, params) => {
+        if (method === 'session/update') {
+          this.onSessionUpdate?.(params || {})
+        }
+      },
+      onServerRequest: (_t, msg) => {
+        if (this.onServerRequest) {
+          this.onServerRequest(this, msg)
+          return
+        }
+        if (msg.method === 'session/request_permission' && this.autoApprove) {
+          const opts = msg.params?.options || []
+          const allow = opts.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always') || opts[0]
+          this.sendRaw({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { outcome: allow ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' } },
+          })
+        } else {
+          this.sendRaw({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32601, message: `Unsupported client method: ${msg.method}` },
+          })
+        }
+      },
+      onExit: ({ code }) => {
+        try { this.onExit?.(code, this) } catch {}
+      },
     })
-    this.proc = proc
-    proc.stdout.setEncoding('utf8')
-    proc.stderr?.setEncoding('utf8')
-    proc.stdin?.on('error', () => {})
-
-    proc.stdout.on('data', (chunk) => {
-      this.stdoutBuf += chunk
-      let idx
-      while ((idx = this.stdoutBuf.indexOf('\n')) !== -1) {
-        const line = this.stdoutBuf.slice(0, idx).trim()
-        this.stdoutBuf = this.stdoutBuf.slice(idx + 1)
-        if (!line) continue
-        this.handleLine(line)
-      }
-    })
-
-    proc.stderr.on('data', (chunk) => {
-      this.stderrBuf = (this.stderrBuf + chunk).slice(-4096)
-    })
-
-    proc.on('error', (err) => {
-      this.failAll(err)
-    })
-
-    proc.on('close', (code) => {
-      const tail = this.stdoutBuf.trim()
-      this.stdoutBuf = ''
-      if (tail) this.handleLine(tail)
-      const msg = this.stderrBuf.trim() || `agy acp 进程退出（code=${code}）`
-      this.failAll(new Error(msg))
-      this.proc = null
-      try {
-        this.onExit?.(code, this)
-      } catch {}
-    })
+    this.transport.spawnProcess()
 
     await this.rpc(
       'initialize',
@@ -885,183 +823,62 @@ class AgyAcpClient {
     )
   }
 
-  handleLine(line) {
-    let msg
-    try {
-      msg = JSON.parse(line)
-    } catch {
-      return
-    }
-
-    if (msg.id !== undefined && !msg.method) {
-      const p = this.pending.get(msg.id)
-      if (!p) return
-      clearTimeout(p.timer)
-      this.pending.delete(msg.id)
-      if (msg.error) {
-        const errMsg = msg.error?.data?.details || msg.error?.message || JSON.stringify(msg.error)
-        p.reject(new Error(errMsg))
-      } else {
-        p.resolve(msg.result)
-      }
-      return
-    }
-
-    if (msg.method === 'session/update') {
-      this.touchSlidingTimeouts()
-      this.onSessionUpdate?.(msg.params || {})
-      return
-    }
-
-    // Handle server-to-client requests (elicitation/create, session/request_permission, etc.)
-    if (msg.id !== undefined && msg.method) {
-      this.touchSlidingTimeouts()
-      if (this.onServerRequest) {
-        this.onServerRequest(this, msg)
-        return
-      }
-      if (msg.method === 'session/request_permission' && this.autoApprove) {
-        const opts = msg.params?.options || []
-        const allow = opts.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always') || opts[0]
-        this.sendRaw({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: { outcome: allow ? { outcome: 'selected', optionId: allow.optionId } : { outcome: 'cancelled' } },
-        })
-      } else {
-        this.sendRaw({
-          jsonrpc: '2.0',
-          id: msg.id,
-          error: { code: -32601, message: `Unsupported client method: ${msg.method}` },
-        })
-      }
-    }
-  }
-
-  failAll(err) {
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer)
-      p.reject(err)
-    }
-    this.pending.clear()
-  }
-
   sendRaw(obj) {
-    if (!this.proc || !this.proc.stdin.writable) {
-      throw new Error('agy acp 未运行')
-    }
-    this.proc.stdin.write(`${JSON.stringify(obj)}\n`)
+    if (!this.transport) throw new Error('agy acp 未运行')
+    this.transport.sendRaw(obj)
   }
 
   notify(method, params = {}) {
-    try {
-      this.sendRaw({ jsonrpc: '2.0', method, params })
-    } catch {}
+    this.transport?.notify(method, params)
   }
 
   rpc(method, params = {}, timeoutMs = 600_000, { sliding = false } = {}) {
-    return new Promise((resolvePromise, rejectPromise) => {
-      const id = this.nextId++
-      const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return
-        this.pending.delete(id)
-        rejectPromise(new Error(`Antigravity ACP "${method}" 超时`))
-      }, timeoutMs)
-      this.pending.set(id, {
-        resolve: resolvePromise,
-        reject: rejectPromise,
-        timer,
-        method,
-        timeoutMs,
-        sliding,
-      })
-      try {
-        this.sendRaw({ jsonrpc: '2.0', id, method, params })
-      } catch (err) {
-        clearTimeout(timer)
-        this.pending.delete(id)
-        rejectPromise(err)
-      }
-    })
+    if (!this.transport) return Promise.reject(new Error('agy acp 未运行'))
+    return this.transport.callRaw(method, params, timeoutMs, { sliding })
   }
 
   async close(sessionId) {
-    this.closing = true
-    const proc = this.proc
-    if (!proc) return
-    if (sessionId) {
-      await this.rpc('session/close', { sessionId }, 3_000).catch(() => {})
-    }
-    await new Promise((resolveDone) => {
-      let done = false
-      let forceTimer = null
-      let doneTimer = null
-      const finish = () => {
-        if (done) return
-        done = true
-        clearTimeout(killTimer)
-        if (forceTimer) clearTimeout(forceTimer)
-        if (doneTimer) clearTimeout(doneTimer)
-        resolveDone()
-      }
-      proc.once('close', finish)
-      const killTimer = setTimeout(() => {
-        killProcessTree(proc, { force: false })
-        forceTimer = setTimeout(() => {
-          killProcessTree(proc, { force: true })
-          doneTimer = setTimeout(finish, 150)
-          doneTimer.unref?.()
-        }, 400)
-        forceTimer.unref?.()
-      }, 500)
-      killTimer.unref?.()
-      try {
-        proc.stdin.end()
-      } catch {
-        killProcessTree(proc, { force: true })
-        finish()
-      }
+    if (!this.transport) return
+    await this.transport.closeGracefully({
+      graceMs: 500,
+      forceAfterMs: 400,
+      preClose: sessionId ? () => this.rpc('session/close', { sessionId }, 3_000).catch(() => {}) : null,
     })
   }
 
   killImmediate() {
-    this.closing = true
-    if (this.proc) {
-      killProcessTree(this.proc, { force: true })
-      this.proc = null
-    }
-    this.failAll(new Error('agy acp disposed'))
+    this.transport?.killImmediate('agy acp disposed')
   }
 }
 
 /**
  * Zero-invasion Antigravity Adapter backed by official `agy acp --app-data-dir antigravity`.
- * Shares the EXACT SAME conversation store, UUIDs, history, and server prompt cache with Antigravity Desktop:
- *  - ZERO handoff prompt rewriting
- *  - ZERO extra token overhead
- *  - Warm ACP session pool keeps background tasks, subagents, timers, and reactive wakeups alive
- *    without premature `session/close`, and auto-reaps truly idle sessions cleanly!
  */
-export class AntigravityAdapter {
+export class AntigravityAdapter extends BaseAdapter {
   constructor({ config = {}, log = console, emitEvent, onApprovalRequest }) {
+    super(APPS.ANTIGRAVITY, {
+      config,
+      log,
+      emitEvent,
+      onApprovalRequest,
+      capabilities: {
+        supportsApproval: true,
+        supportsMidChatSwitch: true,
+        supportsQuota: true,
+      },
+    })
     this.agyHome = String(config.agyHome || '').trim() || getAgyHome()
     this.configuredBin = config.agyBin
     this.agyBin = findAgyBinary(this.configuredBin)
     this.defaultCwd = config.cwd || process.cwd()
     this.autoApprove = config.agyAutoApprove !== false
-    this.log = log
-    this.emitEvent = emitEvent || (() => {})
-    this.onApprovalRequest = onApprovalRequest || (() => {})
     this.pendingServerRequests = new Map() // approvalId -> { client, rpcId, method, sessionId, params }
     this.activeTurns = new Map() // conversationId -> { client, aborted }
     this.warmSessions = new Map() // conversationId -> warm entry keeping background tasks alive
     this.startingWarmSessions = new Map() // conversationId -> Promise<entry> deduplicating concurrent acquireWarmSession
     this.startingClients = new Set() // in-flight AgyAcpClient instances before warmSessions registration
-    this.disposed = false
-    this.pendingCreated = new Map() // conversationId -> summary (before first turn hits conversation_summaries.db)
-    this.sessionPrefs = new Map() // conversationId -> { model, reasoningEffort }
-    this.bridgeWrittenSessions = new Map() // conversationId -> { writtenAt, stepCount }
-    this.watchedSessions = new Map() // conversationId -> live external-change watch snapshot
+    this.bridgeWrittenSessions = new BoundedLruMap(128) // conversationId -> { writtenAt, stepCount }
+    this.watchedSessions = new BoundedLruMap(MAX_WATCHED_SESSIONS)
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || WATCH_POLL_INTERVAL_MS)
     this.watchTimer = null
     this.watchPollInFlight = false
@@ -1190,14 +1007,16 @@ export class AntigravityAdapter {
       }
       let proc = null
       const timer = setTimeout(() => {
-        try { proc?.kill() } catch {}
+        if (proc) killProcessTree(proc, { force: true })
         done('')
       }, 15_000)
+      timer.unref?.()
       try {
         proc = spawnCrossPlatform(this.agyBin, ['models'], {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
+        this.trackChildProcess(proc)
         let out = ''
         proc.stdout.setEncoding('utf8')
         proc.stdout.on('data', (d) => { out += d })
@@ -1271,14 +1090,16 @@ export class AntigravityAdapter {
       }
       let proc = null
       const timer = setTimeout(() => {
-        try { proc?.kill() } catch {}
+        if (proc) killProcessTree(proc, { force: true })
         done('')
       }, 6_000)
+      timer.unref?.()
       try {
         proc = spawnCrossPlatform(this.agyBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
           windowsHide: true,
         })
+        this.trackChildProcess(proc)
         let out = ''
         proc.stdout.setEncoding('utf8')
         proc.stdout.on('data', (d) => { out += d })
@@ -1316,7 +1137,7 @@ export class AntigravityAdapter {
       onSpawn: (proc) => {
         spawnedProc = proc
         if (this.disposed) {
-          try { proc.kill() } catch {}
+          killProcessTree(proc, { force: true })
           return
         }
         this.activeQuotaProcs.add(proc)
@@ -2479,7 +2300,12 @@ export class AntigravityAdapter {
     for (const [aprId, item] of this.pendingServerRequests.entries()) {
       if (item.client === client) {
         this.pendingServerRequests.delete(aprId)
-        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.ANTIGRAVITY, decision: 'cancel' })
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: aprId,
+          app: APPS.ANTIGRAVITY,
+          sessionId: item.sessionId ? makeCompositeId(APPS.ANTIGRAVITY, item.sessionId) : '',
+          decision: 'cancel',
+        })
       }
     }
   }
@@ -2666,7 +2492,12 @@ export class AntigravityAdapter {
             item.client.sendRaw({ jsonrpc: '2.0', id: item.rpcId, result: { outcome: { outcome: 'cancelled' } } })
           }
         } catch {}
-        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.ANTIGRAVITY, decision: 'cancel' })
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: aprId,
+          app: APPS.ANTIGRAVITY,
+          sessionId: makeCompositeId(APPS.ANTIGRAVITY, sessionId),
+          decision: 'cancel',
+        })
       }
     }
     const active = this.activeTurns.get(sessionId)
@@ -2713,5 +2544,6 @@ export class AntigravityAdapter {
       entry.client?.killImmediate()
     }
     this.warmSessions.clear()
+    this.disposeBase()
   }
 }

@@ -1,6 +1,9 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+
+const DSH_MODELS_CACHE_TTL_MS = 5 * 60_000
+const dshModelsCache = new Map() // patchPath -> { mtimeMs, size, checkedAt, value }
 
 function unquote(val) {
   const s = String(val || '').trim()
@@ -13,11 +16,36 @@ function unquote(val) {
 /**
  * Zero-dependency, secret-safe parser for `~/.dsh/profiles/desktop/cordis.patch.yml`.
  * Extracts ONLY model IDs, display names, provider names, and reasoningEfforts rules.
+ * Cached by mtime/size + 5-min TTL so adapters never re-read YAML on every call.
  * Never reads or returns API keys/tokens/headers.
  */
 export function parseDshConfiguredModels(dshHome = '') {
   const resolvedDshHome = String(dshHome || process.env.DSH_HOME || '').trim() || join(homedir(), '.dsh')
   const patchPath = join(resolvedDshHome, 'profiles', 'desktop', 'cordis.patch.yml')
+
+  const now = Date.now()
+  let fileStat = null
+  if (existsSync(patchPath)) {
+    try { fileStat = statSync(patchPath) } catch {}
+  }
+  const cached = dshModelsCache.get(patchPath)
+  if (
+    cached &&
+    now - cached.checkedAt < DSH_MODELS_CACHE_TTL_MS &&
+    cached.mtimeMs === (fileStat?.mtimeMs || 0) &&
+    cached.size === (fileStat?.size || 0)
+  ) {
+    return cached.value
+  }
+  const storeCache = (val) => {
+    dshModelsCache.set(patchPath, {
+      mtimeMs: fileStat?.mtimeMs || 0,
+      size: fileStat?.size || 0,
+      checkedAt: now,
+      value: val,
+    })
+    return val
+  }
 
   const result = {
     defaultProvider: 'deepseek',
@@ -47,10 +75,10 @@ export function parseDshConfiguredModels(dshHome = '') {
         defaultEffort: 'max',
       },
     ]
-    return result
+    return storeCache(result)
   }
 
-  if (!existsSync(patchPath)) {
+  if (!fileStat) {
     return applyFallbackModels()
   }
 
@@ -238,5 +266,5 @@ export function parseDshConfiguredModels(dshHome = '') {
     return applyFallbackModels()
   }
 
-  return result
+  return storeCache(result)
 }

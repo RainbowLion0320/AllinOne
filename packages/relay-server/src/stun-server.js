@@ -176,21 +176,34 @@ export function createStunServer({
       }
       sock.once('error', onStartupError)
 
+      let lastErrorLogAt = 0
       sock.on('message', (msg, rinfo) => {
         if (!Buffer.isBuffer(msg) || msg.length < STUN_HEADER_BYTES || msg.length > STUN_MAX_PACKET_BYTES) return
+        // Validate RFC 5389 Binding Request header BEFORE charging rate-limit quotas so UDP garbage cannot DoS STUN
+        if (
+          msg.readUInt16BE(0) !== STUN_BINDING_REQUEST ||
+          msg.readUInt32BE(4) !== STUN_MAGIC_COOKIE ||
+          msg.readUInt16BE(2) + STUN_HEADER_BYTES > msg.length
+        ) {
+          return
+        }
         if (!allowPacket(rinfo.address)) return
         const reply = buildStunBindingResponse(msg, rinfo.address, rinfo.port)
         if (!reply) return
         requests += 1
         try {
-          sock.send(reply, rinfo.port, rinfo.address)
+          sock.send(reply, rinfo.port, rinfo.address, () => {})
         } catch {}
       })
 
       sock.bind(port, host, () => {
         sock.off('error', onStartupError)
         sock.on('error', (err) => {
-          log.warn?.(`[stun] UDP socket error: ${err?.message || err}`)
+          const now = Date.now()
+          if (now - lastErrorLogAt >= 10_000) {
+            lastErrorLogAt = now
+            log.warn?.(`[stun] UDP socket error: ${err?.message || err}`)
+          }
         })
         const addr = sock.address()
         boundPort = typeof addr === 'object' && addr ? addr.port : port

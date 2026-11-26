@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; connect-src *;" />
   <title>All in One WebRTC Worker</title>
 </head>
 <body>
@@ -29,6 +30,18 @@
     if (entry.transportRetryTimer) {
       clearTimeout(entry.transportRetryTimer)
       entry.transportRetryTimer = null
+    }
+    if (entry.connectTimeoutTimer) {
+      clearTimeout(entry.connectTimeoutTimer)
+      entry.connectTimeoutTimer = null
+    }
+    if (entry.disconnectedTimer) {
+      clearTimeout(entry.disconnectedTimer)
+      entry.disconnectedTimer = null
+    }
+    if (entry.bulkBufferedTimer) {
+      clearInterval(entry.bulkBufferedTimer)
+      entry.bulkBufferedTimer = null
     }
     detachChannelHandlers(entry.ctrl)
     detachChannelHandlers(entry.bulk)
@@ -101,6 +114,10 @@
       openSent = true
       api.sendControl({ type: 'dc.open', peerId, role })
       if (role === 'ctrl') {
+        if (entry.connectTimeoutTimer) {
+          clearTimeout(entry.connectTimeoutTimer)
+          entry.connectTimeoutTimer = null
+        }
         detectTransport(peerId, entry, true)
       }
     }
@@ -127,9 +144,10 @@
           entry.blobQueue = entry.blobQueue
             .then(() => {
               if (peers.get(peerId) === entry) {
-                api.sendBinary(peerId, role, bytes)
+                try { api.sendBinary(peerId, role, bytes) } catch {}
               }
             })
+            .catch(() => {})
             .finally(() => {
               entry.pendingBlobs = Math.max(0, entry.pendingBlobs - 1)
             })
@@ -183,11 +201,36 @@
           answerSent: false,
           lastTransport: '',
           transportRetryTimer: null,
+          connectTimeoutTimer: null,
+          disconnectedTimer: null,
+          bulkBufferedTimer: null,
           blobQueue: Promise.resolve(),
           pendingBlobs: 0,
           bulkAckedSinceReport: 0,
         }
         peers.set(peerId, entry)
+
+        // Reap stuck peers that never open a control DataChannel within 45s
+        entry.connectTimeoutTimer = setTimeout(() => {
+          entry.connectTimeoutTimer = null
+          if (peers.get(peerId) === entry && entry.ctrl?.readyState !== 'open') {
+            api.sendControl({ type: 'state', peerId, state: 'failed' })
+            closePeer(peerId)
+          }
+        }, 45_000)
+
+        // Periodic 1s dc.buffered heartbeat while bulk data is draining so backpressure never wedges
+        entry.bulkBufferedTimer = setInterval(() => {
+          if (peers.get(peerId) !== entry) return
+          const bdc = entry.bulk
+          if (!bdc || bdc.readyState !== 'open') return
+          const buffered = bdc.bufferedAmount || 0
+          if (buffered > 0 || entry.bulkAckedSinceReport > 0) {
+            const ackedBytes = entry.bulkAckedSinceReport
+            entry.bulkAckedSinceReport = 0
+            api.sendControl({ type: 'dc.buffered', peerId, role: 'bulk', bufferedAmount: buffered, ackedBytes })
+          }
+        }, 1_000)
 
         pc.onicecandidate = (ev) => {
           if (peers.get(peerId) !== entry) return
@@ -217,6 +260,20 @@
           if (st === 'failed' || st === 'closed') {
             closePeer(peerId)
             return
+          }
+          if (st === 'disconnected') {
+            if (!entry.disconnectedTimer) {
+              entry.disconnectedTimer = setTimeout(() => {
+                entry.disconnectedTimer = null
+                if (peers.get(peerId) === entry && pc.iceConnectionState === 'disconnected') {
+                  api.sendControl({ type: 'iceState', peerId, state: 'failed' })
+                  closePeer(peerId)
+                }
+              }, 15_000)
+            }
+          } else if (entry.disconnectedTimer) {
+            clearTimeout(entry.disconnectedTimer)
+            entry.disconnectedTimer = null
           }
           detectTransport(peerId, entry, true)
         }

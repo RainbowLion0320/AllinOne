@@ -28,6 +28,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify version sync across workspace
+        run: node scripts/bump-version.mjs --check
+
       - name: Build portable bridge & frontend
         run: npm run build
 
@@ -42,8 +45,11 @@ jobs:
           bash -n deploy/install.sh
           node -e "const fs = require('fs'); for (const p of ['packages/mobile-app/dist/setup.sh', 'deploy/install.sh']) { if (fs.readFileSync(p).includes(13)) { console.error(p + ' contains CR bytes'); process.exit(1); } }"
 
-      - name: Run end-to-end smoke & security tests
-        run: npm run test:smoke
+      - name: Run modular unit & end-to-end smoke tests
+        run: npm test
+
+      - name: Audit production dependencies (high/critical)
+        run: npm audit --omit=dev --audit-level=high || true
 
   docker-check:
     name: Verify Relay Dockerfile

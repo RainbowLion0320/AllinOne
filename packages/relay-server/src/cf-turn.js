@@ -1,10 +1,22 @@
+import { VALID_TIERS as SHARED_TIERS } from '@allinone/shared'
+
 const DEFAULT_CF_TURN_API_BASE = 'https://rtc.live.cloudflare.com'
 const DEFAULT_CF_TURN_TTL_SEC = 3600
 const MIN_CF_TURN_TTL_SEC = 300
 const MAX_CF_TURN_TTL_SEC = 86400
 const FETCH_TIMEOUT_MS = 6000
 const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000, 120_000]
-const VALID_TIERS = new Set(['free', 'pro', 'ultra', 'admin'])
+const MAX_SCOPED_CREDS = 500
+const MAX_SCOPED_FETCH_PER_MIN = 30
+const VALID_TIERS = new Set([...SHARED_TIERS, 'admin'])
+
+function parseBoolOption(raw, fallback) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  const lower = String(raw).trim().toLowerCase()
+  if (lower === '1' || lower === 'true' || lower === 'yes') return true
+  if (lower === '0' || lower === 'false' || lower === 'no') return false
+  return fallback
+}
 
 export function parseCfTurnTiers(raw) {
   const input = raw === undefined || raw === null || String(raw).trim() === '' ? 'free' : String(raw)
@@ -79,6 +91,10 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
   const rawTtl = options.cfTurnTtlSec ?? (String(env.CF_TURN_TTL_SEC ?? '').trim() || undefined)
   const ttlSec = clampTtl(rawTtl ?? DEFAULT_CF_TURN_TTL_SEC)
   const tiers = parseCfTurnTiers(options.cfTurnTiers ?? env.CF_TURN_TIERS ?? 'free')
+  const fallbackSelfHosted = parseBoolOption(
+    options.cfTurnFallbackSelfHosted ?? env.CF_TURN_FALLBACK_SELF_HOSTED,
+    true,
+  )
   const fetchFn = typeof options.fetchFn === 'function' ? options.fetchFn : globalThis.fetch
   const onRecovered = typeof options.onRecovered === 'function' ? options.onRecovered : null
   const log = options.log || console
@@ -87,11 +103,82 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
 
   let cached = null // { stunServers, turnServers, fetchedAt, expiresAt }
   let inflight = null
+  /** @type {Map<string, { stunServers: any[], turnServers: any[], fetchedAt: number, expiresAt: number }>} */
+  const scopedCache = new Map()
+  /** @type {Map<string, Promise<any>>} */
+  const scopedInflight = new Map()
+  const scopedFetchTimestamps = []
   let refreshTimer = null
   let retryTimer = null
   let retryAttempt = 0
   let stopped = false
   let lastError = ''
+
+  function canFetchScoped(now = Date.now()) {
+    while (scopedFetchTimestamps.length > 0 && now - scopedFetchTimestamps[0] > 60_000) {
+      scopedFetchTimestamps.shift()
+    }
+    if (scopedFetchTimestamps.length >= MAX_SCOPED_FETCH_PER_MIN) return false
+    scopedFetchTimestamps.push(now)
+    return true
+  }
+
+  async function fetchOneCredential() {
+    const url = `${apiBase}/v1/turn/keys/${encodeURIComponent(tokenId)}/credentials/generate-ice-servers`
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+    const timer = controller ? setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS) : null
+    timer?.unref?.()
+    try {
+      const res = await fetchFn(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ttl: ttlSec }),
+        ...(controller ? { signal: controller.signal } : {}),
+      })
+      if (!res.ok) {
+        throw new Error(`Cloudflare TURN HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      const normalized = normalizeCloudflareIceResponse(data)
+      if (normalized.turnServers.length === 0) {
+        throw new Error('Cloudflare TURN returned empty turnServers')
+      }
+      const now = Date.now()
+      return {
+        stunServers: normalized.stunServers,
+        turnServers: normalized.turnServers,
+        fetchedAt: now,
+        expiresAt: now + ttlSec * 1000,
+      }
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  function refreshForScope(scopeKey) {
+    const key = String(scopeKey || '').trim()
+    if (!key || !enabled || stopped || retryTimer) return null
+    if (scopedInflight.has(key)) return scopedInflight.get(key)
+    if (!canFetchScoped()) return null
+    const p = fetchOneCredential()
+      .then((entry) => {
+        if (scopedCache.size >= MAX_SCOPED_CREDS) {
+          const oldest = scopedCache.keys().next().value
+          if (oldest) scopedCache.delete(oldest)
+        }
+        scopedCache.set(key, entry)
+        return entry
+      })
+      .catch(() => null)
+      .finally(() => {
+        scopedInflight.delete(key)
+      })
+    scopedInflight.set(key, p)
+    return p
+  }
 
   function clearRetryTimer() {
     if (retryTimer) {
@@ -115,37 +202,13 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
     if (!enabled || stopped) return null
     if (inflight) return inflight
 
-    const url = `${apiBase}/v1/turn/keys/${encodeURIComponent(tokenId)}/credentials/generate-ice-servers`
     inflight = (async () => {
-      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
-      const timer = controller ? setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS) : null
       try {
-        const res = await fetchFn(url, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiToken}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ ttl: ttlSec }),
-          ...(controller ? { signal: controller.signal } : {}),
-        })
-        if (!res.ok) {
-          throw new Error(`Cloudflare TURN HTTP ${res.status}`)
-        }
-        const data = await res.json()
-        const normalized = normalizeCloudflareIceResponse(data)
-        if (normalized.turnServers.length === 0) {
-          throw new Error('Cloudflare TURN returned empty turnServers')
-        }
-        const now = Date.now()
+        const entry = await fetchOneCredential()
+        const now = entry.fetchedAt
         const wasUnavailable = !cached || now >= cached.expiresAt - 10_000
         const hadPriorFailure = Boolean(lastError || retryAttempt > 0)
-        cached = {
-          stunServers: normalized.stunServers,
-          turnServers: normalized.turnServers,
-          fetchedAt: now,
-          expiresAt: now + ttlSec * 1000,
-        }
+        cached = entry
         lastError = ''
         retryAttempt = 0
         clearRetryTimer()
@@ -159,7 +222,6 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
         scheduleRetry()
         return null
       } finally {
-        if (timer) clearTimeout(timer)
         inflight = null
       }
     })()
@@ -197,12 +259,31 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
   }
 
   /**
-   * Synchronously return cached Cloudflare TURN servers if valid (>60s remaining),
-   * triggering a background refresh when approaching 40% TTL or expiry. Returns `null` if unavailable.
+   * Synchronously return cached Cloudflare TURN servers if valid (>60s remaining).
+   * When `scopeKey` (e.g. `roomId`) is provided, issues isolated per-user credentials
+   * asynchronously while returning the warm entry immediately to keep connects at 0ms.
    */
-  function getIceEntry() {
+  function getIceEntry(scopeKey = '') {
     if (!enabled) return null
     const now = Date.now()
+    const cleanScope = String(scopeKey || '').trim()
+    if (cleanScope) {
+      const scoped = scopedCache.get(cleanScope)
+      if (scoped && now < scoped.expiresAt - 10_000) {
+        // Refresh LRU recency
+        scopedCache.delete(cleanScope)
+        scopedCache.set(cleanScope, scoped)
+        if (now >= scoped.fetchedAt + Math.floor(ttlSec * 0.5 * 1000)) {
+          void refreshForScope(cleanScope)
+        }
+        return scoped
+      }
+      if (scoped) scopedCache.delete(cleanScope)
+      // Trigger isolated per-user credential fetch in background if global pool is healthy
+      if (cached && now < cached.expiresAt - 10_000) {
+        void refreshForScope(cleanScope)
+      }
+    }
     if (!cached || now >= cached.expiresAt - 60_000) {
       if (!retryTimer) void refresh()
       if (!cached || now >= cached.expiresAt - 10_000) return null
@@ -220,6 +301,8 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
       ready,
       tiers: [...tiers],
       ttlSec,
+      fallbackSelfHosted,
+      scopedCount: scopedCache.size,
       lastRefreshAt: cached?.fetchedAt || 0,
       expiresAt: cached?.expiresAt || 0,
       lastError,
@@ -230,6 +313,7 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
     enabled,
     tiers,
     ttlSec,
+    fallbackSelfHosted,
     appliesToTier,
     refresh,
     start,

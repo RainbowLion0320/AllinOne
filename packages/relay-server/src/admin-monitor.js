@@ -1,6 +1,17 @@
 import os from 'node:os'
-import { APP_LIST } from '@allinone/shared'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { APP_LIST, APP_META } from '@allinone/shared'
 
+const __dirname = fileURLToPath(new URL('.', import.meta.url))
+const DEFAULT_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8'))?.version || '0.0.0')
+  } catch {
+    return '0.0.0'
+  }
+})()
 const ALLOWED_APPS = new Set(APP_LIST)
 
 function normalizeApps(rawApps) {
@@ -47,7 +58,7 @@ export function collectServerHealth({
   turn = null,
   dailyRegistration = null,
   startedAt = Date.now(),
-  version = '1.0.29',
+  version = DEFAULT_VERSION,
 } = {}) {
   const mem = process.memoryUsage()
   const totalMem = os.totalmem()
@@ -353,6 +364,8 @@ export function buildAdminOverview({
   return {
     ok: true,
     generatedAt: now,
+    appMeta: APP_META,
+    appList: APP_LIST,
     server: serverHealth,
     summary: {
       totalUsers: users.length,

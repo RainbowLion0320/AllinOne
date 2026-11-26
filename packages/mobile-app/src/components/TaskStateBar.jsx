@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertCircle,
@@ -15,8 +15,11 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useI18n } from '../lib/i18n.jsx'
-import { MarkdownView } from '../lib/markdown.jsx'
 import { fetchE2eeDeliverableFile } from '../lib/e2eeFiles.js'
+
+const LazyMarkdownView = lazy(() =>
+  import('../lib/markdown.jsx').then((mod) => ({ default: mod.MarkdownView })),
+)
 
 function PlanDocModal({ planDoc, imageContext, onClose }) {
   const { bi } = useI18n()
@@ -130,7 +133,15 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
               <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{errorMsg}</span>
             </div>
           ) : (
-            <MarkdownView text={content} imageContext={imageContext} />
+            <Suspense
+              fallback={
+                <div className="flex items-center justify-center gap-2 py-12 text-xs text-slate-400">
+                  <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
+                </div>
+              }
+            >
+              <LazyMarkdownView text={content} imageContext={imageContext} />
+            </Suspense>
           )}
         </div>
       </div>

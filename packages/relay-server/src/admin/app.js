@@ -576,7 +576,12 @@
     const sum = d.summary || {}
 
     const verEl = document.getElementById('tb-version')
-    if (verEl) verEl.textContent = `v${srv.version || '1.0.29'}`
+    if (verEl && srv.version) verEl.textContent = `v${srv.version}`
+    if (d.appMeta && typeof d.appMeta === 'object') {
+      for (const [k, meta] of Object.entries(d.appMeta)) {
+        if (meta && meta.color) APP_COLORS[k] = meta.color
+      }
+    }
 
     const subEl = document.getElementById('tb-subtitle')
     if (subEl) {

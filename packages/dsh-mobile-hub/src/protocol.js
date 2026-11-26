@@ -25,6 +25,13 @@ const SENSITIVE_CWD_SEGMENTS = new Set([
   '.allinone',
   '.allinone-bridge',
   '.dsh-mobile',
+  '.dsh',
+  '.codex',
+  '.claude',
+  '.workbuddy',
+  '.codebuddy',
+  '.gemini',
+  'codebuddyextension',
   'keychains',
 ])
 
@@ -47,10 +54,21 @@ const SENSITIVE_SUBPATH_PREFIXES = [
   '/library/application support/google/chrome',
   '/library/application support/microsoft edge',
   '/library/application support/firefox',
+  '/library/application support/codebuddyextension',
   '/appdata/local/google/chrome',
   '/appdata/local/microsoft/edge',
   '/appdata/roaming/mozilla',
+  '/appdata/roaming/codebuddyextension',
 ]
+
+function getNormalizedHomePath() {
+  try {
+    const h = existsSync(homedir()) ? realpathSync(homedir()) : homedir()
+    return String(h || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  } catch {
+    return String(homedir() || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  }
+}
 
 /**
  * Return normalized lowercase forward-slash path of Windows SystemRoot (e.g. `c:/windows`).
@@ -65,6 +83,9 @@ function isSensitiveOrSystemCwdPath(absPath) {
   const rawNorm = String(absPath || '').replace(/\\/g, '/').toLowerCase()
   const norm = rawNorm.replace(/\/+$/, '')
   if (!norm || norm === '/' || /^[a-z]:$/.test(norm)) return true
+
+  const homeNorm = getNormalizedHomePath()
+  if (homeNorm && norm === homeNorm) return true
 
   const winSysRoot = getWindowsSystemRootNorm()
   if (

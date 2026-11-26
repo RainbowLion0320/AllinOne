@@ -1,6 +1,7 @@
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
+import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from '@allinone/shared'
 import { EVENTS } from './protocol.js'
 import {
   E2EE_VERSION,
@@ -26,8 +27,10 @@ export class RelayBridgeLink {
     roomId = '',
     bridgeId = 'home-pc',
     mode = 'desktop',
+    bridgeVersion = '',
     e2eeKey = '',
     inboundDir = '',
+    inboundStore = null,
     webrtcProxy = null,
     log = console,
     onRpc,
@@ -47,6 +50,7 @@ export class RelayBridgeLink {
     this.roomId = cleanRoomId
     this.bridgeId = bridgeId
     this.mode = mode
+    this.bridgeVersion = String(bridgeVersion || (typeof __ALLINONE_VERSION__ === 'string' ? __ALLINONE_VERSION__ : '') || '').trim()
     this.e2eeKey = cleanE2eeKey
     this.e2eeKeyId = ''
     this.e2eeReady = computeE2eeKeyId(this.e2eeKey).then((kid) => {
@@ -85,6 +89,7 @@ export class RelayBridgeLink {
       onRpc: (method, params, ctx) => this.onRpc(method, params, ctx),
       onRegisterP2pUpload,
       inboundDir: resolvedInboundDir,
+      inboundStore,
       webrtcProxy,
       log: this.log,
     })
@@ -96,6 +101,9 @@ export class RelayBridgeLink {
     }
     const meta = {
       ...(this.metaApps.length > 0 ? { apps: this.metaApps } : {}),
+      ...(this.bridgeVersion ? { bridgeVersion: this.bridgeVersion } : {}),
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: PROTOCOL_CAPABILITIES,
       p2pEngine: this.p2p.getEngineName(),
       e2ee: { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId },
     }
@@ -299,6 +307,11 @@ export class RelayBridgeLink {
       }
 
       if (msg.type === 'bridge.welcome') {
+        if (msg.protocolVersion && Number(msg.protocolVersion) !== PROTOCOL_VERSION) {
+          this.log.warn?.(
+            `mobile-hub: relay protocolVersion=${msg.protocolVersion} differs from local PROTOCOL_VERSION=${PROTOCOL_VERSION}`,
+          )
+        }
         if (Array.isArray(msg.iceServers)) {
           this.iceServers = msg.iceServers
         }
@@ -359,7 +372,7 @@ export class RelayBridgeLink {
         void this.p2p?.dispose?.().catch(() => {})
         const detail = reason || 'E2EE required by control server'
         this.log.warn?.(`mobile-hub: control server rejected bridge (${detail})`)
-        this.emitState('error', detail)
+        this.emitState('fatal', detail)
         return
       }
       const detail = `closed code=${code}${reason ? ` (${reason})` : ''}`

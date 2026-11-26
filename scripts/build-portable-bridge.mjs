@@ -39,6 +39,9 @@ function readLocalEnvValue(key) {
   return ''
 }
 
+const rootPkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'))
+const appVersion = String(rootPkg.version || '0.0.0').trim()
+
 const defaultServer = (
   readLocalEnvValue('PUBLIC_RELAY_URL') ||
   readLocalEnvValue('ALLINONE_SERVER') ||
@@ -75,6 +78,7 @@ await esbuild.build({
   legalComments: 'none',
   external: ['node:*', 'bufferutil', 'utf-8-validate'],
   define: {
+    __ALLINONE_VERSION__: JSON.stringify(appVersion),
     __ALLINONE_DEFAULT_SERVER__: JSON.stringify(defaultServer),
     __ALLINONE_DSH_IPC_PLUGIN_CODE__: JSON.stringify(dshIpcPluginCode),
   },

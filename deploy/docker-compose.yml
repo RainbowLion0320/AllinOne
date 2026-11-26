@@ -10,9 +10,19 @@ services:
         VITE_APK_URL: ${VITE_APK_URL:-}
     container_name: allinone-relay
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       PORT: 8787
       HOST: 0.0.0.0
+      LOG_FORMAT: ${LOG_FORMAT:-text}
       # 内置无状态 STUN (RFC 5389) 端口：默认 3478；同机部署 coturn 时请设为 off 并注释下方 UDP 端口映射
       # 如需自定义 STUN 端口，请同时将 STUN_PORT 与 STUN_HOST_PORT 设为同一数字端口
       STUN_PORT: ${STUN_PORT:-3478}
@@ -31,14 +41,18 @@ services:
       CF_TURN_API_TOKEN: ${CF_TURN_API_TOKEN:-}
       CF_TURN_TIERS: ${CF_TURN_TIERS:-free}
       CF_TURN_TTL_SEC: ${CF_TURN_TTL_SEC:-3600}
+      CF_TURN_FALLBACK_SELF_HOSTED: ${CF_TURN_FALLBACK_SELF_HOSTED:-true}
       # 请在同目录创建 .env 文件或直接替换下面的密钥（勿提交到 Git）
       JWT_SECRET: ${JWT_SECRET:?请设置至少 16 位随机 JWT_SECRET（可用 openssl rand -hex 32 生成）}
+      JWT_SECRET_PREVIOUS: ${JWT_SECRET_PREVIOUS:-}
       ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-}
       # 开放注册每日上限（默认 20，防止暴力注册；设 0 为不限制）
       MAX_DAILY_REGISTRATIONS: ${MAX_DAILY_REGISTRATIONS:-20}
+      MAX_REGISTRATIONS_PER_IP_PER_DAY: ${MAX_REGISTRATIONS_PER_IP_PER_DAY:-5}
       PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       TRUST_PROXY: ${TRUST_PROXY:-private}
+      TRUST_PROXY_HEADER: ${TRUST_PROXY_HEADER:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-465}
       SMTP_SECURE: ${SMTP_SECURE:-}
@@ -63,6 +77,13 @@ services:
     image: caddy:2-alpine
     container_name: allinone-caddy
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "80:80"
       - "443:443"
@@ -71,7 +92,8 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - allinone-relay
+      allinone-relay:
+        condition: service_healthy
 
 volumes:
   relay_data:
