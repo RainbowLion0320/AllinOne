@@ -5,7 +5,8 @@
 <h1>All in One</h1>
 
 <p>
-  <strong>在手机或任意电脑上，端到端加密远程续聊你本机的 5 大 AI 编程助手</strong>
+  <strong>Not an Agent. Not a Harness. Just a Tool.</strong><br/>
+  <sub>零侵入、零额外 Token —— 在手机或任意电脑上，端到端加密远程控制你本机的 AI 编程工具</sub>
 </p>
 
 <p>
@@ -29,7 +30,7 @@
 </p>
 
 <p>
-  <a href="#-支持的-5-大-ai-工具">支持工具</a> ·
+  <a href="#-支持的-ai-工具">支持工具</a> ·
   <a href="#-快速开始">快速开始</a> ·
   <a href="#-安全与架构">安全架构</a> ·
   <a href="#-一键私有化部署docker">私有部署</a> ·
@@ -47,7 +48,7 @@
     <td width="72%" align="center" valign="bottom">
       <img src="./docs/preview-desktop.png" alt="All in One 桌面端与网页端界面" />
       <br/>
-      <sub><strong>桌面端 / Web</strong> — 5 大工具智能聚合侧边栏、周额度环、项目分组与交互式审批</sub>
+      <sub><strong>桌面端 / Web</strong> — 多工具智能聚合侧边栏、首页额度总览、项目分组与交互式审批</sub>
     </td>
     <td width="28%" align="center" valign="bottom">
       <img src="./docs/preview-mobile.png" alt="All in One 手机端界面" />
@@ -57,22 +58,24 @@
   </tr>
 </table>
 
-- **一站聚合 5 大工具**：直接复用本机已有对话、项目工作区与官方 Prompt Cache，按活跃度自动排序，支持周额度实时展示。
+- **一站聚合多款主流工具**：直接复用本机已有对话、项目工作区与官方 Prompt Cache，按活跃度自动排序，主界面实时总览各厂商 5 小时/周额度、积分与账户余额。
 - **P2P 直连优先，0 流量限速**：默认 WebRTC 端到端直连，常规网络 **0 字节经过服务器**；极端网络自动回落加密 TURN 中继。
 - **零知识端到端加密**：所有对话、代码与文件均由本机 256-bit 密钥（`AES-256-GCM`）加解密，服务器只做鉴权与信令，看不到任何内容。
-- **全平台 + 极轻自建**：提供 macOS / Windows / Android 客户端、iOS 网页 PWA 与 Linux 一行接入脚本；1 核 1G 服务器一条 Docker 命令即可部署。
+- **全平台 + 极轻自建**：提供 macOS / Windows / Android 客户端（支持签名应用内热更重启）、iOS 网页 PWA 与 Linux 一行接入脚本；1 核 1G 服务器一条 Docker 命令即可部署。
 
 ---
 
-## 🤖 支持的 5 大 AI 工具
+## 🤖 支持的 AI 工具
+
+> 持续接入更多主流 AI 编程助手，当前已原生支持：
 
 | 厂商 | 核心能力 | 接入体验 |
 | :--- | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | 读写会话、切模型与推理强度、运行中转向（`turn/steer`）、交互问答、周额度环 | 自动发现本机 CLI / Codex Desktop，开箱即用 |
-| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | 读写本地项目会话、切模型、中断、Cowork 桌面端实时镜像、周额度环 | 自动复用本地登录态，免重复登录 |
-| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 共享桌面端历史与登录态、切模型与档位、任务同步、Gemini 周额度环 | 官方 ACP 协议直连，自动同步桌面进度 |
-| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 读写会话、切模型、审批问答双向同步；关闭时自动降级为只读历史 | 检测到桌面端时零终端自动安装本地环回插件 |
-| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 实时同步桌面端会话、思考链与工具调用；授权后支持远程新建/续聊、切模型与积分余额展示 | 开箱只读同步；界面点「一键微信扫码」免终端解锁读写，账号与积分额度互通 |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | 读写会话、切模型与推理强度、运行中转向（`turn/steer`）、交互问答、5h/周额度与附加积分/重置券展示 | 自动发现本机 CLI / Codex Desktop，开箱即用 |
+| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | 读写本地项目会话、切模型、中断、Cowork 桌面端实时镜像、5h/周额度实时同步 | 自动复用本地登录态，免重复登录 |
+| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 共享桌面端历史与登录态、切模型与档位、任务同步、Gemini 与 Claude/GPT 双池 5h/周额度 | 官方 ACP 协议直连，自动同步桌面进度 |
+| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 读写会话、切模型、审批问答双向同步、官方账户余额实时展示；关闭时自动降级为只读历史 | 检测到桌面端时零终端自动安装本地环回插件 |
+| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 实时同步桌面端会话、思考链与工具调用；授权后支持远程新建/续聊、切模型与分项积分余额展示 | 开箱只读同步；界面点「一键微信扫码」免终端解锁读写，账号与积分额度互通 |
 
 ---
 
@@ -92,7 +95,7 @@
 | 手机端网页直连（iOS / Android） | Android 客户端 APK（永久最新） |
 | :---: | :---: |
 | <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="156" height="156" alt="手机端网页直连二维码" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="156" height="156" alt="Android APK 下载二维码" /></a> |
-| [直接打开网页端](https://123.206.218.214/dsh/) · 支持 PWA 桌面图标 | [直接下载最新 APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · 自动更新 |
+| [直接打开网页端](https://123.206.218.214/dsh/) · 支持 PWA 桌面图标 | [直接下载最新 APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · 应用内热更重启 |
 
 <details>
 <summary>Linux 终端一行接入 &amp; 首次打开系统拦截提醒</summary>
@@ -238,7 +241,7 @@ npm run test:smoke    # 运行全部 17 组端到端与安全冒烟测试
 packages/
 ├── shared/          # 共享协议、AES-256-GCM / ECDH 端到端加密与 P2P 多路复用
 ├── relay-server/    # 纯控制面网关、内置 STUN、TURN 配额调度与 /admin 看板
-├── dsh-mobile-hub/  # 5 大 AI 适配器、WebRTC P2P、额度采集与便携桥接器
+├── dsh-mobile-hub/  # 多厂商 AI 适配器、WebRTC P2P、额度采集与便携桥接器
 ├── mobile-app/      # React + Tailwind + Vite PWA 与 Capacitor Android 壳
 └── desktop-app/     # Electron 桌面端、原生 libwebrtc 与自动更新器
 ```

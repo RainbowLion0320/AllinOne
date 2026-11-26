@@ -5,7 +5,8 @@
 <h1>All in One</h1>
 
 <p>
-  <strong>End-to-End Encrypted Remote Control for Your 5 Local AI Coding Agents</strong>
+  <strong>Not an Agent. Not a Harness. Just a Tool.</strong><br/>
+  <sub>Zero prompt injection, zero extra token overhead — end-to-end encrypted remote control for your local AI coding tools</sub>
 </p>
 
 <p>
@@ -29,7 +30,7 @@
 </p>
 
 <p>
-  <a href="#-5-supported-ai-agents">Supported Agents</a> ·
+  <a href="#-supported-ai-agents">Supported Agents</a> ·
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-security--architecture">Security</a> ·
   <a href="#-one-click-self-hosting-docker">Self-Hosting</a> ·
@@ -47,7 +48,7 @@
     <td width="72%" align="center" valign="bottom">
       <img src="./docs/preview-desktop.png" alt="All in One Desktop & Web UI" />
       <br/>
-      <sub><strong>Desktop / Web</strong> — Smart 5-agent sidebar, weekly quota rings, project tree &amp; interactive approvals</sub>
+      <sub><strong>Desktop / Web</strong> — Multi-agent sidebar, home quota overview, project tree &amp; interactive approvals</sub>
     </td>
     <td width="28%" align="center" valign="bottom">
       <img src="./docs/preview-mobile.png" alt="All in One Mobile UI" />
@@ -57,22 +58,24 @@
   </tr>
 </table>
 
-- **5 Agents, One Unified Workspace**: Reuse your existing local chats, workspaces, and vendor prompt caches with activity-sorted vendor pills and live weekly quota rings.
+- **All Your Agents, One Unified Workspace**: Reuse existing local chats, workspaces, and vendor prompt caches with activity-sorted tabs and a live home dashboard showing 5-hour/weekly limits, credits, and account balances.
 - **Direct P2P First, Zero Relay Traffic**: Connects directly over encrypted WebRTC DataChannels by default (**0 bytes through your server**); automatically falls back to encrypted TURN on double-symmetric NATs.
 - **Mandatory Zero-Knowledge E2EE**: All messages, code, and files are encrypted client-side with a local 256-bit `AES-256-GCM` key — your server handles only auth and signaling.
-- **Cross-Platform & 1-Minute Self-Hosting**: Desktop apps for macOS / Windows, Android APK, iOS PWA, Linux one-liner CLI, and single-command Docker self-hosting on any 1-vCPU VPS.
+- **Cross-Platform & 1-Minute Self-Hosting**: Desktop apps for macOS / Windows, Android APK (with signed in-app OTA hot updates), iOS PWA, Linux one-liner CLI, and single-command Docker self-hosting on any 1-vCPU VPS.
 
 ---
 
-## 🤖 5 Supported AI Agents
+## 🤖 Supported AI Agents
+
+> Continuously expanding — currently integrated out of the box:
 
 | Agent | Capabilities | Setup Experience |
 | :--- | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | Read/write sessions, model & reasoning switching, mid-turn `turn/steer`, interactive Q&A, weekly quota ring | Auto-detects local CLI & Codex Desktop out of the box |
-| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | Read/write local project threads, model switching, interrupt, Cowork Desktop mirror, weekly quota ring | Reuses local auth automatically |
-| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Shared desktop history & login, model/effort switching, task sync, Gemini weekly quota ring | Native ACP connection with live desktop progress sync |
-| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Read/write sessions, model switching, bidirectional prompt sync; read-only history fallback when closed | Auto-installs local loopback IPC plugin with zero terminal setup |
-| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **Tencent WorkBuddy** | Live sync of desktop sessions, thinking & tool calls; remote sending, resume, model switching & live Credits balance | Zero-config live mirror; 1-click QR sign-in (no terminal/Node.js) unlocks RW sharing the same account & Credits |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | Read/write sessions, model & reasoning switching, mid-turn `turn/steer`, interactive Q&A, 5h/weekly limits, extra credits & reset vouchers | Auto-detects local CLI & Codex Desktop out of the box |
+| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | Read/write local project threads, model switching, interrupt, Cowork Desktop mirror, live 5h/weekly limits | Reuses local auth automatically |
+| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Shared desktop history & login, model/effort switching, task sync, Gemini & Claude/GPT dual-pool 5h/weekly limits | Native ACP connection with live desktop progress sync |
+| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Read/write sessions, model switching, bidirectional prompt sync & live official account balance; read-only history fallback when closed | Auto-installs local loopback IPC plugin with zero terminal setup |
+| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **Tencent WorkBuddy** | Live sync of desktop sessions, thinking & tool calls; remote sending, resume, model switching & itemized Credits balance | Zero-config live mirror; 1-click QR sign-in (no terminal/Node.js) unlocks RW sharing the same account & Credits |
 
 ---
 
@@ -92,7 +95,7 @@
 | Mobile Web (iOS / Android) | Android APK (Always Latest) |
 | :---: | :---: |
 | <a href="https://123.206.218.214/dsh/"><img src="./docs/qr-web.svg" width="156" height="156" alt="Mobile Web QR Code" /></a> | <a href="https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk"><img src="./docs/qr-apk.svg" width="156" height="156" alt="Android APK QR Code" /></a> |
-| [Open Web App](https://123.206.218.214/dsh/) · Installable PWA | [Download Latest APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · Auto-updates |
+| [Open Web App](https://123.206.218.214/dsh/) · Installable PWA | [Download Latest APK](https://github.com/RainbowLion0320/AllinOne/releases/latest/download/All-in-One-Android.apk) · In-app OTA hot updates |
 
 <details>
 <summary>Linux one-line bridge &amp; first-launch macOS/Windows prompts</summary>
@@ -238,7 +241,7 @@ npm run test:smoke    # Run all 17 E2E & security smoke test suites
 packages/
 ├── shared/          # Shared protocol, AES-256-GCM / ECDH E2EE & P2P mux
 ├── relay-server/    # Pure control plane, built-in STUN, TURN quotas & /admin
-├── dsh-mobile-hub/  # 5 AI agent adapters, WebRTC P2P, quotas & portable bridge
+├── dsh-mobile-hub/  # Multi-vendor AI adapters, WebRTC P2P, quotas & portable bridge
 ├── mobile-app/      # React + Tailwind + Vite PWA & Capacitor Android wrapper
 └── desktop-app/     # Electron desktop client, native libwebrtc & auto-updater
 ```
