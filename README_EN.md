@@ -32,7 +32,7 @@
 </p>
 
 <p>
-  <a href="#-supported-ai-agents">Supported Agents</a> ·
+  <a href="#-supported-ai-tools">Supported Tools</a> ·
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-security--architecture">Security</a> ·
   <a href="#-one-click-self-hosting-docker">Self-Hosting</a> ·
@@ -67,17 +67,17 @@
 
 ---
 
-## 🤖 Supported AI Agents
+## 🤖 Supported AI Tools
 
-> Continuously expanding — currently integrated out of the box:
+| Tool | Support |
+| :--- | :--- |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | Remote Chat · Quota Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | Remote Chat · Quota Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Remote Chat · Quota Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Remote Chat · Balance Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **Tencent WorkBuddy** | Remote Chat · Credits Tracking |
 
-| Agent | Capabilities | Setup Experience |
-| :--- | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | Read/write sessions, model & reasoning switching, mid-turn `turn/steer`, interactive Q&A, 5h/weekly limits, extra credits & reset vouchers | Auto-detects local CLI & Codex Desktop out of the box |
-| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | Read/write local project threads, model switching, interrupt, Cowork Desktop mirror, live 5h/weekly limits | Reuses local auth automatically |
-| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Shared desktop history & login, model/effort switching, task sync, Gemini & Claude/GPT dual-pool 5h/weekly limits | Native ACP connection with live desktop progress sync |
-| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Read/write sessions, model switching, bidirectional prompt sync & live official account balance; read-only history fallback when closed | Auto-installs local loopback IPC plugin with zero terminal setup |
-| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **Tencent WorkBuddy** | Live sync of desktop sessions, thinking & tool calls; remote sending, resume, model switching & itemized Credits balance | Zero-config live mirror; 1-click QR sign-in (no terminal/Node.js) unlocks RW sharing the same account & Credits |
+> Automatically reuses your local sign-in out of the box. More AI tools are continuously being added — request yours in [Issues](https://github.com/RainbowLion0320/AllinOne/issues).
 
 ---
 

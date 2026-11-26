@@ -69,15 +69,15 @@
 
 ## 🤖 支持的 AI 工具
 
-> 持续接入更多主流 AI 编程助手，当前已原生支持：
+| 工具 | 支持范围 |
+| :--- | :--- |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | 远程读写 · 额度监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | 远程读写 · 额度监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 远程读写 · 额度监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 远程读写 · 余额监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 远程读写 · 积分监控 |
 
-| 厂商 | 核心能力 | 接入体验 |
-| :--- | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | 读写会话、切模型与推理强度、运行中转向（`turn/steer`）、交互问答、5h/周额度与附加积分/重置券展示 | 自动发现本机 CLI / Codex Desktop，开箱即用 |
-| <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | 读写本地项目会话、切模型、中断、Cowork 桌面端实时镜像、5h/周额度实时同步 | 自动复用本地登录态，免重复登录 |
-| <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 共享桌面端历史与登录态、切模型与档位、任务同步、Gemini 与 Claude/GPT 双池 5h/周额度 | 官方 ACP 协议直连，自动同步桌面进度 |
-| <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 读写会话、切模型、审批问答双向同步、官方账户余额实时展示；关闭时自动降级为只读历史 | 检测到桌面端时零终端自动安装本地环回插件 |
-| <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 实时同步桌面端会话、思考链与工具调用；授权后支持远程新建/续聊、切模型与分项积分余额展示 | 开箱只读同步；界面点「一键微信扫码」免终端解锁读写，账号与积分额度互通 |
+> 自动复用各工具本机已有登录态，开箱即用。更多主流 AI 工具持续接入中，欢迎在 [Issues](https://github.com/RainbowLion0320/AllinOne/issues) 提出需求。
 
 ---
 
