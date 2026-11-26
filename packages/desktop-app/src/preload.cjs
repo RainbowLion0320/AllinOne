@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('allinoneDesktop', {
   platform: initInfo.platform || process.platform,
   hostname: initInfo.hostname || '',
   clientUid: initInfo.clientUid || '',
-  version: initInfo.version || '1.0.19',
+  version: initInfo.version || '1.0.20',
   defaultServerUrl: initInfo.defaultServerUrl || '',
   initialLang: initInfo.lang || '',
   setLanguage: (lang) => ipcRenderer.invoke('desktop:set-language', lang),
