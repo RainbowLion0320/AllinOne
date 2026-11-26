@@ -174,11 +174,7 @@ export class MultiAppOrchestrator {
   async readSession({ id, app, sessionId, limit = 25, cursor = null } = {}) {
     const parsed = id ? parseCompositeId(id) : { app: app || APPS.DSH, sessionId }
     if (!parsed.sessionId) throw new Error('缺少 sessionId')
-    const session = await this.getAdapter(parsed.app).readSession(parsed.sessionId, { limit, cursor })
-    if (session && typeof session === 'object' && !session.workspace && session.cwd) {
-      session.workspace = basename(String(session.cwd).trim())
-    }
-    return session
+    return this.getAdapter(parsed.app).readSession(parsed.sessionId, { limit, cursor })
   }
 
   async listModels({ app = 'all' } = {}) {
@@ -218,9 +214,6 @@ export class MultiAppOrchestrator {
       sandbox,
       approvalPolicy,
     })
-    if (created && typeof created === 'object' && !created.workspace && created.cwd) {
-      created.workspace = basename(String(created.cwd).trim())
-    }
     this.onEvent(EVENTS.SESSION_UPDATED, { session: created })
     return created
   }

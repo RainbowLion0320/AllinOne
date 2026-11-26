@@ -61,7 +61,6 @@ import {
   saveLastSessionId,
   saveLastWorkspace,
 } from './lib/draftStore.js'
-import { enrichSessionMeta, resolveSessionWorkspaceLabel } from './lib/clientHelpers.js'
 import { LoginScreen } from './components/LoginScreen.jsx'
 import { SidebarDrawer } from './components/SidebarDrawer.jsx'
 import { ChatView } from './components/ChatView.jsx'
@@ -620,8 +619,6 @@ export function App() {
     }
     return [...map.values()]
   }, [workspaces, sessions])
-  const effectiveWorkspacesRef = useRef(effectiveWorkspaces)
-  effectiveWorkspacesRef.current = effectiveWorkspaces
 
   const selectedDraftWorkspaceObj = useMemo(() => {
     if (!selectedDraftCwd) return null
@@ -804,12 +801,7 @@ export function App() {
         return
       }
       if (res?.session) {
-        const enrichedSession = enrichSessionMeta(
-          res.session,
-          activeSessionRef.current,
-          effectiveWorkspacesRef.current,
-        )
-        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = enrichedSession
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
         const currentSnapshot = {
           messages: messagesRef.current,
           hasMore: historyMetaRef.current.hasMore,
@@ -827,13 +819,13 @@ export function App() {
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
         }
-        activeSessionRef.current = enrichedSession
+        activeSessionRef.current = res.session
         messagesRef.current = reconciled.messages
         historyMetaRef.current = nextHistoryMeta
-        setActiveSession(enrichedSession)
-        if (enrichedSession.cwd) {
-          saveLastWorkspace(scope, enrichedSession.cwd)
-          setSelectedDraftCwd(enrichedSession.cwd)
+        setActiveSession(res.session)
+        if (res.session.cwd) {
+          saveLastWorkspace(scope, res.session.cwd)
+          setSelectedDraftCwd(res.session.cwd)
         }
         setMessages(reconciled.messages)
         setHistoryMeta(nextHistoryMeta)
@@ -843,12 +835,12 @@ export function App() {
             s.id === targetId
               ? {
                   ...s,
-                  status: enrichedSession.status || s.status,
-                  title: enrichedSession.title || s.title,
-                  cwd: enrichedSession.cwd || s.cwd,
-                  workspace: enrichedSession.workspace || s.workspace,
-                  syncState: enrichedSession.syncState ?? null,
-                  ...(enrichedSession.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, enrichedSession.updatedAt) } : {}),
+                  status: res.session.status || s.status,
+                  title: res.session.title || s.title,
+                  cwd: res.session.cwd || s.cwd,
+                  workspace: res.session.workspace || s.workspace,
+                  syncState: res.session.syncState ?? null,
+                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
                 }
               : s,
           ),
@@ -915,24 +907,19 @@ export function App() {
       }
       if (sessRes && Array.isArray(sessRes.sessions)) {
         setSessions(sessRes.sessions)
-        const latestWorkspaces = wsRes && Array.isArray(wsRes.workspaces) ? wsRes.workspaces : effectiveWorkspacesRef.current
         const curActiveId = activeSessionRef.current?.id
         for (const s of sessRes.sessions) {
           if (s?.id && s.id === curActiveId) {
             setActiveSession((prev) => {
               if (!prev || prev.id !== s.id) return prev
-              const merged = enrichSessionMeta(
-                {
-                  ...prev,
-                  title: s.title || prev.title,
-                  cwd: s.cwd || prev.cwd,
-                  workspace: s.workspace || prev.workspace,
-                  status: s.status || prev.status,
-                  ...(s.updatedAt ? { updatedAt: Math.max(prev.updatedAt || 0, s.updatedAt) } : {}),
-                },
-                prev,
-                latestWorkspaces,
-              )
+              const merged = {
+                ...prev,
+                title: s.title || prev.title,
+                cwd: s.cwd || prev.cwd,
+                workspace: s.workspace || prev.workspace,
+                status: s.status || prev.status,
+                ...(s.updatedAt ? { updatedAt: Math.max(prev.updatedAt || 0, s.updatedAt) } : {}),
+              }
               activeSessionRef.current = merged
               return merged
             })
@@ -1046,12 +1033,11 @@ export function App() {
     setSessionOpenSeq((n) => n + 1)
 
     if (typeof sessionOrId === 'object') {
-      const enrichedInitial = enrichSessionMeta(sessionOrId, null, effectiveWorkspacesRef.current)
-      activeSessionRef.current = enrichedInitial
-      setActiveSession(enrichedInitial)
-      if (enrichedInitial.cwd) {
-        saveLastWorkspace(scope, enrichedInitial.cwd)
-        setSelectedDraftCwd(enrichedInitial.cwd)
+      activeSessionRef.current = sessionOrId
+      setActiveSession(sessionOrId)
+      if (sessionOrId.cwd) {
+        saveLastWorkspace(scope, sessionOrId.cwd)
+        setSelectedDraftCwd(sessionOrId.cwd)
       }
     }
     saveLastSessionId(scope, id)
@@ -1069,16 +1055,11 @@ export function App() {
     if (openRequestSeqRef.current !== reqSeq || deviceGenRef.current !== gen) return
     if (cached && cached.messages?.length > 0) {
       if (cached.meta && typeof sessionOrId === 'string') {
-        const enrichedCached = enrichSessionMeta(
-          cached.meta,
-          activeSessionRef.current,
-          effectiveWorkspacesRef.current,
-        )
-        activeSessionRef.current = enrichedCached
-        setActiveSession(enrichedCached)
-        if (enrichedCached.cwd) {
-          saveLastWorkspace(scope, enrichedCached.cwd)
-          setSelectedDraftCwd(enrichedCached.cwd)
+        activeSessionRef.current = cached.meta
+        setActiveSession(cached.meta)
+        if (cached.meta.cwd) {
+          saveLastWorkspace(scope, cached.meta.cwd)
+          setSelectedDraftCwd(cached.meta.cwd)
         }
       }
       const nextMeta = {
@@ -1112,12 +1093,7 @@ export function App() {
         if (res.session.status === 'idle' && isStaleStreamForIdle(id)) {
           clearLiveStreamEntry(id)
         }
-        const enrichedSession = enrichSessionMeta(
-          res.session,
-          activeSessionRef.current,
-          effectiveWorkspacesRef.current,
-        )
-        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = enrichedSession
+        const { messages: freshMsgs = [], hasMore, nextCursor, totalCount, ...metaOnly } = res.session
         const reconciled = reconcileCachedWithFreshPage(cached, {
           messages: freshMsgs,
           hasMore,
@@ -1146,25 +1122,25 @@ export function App() {
           nextCursor: reconciled.nextCursor,
           totalCount: reconciled.totalCount,
         }
-        activeSessionRef.current = enrichedSession
+        activeSessionRef.current = res.session
         messagesRef.current = finalMessages
         historyMetaRef.current = nextMeta
-        setActiveSession(enrichedSession)
-        if (enrichedSession.cwd) {
-          saveLastWorkspace(scope, enrichedSession.cwd)
-          setSelectedDraftCwd(enrichedSession.cwd)
+        setActiveSession(res.session)
+        if (res.session.cwd) {
+          saveLastWorkspace(scope, res.session.cwd)
+          setSelectedDraftCwd(res.session.cwd)
         }
         setSessions((prev) =>
           prev.map((s) =>
             s.id === id
               ? {
                   ...s,
-                  status: enrichedSession.status || s.status,
-                  title: enrichedSession.title || s.title,
-                  cwd: enrichedSession.cwd || s.cwd,
-                  workspace: enrichedSession.workspace || s.workspace,
-                  syncState: enrichedSession.syncState ?? s.syncState,
-                  ...(enrichedSession.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, enrichedSession.updatedAt) } : {}),
+                  status: res.session.status || s.status,
+                  title: res.session.title || s.title,
+                  cwd: res.session.cwd || s.cwd,
+                  workspace: res.session.workspace || s.workspace,
+                  syncState: res.session.syncState ?? s.syncState,
+                  ...(res.session.updatedAt ? { updatedAt: Math.max(s.updatedAt || 0, res.session.updatedAt) } : {}),
                 }
               : s,
           ),
@@ -1492,11 +1468,7 @@ export function App() {
         }
         setSessions((prev) => {
           const prevItem = prev.find((s) => s.id === updated.id)
-          const merged = enrichSessionMeta(
-            prevItem ? { ...prevItem, ...updated } : updated,
-            prevItem,
-            effectiveWorkspacesRef.current,
-          )
+          const merged = prevItem ? { ...prevItem, ...updated } : updated
           const next = [merged, ...prev.filter((s) => s.id !== updated.id)]
           next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
           return next
@@ -1505,11 +1477,7 @@ export function App() {
           const nextCwd = String(updated.cwd || activeSessionRef.current?.cwd || '').trim()
           setActiveSession((prev) => {
             if (!prev || prev.id !== updated.id) return prev
-            const merged = enrichSessionMeta(
-              { ...prev, ...updated },
-              prev,
-              effectiveWorkspacesRef.current,
-            )
+            const merged = { ...prev, ...updated }
             activeSessionRef.current = merged
             return merged
           })
@@ -2538,7 +2506,7 @@ export function App() {
 
   const hasMultipleTargets = devices.length > 1 || onlineBridges.length > 1 || accountDevices.length > 1
   const currentWorkspaceLabel = activeSession
-    ? resolveSessionWorkspaceLabel(activeSession, effectiveWorkspaces)
+    ? (activeSession.workspace || '')
     : (selectedDraftWorkspaceObj?.name || '')
   const headerSubtitle = (() => {
     if (connState === 'unauthorized') return `${activeDeviceName} · ${t('common.expired')}`
