@@ -863,7 +863,7 @@ class CodexRpcClient {
         }
       })
 
-      const initClientInfo = { name: 'allinone-dsh-mobile', version: '1.0.20' }
+      const initClientInfo = { name: 'allinone-dsh-mobile', version: '1.0.21' }
       this.callRaw('initialize', {
         clientInfo: initClientInfo,
         capabilities: { experimentalApi: true },
