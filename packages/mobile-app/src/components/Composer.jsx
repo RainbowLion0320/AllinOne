@@ -68,6 +68,35 @@ function revokeAttachmentPreview(att) {
   }
 }
 
+const MIME_EXT_MAP = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+  'image/svg+xml': 'svg',
+}
+
+function normalizePastedFile(file, idx = 0) {
+  if (!file) return null
+  const rawName = String(file.name || '').trim()
+  const mime = String(file.type || '').toLowerCase()
+  const isGenericClipboardImg = !rawName || /^image\.(png|jpe?g|webp|gif|bmp)$/i.test(rawName)
+  if (!isGenericClipboardImg) return file
+  const ext = MIME_EXT_MAP[mime] || (rawName.includes('.') ? rawName.split('.').pop() : 'png') || 'png'
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  const suffix = idx > 0 ? `-${idx + 1}` : ''
+  const nextName = `pasted-${stamp}${suffix}.${ext}`
+  try {
+    return new File([file], nextName, { type: file.type || `image/${ext}`, lastModified: file.lastModified || Date.now() })
+  } catch {
+    return file
+  }
+}
+
 function ComposerAttachmentChip({ att, onRemove }) {
   const isImg = String(att?.mimeType || '').startsWith('image/')
   const [loadError, setLoadError] = useState(false)
@@ -131,6 +160,7 @@ export function Composer({
   const [text, setText] = useState(() => loadDraft(draftKey).text)
   const [attachments, setAttachments] = useState(() => loadDraft(draftKey).attachments)
   const [uploading, setUploading] = useState(false)
+  const [draggingFiles, setDraggingFiles] = useState(false)
   const [sending, setSending] = useState(false)
   const [inlineError, setInlineError] = useState('')
   const [slashDismissed, setSlashDismissed] = useState(false)
@@ -142,6 +172,8 @@ export function Composer({
   const textRef = useRef(text)
   const attachmentsRef = useRef(attachments)
   const sendingRef = useRef(false)
+  const uploadingCountRef = useRef(0)
+  const dragDepthRef = useRef(0)
   const composingRef = useRef(false)
   const mountedRef = useRef(true)
   textRef.current = text
@@ -258,44 +290,126 @@ export function Composer({
     })
   }
 
-  const handleFileChange = async (e) => {
-    const file = e.target.files?.[0]
-    e.target.value = ''
-    if (!file || !onUploadFile) return
+  const uploadFiles = async (rawFiles) => {
+    const list = Array.from(rawFiles || []).filter(Boolean)
+    if (list.length === 0 || !onUploadFile || disabled || sendingRef.current) return
     const targetKey = draftKeyRef.current
-    setUploading(true)
-    setInlineError('')
+    uploadingCountRef.current += 1
+    if (mountedRef.current) {
+      setUploading(true)
+      setInlineError('')
+    }
     try {
-      const uploaded = await onUploadFile(file)
-      if (!uploaded || typeof uploaded !== 'object') return
-      if (!mountedRef.current) {
-        revokeAttachmentPreview(uploaded)
-        const existing = loadDraft(targetKey)
-        saveDraft(targetKey, {
-          text: existing.text,
-          attachments: [...existing.attachments, uploaded],
-        })
-        return
-      }
-      if (draftKeyRef.current === targetKey) {
-        updateAttachments((prev) => [...prev, uploaded])
-      } else {
-        // User switched conversations mid-upload: revoke ephemeral blob URL and persist scoped metadata
-        revokeAttachmentPreview(uploaded)
-        const existing = loadDraft(targetKey)
-        saveDraft(targetKey, {
-          text: existing.text,
-          attachments: [...existing.attachments, uploaded],
-        })
+      for (const file of list) {
+        const uploaded = await onUploadFile(file)
+        if (!uploaded || typeof uploaded !== 'object') continue
+        if (!mountedRef.current) {
+          revokeAttachmentPreview(uploaded)
+          const existing = loadDraft(targetKey)
+          saveDraft(targetKey, {
+            text: existing.text,
+            attachments: [...existing.attachments, uploaded],
+          })
+          continue
+        }
+        if (draftKeyRef.current === targetKey) {
+          updateAttachments((prev) => [...prev, uploaded])
+        } else {
+          // User switched conversations mid-upload: revoke ephemeral blob URL and persist scoped metadata
+          revokeAttachmentPreview(uploaded)
+          const existing = loadDraft(targetKey)
+          saveDraft(targetKey, {
+            text: existing.text,
+            attachments: [...existing.attachments, uploaded],
+          })
+        }
       }
     } catch (err) {
       const msg = bi(`上传失败：${err?.message || err}`, `Upload failed: ${err?.message || err}`)
       if (onError) onError(msg)
       else if (mountedRef.current) setInlineError(msg)
     } finally {
-      if (mountedRef.current) {
+      uploadingCountRef.current = Math.max(0, uploadingCountRef.current - 1)
+      if (mountedRef.current && uploadingCountRef.current === 0) {
         setUploading(false)
       }
+    }
+  }
+
+  const handleFileChange = (e) => {
+    const files = Array.from(e.target.files || [])
+    e.target.value = ''
+    if (files.length === 0) return
+    void uploadFiles(files)
+  }
+
+  const handlePaste = (e) => {
+    if (disabled || sendingRef.current || !onUploadFile) return
+    const dt = e.clipboardData
+    if (!dt) return
+    const extracted = []
+    if (dt.items && dt.items.length > 0) {
+      for (const item of dt.items) {
+        if (item.kind === 'file') {
+          const f = item.getAsFile?.()
+          if (f) extracted.push(f)
+        }
+      }
+    }
+    if (extracted.length === 0 && dt.files && dt.files.length > 0) {
+      for (const f of dt.files) {
+        if (f) extracted.push(f)
+      }
+    }
+    if (extracted.length === 0) return
+
+    // Avoid hijacking rich-text pastes (e.g. Excel/Word tables) that bundle both plain text + HTML + synthetic image.png
+    const plainText = String(dt.getData?.('text/plain') || '').trim()
+    const hasHtml = Boolean(dt.getData?.('text/html'))
+    const allGenericImgs = extracted.every((f) => !f.name || /^image\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name))
+    if (plainText && hasHtml && allGenericImgs) return
+
+    e.preventDefault()
+    const normalized = extracted.map((f, idx) => normalizePastedFile(f, idx)).filter(Boolean)
+    if (normalized.length > 0) {
+      void uploadFiles(normalized)
+    }
+  }
+
+  const hasDraggedFiles = (dt) => {
+    if (!dt) return false
+    const types = Array.from(dt.types || [])
+    return types.includes('Files') || (dt.files && dt.files.length > 0)
+  }
+
+  const handleDragEnter = (e) => {
+    if (disabled || sendingRef.current || !onUploadFile || !hasDraggedFiles(e.dataTransfer)) return
+    e.preventDefault()
+    dragDepthRef.current += 1
+    setDraggingFiles(true)
+  }
+
+  const handleDragOver = (e) => {
+    if (disabled || sendingRef.current || !onUploadFile || !hasDraggedFiles(e.dataTransfer)) return
+    e.preventDefault()
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleDragLeave = (e) => {
+    if (!draggingFiles) return
+    e.preventDefault()
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) setDraggingFiles(false)
+  }
+
+  const handleDrop = (e) => {
+    dragDepthRef.current = 0
+    if (draggingFiles) setDraggingFiles(false)
+    if (disabled || sendingRef.current || !onUploadFile || !hasDraggedFiles(e.dataTransfer)) return
+    e.preventDefault()
+    const files = Array.from(e.dataTransfer?.files || []).filter(Boolean)
+    if (files.length > 0) {
+      void uploadFiles(files)
     }
   }
 
@@ -505,8 +619,18 @@ export function Composer({
           </div>
         )}
 
-        {/* Floating DeepSeek-style pill composer */}
-        <div className="rounded-[26px] border border-slate-200/90 bg-[#F4F6FA] px-3.5 pt-2.5 pb-2 shadow-xs transition focus-within:border-[#4D6BFE]/60 focus-within:bg-white dark:border-slate-700/80 dark:bg-[#21232B] dark:focus-within:bg-[#242731]">
+        {/* Floating DeepSeek-style pill composer (supports Ctrl+V / Cmd+V paste & file drag-and-drop) */}
+        <div
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          className={`rounded-[26px] border px-3.5 pt-2.5 pb-2 shadow-xs transition ${
+            draggingFiles
+              ? 'border-[#4D6BFE] bg-[#F0F4FF] ring-2 ring-[#4D6BFE]/20 dark:border-[#4D6BFE] dark:bg-[#22283C]'
+              : 'border-slate-200/90 bg-[#F4F6FA] focus-within:border-[#4D6BFE]/60 focus-within:bg-white dark:border-slate-700/80 dark:bg-[#21232B] dark:focus-within:bg-[#242731]'
+          }`}
+        >
           <textarea
             ref={textareaRef}
             rows={1}
@@ -522,8 +646,9 @@ export function Composer({
               updateText(e.target.value)
               autoResize(e.target)
             }}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown}
-            placeholder={placeholderText}
+            placeholder={draggingFiles ? bi('松开即可上传图片或文件...', 'Drop images or files to attach...') : placeholderText}
             className="max-h-[140px] w-full resize-none bg-transparent px-1 text-[15px] leading-relaxed text-slate-900 placeholder-slate-400 outline-none dark:text-white dark:placeholder-slate-500"
           />
 
@@ -560,6 +685,7 @@ export function Composer({
               <input
                 ref={fileRef}
                 type="file"
+                multiple
                 className="hidden"
                 onChange={handleFileChange}
               />
