@@ -50,7 +50,7 @@
     <td width="72%" align="center" valign="bottom">
       <img src="./docs/preview-desktop.png" alt="All in One Desktop & Web UI" />
       <br/>
-      <sub><strong>Desktop / Web</strong> — Multi-agent sidebar, home quota overview, project tree &amp; interactive approvals</sub>
+      <sub><strong>Desktop / Web</strong> — Multi-host switcher, smart vendor sidebar &amp; live home quota/balance dashboard</sub>
     </td>
     <td width="28%" align="center" valign="bottom">
       <img src="./docs/preview-mobile.png" alt="All in One Mobile UI" />

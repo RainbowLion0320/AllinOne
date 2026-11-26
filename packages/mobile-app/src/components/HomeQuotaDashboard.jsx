@@ -380,7 +380,7 @@ function QuotaVendorCard({ card, selected, onSelect, bi, index, spanFullOnDeskto
       </div>
 
       {/* Quota Body */}
-      <div className="mt-auto">
+      <div className="flex-1">
         {details?.kind === 'balance' ? (
           <BalanceMeterBody details={details} card={card} bi={bi} />
         ) : details?.kind === 'credits' ? (

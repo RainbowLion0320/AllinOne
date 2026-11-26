@@ -4,6 +4,7 @@ import {
   ArrowLeftRight,
   ChevronDown,
   ExternalLink,
+  Home,
   KeyRound,
   Loader2,
   Lock,
@@ -3112,12 +3113,23 @@ export function App() {
 
           <button
             type="button"
-            onClick={() => openNewChatModal(activeSession?.cwd || selectedDraftCwd || '')}
-            aria-label={t('common.newChat')}
-            title={activeSession?.cwd ? bi('在当前项目新建对话', 'New chat in current project') : t('common.newChat')}
-            className="app-no-drag flex h-9 w-9 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            onClick={() => {
+              if (activeSession) returnToHome()
+              else void handleRefreshQuotas()
+            }}
+            aria-label={bi('主页', 'Home')}
+            title={
+              activeSession
+                ? bi('返回主页（额度总览）', 'Back to Home (Quota Overview)')
+                : bi('主页（点击刷新额度）', 'Home (click to refresh quotas)')
+            }
+            className={`app-no-drag flex h-9 w-9 items-center justify-center rounded-xl transition active:scale-95 ${
+              !activeSession
+                ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] hover:bg-[#4D6BFE]/20 dark:bg-[#4D6BFE]/20 dark:text-[#9BB0FF] dark:hover:bg-[#4D6BFE]/28'
+                : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800'
+            }`}
           >
-            <SquarePen className="h-4.5 w-4.5" />
+            <Home className="h-4.5 w-4.5" />
           </button>
         </div>
       </header>

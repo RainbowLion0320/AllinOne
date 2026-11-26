@@ -50,7 +50,7 @@
     <td width="72%" align="center" valign="bottom">
       <img src="./docs/preview-desktop.png" alt="All in One 桌面端与网页端界面" />
       <br/>
-      <sub><strong>桌面端 / Web</strong> — 多工具智能聚合侧边栏、首页额度总览、项目分组与交互式审批</sub>
+      <sub><strong>桌面端 / Web</strong> — 多机切换、智能聚合侧边栏、首页多厂商额度与余额总览</sub>
     </td>
     <td width="28%" align="center" valign="bottom">
       <img src="./docs/preview-mobile.png" alt="All in One 手机端界面" />
