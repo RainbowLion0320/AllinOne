@@ -4935,8 +4935,9 @@ async function main() {
           assert.equal(setupRes.ok, true)
           assert.equal(setupRes.status, 'awaiting_login')
           assert.equal(setupRes.authUrl, 'https://www.codebuddy.cn/oauth/login?state=smoke&m=internal')
-          for (let i = 0; i < 30; i += 1) {
-            if (wbRw.isCliAuthenticated()) break
+          for (let i = 0; i < 40; i += 1) {
+            const hasAuthEv = rwEvents.some((x) => x.ev === EVENTS.SESSION_UPDATED && x.payload?.authReady && x.payload?.app === 'workbuddy')
+            if (wbRw.isCliAuthenticated() && hasAuthEv) break
             await new Promise((r) => setTimeout(r, 50))
           }
           assert.equal(wbRw.isCliAuthenticated(), true)
