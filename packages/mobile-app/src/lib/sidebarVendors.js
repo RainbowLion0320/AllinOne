@@ -17,6 +17,9 @@ function toValidTimestamp(value) {
 function getValidQuota(info) {
   const q = info?.quota
   if (!q || typeof q !== 'object') return null
+  if (q.windowKind === 'balance' && typeof q.balanceTotal === 'number' && Number.isFinite(q.balanceTotal)) {
+    return q
+  }
   if (typeof q.remainingPercent === 'number' && Number.isFinite(q.remainingPercent)) {
     return q
   }
@@ -24,6 +27,21 @@ function getValidQuota(info) {
     return q
   }
   return null
+}
+
+export function formatMoneyExact(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return '0.00'
+  return n.toFixed(2)
+}
+
+export function formatMoneyCompact(value, symbol = '¥') {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return `${symbol}0`
+  if (n >= 10_000) return `${symbol}${(n / 1_000).toFixed(0)}k`
+  if (n >= 1_000) return `${symbol}${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`
+  if (n >= 10) return `${symbol}${Math.round(n)}`
+  return `${symbol}${n.toFixed(1).replace(/\.0$/, '')}`
 }
 
 export function formatCreditsExact(value) {
@@ -45,6 +63,13 @@ export function formatCreditsCompact(value) {
 
 export function formatQuotaBadgeText(quota, { compact = true, lang = 'zh', showTotal = false } = {}) {
   if (!quota || typeof quota !== 'object') return ''
+  if (quota.windowKind === 'balance') {
+    const sym = String(quota.currencySymbol || (quota.currency === 'USD' ? '$' : '¥'))
+    const total = Number(quota.balanceTotal)
+    if (Number.isFinite(total)) {
+      return compact ? formatMoneyCompact(total, sym) : `${sym}${formatMoneyExact(total)}`
+    }
+  }
   if (quota.windowKind === 'credits') {
     if (quota.unlimited) {
       return compact ? '∞' : (lang === 'en' ? 'Unlimited' : '不限积分')
@@ -87,6 +112,27 @@ export function formatQuotaTooltip(label, quota, lang = 'zh') {
   if (!quota || typeof quota !== 'object') return label
   const planRaw = String(quota.planType || '').trim()
   const planSuffix = planRaw ? ` (${/^[a-z0-9_-]+$/i.test(planRaw) ? planRaw.toUpperCase() : planRaw})` : ''
+
+  if (quota.windowKind === 'balance') {
+    const sym = String(quota.currencySymbol || (quota.currency === 'USD' ? '$' : '¥'))
+    const totalStr = `${sym}${formatMoneyExact(quota.balanceTotal)}`
+    const parts = [label, lang === 'en' ? `Balance ${totalStr}` : `余额 ${totalStr}`]
+    if (Number(quota.balanceToppedUp) > 0) {
+      parts.push(
+        lang === 'en'
+          ? `Top-up ${sym}${formatMoneyExact(quota.balanceToppedUp)}`
+          : `充值 ${sym}${formatMoneyExact(quota.balanceToppedUp)}`,
+      )
+    }
+    if (Number(quota.balanceGranted) > 0) {
+      parts.push(
+        lang === 'en'
+          ? `Granted ${sym}${formatMoneyExact(quota.balanceGranted)}`
+          : `赠送 ${sym}${formatMoneyExact(quota.balanceGranted)}`,
+      )
+    }
+    return parts.join(' · ')
+  }
 
   if (quota.windowKind === 'credits') {
     const parts = [`${label}${planSuffix}`]
@@ -135,6 +181,20 @@ export function formatQuotaTooltip(label, quota, lang = 'zh') {
         ? `${hrs}h left ${quota.shortWindow.remainingPercent}%`
         : `${hrs}h剩余 ${quota.shortWindow.remainingPercent}%`,
     )
+  }
+  if (Array.isArray(quota.pools) && quota.pools.length > 1) {
+    for (const p of quota.pools.slice(1, 3)) {
+      if (!p || !Array.isArray(p.windows) || p.windows.length === 0) continue
+      const pName = lang === 'en' ? (p.label || p.id) : (p.labelZh || p.label || p.id)
+      const wSummary = p.windows
+        .filter((w) => typeof w?.remainingPercent === 'number')
+        .map((w) => {
+          const isWk = w.kind === 'weekly' || Number(w.windowMinutes) >= 1440
+          return isWk ? `${lang === 'en' ? '7d' : '周'} ${w.remainingPercent}%` : `${Math.max(1, Math.round((w.windowMinutes || 300) / 60))}h ${w.remainingPercent}%`
+        })
+        .join(' / ')
+      if (wSummary) parts.push(`${pName} ${wSummary}`)
+    }
   }
   const resetStr = formatResetShort(quota.resetsAt, lang)
   if (resetStr) parts.push(resetStr)

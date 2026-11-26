@@ -1067,6 +1067,69 @@ export function normalizeCodexQuota(raw, now = Date.now()) {
   }
 
   const planType = String(rl.planType || rl.plan_type || '').trim().toLowerCase()
+
+  // Optional extra credit balance (e.g. Pro / enterprise top-up credits)
+  let extraCredits = null
+  const rawCredits = rl.credits
+  if (rawCredits && typeof rawCredits === 'object' && (rawCredits.hasCredits || rawCredits.unlimited)) {
+    const rawBal = Number(rawCredits.balance)
+    if (rawCredits.unlimited) {
+      extraCredits = { unlimited: true, balance: null }
+    } else if (Number.isFinite(rawBal) && rawBal > 0) {
+      extraCredits = { unlimited: false, balance: Math.round(rawBal * 10) / 10 }
+    }
+  }
+
+  // Optional free rate-limit reset credits (e.g. Codex Pro "Full reset" vouchers)
+  let resetCredits = null
+  const rawResetCredits = raw.rateLimitResetCredits || raw.rate_limit_reset_credits
+  if (rawResetCredits && typeof rawResetCredits === 'object') {
+    const availList = Array.isArray(rawResetCredits.credits)
+      ? rawResetCredits.credits.filter((c) => c && String(c.status || '').toLowerCase() === 'available')
+      : []
+    const availableCount = Math.max(
+      Number(rawResetCredits.availableCount ?? rawResetCredits.available_count ?? 0) || 0,
+      availList.length,
+    )
+    if (availableCount > 0) {
+      const expiries = availList
+        .map((c) => toEpochMs(c.expiresAt ?? c.expires_at ?? 0))
+        .filter((ts) => ts > now)
+        .sort((a, b) => a - b)
+      resetCredits = {
+        availableCount,
+        ...(expiries[0] ? { nextExpiresAt: expiries[0] } : {}),
+      }
+    }
+  }
+
+  // Optional secondary rate-limit pools from `rateLimitsByLimitId` (e.g. model-specific pools beyond `codex`)
+  const extraPools = []
+  const byLimitId = raw.rateLimitsByLimitId || raw.rate_limits_by_limit_id
+  if (byLimitId && typeof byLimitId === 'object') {
+    const mainId = String(rl.limitId || rl.limit_id || 'codex').trim().toLowerCase()
+    for (const [id, entry] of Object.entries(byLimitId)) {
+      if (!entry || typeof entry !== 'object') continue
+      if (String(id).trim().toLowerCase() === mainId) continue
+      const ew = [parseWindow(entry.primary), parseWindow(entry.secondary)]
+        .filter(Boolean)
+        .filter((w) => !(w.resetsAt > 0 && now > w.resetsAt + 60_000))
+      if (ew.length === 0) continue
+      ew.sort((a, b) => (a.windowMinutes || 999999) - (b.windowMinutes || 999999))
+      const poolLabel = String(entry.limitName || entry.limit_name || entry.normalModelSlug || id).trim()
+      extraPools.push({
+        id: String(id),
+        label: poolLabel,
+        labelZh: poolLabel,
+        windows: ew.map((w) => ({
+          id: w.windowMinutes >= 1440 ? 'weekly' : 'short',
+          kind: w.windowMinutes >= 1440 ? 'weekly' : 'short',
+          ...w,
+        })),
+      })
+    }
+  }
+
   return {
     remainingPercent: chosen.remainingPercent,
     usedPercent: chosen.usedPercent,
@@ -1084,6 +1147,28 @@ export function normalizeCodexQuota(raw, now = Date.now()) {
           },
         }
       : {}),
+    ...(extraPools.length > 0
+      ? {
+          pools: [
+            {
+              id: 'codex',
+              label: 'Codex',
+              labelZh: 'Codex 主额度',
+              windows: [
+                ...(shorter ? [{ id: 'short', kind: 'short', ...shorter }] : []),
+                {
+                  id: chosen.windowMinutes >= 1440 ? 'weekly' : 'short',
+                  kind: chosen.windowMinutes >= 1440 ? 'weekly' : 'short',
+                  ...chosen,
+                },
+              ],
+            },
+            ...extraPools,
+          ],
+        }
+      : {}),
+    ...(extraCredits ? { extraCredits } : {}),
+    ...(resetCredits ? { resetCredits } : {}),
     updatedAt: now,
   }
 }

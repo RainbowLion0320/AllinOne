@@ -72,7 +72,11 @@ import { sanitizeChildEnv } from '../packages/dsh-mobile-hub/src/helpers/bin-fin
 import { P2PBridgeManager } from '../packages/dsh-mobile-hub/src/p2p/manager.js'
 import { startStandaloneBridge } from '../packages/dsh-mobile-hub/standalone.js'
 import { apply as applyDshPlugin } from '../packages/dsh-mobile-hub/index.js'
-import { DshAdapter } from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
+import {
+  DshAdapter,
+  normalizeDeepseekBalanceQuota,
+  readDshDeepseekApiKey,
+} from '../packages/dsh-mobile-hub/src/adapters/dsh.js'
 import { startDshLocalIpcServer } from '../packages/dsh-mobile-hub/src/dsh-local-ipc.js'
 import { ensureDshLocalIpcPlugin } from '../packages/dsh-mobile-hub/src/helpers/dsh-ipc-installer.js'
 import { autoCompleteHalfInstalledClis, detectHalfInstalledClis } from '../packages/dsh-mobile-hub/src/helpers/env-autofix.js'
@@ -4115,7 +4119,8 @@ async function main() {
       const futureIso = new Date(Date.now() + 5 * 86400 * 1000).toISOString()
       const agyQuota = normalizeAntigravityQuota({
         quota: {
-          '3p-weekly': { remaining_fraction: 0 },
+          '3p-5h': { remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z', reset_in_seconds: 0 },
+          '3p-weekly': { remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z', reset_in_seconds: 0 },
           'gemini-5h': { remaining_fraction: 0.84, reset_time: new Date(Date.now() + 3600_000).toISOString() },
           'gemini-weekly': { remaining_fraction: 0.926, reset_time: futureIso },
         },
@@ -4123,7 +4128,15 @@ async function main() {
       assert.equal(agyQuota.remainingPercent, 93)
       assert.equal(agyQuota.bucketLabel, 'Gemini')
       assert.equal(agyQuota.shortWindow?.remainingPercent, 84)
-      assert.equal(normalizeAntigravityQuota({ quota: { '3p-weekly': { remaining_fraction: 0.5 } } }), null)
+      assert.equal(agyQuota.pools?.length, 2)
+      assert.equal(agyQuota.pools[0].id, 'gemini')
+      assert.equal(agyQuota.pools[1].id, '3p')
+      assert.equal(agyQuota.pools[1].windows.length, 2)
+      assert.equal(agyQuota.pools[1].windows[0].remainingPercent, 100)
+      assert.equal(agyQuota.pools[1].windows[0].resetsAt, 0)
+      const agy3pOnly = normalizeAntigravityQuota({ quota: { '3p-weekly': { remaining_fraction: 0.5 } } })
+      assert.equal(agy3pOnly?.remainingPercent, 50)
+      assert.equal(agy3pOnly?.pools?.[0]?.id, '3p')
       assert.equal(normalizeAntigravityQuota({ quota: { 'gemini-weekly': { remaining_fraction: 0.9, disabled: true } } }), null)
       assert.equal(normalizeAntigravityQuota({ quota: { 'gemini-weekly': { remaining_fraction: 0.5, reset_time: new Date(Date.now() - 10 * 60_000).toISOString() } } }), null)
       writeFileSync(agyQuotaCachePath, JSON.stringify(agyQuota), 'utf8')
@@ -4322,8 +4335,57 @@ async function main() {
 
       // 15d. Subscription weekly quota normalization (Codex Pro/Plus + Claude) & ZK Relay stripping
       const futureSec = Math.floor(Date.now() / 1000) + 3 * 86400
-      const proQ = normalizeCodexQuota({ rateLimits: { planType: 'pro', primary: { usedPercent: 18, windowDurationMins: 10080, resetsAt: futureSec }, secondary: null } })
+      const proQ = normalizeCodexQuota({
+        rateLimits: {
+          planType: 'pro',
+          primary: { usedPercent: 18, windowDurationMins: 10080, resetsAt: futureSec },
+          secondary: null,
+          credits: { hasCredits: true, unlimited: false, balance: '40189.1284' },
+        },
+        rateLimitResetCredits: {
+          availableCount: 2,
+          credits: [{ status: 'available', expiresAt: futureSec }],
+        },
+      })
       assert.equal(proQ.remainingPercent, 82)
+      assert.equal(proQ.extraCredits?.balance, 40189.1)
+      assert.equal(proQ.resetCredits?.availableCount, 2)
+      const proDash = extractVendorQuotaDetails(proQ, { lang: 'zh' })
+      assert.equal(proDash?.extraCredits?.balanceText, '40,189')
+      assert.equal(proDash?.resetCredits?.availableCount, 2)
+      const agyMultiDash = extractVendorQuotaDetails(agyQuota, { lang: 'zh' })
+      assert.equal(agyMultiDash?.hasMultiPool, true)
+      assert.equal(agyMultiDash?.pools?.length, 2)
+      assert.equal(agyMultiDash?.pools[0].label, 'Gemini 模型')
+      assert.equal(agyMultiDash?.pools[1].label, 'Claude / GPT 模型')
+      assert.equal(agyMultiDash?.pools[1].badge, '含赠送')
+
+      // DeepSeek Harness official balance normalization, .credentials.yaml parser & dashboard rendering
+      const fakeDshHome = join(tmpDir, 'fake-dsh-balance-home')
+      mkdirSync(fakeDshHome, { recursive: true })
+      writeFileSync(
+        join(fakeDshHome, '.credentials.yaml'),
+        'version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-test-deepseek-key-1234567890\nrecords:\n  other: foo\n',
+        'utf8',
+      )
+      assert.equal(readDshDeepseekApiKey({ dshHome: fakeDshHome, env: {} }), 'sk-test-deepseek-key-1234567890')
+      const dshBal = normalizeDeepseekBalanceQuota({
+        is_available: true,
+        balance_infos: [
+          { currency: 'CNY', total_balance: '84.30', granted_balance: '0.00', topped_up_balance: '84.30' },
+        ],
+      })
+      assert.equal(dshBal?.windowKind, 'balance')
+      assert.equal(dshBal?.balanceTotal, 84.3)
+      assert.equal(dshBal?.currencySymbol, '¥')
+      assert.equal(formatQuotaBadgeText(dshBal, { compact: true, lang: 'zh' }), '¥84')
+      assert.equal(formatQuotaBadgeText(dshBal, { compact: false, lang: 'zh' }), '¥84.30')
+      assert.ok(formatQuotaTooltip('DeepSeek', dshBal, 'zh').includes('余额 ¥84.30'))
+      const dshDash = extractVendorQuotaDetails(dshBal, { lang: 'zh' })
+      assert.equal(dshDash?.kind, 'balance')
+      assert.equal(dshDash?.totalText, '¥84.30')
+      assert.equal(dshDash?.toppedUpText, '¥84.30')
+      assert.equal(dshDash?.health, 'healthy')
       const plusQ = normalizeCodexQuota({ rateLimits: { planType: 'plus', primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: futureSec }, secondary: { usedPercent: 64, windowDurationMins: 10080, resetsAt: futureSec } } })
       assert.equal(plusQ.remainingPercent, 36)
       assert.equal(plusQ.shortWindow?.remainingPercent, 90)

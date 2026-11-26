@@ -8,7 +8,9 @@ import {
   Folder,
   FolderPlus,
   RefreshCw,
+  RotateCcw,
   Sparkles,
+  Wallet,
   Zap,
 } from 'lucide-react'
 import { VendorBadge } from './VendorIcon.jsx'
@@ -103,60 +105,209 @@ function WindowMeterRow({ win }) {
 function CreditsMeterBody({ details, bi }) {
   const colors = healthColorClasses(details.health)
   return (
-    <div className="space-y-2.5">
-      <div className="flex items-baseline justify-between gap-2">
-        <div className="flex min-w-0 items-baseline gap-1.5">
-          <span className={`text-[22px] leading-none font-extrabold tracking-tight tabular-nums ${colors.text}`}>
-            {details.remainingText}
-          </span>
-          {details.unlimited ? (
-            <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
-              {bi('不限积分', 'Unlimited')}
+    <div className="space-y-3">
+      <div className="space-y-2">
+        <div className="flex items-baseline justify-between gap-2">
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <span className={`text-[22px] leading-none font-extrabold tracking-tight tabular-nums ${colors.text}`}>
+              {details.remainingText}
             </span>
-          ) : (
-            <span className="truncate text-[11.5px] font-medium text-slate-400 tabular-nums dark:text-slate-500">
-              {details.totalText
-                ? `/ ${details.totalText} ${bi('积分', 'cr')}`
-                : bi('剩余积分', 'credits left')}
+            {details.unlimited ? (
+              <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                {bi('不限积分', 'Unlimited')}
+              </span>
+            ) : (
+              <span className="truncate text-[11.5px] font-medium text-slate-400 tabular-nums dark:text-slate-500">
+                {details.totalText
+                  ? `/ ${details.totalText} ${bi('积分', 'cr')}`
+                  : bi('剩余积分', 'credits left')}
+              </span>
+            )}
+          </div>
+          {!details.unlimited && (
+            <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-bold tabular-nums ${colors.pill}`}>
+              {details.remainingPercent}%
             </span>
           )}
         </div>
-        {!details.unlimited && (
-          <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-bold tabular-nums ${colors.pill}`}>
-            {details.remainingPercent}%
+
+        <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
+          <div
+            className={`h-full rounded-full bg-gradient-to-r transition-all duration-500 ease-out ${
+              details.health === 'healthy' ? 'from-[#06C798] to-emerald-400' : colors.bar
+            }`}
+            style={{
+              width: `${Math.max(details.remainingPercent > 0 ? 4 : 0, Math.min(100, details.remainingPercent))}%`,
+            }}
+          />
+        </div>
+      </div>
+
+      {details.groups.length > 0 && (
+        <div className="space-y-2 border-t border-slate-100 pt-2.5 dark:border-slate-800/80">
+          {details.groups.map((g, i) => {
+            const gColors = healthColorClasses(g.health)
+            return (
+              <div key={`${g.kind || g.name}-${i}`} className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-[11px]">
+                  <span className="flex min-w-0 items-center gap-1.5 font-medium text-slate-600 dark:text-slate-300">
+                    <Coins className="h-3 w-3 shrink-0 text-[#06C798]" />
+                    <span className="truncate">{g.name}</span>
+                  </span>
+                  <span className="shrink-0 font-semibold text-slate-700 tabular-nums dark:text-slate-200">
+                    {g.totalText ? `${g.remainingText} / ${g.totalText}` : g.remainingText}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
+                  <div
+                    className={`h-full rounded-full bg-gradient-to-r transition-all duration-500 ease-out ${
+                      g.health === 'healthy' ? 'from-[#06C798] to-teal-400' : gColors.bar
+                    }`}
+                    style={{ width: `${Math.max(g.percent > 0 ? 4 : 0, Math.min(100, g.percent))}%` }}
+                  />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {details.resetText && (
+        <div className="flex items-center gap-1 text-[10.5px] font-medium text-slate-400 tabular-nums dark:text-slate-500">
+          <Clock className="h-3 w-3 shrink-0 opacity-75" />
+          <span>{details.resetText}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BalanceMeterBody({ details, card, bi }) {
+  const colors = healthColorClasses(details.health)
+  const statusLabel = !details.isAvailable
+    ? bi('余额不足', 'Depleted')
+    : details.health === 'warning'
+      ? bi('余额偏低', 'Low')
+      : bi('余额可用', 'Available')
+  const modeHint =
+    card.mode === 'cordis-live'
+      ? bi('Cordis 引擎实时直连', 'Cordis live engine')
+      : card.mode === 'dsh-local-ipc'
+        ? bi('本机 IPC 读写就绪', 'Local IPC ready')
+        : bi('历史只读（打开 DSH 后解锁发送）', 'Read-only (open DSH to send)')
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <div className="flex min-w-0 items-baseline gap-1.5">
+          <span className={`text-[24px] leading-none font-extrabold tracking-tight tabular-nums ${colors.text}`}>
+            {details.totalText}
+          </span>
+          <span className="truncate text-[11px] font-medium text-slate-400 dark:text-slate-500">
+            {bi('账户余额', 'Balance')}
+          </span>
+        </div>
+        <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ${colors.pill}`}>
+          {statusLabel}
+        </span>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-2.5 dark:border-slate-800/80">
+        <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100/90 px-2 py-1 text-[10.5px] font-semibold text-slate-700 tabular-nums dark:bg-slate-800/85 dark:text-slate-200">
+          <Wallet className="h-3 w-3 shrink-0 text-[#4D6BFE]" />
+          <span>{bi('充值余额', 'Top-up')}</span>
+          <span>{details.toppedUpText}</span>
+        </span>
+        {details.granted > 0 && (
+          <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-[10.5px] font-semibold text-emerald-700 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-300">
+            <Coins className="h-3 w-3 shrink-0" />
+            <span>{bi('赠送余额', 'Granted')}</span>
+            <span>{details.grantedText}</span>
           </span>
         )}
+        {details.extraBalances.map((eb) => (
+          <span
+            key={eb.currency}
+            className="inline-flex items-center gap-1 rounded-lg bg-slate-100/90 px-2 py-1 text-[10.5px] font-semibold text-slate-600 tabular-nums dark:bg-slate-800/85 dark:text-slate-300"
+          >
+            <span>{eb.currency}</span>
+            <span>{eb.totalText}</span>
+          </span>
+        ))}
       </div>
 
-      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
-        <div
-          className={`h-full rounded-full bg-gradient-to-r transition-all duration-500 ease-out ${
-            details.health === 'healthy' ? 'from-[#06C798] to-emerald-400' : colors.bar
-          }`}
-          style={{
-            width: `${Math.max(details.remainingPercent > 0 ? 4 : 0, Math.min(100, details.remainingPercent))}%`,
-          }}
-        />
-      </div>
+      <div className="text-[10.5px] text-slate-400 dark:text-slate-500">{modeHint}</div>
+    </div>
+  )
+}
 
-      {(details.groups.length > 0 || details.resetText) && (
-        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-          {details.groups.map((g, i) => (
-            <span
-              key={`${g.kind || g.name}-${i}`}
-              className="inline-flex items-center gap-1 rounded-lg bg-slate-100/85 px-2 py-0.5 text-[10.5px] font-medium text-slate-600 tabular-nums dark:bg-slate-800/80 dark:text-slate-300"
+function WindowsQuotaBody({ details, bi }) {
+  const hasPools = Array.isArray(details?.pools) && details.pools.length > 1
+  const hasExtras = Boolean(details?.extraCredits || details?.resetCredits)
+
+  return (
+    <div className="space-y-3">
+      {hasPools ? (
+        <div className="space-y-3">
+          {details.pools.map((pool, poolIdx) => (
+            <div
+              key={pool.id}
+              className={poolIdx > 0 ? 'space-y-2 border-t border-slate-100 pt-2.5 dark:border-slate-800/80' : 'space-y-2'}
             >
-              <Coins className="h-2.5 w-2.5 shrink-0 text-[#06C798]" />
-              <span className="max-w-[110px] truncate">{g.name}</span>
-              <span className="font-semibold text-slate-800 dark:text-slate-100">
-                {g.totalText ? `${g.remainingText}/${g.totalText}` : g.remainingText}
-              </span>
-            </span>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <span
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                      pool.id === '3p' ? 'bg-violet-500 dark:bg-violet-400' : 'bg-[#3186FF]'
+                    }`}
+                  />
+                  <span className="truncate text-[11px] font-bold tracking-wide text-slate-600 dark:text-slate-300">
+                    {pool.label}
+                  </span>
+                  {pool.badge && (
+                    <span className="shrink-0 rounded-md bg-violet-500/10 px-1.5 py-0.5 text-[9.5px] leading-none font-semibold text-violet-600 dark:bg-violet-400/15 dark:text-violet-300">
+                      {pool.badge}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="space-y-2.5">
+                {pool.windows.map((win) => (
+                  <WindowMeterRow key={`${pool.id}-${win.id}`} win={win} />
+                ))}
+              </div>
+            </div>
           ))}
-          {details.resetText && (
-            <span className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100/85 px-2 py-0.5 text-[10px] font-medium text-slate-500 tabular-nums dark:bg-slate-800/80 dark:text-slate-400">
-              <Clock className="h-2.5 w-2.5 shrink-0 opacity-75" />
-              <span>{details.resetText}</span>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {(details?.windows || []).map((win) => (
+            <WindowMeterRow key={win.id} win={win} />
+          ))}
+        </div>
+      )}
+
+      {hasExtras && (
+        <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-2.5 dark:border-slate-800/80">
+          {details.extraCredits && (
+            <span className="inline-flex items-center gap-1 rounded-lg bg-indigo-500/10 px-2 py-1 text-[10.5px] font-semibold text-indigo-700 tabular-nums dark:bg-indigo-400/15 dark:text-indigo-300">
+              <Coins className="h-3 w-3 shrink-0" />
+              <span>{bi('附加积分', 'Credits')}</span>
+              <span>{details.extraCredits.balanceText}</span>
+            </span>
+          )}
+          {details.resetCredits && (
+            <span
+              title={details.resetCredits.expiryText || bi('免费重置当前限额', 'Free rate-limit reset voucher')}
+              className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-[10.5px] font-semibold text-emerald-700 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-300"
+            >
+              <RotateCcw className="h-3 w-3 shrink-0" />
+              <span>
+                {bi(
+                  `免费重置券 ×${details.resetCredits.availableCount}`,
+                  `Free reset ×${details.resetCredits.availableCount}`,
+                )}
+              </span>
             </span>
           )}
         </div>
@@ -230,14 +381,12 @@ function QuotaVendorCard({ card, selected, onSelect, bi, index, spanFullOnDeskto
 
       {/* Quota Body */}
       <div className="mt-auto">
-        {details?.kind === 'credits' ? (
+        {details?.kind === 'balance' ? (
+          <BalanceMeterBody details={details} card={card} bi={bi} />
+        ) : details?.kind === 'credits' ? (
           <CreditsMeterBody details={details} bi={bi} />
         ) : (
-          <div className="space-y-3">
-            {(details?.windows || []).map((win) => (
-              <WindowMeterRow key={win.id} win={win} />
-            ))}
-          </div>
+          <WindowsQuotaBody details={details} bi={bi} />
         )}
       </div>
     </button>

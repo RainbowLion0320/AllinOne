@@ -29,8 +29,9 @@ let desktopProcCache = { running: false, checkedAt: 0 }
 
 /**
  * Normalize an official Antigravity CLI `statusLine` JSON payload into a uniform E2EE quota object.
- * Strictly displays ONLY the Gemini model weekly quota (`gemini-weekly`), ignoring 3P / other buckets,
- * and attaches `gemini-5h` as `shortWindow` for hover tooltip details.
+ * Keeps `gemini-weekly` as the primary sidebar ring metric (with `gemini-5h` in `shortWindow`),
+ * and ALSO preserves all active model pools (`Gemini` + `3p` Claude/GPT 5h & weekly buckets)
+ * in `pools` for the rich Home Quota Overview Dashboard.
  */
 export function normalizeAntigravityQuota(payload, now = Date.now()) {
   if (!payload || typeof payload !== 'object') return null
@@ -43,7 +44,16 @@ export function normalizeAntigravityQuota(payload, now = Date.now()) {
     if (typeof rawFrac !== 'number' || !Number.isFinite(rawFrac)) return null
     const pct = rawFrac >= 0 && rawFrac <= 1 ? rawFrac * 100 : rawFrac
     const remainingPercent = Math.max(0, Math.min(100, Math.round(pct)))
-    const resetsAt = toEpochMs(b.reset_time || b.resetTime || 0)
+    const rawResetTime = b.reset_time || b.resetTime || 0
+    let resetsAt = toEpochMs(rawResetTime)
+    // Antigravity emits epoch 0 ("1970-01-01T00:00:00Z") + reset_in_seconds=0 when a bucket is unused at 100%
+    if (resetsAt <= 86_400_000) {
+      resetsAt = 0
+    }
+    const resetInSec = Number(b.reset_in_seconds ?? b.resetInSeconds ?? 0)
+    if (!resetsAt && Number.isFinite(resetInSec) && resetInSec > 0) {
+      resetsAt = now + Math.round(resetInSec * 1000)
+    }
     if (resetsAt > 0 && now > resetsAt + 60_000) return null
     return {
       remainingPercent,
@@ -53,33 +63,54 @@ export function normalizeAntigravityQuota(payload, now = Date.now()) {
     }
   }
 
-  const weekly = parseBucket(buckets['gemini-weekly'], 10080)
-  const shortWin = parseBucket(buckets['gemini-5h'], 300)
-  if (!weekly && !shortWin) return null
-  const planType = String(payload.plan_tier || payload.planTier || '').trim()
+  const geminiWeekly = parseBucket(buckets['gemini-weekly'], 10080)
+  const geminiShort = parseBucket(buckets['gemini-5h'], 300)
+  const thirdPartyWeekly = parseBucket(buckets['3p-weekly'], 10080)
+  const thirdPartyShort = parseBucket(buckets['3p-5h'], 300)
 
-  if (!weekly) {
-    return {
-      remainingPercent: shortWin.remainingPercent,
-      usedPercent: shortWin.usedPercent,
-      windowKind: 'session',
-      windowMinutes: shortWin.windowMinutes,
-      resetsAt: shortWin.resetsAt,
-      bucketLabel: 'Gemini',
-      ...(planType ? { planType } : {}),
-      updatedAt: now,
-    }
+  const pools = []
+  const geminiWindows = []
+  if (geminiShort) geminiWindows.push({ id: 'short', kind: 'short', ...geminiShort })
+  if (geminiWeekly) geminiWindows.push({ id: 'weekly', kind: 'weekly', ...geminiWeekly })
+  if (geminiWindows.length > 0) {
+    pools.push({
+      id: 'gemini',
+      label: 'Gemini Models',
+      labelZh: 'Gemini 模型',
+      windows: geminiWindows,
+    })
   }
 
+  const thirdPartyWindows = []
+  if (thirdPartyShort) thirdPartyWindows.push({ id: 'short', kind: 'short', ...thirdPartyShort })
+  if (thirdPartyWeekly) thirdPartyWindows.push({ id: 'weekly', kind: 'weekly', ...thirdPartyWeekly })
+  if (thirdPartyWindows.length > 0) {
+    pools.push({
+      id: '3p',
+      label: 'Claude & GPT',
+      labelZh: 'Claude / GPT 模型',
+      windows: thirdPartyWindows,
+    })
+  }
+
+  const primary = geminiWeekly || geminiShort || thirdPartyWeekly || thirdPartyShort
+  if (!primary) return null
+  const primaryIsWeekly = primary === geminiWeekly || primary === thirdPartyWeekly
+  const primaryShort =
+    primary === geminiWeekly ? geminiShort : primary === thirdPartyWeekly ? thirdPartyShort : null
+  const primaryBucketLabel = primary === geminiWeekly || primary === geminiShort ? 'Gemini' : 'Claude / GPT'
+  const planType = String(payload.plan_tier || payload.planTier || '').trim()
+
   return {
-    remainingPercent: weekly.remainingPercent,
-    usedPercent: weekly.usedPercent,
-    windowKind: 'weekly',
-    windowMinutes: weekly.windowMinutes,
-    resetsAt: weekly.resetsAt,
-    bucketLabel: 'Gemini',
+    remainingPercent: primary.remainingPercent,
+    usedPercent: primary.usedPercent,
+    windowKind: primaryIsWeekly ? 'weekly' : 'session',
+    windowMinutes: primary.windowMinutes,
+    resetsAt: primary.resetsAt,
+    bucketLabel: primaryBucketLabel,
     ...(planType ? { planType } : {}),
-    ...(shortWin ? { shortWindow: shortWin } : {}),
+    ...(primaryShort ? { shortWindow: primaryShort } : {}),
+    ...(pools.length > 0 ? { pools } : {}),
     updatedAt: now,
   }
 }
@@ -1273,7 +1304,7 @@ export class AntigravityAdapter {
   refreshQuotaInBackground({ force = false } = {}) {
     if (this.disposed || this.disableQuotaProbe) return Promise.resolve(this.getValidQuota())
     const now = Date.now()
-    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < AGY_QUOTA_CACHE_TTL_MS) {
+    if (!force && this.quotaCache && Array.isArray(this.quotaCache.pools) && this.quotaCacheAt > 0 && now - this.quotaCacheAt < AGY_QUOTA_CACHE_TTL_MS) {
       return Promise.resolve(this.getValidQuota(now))
     }
     if (this.quotaRefreshInFlight) return this.quotaRefreshInFlight

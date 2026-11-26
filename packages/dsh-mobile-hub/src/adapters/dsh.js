@@ -34,6 +34,148 @@ function getDshHome() {
   return String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
 }
 
+const DSH_QUOTA_CACHE_TTL_MS = 3 * 60_000
+const DSH_QUOTA_TIMEOUT_MS = 5_000
+const DEEPSEEK_BALANCE_API_URL = 'https://api.deepseek.com/user/balance'
+
+function currencySymbolFor(code) {
+  const c = String(code || '').trim().toUpperCase()
+  if (c === 'CNY' || c === 'RMB') return '¥'
+  if (c === 'USD') return '$'
+  if (c === 'EUR') return '€'
+  return c ? `${c} ` : ''
+}
+
+function roundMoney(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return 0
+  return Math.round(v * 100) / 100
+}
+
+/**
+ * Read DEEPSEEK_API_KEY from `~/.dsh/.credentials.yaml` (`refs:` section) or env
+ * strictly for querying DeepSeek's official read-only `/user/balance` endpoint.
+ * Never logs or exposes the API key.
+ */
+export function readDshDeepseekApiKey({ dshHome = '', env = process.env } = {}) {
+  const home = String(dshHome || '').trim() || getDshHome()
+  const credPath = join(home, '.credentials.yaml')
+  try {
+    if (existsSync(credPath)) {
+      const st = statSync(credPath)
+      if (st.isFile() && st.size > 0 && st.size <= 256 * 1024) {
+        const lines = readFileSync(credPath, 'utf8').split(/\r?\n/)
+        let inRefs = false
+        for (const rawLine of lines) {
+          if (!rawLine.trim() || rawLine.trim().startsWith('#')) continue
+          const indent = rawLine.search(/\S/)
+          const trimmed = rawLine.trim()
+          if (indent === 0) {
+            inRefs = trimmed === 'refs:'
+            continue
+          }
+          if (!inRefs) continue
+          const m = trimmed.match(/^DEEPSEEK_API_KEY:\s*(.+)$/)
+          if (m) {
+            let val = m[1].trim()
+            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+              val = val.slice(1, -1).trim()
+            }
+            if (val.length >= 16) return val
+          }
+        }
+      }
+    }
+  } catch {}
+  const fromEnv = String(env?.DEEPSEEK_API_KEY || '').trim()
+  return fromEnv.length >= 16 ? fromEnv : ''
+}
+
+/**
+ * Normalize official DeepSeek Open Platform `/user/balance` JSON into All in One's unified quota shape.
+ */
+export function normalizeDeepseekBalanceQuota(rawPayload, now = Date.now()) {
+  if (!rawPayload || typeof rawPayload !== 'object') return null
+  const list = Array.isArray(rawPayload.balance_infos) ? rawPayload.balance_infos : []
+  if (list.length === 0) return null
+
+  const balances = []
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue
+    const currency = String(item.currency || 'CNY').trim().toUpperCase() || 'CNY'
+    const total = Math.max(0, roundMoney(item.total_balance))
+    const toppedUp = Math.max(0, roundMoney(item.topped_up_balance))
+    const granted = Math.max(0, roundMoney(item.granted_balance))
+    if (!Number.isFinite(Number(item.total_balance))) continue
+    balances.push({
+      currency,
+      symbol: currencySymbolFor(currency),
+      total,
+      toppedUp,
+      granted,
+    })
+  }
+  if (balances.length === 0) return null
+
+  // Prefer the first currency with a positive balance (preferring CNY on ties)
+  const primary =
+    balances.find((b) => b.total > 0 && b.currency === 'CNY') ||
+    balances.find((b) => b.total > 0) ||
+    balances.find((b) => b.currency === 'CNY') ||
+    balances[0]
+
+  const isAvailable = rawPayload.is_available !== false && primary.total > 0
+  const lowThreshold = primary.currency === 'USD' ? 2 : 10
+  const remainingPercent = !isAvailable ? 0 : primary.total < lowThreshold ? 35 : 100
+
+  return {
+    windowKind: 'balance',
+    isAvailable,
+    currency: primary.currency,
+    currencySymbol: primary.symbol,
+    balanceTotal: primary.total,
+    balanceToppedUp: primary.toppedUp,
+    balanceGranted: primary.granted,
+    balances,
+    remainingPercent,
+    updatedAt: now,
+  }
+}
+
+export async function fetchDeepseekBalanceQuota({
+  dshHome = '',
+  env = process.env,
+  endpointOverride = '',
+  fetchImpl = globalThis.fetch,
+  timeoutMs = DSH_QUOTA_TIMEOUT_MS,
+} = {}) {
+  if (typeof fetchImpl !== 'function') return null
+  const apiKey = readDshDeepseekApiKey({ dshHome, env })
+  if (!apiKey) return null
+
+  const targetUrl = endpointOverride ? String(endpointOverride).trim() : DEEPSEEK_BALANCE_API_URL
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  timer?.unref?.()
+  try {
+    const res = await fetchImpl(targetUrl, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+    if (!res?.ok) return null
+    const json = await res.json()
+    return normalizeDeepseekBalanceQuota(json)
+  } catch {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 function readJsonSafe(filePath) {
   try {
     return JSON.parse(readFileSync(filePath, 'utf8'))
@@ -347,6 +489,16 @@ export class DshAdapter {
     this.sessionModels = new Map() // sessionId -> { provider, model, reasoningEffort }
     this.pendingApprovals = new Map() // id -> { req, resolveMobile, rejectMobile }
     this.cordisDisposers = []
+    this.disposed = false
+    this.quotaCache = null
+    this.quotaCacheAt = 0
+    this.quotaFetchInFlight = null
+    this.fetchQuotaFn = typeof config.fetchDeepseekQuota === 'function'
+      ? config.fetchDeepseekQuota
+      : () => fetchDeepseekBalanceQuota({
+          dshHome: this.dshHome,
+          endpointOverride: String(config.deepseekBalanceEndpoint || '').trim(),
+        })
     this.ipcClient = this.ctx
       ? null
       : new DshLocalIpcClient({
@@ -851,8 +1003,65 @@ export class DshAdapter {
     return Boolean(this.ctx && (this.ctx.agents || this.ctx.get?.('sessionController')))
   }
 
-  async getStatus() {
+  async refreshQuotaInBackground({ force = false } = {}) {
+    if (this.disposed) return this.quotaCache
+    const now = Date.now()
+    if (!force && this.quotaCache && this.quotaCacheAt > 0 && now - this.quotaCacheAt < DSH_QUOTA_CACHE_TTL_MS) {
+      return this.quotaCache
+    }
+    if (this.quotaFetchInFlight) return this.quotaFetchInFlight
+    const task = Promise.resolve()
+      .then(() => this.fetchQuotaFn())
+      .then((fresh) => {
+        if (this.disposed) return null
+        this.quotaCacheAt = Date.now()
+        if (fresh) {
+          this.quotaCache = fresh
+          this.emitEvent(EVENTS.BRIDGE_STATUS, {
+            type: 'quota.updated',
+            app: APPS.DSH,
+            quota: fresh,
+          })
+        }
+        return this.quotaCache
+      })
+      .catch(() => this.quotaCache)
+      .finally(() => {
+        if (this.quotaFetchInFlight === task) this.quotaFetchInFlight = null
+      })
+    this.quotaFetchInFlight = task
+    return task
+  }
+
+  async resolveQuota({ forceQuota = false } = {}) {
+    let quota = this.quotaCache
+    const now = Date.now()
+    const stale = forceQuota || !quota || now - this.quotaCacheAt >= DSH_QUOTA_CACHE_TTL_MS
+    if (stale) {
+      const p = this.refreshQuotaInBackground({ force: forceQuota })
+      if (!quota || forceQuota) {
+        let t = null
+        try {
+          const fresh = await Promise.race([
+            p,
+            new Promise((r) => {
+              t = setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
+              t.unref?.()
+            }),
+          ])
+          if (fresh) quota = fresh
+        } finally {
+          if (t) clearTimeout(t)
+        }
+      }
+    }
+    return quota
+  }
+
+  async getStatus(opts = {}) {
+    const forceQuota = Boolean(opts?.forceQuota)
     const storagesExists = existsSync(join(this.dshHome, 'storages'))
+    const quota = await this.resolveQuota({ forceQuota }).catch(() => this.quotaCache)
     if (this.isLive()) {
       return {
         app: APPS.DSH,
@@ -861,6 +1070,7 @@ export class DshAdapter {
         mode: 'cordis-live',
         detail: '已挂载到 DeepSeek Harness 核心引擎（零侵入纯桥接，0 额外 Token 与工具注入）',
         activeCount: this.activeTurns.size,
+        ...(quota ? { quota } : {}),
       }
     }
     const ipc = await this.ipcClient?.checkHealth()
@@ -872,6 +1082,7 @@ export class DshAdapter {
         mode: 'dsh-local-ipc',
         detail: '已通过本机安全 IPC 连接到运行中的 DeepSeek Harness 引擎（读写就绪）',
         activeCount: ipc.activeCount || 0,
+        ...(quota ? { quota } : {}),
       }
     }
     return {
@@ -883,6 +1094,7 @@ export class DshAdapter {
         ? '只读模式（打开或重启 DeepSeek Harness 桌面端后自动切换为读写就绪）'
         : '只读模式（可浏览 DSH 历史；All in One 将自动安装本机 DSH 桥接插件，重启 DSH 后即可读写控制）',
       activeCount: this.activeTurns.size,
+      ...(quota ? { quota } : {}),
     }
   }
 
@@ -1507,6 +1719,7 @@ export class DshAdapter {
       if (this.activeTurns.get(lockedId) === turnState) {
         this.activeTurns.delete(lockedId)
       }
+      void this.refreshQuotaInBackground({ force: true })
     }
   }
 
@@ -1531,6 +1744,7 @@ export class DshAdapter {
   }
 
   async dispose() {
+    this.disposed = true
     for (const disposeFn of this.cordisDisposers) {
       try { disposeFn() } catch {}
     }
