@@ -5,6 +5,10 @@ const DEFAULT_RELEASES_API_URL = 'https://api.github.com/repos/RainbowLion0320/A
 export const RELEASES_URL =
   String(import.meta.env?.VITE_RELEASES_URL || '').trim() || DEFAULT_RELEASES_URL
 
+const SAFE_SHA256_RE = /^[a-f0-9]{64}$/i
+const MIN_NATIVE_MARKER_RE = /<!--\s*android-ota-min-native:\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\s*-->/i
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0'])
+
 export function compareSemver(a, b) {
   const parse = (raw) => {
     const clean = String(raw || '').trim().replace(/^v/i, '')
@@ -24,95 +28,422 @@ export function compareSemver(a, b) {
   return pa.pre.localeCompare(pb.pre)
 }
 
+function parseSha256Digest(raw) {
+  const s = String(raw || '').trim()
+  const m = s.match(/^(?:sha256:)?([a-f0-9]{64})$/i)
+  return m ? m[1].toLowerCase() : ''
+}
+
+function parseMinNativeVersionFromBody(body) {
+  const m = String(body || '').match(MIN_NATIVE_MARKER_RE)
+  return m ? m[1].trim() : ''
+}
+
 /**
- * Lightweight version checker for native mobile (Capacitor Android APK) builds.
- * Checks GitHub Releases API first (for APK direct URL & exact size) and falls back
- * to the authenticated relay `/api/health` version so mainland China users always get
- * timely update notifications even when `api.github.com` is slow or unreachable.
+ * Returns true when the app is served directly from a remote HTTP(S) web server
+ * (Mobile Browser PWA or remote-URL Capacitor WebView APK) rather than bundled
+ * local assets (`https://localhost`, `capacitor://`, `app://`, `file://`).
+ * In this mode, hot-updating simply refreshes the Service Worker / WebView cache
+ * and reloads the current origin — never redirecting to an external download page.
  */
-export async function checkNativeMobileUpdate({
+export function isHotReloadableWebOrigin(locationLike = typeof window !== 'undefined' ? window.location : null) {
+  if (!locationLike) return false
+  const proto = String(locationLike.protocol || '').toLowerCase()
+  const host = String(locationLike.hostname || '').toLowerCase()
+  if (proto !== 'https:' && proto !== 'http:') return false
+  if (!host || LOCAL_HOSTS.has(host)) return false
+  return true
+}
+
+export function resolveCurrentAppBaseUrl(locationLike = typeof window !== 'undefined' ? window.location : null) {
+  if (!locationLike || !locationLike.origin || locationLike.origin === 'null') return ''
+  const pathname = String(locationLike.pathname || '/')
+  const dir = pathname.endsWith('/')
+    ? pathname.replace(/\/+$/, '')
+    : pathname.replace(/\/[^/]*$/, '').replace(/\/+$/, '')
+  return `${locationLike.origin}${dir}`
+}
+
+export async function clearWebCachesAndServiceWorkers({
+  navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
+  cachesLike = typeof caches !== 'undefined' ? caches : null,
+} = {}) {
+  try {
+    if (typeof window !== 'undefined') {
+      window.__allinoneHotReloading = true
+    }
+  } catch {}
+
+  try {
+    if (navigatorLike?.serviceWorker?.getRegistrations) {
+      const regs = await navigatorLike.serviceWorker.getRegistrations()
+      await Promise.all(regs.map((r) => r.unregister().catch(() => {})))
+    }
+  } catch {}
+
+  try {
+    if (cachesLike?.keys) {
+      const keys = await cachesLike.keys()
+      await Promise.all(keys.map((k) => cachesLike.delete(k).catch(() => {})))
+    }
+  } catch {}
+}
+
+export async function performWebHotReload({
+  locationLike = typeof window !== 'undefined' ? window.location : null,
+  navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
+  cachesLike = typeof caches !== 'undefined' ? caches : null,
+} = {}) {
+  await clearWebCachesAndServiceWorkers({ navigatorLike, cachesLike })
+  if (!locationLike) return
+  try {
+    const u = new URL(locationLike.href)
+    u.searchParams.set('_r', String(Date.now()))
+    locationLike.replace(u.toString())
+  } catch {
+    locationLike.reload?.()
+  }
+}
+
+/**
+ * Checks for an in-place web hot-update when running from a remote web origin
+ * (Mobile Browser PWA or remote-URL Capacitor WebView APK).
+ */
+export async function checkWebHotUpdate({
   currentVersion = '',
   baseUrl = '',
   token = '',
   timeoutMs = 7000,
+  locationLike = typeof window !== 'undefined' ? window.location : null,
+  fetchImpl = typeof fetch === 'function' ? fetch : null,
+  navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
 } = {}) {
   const curVer = String(currentVersion || '').trim().replace(/^v/i, '')
-  let bestVersion = ''
-  let releaseUrl = resolveApkUrl(baseUrl) || RELEASES_URL
-  let assetSize = 0
+  let swUpdateReady = false
   let checkedAny = false
+  let serverVersion = ''
 
-  const fetchWithTimeout = async (url, opts = {}) => {
+  if (navigatorLike?.serviceWorker?.getRegistrations) {
+    try {
+      const regs = await navigatorLike.serviceWorker.getRegistrations()
+      if (regs.length > 0) checkedAny = true
+      await Promise.all(
+        regs.map(async (reg) => {
+          try {
+            await reg.update()
+          } catch {}
+          if (reg.waiting) swUpdateReady = true
+        }),
+      )
+    } catch {}
+  }
+
+  const originBase = resolveCurrentAppBaseUrl(locationLike)
+  const cleanDeviceBase = String(baseUrl || '').trim().replace(/\/+$/, '')
+  const targetBase = originBase || cleanDeviceBase
+
+  if (targetBase && fetchImpl) {
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null
     const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null
     try {
-      return await fetch(url, { ...opts, ...(ctrl ? { signal: ctrl.signal } : {}) })
+      let sendAuth = false
+      if (token && cleanDeviceBase) {
+        try {
+          sendAuth = new URL(cleanDeviceBase).origin === new URL(targetBase).origin
+        } catch {
+          sendAuth = cleanDeviceBase === targetBase
+        }
+      }
+      const res = await fetchImpl(`${targetBase}/api/health?_t=${Date.now()}`, {
+        cache: 'no-store',
+        ...(sendAuth ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+        ...(ctrl ? { signal: ctrl.signal } : {}),
+      })
+      if (res.ok) {
+        checkedAny = true
+        const data = await res.json().catch(() => null)
+        const srvVer = String(data?.version || '').trim().replace(/^v/i, '')
+        if (srvVer) serverVersion = srvVer
+      }
+    } catch {
     } finally {
       if (timer) clearTimeout(timer)
     }
   }
 
-  // 1. Prefer authenticated relay /api/health (fast, direct, always reachable)
-  const cleanBase = String(baseUrl || '').trim().replace(/\/+$/, '')
-  if (cleanBase && token) {
+  if (!checkedAny && !serverVersion) {
+    return { status: 'error', currentVersion: curVer, error: 'Unable to check for updates' }
+  }
+
+  const hasNewerServer = Boolean(serverVersion && curVer && compareSemver(serverVersion, curVer) > 0)
+  if (hasNewerServer || swUpdateReady) {
+    return {
+      status: 'downloaded',
+      hotUpdate: true,
+      mode: 'web-reload',
+      currentVersion: curVer,
+      latestVersion: hasNewerServer ? serverVersion : curVer,
+    }
+  }
+
+  return {
+    status: 'up-to-date',
+    hotUpdate: true,
+    mode: 'web-reload',
+    currentVersion: curVer,
+    latestVersion: serverVersion || curVer,
+  }
+}
+
+/**
+ * Unified update checker for mobile & native Android builds:
+ *  - Remote-URL Android WebView APK & Mobile Browser PWA: checks live origin `/api/health`
+ *    and Service Worker state, returning an instant in-app hot-reload (`mode: 'web-reload'`).
+ *  - Bundled-local Capacitor Android APK (`https://localhost`) with `AllinOneUpdater`:
+ *    checks signed relay OTA mirror (fast in China, verified against APK signing cert) and
+ *    GitHub Releases `All-in-One-WebBundle.zip` (verified by SHA-256), enabling in-app OTA
+ *    download + hot restart (`mode: 'capacitor-ota'`) without jumping to a download page.
+ *  - Only falls back to native APK installer guidance when `minNativeVersion > nativeVersion`
+ *    or when running an older bundled APK without the native OTA plugin.
+ */
+export async function checkNativeMobileUpdate({
+  currentVersion = '',
+  nativeVersion = '',
+  stagedVersion = '',
+  hasNativeOta = false,
+  baseUrl = '',
+  token = '',
+  timeoutMs = 7000,
+  locationLike = typeof window !== 'undefined' ? window.location : null,
+  fetchImpl = typeof fetch === 'function' ? fetch : null,
+  navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
+  releasesApiUrl = DEFAULT_RELEASES_API_URL,
+} = {}) {
+  // 1. Remote HTTPS web origin (Mobile PWA or remote-hosted Android WebView APK): always hot-reload in-place!
+  if (isHotReloadableWebOrigin(locationLike)) {
+    return checkWebHotUpdate({
+      currentVersion,
+      baseUrl,
+      token,
+      timeoutMs,
+      locationLike,
+      fetchImpl,
+      navigatorLike,
+    })
+  }
+
+  const curVer = String(currentVersion || '').trim().replace(/^v/i, '')
+  const curNativeVer = String(nativeVersion || curVer).trim().replace(/^v/i, '')
+  const curStagedVer = String(stagedVersion || '').trim().replace(/^v/i, '')
+  let bestVersion = ''
+  let releaseUrl = resolveApkUrl(baseUrl) || RELEASES_URL
+  let apkAssetSize = 0
+  let checkedAny = false
+
+  let relayOta = null
+  let githubOta = null
+  let githubMinNative = ''
+
+  const fetchWithTimeout = async (url, opts = {}) => {
+    if (!fetchImpl) throw new Error('fetch unavailable')
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null
     try {
-      const res = await fetchWithTimeout(`${cleanBase}/api/health`, {
+      return await fetchImpl(url, { ...opts, ...(ctrl ? { signal: ctrl.signal } : {}) })
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  const cleanBase = String(baseUrl || '').trim().replace(/\/+$/, '')
+
+  const checkRelayHealth = async () => {
+    if (!cleanBase || !token) return
+    try {
+      const res = await fetchWithTimeout(`${cleanBase}/api/health?_t=${Date.now()}`, {
+        cache: 'no-store',
         headers: { Authorization: `Bearer ${token}` },
       })
       if (res.ok) {
-        const data = await res.json()
+        const data = await res.json().catch(() => null)
         const srvVer = String(data?.version || '').trim().replace(/^v/i, '')
         if (srvVer) {
           checkedAny = true
-          bestVersion = srvVer
+          if (!bestVersion || compareSemver(srvVer, bestVersion) > 0) {
+            bestVersion = srvVer
+          }
         }
       }
     } catch {}
   }
 
-  // 2. Also query GitHub Releases latest (gives exact APK download URL & size when reachable)
-  try {
-    const res = await fetchWithTimeout(DEFAULT_RELEASES_API_URL, {
-      headers: { Accept: 'application/vnd.github+json' },
-    })
-    if (res.ok) {
-      const data = await res.json()
+  const checkRelayOtaMirror = async () => {
+    if (!hasNativeOta || !cleanBase || !/^https:\/\//i.test(cleanBase)) return
+    try {
+      const res = await fetchWithTimeout(`${cleanBase}/downloads/ota/All-in-One-WebBundle.json?_t=${Date.now()}`, {
+        cache: 'no-store',
+      })
+      if (!res.ok) return
+      const data = await res.json().catch(() => null)
+      const ver = String(data?.version || '').trim().replace(/^v/i, '')
+      const sha256 = parseSha256Digest(data?.sha256)
+      const signature = String(data?.signature || '').trim()
+      const sigAlg = String(data?.sigAlg || '').trim()
+      const bundleFile = String(data?.bundleFile || 'All-in-One-WebBundle.zip').trim().replace(/^\/+/, '')
+      const minNativeVersion = String(data?.minNativeVersion || '').trim().replace(/^v/i, '')
+      const size = Number(data?.size || 0)
+      // Non-GitHub mirror MUST carry a cryptographic signature (verified natively against the APK cert)
+      if (!ver || !sha256 || !signature || !sigAlg || !/^[A-Za-z0-9._-]+\.zip$/i.test(bundleFile)) {
+        return
+      }
+      checkedAny = true
+      relayOta = {
+        version: ver,
+        downloadUrl: `${cleanBase}/downloads/ota/${bundleFile}`,
+        expectedSha256: sha256,
+        signature,
+        sigAlg,
+        minNativeVersion,
+        size: Number.isFinite(size) && size > 0 ? size : 0,
+      }
+      if (!bestVersion || compareSemver(ver, bestVersion) > 0) {
+        bestVersion = ver
+      }
+    } catch {}
+  }
+
+  const checkGithubRelease = async () => {
+    try {
+      const res = await fetchWithTimeout(releasesApiUrl, {
+        cache: 'no-store',
+        headers: { Accept: 'application/vnd.github+json' },
+      })
+      if (!res.ok) return
+      const data = await res.json().catch(() => null)
       const ghVer = String(data?.tag_name || '').trim().replace(/^v/i, '')
-      if (ghVer) {
-        checkedAny = true
-        if (!bestVersion || compareSemver(ghVer, bestVersion) >= 0) {
-          bestVersion = ghVer
-          const apkAsset = Array.isArray(data?.assets)
-            ? data.assets.find((a) => /\.apk$/i.test(String(a?.name || '')) && /^https:\/\//i.test(String(a?.browser_download_url || '')))
-            : null
-          if (apkAsset) {
-            releaseUrl = apkAsset.browser_download_url
-            assetSize = Number(apkAsset.size || 0)
-          } else if (/^https:\/\//i.test(String(data?.html_url || ''))) {
-            releaseUrl = data.html_url
-          }
+      if (!ghVer) return
+      checkedAny = true
+      if (!bestVersion || compareSemver(ghVer, bestVersion) >= 0) {
+        bestVersion = ghVer
+      }
+
+      const assets = Array.isArray(data?.assets) ? data.assets : []
+      const apkAsset = assets.find(
+        (a) => /\.apk$/i.test(String(a?.name || '')) && /^https:\/\//i.test(String(a?.browser_download_url || '')),
+      )
+      if (apkAsset) {
+        releaseUrl = apkAsset.browser_download_url
+        apkAssetSize = Number(apkAsset.size || 0)
+      } else if (/^https:\/\//i.test(String(data?.html_url || ''))) {
+        releaseUrl = data.html_url
+      }
+
+      githubMinNative = parseMinNativeVersionFromBody(data?.body || '')
+      const webBundleAsset = assets.find(
+        (a) =>
+          /^All-in-One-WebBundle.*\.zip$/i.test(String(a?.name || '')) &&
+          /^https:\/\//i.test(String(a?.browser_download_url || '')),
+      )
+      const bundleSha = parseSha256Digest(webBundleAsset?.digest)
+      if (webBundleAsset && SAFE_SHA256_RE.test(bundleSha)) {
+        githubOta = {
+          version: ghVer,
+          downloadUrl: webBundleAsset.browser_download_url,
+          expectedSha256: bundleSha,
+          signature: '',
+          sigAlg: '',
+          minNativeVersion: githubMinNative,
+          size: Number(webBundleAsset.size || 0),
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
+
+  await Promise.all([checkRelayHealth(), checkRelayOtaMirror(), checkGithubRelease()])
 
   if (!checkedAny || !bestVersion) {
     return { status: 'error', currentVersion: curVer, error: 'Unable to check for updates' }
   }
-  if (curVer && compareSemver(bestVersion, curVer) > 0) {
-    return {
-      status: 'available',
-      currentVersion: curVer,
-      latestVersion: bestVersion,
-      releaseUrl,
-      assetSize,
+
+  // Pick the highest available OTA candidate (prefer signed relay mirror as primary when versions match, with GitHub fallback)
+  let bestOta = null
+  if (hasNativeOta) {
+    if (relayOta && githubOta) {
+      const cmp = compareSemver(relayOta.version, githubOta.version)
+      if (cmp > 0) {
+        bestOta = relayOta
+      } else if (cmp < 0) {
+        bestOta = githubOta
+      } else if (relayOta.expectedSha256 === githubOta.expectedSha256) {
+        bestOta = {
+          ...relayOta,
+          fallbackUrl: githubOta.downloadUrl,
+          minNativeVersion: relayOta.minNativeVersion || githubOta.minNativeVersion || '',
+          size: relayOta.size || githubOta.size || 0,
+        }
+      } else {
+        // Digest mismatch between mirror and GitHub: trust official GitHub release
+        bestOta = githubOta
+      }
+    } else {
+      bestOta = relayOta || githubOta || null
     }
   }
+
+  const effectiveLatest = bestOta && compareSemver(bestOta.version, bestVersion) >= 0 ? bestOta.version : bestVersion
+  if (!curVer || compareSemver(effectiveLatest, curVer) <= 0) {
+    return {
+      status: 'up-to-date',
+      hotUpdate: Boolean(hasNativeOta),
+      currentVersion: curVer,
+      latestVersion: effectiveLatest,
+      releaseUrl,
+    }
+  }
+
+  // Check whether the new release requires a native APK shell upgrade
+  const requiredMinNative = bestOta?.minNativeVersion || githubMinNative || ''
+  const needsNativeShellUpgrade = Boolean(
+    requiredMinNative && curNativeVer && compareSemver(requiredMinNative, curNativeVer) > 0,
+  )
+
+  if (hasNativeOta && bestOta && !needsNativeShellUpgrade && compareSemver(bestOta.version, curVer) > 0) {
+    if (curStagedVer && compareSemver(curStagedVer, bestOta.version) === 0) {
+      return {
+        status: 'downloaded',
+        hotUpdate: true,
+        mode: 'capacitor-ota',
+        currentVersion: curVer,
+        latestVersion: bestOta.version,
+        assetSize: bestOta.size || 0,
+        releaseUrl,
+      }
+    }
+    return {
+      status: 'available',
+      hotUpdate: true,
+      mode: 'capacitor-ota',
+      currentVersion: curVer,
+      latestVersion: bestOta.version,
+      downloadUrl: bestOta.downloadUrl,
+      fallbackUrl: bestOta.fallbackUrl || '',
+      expectedSha256: bestOta.expectedSha256,
+      signature: bestOta.signature || '',
+      sigAlg: bestOta.sigAlg || '',
+      minNativeVersion: bestOta.minNativeVersion || '',
+      assetSize: bestOta.size || 0,
+      releaseUrl,
+    }
+  }
+
   return {
-    status: 'up-to-date',
+    status: 'available',
+    hotUpdate: false,
+    nativeUpgradeRequired: true,
     currentVersion: curVer,
-    latestVersion: bestVersion,
+    latestVersion: effectiveLatest,
     releaseUrl,
+    assetSize: apkAssetSize,
   }
 }
 

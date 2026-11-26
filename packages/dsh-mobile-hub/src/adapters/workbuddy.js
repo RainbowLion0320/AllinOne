@@ -336,11 +336,17 @@ export function normalizeWorkbuddyCreditsQuota(rawPayload, { isEnterprise = fals
   let usedSum = 0
   let remainSum = 0
   const creditGroups = []
+  let resetsAt = data.CycleResetTime || data.ResetTime ? toEpochMs(data.CycleResetTime || data.ResetTime) : 0
   for (const g of sourceList) {
     if (!g || typeof g !== 'object') continue
     const gTotal = Number(g.CycleTotalCapacity) || 0
     const gUsed = Number(g.CycleUsedCapacity) || 0
     const gRemain = Number(g.CycleRemainCapacity) || 0
+    const gReset = g.CycleResetTime || g.ResetTime || g.ExpireTime
+    if (gReset && !resetsAt) {
+      const ts = toEpochMs(gReset)
+      if (ts > 0) resetsAt = ts
+    }
     totalSum += gTotal
     usedSum += gUsed
     remainSum += gRemain
@@ -375,7 +381,7 @@ export function normalizeWorkbuddyCreditsQuota(rawPayload, { isEnterprise = fals
     unlimited: false,
     planType,
     creditGroups,
-    resetsAt: 0,
+    resetsAt,
     updatedAt: Date.now(),
   }
 }
@@ -1347,7 +1353,8 @@ export class WorkBuddyAdapter {
     return task
   }
 
-  async getStatus() {
+  async getStatus(opts = {}) {
+    const forceQuota = Boolean(opts?.forceQuota)
     const cliVersion = await this.probeCliVersion({ force: true })
     const dbSnap = readWorkbuddyDbSnapshot(this.workbuddyHome)
     const projectRoots = this.getProjectsRoots()
@@ -1360,20 +1367,21 @@ export class WorkBuddyAdapter {
     let quota = this.quotaCache
     if (authenticated || hasStandaloneCodebuddyAuth({ authDir: this.authDir })) {
       const now = Date.now()
-      const stale = !quota || now - this.quotaCacheAt >= WORKBUDDY_QUOTA_CACHE_TTL_MS
+      const stale = forceQuota || !quota || now - this.quotaCacheAt >= WORKBUDDY_QUOTA_CACHE_TTL_MS
       if (stale) {
-        const refreshPromise = this.refreshQuotaInBackground()
-        if (!quota) {
-          // On cold start give the lightweight summary API up to 1.8s so the first sidebar render shows credits immediately
+        const refreshPromise = this.refreshQuotaInBackground({ force: forceQuota })
+        if (!quota || forceQuota) {
+          // On cold start or explicit refresh give the lightweight summary API up to 2.2s
           let t = null
           try {
-            quota = await Promise.race([
+            const fresh = await Promise.race([
               refreshPromise,
               new Promise((r) => {
-                t = setTimeout(() => r(null), 1_800)
+                t = setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
                 t.unref?.()
               }),
             ])
+            if (fresh) quota = fresh
           } finally {
             if (t) clearTimeout(t)
           }

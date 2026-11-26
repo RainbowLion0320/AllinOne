@@ -2429,7 +2429,9 @@ export function createRelayServer(options = {}) {
             ext === '.mjs' ||
             target.endsWith('sw.js') ||
             target.endsWith('registerSW.js') ||
-            target.endsWith('manifest.webmanifest')
+            target.endsWith('manifest.webmanifest') ||
+            target.endsWith('All-in-One-WebBundle.json') ||
+            target.endsWith('All-in-One-WebBundle.zip')
 
           // Dynamically inject this server's strictly validated public URL into setup.ps1 / setup.sh
           if (ext === '.ps1' || ext === '.sh') {

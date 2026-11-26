@@ -146,11 +146,11 @@ export class MultiAppOrchestrator {
     }
   }
 
-  async getAppsStatus() {
+  async getAppsStatus({ forceQuota = false } = {}) {
     const results = await Promise.all(
       APP_LIST.map(async (app) => {
         try {
-          return await this.adapters[app].getStatus()
+          return await this.adapters[app].getStatus({ forceQuota })
         } catch (err) {
           return {
             app,
@@ -909,7 +909,7 @@ export class MultiAppOrchestrator {
       case RPC.FILE_READ:
         return await this.readLocalFile(params)
       case RPC.APPS_STATUS:
-        return { apps: await this.getAppsStatus() }
+        return { apps: await this.getAppsStatus({ forceQuota: Boolean(params?.forceQuota) }) }
       case RPC.APP_SETUP: {
         const app = String(params?.app || '').trim()
         if (!app || !this.adapters[app]) {

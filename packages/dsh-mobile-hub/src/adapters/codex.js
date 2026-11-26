@@ -1056,8 +1056,9 @@ export function normalizeCodexQuota(raw, now = Date.now()) {
 
   // Prefer the 7-day / weekly window (>= 24h) as primary display metric
   const weekly = windows.find((w) => w.windowMinutes >= 1440) || null
-  const shorter = windows.find((w) => w !== weekly && w.windowMinutes > 0 && w.windowMinutes < 1440) || null
-  const chosen = weekly || windows[0]
+  const rawShorter = windows.find((w) => w !== weekly && w.windowMinutes > 0 && w.windowMinutes < 1440) || null
+  const shorter = rawShorter && !(rawShorter.resetsAt > 0 && now > rawShorter.resetsAt + 60_000) ? rawShorter : null
+  const chosen = weekly || shorter || windows[0]
   if (!chosen) return null
 
   // Ignore clearly expired cached windows (only when no newer live snapshot)
@@ -1112,6 +1113,11 @@ export class CodexAdapter {
           if (parsed) {
             this.quotaCache = parsed
             this.quotaCacheAt = Date.now()
+            this.emitEvent(EVENTS.BRIDGE_STATUS, {
+              type: 'quota.updated',
+              app: APPS.CODEX,
+              quota: parsed,
+            })
           }
         }
       },
@@ -1790,7 +1796,7 @@ export class CodexAdapter {
     }
   }
 
-  async getStatus() {
+  async getStatus(opts = {}) {
     try {
       // Re-resolve binary if previously missing (e.g. user installed Codex after starting bridge)
       if (!this.reader.proc) {
@@ -1799,7 +1805,7 @@ export class CodexAdapter {
         this.reader.codexBin = resolved
       }
       await this.reader.ensureStarted()
-      const quota = await this.readQuota().catch(() => null)
+      const quota = await this.readQuota({ force: Boolean(opts?.forceQuota) }).catch(() => null)
       return {
         app: APPS.CODEX,
         available: true,

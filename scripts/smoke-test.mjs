@@ -124,6 +124,11 @@ import {
   formatQuotaBadgeText,
   formatQuotaTooltip,
 } from '../packages/mobile-app/src/lib/sidebarVendors.js'
+import {
+  buildHomeQuotaCards,
+  extractVendorQuotaDetails,
+  formatQuotaResetCountdown,
+} from '../packages/mobile-app/src/lib/quotaDashboard.js'
 import { RelayBridgeLink } from '../packages/dsh-mobile-hub/src/ws-client.js'
 import {
   parseCompositeId as hubParseCompositeId,
@@ -191,7 +196,17 @@ import {
   reconcileCachedWithFreshPage,
   saveCachedSession,
 } from '../packages/mobile-app/src/lib/sessionCache.js'
-import { compareSemver as compareMobileSemver } from '../packages/mobile-app/src/lib/clientHelpers.js'
+import {
+  checkNativeMobileUpdate,
+  compareSemver as compareMobileSemver,
+  isHotReloadableWebOrigin,
+  resolveCurrentAppBaseUrl,
+} from '../packages/mobile-app/src/lib/clientHelpers.js'
+import {
+  buildZipBuffer,
+  computeOtaCanonicalPayload,
+  packageAndroidOtaBundle,
+} from './package-android-ota.mjs'
 import {
   extractImageRefsFromText,
   isExternalHttpImageUrl,
@@ -3030,6 +3045,169 @@ async function main() {
         await new Promise((r) => mockReleaseServer.close(r))
       }
 
+      // 10b-2. Mobile / Android OTA hot-update checks (remote web hot-reload, Capacitor OTA, staged reuse, minNativeVersion guard & ZIP bundler)
+      assert.equal(isHotReloadableWebOrigin({ protocol: 'https:', hostname: '123.206.218.214' }), true)
+      assert.equal(isHotReloadableWebOrigin({ protocol: 'https:', hostname: 'localhost' }), false)
+      assert.equal(isHotReloadableWebOrigin({ protocol: 'capacitor:', hostname: 'localhost' }), false)
+      assert.equal(isHotReloadableWebOrigin({ protocol: 'app:', hostname: 'allinone' }), false)
+      assert.equal(
+        resolveCurrentAppBaseUrl({ origin: 'https://123.206.218.214', pathname: '/dsh/' }),
+        'https://123.206.218.214/dsh',
+      )
+      assert.equal(
+        resolveCurrentAppBaseUrl({ origin: 'https://123.206.218.214', pathname: '/dsh/index.html' }),
+        'https://123.206.218.214/dsh',
+      )
+
+      // Mode B: Remote-URL WebView APK or Mobile PWA MUST hot-reload in-place (never jump to GitHub download URL)
+      {
+        let swUpdated = false
+        const remoteHot = await checkNativeMobileUpdate({
+          currentVersion: '1.0.25',
+          baseUrl: 'https://123.206.218.214/dsh',
+          token: 'tok-1',
+          locationLike: { protocol: 'https:', hostname: '123.206.218.214', origin: 'https://123.206.218.214', pathname: '/dsh/' },
+          navigatorLike: {
+            serviceWorker: {
+              getRegistrations: async () => [{ update: async () => { swUpdated = true }, waiting: null }],
+            },
+          },
+          fetchImpl: async (url) => {
+            assert.match(String(url), /^https:\/\/123\.206\.218\.214\/dsh\/api\/health\?_t=/)
+            return { ok: true, json: async () => ({ ok: true, version: '1.0.26' }) }
+          },
+        })
+        assert.equal(swUpdated, true)
+        assert.equal(remoteHot.status, 'downloaded')
+        assert.equal(remoteHot.hotUpdate, true)
+        assert.equal(remoteHot.mode, 'web-reload')
+        assert.equal(remoteHot.latestVersion, '1.0.26')
+        assert.equal(remoteHot.releaseUrl, undefined)
+      }
+
+      // Mode A: Bundled-local Capacitor Android APK (`https://localhost`) with native AllinOneUpdater plugin
+      {
+        const mockSha = 'a'.repeat(64)
+        const localLoc = { protocol: 'https:', hostname: 'localhost', origin: 'https://localhost', pathname: '/' }
+        const mockFetch = async (url) => {
+          const u = String(url)
+          if (u.includes('/downloads/ota/All-in-One-WebBundle.json')) {
+            return {
+              ok: true,
+              json: async () => ({
+                schema: 1,
+                version: '1.0.27',
+                minNativeVersion: '1.0.26',
+                bundleFile: 'All-in-One-WebBundle.zip',
+                sha256: mockSha,
+                size: 1_250_000,
+                sigAlg: 'SHA256withRSA',
+                signature: 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5',
+              }),
+            }
+          }
+          if (u.includes('/api/health')) {
+            return { ok: true, json: async () => ({ ok: true, version: '1.0.27' }) }
+          }
+          return {
+            ok: true,
+            json: async () => ({
+              tag_name: 'v1.0.27',
+              html_url: 'https://github.com/RainbowLion0320/AllinOne/releases/tag/v1.0.27',
+              body: '<!-- android-ota-min-native: 1.0.26 -->',
+              assets: [
+                {
+                  name: 'All-in-One-WebBundle.zip',
+                  size: 1_250_000,
+                  digest: `sha256:${mockSha}`,
+                  browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-WebBundle.zip',
+                },
+                {
+                  name: 'All-in-One-Android.apk',
+                  size: 8_400_000,
+                  browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-Android.apk',
+                },
+              ],
+            }),
+          }
+        }
+
+        // Prefers signed relay mirror as primary with GitHub fallback when digests match
+        const capOta = await checkNativeMobileUpdate({
+          currentVersion: '1.0.26',
+          nativeVersion: '1.0.26',
+          hasNativeOta: true,
+          baseUrl: 'https://123.206.218.214/dsh',
+          token: 'tok-1',
+          locationLike: localLoc,
+          fetchImpl: mockFetch,
+        })
+        assert.equal(capOta.status, 'available')
+        assert.equal(capOta.hotUpdate, true)
+        assert.equal(capOta.mode, 'capacitor-ota')
+        assert.equal(capOta.latestVersion, '1.0.27')
+        assert.equal(capOta.downloadUrl, 'https://123.206.218.214/dsh/downloads/ota/All-in-One-WebBundle.zip')
+        assert.equal(capOta.fallbackUrl, 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.27/All-in-One-WebBundle.zip')
+        assert.equal(capOta.expectedSha256, mockSha)
+        assert.equal(capOta.sigAlg, 'SHA256withRSA')
+
+        // Already-staged bundle immediately reports 'downloaded' ready for instant hot restart
+        const capStaged = await checkNativeMobileUpdate({
+          currentVersion: '1.0.26',
+          nativeVersion: '1.0.26',
+          stagedVersion: '1.0.27',
+          hasNativeOta: true,
+          baseUrl: 'https://123.206.218.214/dsh',
+          token: 'tok-1',
+          locationLike: localLoc,
+          fetchImpl: mockFetch,
+        })
+        assert.equal(capStaged.status, 'downloaded')
+        assert.equal(capStaged.hotUpdate, true)
+        assert.equal(capStaged.mode, 'capacitor-ota')
+
+        // Enforces minNativeVersion: older native APK shell requires installer upgrade instead of incompatible hot-update
+        const capNeedsNative = await checkNativeMobileUpdate({
+          currentVersion: '1.0.25',
+          nativeVersion: '1.0.25',
+          hasNativeOta: true,
+          baseUrl: 'https://123.206.218.214/dsh',
+          token: 'tok-1',
+          locationLike: localLoc,
+          fetchImpl: mockFetch,
+        })
+        assert.equal(capNeedsNative.status, 'available')
+        assert.equal(capNeedsNative.hotUpdate, false)
+        assert.equal(capNeedsNative.nativeUpgradeRequired, true)
+      }
+
+      // Deterministic Android OTA PKZIP packager verification
+      {
+        const sampleZip = buildZipBuffer([
+          { name: 'index.html', data: Buffer.from('<!doctype html><title>OTA</title>') },
+          { name: 'assets/app.js', data: Buffer.from('console.log("ok")') },
+        ])
+        assert.equal(sampleZip.readUInt32LE(0), 0x04034b50) // PKZIP local file header
+        assert.equal(sampleZip.readUInt32LE(sampleZip.length - 22), 0x06054b50) // PKZIP EOCD
+        assert.equal(
+          computeOtaCanonicalPayload({ version: '1.0.26', minNativeVersion: '1.0.26', sha256: 'AB'.repeat(32), size: 42 }),
+          `allinone-ota-v1\n1.0.26\n1.0.26\n${'ab'.repeat(32)}\n42`,
+        )
+        const otaTmpOut = join(tmpDir, 'ota-pack-test')
+        const packed = packageAndroidOtaBundle({
+          outDir: otaTmpOut,
+          version: '1.0.26',
+          signWithKeystore: false,
+        })
+        assert.equal(existsSync(packed.zipPath), true)
+        assert.equal(existsSync(packed.manifestPath), true)
+        assert.equal(packed.manifest.version, '1.0.26')
+        assert.match(packed.manifest.sha256, /^[a-f0-9]{64}$/)
+        assert.ok(packed.manifest.size > 1000)
+        const actualZipSha = createHash('sha256').update(readFileSync(packed.zipPath)).digest('hex')
+        assert.equal(actualZipSha, packed.manifest.sha256)
+      }
+
       // 10c. DesktopWebRtcProxy + ElectronWebRtcClient cold-start concurrency, FIFO framing & worker recovery
       const ipcMain = new EventEmitter()
       const receivedCmds = []
@@ -3362,8 +3540,80 @@ async function main() {
       assert.equal(formatQuotaBadgeText({ windowKind: 'credits', unlimited: true }, { compact: true }), '∞')
       assert.ok(formatQuotaTooltip('WorkBuddy', wbCreditQuota, 'zh').includes('剩余积分 791.8 / 800 (99%)'))
       assert.ok(formatQuotaTooltip('WorkBuddy', wbCreditQuota, 'en').includes('Credits left 791.8 / 800 (99%)'))
+
+      // Home Quota Overview Dashboard (5h short window priority, 7d weekly, credits breakdown & card ordering)
+      const nowFixed = 1_795_000_000_000
+      assert.equal(formatQuotaResetCountdown(nowFixed + 2 * 3600_000 + 15 * 60_000, { lang: 'zh', now: nowFixed }), '2小时15分后重置')
+      assert.equal(formatQuotaResetCountdown(nowFixed + 2 * 3600_000 + 15 * 60_000, { lang: 'en', now: nowFixed }), 'Resets in 2h 15m')
+      assert.equal(formatQuotaResetCountdown(nowFixed + 35_000, { lang: 'zh', now: nowFixed }), '即将重置')
+
+      const codexDualDetails = extractVendorQuotaDetails(
+        {
+          windowKind: 'weekly',
+          windowMinutes: 10080,
+          remainingPercent: 45,
+          usedPercent: 55,
+          resetsAt: nowFixed + 3 * 86400_000 + 4 * 3600_000,
+          planType: 'plus',
+          shortWindow: {
+            remainingPercent: 86,
+            usedPercent: 14,
+            windowMinutes: 300,
+            resetsAt: nowFixed + 2 * 3600_000 + 20 * 60_000,
+          },
+          updatedAt: nowFixed,
+        },
+        { lang: 'zh', now: nowFixed },
+      )
+      assert.equal(codexDualDetails?.kind, 'windows')
+      assert.equal(codexDualDetails?.planLabel, 'Plus')
+      assert.equal(codexDualDetails?.windows.length, 2)
+      assert.equal(codexDualDetails?.windows[0].kind, 'short')
+      assert.equal(codexDualDetails?.windows[0].label, '5小时额度')
+      assert.equal(codexDualDetails?.windows[0].remainingPercent, 86)
+      assert.equal(codexDualDetails?.windows[1].kind, 'weekly')
+      assert.equal(codexDualDetails?.windows[1].label, '7天周额度')
+      assert.equal(codexDualDetails?.windows[1].remainingPercent, 45)
+      assert.equal(codexDualDetails?.windows[1].health, 'warning')
+
+      const wbDashDetails = extractVendorQuotaDetails(wbCreditQuota, { lang: 'zh', now: nowFixed })
+      assert.equal(wbDashDetails?.kind, 'credits')
+      assert.equal(wbDashDetails?.remainingText, '791.8')
+      assert.equal(wbDashDetails?.totalText, '800')
+      assert.equal(wbDashDetails?.groups.length, 2)
+
+      const homeCards = buildHomeQuotaCards({
+        appList: ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy'],
+        sessions: [
+          { app: 'workbuddy', updatedAt: 500, status: 'running' },
+          { app: 'codex', updatedAt: 400, status: 'idle' },
+          { app: 'dsh', updatedAt: 900, status: 'idle' },
+        ],
+        appsStatus: [
+          { app: 'dsh', available: true, writable: true, mode: 'dsh-local-ipc' },
+          {
+            app: 'codex',
+            available: true,
+            writable: true,
+            quota: {
+              windowKind: 'weekly',
+              remainingPercent: 45,
+              shortWindow: { remainingPercent: 86, windowMinutes: 300, resetsAt: nowFixed + 3600_000 },
+              resetsAt: nowFixed + 86400_000,
+            },
+          },
+          { app: 'antigravity', available: true, writable: true, quota: { windowKind: 'weekly', remainingPercent: 98, bucketLabel: 'Gemini' } },
+          { app: 'workbuddy', available: true, writable: true, quota: wbCreditQuota },
+          { app: 'claude', available: false, writable: false },
+        ],
+        lang: 'zh',
+        now: nowFixed,
+      })
+      assert.deepEqual(homeCards.quotaCards.map((c) => c.app), ['workbuddy', 'codex', 'antigravity'])
+      assert.deepEqual(homeCards.otherCards.map((c) => c.app), ['dsh'])
+      assert.equal(homeCards.quotaCards[0].runningCount, 1)
     }
-    pass(11, 'Frontend guards (React Hooks, i18n parity, deviceStore LRU, scoped sessionCache, drafts & smart vendor bar)')
+    pass(11, 'Frontend guards (React Hooks, i18n parity, deviceStore LRU, scoped sessionCache, drafts & home quota dashboard)')
 
     // =========================================================================
     // 12. Deliverable Documents E2EE Download, Security Guards & Sandbox HTML Preview

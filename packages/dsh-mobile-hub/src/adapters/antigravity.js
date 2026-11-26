@@ -54,9 +54,22 @@ export function normalizeAntigravityQuota(payload, now = Date.now()) {
   }
 
   const weekly = parseBucket(buckets['gemini-weekly'], 10080)
-  if (!weekly) return null
   const shortWin = parseBucket(buckets['gemini-5h'], 300)
+  if (!weekly && !shortWin) return null
   const planType = String(payload.plan_tier || payload.planTier || '').trim()
+
+  if (!weekly) {
+    return {
+      remainingPercent: shortWin.remainingPercent,
+      usedPercent: shortWin.usedPercent,
+      windowKind: 'session',
+      windowMinutes: shortWin.windowMinutes,
+      resetsAt: shortWin.resetsAt,
+      bucketLabel: 'Gemini',
+      ...(planType ? { planType } : {}),
+      updatedAt: now,
+    }
+  }
 
   return {
     remainingPercent: weekly.remainingPercent,
@@ -1303,14 +1316,14 @@ export class AntigravityAdapter {
     return p
   }
 
-  async getStatus() {
+  async getStatus(opts = {}) {
     const dbExists = existsSync(join(this.agyHome, 'conversation_summaries.db'))
     const cliVer = await this.checkCliVersion()
     const writable = Boolean(cliVer)
     const quota = this.getValidQuota()
     if (writable) {
-      // Refresh Gemini weekly quota non-blockingly in background; emits E2EE BRIDGE_STATUS once ready
-      void this.refreshQuotaInBackground()
+      // Refresh Gemini weekly + 5h quota non-blockingly in background; emits E2EE BRIDGE_STATUS once ready
+      void this.refreshQuotaInBackground({ force: Boolean(opts?.forceQuota) })
     }
     return {
       app: APPS.ANTIGRAVITY,

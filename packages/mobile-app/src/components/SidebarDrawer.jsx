@@ -16,7 +16,6 @@ import {
   ScanLine,
   Search,
   Settings,
-  SquarePen,
   User,
   X,
 } from 'lucide-react'
@@ -404,18 +403,6 @@ export function SidebarDrawer({
               }`}
             >
               <Search className="h-4 w-4" />
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onNewChat('', filterApp !== 'all' ? filterApp : '')
-              }}
-              title={t('common.newChat')}
-              aria-label={t('common.newChat')}
-              className="rounded-xl p-2 text-slate-500 transition hover:bg-slate-200/70 hover:text-[#4D6BFE] lg:hidden dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-[#9AB0FF]"
-            >
-              <SquarePen className="h-4 w-4" />
             </button>
             <button
               type="button"

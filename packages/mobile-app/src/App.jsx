@@ -19,7 +19,12 @@ import {
 } from 'lucide-react'
 import { computeGrantPubKeyFp, formatE2eeFingerprint } from '@allinone/shared/e2ee'
 import { clearE2eeMediaCache } from './lib/e2eeMedia.js'
-import { checkNativeMobileUpdate } from './lib/clientHelpers.js'
+import {
+  checkNativeMobileUpdate,
+  clearWebCachesAndServiceWorkers,
+  isHotReloadableWebOrigin,
+  performWebHotReload,
+} from './lib/clientHelpers.js'
 import { compressImageForUpload } from './lib/imageCompress.js'
 import {
   MobileRelayClient,
@@ -148,6 +153,7 @@ export function App() {
   const [workspaces, setWorkspaces] = useState([])
   const [sessions, setSessions] = useState([])
   const [refreshing, setRefreshing] = useState(false)
+  const [refreshingQuotas, setRefreshingQuotas] = useState(false)
 
   const [activeSession, setActiveSession] = useState(null)
   const [messages, setMessages] = useState([])
@@ -162,11 +168,17 @@ export function App() {
   const [approvals, setApprovals] = useState([])
   const [desktopBridge, setDesktopBridge] = useState(null)
   const [updateState, setUpdateState] = useState(null)
+  const updateStateRef = useRef(null)
+  updateStateRef.current = updateState
 
   const desktopApi = typeof window !== 'undefined' ? window.allinoneDesktop || null : null
   const isMacDesktop = desktopApi?.platform === 'darwin'
   const isNativeMobile =
     typeof window !== 'undefined' && !desktopApi && Boolean(window.Capacitor?.isNativePlatform?.())
+  const nativeOtaPlugin = isNativeMobile ? window.Capacitor?.Plugins?.AllinOneUpdater || null : null
+  const isWebHotUpdatable =
+    typeof window !== 'undefined' && !desktopApi && isHotReloadableWebOrigin(window.location)
+  const canCheckMobileUpdate = !desktopApi && (isNativeMobile || isWebHotUpdatable)
 
   const devices = deviceState.devices
   const activeDevice = useMemo(() => getActiveDevice(deviceState), [deviceState])
@@ -461,6 +473,36 @@ export function App() {
     }
   }, [sidebarFilterApp, selectedDraftApp, appsStatus])
 
+  const handleRefreshQuotas = useCallback(async () => {
+    const client = clientRef.current
+    if (!client) return
+    const targetBridge = String(activeBridgeIdRef.current || '').trim()
+    const gen = deviceGenRef.current
+    setRefreshingQuotas(true)
+    try {
+      const res = await client.rpc(
+        RPC.APPS_STATUS,
+        { forceQuota: true },
+        15_000,
+        targetBridge ? { bridgeId: targetBridge } : {},
+      )
+      if (
+        deviceGenRef.current === gen &&
+        clientRef.current === client &&
+        (!targetBridge || activeBridgeIdRef.current === targetBridge) &&
+        Array.isArray(res?.apps) &&
+        res.apps.length > 0
+      ) {
+        setAppsStatus(res.apps)
+      }
+    } catch {
+    } finally {
+      if (deviceGenRef.current === gen) {
+        setRefreshingQuotas(false)
+      }
+    }
+  }, [])
+
   // Electron Desktop App integration: live local bridge status + auto-updater + menu shortcuts
   useEffect(() => {
     if (!desktopApi) return
@@ -494,30 +536,172 @@ export function App() {
     }
   }, [desktopApi, openNewChatModal])
 
+  // Native Android OTA plugin: confirm healthy boot & subscribe to live download progress
+  useEffect(() => {
+    if (!nativeOtaPlugin) return
+    const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
+    try {
+      void nativeOtaPlugin.confirmBoot?.({ version: currentVersion })?.catch?.(() => {})
+    } catch {}
+
+    let handlePromise = null
+    if (typeof nativeOtaPlugin.addListener === 'function') {
+      try {
+        handlePromise = Promise.resolve(
+          nativeOtaPlugin.addListener('otaProgress', (ev) => {
+            if (!ev || typeof ev !== 'object') return
+            if (ev.status === 'downloading') {
+              setUpdateState((prev) => ({
+                ...(prev || {}),
+                status: 'downloading',
+                hotUpdate: true,
+                mode: 'capacitor-ota',
+                latestVersion: ev.version || prev?.latestVersion || '',
+                downloadedBytes: Number(ev.downloadedBytes || 0),
+                totalBytes: Number(ev.totalBytes || prev?.assetSize || 0),
+                percent: Number(ev.percent || 0),
+                error: '',
+              }))
+            }
+          }),
+        )
+      } catch {}
+    }
+    return () => {
+      handlePromise
+        ?.then((h) => h?.remove?.())
+        ?.catch?.(() => {})
+    }
+  }, [nativeOtaPlugin])
+
+  const handleDownloadMobileUpdate = useCallback(
+    async (explicitCandidate = null) => {
+      const target = explicitCandidate || updateStateRef.current
+      if (!nativeOtaPlugin?.downloadBundle || !target?.downloadUrl || !target?.expectedSha256) return null
+      const curStatus = updateStateRef.current?.status
+      if (curStatus === 'downloading' || curStatus === 'installing') return updateStateRef.current
+
+      setUpdateState({
+        ...target,
+        status: 'downloading',
+        hotUpdate: true,
+        mode: 'capacitor-ota',
+        percent: 0,
+        downloadedBytes: 0,
+        totalBytes: Number(target.assetSize || 0),
+        error: '',
+      })
+
+      try {
+        const res = await nativeOtaPlugin.downloadBundle({
+          version: target.latestVersion || '',
+          minNativeVersion: target.minNativeVersion || '',
+          url: target.downloadUrl,
+          fallbackUrl: target.fallbackUrl || '',
+          expectedSha256: target.expectedSha256,
+          expectedSize: Number(target.assetSize || 0),
+          signature: target.signature || '',
+          sigAlg: target.sigAlg || '',
+        })
+        if (res?.status === 'cancelled') {
+          const next = { ...target, status: 'available', percent: 0, error: '' }
+          setUpdateState(next)
+          return next
+        }
+        const next = {
+          ...target,
+          status: 'downloaded',
+          hotUpdate: true,
+          mode: 'capacitor-ota',
+          latestVersion: res?.version || target.latestVersion || '',
+          percent: 100,
+          error: '',
+        }
+        setUpdateState(next)
+        return next
+      } catch (err) {
+        const msg = String(err?.message || err || biLang(getCurrentLang(), '热更新下载失败', 'Hot update download failed'))
+        const next = { ...target, status: 'error', error: msg }
+        setUpdateState(next)
+        return next
+      }
+    },
+    [nativeOtaPlugin],
+  )
+
+  const handleCancelMobileUpdate = useCallback(async () => {
+    try {
+      await nativeOtaPlugin?.cancelDownload?.()
+    } catch {}
+    setUpdateState((prev) =>
+      prev && prev.status === 'downloading'
+        ? { ...prev, status: 'available', percent: 0, error: '' }
+        : prev,
+    )
+  }, [nativeOtaPlugin])
+
+  const handleInstallMobileUpdate = useCallback(async () => {
+    const cur = updateStateRef.current
+    if (!cur || cur.status === 'installing') return
+    setUpdateState((prev) => ({ ...(prev || {}), status: 'installing', error: '' }))
+    try {
+      if (cur.mode === 'capacitor-ota' && nativeOtaPlugin?.applyUpdate) {
+        // Clear any Service Worker / CacheStorage before switching Capacitor's local bundle root
+        await clearWebCachesAndServiceWorkers()
+        await nativeOtaPlugin.applyUpdate({ version: cur.latestVersion || '' })
+        return
+      }
+      await performWebHotReload()
+    } catch (err) {
+      const msg = String(err?.message || err || biLang(getCurrentLang(), '热更重启失败', 'Hot restart failed'))
+      setUpdateState((prev) => ({ ...(prev || {}), status: 'error', error: msg }))
+    }
+  }, [nativeOtaPlugin])
+
   const handleCheckNativeMobileUpdate = useCallback(
     async ({ silent = false } = {}) => {
-      if (!isNativeMobile) return null
+      if (!canCheckMobileUpdate) return null
+      const curStatus = updateStateRef.current?.status
+      if (curStatus === 'downloading' || curStatus === 'installing') {
+        return updateStateRef.current
+      }
       const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
       if (!silent) {
-        setUpdateState((prev) => ({ ...(prev || {}), status: 'checking', currentVersion }))
+        setUpdateState((prev) => ({ ...(prev || {}), status: 'checking', currentVersion, error: '' }))
+      }
+      let nativeVersion = ''
+      let stagedVersion = ''
+      if (nativeOtaPlugin?.getAppInfo) {
+        try {
+          const info = await nativeOtaPlugin.getAppInfo()
+          nativeVersion = String(info?.nativeVersion || '').trim()
+          stagedVersion = String(info?.stagedVersion || '').trim()
+        } catch {}
       }
       const next = await checkNativeMobileUpdate({
         currentVersion,
+        nativeVersion,
+        stagedVersion,
+        hasNativeOta: Boolean(nativeOtaPlugin),
         baseUrl: activeDevice?.baseUrl || '',
         token: activeDevice?.token || '',
       })
       if (silent && next.status === 'error') {
         return next
       }
+      // On manual check, if a small signed OTA hot-update bundle is available, start downloading in-app right away
+      if (!silent && next.status === 'available' && next.hotUpdate && next.mode === 'capacitor-ota' && nativeOtaPlugin) {
+        return handleDownloadMobileUpdate(next)
+      }
       setUpdateState(next)
       return next
     },
-    [isNativeMobile, activeDevice?.baseUrl, activeDevice?.token],
+    [canCheckMobileUpdate, nativeOtaPlugin, activeDevice?.baseUrl, activeDevice?.token, handleDownloadMobileUpdate],
   )
 
-  // Native mobile (Android APK) automatic update check shortly after launch + every 4 hours
+  // Mobile (Android APK & Mobile PWA) automatic silent update check shortly after launch + every 4 hours
   useEffect(() => {
-    if (!isNativeMobile) return
+    if (!canCheckMobileUpdate) return
     const startupTimer = setTimeout(() => {
       void handleCheckNativeMobileUpdate({ silent: true })
     }, 5_000)
@@ -528,7 +712,7 @@ export function App() {
       clearTimeout(startupTimer)
       clearInterval(periodicTimer)
     }
-  }, [isNativeMobile, handleCheckNativeMobileUpdate])
+  }, [canCheckMobileUpdate, handleCheckNativeMobileUpdate])
 
   const hadDesktopAccountRef = useRef(false)
   // Auto-bind & run embedded local PC bridge whenever signed into an account inside Desktop App
@@ -3225,6 +3409,7 @@ export function App() {
         sessionOpenSeq={sessionOpenSeq}
         onLoadOlder={loadOlderMessages}
         appsStatus={appsStatus}
+        sessions={sessions}
         activeApp={activeApp}
         onSelectApp={(appId) => {
           setSelectedDraftApp(appId)
@@ -3237,6 +3422,10 @@ export function App() {
           if (cwdPath) saveLastWorkspace(cacheScopeRef.current, cwdPath)
         }}
         onOpenNewChatModal={() => openNewChatModal(selectedDraftCwd || '', effectiveDefaultApp)}
+        activeDeviceName={activeDeviceName}
+        bridgeOnline={bridgeOnline}
+        refreshingQuotas={refreshingQuotas}
+        onRefreshQuotas={handleRefreshQuotas}
         approvals={activeSessionApprovals}
         imageContext={imageContext}
         onResolveApproval={handleResolveApproval}
@@ -3528,13 +3717,31 @@ export function App() {
             onCheckUpdate={
               desktopApi
                 ? () => { void desktopApi.checkForUpdates?.().then((st) => st && setUpdateState(st)) }
-                : isNativeMobile
+                : canCheckMobileUpdate
                   ? () => { void handleCheckNativeMobileUpdate({ silent: false }) }
                   : null
             }
-            onDownloadUpdate={desktopApi ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) } : null}
-            onCancelUpdate={desktopApi ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) } : null}
-            onInstallUpdate={desktopApi ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) } : null}
+            onDownloadUpdate={
+              desktopApi
+                ? () => { void desktopApi.downloadUpdate?.().then((st) => st && setUpdateState(st)) }
+                : nativeOtaPlugin
+                  ? () => { void handleDownloadMobileUpdate() }
+                  : null
+            }
+            onCancelUpdate={
+              desktopApi
+                ? () => { void desktopApi.cancelUpdateDownload?.().then((st) => st && setUpdateState(st)) }
+                : nativeOtaPlugin
+                  ? () => { void handleCancelMobileUpdate() }
+                  : null
+            }
+            onInstallUpdate={
+              desktopApi
+                ? () => { void desktopApi.installUpdate?.().then((st) => st && setUpdateState(st)) }
+                : canCheckMobileUpdate
+                  ? () => { void handleInstallMobileUpdate() }
+                  : null
+            }
             onSendBindEmailCode={handleSendBindEmailCode}
             onBindAccountEmail={handleBindAccountEmail}
             onToggleLogin2fa={handleToggleLoginEmail2fa}

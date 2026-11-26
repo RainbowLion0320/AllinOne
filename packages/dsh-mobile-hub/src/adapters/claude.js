@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -12,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
 import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
@@ -1017,6 +1018,41 @@ export function normalizeClaudeQuota(rateLimitInfo, now = Date.now()) {
   }
 }
 
+function getClaudeQuotaCachePath() {
+  const base = String(process.env.ALLINONE_HOME || '').trim() || join(homedir(), '.allinone-bridge')
+  return join(base, 'claude-quota-cache.json')
+}
+
+function readDiskClaudeQuota(cachePath, now = Date.now()) {
+  try {
+    if (!cachePath || !existsSync(cachePath)) return { weekly: null, short: null }
+    const raw = JSON.parse(readFileSync(cachePath, 'utf8'))
+    const ok = (q) =>
+      q &&
+      typeof q === 'object' &&
+      typeof q.remainingPercent === 'number' &&
+      Number.isFinite(q.remainingPercent) &&
+      (!q.resetsAt || now <= q.resetsAt + 60_000)
+    return {
+      weekly: ok(raw?.weekly) ? raw.weekly : null,
+      short: ok(raw?.short) ? raw.short : null,
+    }
+  } catch {
+    return { weekly: null, short: null }
+  }
+}
+
+function writeDiskClaudeQuota(cachePath, weekly, shortWin) {
+  if (!cachePath || (!weekly && !shortWin)) return
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true })
+    writeFileSync(cachePath, JSON.stringify({ weekly: weekly || null, short: shortWin || null }), {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+  } catch {}
+}
+
 /**
  * Claude Code / Claude Desktop (Cowork + Desktop Code) Sessions Adapter.
  * - Claude Code CLI & Desktop Code sessions: full read/write streaming via `claude -p --output-format stream-json --verbose [--resume <id>]` + external running-state sync.
@@ -1042,8 +1078,10 @@ export class ClaudeAdapter {
     this.pendingCreated = new Map() // sessionId -> summary (before first turn persists jsonl)
     this.sessionPrefs = new Map() // sessionId -> { model, reasoningEffort }
     this.sessionTaskStates = new Map() // sessionId -> normalized taskState | null
-    this.weeklyQuota = null
-    this.shortQuota = null
+    this.quotaCachePath = config.claudeQuotaCachePath || getClaudeQuotaCachePath()
+    const cachedClaudeQuota = readDiskClaudeQuota(this.quotaCachePath)
+    this.weeklyQuota = cachedClaudeQuota.weekly
+    this.shortQuota = cachedClaudeQuota.short
     this.desktopEntriesById = new Map() // nativeId -> desktop entry descriptor
     this.watchedSessions = new Map() // nativeId -> watch state
     this.trackedListSessions = new Map() // nativeId -> tracked list state
@@ -1372,6 +1410,15 @@ export class ClaudeAdapter {
       this.weeklyQuota = parsed
     } else {
       this.shortQuota = parsed
+    }
+    writeDiskClaudeQuota(this.quotaCachePath, this.weeklyQuota, this.shortQuota)
+    const combined = this.getCachedQuota()
+    if (combined) {
+      this.emitEvent(EVENTS.BRIDGE_STATUS, {
+        type: 'quota.updated',
+        app: APPS.CLAUDE,
+        quota: combined,
+      })
     }
   }
 

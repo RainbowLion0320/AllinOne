@@ -1252,11 +1252,18 @@ export function SettingsModal({
                     <div className="flex items-center justify-between gap-2 rounded-xl border border-[#4D6BFE]/30 bg-[#F3F6FF] px-3 py-2 dark:border-[#4D6BFE]/35 dark:bg-[#1C2338]">
                       <div className="min-w-0">
                         <div className="font-bold text-[#2842C9] dark:text-white">
-                          {bi(`新版本 v${updateState.latestVersion}`, `Update v${updateState.latestVersion}`)}
+                          {updateState.nativeUpgradeRequired && !(updateState.downloadUrl && onDownloadUpdate)
+                            ? bi(`需安装新包 v${updateState.latestVersion}`, `Installer update v${updateState.latestVersion}`)
+                            : bi(`新版本 v${updateState.latestVersion}`, `Update v${updateState.latestVersion}`)}
                         </div>
-                        {updateState.assetSize > 0 && (
+                        {(updateState.assetSize > 0 || updateState.hotUpdate) && (
                           <div className="text-[10.5px] text-slate-500 dark:text-slate-400">
-                            {formatBytesCompact(updateState.assetSize)}
+                            {[
+                              updateState.assetSize > 0 ? formatBytesCompact(updateState.assetSize) : '',
+                              updateState.hotUpdate ? bi('热更新', 'Hot update') : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
                           </div>
                         )}
                       </div>
@@ -1267,7 +1274,7 @@ export function SettingsModal({
                           className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE] px-3 py-1.5 text-[11.5px] font-semibold text-white shadow-xs active:scale-95"
                         >
                           <Download className="h-3.5 w-3.5" />
-                          <span>{bi('下载', 'Download')}</span>
+                          <span>{updateState.hotUpdate ? bi('立即更新', 'Update') : bi('下载', 'Download')}</span>
                         </button>
                       ) : (
                         <a
@@ -1276,7 +1283,7 @@ export function SettingsModal({
                           rel="noopener noreferrer"
                           className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE] px-3 py-1.5 text-[11.5px] font-semibold text-white"
                         >
-                          <span>{bi('去下载', 'Download')}</span>
+                          <span>{bi('下载安装包', 'Get Installer')}</span>
                           <ExternalLink className="h-3 w-3" />
                         </a>
                       )}
@@ -1287,15 +1294,20 @@ export function SettingsModal({
                     <div className="space-y-1.5 rounded-xl border border-slate-200/80 bg-slate-50 px-3 py-2 dark:border-slate-700/80 dark:bg-[#171A23]">
                       <div className="flex items-center justify-between gap-2 text-[11.5px]">
                         <span className="font-semibold text-slate-800 dark:text-slate-100">
-                          {bi(`下载中 v${updateState.latestVersion} · ${updateState.percent}%`, `Downloading v${updateState.latestVersion} · ${updateState.percent}%`)}
+                          {bi(
+                            `${updateState.hotUpdate ? '热更下载中' : '下载中'} v${updateState.latestVersion} · ${updateState.percent}%`,
+                            `Downloading v${updateState.latestVersion} · ${updateState.percent}%`,
+                          )}
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => onCancelUpdate?.()}
-                          className="text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                        >
-                          {t('common.cancel')}
-                        </button>
+                        {onCancelUpdate && (
+                          <button
+                            type="button"
+                            onClick={() => onCancelUpdate?.()}
+                            className="text-[11px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                          >
+                            {t('common.cancel')}
+                          </button>
+                        )}
                       </div>
                       <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
                         <div
@@ -1308,9 +1320,16 @@ export function SettingsModal({
 
                   {updateState.status === 'downloaded' && (
                     <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-200/80 bg-emerald-50/80 px-3 py-2 dark:border-emerald-900/60 dark:bg-emerald-950/35">
-                      <span className="font-semibold text-emerald-700 dark:text-emerald-300">
-                        {bi(`v${updateState.latestVersion} 已就绪`, `v${updateState.latestVersion} ready`)}
-                      </span>
+                      <div className="min-w-0">
+                        <div className="font-semibold text-emerald-700 dark:text-emerald-300">
+                          {bi(`v${updateState.latestVersion} 已就绪`, `v${updateState.latestVersion} ready`)}
+                        </div>
+                        {updateState.hotUpdate && (
+                          <div className="text-[10.5px] text-emerald-600/80 dark:text-emerald-400/80">
+                            {bi('应用内热更新，无需重装', 'In-app hot update, no reinstall needed')}
+                          </div>
+                        )}
+                      </div>
                       <button
                         type="button"
                         onClick={() => onInstallUpdate?.()}
@@ -1325,7 +1344,11 @@ export function SettingsModal({
                   {updateState.status === 'installing' && (
                     <div className="flex items-center gap-2 text-[#4D6BFE]">
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      <span>{bi('正在更新并重启...', 'Updating & restarting...')}</span>
+                      <span>
+                        {updateState.hotUpdate
+                          ? bi('正在热更并重启...', 'Hot-updating & restarting...')
+                          : bi('正在更新并重启...', 'Updating & restarting...')}
+                      </span>
                     </div>
                   )}
 

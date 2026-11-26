@@ -1,5 +1,4 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { APP_LIST, APP_META } from '@allinone/shared'
 import {
   AlertTriangle,
   ArrowUp,
@@ -9,7 +8,6 @@ import {
   ChevronRight,
   Cpu,
   Folder,
-  FolderPlus,
   History,
   Info,
   Loader2,
@@ -23,8 +21,8 @@ import { extractImageRefsFromText, normalizeImageKey } from '../lib/imageUrls.js
 import { extractDeliverableRefsFromMessage } from '../lib/deliverableFiles.js'
 import { ChatImageGallery } from './ChatImageGallery.jsx'
 import { ChatDeliverableList } from './ChatDeliverableList.jsx'
-import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
-import { formatQuotaBadgeText, formatQuotaTooltip } from '../lib/sidebarVendors.js'
+import { VendorBadge } from './VendorIcon.jsx'
+import { HomeQuotaDashboard } from './HomeQuotaDashboard.jsx'
 import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { TaskStateBar } from './TaskStateBar.jsx'
 import { useI18n } from '../lib/i18n.jsx'
@@ -321,17 +319,22 @@ export function ChatView({
   sessionOpenSeq = 0,
   onLoadOlder,
   appsStatus,
+  sessions = [],
   activeApp = 'dsh',
   onSelectApp,
   workspaces = [],
   selectedWorkspace = '',
   onSelectWorkspace,
   onOpenNewChatModal,
+  activeDeviceName = '',
+  bridgeOnline = false,
+  refreshingQuotas = false,
+  onRefreshQuotas,
   approvals,
   imageContext,
   onResolveApproval,
 }) {
-  const { lang, bi, t } = useI18n()
+  const { bi, t } = useI18n()
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
   const topSentinelRef = useRef(null)
@@ -795,18 +798,17 @@ export function ChatView({
           </div>
         )}
 
-        {/* Empty Greeting Screen */}
+        {/* Empty Greeting / Home Quota Overview Dashboard */}
         {!loadingSession && !hasContent && (
-          <div className="flex flex-col items-center pt-20 pb-8 text-center">
-            <div className="animate-home-rise mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10 transition-transform duration-300 hover:scale-105">
-              <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
-            </div>
-            <h2 className="animate-home-rise text-lg font-bold text-slate-900 dark:text-white">
-              {session ? session.title : 'All in One'}
-            </h2>
-
-            {session ? (
-              session.workspace && (
+          session ? (
+            <div className="flex flex-col items-center pt-20 pb-8 text-center">
+              <div className="animate-home-rise mb-3.5 h-15 w-15 overflow-hidden rounded-[18px] bg-[#03080E] shadow-lg shadow-blue-950/30 ring-1 ring-white/10 transition-transform duration-300 hover:scale-105">
+                <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
+              </div>
+              <h2 className="animate-home-rise text-lg font-bold text-slate-900 dark:text-white">
+                {session.title}
+              </h2>
+              {session.workspace && (
                 <div
                   title={session.cwd || session.workspace}
                   className="mt-3 inline-flex max-w-xs items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-300"
@@ -814,115 +816,24 @@ export function ChatView({
                   <Folder className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
                   <span className="truncate">{session.workspace}</span>
                 </div>
-              )
-            ) : (
-              <>
-                {/* Dynamic AI Tool Switcher Pills (only shows tools detected on this PC) */}
-                {(() => {
-                  const detectedAppIds = APP_LIST.filter((appId) => {
-                    const info = appsStatus.find((a) => a.app === appId)
-                    return Boolean(info?.available || info?.writable)
-                  })
-                  if (detectedAppIds.length > 0) {
-                    return (
-                      <div className="animate-home-rise-1 mt-5 flex flex-wrap justify-center gap-2">
-                        {detectedAppIds.map((appId) => {
-                          const info = appsStatus.find((a) => a.app === appId)
-                          const am = APP_META[appId]
-                          const online = info?.available
-                          const rw = info?.writable
-                          const selected = activeApp === appId
-                          const creditLabel =
-                            info?.quota?.windowKind === 'credits'
-                              ? formatQuotaBadgeText(info.quota, { compact: false, lang })
-                              : ''
-                          const pillTip = formatQuotaTooltip(am.shortName, info?.quota, lang)
-                          return (
-                            <button
-                              key={appId}
-                              type="button"
-                              title={pillTip}
-                              onClick={() => onSelectApp?.(appId)}
-                              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium shadow-2xs transition active:scale-95 ${
-                                selected
-                                  ? 'border-[#4D6BFE]/60 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
-                                  : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
-                              }`}
-                            >
-                              <VendorIcon app={appId} size={13} />
-                              <span>{am.shortName}</span>
-                              {creditLabel && (
-                                <span className="rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] leading-none font-semibold text-emerald-600 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-400">
-                                  {creditLabel}
-                                </span>
-                              )}
-                              <span
-                                className={`h-1.5 w-1.5 rounded-full ${
-                                  online ? (rw ? 'bg-emerald-500' : 'bg-amber-400') : 'bg-slate-300 dark:bg-slate-600'
-                                }`}
-                              />
-                            </button>
-                          )
-                        })}
-                      </div>
-                    )
-                  }
-                  if (appsStatus.length > 0) {
-                    return (
-                      <p className="mt-4 max-w-sm text-xs text-slate-400 dark:text-slate-500">
-                        {bi(
-                          '本机暂未检测到已安装的 AI 工具（支持 DeepSeek Harness / Codex / Claude Code / Antigravity / WorkBuddy）',
-                          'No supported AI tools detected on this computer (DeepSeek Harness / Codex / Claude Code / Antigravity / WorkBuddy)',
-                        )}
-                      </p>
-                    )
-                  }
-                  return null
-                })()}
-
-                {/* Explicit Project Directory Selector (prevents blind sends to unknown directories) */}
-                <div className="animate-home-rise-2 mt-6 w-full max-w-md">
-                  <div className="mb-2 text-[11px] font-medium text-slate-400 dark:text-slate-500">
-                    {selectedWorkspace ? bi('目标项目', 'Target Project') : bi('请选择目标项目后开始对话', 'Select a project directory to start chatting')}
-                  </div>
-                  <div className="flex flex-wrap justify-center gap-1.5">
-                    {workspaces.slice(0, 6).map((w) => {
-                      const isSel = selectedWorkspace && w.path.toLowerCase() === selectedWorkspace.toLowerCase()
-                      return (
-                        <button
-                          key={w.path}
-                          type="button"
-                          title={w.path}
-                          onClick={() => onSelectWorkspace?.(w.path)}
-                          className={`inline-flex max-w-[180px] items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition active:scale-95 ${
-                            isSel
-                              ? 'border-[#4D6BFE]/70 bg-[#EEF2FF] text-[#2842C9] dark:border-[#4D6BFE]/70 dark:bg-[#222942] dark:text-[#A9BDFF]'
-                              : 'border-slate-200/80 bg-white text-slate-700 hover:border-[#4D6BFE]/40 dark:border-slate-700/80 dark:bg-[#1E2028] dark:text-slate-200'
-                          }`}
-                        >
-                          <Folder className={`h-3.5 w-3.5 shrink-0 ${isSel ? 'text-[#4D6BFE]' : 'text-slate-400'}`} />
-                          <span className="truncate">{w.name || w.path}</span>
-                        </button>
-                      )
-                    })}
-                    <button
-                      type="button"
-                      onClick={() => onOpenNewChatModal?.()}
-                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:border-[#4D6BFE]/60 hover:text-[#4D6BFE] active:scale-95 dark:border-slate-700 dark:text-slate-400"
-                    >
-                      <FolderPlus className="h-3.5 w-3.5" />
-                      <span>{bi('选择目录', 'Choose Folder')}</span>
-                    </button>
-                  </div>
-                  {selectedWorkspace && (
-                    <div className="mt-2 truncate px-4 font-mono text-[10.5px] text-slate-400 dark:text-slate-500">
-                      {selectedWorkspace}
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
+              )}
+            </div>
+          ) : (
+            <HomeQuotaDashboard
+              appsStatus={appsStatus}
+              sessions={sessions}
+              activeApp={activeApp}
+              onSelectApp={onSelectApp}
+              workspaces={workspaces}
+              selectedWorkspace={selectedWorkspace}
+              onSelectWorkspace={onSelectWorkspace}
+              onOpenNewChatModal={onOpenNewChatModal}
+              activeDeviceName={activeDeviceName}
+              bridgeOnline={bridgeOnline}
+              refreshingQuotas={refreshingQuotas}
+              onRefreshQuotas={onRefreshQuotas}
+            />
+          )
         )}
 
         {/* Messages list */}

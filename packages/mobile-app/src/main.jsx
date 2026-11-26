@@ -90,11 +90,20 @@ try {
   }
 } catch {}
 
+// Strip one-time hot-reload cache-busting query param so the address bar stays clean
+try {
+  const url = new URL(window.location.href)
+  if (url.searchParams.has('_r')) {
+    url.searchParams.delete('_r')
+    window.history.replaceState(null, '', url.toString())
+  }
+} catch {}
+
 // Auto-reload cleanly whenever a newer PWA Service Worker takes control
 if ('serviceWorker' in navigator) {
   let reloading = false
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (reloading) return
+    if (reloading || window.__allinoneHotReloading) return
     reloading = true
     window.location.reload()
   })
