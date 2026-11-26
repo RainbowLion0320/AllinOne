@@ -1,7 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useId, useMemo, useState } from 'react'
 import { APP_LIST, APP_META } from '@allinone/shared'
 import {
-  CalendarClock,
   Check,
   Clock,
   Coins,
@@ -11,7 +10,6 @@ import {
   RotateCcw,
   Sparkles,
   Wallet,
-  Zap,
 } from 'lucide-react'
 import { VendorBadge } from './VendorIcon.jsx'
 import { buildHomeQuotaCards } from '../lib/quotaDashboard.js'
@@ -63,40 +61,243 @@ function getOtherVendorHint(card, bi) {
   return card.writable ? bi('读写就绪', 'Ready') : bi('只读模式', 'Read-only')
 }
 
-function WindowMeterRow({ win }) {
-  const colors = healthColorClasses(win.health)
-  const isShort = win.kind === 'short'
+function getRingPalette(win, slot = 'outer') {
+  if (win?.health === 'critical') {
+    return {
+      from: '#F43F5E',
+      to: '#FB7185',
+      text: 'text-rose-600 dark:text-rose-400',
+      solid: 'bg-rose-500',
+      ringBorder: 'border-rose-500 dark:border-rose-400',
+    }
+  }
+  if (win?.health === 'warning') {
+    return {
+      from: '#F59E0B',
+      to: '#FB923C',
+      text: 'text-amber-600 dark:text-amber-400',
+      solid: 'bg-amber-500',
+      ringBorder: 'border-amber-500 dark:border-amber-400',
+    }
+  }
+  if (slot === 'inner') {
+    return {
+      from: '#4D6BFE',
+      to: '#38BDF8',
+      text: 'text-[#3B59ED] dark:text-[#78A6FF]',
+      solid: 'bg-[#4D6BFE] dark:bg-[#5E93FF]',
+      ringBorder: 'border-[#4D6BFE] dark:border-[#5E93FF]',
+    }
+  }
+  return {
+    from: '#10B981',
+    to: '#2DD4BF',
+    text: 'text-emerald-600 dark:text-emerald-400',
+    solid: 'bg-emerald-500',
+    ringBorder: 'border-emerald-500 dark:border-emerald-400',
+  }
+}
+
+function splitOuterInnerWindows(windows = []) {
+  const list = Array.isArray(windows) ? windows.filter(Boolean) : []
+  if (list.length === 0) return { outer: null, inner: null }
+  if (list.length === 1) return { outer: list[0], inner: null }
+  const weekly = list.find((w) => w.kind === 'weekly')
+  const short = list.find((w) => w.kind === 'short')
+  if (weekly && short) return { outer: weekly, inner: short }
+  return { outer: list[list.length - 1], inner: list[0] }
+}
+
+/**
+ * Apple-Watch-style concentric dual-ring gauge ("大环套小环"):
+ *  - Outer ring (大环, ○): 7-day weekly window (or sole window)
+ *  - Inner ring (小环, ●): 5-hour rolling window
+ */
+function ConcentricQuotaRings({ outer, inner, size = 74, compact = false }) {
+  const rawUid = useId()
+  const uid = rawUid.replace(/[^a-zA-Z0-9_-]/g, '')
+  const outerGradId = `aio-ring-o-${uid}`
+  const innerGradId = `aio-ring-i-${uid}`
+
+  const viewBoxSize = compact ? 64 : 80
+  const center = viewBoxSize / 2
+  const strokeWidth = compact ? 5.5 : 6.8
+  const outerRadius = compact ? 26 : 33
+  const innerRadius = compact ? 17.5 : 22.8
+
+  const outerPalette = outer ? getRingPalette(outer, inner ? 'outer' : outer.kind === 'short' ? 'inner' : 'outer') : null
+  const innerPalette = inner ? getRingPalette(inner, 'inner') : null
+
+  const renderArc = (radius, pct, gradId) => {
+    const circumference = 2 * Math.PI * radius
+    const clamped = Math.max(0, Math.min(100, Number(pct) || 0))
+    const visualPct = clamped > 0 && clamped < 2 ? 2 : clamped
+    const dashOffset = circumference * (1 - visualPct / 100)
+    return (
+      <>
+        <circle
+          cx={center}
+          cy={center}
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={strokeWidth}
+          className="text-slate-200/80 dark:text-slate-700/70"
+        />
+        {visualPct > 0 && (
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            fill="none"
+            stroke={`url(#${gradId})`}
+            strokeWidth={strokeWidth}
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashOffset}
+            className="transition-[stroke-dashoffset] duration-500 ease-out"
+          />
+        )}
+      </>
+    )
+  }
+
+  const ariaParts = []
+  if (inner) ariaParts.push(`${inner.label} ${inner.remainingPercent}%`)
+  if (outer) ariaParts.push(`${outer.label} ${outer.remainingPercent}%`)
+
   return (
-    <div className="space-y-1.5">
+    <div
+      className="relative shrink-0"
+      style={{ width: size, height: size }}
+      role="img"
+      aria-label={ariaParts.join(', ')}
+    >
+      <svg
+        width={size}
+        height={size}
+        viewBox={`0 0 ${viewBoxSize} ${viewBoxSize}`}
+        className="-rotate-90 overflow-visible"
+      >
+        <defs>
+          {outerPalette && (
+            <linearGradient id={outerGradId} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor={outerPalette.from} />
+              <stop offset="100%" stopColor={outerPalette.to} />
+            </linearGradient>
+          )}
+          {innerPalette && (
+            <linearGradient id={innerGradId} x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor={innerPalette.from} />
+              <stop offset="100%" stopColor={innerPalette.to} />
+            </linearGradient>
+          )}
+        </defs>
+        {outer && renderArc(outerRadius, outer.remainingPercent, outerGradId)}
+        {inner && renderArc(innerRadius, inner.remainingPercent, innerGradId)}
+      </svg>
+
+      {/* Single-ring cards center the bold remaining percentage cleanly inside the ring */}
+      {outer && !inner && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span
+            className={`${compact ? 'text-[12px]' : 'text-[15px]'} leading-none font-extrabold tracking-tight tabular-nums ${outerPalette.text}`}
+          >
+            {outer.remainingPercent}%
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RingLegendRow({ win, slot, compact = false }) {
+  const palette = getRingPalette(win, slot)
+  const isOuter = slot === 'outer'
+  const resetDisplay = compact ? win.compactResetText : win.resetText
+  const compactWindowLabel =
+    win.kind === 'short'
+      ? `${Math.max(1, Math.round((win.windowMinutes || 300) / 60))}h`
+      : win.shortLabel || win.label
+  const fullTooltip = win.resetText
+    ? `${win.label} ${win.remainingPercent}% · ${win.resetText}`
+    : `${win.label} ${win.remainingPercent}%`
+
+  if (compact) {
+    return (
+      <div title={fullTooltip} className="min-w-0">
+        <div className="flex items-center justify-between gap-1">
+          <span className="flex min-w-0 items-center gap-1">
+            {isOuter ? (
+              <span className={`h-2 w-2 shrink-0 rounded-full border-[1.75px] ${palette.ringBorder}`} />
+            ) : (
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${palette.solid}`} />
+            )}
+            <span className="truncate text-[10.5px] font-semibold text-slate-600 dark:text-slate-300">
+              {compactWindowLabel}
+            </span>
+          </span>
+          <span className={`shrink-0 text-[12px] leading-none font-bold tabular-nums ${palette.text}`}>
+            {win.remainingPercent}%
+          </span>
+        </div>
+        {resetDisplay && (
+          <div className="mt-0.5 truncate pl-3 text-[9.5px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
+            {resetDisplay}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div title={fullTooltip} className="min-w-0">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
-          {isShort ? (
-            <Zap className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE] dark:text-[#8DA2FF]" />
+          {isOuter ? (
+            <span className={`h-2.5 w-2.5 shrink-0 rounded-full border-[2px] ${palette.ringBorder}`} />
           ) : (
-            <CalendarClock className="h-3.5 w-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
+            <span className={`h-2 w-2 shrink-0 rounded-full ${palette.solid}`} />
           )}
-          <span className="shrink-0 text-[12px] font-semibold text-slate-700 dark:text-slate-200">
+          <span className="truncate text-[12px] leading-tight font-semibold text-slate-700 dark:text-slate-200">
             {win.label}
           </span>
-          {win.resetText && (
-            <span
-              title={win.resetText}
-              className="inline-flex min-w-0 items-center gap-0.5 rounded-md bg-slate-100/90 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 tabular-nums dark:bg-slate-800/90 dark:text-slate-400"
-            >
-              <Clock className="h-2.5 w-2.5 shrink-0 opacity-75" />
-              <span className="truncate">{win.resetText}</span>
-            </span>
-          )}
         </div>
-        <span className={`shrink-0 text-[13px] font-bold tabular-nums ${colors.text}`}>
+        <span className={`shrink-0 text-[13.5px] leading-none font-bold tabular-nums ${palette.text}`}>
           {win.remainingPercent}%
         </span>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800/90">
-        <div
-          className={`h-full rounded-full bg-gradient-to-r transition-all duration-500 ease-out ${colors.bar}`}
-          style={{ width: `${Math.max(win.remainingPercent > 0 ? 4 : 0, Math.min(100, win.remainingPercent))}%` }}
-        />
+      {resetDisplay && (
+        <div className="mt-0.5 flex items-center gap-1 pl-4 text-[10px] leading-tight text-slate-400 tabular-nums dark:text-slate-500">
+          <Clock className="h-2.5 w-2.5 shrink-0 opacity-70" />
+          <span className="truncate">{resetDisplay}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RingCluster({ windows, compact = false }) {
+  const { outer, inner } = splitOuterInnerWindows(windows)
+  if (!outer) return null
+  const isDual = Boolean(inner)
+
+  return (
+    <div className={`flex items-center ${compact ? 'gap-2' : 'gap-3.5'}`}>
+      <ConcentricQuotaRings outer={outer} inner={inner} size={compact ? 48 : 74} compact={compact} />
+      <div className={`min-w-0 flex-1 ${compact ? 'space-y-1.5' : 'space-y-2'}`}>
+        {isDual ? (
+          <>
+            <RingLegendRow win={inner} slot="inner" compact={compact} />
+            <RingLegendRow win={outer} slot="outer" compact={compact} />
+          </>
+        ) : (
+          <RingLegendRow
+            win={outer}
+            slot={outer.kind === 'short' ? 'inner' : 'outer'}
+            compact={compact}
+          />
+        )}
       </div>
     </div>
   )
@@ -246,51 +447,43 @@ function WindowsQuotaBody({ details, bi }) {
   const hasExtras = Boolean(details?.extraCredits || details?.resetCredits)
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-2.5">
       {hasPools ? (
-        <div className="space-y-3">
-          {details.pools.map((pool, poolIdx) => (
+        <div className="grid grid-cols-2 gap-2">
+          {details.pools.map((pool) => (
             <div
               key={pool.id}
-              className={poolIdx > 0 ? 'space-y-2 border-t border-slate-100 pt-2.5 dark:border-slate-800/80' : 'space-y-2'}
+              className="rounded-xl border border-slate-100 bg-slate-50/80 px-2 py-2 dark:border-slate-800/75 dark:bg-[#151821]/80"
             >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-1.5">
-                  <span
-                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                      pool.id === '3p' ? 'bg-violet-500 dark:bg-violet-400' : 'bg-[#3186FF]'
-                    }`}
-                  />
-                  <span className="truncate text-[11px] font-bold tracking-wide text-slate-600 dark:text-slate-300">
-                    {pool.label}
+              <div className="mb-1.5 flex items-center gap-1">
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    pool.id === '3p' ? 'bg-violet-500 dark:bg-violet-400' : 'bg-[#3186FF]'
+                  }`}
+                />
+                <span className="truncate text-[10.5px] font-bold text-slate-600 dark:text-slate-300">
+                  {pool.label}
+                </span>
+                {pool.badge && (
+                  <span className="shrink-0 rounded bg-violet-500/12 px-1 py-0.5 text-[9px] leading-none font-semibold text-violet-600 dark:bg-violet-400/15 dark:text-violet-300">
+                    {pool.badge}
                   </span>
-                  {pool.badge && (
-                    <span className="shrink-0 rounded-md bg-violet-500/10 px-1.5 py-0.5 text-[9.5px] leading-none font-semibold text-violet-600 dark:bg-violet-400/15 dark:text-violet-300">
-                      {pool.badge}
-                    </span>
-                  )}
-                </div>
+                )}
               </div>
-              <div className="space-y-2.5">
-                {pool.windows.map((win) => (
-                  <WindowMeterRow key={`${pool.id}-${win.id}`} win={win} />
-                ))}
-              </div>
+              <RingCluster windows={pool.windows} compact />
             </div>
           ))}
         </div>
       ) : (
-        <div className="space-y-3">
-          {(details?.windows || []).map((win) => (
-            <WindowMeterRow key={win.id} win={win} />
-          ))}
+        <div className="py-0.5">
+          <RingCluster windows={details?.windows || []} />
         </div>
       )}
 
       {hasExtras && (
-        <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-2.5 dark:border-slate-800/80">
+        <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-2 dark:border-slate-800/80">
           {details.extraCredits && (
-            <span className="inline-flex items-center gap-1 rounded-lg bg-indigo-500/10 px-2 py-1 text-[10.5px] font-semibold text-indigo-700 tabular-nums dark:bg-indigo-400/15 dark:text-indigo-300">
+            <span className="inline-flex items-center gap-1 rounded-lg bg-indigo-500/10 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-700 tabular-nums dark:bg-indigo-400/15 dark:text-indigo-300">
               <Coins className="h-3 w-3 shrink-0" />
               <span>{bi('附加积分', 'Credits')}</span>
               <span>{details.extraCredits.balanceText}</span>
@@ -299,7 +492,7 @@ function WindowsQuotaBody({ details, bi }) {
           {details.resetCredits && (
             <span
               title={details.resetCredits.expiryText || bi('免费重置当前限额', 'Free rate-limit reset voucher')}
-              className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-[10.5px] font-semibold text-emerald-700 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-300"
+              className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-700 tabular-nums dark:bg-emerald-400/15 dark:text-emerald-300"
             >
               <RotateCcw className="h-3 w-3 shrink-0" />
               <span>
@@ -326,7 +519,7 @@ function QuotaVendorCard({ card, selected, onSelect, bi, index, spanFullOnDeskto
       type="button"
       onClick={() => onSelect?.(card.app)}
       style={{ animationDelay: `${Math.min(index, 5) * 45}ms` }}
-      className={`animate-home-rise-1 group relative flex w-full flex-col rounded-2xl border p-3.5 text-left transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.99] ${
+      className={`animate-home-rise-1 group relative flex w-full flex-col rounded-2xl border p-3 text-left transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.99] ${
         spanFullOnDesktop ? 'sm:col-span-2' : ''
       } ${
         selected
@@ -335,7 +528,7 @@ function QuotaVendorCard({ card, selected, onSelect, bi, index, spanFullOnDeskto
       }`}
     >
       {/* Card Header */}
-      <div className="mb-3 flex items-center justify-between gap-2">
+      <div className="mb-2.5 flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2.5">
           <VendorBadge app={card.app} size="md" active={card.runningCount > 0} className="shrink-0 shadow-2xs" />
           <div className="min-w-0">

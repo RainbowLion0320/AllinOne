@@ -1561,14 +1561,22 @@ async function main() {
         const controlEventsBefore = p2pCli.events.length
         const secretToken = 'ZERO_KNOWLEDGE_SECRET_DELTA_987654'
         bridge.link.pushEvent(EVENTS.STREAM_DELTA, { sessionId: 'codex:s1', delta: secretToken })
-        for (let i = 0; i < 30; i += 1) {
-          if (p2pCli.p2pEvents.some((e) => e.bridgeId === smokeDev.bridgeId && e.bin)) break
-          await new Promise((r) => setTimeout(r, 40))
+        let decEv = null
+        for (let i = 0; i < 30 && !decEv; i += 1) {
+          for (const e of p2pCli.p2pEvents) {
+            if (e.bridgeId !== smokeDev.bridgeId || !e.bin) continue
+            try {
+              const cand = await decryptBinaryJson(primaryE2eeKey, e.bin, { kind: 'event', roomId: smokeAdmin.roomId })
+              if (cand?.event === EVENTS.STREAM_DELTA && cand?.payload?.delta === secretToken) {
+                decEv = cand
+                break
+              }
+            } catch {}
+          }
+          if (!decEv) await new Promise((r) => setTimeout(r, 40))
         }
-        const encEv = p2pCli.p2pEvents.find((e) => e.bridgeId === smokeDev.bridgeId && e.bin)
-        assert.ok(encEv)
+        assert.ok(decEv, 'Expected encrypted STREAM_DELTA over P2P aio-ctrl')
         assert.equal(p2pCli.events.length, controlEventsBefore, 'Streaming event must not traverse Control WS')
-        const decEv = await decryptBinaryJson(primaryE2eeKey, encEv.bin, { kind: 'event', roomId: smokeAdmin.roomId })
         assert.equal(decEv.event, EVENTS.STREAM_DELTA)
         assert.equal(decEv.payload.delta, secretToken)
 
@@ -4359,6 +4367,10 @@ async function main() {
       assert.equal(agyMultiDash?.pools[0].label, 'Gemini 模型')
       assert.equal(agyMultiDash?.pools[1].label, 'Claude / GPT 模型')
       assert.equal(agyMultiDash?.pools[1].badge, '含赠送')
+      assert.equal(agyMultiDash?.pools[0].windows[0].shortLabel, '5小时')
+      assert.equal(agyMultiDash?.pools[0].windows[1].shortLabel, '7天')
+      const homeQuotaSrc = readFileSync(join(process.cwd(), 'packages/mobile-app/src/components/HomeQuotaDashboard.jsx'), 'utf8')
+      assert.ok(homeQuotaSrc.includes('ConcentricQuotaRings') && homeQuotaSrc.includes('splitOuterInnerWindows'))
 
       // DeepSeek Harness official balance normalization, .credentials.yaml parser & dashboard rendering
       const fakeDshHome = join(tmpDir, 'fake-dsh-balance-home')

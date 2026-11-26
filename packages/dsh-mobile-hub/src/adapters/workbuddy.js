@@ -1736,7 +1736,7 @@ export class WorkBuddyAdapter {
             params: {
               protocolVersion: 1,
               clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-              clientInfo: { name: 'allinone', version: '1.0.28' },
+              clientInfo: { name: 'allinone', version: '1.0.29' },
             },
           })}\n`,
           'utf8',

@@ -112,6 +112,29 @@ export function isValidQuotaObject(quota, now = Date.now()) {
   return false
 }
 
+export function formatQuotaResetCompact(resetsAt, { lang = 'zh', now = Date.now() } = {}) {
+  const ts = Number(resetsAt)
+  if (!Number.isFinite(ts) || ts <= 86_400_000) return ''
+  const diffMs = ts - now
+  if (diffMs <= 60_000) {
+    return lang === 'en' ? 'soon' : '即将重置'
+  }
+  const totalMins = Math.ceil(diffMs / 60_000)
+  if (totalMins < 60) {
+    return lang === 'en' ? `${totalMins}m` : `${totalMins}分后`
+  }
+  const totalHours = Math.floor(totalMins / 60)
+  const remMins = totalMins % 60
+  if (totalHours < 24) {
+    if (lang === 'en') return remMins > 0 ? `${totalHours}h${remMins}m` : `${totalHours}h`
+    return remMins > 0 ? `${totalHours}h${remMins}m` : `${totalHours}小时`
+  }
+  const days = Math.floor(totalHours / 24)
+  const remHours = totalHours % 24
+  if (lang === 'en') return remHours > 0 ? `${days}d${remHours}h` : `${days}d`
+  return remHours > 0 ? `${days}天${remHours}时` : `${days}天`
+}
+
 function buildNormalizedWindow(w, { lang = 'zh', now = Date.now() } = {}) {
   if (!w || typeof w !== 'object') return null
   if (typeof w.remainingPercent !== 'number' || !Number.isFinite(w.remainingPercent)) return null
@@ -121,26 +144,31 @@ function buildNormalizedWindow(w, { lang = 'zh', now = Date.now() } = {}) {
   const isWeekly = w.kind === 'weekly' || Number(w.windowMinutes) >= 1440
   const mins = Number(w.windowMinutes) || (isWeekly ? 10080 : 300)
   let label
+  let shortLabel
   if (isWeekly) {
     const days = Math.max(1, Math.round(mins / 1440))
     label =
       days === 7
         ? lang === 'en' ? '7-Day Weekly' : '7天周额度'
         : lang === 'en' ? `${days}-Day Window` : `${days}天周期额度`
+    shortLabel = days === 7 ? (lang === 'en' ? '7d' : '7天') : (lang === 'en' ? `${days}d` : `${days}天`)
   } else {
     const hrs = Math.max(1, Math.round(mins / 60))
     label = lang === 'en' ? `${hrs}-Hour Window` : `${hrs}小时额度`
+    shortLabel = lang === 'en' ? `${hrs}h` : `${hrs}小时`
   }
   return {
     id: w.id || (isWeekly ? 'weekly' : 'short'),
     kind: isWeekly ? 'weekly' : 'short',
     windowMinutes: mins,
     label,
+    shortLabel,
     remainingPercent: pct,
     usedPercent: 100 - pct,
     health: getQuotaHealthLevel(pct),
     resetsAt,
     resetText: formatQuotaResetCountdown(resetsAt, { lang, now, compact: !isWeekly }),
+    compactResetText: formatQuotaResetCompact(resetsAt, { lang, now }),
   }
 }
 
