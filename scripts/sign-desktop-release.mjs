@@ -56,7 +56,8 @@ export function signDesktopReleaseManifest({ version, files = [], privateKeyPem 
     const buf = readFileSync(resolved)
     const st = statSync(resolved)
     return {
-      name: basename(resolved),
+      // Match GitHub Releases asset upload normalization (spaces -> dots) so signed manifests match API asset.name
+      name: basename(resolved).replace(/\s+/g, '.'),
       sha256: createHash('sha256').update(buf).digest('hex').toLowerCase(),
       size: st.size,
     }

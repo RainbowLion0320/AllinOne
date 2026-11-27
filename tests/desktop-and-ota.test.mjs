@@ -186,6 +186,17 @@ test('DesktopUpdater exports DEFAULT_DESKTOP_MANIFEST_PUBLIC_KEY and fails close
     const stValid = await uValid.checkForUpdates()
     assert.equal(stValid.status, 'available')
     assert.equal(stValid.expectedSha256, validManifest.assets[0].sha256)
+
+    // 4. Space-named local installer signed manifest matches GitHub dot-normalized asset.name
+    const spaceDmg = join(dir, 'All in One-1.0.32-arm64.dmg')
+    writeFileSync(spaceDmg, Buffer.from('space-named-dmg'))
+    const spaceManifest = signDesktopReleaseManifest({
+      version: '1.0.32',
+      files: [spaceDmg],
+      privateKeyPem: privPem,
+    })
+    assert.equal(spaceManifest.assets[0].name, 'All.in.One-1.0.32-arm64.dmg')
+    assert.equal(verifyManifestSignature(spaceManifest, pubDerB64), true)
   } finally {
     if (server) await new Promise((r) => server.close(r))
     rmSync(dir, { recursive: true, force: true })

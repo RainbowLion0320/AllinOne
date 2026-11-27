@@ -476,7 +476,10 @@ export class DesktopUpdater extends EventEmitter {
                   String(manifest.version || '').trim().replace(/^v/i, '') === latestVersion &&
                   verifyManifestSignature(manifest, this.manifestPublicKey)
                 ) {
-                  const mEntry = manifest.assets.find((a) => a && a.name === asset.name)
+                  // GitHub Releases normalizes spaces in uploaded filenames to dots (e.g. "All in One" -> "All.in.One")
+                  const normAssetName = (n) => String(n || '').trim().replace(/\s+/g, '.')
+                  const wantedName = normAssetName(asset.name)
+                  const mEntry = manifest.assets.find((a) => a && normAssetName(a.name) === wantedName)
                   if (mEntry && /^[a-f0-9]{64}$/i.test(String(mEntry.sha256 || ''))) {
                     const signedSha = String(mEntry.sha256).toLowerCase()
                     if (!expectedSha256 || expectedSha256 === signedSha) {
