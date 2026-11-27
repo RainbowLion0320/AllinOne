@@ -50,12 +50,12 @@
 <table>
   <tr>
     <td width="72%" align="center" valign="bottom">
-      <img src="./docs/preview-desktop.png" alt="All in One Desktop & Web UI" />
+      <img src="./docs/preview-desktop-v2.png" alt="All in One Desktop & Web UI" />
       <br/>
       <sub><strong>Desktop / Web</strong> — Multi-host switcher, smart vendor sidebar &amp; live home quota/balance dashboard</sub>
     </td>
     <td width="28%" align="center" valign="bottom">
-      <img src="./docs/preview-mobile.png" alt="All in One Mobile UI" />
+      <img src="./docs/preview-mobile-v2.png" alt="All in One Mobile UI" />
       <br/>
       <sub><strong>Mobile PWA / Android</strong> — Continue chats, inspect code &amp; approve prompts anywhere</sub>
     </td>
