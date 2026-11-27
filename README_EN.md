@@ -164,7 +164,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 - **Instant Admin & Open Sign-Up**: The first account registered on a new server becomes Admin (`https://your-server/admin` for live monitoring & user tiers); open registration defaults to 20 users/day.
 
 <details>
-<summary>Advanced: Manual Docker Compose / Email 2FA / Encrypted TURN / Admin CLI</summary>
+<summary>Advanced: Manual Docker Compose / GitHub OAuth / Email 2FA / Encrypted TURN / Admin CLI</summary>
 
 #### 1. Manual Docker Compose
 
@@ -213,7 +213,17 @@ CF_TURN_API_TOKEN=your-cf-turn-api-token
 CF_TURN_TIERS=free
 ```
 
-#### 4. Admin CLI
+#### 4. Optional GitHub One-Click Sign-In & Account Linking
+
+Create an OAuth App in [GitHub Developer Settings → OAuth Apps](https://github.com/settings/developers) with callback URL `https://your-server/api/auth/github/callback`, then add to `.env` and restart (hidden automatically when unset):
+
+```env
+GITHUB_CLIENT_ID=your-github-client-id
+GITHUB_CLIENT_SECRET=your-github-client-secret
+# GITHUB_REDIRECT_URI=optional (defaults to PUBLIC_RELAY_URL + /api/auth/github/callback)
+```
+
+#### 5. Admin CLI
 
 ```bash
 npm run admin -- users

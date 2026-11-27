@@ -49,6 +49,7 @@ export function useTransportBridge({
   })
   const [liveOnlineClientCount, setLiveOnlineClientCount] = useState(0)
   const [serverEmailEnabled, setServerEmailEnabled] = useState(false)
+  const [serverGithubEnabled, setServerGithubEnabled] = useState(false)
   const [pendingGrantPopup, setPendingGrantPopup] = useState(null)
   const [qrNudge, setQrNudge] = useState(null)
   const [desktopBridge, setDesktopBridge] = useState(null)
@@ -547,6 +548,8 @@ export function useTransportBridge({
     setLiveOnlineClientCount,
     serverEmailEnabled,
     setServerEmailEnabled,
+    serverGithubEnabled,
+    setServerGithubEnabled,
     pendingGrantPopup,
     setPendingGrantPopup,
     qrNudge,

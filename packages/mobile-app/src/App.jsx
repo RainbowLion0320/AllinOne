@@ -27,6 +27,12 @@ import {
 } from './lib/deviceStore.js'
 import { formatBytesCompact } from './lib/sessionCache.js'
 import { makeDraftKey } from './lib/draftStore.js'
+import { pollGithubOAuth } from './lib/wsClient.js'
+import {
+  clearPendingGithubOAuth,
+  loadPendingGithubOAuth,
+  stripOAuthQueryParamFromUrl,
+} from './lib/githubOAuthClient.js'
 import { useSessionStreamingActive } from './state/streamingStore.js'
 import { ImageActionsProvider, ImageLiveStateProvider } from './state/ImageContext.jsx'
 import { useTransportBridge } from './hooks/useTransportBridge.js'
@@ -134,6 +140,8 @@ export function App() {
     setLiveOnlineClientCount,
     serverEmailEnabled,
     setServerEmailEnabled,
+    serverGithubEnabled,
+    setServerGithubEnabled,
     pendingGrantPopup,
     setPendingGrantPopup,
     qrNudge,
@@ -268,6 +276,8 @@ export function App() {
     handleSendBindEmailCode,
     handleBindAccountEmail,
     handleToggleLoginEmail2fa,
+    handleGithubLinked,
+    handleUnlinkGithub,
     handleRemoveDevice,
   } = useAccountDevices({
     devices,
@@ -287,6 +297,7 @@ export function App() {
     setClientSessions,
     setLiveOnlineClientCount,
     setServerEmailEnabled,
+    setServerGithubEnabled,
     setTurnQuota,
     setDeviceSwitcherOpen,
     setDrawerOpen,
@@ -440,6 +451,31 @@ export function App() {
     },
     [resetTransientWorkspace, setAccountDevices, setBridges, showToast],
   )
+
+  // Resume same-tab GitHub OAuth sign-in when returning to an already-signed-in client (e.g. adding a 2nd account on iOS PWA)
+  useEffect(() => {
+    if (!activeDevice || addingDevice.open) return undefined
+    const pending = loadPendingGithubOAuth('login')
+    if (!pending) return undefined
+    stripOAuthQueryParamFromUrl()
+    clearPendingGithubOAuth()
+    let cancelled = false
+    pollGithubOAuth(pending.serverUrl, { pollToken: pending.pollToken })
+      .then((res) => {
+        if (cancelled) return
+        if (res.status === 'completed' && res.token) {
+          handleDeviceAuthenticated(res)
+        } else if (res.error) {
+          showToast(res.error)
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) showToast(String(err?.message || err))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeDevice, addingDevice.open, handleDeviceAuthenticated, showToast])
 
   // Unified Escape + Android hardware back layer + Desktop shortcuts
   useModalBackLayer({
@@ -1185,6 +1221,7 @@ export function App() {
             activeDeviceName={activeDeviceName}
             isAdmin={isAdmin}
             serverEmailEnabled={serverEmailEnabled}
+            serverGithubEnabled={serverGithubEnabled}
             bridgeOnline={bridgeOnline}
             clientSessions={clientSessions}
             onlineClientCount={liveOnlineClientCount || clientSessions.onlineCount}
@@ -1209,6 +1246,8 @@ export function App() {
             onSendBindEmailCode={handleSendBindEmailCode}
             onBindAccountEmail={handleBindAccountEmail}
             onToggleLoginEmail2fa={handleToggleLoginEmail2fa}
+            onGithubLinked={handleGithubLinked}
+            onUnlinkGithub={handleUnlinkGithub}
             turnQuota={turnQuota}
             dataSaver={dataSaver}
             onToggleDataSaver={handleToggleDataSaver}

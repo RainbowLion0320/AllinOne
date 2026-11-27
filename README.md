@@ -164,7 +164,7 @@ curl -fsSL https://raw.githubusercontent.com/RainbowLion0320/AllinOne/main/deplo
 - **首号自动成管理员**：全新服务器注册的第一个账号即为管理员，可通过 `https://你的服务器/admin` 查看在线状态与管理用户；默认开放注册（每日上限 20 人）。
 
 <details>
-<summary>进阶配置：手动 Docker Compose / 邮箱 2FA / TURN 中继 / 管理 CLI</summary>
+<summary>进阶配置：手动 Docker Compose / GitHub 一键登录 / 邮箱 2FA / TURN 中继 / 管理 CLI</summary>
 
 #### 1. 手动 Docker Compose
 
@@ -213,7 +213,17 @@ CF_TURN_API_TOKEN=你的ApiToken
 CF_TURN_TIERS=free
 ```
 
-#### 4. 常用管理员 CLI
+#### 4. 可选开启 GitHub 一键登录与账号绑定
+
+在 [GitHub Developer Settings → OAuth Apps](https://github.com/settings/developers) 创建应用，回调地址填 `https://你的服务器/api/auth/github/callback`，然后在 `.env` 中加入并重启（未配置时自动隐藏按钮）：
+
+```env
+GITHUB_CLIENT_ID=你的ClientID
+GITHUB_CLIENT_SECRET=你的ClientSecret
+# GITHUB_REDIRECT_URI=可选：默认自动拼接 PUBLIC_RELAY_URL + /api/auth/github/callback
+```
+
+#### 5. 常用管理员 CLI
 
 ```bash
 npm run admin -- users

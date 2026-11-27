@@ -63,6 +63,10 @@ services:
       SMTP_FROM: ${SMTP_FROM:-}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       RESEND_FROM: ${RESEND_FROM:-}
+      # 可选：GitHub 一键登录与绑定（在 GitHub Developer Settings -> OAuth Apps 创建）
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
     volumes:
       - relay_data:/app/packages/relay-server/data
       # 若启用自建 coturn 按用户配额计量（TURN_LOG_PATH=/var/log/coturn/turn.log），取消下方只读目录挂载注释（挂载目录避免 logrotate 替换 inode 后断流）：

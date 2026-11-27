@@ -169,12 +169,8 @@ export function NetworkStorageSection({
           <div className="flex min-w-0 items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200">
             <HardDrive className="h-3.5 w-3.5 shrink-0 text-slate-400" />
             <span className="shrink-0">{bi('本地缓存', 'Cache')}</span>
-            <span className="truncate text-[11px] font-normal text-slate-400">
-              {cacheClearedHint
-                ? bi('已清理', 'Cleared')
-                : cacheStats.imageCount > 0
-                  ? `${cacheStats.sessionCount} ${bi('会话', 'chats')} · ${cacheStats.imageCount} ${bi('图片', 'imgs')} · ${formatBytesCompact(cacheStats.totalBytes)}`
-                  : `${cacheStats.sessionCount} ${bi('会话', 'chats')} · ${formatBytesCompact(cacheStats.totalBytes)}`}
+            <span className="truncate text-[11px] font-normal tabular-nums text-slate-400">
+              {cacheClearedHint ? bi('已清理', 'Cleared') : formatBytesCompact(cacheStats.totalBytes)}
             </span>
           </div>
           <button

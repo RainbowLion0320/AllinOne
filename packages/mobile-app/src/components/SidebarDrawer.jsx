@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ChevronsUpDown,
   Clock,
@@ -7,7 +7,6 @@ import {
   QrCode,
   RefreshCw,
   ScanLine,
-  Search,
   Settings,
   User,
   X,
@@ -98,9 +97,6 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
     [onFilterAppChange],
   )
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
-  const [searchOpen, setSearchOpen] = useState(false)
-  const [search, setSearch] = useState('')
-  const searchInputRef = useRef(null)
   const [expandedMap, setExpandedMap] = useState({})
 
   // Unmount heavy hidden mobile drawer body after slide-out animation completes so mobile background ticks cost 0ms
@@ -119,31 +115,11 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
     try { localStorage.setItem('allinone_group_mode', groupMode) } catch {}
   }, [groupMode])
 
-  useEffect(() => {
-    if (searchOpen) {
-      requestAnimationFrame(() => searchInputRef.current?.focus())
-    }
-  }, [searchOpen])
-
-  const closeSearch = useCallback(() => {
-    setSearch('')
-    setSearchOpen(false)
-  }, [])
-
   const filtered = useMemo(() => {
     if (!shouldRenderContent) return []
-    const q = search.trim().toLowerCase()
-    return sessions.filter((s) => {
-      if (filterApp !== 'all' && s.app !== filterApp) return false
-      if (!q) return true
-      return (
-        (s.title || '').toLowerCase().includes(q) ||
-        (s.workspace || '').toLowerCase().includes(q) ||
-        (s.cwd || '').toLowerCase().includes(q) ||
-        (s.preview || '').toLowerCase().includes(q)
-      )
-    })
-  }, [shouldRenderContent, sessions, filterApp, search])
+    if (filterApp === 'all') return sessions
+    return sessions.filter((s) => s.app === filterApp)
+  }, [shouldRenderContent, sessions, filterApp])
 
   const { showFilterBar, allTab, visibleVendors, overflowVendors, soleQuotaTab } = useMemo(() => {
     const allTabs = getFilterTabs(lang)
@@ -187,12 +163,11 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
 
   const isProjectExpanded = useCallback(
     (group, index) => {
-      if (search.trim().length > 0) return true
       if (group.key in expandedMap) return expandedMap[group.key]
       if (group.key === activeProjectKey) return true
       return index < 3
     },
-    [search, expandedMap, activeProjectKey],
+    [expandedMap, activeProjectKey],
   )
 
   const toggleProject = useCallback((key, current) => {
@@ -251,23 +226,6 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
               </button>
 
               <div className="app-no-drag flex items-center gap-0.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (searchOpen) closeSearch()
-                    else setSearchOpen(true)
-                  }}
-                  title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-                  aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-                  aria-expanded={searchOpen}
-                  className={`rounded-xl p-2 transition ${
-                    searchOpen || search.trim().length > 0
-                      ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
-                      : 'text-slate-500 hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'
-                  }`}
-                >
-                  <Search className="h-4 w-4" />
-                </button>
                 <button
                   type="button"
                   onClick={onRefresh}
@@ -333,37 +291,6 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
               </button>
             </div>
 
-            {/* Collapsible Search Input */}
-            {searchOpen && (
-              <div className="animate-reveal-down px-4 pb-2">
-                <div className="relative">
-                  <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                  <input
-                    ref={searchInputRef}
-                    type="text"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Escape') {
-                        e.stopPropagation()
-                        closeSearch()
-                      }
-                    }}
-                    placeholder={bi('搜索对话...', 'Search chats...')}
-                    className="w-full rounded-xl border border-[#4D6BFE]/50 bg-white py-1.5 pr-8 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-[#4D6BFE]/50 dark:bg-[#14161B] dark:text-slate-100"
-                  />
-                  <button
-                    type="button"
-                    onClick={closeSearch}
-                    aria-label={bi('清空并关闭搜索', 'Clear and close search')}
-                    className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
-            )}
-
             {/* Dynamic Vendor Filter & Subscription Quota Bar */}
             <VendorQuotaRings
               drawerOpen={open}
@@ -405,7 +332,7 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
                 </button>
               </div>
 
-              {groupMode === 'project' && projectGroups.length > 0 && search.trim().length === 0 && (
+              {groupMode === 'project' && projectGroups.length > 0 && (
                 <button
                   type="button"
                   onClick={toggleAllProjects}

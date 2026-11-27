@@ -5,6 +5,7 @@ import {
   fetchAuthSessions,
   listAccountDevices,
   logoutDeviceSession,
+  pollGithubOAuth,
   probeDeviceStatus,
   removeAccountDevice,
   renameAccountDevice,
@@ -13,7 +14,13 @@ import {
   revokeOtherAuthSessions,
   sendEmailVerificationCode,
   setAccountLogin2fa,
+  unlinkGithubAccount,
 } from '../lib/wsClient.js'
+import {
+  clearPendingGithubOAuth,
+  loadPendingGithubOAuth,
+  stripOAuthQueryParamFromUrl,
+} from '../lib/githubOAuthClient.js'
 import {
   getDeviceDisplayName,
   removeDevice,
@@ -48,6 +55,7 @@ export function useAccountDevices({
   setClientSessions,
   setLiveOnlineClientCount,
   setServerEmailEnabled,
+  setServerGithubEnabled,
   setTurnQuota,
   setDeviceSwitcherOpen,
   setDrawerOpen,
@@ -256,6 +264,7 @@ export function useAccountDevices({
       if (meRes && meRes.status !== 'expired' && meRes.status !== 'unreachable') {
         if (!devRes && Array.isArray(meRes.devices)) setAccountDevices(meRes.devices)
         setServerEmailEnabled(Boolean(meRes.emailEnabled))
+        setServerGithubEnabled?.(Boolean(meRes.githubEnabled))
         if (meRes.turnQuota) setTurnQuota(meRes.turnQuota)
         setDeviceState((prev) =>
           updateDeviceMeta(prev, targetDeviceId, {
@@ -264,11 +273,14 @@ export function useAccountDevices({
             ...(meRes.tier ? { tier: meRes.tier } : {}),
             email: meRes.email || '',
             loginEmail2fa: Boolean(meRes.loginEmail2fa),
+            githubLinked: Boolean(meRes.githubLinked),
+            githubLogin: meRes.githubLogin || '',
+            hasPassword: meRes.hasPassword !== false,
           }),
         )
       }
     } catch {}
-  }, [activeDeviceRef, deviceGenRef, setAccountDevices, setServerEmailEnabled, setTurnQuota, setDeviceState])
+  }, [activeDeviceRef, deviceGenRef, setAccountDevices, setServerEmailEnabled, setServerGithubEnabled, setTurnQuota, setDeviceState])
 
   // Account status probe on device mount/switch/token refresh, and when Settings OPENS (never on close)
   const lastProbedKeyRef = useRef('')
@@ -283,6 +295,7 @@ export function useAccountDevices({
     if (!devId || !baseUrl || !token) {
       lastProbedKeyRef.current = ''
       setServerEmailEnabled(false)
+      setServerGithubEnabled?.(false)
       return undefined
     }
 
@@ -298,6 +311,7 @@ export function useAccountDevices({
         if (cancelled || !res || res.status === 'expired' || res.status === 'unreachable') return
         if (Array.isArray(res.devices)) setAccountDevices(res.devices)
         setServerEmailEnabled(Boolean(res.emailEnabled))
+        setServerGithubEnabled?.(Boolean(res.githubEnabled))
         if (res.turnQuota) setTurnQuota(res.turnQuota)
         setDeviceState((prev) =>
           updateDeviceMeta(prev, devId, {
@@ -306,6 +320,9 @@ export function useAccountDevices({
             ...(res.tier ? { tier: res.tier } : {}),
             email: res.email || '',
             loginEmail2fa: Boolean(res.loginEmail2fa),
+            githubLinked: Boolean(res.githubLinked),
+            githubLogin: res.githubLogin || '',
+            hasPassword: res.hasPassword !== false,
           }),
         )
       })
@@ -321,6 +338,7 @@ export function useAccountDevices({
     settingsOpen,
     setAccountDevices,
     setServerEmailEnabled,
+    setServerGithubEnabled,
     setTurnQuota,
     setDeviceState,
   ])
@@ -384,6 +402,73 @@ export function useAccountDevices({
     [activeDeviceRef, setDeviceState, showToast],
   )
 
+  const handleGithubLinked = useCallback(
+    (user) => {
+      const dev = activeDeviceRef.current
+      if (!dev?.id || !user) return
+      const login = String(user.githubLogin || '').trim()
+      setDeviceState((prev) =>
+        updateDeviceMeta(prev, dev.id, {
+          githubLinked: Boolean(user.githubLinked || login),
+          githubLogin: login,
+          hasPassword: user.hasPassword !== false,
+        }),
+      )
+      showToast(
+        login
+          ? biLang(getCurrentLang(), `已绑定 GitHub @${login}`, `Linked GitHub @${login}`)
+          : biLang(getCurrentLang(), '已绑定 GitHub 账号', 'Linked GitHub account'),
+      )
+    },
+    [activeDeviceRef, setDeviceState, showToast],
+  )
+
+  const handleUnlinkGithub = useCallback(async () => {
+    const dev = activeDeviceRef.current
+    if (!dev?.id || !dev?.baseUrl || !dev?.token) {
+      throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
+    }
+    const devId = dev.id
+    const user = await unlinkGithubAccount(dev.baseUrl, dev.token)
+    setDeviceState((prev) =>
+      updateDeviceMeta(prev, devId, {
+        githubLinked: Boolean(user?.githubLinked),
+        githubLogin: String(user?.githubLogin || ''),
+        hasPassword: user?.hasPassword !== false,
+      }),
+    )
+    showToast(biLang(getCurrentLang(), '已解绑 GitHub 账号', 'Unlinked GitHub account'))
+    return user
+  }, [activeDeviceRef, setDeviceState, showToast])
+
+  // Resume same-tab GitHub account-bind return (mobile browser / iOS PWA fallback)
+  useEffect(() => {
+    const devId = activeDevice?.id
+    const baseUrl = activeDevice?.baseUrl
+    const token = activeDevice?.token
+    if (!devId || !baseUrl || !token) return undefined
+    const pending = loadPendingGithubOAuth('bind')
+    if (!pending || (pending.deviceId && pending.deviceId !== devId)) return undefined
+    stripOAuthQueryParamFromUrl()
+    clearPendingGithubOAuth()
+    let cancelled = false
+    pollGithubOAuth(pending.serverUrl || baseUrl, { pollToken: pending.pollToken, token })
+      .then((res) => {
+        if (cancelled) return
+        if (res.status === 'completed' && res.user) {
+          handleGithubLinked(res.user)
+        } else if (res.error) {
+          showToast(res.error)
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) showToast(String(err?.message || err))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeDevice?.id, activeDevice?.baseUrl, activeDevice?.token, handleGithubLinked, showToast])
+
   const handleRemoveDevice = useCallback(
     async (deviceId, { revokeAll = false } = {}) => {
       const target = devices.find((d) => d.id === deviceId)
@@ -446,6 +531,8 @@ export function useAccountDevices({
     handleSendBindEmailCode,
     handleBindAccountEmail,
     handleToggleLoginEmail2fa,
+    handleGithubLinked,
+    handleUnlinkGithub,
     handleRemoveDevice,
   }
 }

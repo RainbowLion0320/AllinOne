@@ -1,7 +1,7 @@
 import { randomInt } from 'node:crypto'
 import { validateEmail, validatePassword, validateUsername } from '../accounts.js'
 import { parseClientDeviceInfo } from '../hub.js'
-import { maskEmailAddress, readJsonObjectBody, sendJson, sendRouteError } from '../http-utils.js'
+import { getTrustedForwardedProto, maskEmailAddress, readJsonObjectBody, sendJson, sendRouteError } from '../http-utils.js'
 
 /**
  * Account, Authentication, Email OTP, 2FA, Password & Session management routes:
@@ -13,10 +13,13 @@ export function createAuthRoutes({
   hub,
   mailer,
   emailCodes,
+  githubOAuth = null,
   outboundEmailGate,
   ipDailyRegLimiter,
   adminBootstrapToken,
   maxDailyRegistrations,
+  isTrustedProxy = () => false,
+  isAllowedOrigin = () => false,
   extractBearer,
   checkUserActionRateLimit,
   getClientIp,
@@ -129,6 +132,7 @@ export function createAuthRoutes({
         userCount: accounts.getUserCount(),
         needsBootstrapToken: !hasAdmin && Boolean(adminBootstrapToken),
         emailEnabled: mailer.isConfigured(),
+        githubEnabled: Boolean(githubOAuth?.isConfigured?.()),
         openRegistration: true,
         dailyRegistrationLimit: maxDailyRegistrations,
         dailyRegistrationsUsed: dailyStats.used,
@@ -1175,6 +1179,331 @@ export function createAuthRoutes({
       return true
     }
 
+    // GitHub OAuth 2.0: start login/register or account-bind handshake
+    if (pathname === '/api/auth/github/start' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip) || !checkUserActionRateLimit('github-start', ip, 30)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return true
+      }
+      if (!githubOAuth?.isConfigured?.()) {
+        sendJson(res, 503, { ok: false, error: '服务器尚未开启 GitHub 登录' })
+        return true
+      }
+      try {
+        const body = await readJsonObjectBody(req)
+        const mode = body.mode === 'bind' ? 'bind' : 'login'
+        let bindUserId = ''
+        if (mode === 'bind') {
+          const payload = auth.verifySessionToken(extractBearer(req))
+          if (!payload || !String(payload.room || '').startsWith('usr_')) {
+            sendJson(res, 401, { ok: false, error: '请先登录账号后再绑定 GitHub' })
+            return true
+          }
+          if (!checkUserActionRateLimit('write', payload.room, 60)) {
+            sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+            return true
+          }
+          bindUserId = payload.room
+        }
+
+        // Optional same-tab returnUrl (mobile browser / iOS PWA fallback): strictly enforce allowed origins (zero open redirect)
+        let safeReturnUrl = ''
+        const rawReturnUrl = String(body.returnUrl || '').trim()
+        if (rawReturnUrl) {
+          try {
+            const parsedRet = new URL(rawReturnUrl)
+            if (
+              (parsedRet.protocol === 'https:' || parsedRet.protocol === 'http:') &&
+              !parsedRet.username &&
+              !parsedRet.password &&
+              isAllowedOrigin(parsedRet.origin, req)
+            ) {
+              parsedRet.searchParams.delete('oauth')
+              parsedRet.hash = ''
+              safeReturnUrl = parsedRet.toString()
+            }
+          } catch {}
+        }
+
+        const reqHost = String(req.headers.host || '').trim()
+        const proto = getTrustedForwardedProto(req, isTrustedProxy) || (req.socket?.encrypted ? 'https' : 'http')
+        const fallbackOrigin = reqHost ? `${proto}://${reqHost}` : ''
+        const devInfo = parseClientDeviceInfo(
+          body.deviceName || '',
+          req.headers['user-agent'] || '',
+          body.clientKind || '',
+        )
+        const started = githubOAuth.createHandshake({
+          mode,
+          bindUserId,
+          deviceName: devInfo.deviceName,
+          clientKind: devInfo.clientKind,
+          clientUid: String(body.clientUid || '').trim(),
+          bootstrapToken: String(body.bootstrapToken || '').trim(),
+          ip,
+          fallbackOrigin,
+          returnUrl: safeReturnUrl,
+        })
+        if (!started.ok) {
+          sendJson(res, started.statusCode || 500, { ok: false, error: started.error })
+          return true
+        }
+        sendJson(res, 200, started)
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
+      }
+      return true
+    }
+
+    // GitHub OAuth 2.0 callback: exchanges code server-side and completes login/register/bind
+    if (pathname === '/api/auth/github/callback' && req.method === 'GET') {
+      const ip = getClientIp(req)
+      if (!checkUserActionRateLimit('github-cb', ip, 60)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return true
+      }
+
+      const sendCallbackResponse = (entry, view) => {
+        if (entry?.returnUrl) {
+          try {
+            const dest = new URL(entry.returnUrl)
+            dest.searchParams.set('oauth', 'github')
+            res.writeHead(302, {
+              Location: dest.toString(),
+              'Cache-Control': 'no-store',
+              'Referrer-Policy': 'no-referrer',
+            })
+            res.end()
+            return
+          } catch {}
+        }
+        const html = githubOAuth?.renderCallbackHtml
+          ? githubOAuth.renderCallbackHtml(view)
+          : '<!doctype html><html><body>GitHub OAuth unavailable</body></html>'
+        const bodyBuf = Buffer.from(html, 'utf8')
+        res.writeHead(entry ? 200 : 400, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Length': bodyBuf.length,
+          'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
+        })
+        res.end(bodyBuf)
+      }
+
+      if (!githubOAuth?.isConfigured?.()) {
+        sendCallbackResponse(null, { ok: false, error: '服务器尚未开启 GitHub 登录' })
+        return true
+      }
+
+      const state = String(urlObj.searchParams.get('state') || '').trim()
+      const code = String(urlObj.searchParams.get('code') || '').trim()
+      const oauthError = String(urlObj.searchParams.get('error') || '').trim()
+      const entry = githubOAuth.claimState(state)
+      if (!entry) {
+        sendCallbackResponse(null, { ok: false, error: '授权会话无效或已过期，请返回 All in One 重新发起 GitHub 登录' })
+        return true
+      }
+
+      if (oauthError) {
+        const msg = oauthError === 'access_denied' ? '你已取消 GitHub 授权' : `GitHub 授权失败 (${oauthError})`
+        githubOAuth.failHandshake(entry, msg, oauthError)
+        sendCallbackResponse(entry, { ok: false, mode: entry.mode, error: msg })
+        return true
+      }
+
+      let ipReservation = null
+      let registrationCommitted = false
+      try {
+        const accessToken = await githubOAuth.exchangeCodeForToken(code, entry.callbackUri)
+        const ghProfile = await githubOAuth.fetchGithubProfile(accessToken)
+
+        if (entry.mode === 'bind') {
+          const linked = accounts.linkUserGithub(entry.bindUserId, {
+            githubId: ghProfile.githubId,
+            githubLogin: ghProfile.githubLogin,
+          })
+          if (!linked.ok) {
+            githubOAuth.failHandshake(entry, linked.error)
+            sendCallbackResponse(entry, { ok: false, mode: 'bind', error: linked.error })
+            return true
+          }
+          githubOAuth.completeHandshake(entry, { user: linked.user })
+          sendCallbackResponse(entry, {
+            ok: true,
+            mode: 'bind',
+            username: linked.user.username,
+            githubLogin: ghProfile.githubLogin,
+          })
+          return true
+        }
+
+        // Login / auto-register mode
+        const existingGhUser = accounts.getUserByGithubId(ghProfile.githubId)
+        if (!existingGhUser && accounts.hasAnyUser()) {
+          const resv = ipDailyRegLimiter.tryReserve(entry.ip || ip)
+          if (!resv.ok) {
+            const limitMsg = `当前网络今日注册次数已达上限（每日每 IP 最多 ${ipDailyRegLimiter.limit} 个账号），请明天再试`
+            githubOAuth.failHandshake(entry, limitMsg, 'IP_DAILY_REGISTRATION_LIMIT')
+            sendCallbackResponse(entry, { ok: false, mode: 'login', error: limitMsg })
+            return true
+          }
+          ipReservation = resv
+        }
+
+        const authRes = await accounts.loginOrRegisterGithubUserAsync({
+          githubId: ghProfile.githubId,
+          githubLogin: ghProfile.githubLogin,
+          email: ghProfile.email,
+          emailVerified: ghProfile.emailVerified,
+          bootstrapToken: entry.bootstrapToken,
+          expectedBootstrapToken: adminBootstrapToken,
+          maxDailyRegistrations,
+        })
+        if (!authRes.ok) {
+          githubOAuth.failHandshake(entry, authRes.error, authRes.code || '')
+          sendCallbackResponse(entry, { ok: false, mode: 'login', error: authRes.error })
+          return true
+        }
+
+        if (authRes.isNewUser) {
+          registrationCommitted = true
+        }
+
+        let user = authRes.user
+        const effectiveIp = entry.ip || ip
+        observeRequestHost(req, user.userId)
+        user = accounts.markUserLogin(user.userId) || user
+        const devName = entry.deviceName || 'Web Client'
+        const devKind = entry.clientKind || 'web'
+        const { isNewContext } = authRes.isNewUser
+          ? { isNewContext: false }
+          : accounts.checkAndRememberLoginContext(user.userId, {
+              deviceName: devName,
+              ip: effectiveIp,
+              clientUid: entry.clientUid || '',
+              skipSave: true,
+            })
+        const sid = auth.generateSessionId()
+        const onlineSids = new Set(hub.getClientList(user.userId).map((c) => c.sid).filter(Boolean))
+        const recorded = accounts.recordUserSession(user.userId, {
+          sid,
+          deviceName: devName,
+          clientKind: devKind,
+          ip: effectiveIp,
+          clientUid: entry.clientUid || '',
+          onlineSids,
+        })
+        for (const oldSid of recorded?.replacedSids || []) {
+          hub.disconnectClient(user.userId, { sid: oldSid }, 4401, 'Replaced by new sign-in on same device')
+        }
+        if (
+          !authRes.isNewUser &&
+          isNewContext &&
+          mailer.isConfigured() &&
+          user.email &&
+          user.emailVerified &&
+          shouldSendSecurityEmail(user.userId, 'login_alert', effectiveIp)
+        ) {
+          mailer
+            .sendLoginAlert({
+              to: user.email,
+              username: user.username,
+              deviceName: `${devName} (GitHub)`,
+              ip: effectiveIp,
+              at: Date.now(),
+            })
+            .catch((err) => {
+              log.warn(`[relay] Failed to send GitHub login alert email for @${user.username}: ${String(err?.message || err)}`)
+            })
+        }
+        hub.recordActivity({
+          type: authRes.isNewUser ? 'user.register' : 'user.login',
+          roomId: user.userId,
+          label: `@${user.username}`,
+          detail: `${devName} (GitHub @${ghProfile.githubLogin})`,
+          ip: effectiveIp,
+        })
+        const token = auth.signSessionToken(
+          user.userId,
+          devName,
+          user.userId,
+          user.tokenVersion,
+          { role: user.role, username: user.username, sid },
+        )
+        const bridges = hub.getBridgeList(user.userId)
+        githubOAuth.completeHandshake(entry, {
+          token,
+          roomId: user.userId,
+          user,
+          isNewUser: Boolean(authRes.isNewUser),
+          devices: getMergedAccountDevices(user.userId, bridges),
+          bridges,
+        })
+        sendCallbackResponse(entry, {
+          ok: true,
+          mode: 'login',
+          username: user.username,
+          githubLogin: ghProfile.githubLogin,
+        })
+      } catch (err) {
+        const msg = String(err?.message || 'GitHub 授权处理失败，请重试')
+        log.warn(`[relay] GitHub OAuth callback error: ${msg}`)
+        githubOAuth.failHandshake(entry, msg)
+        sendCallbackResponse(entry, { ok: false, mode: entry.mode, error: msg })
+      } finally {
+        if (!registrationCommitted && ipReservation) {
+          ipReservation.release()
+        }
+      }
+      return true
+    }
+
+    // GitHub OAuth 2.0 poll: initiating client retrieves single-use result using its secret pollToken
+    if (pathname === '/api/auth/github/poll' && req.method === 'POST') {
+      const ip = getClientIp(req)
+      if (!checkUserActionRateLimit('github-poll', ip, 180)) {
+        sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
+        return true
+      }
+      if (!githubOAuth?.isConfigured?.()) {
+        sendJson(res, 503, { ok: false, error: '服务器尚未开启 GitHub 登录' })
+        return true
+      }
+      try {
+        const body = await readJsonObjectBody(req, 16 * 1024)
+        const bearer = extractBearer(req)
+        const bearerPayload = bearer ? auth.verifySessionToken(bearer) : null
+        const polled = githubOAuth.pollHandshake(body.pollToken, {
+          bindUserId: bearerPayload?.room || '',
+        })
+        sendJson(res, polled.statusCode || 200, polled)
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
+      }
+      return true
+    }
+
+    // Unlink GitHub account from an authenticated user (blocked for passwordless GitHub-only accounts)
+    if (pathname === '/api/account/github/unlink' && req.method === 'POST') {
+      const payload = auth.verifySessionToken(extractBearer(req))
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
+        return true
+      }
+      if (!checkUserActionRateLimit('write', payload.room, 60)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return true
+      }
+      const unlinked = accounts.unlinkUserGithub(payload.room)
+      if (!unlinked.ok) {
+        sendJson(res, 400, { ok: false, error: unlinked.error })
+        return true
+      }
+      sendJson(res, 200, { ok: true, user: unlinked.user })
+      return true
+    }
+
     // Verify existing session token & return profile + ICE servers
     if (pathname === '/api/auth/me' && req.method === 'GET') {
       const payload = auth.verifySessionToken(extractBearer(req))
@@ -1203,6 +1532,10 @@ export function createAuthRoutes({
         emailVerified: Boolean(acctUser.emailVerified),
         loginEmail2fa: Boolean(acctUser.loginEmail2fa),
         emailEnabled: mailer.isConfigured(),
+        githubEnabled: Boolean(githubOAuth?.isConfigured?.()),
+        githubLinked: Boolean(acctUser.githubLinked),
+        githubLogin: acctUser.githubLogin || '',
+        hasPassword: acctUser.hasPassword !== false,
         role: acctUser.role,
         tier: acctUser.tier,
         turnQuota: buildUserTurnQuota(payload.room),

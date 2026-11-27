@@ -69,6 +69,7 @@ export function AppModals({
   activeDeviceName,
   isAdmin,
   serverEmailEnabled,
+  serverGithubEnabled,
   bridgeOnline,
   clientSessions,
   onlineClientCount,
@@ -93,6 +94,8 @@ export function AppModals({
   onSendBindEmailCode,
   onBindAccountEmail,
   onToggleLoginEmail2fa,
+  onGithubLinked,
+  onUnlinkGithub,
   turnQuota,
   dataSaver,
   onToggleDataSaver,
@@ -209,6 +212,7 @@ export function AppModals({
             activeDeviceName={activeDeviceName}
             isAdmin={isAdmin}
             emailEnabled={serverEmailEnabled}
+            githubEnabled={serverGithubEnabled}
             connState={connState}
             bridgeOnline={bridgeOnline}
             clientSessions={clientSessions}
@@ -270,6 +274,8 @@ export function AppModals({
             onSendBindEmailCode={onSendBindEmailCode}
             onBindAccountEmail={onBindAccountEmail}
             onToggleLogin2fa={onToggleLoginEmail2fa}
+            onGithubLinked={onGithubLinked}
+            onUnlinkGithub={onUnlinkGithub}
             turnQuota={turnQuota}
             dataSaver={dataSaver}
             onToggleDataSaver={onToggleDataSaver}

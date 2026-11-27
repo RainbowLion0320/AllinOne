@@ -7,10 +7,12 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  ExternalLink,
   Eye,
   EyeOff,
   Globe,
   KeyRound,
+  Loader2,
   Lock,
   Mail,
   Moon,
@@ -27,18 +29,35 @@ import {
   fetchBootstrapStatus,
   loginAccount,
   normalizeBaseUrl,
+  pollGithubOAuth,
   registerAccount,
   resetAccountPassword,
   sendEmailVerificationCode,
 } from '../lib/wsClient.js'
+import {
+  clearPendingGithubOAuth,
+  launchGithubOAuthFlow,
+  loadPendingGithubOAuth,
+  startGithubOAuthPolling,
+  stripOAuthQueryParamFromUrl,
+} from '../lib/githubOAuthClient.js'
 import { useI18n } from '../lib/i18n.jsx'
 import { copyTextToClipboard, formatSafeSetupCmd } from '../lib/clientHelpers.js'
+
+function GithubMark({ className = 'h-4 w-4' }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M12 1.5C6.2 1.5 1.5 6.2 1.5 12c0 4.64 3.01 8.57 7.18 9.96.53.1.72-.23.72-.5 0-.25-.01-1.08-.01-1.96-2.92.63-3.54-1.24-3.54-1.24-.48-1.21-1.17-1.53-1.17-1.53-.96-.65.07-.64.07-.64 1.06.07 1.62 1.09 1.62 1.09.94 1.61 2.47 1.15 3.07.88.1-.68.37-1.15.67-1.41-2.33-.26-4.78-1.17-4.78-5.19 0-1.15.41-2.09 1.08-2.82-.11-.26-.47-1.33.1-2.78 0 0 .88-.28 2.89 1.08a10.02 10.02 0 0 1 5.26 0c2.01-1.36 2.89-1.08 2.89-1.08.57 1.45.21 2.52.1 2.78.68.73 1.08 1.67 1.08 2.82 0 4.03-2.46 4.92-4.8 5.18.38.32.71.97.71 1.95 0 1.41-.01 2.55-.01 2.9 0 .28.19.61.73.5A10.5 10.5 0 0 0 22.5 12C22.5 6.2 17.8 1.5 12 1.5Z" />
+    </svg>
+  )
+}
 
 const DEFAULT_BOOTSTRAP_STATUS = {
   hasUsers: true,
   hasAdmin: true,
   needsBootstrapToken: false,
   emailEnabled: false,
+  githubEnabled: false,
   dailyRegistrationLimit: 0,
   dailyRegistrationsUsed: 0,
   dailyRegistrationRemaining: null,
@@ -82,14 +101,54 @@ export function LoginScreen({
   const [codeCooldown, setCodeCooldown] = useState(0)
 
   const [loading, setLoading] = useState(false)
+  const [githubAuth, setGithubAuth] = useState({ starting: false, pending: false, authorizeUrl: '' })
   const [error, setError] = useState('')
   const [infoMsg, setInfoMsg] = useState('')
   const mountedRef = useRef(true)
+  const githubPollStopRef = useRef(null)
+  const onSuccessRef = useRef(onSuccess)
+  onSuccessRef.current = onSuccess
 
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      try { githubPollStopRef.current?.() } catch {}
+      githubPollStopRef.current = null
+    }
+  }, [])
+
+  // Resume same-tab GitHub OAuth callback (mobile browser / iOS PWA fallback)
+  useEffect(() => {
+    const pending = loadPendingGithubOAuth('login')
+    if (!pending) return undefined
+    stripOAuthQueryParamFromUrl()
+    clearPendingGithubOAuth()
+    let cancelled = false
+    setLoading(true)
+    setError('')
+    setInfoMsg('')
+    pollGithubOAuth(pending.serverUrl, { pollToken: pending.pollToken })
+      .then((res) => {
+        if (cancelled || !mountedRef.current) return
+        if (res.status === 'completed' && res.token) {
+          onSuccessRef.current?.(res)
+        } else if (res.error) {
+          setError(res.error)
+        }
+      })
+      .catch((err) => {
+        if (!cancelled && mountedRef.current) {
+          setError(String(err?.message || err))
+        }
+      })
+      .finally(() => {
+        if (!cancelled && mountedRef.current) {
+          setLoading(false)
+        }
+      })
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -99,6 +158,7 @@ export function LoginScreen({
 
   const effectiveServer = normalizeBaseUrl(serverUrl)
   const emailEnabled = Boolean(bootstrapStatus.emailEnabled)
+  const githubEnabled = Boolean(bootstrapStatus.githubEnabled)
   const needsBootstrapToken = !bootstrapStatus.hasAdmin && Boolean(bootstrapStatus.needsBootstrapToken)
   const showFirstAdminNotice = !bootstrapStatus.hasAdmin && !bootstrapStatus.needsBootstrapToken
   const dailyCapReached = Boolean(
@@ -186,7 +246,61 @@ export function LoginScreen({
     setTimeout(() => setCopiedCmd(false), 1800)
   }
 
+  const cancelGithubOAuth = () => {
+    try { githubPollStopRef.current?.() } catch {}
+    githubPollStopRef.current = null
+    setGithubAuth({ starting: false, pending: false, authorizeUrl: '' })
+  }
+
+  const handleStartGithubLogin = async () => {
+    setError('')
+    setInfoMsg('')
+    if (needsBootstrapToken && !bootstrapToken.trim()) {
+      if (mode !== 'register') setMode('register')
+      setError(
+        bi(
+          '首次部署需先填写管理员初始化密钥 (ADMIN_BOOTSTRAP_TOKEN)，再使用 GitHub 登录',
+          'Enter the Admin Bootstrap Token first before signing in with GitHub',
+        ),
+      )
+      return
+    }
+    cancelGithubOAuth()
+    setGithubAuth({ starting: true, pending: false, authorizeUrl: '' })
+    try {
+      const flow = await launchGithubOAuthFlow({
+        serverUrl: effectiveServer,
+        mode: 'login',
+        bootstrapToken: needsBootstrapToken ? bootstrapToken.trim() : '',
+      })
+      if (!mountedRef.current || flow.redirected) return
+      setGithubAuth({ starting: false, pending: true, authorizeUrl: flow.authorizeUrl })
+      githubPollStopRef.current = startGithubOAuthPolling({
+        serverUrl: flow.baseUrl,
+        pollToken: flow.pollToken,
+        popup: flow.popup,
+        onComplete: (res) => {
+          githubPollStopRef.current = null
+          if (!mountedRef.current) return
+          setGithubAuth({ starting: false, pending: false, authorizeUrl: '' })
+          onSuccessRef.current?.(res)
+        },
+        onError: (msg) => {
+          githubPollStopRef.current = null
+          if (!mountedRef.current) return
+          setGithubAuth({ starting: false, pending: false, authorizeUrl: '' })
+          setError(msg)
+        },
+      })
+    } catch (err) {
+      if (!mountedRef.current) return
+      setGithubAuth({ starting: false, pending: false, authorizeUrl: '' })
+      setError(String(err?.message || err))
+    }
+  }
+
   const switchAuthMode = (nextMode) => {
+    cancelGithubOAuth()
     setMode(nextMode)
     setError('')
     setInfoMsg('')
@@ -231,6 +345,9 @@ export function LoginScreen({
           username: result.username,
           email: result.email,
           loginEmail2fa: Boolean(result.loginEmail2fa),
+          githubLinked: Boolean(result.githubLinked),
+          githubLogin: result.githubLogin || '',
+          hasPassword: result.hasPassword !== false,
           role: result.role,
           tier: result.tier,
           label: result.label,
@@ -930,7 +1047,7 @@ export function LoginScreen({
 
           <button
             type="submit"
-            disabled={loading || (mode === 'register' && dailyCapReached)}
+            disabled={loading || githubAuth.starting || (mode === 'register' && dailyCapReached)}
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-3 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 transition active:scale-[0.98] disabled:opacity-60"
           >
             <span>
@@ -944,6 +1061,63 @@ export function LoginScreen({
             </span>
             {!loading && <ArrowRight className="h-4 w-4" />}
           </button>
+
+          {isAccountTab && githubEnabled && (
+            <div className="space-y-2.5 pt-0.5">
+              <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
+                <span>{bi('或', 'or')}</span>
+                <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
+              </div>
+
+              {githubAuth.pending ? (
+                <div className="space-y-2 rounded-2xl border border-[#4D6BFE]/35 bg-[#F2F5FF] p-3 dark:border-[#4D6BFE]/40 dark:bg-[#1B2236]">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-[#2842C9] dark:text-[#A9BDFF]">
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                    <span>{bi('请在浏览器中完成 GitHub 授权…', 'Finish GitHub authorization in your browser…')}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <a
+                      href={githubAuth.authorizeUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-[11.5px] font-medium text-[#4D6BFE] hover:underline dark:text-[#8DA2FF]"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      <span>{bi('重新打开授权页', 'Reopen auth page')}</span>
+                    </a>
+                    <button
+                      type="button"
+                      onClick={cancelGithubOAuth}
+                      className="rounded-lg px-2 py-0.5 text-[11.5px] font-medium text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+                    >
+                      {t('common.cancel')}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  disabled={loading || githubAuth.starting}
+                  onClick={() => void handleStartGithubLogin()}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-slate-900 py-2.5 text-sm font-semibold text-white shadow-xs transition hover:bg-slate-800 active:scale-[0.98] disabled:opacity-60 dark:border-slate-700 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-100"
+                >
+                  {githubAuth.starting ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <GithubMark className="h-4 w-4" />
+                  )}
+                  <span>
+                    {githubAuth.starting
+                      ? bi('正在连接 GitHub...', 'Connecting to GitHub...')
+                      : mode === 'register'
+                        ? bi('使用 GitHub 一键注册 / 登录', 'Continue with GitHub')
+                        : bi('使用 GitHub 一键登录', 'Continue with GitHub')}
+                  </span>
+                </button>
+              )}
+            </div>
+          )}
         </form>
       </div>
     </div>

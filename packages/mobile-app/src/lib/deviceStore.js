@@ -77,6 +77,9 @@ function sanitizeDevice(raw, { allowEmptyToken = false } = {}) {
     username: String(raw.username || '').trim().slice(0, 32),
     email: String(raw.email || '').trim().slice(0, 254),
     loginEmail2fa: Boolean(raw.loginEmail2fa),
+    githubLinked: Boolean(raw.githubLinked || raw.githubLogin),
+    githubLogin: String(raw.githubLogin || '').trim().slice(0, 39),
+    hasPassword: raw.hasPassword === undefined ? true : Boolean(raw.hasPassword),
     role,
     tier,
     label: String(raw.label || '').trim().slice(0, 64),
@@ -165,6 +168,18 @@ export function upsertDevice(state, payload) {
         payload?.loginEmail2fa !== undefined
           ? Boolean(payload.loginEmail2fa)
           : Boolean(existing.loginEmail2fa),
+      githubLinked:
+        payload?.githubLinked !== undefined
+          ? Boolean(payload.githubLinked)
+          : Boolean(existing.githubLinked),
+      githubLogin:
+        payload?.githubLogin !== undefined
+          ? String(payload.githubLogin || '').trim().slice(0, 39)
+          : String(existing.githubLogin || ''),
+      hasPassword:
+        payload?.hasPassword !== undefined
+          ? Boolean(payload.hasPassword)
+          : existing.hasPassword !== false,
       role: incoming.role || existing.role || '',
       tier: payload?.tier ? incoming.tier : existing.tier || incoming.tier || 'free',
       label: incoming.label || existing.label,
@@ -266,6 +281,27 @@ export function updateDeviceMeta(state, deviceId, patch = {}) {
     const val = Boolean(patch.loginEmail2fa)
     if (val !== Boolean(cur.loginEmail2fa)) {
       next.loginEmail2fa = val
+      changed = true
+    }
+  }
+  if (patch.githubLinked !== undefined) {
+    const val = Boolean(patch.githubLinked)
+    if (val !== Boolean(cur.githubLinked)) {
+      next.githubLinked = val
+      changed = true
+    }
+  }
+  if (patch.githubLogin !== undefined) {
+    const val = String(patch.githubLogin || '').trim().slice(0, 39)
+    if (val !== (cur.githubLogin || '')) {
+      next.githubLogin = val
+      changed = true
+    }
+  }
+  if (patch.hasPassword !== undefined) {
+    const val = Boolean(patch.hasPassword)
+    if (val !== (cur.hasPassword !== false)) {
+      next.hasPassword = val
       changed = true
     }
   }

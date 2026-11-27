@@ -20,7 +20,7 @@ const DUMMY_SCRYPT_SALT = '00112233445566778899aabbccddeeff'
 const MAX_DEVICES_PER_USER = 20
 const MAX_DAILY_REG_DAYS = 14
 const DEFAULT_MAX_DAILY_REGISTRATIONS = 20
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 export const VALID_TIERS = new Set(SHARED_TIERS)
 
@@ -256,7 +256,7 @@ export function createAccountStore({ filePath }) {
   hardenDbFilePermissions(true)
 
   const currentSchemaVer = Number(db.prepare('PRAGMA user_version').get()?.user_version || 0)
-  if (currentSchemaVer < SCHEMA_VERSION) {
+  if (currentSchemaVer < 1) {
     db.exec('BEGIN IMMEDIATE')
     try {
       db.exec(`
@@ -273,6 +273,9 @@ export function createAccountStore({ filePath }) {
           role TEXT NOT NULL DEFAULT 'user',
           password_salt TEXT NOT NULL,
           password_hash TEXT NOT NULL,
+          has_password INTEGER NOT NULL DEFAULT 1,
+          github_id TEXT NOT NULL DEFAULT '',
+          github_login TEXT NOT NULL DEFAULT '',
           token_version INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL,
           last_login_at INTEGER NOT NULL,
@@ -282,10 +285,34 @@ export function createAccountStore({ filePath }) {
           sessions_json TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(email_lower) WHERE email_lower != '';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_github_id ON users(github_id) WHERE github_id != '';
         CREATE TABLE IF NOT EXISTS daily_registrations (
           day_key TEXT PRIMARY KEY,
           count INTEGER NOT NULL DEFAULT 0
         );
+        PRAGMA user_version = ${SCHEMA_VERSION};
+      `)
+      db.exec('COMMIT')
+      hardenDbFilePermissions(true)
+    } catch (err) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw err
+    }
+  } else if (currentSchemaVer < SCHEMA_VERSION) {
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const cols = new Set(db.prepare('PRAGMA table_info(users)').all().map((c) => String(c.name)))
+      if (!cols.has('has_password')) {
+        db.exec('ALTER TABLE users ADD COLUMN has_password INTEGER NOT NULL DEFAULT 1')
+      }
+      if (!cols.has('github_id')) {
+        db.exec("ALTER TABLE users ADD COLUMN github_id TEXT NOT NULL DEFAULT ''")
+      }
+      if (!cols.has('github_login')) {
+        db.exec("ALTER TABLE users ADD COLUMN github_login TEXT NOT NULL DEFAULT ''")
+      }
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_github_id ON users(github_id) WHERE github_id != '';
         PRAGMA user_version = ${SCHEMA_VERSION};
       `)
       db.exec('COMMIT')
@@ -300,12 +327,14 @@ export function createAccountStore({ filePath }) {
     INSERT INTO users (
       user_id, username, username_lower, email, email_lower,
       email_verified, email_verified_at, login_email_2fa, tier, role,
-      password_salt, password_hash, token_version, created_at, last_login_at,
+      password_salt, password_hash, has_password, github_id, github_login,
+      token_version, created_at, last_login_at,
       known_login_ips_json, turn_usage_json, devices_json, sessions_json
     ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
+      ?, ?, ?,
       ?, ?, ?, ?
     )
     ON CONFLICT(user_id) DO UPDATE SET
@@ -320,6 +349,9 @@ export function createAccountStore({ filePath }) {
       role = excluded.role,
       password_salt = excluded.password_salt,
       password_hash = excluded.password_hash,
+      has_password = excluded.has_password,
+      github_id = excluded.github_id,
+      github_login = excluded.github_login,
       token_version = excluded.token_version,
       last_login_at = excluded.last_login_at,
       known_login_ips_json = excluded.known_login_ips_json,
@@ -330,13 +362,16 @@ export function createAccountStore({ filePath }) {
 
   // Targeted column updates prevent concurrent admin-cli.js edits (tier/role/etc.) from ever being reverted
   const stmtUpdatePasswordOnly = db.prepare(
-    'UPDATE users SET password_salt = ?, password_hash = ? WHERE user_id = ?',
+    'UPDATE users SET password_salt = ?, password_hash = ?, has_password = 1 WHERE user_id = ?',
   )
   const stmtUpdatePasswordAndRevoke = db.prepare(
-    'UPDATE users SET password_salt = ?, password_hash = ?, token_version = ?, sessions_json = ? WHERE user_id = ?',
+    'UPDATE users SET password_salt = ?, password_hash = ?, has_password = 1, token_version = ?, sessions_json = ? WHERE user_id = ?',
   )
   const stmtUpdateEmail = db.prepare(
     'UPDATE users SET email = ?, email_lower = ?, email_verified = ?, email_verified_at = ? WHERE user_id = ?',
+  )
+  const stmtUpdateGithub = db.prepare(
+    'UPDATE users SET github_id = ?, github_login = ? WHERE user_id = ?',
   )
   const stmtUpdateLogin2fa = db.prepare('UPDATE users SET login_email_2fa = ? WHERE user_id = ?')
   const stmtUpdateTierRole = db.prepare('UPDATE users SET tier = ?, role = ? WHERE user_id = ?')
@@ -370,6 +405,8 @@ export function createAccountStore({ filePath }) {
   const userIdByLower = new Map()
   /** @type {Map<string, string>} */
   const userIdByEmailLower = new Map()
+  /** @type {Map<string, string>} */
+  const userIdByGithubId = new Map()
   /** @type {Record<string, number>} */
   let dailyRegistrations = {}
   /** @type {Set<string>} */
@@ -440,6 +477,9 @@ export function createAccountStore({ filePath }) {
       role,
       passwordSalt: String(row.password_salt || ''),
       passwordHash: String(row.password_hash || ''),
+      hasPassword: row.has_password === undefined || row.has_password === null ? true : Boolean(Number(row.has_password)),
+      githubId: String(row.github_id || '').trim(),
+      githubLogin: String(row.github_login || '').trim(),
       tokenVersion: Number.isFinite(Number(row.token_version)) ? Math.max(0, Math.floor(Number(row.token_version))) : 0,
       createdAt: Number(row.created_at) || 0,
       lastLoginAt: Number(row.last_login_at) || 0,
@@ -464,6 +504,9 @@ export function createAccountStore({ filePath }) {
       record.role,
       record.passwordSalt || '',
       record.passwordHash || '',
+      record.hasPassword === false ? 0 : 1,
+      String(record.githubId || '').trim(),
+      String(record.githubLogin || '').trim(),
       Number(record.tokenVersion) || 0,
       Number(record.createdAt) || 0,
       Number(record.lastLoginAt) || 0,
@@ -535,6 +578,7 @@ export function createAccountStore({ filePath }) {
     usersById.clear()
     userIdByLower.clear()
     userIdByEmailLower.clear()
+    userIdByGithubId.clear()
 
     const rows = stmtAllUsers.all()
     const countedByDay = {}
@@ -544,6 +588,9 @@ export function createAccountStore({ filePath }) {
       userIdByLower.set(normalized.usernameLower, normalized.userId)
       if (normalized.emailLower) {
         userIdByEmailLower.set(normalized.emailLower, normalized.userId)
+      }
+      if (normalized.githubId) {
+        userIdByGithubId.set(normalized.githubId, normalized.userId)
       }
       if (normalized.createdAt) {
         const dk = getLocalDayKey(normalized.createdAt)
@@ -763,6 +810,9 @@ export function createAccountStore({ filePath }) {
       email: u.email || '',
       emailVerified: Boolean(u.email && u.emailVerified),
       loginEmail2fa: Boolean(u.email && u.emailVerified && u.loginEmail2fa),
+      githubLinked: Boolean(u.githubId),
+      githubLogin: String(u.githubLogin || ''),
+      hasPassword: u.hasPassword !== false,
       role,
       tier,
       turnUsage: normalizeTurnUsageRecord(u.turnUsage),
@@ -814,6 +864,277 @@ export function createAccountStore({ filePath }) {
     const userId = userIdByEmailLower.get(lower)
     if (!userId) return null
     return sanitizeUser(usersById.get(userId))
+  }
+
+  function getUserByGithubId(githubId) {
+    syncExternalChangesIfNeeded()
+    const cleanId = String(githubId || '').trim()
+    if (!cleanId) return null
+    const userId = userIdByGithubId.get(cleanId)
+    if (!userId) return null
+    return sanitizeUser(usersById.get(userId))
+  }
+
+  function deriveAvailableGithubUsername(rawLogin, githubId) {
+    const baseRaw = String(rawLogin || '')
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/_{2,}/g, '_')
+      .replace(/^[_.-]+|[_.-]+$/g, '')
+      .slice(0, 24)
+    const base = baseRaw.length >= 3 ? baseRaw : `gh_${String(githubId || '').slice(-8) || randomBytes(3).toString('hex')}`
+    if (!userIdByLower.has(base.toLowerCase()) && USERNAME_RE.test(base)) {
+      return base
+    }
+    const baseWithGh = `${base.slice(0, 28)}_gh`
+    if (!userIdByLower.has(baseWithGh.toLowerCase()) && USERNAME_RE.test(baseWithGh)) {
+      return baseWithGh
+    }
+    for (let i = 0; i < 12; i += 1) {
+      const suffix = randomBytes(2).toString('hex')
+      const candidate = `${base.slice(0, 27)}_${suffix}`
+      if (!userIdByLower.has(candidate.toLowerCase()) && USERNAME_RE.test(candidate)) {
+        return candidate
+      }
+    }
+    return `gh_${randomBytes(6).toString('hex')}`
+  }
+
+  async function loginOrRegisterGithubUserAsync({
+    githubId,
+    githubLogin = '',
+    email = '',
+    emailVerified = false,
+    bootstrapToken = '',
+    expectedBootstrapToken = '',
+    maxDailyRegistrations = DEFAULT_MAX_DAILY_REGISTRATIONS,
+  } = {}) {
+    syncExternalChangesIfNeeded()
+    const cleanGithubId = String(githubId || '').trim()
+    const cleanGithubLogin = String(githubLogin || '').trim().slice(0, 39)
+    if (!/^\d{1,24}$/.test(cleanGithubId)) {
+      return { ok: false, statusCode: 400, error: 'GitHub 用户标识无效' }
+    }
+
+    // Fast path: existing linked GitHub user (never touches registration limits or scrypt)
+    const existingUid = userIdByGithubId.get(cleanGithubId)
+    if (existingUid) {
+      let existingResult = null
+      runTx(() => {
+        const uid = userIdByGithubId.get(cleanGithubId)
+        const record = uid ? usersById.get(uid) : null
+        if (!record) return
+        if (cleanGithubLogin && record.githubLogin !== cleanGithubLogin) {
+          stmtUpdateGithub.run(cleanGithubId, cleanGithubLogin, record.userId)
+          record.githubLogin = cleanGithubLogin
+        }
+        existingResult = {
+          ok: true,
+          isNewUser: false,
+          user: sanitizeUser(record),
+          devices: (Array.isArray(record.devices) ? record.devices : []).map(sanitizeDeviceRecord),
+        }
+      })
+      if (existingResult) return existingResult
+    }
+
+    // New user registration via GitHub: enforce bootstrap token & daily registration cap
+    const isBootstrap = usersById.size === 0
+    const expectedBoot = String(expectedBootstrapToken || '').trim()
+    const providedBoot = String(bootstrapToken || '').trim()
+    const cleanLimit = normalizeMaxDailyRegistrations(maxDailyRegistrations, DEFAULT_MAX_DAILY_REGISTRATIONS)
+
+    if (isBootstrap) {
+      if (expectedBoot && !safeEqual(providedBoot, expectedBoot)) {
+        return { ok: false, statusCode: 400, error: '管理员初始化密钥无效，请先填写初始化密钥后再使用 GitHub 登录' }
+      }
+    } else if (cleanLimit > 0 && getTodayRegistrationCount() >= cleanLimit) {
+      return {
+        ok: false,
+        statusCode: 429,
+        code: 'DAILY_REGISTRATION_LIMIT',
+        error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
+      }
+    }
+
+    // Generate a high-entropy unguessable password placeholder for OAuth-only accounts (`hasPassword = false`)
+    const { salt, hash } = await hashPasswordAsync(randomBytes(32).toString('base64url'))
+
+    let cleanEmail = ''
+    let cleanEmailLower = ''
+    if (emailVerified && String(email || '').trim()) {
+      const eCheck = validateEmail(email)
+      if (eCheck.ok) {
+        cleanEmail = eCheck.email
+        cleanEmailLower = eCheck.emailLower
+      }
+    }
+
+    let txResult = null
+    runTx(() => {
+      // Re-check inside transaction in case a parallel callback already registered this GitHub ID
+      const raceUid = userIdByGithubId.get(cleanGithubId)
+      if (raceUid && usersById.has(raceUid)) {
+        const rec = usersById.get(raceUid)
+        txResult = {
+          ok: true,
+          isNewUser: false,
+          record: rec,
+          devices: (Array.isArray(rec.devices) ? rec.devices : []).map(sanitizeDeviceRecord),
+        }
+        return
+      }
+
+      if (isBootstrap && usersById.size > 0) {
+        txResult = { ok: false, statusCode: 400, error: '管理员账号已初始化，请重新点击 GitHub 登录' }
+        return
+      }
+      const finalIsBootstrap = isBootstrap && usersById.size === 0
+      const now = Date.now()
+      const todayKey = getLocalDayKey(now)
+      const currentTodayCount = Math.max(0, Math.floor(Number(dailyRegistrations[todayKey]) || 0))
+      if (!finalIsBootstrap && cleanLimit > 0 && currentTodayCount >= cleanLimit) {
+        txResult = {
+          ok: false,
+          statusCode: 429,
+          code: 'DAILY_REGISTRATION_LIMIT',
+          error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
+        }
+        return
+      }
+
+      // Never collide or auto-merge on an email already owned by another account
+      const usableEmail = cleanEmailLower && !userIdByEmailLower.has(cleanEmailLower) ? cleanEmail : ''
+      const usableEmailLower = usableEmail ? cleanEmailLower : ''
+
+      const username = deriveAvailableGithubUsername(cleanGithubLogin, cleanGithubId)
+      const usernameLower = username.toLowerCase()
+      const nextTodayCount = currentTodayCount + 1
+      const cutoffKey = getLocalDayKey(now - (MAX_DAILY_REG_DAYS - 1) * 24 * 60 * 60 * 1000)
+      const userId = `usr_${randomBytes(8).toString('hex')}`
+      const tier = finalIsBootstrap ? 'admin' : 'free'
+      const role = finalIsBootstrap ? 'admin' : 'user'
+
+      const record = {
+        userId,
+        username,
+        usernameLower,
+        email: usableEmail,
+        emailLower: usableEmailLower,
+        emailVerified: Boolean(usableEmail),
+        emailVerifiedAt: usableEmail ? now : 0,
+        loginEmail2fa: false,
+        knownLoginIps: [],
+        tier,
+        role,
+        turnUsage: normalizeTurnUsageRecord(null, now),
+        passwordSalt: salt,
+        passwordHash: hash,
+        hasPassword: false,
+        githubId: cleanGithubId,
+        githubLogin: cleanGithubLogin || username,
+        tokenVersion: 0,
+        createdAt: now,
+        lastLoginAt: now,
+        devices: [],
+        sessions: [],
+      }
+
+      persistUserRow(record)
+      stmtUpsertDaily.run(todayKey, nextTodayCount)
+      stmtPruneDaily.run(cutoffKey)
+
+      txResult = { ok: true, isNewUser: true, record, todayKey, nextTodayCount, now }
+    })
+
+    if (!txResult || !txResult.ok) {
+      return txResult || { ok: false, statusCode: 400, error: 'GitHub 注册失败，请重试' }
+    }
+
+    if (!txResult.isNewUser) {
+      return {
+        ok: true,
+        isNewUser: false,
+        user: sanitizeUser(txResult.record),
+        devices: txResult.devices || [],
+      }
+    }
+
+    const { record, todayKey, nextTodayCount, now } = txResult
+    usersById.set(record.userId, record)
+    userIdByLower.set(record.usernameLower, record.userId)
+    if (record.emailLower) {
+      userIdByEmailLower.set(record.emailLower, record.userId)
+    }
+    userIdByGithubId.set(record.githubId, record.userId)
+    dailyRegistrations[todayKey] = nextTodayCount
+    dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations, now)
+
+    return {
+      ok: true,
+      isNewUser: true,
+      user: sanitizeUser(record),
+      devices: [],
+    }
+  }
+
+  function linkUserGithub(userId, { githubId, githubLogin = '' } = {}) {
+    const cleanGithubId = String(githubId || '').trim()
+    const cleanGithubLogin = String(githubLogin || '').trim().slice(0, 39)
+    if (!/^\d{1,24}$/.test(cleanGithubId)) {
+      return { ok: false, error: 'GitHub 用户标识无效' }
+    }
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
+      }
+      const existingOwner = userIdByGithubId.get(cleanGithubId)
+      if (existingOwner && existingOwner !== userId) {
+        result = { ok: false, error: '该 GitHub 账号已绑定到其他 All in One 账号' }
+        return
+      }
+      const prevGithubId = record.githubId
+      stmtUpdateGithub.run(cleanGithubId, cleanGithubLogin, userId)
+      if (prevGithubId && prevGithubId !== cleanGithubId && userIdByGithubId.get(prevGithubId) === userId) {
+        userIdByGithubId.delete(prevGithubId)
+      }
+      record.githubId = cleanGithubId
+      record.githubLogin = cleanGithubLogin
+      userIdByGithubId.set(cleanGithubId, userId)
+      result = { ok: true, user: sanitizeUser(record) }
+    })
+    return result
+  }
+
+  function unlinkUserGithub(userId) {
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
+      }
+      if (!record.githubId) {
+        result = { ok: false, error: '当前账号未绑定 GitHub' }
+        return
+      }
+      if (record.hasPassword === false) {
+        result = { ok: false, error: '该账号由 GitHub 注册，请先设置登录密码后再解绑 GitHub' }
+        return
+      }
+      const prevGithubId = record.githubId
+      stmtUpdateGithub.run('', '', userId)
+      if (userIdByGithubId.get(prevGithubId) === userId) {
+        userIdByGithubId.delete(prevGithubId)
+      }
+      record.githubId = ''
+      record.githubLogin = ''
+      result = { ok: true, user: sanitizeUser(record) }
+    })
+    return result
   }
 
   async function registerUserAsync({
@@ -916,6 +1237,9 @@ export function createAccountStore({ filePath }) {
         turnUsage: normalizeTurnUsageRecord(null, now),
         passwordSalt: salt,
         passwordHash: hash,
+        hasPassword: true,
+        githubId: '',
+        githubLogin: '',
         tokenVersion: 0,
         createdAt: now,
         lastLoginAt: now,
@@ -1094,6 +1418,7 @@ export function createAccountStore({ filePath }) {
       stmtUpdatePasswordAndRevoke.run(salt, hash, nextTv, '[]', userId)
       fresh.passwordSalt = salt
       fresh.passwordHash = hash
+      fresh.hasPassword = true
       fresh.tokenVersion = nextTv
       fresh.sessions = []
       pendingSessionTouches.delete(userId)
@@ -1141,6 +1466,7 @@ export function createAccountStore({ filePath }) {
         stmtUpdatePasswordAndRevoke.run(salt, hash, nextTv, '[]', userId)
         fresh.passwordSalt = salt
         fresh.passwordHash = hash
+        fresh.hasPassword = true
         fresh.tokenVersion = nextTv
         fresh.sessions = []
         pendingSessionTouches.delete(userId)
@@ -1860,7 +2186,11 @@ export function createAccountStore({ filePath }) {
     isUsernameTaken,
     isEmailTaken,
     getUserByEmail,
+    getUserByGithubId,
     registerUserAsync,
+    loginOrRegisterGithubUserAsync,
+    linkUserGithub,
+    unlinkUserGithub,
     resolveAccountKey,
     markUserLogin,
     verifyUserPasswordAsync,

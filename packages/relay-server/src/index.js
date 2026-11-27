@@ -6,6 +6,7 @@ import { WebSocketServer } from 'ws'
 import { createAuthManager, safeEqual } from './auth.js'
 import { createAccountStore, normalizeMaxDailyRegistrations } from './accounts.js'
 import { createEmailCodeStore } from './emailCodes.js'
+import { createGithubOAuthManager } from './github-oauth.js'
 import { createMailer } from './mailer.js'
 import { RelayHub } from './hub.js'
 import { createStunServer } from './stun-server.js'
@@ -155,6 +156,16 @@ export function createRelayServer(options = {}) {
   const accounts = createAccountStore({ filePath: accountsFile })
   const mailer = createMailer(options)
   const emailCodes = createEmailCodeStore(options.emailCodeOptions || {})
+  const githubOAuth = createGithubOAuthManager({
+    clientId: options.githubClientId ?? process.env.GITHUB_CLIENT_ID ?? '',
+    clientSecret: options.githubClientSecret ?? process.env.GITHUB_CLIENT_SECRET ?? '',
+    redirectUri: options.githubRedirectUri ?? process.env.GITHUB_REDIRECT_URI ?? '',
+    oauthBaseUrl: options.githubOAuthBaseUrl ?? process.env.GITHUB_OAUTH_BASE_URL ?? 'https://github.com',
+    apiBaseUrl: options.githubApiBaseUrl ?? process.env.GITHUB_API_BASE_URL ?? 'https://api.github.com',
+    publicRelayUrl,
+    ...(options.githubOAuthTtlMs ? { ttlMs: options.githubOAuthTtlMs } : {}),
+    ...(options.githubFetchImpl ? { fetchImpl: options.githubFetchImpl } : {}),
+  })
   const outboundEmailGate = createOutboundEmailGate({
     maxGlobalPerHour: Number(process.env.MAX_EMAILS_PER_HOUR) || 120,
   })
@@ -275,10 +286,13 @@ export function createRelayServer(options = {}) {
     hub,
     mailer,
     emailCodes,
+    githubOAuth,
     outboundEmailGate,
     ipDailyRegLimiter,
     adminBootstrapToken,
     maxDailyRegistrations,
+    isTrustedProxy,
+    isAllowedOrigin,
     extractBearer,
     checkUserActionRateLimit,
     getClientIp,
@@ -555,6 +569,13 @@ export function createRelayServer(options = {}) {
           log.info(`[control] Static PWA dir: ${staticDir} (${existsSync(staticDir) ? 'ready' : 'not built yet'})`)
           log.info(`[control] Registration: Open registration (daily limit: ${maxDailyRegistrations || 'unlimited'})`)
           log.info(`[control] Email verification: ${mailer.isConfigured() ? mailer.getProvider() : 'disabled (configure SMTP_* or RESEND_API_KEY to enable)'}`)
+          log.info(
+            `[control] GitHub OAuth: ${
+              githubOAuth.isConfigured()
+                ? `enabled (callback: ${githubOAuth.resolveCallbackUri(`http://${host}:${boundPort}`)})`
+                : 'disabled (configure GITHUB_CLIENT_ID & GITHUB_CLIENT_SECRET to enable)'
+            }`,
+          )
           if (jwtSecret.length < 16) {
             log.warn('[control] WARNING: JWT_SECRET is not set — using an ephemeral random signing key. Set JWT_SECRET (>= 16 chars) in .env before deploying publicly.')
           }

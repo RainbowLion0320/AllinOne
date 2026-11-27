@@ -13,6 +13,7 @@ export function SettingsModal({
   activeDeviceName = '',
   isAdmin = false,
   emailEnabled = false,
+  githubEnabled = false,
   connState = 'disconnected',
   bridgeOnline = false,
   clientSessions = null,
@@ -38,6 +39,8 @@ export function SettingsModal({
   onSendBindEmailCode = null,
   onBindAccountEmail = null,
   onToggleLogin2fa = null,
+  onGithubLinked = null,
+  onUnlinkGithub = null,
   turnQuota = null,
   dataSaver = true,
   onToggleDataSaver = null,
@@ -105,6 +108,7 @@ export function SettingsModal({
             serverDisplay={serverDisplay}
             isAdmin={isAdmin}
             emailEnabled={emailEnabled}
+            githubEnabled={githubEnabled}
             connState={connState}
             bridgeOnline={bridgeOnline}
             turnQuota={turnQuota}
@@ -118,6 +122,8 @@ export function SettingsModal({
             onSendBindEmailCode={onSendBindEmailCode}
             onBindAccountEmail={onBindAccountEmail}
             onToggleLogin2fa={onToggleLogin2fa}
+            onGithubLinked={onGithubLinked}
+            onUnlinkGithub={onUnlinkGithub}
           />
 
           <AppearanceDesktopSection

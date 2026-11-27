@@ -69,6 +69,7 @@ const DEFAULT_BOOTSTRAP_STATUS = {
   hasAdmin: true,
   needsBootstrapToken: false,
   emailEnabled: false,
+  githubEnabled: false,
   dailyRegistrationLimit: 0,
   dailyRegistrationsUsed: 0,
   dailyRegistrationRemaining: null,
@@ -97,6 +98,7 @@ export async function fetchBootstrapStatus(serverUrl, timeoutMs = 4000) {
       hasAdmin,
       needsBootstrapToken: Boolean(data.needsBootstrapToken),
       emailEnabled: Boolean(data.emailEnabled),
+      githubEnabled: Boolean(data.githubEnabled),
       dailyRegistrationLimit,
       dailyRegistrationsUsed,
       dailyRegistrationRemaining,
@@ -204,6 +206,9 @@ export async function loginAccount(serverUrl, { username, password, emailCode = 
     username: data.user?.username || String(username || '').trim(),
     email: data.user?.email || '',
     loginEmail2fa: Boolean(data.user?.loginEmail2fa),
+    githubLinked: Boolean(data.user?.githubLinked),
+    githubLogin: String(data.user?.githubLogin || ''),
+    hasPassword: data.user?.hasPassword !== false,
     role: data.user?.role || 'user',
     tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
     label: `@${data.user?.username || String(username || '').trim()}`,
@@ -332,7 +337,122 @@ export async function resetAccountPassword(serverUrl, { email, code, newPassword
   if (!res.ok || !data.ok) {
     throw new Error(data.error || L(`重置密码失败 (HTTP ${res.status})`, `Password reset failed (HTTP ${res.status})`))
   }
-  return { username: data.username || '' }
+  return {
+    username: data.username || '',
+  }
+}
+
+export async function startGithubOAuth(
+  serverUrl,
+  { mode = 'login', token = '', bootstrapToken = '', returnUrl = '' } = {},
+) {
+  const base = normalizeBaseUrl(serverUrl)
+  const devMeta = detectClientDeviceMeta()
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  const cleanBoot = String(bootstrapToken || '').trim()
+  const cleanRet = String(returnUrl || '').trim()
+  const res = await fetch(`${base}/api/auth/github/start`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      mode: mode === 'bind' ? 'bind' : 'login',
+      deviceName: devMeta.deviceName,
+      clientKind: devMeta.clientKind,
+      ...(devMeta.clientUid ? { clientUid: devMeta.clientUid } : {}),
+      ...(cleanBoot ? { bootstrapToken: cleanBoot } : {}),
+      ...(cleanRet ? { returnUrl: cleanRet } : {}),
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok || !data.authorizeUrl || !data.pollToken) {
+    throw new Error(
+      data.error || L(`发起 GitHub 授权失败 (HTTP ${res.status})`, `Failed to start GitHub OAuth (HTTP ${res.status})`),
+    )
+  }
+  return {
+    baseUrl: base,
+    authorizeUrl: String(data.authorizeUrl),
+    pollToken: String(data.pollToken),
+    expiresInSec: Number(data.expiresInSec) || 600,
+  }
+}
+
+export async function pollGithubOAuth(serverUrl, { pollToken, token = '' } = {}) {
+  const base = normalizeBaseUrl(serverUrl)
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(`${base}/api/auth/github/poll`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ pollToken: String(pollToken || '').trim() }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (res.status === 410 || data.status === 'expired' || data.status === 'invalid') {
+    return {
+      status: 'expired',
+      error: data.error || L('GitHub 授权已超时，请重试', 'GitHub authorization expired. Please try again.'),
+    }
+  }
+  if (data.status === 'failed') {
+    return {
+      status: 'failed',
+      code: String(data.code || ''),
+      error: data.error || L('GitHub 授权失败', 'GitHub authorization failed'),
+    }
+  }
+  if (data.status === 'pending') {
+    return { status: 'pending' }
+  }
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      data.error || L(`查询 GitHub 授权状态失败 (HTTP ${res.status})`, `Failed to check GitHub OAuth (HTTP ${res.status})`),
+    )
+  }
+  if (data.mode === 'bind') {
+    return {
+      status: 'completed',
+      mode: 'bind',
+      user: data.user || null,
+    }
+  }
+  const uname = String(data.user?.username || '').trim()
+  return {
+    status: 'completed',
+    mode: 'login',
+    isNewUser: Boolean(data.isNewUser),
+    baseUrl: base,
+    token: data.token,
+    roomId: data.roomId || data.user?.userId || '',
+    username: uname,
+    email: data.user?.email || '',
+    loginEmail2fa: Boolean(data.user?.loginEmail2fa),
+    githubLinked: Boolean(data.user?.githubLinked),
+    githubLogin: String(data.user?.githubLogin || ''),
+    hasPassword: data.user?.hasPassword !== false,
+    role: data.user?.role || 'user',
+    tier: data.user?.tier || (data.user?.role === 'admin' ? 'admin' : 'free'),
+    label: uname ? `@${uname}` : '',
+    devices: Array.isArray(data.devices) ? data.devices : [],
+    bridges: Array.isArray(data.bridges) ? data.bridges : [],
+  }
+}
+
+export async function unlinkGithubAccount(baseUrl, token) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/github/unlink`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: '{}',
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`解绑 GitHub 失败 (HTTP ${res.status})`, `Failed to unlink GitHub (HTTP ${res.status})`))
+  }
+  return data.user
 }
 
 export async function listAccountDevices(baseUrl, token) {
@@ -418,6 +538,10 @@ export async function probeDeviceStatus(device, timeoutMs = 5000) {
       email: String(data.email || ''),
       loginEmail2fa: Boolean(data.loginEmail2fa),
       emailEnabled: Boolean(data.emailEnabled),
+      githubEnabled: Boolean(data.githubEnabled),
+      githubLinked: Boolean(data.githubLinked),
+      githubLogin: String(data.githubLogin || ''),
+      hasPassword: data.hasPassword !== false,
       role: String(data.role || ''),
       tier: String(data.tier || ''),
       turnQuota: data.turnQuota || null,
