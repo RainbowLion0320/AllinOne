@@ -145,11 +145,12 @@ function checkVersions() {
         `Version drift in ${IOS_PBXPROJ_PATH}: MARKETING_VERSION=[${marketingVals.join(', ')}], expected "${expectedMarketing}"`,
       )
     }
+    const expectedBuildRe = new RegExp(`^${androidVersionCode}(?:\\.\\d+)?$`)
     if (buildVals.length === 0) {
       errors.push(`Missing CURRENT_PROJECT_VERSION in ${IOS_PBXPROJ_PATH}`)
-    } else if (buildVals.some((v) => v !== String(androidVersionCode))) {
+    } else if (buildVals.some((v) => !expectedBuildRe.test(v))) {
       errors.push(
-        `Version drift in ${IOS_PBXPROJ_PATH}: CURRENT_PROJECT_VERSION=[${buildVals.join(', ')}], expected "${androidVersionCode}"`,
+        `Version drift in ${IOS_PBXPROJ_PATH}: CURRENT_PROJECT_VERSION=[${buildVals.join(', ')}], expected "${androidVersionCode}" (or "${androidVersionCode}.N")`,
       )
     }
   }

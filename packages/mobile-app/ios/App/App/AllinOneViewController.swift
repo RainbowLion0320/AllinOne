@@ -6,6 +6,7 @@ import Capacitor
 ///  2. Applies the dark `#0B0E14` surface color before WebView paint to eliminate white cold-start flashes.
 ///  3. Dispatches `allinone:appstate` events on foreground/background transitions so `wsClient.js`
 ///     immediately recovers WebSocket & WebRTC P2P channels when returning from iOS background.
+@objc(AllinOneViewController)
 class AllinOneViewController: CAPBridgeViewController {
     private static let darkSurfaceColor = UIColor(
         red: 11.0 / 255.0,
@@ -36,8 +37,20 @@ class AllinOneViewController: CAPBridgeViewController {
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(handleAppDidBecomeActive),
+            name: UIScene.didActivateNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(handleAppDidEnterBackground),
             name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidEnterBackground),
+            name: UIScene.didEnterBackgroundNotification,
             object: nil
         )
     }

@@ -127,6 +127,7 @@ function main() {
     appId: 'com.allinone.dshmobile',
     appName: 'All in One',
     webDir: 'dist',
+    packageClassList: [],
     server: {
       iosScheme: 'capacitor',
       cleartext: false,
