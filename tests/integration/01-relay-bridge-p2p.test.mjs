@@ -15,7 +15,7 @@ import {
   parseCompositeId as hubParseCompositeId,
   toEpochMs as hubToEpochMs,
 } from '../../packages/dsh-mobile-hub/src/protocol.js'
-import { EVENTS, RPC, parseCompositeId, toEpochMs } from '../../packages/shared/src/protocol.js'
+import { APP_LIST, EVENTS, RPC, parseCompositeId, toEpochMs } from '../../packages/shared/src/protocol.js'
 import {
   base64UrlToBytes,
   computeE2eeKeyId,
@@ -513,13 +513,13 @@ describe('Suites 2-4: Live E2EE Bridge, Core Security Hardening & WebRTC P2P', (
       )
 
       const statusRes = await rpc(RPC.APPS_STATUS)
-      assert.equal(statusRes.apps.length, 5)
+      assert.equal(statusRes.apps.length, APP_LIST.length)
 
       const wsRes = await rpc(RPC.WORKSPACES_LIST)
       assert.ok(Array.isArray(wsRes.workspaces))
 
       const modelsRes = await rpc(RPC.MODELS_LIST)
-      for (const app of ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy']) {
+      for (const app of APP_LIST) {
         assert.ok(Array.isArray(modelsRes.catalog[app]?.models))
         const appInfo = statusRes.apps.find((a) => a.app === app)
         if (appInfo?.writable || app === 'dsh') {
@@ -982,7 +982,7 @@ describe('Suites 2-4: Live E2EE Bridge, Core Security Hardening & WebRTC P2P', (
           e2eeKey: primaryE2eeKey,
           roomId: smokeAdmin.roomId,
         })
-        assert.equal((await victimPeer.sendEncryptedRpc(RPC.APPS_STATUS)).apps.length, 5)
+        assert.equal((await victimPeer.sendEncryptedRpc(RPC.APPS_STATUS)).apps.length, APP_LIST.length)
         assert.ok(bridge.link.p2p.sessions.has(victimCli.hello.clientId))
 
         const kickStarted = Date.now()

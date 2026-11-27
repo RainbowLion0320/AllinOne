@@ -37,6 +37,7 @@ export const SENSITIVE_HOME_SUBDIRS = Object.freeze([
   '.workbuddy',
   '.codebuddy',
   '.gemini',
+  '.zcode',
 ])
 
 export function isSafeWindowsLocalPath(candidate) {
@@ -129,15 +130,19 @@ export function resolveSafeDeliverableCwd(
     }
   }
 
-  // Reject sensitive dot-directories (except Antigravity brain artifacts)
+  // Reject sensitive dot-directories (except Antigravity brain artifacts and ZCode workspace dirs)
   let realGeminiBrain = ''
   try { realGeminiBrain = realpathSync(geminiBrainDir) } catch {}
   const inGeminiBrain = Boolean(realGeminiBrain && isUnderNormalized(realCwd, realGeminiBrain))
+  let realZcodeWorkspace = ''
+  try { realZcodeWorkspace = realpathSync(join(homeDir, '.zcode', 'workspace')) } catch {}
+  const inZcodeWorkspace = Boolean(realZcodeWorkspace && isUnderNormalized(realCwd, realZcodeWorkspace))
   for (const sub of blockedDotDirs) {
     let realSub = ''
     try { realSub = realpathSync(join(homeDir, sub)) } catch { continue }
     if (isUnderNormalized(realCwd, realSub)) {
       if (sub === '.gemini' && inGeminiBrain) continue
+      if (sub === '.zcode' && inZcodeWorkspace) continue
       return ''
     }
   }
@@ -221,9 +226,10 @@ export function resolveSafeDesktopDeliverable(
     }
   }
   const inGeminiBrain = isUnderDir(realPath, geminiBrainDir)
+  const inZcodeWorkspace = isUnderDir(realPath, join(homeDir, '.zcode', 'workspace'))
   for (const sub of SENSITIVE_HOME_SUBDIRS) {
     if (isUnderDir(realPath, join(homeDir, sub))) {
-      if (sub === '.gemini' && inGeminiBrain) {
+      if ((sub === '.gemini' && inGeminiBrain) || (sub === '.zcode' && inZcodeWorkspace)) {
         const baseLower = basename(realPath).toLowerCase()
         if (
           baseLower.startsWith('.') ||

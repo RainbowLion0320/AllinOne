@@ -21,6 +21,7 @@ import { CodexAdapter } from './adapters/codex.js'
 import { ClaudeAdapter } from './adapters/claude.js'
 import { AntigravityAdapter } from './adapters/antigravity.js'
 import { WorkBuddyAdapter } from './adapters/workbuddy.js'
+import { ZCodeAdapter } from './adapters/zcode.js'
 
 const MAX_P2P_DOCUMENT_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local safety cap
 const MAX_P2P_IMAGE_BYTES = 100 * 1024 * 1024 // 100 MB image cap
@@ -143,6 +144,7 @@ export class MultiAppOrchestrator {
         [APPS.CLAUDE]: new ClaudeAdapter({ config, log, emitEvent, onApprovalRequest }),
         [APPS.ANTIGRAVITY]: new AntigravityAdapter({ config, log, emitEvent, onApprovalRequest }),
         [APPS.WORKBUDDY]: new WorkBuddyAdapter({ config, log, emitEvent, onApprovalRequest }),
+        [APPS.ZCODE]: new ZCodeAdapter({ config, log, emitEvent, onApprovalRequest }),
       }
     }
     this.enabledApps = Object.keys(this.adapters)
@@ -759,6 +761,9 @@ export class MultiAppOrchestrator {
       normReal.includes('/.claude/.credentials') ||
       normReal.includes('/.workbuddy/auth') ||
       normReal.includes('/.codebuddy/auth') ||
+      normReal.includes('/.zcode/v2/') ||
+      normReal.includes('/.zcode/cli/') ||
+      normReal.includes('/.zcode/certs/') ||
       normReal.includes('/library/application support/google/chrome/') ||
       normReal.includes('/library/application support/microsoft edge/') ||
       normReal.includes('/library/application support/firefox/') ||

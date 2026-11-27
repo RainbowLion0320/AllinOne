@@ -54,6 +54,8 @@ export function AppModals({
   modelsCatalog,
   workbuddySetup,
   onSetupWorkbuddy,
+  zcodeSetup,
+  onSetupZcode,
   onCreateSession,
   // Model Picker
   modelPickerOpen,
@@ -188,6 +190,8 @@ export function AppModals({
             modelsCatalog={modelsCatalog}
             workbuddySetup={workbuddySetup}
             onSetupWorkbuddy={onSetupWorkbuddy}
+            zcodeSetup={zcodeSetup}
+            onSetupZcode={onSetupZcode}
             onCreate={onCreateSession}
           />
         )}

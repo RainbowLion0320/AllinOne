@@ -58,6 +58,10 @@ function getOtherVendorHint(card, bi) {
   if (card.app === 'codex') {
     return bi('正在同步 Codex 5h / 周额度...', 'Syncing Codex 5h & weekly quota...')
   }
+  if (card.app === 'zcode') {
+    if (!card.writable) return bi('已同步桌面端会话 · 浏览器授权一次即可远程发送', 'Desktop mirror · Sign in once via browser to send')
+    return bi('智谱 ZCode 读写就绪 · 自动同步套餐额度', 'ZCode ready · Auto-syncing plan quota')
+  }
   return card.writable ? bi('读写就绪', 'Ready') : bi('只读模式', 'Read-only')
 }
 

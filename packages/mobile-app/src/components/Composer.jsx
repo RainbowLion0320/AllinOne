@@ -66,6 +66,13 @@ const NATIVE_SLASH_COMMANDS = {
     { cmd: '/clear', icon: Eraser, zh: '清空当前上下文重新开始', en: 'Clear conversation history' },
     { cmd: '/init', icon: FileCode, zh: '初始化项目指引文件', en: 'Initialize project guide' },
   ],
+  zcode: [
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 只读分析并规划方案', en: 'Plan mode before applying edits' },
+    { cmd: '/goal', needsArgs: true, icon: Timer, zh: '设定当前会话持续目标', en: 'Set or manage session goal' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/init', icon: FileCode, zh: '初始化项目 AGENTS.md 指引', en: 'Initialize workspace AGENTS.md guide' },
+    { cmd: '/skill', needsArgs: true, icon: Sparkles, zh: '调用本地技能处理任务', en: 'Invoke a local ZCode skill' },
+  ],
 }
 
 function revokeAttachmentPreview(att) {

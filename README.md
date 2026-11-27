@@ -14,7 +14,8 @@
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
-  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp; <em>and more</em>
+  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp;
+  <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> <strong>ZCode</strong> &nbsp;·&nbsp; <em>and more</em>
   <br/>
   <sub>目前已接入以上主流 AI 工具，更多工具持续扩展中</sub>
 </p>
@@ -76,6 +77,7 @@
 | <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 远程读写 · 额度监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 远程读写 · 余额监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 远程读写 · 积分监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> **智谱 ZCode** | 远程读写 · 额度监控 |
 
 > 自动复用各工具本机已有登录态，开箱即用。更多主流 AI 工具持续接入中，欢迎在 [Issues](https://github.com/RainbowLion0320/AllinOne/issues) 提出需求。
 

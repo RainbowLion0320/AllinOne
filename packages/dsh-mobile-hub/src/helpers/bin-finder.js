@@ -612,3 +612,187 @@ export function getCodebuddyCandidates(home = homedir(), platform = process.plat
   }
   return list.filter(Boolean)
 }
+
+/**
+ * Candidate resource roots / entry scripts for Zhipu ZCode (Desktop bundled `zcode.cjs` + standalone `zcode` CLI).
+ */
+export function getZCodeResourceRoots(home = homedir(), platform = process.platform, env = process.env) {
+  const roots = []
+  if (platform === 'win32') {
+    const programFiles = env?.ProgramFiles || 'C:\\Program Files'
+    const programFilesX86 = env?.['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    roots.push(
+      join(programFiles, 'ZCode', 'resources'),
+      join(localApp, 'Programs', 'ZCode', 'resources'),
+      join(localApp, 'ZCode', 'resources'),
+      join(programFilesX86, 'ZCode', 'resources'),
+    )
+  } else if (platform === 'darwin') {
+    roots.push(
+      '/Applications/ZCode.app/Contents/Resources',
+      join(home, 'Applications', 'ZCode.app', 'Contents', 'Resources'),
+    )
+  } else {
+    roots.push(
+      '/opt/ZCode/resources',
+      '/usr/lib/zcode/resources',
+      '/usr/share/zcode/resources',
+      join(home, '.local', 'share', 'zcode', 'resources'),
+    )
+  }
+  return roots.filter(Boolean)
+}
+
+export function getZCodeCandidates(home = homedir(), platform = process.platform, env = process.env, configuredBin = '') {
+  const list = [
+    configuredBin,
+    env?.ZCODE_BIN,
+    env?.ZCODE_CLI_BIN,
+  ]
+  if (platform === 'win32') {
+    const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(
+      join(appData, 'npm', 'zcode.cmd'),
+      join(appData, 'npm', 'zcode.exe'),
+      join(home, '.local', 'bin', 'zcode.exe'),
+      join(localApp, 'zcode', 'bin', 'zcode.exe'),
+    )
+  } else {
+    list.push(
+      join(home, '.local', 'bin', 'zcode'),
+      join(home, '.zcode', 'bin', 'zcode'),
+      join(home, '.npm-global', 'bin', 'zcode'),
+      '/opt/homebrew/bin/zcode',
+      '/usr/local/bin/zcode',
+    )
+  }
+  return list.filter(Boolean)
+}
+
+/**
+ * Find the newest cached `zcode-builtin.json` under `~/.zcode/v2/runtime/provider`,
+ * falling back to the desktop app's bundled `resources/config/provider/zcode-builtin.json`.
+ */
+export function findZCodeBuiltinConfig(zcodeHome, resourceRoot = '') {
+  const runtimeProviderDir = join(zcodeHome, 'v2', 'runtime', 'provider')
+  const cached = []
+  const scanDir = (dir, depth = 0) => {
+    if (depth > 4 || !existsSync(dir)) return
+    let entries
+    try { entries = readdirSync(dir) } catch { return }
+    for (const name of entries) {
+      const full = join(dir, name)
+      let st
+      try { st = statSync(full) } catch { continue }
+      if (st.isDirectory()) {
+        scanDir(full, depth + 1)
+      } else if (st.isFile() && name === 'zcode-builtin.json' && st.size > 100) {
+        cached.push({ path: full, mtimeMs: st.mtimeMs || 0 })
+      }
+    }
+  }
+  scanDir(runtimeProviderDir, 0)
+  if (cached.length > 0) {
+    cached.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return cached[0].path
+  }
+  if (resourceRoot) {
+    const bundled = join(resourceRoot, 'config', 'provider', 'zcode-builtin.json')
+    if (existsSync(bundled)) return bundled
+  }
+  return ''
+}
+
+/**
+ * Locate Zhipu ZCode's executable launcher (standalone `zcode` CLI or desktop-bundled `resources/glm/zcode.cjs` + Node runtime).
+ */
+export function findZCodeLauncher({
+  home = homedir(),
+  platform = process.platform,
+  env = process.env,
+  configuredBin = '',
+  zcodeHome = '',
+} = {}) {
+  const effectiveHome = String(zcodeHome || env?.ZCODE_HOME || '').trim() || join(home, '.zcode')
+  const explicit = String(configuredBin || env?.ZCODE_BIN || env?.ZCODE_CLI_BIN || '').trim()
+
+  const resolveNodeBin = (glmDir = '') => {
+    const candidates = []
+    if (glmDir) {
+      if (platform === 'win32') {
+        candidates.push(join(glmDir, 'node-runtime', 'node.exe'))
+      } else {
+        candidates.push(
+          join(glmDir, 'node-runtime', 'bin', 'node'),
+          join(glmDir, 'node-runtime', 'node'),
+        )
+      }
+    }
+    if (!process.versions.electron && process.execPath && /node(?:\.exe)?$/i.test(process.execPath)) {
+      candidates.push(process.execPath)
+    }
+    return findExecutable(platform === 'win32' ? ['node.exe', 'node'] : ['node'], candidates) || ''
+  }
+
+  // 1. Explicit `.cjs`/`.js` script path
+  if (explicit && /\.(?:cjs|mjs|js)$/i.test(explicit) && existsSync(explicit)) {
+    const glmDir = dirname(explicit)
+    const nodeBin = resolveNodeBin(glmDir)
+    if (nodeBin) {
+      const resRoot = dirname(glmDir)
+      return {
+        bin: nodeBin,
+        baseArgs: [explicit],
+        entryScript: explicit,
+        resourceRoot: resRoot,
+        builtinConfigPath: findZCodeBuiltinConfig(effectiveHome, resRoot),
+        kind: 'bundled-script',
+      }
+    }
+  }
+
+  // 2. Standalone CLI binary (`zcode` / `zcode.exe` / `zcode.cmd`)
+  const cliNames = platform === 'win32' ? ['zcode.exe', 'zcode.cmd', 'zcode'] : ['zcode']
+  const standaloneBin = findExecutable(cliNames, getZCodeCandidates(home, platform, env, explicit))
+  if (standaloneBin) {
+    let builtinConfigPath = findZCodeBuiltinConfig(effectiveHome, '')
+    if (!builtinConfigPath) {
+      for (const r of getZCodeResourceRoots(home, platform, env)) {
+        const candidate = join(r, 'config', 'provider', 'zcode-builtin.json')
+        if (existsSync(candidate)) {
+          builtinConfigPath = candidate
+          break
+        }
+      }
+    }
+    return {
+      bin: standaloneBin,
+      baseArgs: [],
+      entryScript: '',
+      resourceRoot: '',
+      builtinConfigPath,
+      kind: 'standalone-cli',
+    }
+  }
+
+  // 3. ZCode Desktop bundled `resources/glm/zcode.cjs` + Node runtime
+  for (const resRoot of getZCodeResourceRoots(home, platform, env)) {
+    const glmDir = join(resRoot, 'glm')
+    const scriptPath = join(glmDir, 'zcode.cjs')
+    if (!existsSync(scriptPath)) continue
+    const nodeBin = resolveNodeBin(glmDir)
+    if (!nodeBin) continue
+    return {
+      bin: nodeBin,
+      baseArgs: [scriptPath],
+      entryScript: scriptPath,
+      resourceRoot: resRoot,
+      builtinConfigPath: findZCodeBuiltinConfig(effectiveHome, resRoot),
+      kind: 'desktop-bundled',
+    }
+  }
+
+  return null
+}

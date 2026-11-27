@@ -30,6 +30,7 @@ function getFilterTabs(lang) {
     { id: 'claude', label: 'Claude', color: '#D97757' },
     { id: 'antigravity', label: 'Antigravity', color: '#3186FF' },
     { id: 'workbuddy', label: 'WorkBuddy', color: '#06C798' },
+    { id: 'zcode', label: 'ZCode', color: '#64748B' },
   ]
 }
 

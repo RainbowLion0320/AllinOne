@@ -19,6 +19,8 @@ export function NewChatModal({
   modelsCatalog = {},
   workbuddySetup = null,
   onSetupWorkbuddy = null,
+  zcodeSetup = null,
+  onSetupZcode = null,
   onCreate,
 }) {
   const { lang, bi, t } = useI18n()
@@ -469,6 +471,59 @@ export function NewChatModal({
               </div>
             )}
 
+            {app === 'zcode' && !selectedAppStatus?.writable && onSetupZcode && (
+              <div className="rounded-2xl border border-slate-300/75 bg-slate-50 p-3 text-xs dark:border-slate-700/80 dark:bg-[#191C24]">
+                <div className="mb-2 text-[11.5px] leading-relaxed text-slate-700 dark:text-slate-200">
+                  {zcodeSetup?.status === 'working'
+                    ? bi('正在生成智谱官方登录授权链接，请稍候…', 'Launching official ZCode browser sign-in…')
+                    : zcodeSetup?.status === 'awaiting_login'
+                      ? bi('请在弹出的智谱官方页面完成登录确认，授权成功后自动解锁。', 'Finish browser sign-in on the official page to unlock automatically.')
+                      : bi('智谱 ZCode 当前处于只读同步模式。点击下方按钮通过官方浏览器完成一次登录授权，即可解锁远程新建与发消息（与桌面端共享本地会话）。', 'ZCode is currently in read-only sync mode. Complete one-time browser authorization below to unlock remote chat.')}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {zcodeSetup?.status === 'awaiting_login' && zcodeSetup?.authUrl ? (
+                    <a
+                      href={zcodeSetup.authUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      <span>{bi('打开智谱授权页', 'Open Sign-In Page')}</span>
+                    </a>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={zcodeSetup?.status === 'working'}
+                        onClick={() => onSetupZcode('internal')}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+                      >
+                        {zcodeSetup?.status === 'working' ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {zcodeSetup?.status === 'working'
+                            ? bi('正在授权…', 'Authorizing…')
+                            : bi('一键智谱 BigModel 登录', 'Sign in BigModel')}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={zcodeSetup?.status === 'working'}
+                        onClick={() => onSetupZcode('external')}
+                        className="rounded-xl border border-slate-300/80 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 hover:bg-white/70 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800/60"
+                      >
+                        {bi('Z.AI 国际版', 'Z.AI Global')}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
             {createError && (
               <div className="rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
                 {createError}
@@ -477,7 +532,7 @@ export function NewChatModal({
 
             <button
               type="submit"
-              disabled={creating || (app === 'workbuddy' && !selectedAppStatus?.writable)}
+              disabled={creating || ((app === 'workbuddy' || app === 'zcode') && !selectedAppStatus?.writable)}
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-60"
             >
               {creating && <Loader2 className="h-4 w-4 animate-spin" />}

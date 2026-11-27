@@ -89,6 +89,12 @@ export function useSessionManager({
     error: '',
     methodId: 'internal',
   })
+  const [zcodeSetup, setZcodeSetup] = useState({
+    status: 'idle',
+    authUrl: '',
+    error: '',
+    methodId: 'internal',
+  })
 
   // Live refs for zero-stale-closure memoized callbacks
   const activeSessionRef = useRef(activeSession)
@@ -123,6 +129,7 @@ export function useSessionManager({
   const quietSyncPendingRef = useRef('')
   const lastFocusSyncAtRef = useRef(0)
   const workbuddyPollTimerRef = useRef(null)
+  const zcodePollTimerRef = useRef(null)
   const lastMetaAppsSigRef = useRef('')
   const prevP2pStateRef = useRef('idle')
 
@@ -186,13 +193,21 @@ export function useSessionManager({
     }
   }, [])
 
+  const stopZcodeSetupPoll = useCallback(() => {
+    if (zcodePollTimerRef.current) {
+      clearInterval(zcodePollTimerRef.current)
+      zcodePollTimerRef.current = null
+    }
+  }, [])
+
   useEffect(() => {
     return () => {
       stopWorkbuddySetupPoll()
+      stopZcodeSetupPoll()
       clearOptimisticRetryTimer()
       revokeAllSentPreviewUrls()
     }
-  }, [stopWorkbuddySetupPoll, clearOptimisticRetryTimer, revokeAllSentPreviewUrls])
+  }, [stopWorkbuddySetupPoll, stopZcodeSetupPoll, clearOptimisticRetryTimer, revokeAllSentPreviewUrls])
 
   const applyWorkbuddyUnlocked = useCallback(
     (freshApps = null) => {
@@ -293,8 +308,107 @@ export function useSessionManager({
     [activeBridgeIdRef, applyWorkbuddyUnlocked, clientRef, deviceGenRef, showToast, stopWorkbuddySetupPoll],
   )
 
+  const applyZcodeUnlocked = useCallback(
+    (freshApps = null) => {
+      stopZcodeSetupPoll()
+      setZcodeSetup({ status: 'idle', authUrl: '', error: '', methodId: 'internal' })
+      if (Array.isArray(freshApps)) {
+        setAppsStatus(freshApps)
+      }
+      setSessions((prev) => prev.map((s) => (s.app === 'zcode' ? { ...s, writable: true } : s)))
+      setActiveSession((prev) => {
+        if (!prev || prev.app !== 'zcode') return prev
+        const next = { ...prev, writable: true }
+        activeSessionRef.current = next
+        return next
+      })
+    },
+    [stopZcodeSetupPoll],
+  )
+
+  const handleSetupZcode = useCallback(
+    async (methodId = 'internal') => {
+      const client = clientRef.current
+      const reqBridgeId = String(activeBridgeIdRef.current || '').trim()
+      if (!client || !reqBridgeId) {
+        showToast(biLang(getCurrentLang(), '请先连接电脑后再授权 ZCode', 'Connect your computer first'))
+        return
+      }
+      const gen = deviceGenRef.current
+      stopZcodeSetupPoll()
+      setZcodeSetup({ status: 'working', authUrl: '', error: '', methodId })
+      try {
+        const res = await client.rpc(
+          RPC.APP_SETUP,
+          { app: 'zcode', action: 'setup', methodId },
+          30_000,
+          { bridgeId: reqBridgeId },
+        )
+        if (deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) return
+
+        if (res?.writable || res?.status === 'ready') {
+          const fresh = await client.rpc(RPC.APPS_STATUS, {}, 12_000, { bridgeId: reqBridgeId }).catch(() => null)
+          applyZcodeUnlocked(fresh?.apps || null)
+          showToast(biLang(getCurrentLang(), 'ZCode 远程发送权限已解锁！', 'ZCode remote sending unlocked!'))
+          return
+        }
+
+        if (res?.ok && res?.status === 'awaiting_login') {
+          const authUrl = typeof res.authUrl === 'string' && /^https:\/\//i.test(res.authUrl) ? res.authUrl : ''
+          setZcodeSetup({ status: 'awaiting_login', authUrl, error: '', methodId })
+          if (authUrl) {
+            try {
+              window.open(authUrl, '_blank', 'noopener,noreferrer')
+            } catch {}
+          }
+          showToast(
+            authUrl
+              ? biLang(getCurrentLang(), '已打开智谱官方授权页，登录确认后自动解锁', 'Opened official ZCode login page — unlocks automatically.')
+              : biLang(getCurrentLang(), '正在等待智谱官方登录页，请完成授权', 'Waiting for official ZCode sign-in confirmation'),
+          )
+
+          let pollCount = 0
+          zcodePollTimerRef.current = setInterval(() => {
+            pollCount += 1
+            if (pollCount > 72 || deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) {
+              stopZcodeSetupPoll()
+              return
+            }
+            const curClient = clientRef.current
+            if (!curClient) return
+            curClient
+              .rpc(RPC.APPS_STATUS, {}, 10_000, { bridgeId: reqBridgeId })
+              .then((stRes) => {
+                if (deviceGenRef.current !== gen || activeBridgeIdRef.current !== reqBridgeId) return
+                if (Array.isArray(stRes?.apps)) {
+                  setAppsStatus(stRes.apps)
+                  const zc = stRes.apps.find((a) => a.app === 'zcode')
+                  if (zc?.writable) {
+                    applyZcodeUnlocked(stRes.apps)
+                    showToast(biLang(getCurrentLang(), 'ZCode 授权成功，已解锁远程发送！', 'ZCode authorized! Remote sending unlocked.'))
+                  }
+                }
+              })
+              .catch(() => {})
+          }, 2_500)
+          return
+        }
+
+        const errMsg = res?.error || biLang(getCurrentLang(), '授权 ZCode 失败，请稍后重试', 'Failed to authorize ZCode')
+        setZcodeSetup({ status: 'error', authUrl: '', error: errMsg, methodId })
+        showToast(errMsg)
+      } catch (err) {
+        if (deviceGenRef.current !== gen) return
+        const errMsg = String(err?.message || err)
+        setZcodeSetup({ status: 'error', authUrl: '', error: errMsg, methodId })
+        showToast(errMsg)
+      }
+    },
+    [activeBridgeIdRef, applyZcodeUnlocked, clientRef, deviceGenRef, showToast, stopZcodeSetupPoll],
+  )
+
   const defaultApp = useMemo(() => {
-    const order = ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy']
+    const order = ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy', 'zcode']
     for (const id of order) {
       if (appsStatus.find((a) => a.app === id && a.writable)) return id
     }
@@ -1564,15 +1678,17 @@ export function useSessionManager({
         })
         return
       }
-      if (event === EVENTS.SESSION_UPDATED && payload?.authReady && payload?.app === 'workbuddy') {
+      if (event === EVENTS.SESSION_UPDATED && payload?.authReady && (payload?.app === 'workbuddy' || payload?.app === 'zcode')) {
+        const readyApp = payload.app
         const curClient = clientRef.current
         const reqBridgeId = activeBridgeIdRef.current
         if (curClient && reqBridgeId) {
           curClient
             .rpc(RPC.APPS_STATUS, {}, 12_000, { bridgeId: reqBridgeId })
             .then((res) => {
-              if (Array.isArray(res?.apps) && res.apps.find((a) => a.app === 'workbuddy')?.writable) {
-                applyWorkbuddyUnlocked(res.apps)
+              if (Array.isArray(res?.apps) && res.apps.find((a) => a.app === readyApp)?.writable) {
+                if (readyApp === 'workbuddy') applyWorkbuddyUnlocked(res.apps)
+                else if (readyApp === 'zcode') applyZcodeUnlocked(res.apps)
               }
             })
             .catch(() => {})
@@ -1806,6 +1922,7 @@ export function useSessionManager({
     modelPickerOpen,
     setModelPickerOpen,
     workbuddySetup,
+    zcodeSetup,
     activeApp,
     activeCatalog,
     activeModelPref,
@@ -1818,6 +1935,7 @@ export function useSessionManager({
     handleSelectDraftWorkspace,
     handleRefreshQuotas,
     handleSetupWorkbuddy,
+    handleSetupZcode,
     loadWorkspaceData,
     openSession,
     returnToHome,

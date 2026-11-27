@@ -2,7 +2,7 @@ import { killProcessTree } from '../helpers/bin-finder.js'
 import { BoundedLruMap, FileParseCache } from '../primitives/lru.js'
 
 /**
- * Shared foundation for all 5 PC AI App Adapters (`DSH`, `Codex`, `Claude`, `Antigravity`, `WorkBuddy`).
+ * Shared foundation for all PC AI App Adapters (`DSH`, `Codex`, `Claude`, `Antigravity`, `WorkBuddy`, `ZCode`).
  *
  * Centralizes:
  *  - Capability metadata so `MultiAppOrchestrator` queries capabilities instead of hardcoding app names

@@ -14,7 +14,8 @@
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
-  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp; <em>and more</em>
+  <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp;
+  <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> <strong>ZCode</strong> &nbsp;·&nbsp; <em>and more</em>
   <br/>
   <sub>Currently integrated — continuously expanding to more AI tools</sub>
 </p>
@@ -76,6 +77,7 @@
 | <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Remote Chat · Quota Tracking |
 | <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Remote Chat · Balance Tracking |
 | <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **Tencent WorkBuddy** | Remote Chat · Credits Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> **Zhipu ZCode** | Remote Chat · Quota Tracking |
 
 > Automatically reuses your local sign-in out of the box. More AI tools are continuously being added — request yours in [Issues](https://github.com/RainbowLion0320/AllinOne/issues).
 

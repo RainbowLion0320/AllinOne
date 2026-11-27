@@ -141,11 +141,15 @@ function buildNormalizedWindow(w, { lang = 'zh', now = Date.now() } = {}) {
   const resetsAt = toValidTimestamp(w.resetsAt) > 86_400_000 ? toValidTimestamp(w.resetsAt) : 0
   if (resetsAt > 0 && now > resetsAt + 60_000) return null
   const pct = Math.max(0, Math.min(100, Math.round(w.remainingPercent)))
-  const isWeekly = w.kind === 'weekly' || Number(w.windowMinutes) >= 1440
-  const mins = Number(w.windowMinutes) || (isWeekly ? 10080 : 300)
+  const isDaily = w.kind === 'daily' || (Number(w.windowMinutes) >= 720 && Number(w.windowMinutes) <= 2160)
+  const isWeekly = !isDaily && (w.kind === 'weekly' || Number(w.windowMinutes) > 2160)
+  const mins = Number(w.windowMinutes) || (isDaily ? 1440 : isWeekly ? 10080 : 300)
   let label
   let shortLabel
-  if (isWeekly) {
+  if (isDaily) {
+    label = lang === 'en' ? 'Daily Window' : '今日额度'
+    shortLabel = lang === 'en' ? 'Daily' : '今日'
+  } else if (isWeekly) {
     const days = Math.max(1, Math.round(mins / 1440))
     label =
       days === 7
@@ -158,8 +162,8 @@ function buildNormalizedWindow(w, { lang = 'zh', now = Date.now() } = {}) {
     shortLabel = lang === 'en' ? `${hrs}h` : `${hrs}小时`
   }
   return {
-    id: w.id || (isWeekly ? 'weekly' : 'short'),
-    kind: isWeekly ? 'weekly' : 'short',
+    id: w.id || (isDaily ? 'daily' : isWeekly ? 'weekly' : 'short'),
+    kind: isDaily ? 'short' : isWeekly ? 'weekly' : 'short',
     windowMinutes: mins,
     label,
     shortLabel,

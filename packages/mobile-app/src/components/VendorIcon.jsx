@@ -6,6 +6,7 @@ import codexSvg from '../assets/vendors/codex.svg'
 import claudeSvg from '../assets/vendors/claude.svg'
 import antigravitySvg from '../assets/vendors/antigravity.svg'
 import workbuddySvg from '../assets/vendors/workbuddy.svg'
+import zcodeSvg from '../assets/vendors/zcode.svg'
 
 const OFFICIAL_VENDOR_SVG = {
   dsh: deepseekSvg,
@@ -13,6 +14,7 @@ const OFFICIAL_VENDOR_SVG = {
   claude: claudeSvg,
   antigravity: antigravitySvg,
   workbuddy: workbuddySvg,
+  zcode: zcodeSvg,
 }
 
 export function formatEffortLabel(effort, lang = getCurrentLang()) {
@@ -121,7 +123,7 @@ export function VendorIcon({ app, size = 18, className = '', mono = false, activ
           ...(active ? { '--vendor-glow': APP_META[app]?.color || '#4D6BFE' } : {}),
         }}
         className={`inline-block shrink-0 select-none object-contain ${
-          app === 'workbuddy' ? 'rounded-[22%]' : ''
+          app === 'workbuddy' || app === 'zcode' ? 'rounded-[22%]' : ''
         } ${active ? 'vendor-icon-live' : ''} ${className}`}
       />
     )
@@ -148,6 +150,7 @@ const VENDOR_TINTS = {
   claude: 'bg-[#D97757]/12 ring-[#D97757]/25 dark:bg-[#D97757]/20 dark:ring-[#D97757]/35',
   antigravity: 'bg-[#3186FF]/12 ring-[#3186FF]/25 dark:bg-[#3186FF]/18 dark:ring-[#3186FF]/35',
   workbuddy: 'bg-[#06C798]/12 ring-[#06C798]/25 dark:bg-[#06C798]/20 dark:ring-[#06C798]/35',
+  zcode: 'bg-slate-900/10 ring-slate-900/20 dark:bg-white/10 dark:ring-white/20',
 }
 
 /**

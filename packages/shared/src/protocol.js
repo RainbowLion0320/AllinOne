@@ -9,6 +9,7 @@ export const APPS = Object.freeze({
   CLAUDE: 'claude',
   ANTIGRAVITY: 'antigravity',
   WORKBUDDY: 'workbuddy',
+  ZCODE: 'zcode',
 })
 
 export const APP_LIST = Object.freeze([
@@ -17,6 +18,7 @@ export const APP_LIST = Object.freeze([
   APPS.CLAUDE,
   APPS.ANTIGRAVITY,
   APPS.WORKBUDDY,
+  APPS.ZCODE,
 ])
 
 export const APP_META = Object.freeze({
@@ -59,6 +61,14 @@ export const APP_META = Object.freeze({
     color: '#06C798',
     badge: 'WKB',
     description: '腾讯 WorkBuddy 桌面端会话实时同步（安装并登录官方 codebuddy CLI 可解锁远程发消息，账号与额度互通）',
+  },
+  zcode: {
+    id: 'zcode',
+    name: 'ZCode',
+    shortName: 'ZCode',
+    color: '#64748B',
+    badge: 'ZCD',
+    description: '智谱 ZCode 桌面端会话与额度实时同步（复用官方原生 CLI 流式协议，与桌面端共享本地会话）',
   },
 })
 

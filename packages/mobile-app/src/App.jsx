@@ -201,6 +201,7 @@ export function App() {
     modelPickerOpen,
     setModelPickerOpen,
     workbuddySetup,
+    zcodeSetup,
     activeApp,
     activeCatalog,
     activeModelPref,
@@ -213,6 +214,7 @@ export function App() {
     handleSelectDraftWorkspace,
     handleRefreshQuotas,
     handleSetupWorkbuddy,
+    handleSetupZcode,
     loadWorkspaceData,
     openSession,
     returnToHome,
@@ -598,6 +600,13 @@ export function App() {
   const isWorkbuddyWorking = workbuddySetup.status === 'working'
   const isWorkbuddyAwaiting = workbuddySetup.status === 'awaiting_login'
   const workbuddyNeedsCli = wbStatus?.setupState === 'needs_cli' || !wbStatus?.cliInstalled
+
+  const zcodeStatus = appsStatus.find((a) => a.app === 'zcode')
+  const isZcodeReadonly =
+    (activeSession?.app === 'zcode' && activeSession?.writable === false) ||
+    (!activeSession && activeApp === 'zcode' && zcodeStatus && !zcodeStatus.writable)
+  const isZcodeWorking = zcodeSetup.status === 'working'
+  const isZcodeAwaiting = zcodeSetup.status === 'awaiting_login'
 
   return (
     <ImageActionsProvider value={imageActions}>
@@ -1134,6 +1143,73 @@ export function App() {
                       </div>
                     </div>
                   </div>
+                ) : isZcodeReadonly ? (
+                  <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
+                    <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2.5 rounded-2xl border border-slate-300/75 bg-slate-50 px-3.5 py-2.5 lg:max-w-3xl dark:border-slate-700/80 dark:bg-[#1E212B]">
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <span
+                          className={`h-2 w-2 shrink-0 rounded-full ${
+                            isZcodeWorking || isZcodeAwaiting || activeSession?.syncState?.externalRunning
+                              ? 'bg-[#4D6BFE] animate-pulse-dot'
+                              : 'bg-amber-400'
+                          }`}
+                        />
+                        <span className="truncate text-xs font-medium text-slate-700 dark:text-slate-200">
+                          {isZcodeWorking
+                            ? bi('正在生成智谱 ZCode 官方授权链接，请稍候…', 'Starting official ZCode browser sign-in…')
+                            : isZcodeAwaiting
+                              ? bi('请在弹出的智谱官方页面完成登录确认，授权后自动解锁发送', 'Finish sign-in on the official page — unlocks automatically')
+                              : activeSession?.syncState?.externalRunning
+                                ? bi('ZCode 正在电脑端执行 · 实时只读同步中', 'ZCode running on PC · Live read-only sync')
+                                : bi('ZCode 桌面端已同步 · 浏览器授权一次即可解锁远程发送', 'ZCode desktop mirror · 1-click browser sign-in to unlock sending')}
+                        </span>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {isZcodeAwaiting && zcodeSetup.authUrl ? (
+                          <a
+                            href={zcodeSetup.authUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-slate-800 active:scale-95 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            <span>{bi('打开智谱授权页', 'Open Sign-In Page')}</span>
+                          </a>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              disabled={isZcodeWorking || !bridgeOnline || connState !== 'connected'}
+                              onClick={() => handleSetupZcode('internal')}
+                              className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-slate-800 active:scale-95 disabled:opacity-60 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+                            >
+                              {isZcodeWorking ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <ExternalLink className="h-3.5 w-3.5" />
+                              )}
+                              <span>
+                                {isZcodeWorking
+                                  ? bi('授权中…', 'Authorizing…')
+                                  : bi('一键智谱登录', 'Sign in BigModel')}
+                              </span>
+                            </button>
+                            {!isZcodeWorking && (
+                              <button
+                                type="button"
+                                disabled={!bridgeOnline || connState !== 'connected'}
+                                onClick={() => handleSetupZcode('external')}
+                                title={bi('Z.AI 国际版账号登录', 'Sign in with Z.AI Global')}
+                                className="rounded-full border border-slate-300/80 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition hover:bg-white/70 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800/60"
+                              >
+                                {bi('Z.AI 国际版', 'Z.AI')}
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 ) : activeSession?.writable === false ? (
                   <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
                     <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-2.5 rounded-2xl border border-slate-200/90 bg-[#F4F6FA] px-3.5 py-2.5 lg:max-w-3xl dark:border-slate-700/80 dark:bg-[#21232B]">
@@ -1208,6 +1284,8 @@ export function App() {
             modelsCatalog={modelsCatalog}
             workbuddySetup={workbuddySetup}
             onSetupWorkbuddy={handleSetupWorkbuddy}
+            zcodeSetup={zcodeSetup}
+            onSetupZcode={handleSetupZcode}
             onCreateSession={handleCreateSession}
             modelPickerOpen={modelPickerOpen}
             activeApp={activeApp}
