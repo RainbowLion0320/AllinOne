@@ -1,6 +1,6 @@
 {
   "name": "allinone-dsh-mobile",
-  "version": "1.0.32",
+  "version": "1.0.33",
   "private": true,
   "license": "MIT",
   "description": "All in One — Self-hosted cross-device control center (Mobile PWA / Electron Desktop / PC Bridge) for DeepSeek Harness, Codex, Claude Code, and Antigravity.",
