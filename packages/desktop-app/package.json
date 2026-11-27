@@ -38,6 +38,7 @@
       "zh_TW"
     ],
     "afterPack": "scripts/after-pack.cjs",
+    "afterSign": "scripts/notarize.cjs",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -65,7 +66,6 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
-      "identity": null,
       "target": [
         {
           "target": "dmg",
@@ -75,7 +75,11 @@
         }
       ],
       "darkModeSupport": true,
-      "hardenedRuntime": false
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
+      "notarize": false
     },
     "dmg": {
       "title": "All in One",

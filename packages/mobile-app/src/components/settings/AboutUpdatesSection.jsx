@@ -9,8 +9,24 @@ import {
   RotateCw,
 } from 'lucide-react'
 import { formatBytesCompact } from '../../lib/sessionCache.js'
-import { RELEASES_URL, REPO_URL } from '../../lib/clientHelpers.js'
+import { IOS_APP_STORE_URL, RELEASES_URL, REPO_URL } from '../../lib/clientHelpers.js'
 import { useI18n } from '../../lib/i18n.jsx'
+
+function resolveLegalPageUrl(page, baseUrl = '') {
+  const cleanBase = String(baseUrl || '').trim().replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(cleanBase)) {
+    return `${cleanBase}/${page}`
+  }
+  const bakedRelay = String(import.meta.env?.VITE_RELAY_URL || '').trim().replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(bakedRelay)) {
+    return `${bakedRelay}/${page}`
+  }
+  const isNative = typeof window !== 'undefined' && Boolean(window.Capacitor?.isNativePlatform?.())
+  if (isNative) {
+    return page === 'support.html' ? `${REPO_URL}/issues` : REPO_URL
+  }
+  return `./${page}`
+}
 
 export function AboutUpdatesSection({
   open,
@@ -33,6 +49,10 @@ export function AboutUpdatesSection({
   useEffect(() => {
     if (!open) setConfirmLogout(false)
   }, [open])
+
+  const isAppStoreUpdate = updateState?.mode === 'app-store'
+  const privacyUrl = resolveLegalPageUrl('privacy.html', activeDevice?.baseUrl)
+  const supportUrl = resolveLegalPageUrl('support.html', activeDevice?.baseUrl)
 
   const hasActionableUpdate =
     Boolean(onCheckUpdate) &&
@@ -104,15 +124,16 @@ export function AboutUpdatesSection({
                 <div className="flex items-center justify-between gap-2 rounded-xl border border-[#4D6BFE]/30 bg-[#F3F6FF] px-3 py-2 dark:border-[#4D6BFE]/35 dark:bg-[#1C2338]">
                   <div className="min-w-0">
                     <div className="font-bold text-[#2842C9] dark:text-white">
-                      {updateState.nativeUpgradeRequired && !(updateState.downloadUrl && onDownloadUpdate)
+                      {!isAppStoreUpdate && updateState.nativeUpgradeRequired && !(updateState.downloadUrl && onDownloadUpdate)
                         ? bi(`需安装新包 v${updateState.latestVersion}`, `Installer update v${updateState.latestVersion}`)
                         : bi(`新版本 v${updateState.latestVersion}`, `Update v${updateState.latestVersion}`)}
                     </div>
-                    {(updateState.assetSize > 0 || updateState.hotUpdate) && (
+                    {(updateState.assetSize > 0 || updateState.hotUpdate || isAppStoreUpdate) && (
                       <div className="text-[10.5px] text-slate-500 dark:text-slate-400">
                         {[
                           updateState.assetSize > 0 ? formatBytesCompact(updateState.assetSize) : '',
                           updateState.hotUpdate ? bi('热更新', 'Hot update') : '',
+                          isAppStoreUpdate ? 'App Store' : '',
                         ]
                           .filter(Boolean)
                           .join(' · ')}
@@ -130,12 +151,12 @@ export function AboutUpdatesSection({
                     </button>
                   ) : (
                     <a
-                      href={updateState.releaseUrl || RELEASES_URL}
+                      href={isAppStoreUpdate ? (updateState.releaseUrl || IOS_APP_STORE_URL) : (updateState.releaseUrl || RELEASES_URL)}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE] px-3 py-1.5 text-[11.5px] font-semibold text-white"
                     >
-                      <span>{bi('下载安装包', 'Get Installer')}</span>
+                      <span>{isAppStoreUpdate ? bi('前往 App Store', 'App Store') : bi('下载安装包', 'Get Installer')}</span>
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   )}
@@ -242,14 +263,24 @@ export function AboutUpdatesSection({
             </div>
           )}
 
-          <div className="flex items-center justify-around px-3 py-2 text-[11.5px] font-medium text-slate-500 dark:text-slate-400">
+          <div className="flex flex-wrap items-center justify-around gap-y-1 px-3 py-2 text-[11.5px] font-medium text-slate-500 dark:text-slate-400">
             <a
-              href={RELEASES_URL}
+              href={privacyUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1 transition hover:text-slate-800 dark:hover:text-slate-200"
             >
-              <span>Releases</span>
+              <span>{bi('隐私政策', 'Privacy')}</span>
+              <ExternalLink className="h-3 w-3 opacity-70" />
+            </a>
+            <span className="h-3 w-px bg-slate-200 dark:bg-slate-700" />
+            <a
+              href={supportUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 transition hover:text-slate-800 dark:hover:text-slate-200"
+            >
+              <span>{bi('技术支持', 'Support')}</span>
               <ExternalLink className="h-3 w-3 opacity-70" />
             </a>
             <span className="h-3 w-px bg-slate-200 dark:bg-slate-700" />

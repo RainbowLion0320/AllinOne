@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react'
 import { clearE2eeMediaCache } from '../lib/e2eeMedia.js'
 import {
   bindAccountEmail,
+  deleteUserAccount,
   fetchAuthSessions,
   listAccountDevices,
   logoutDeviceSession,
@@ -519,6 +520,53 @@ export function useAccountDevices({
     ],
   )
 
+  const handleDeleteAccount = useCallback(
+    async ({ currentPassword = '', confirmUsername = '' } = {}) => {
+      const dev = activeDeviceRef.current
+      if (!dev?.id || !dev?.baseUrl || !dev?.token) {
+        throw new Error(biLang(getCurrentLang(), '未登录账号', 'Not signed in'))
+      }
+      const targetId = dev.id
+      const targetRoomId = dev.roomId || ''
+      const res = await deleteUserAccount(dev.baseUrl, dev.token, {
+        currentPassword,
+        confirmUsername,
+      })
+      const removingLast = devices.length <= 1
+      void clearSessionCache(targetId, { prefix: true })
+      if (targetRoomId) {
+        void clearE2eeMediaCache({ persistent: true, roomId: targetRoomId })
+      }
+      clearDraftsForScope(targetId)
+      resetTransientWorkspace()
+      setBridges([])
+      setAccountDevices([])
+      if (removingLast) {
+        setDeviceSwitcherOpen(false)
+        setDrawerOpen(false)
+      }
+      setDeviceState((prev) => removeDevice(prev, targetId))
+      const deletedName = res?.deletedUsername ? `@${res.deletedUsername}` : ''
+      showToast(
+        deletedName
+          ? biLang(getCurrentLang(), `账号 ${deletedName} 已永久注销`, `Account ${deletedName} permanently deleted`)
+          : biLang(getCurrentLang(), '账号已永久注销', 'Account permanently deleted'),
+      )
+      return res
+    },
+    [
+      activeDeviceRef,
+      devices.length,
+      resetTransientWorkspace,
+      setAccountDevices,
+      setBridges,
+      setDeviceState,
+      setDeviceSwitcherOpen,
+      setDrawerOpen,
+      showToast,
+    ],
+  )
+
   return {
     handleSelectDevice,
     handleSyncDeviceMeta,
@@ -533,6 +581,7 @@ export function useAccountDevices({
     handleToggleLoginEmail2fa,
     handleGithubLinked,
     handleUnlinkGithub,
+    handleDeleteAccount,
     handleRemoveDevice,
   }
 }

@@ -786,3 +786,153 @@ test('routes/static.js sets non-immutable Cache-Control on .apk/.dmg/.json and i
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+
+test('POST /api/account/delete enforces authentication, password/OAuth verification, sole-admin safety, and erases account permanently', async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), 'aio-acct-del-'))
+  let srv = null
+  try {
+    srv = createRelayServer({
+      port: 0,
+      host: '127.0.0.1',
+      stunEnabled: false,
+      jwtSecret: 'delete-account-test-secret-123456',
+      accountsFile: join(dir, 'accounts.json'),
+      log: silentLog,
+    })
+    const { port } = await srv.start()
+
+    // 1. Register first user (admin) + second user (normal)
+    const adminReg = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/register',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'del_admin', password: 'AdminDeletePass!1' }),
+    })
+    assert.equal(adminReg.status, 200)
+    const adminToken = adminReg.json.token
+
+    const userReg = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/register',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'del_alice', password: 'AliceDeletePass!1' }),
+    })
+    assert.equal(userReg.status, 200)
+    const aliceToken = userReg.json.token
+    const aliceUserId = userReg.json.roomId
+
+    // 2. Unauthenticated request -> 401
+    const unauth = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: 'AliceDeletePass!1' }),
+    })
+    assert.equal(unauth.status, 401)
+
+    // 3. Wrong password -> 403, account untouched
+    const badPw = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceToken}`,
+      },
+      body: JSON.stringify({ currentPassword: 'WrongPassword!99' }),
+    })
+    assert.equal(badPw.status, 403)
+    assert.ok(srv.accounts.getUserById(aliceUserId))
+
+    // 4. Sole admin cannot self-delete while other users exist -> 400
+    const soleAdminBlocked = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ currentPassword: 'AdminDeletePass!1' }),
+    })
+    assert.equal(soleAdminBlocked.status, 400)
+
+    // 5. Normal user deletes own account with valid password -> 200 & token immediately invalid
+    const aliceDeleted = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceToken}`,
+      },
+      body: JSON.stringify({ currentPassword: 'AliceDeletePass!1' }),
+    })
+    assert.equal(aliceDeleted.status, 200)
+    assert.equal(aliceDeleted.json.ok, true)
+    assert.equal(aliceDeleted.json.deletedUsername, 'del_alice')
+    assert.equal(srv.accounts.getUserById(aliceUserId), null)
+
+    const meAfterDelete = await httpRequestRaw({
+      port,
+      method: 'GET',
+      path: '/api/auth/me',
+      headers: { Authorization: `Bearer ${aliceToken}` },
+    })
+    assert.equal(meAfterDelete.status, 401)
+
+    // 6. Passwordless GitHub OAuth account can self-delete by confirming username
+    const ghLogin = await srv.accounts.loginOrRegisterGithubUserAsync({
+      githubId: '987654321',
+      githubLogin: 'gh_del_bob',
+      email: 'bob@example.com',
+      emailVerified: true,
+    })
+    assert.equal(ghLogin.ok, true)
+    const authHelper = createAuthManager({ jwtSecret: 'delete-account-test-secret-123456' })
+    const bobSid = authHelper.generateSessionId()
+    srv.accounts.recordUserSession(ghLogin.user.userId, { sid: bobSid, deviceName: 'iPhone', clientKind: 'mobile', ip: '127.0.0.1' })
+    const bobToken = authHelper.signSessionToken(ghLogin.user.userId, 'iPhone', ghLogin.user.userId, ghLogin.user.tokenVersion, {
+      role: ghLogin.user.role,
+      username: ghLogin.user.username,
+      sid: bobSid,
+    })
+
+    const badConfirm = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bobToken}` },
+      body: JSON.stringify({ confirmUsername: 'wrong_name' }),
+    })
+    assert.equal(badConfirm.status, 400)
+
+    const bobDeleted = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bobToken}` },
+      body: JSON.stringify({ confirmUsername: ghLogin.user.username }),
+    })
+    assert.equal(bobDeleted.status, 200)
+    assert.equal(srv.accounts.getUserById(ghLogin.user.userId), null)
+
+    // 7. Once sole remaining user on the server, admin can also cleanly delete their own account
+    const adminDeleted = await httpRequestRaw({
+      port,
+      method: 'POST',
+      path: '/api/account/delete',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ currentPassword: 'AdminDeletePass!1' }),
+    })
+    assert.equal(adminDeleted.status, 200)
+    assert.equal(srv.accounts.getUserCount(), 0)
+  } finally {
+    if (srv) await srv.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

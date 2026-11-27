@@ -280,6 +280,7 @@ export function App() {
     handleToggleLoginEmail2fa,
     handleGithubLinked,
     handleUnlinkGithub,
+    handleDeleteAccount,
     handleRemoveDevice,
   } = useAccountDevices({
     devices,
@@ -1353,6 +1354,7 @@ export function App() {
             onToggleLoginEmail2fa={handleToggleLoginEmail2fa}
             onGithubLinked={handleGithubLinked}
             onUnlinkGithub={handleUnlinkGithub}
+            onDeleteAccount={handleDeleteAccount}
             turnQuota={turnQuota}
             dataSaver={dataSaver}
             onToggleDataSaver={handleToggleDataSaver}

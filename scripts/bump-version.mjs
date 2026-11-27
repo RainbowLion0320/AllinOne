@@ -37,8 +37,19 @@ const EXTRA_SCAN_FILES = [
   'packages/mobile-app/vite.config.js',
 ]
 
+const IOS_PBXPROJ_PATH = 'packages/mobile-app/ios/App/App.xcodeproj/project.pbxproj'
+
+export function computeIosMarketingVersion(rawVersion) {
+  const parsed = parseSemver(rawVersion)
+  if (!parsed) {
+    throw new Error(`Invalid SemVer for iOS MARKETING_VERSION: "${rawVersion}"`)
+  }
+  // App Store Connect requires CFBundleShortVersionString to be numeric X.Y.Z without pre-release suffixes
+  return `${parsed.major}.${parsed.minor}.${parsed.patch}`
+}
+
 /**
- * Compute a strictly monotonic, collision-free Android `versionCode` for SemVer
+ * Compute a strictly monotonic, collision-free Android `versionCode` / iOS `CURRENT_PROJECT_VERSION` for SemVer
  * (including pre-release versions: alpha < beta < rc < stable).
  * Mirrors `packages/mobile-app/android/app/build.gradle`.
  */
@@ -117,6 +128,29 @@ function checkVersions() {
   for (const [rel, ver] of versions.entries()) {
     if (ver !== rootVer) {
       errors.push(`Version drift: ${rel} has "${ver}" but root package.json has "${rootVer}"`)
+    }
+  }
+
+  // Check iOS Xcode MARKETING_VERSION & CURRENT_PROJECT_VERSION sync
+  const iosPbxPath = join(REPO_ROOT, IOS_PBXPROJ_PATH)
+  if (rootVer && existsSync(iosPbxPath)) {
+    const expectedMarketing = computeIosMarketingVersion(rootVer)
+    const pbx = readFileSync(iosPbxPath, 'utf8')
+    const marketingVals = [...pbx.matchAll(/MARKETING_VERSION\s*=\s*([^;]+);/g)].map((m) => m[1].trim())
+    const buildVals = [...pbx.matchAll(/CURRENT_PROJECT_VERSION\s*=\s*([^;]+);/g)].map((m) => m[1].trim())
+    if (marketingVals.length === 0) {
+      errors.push(`Missing MARKETING_VERSION in ${IOS_PBXPROJ_PATH}`)
+    } else if (marketingVals.some((v) => v !== expectedMarketing)) {
+      errors.push(
+        `Version drift in ${IOS_PBXPROJ_PATH}: MARKETING_VERSION=[${marketingVals.join(', ')}], expected "${expectedMarketing}"`,
+      )
+    }
+    if (buildVals.length === 0) {
+      errors.push(`Missing CURRENT_PROJECT_VERSION in ${IOS_PBXPROJ_PATH}`)
+    } else if (buildVals.some((v) => v !== String(androidVersionCode))) {
+      errors.push(
+        `Version drift in ${IOS_PBXPROJ_PATH}: CURRENT_PROJECT_VERSION=[${buildVals.join(', ')}], expected "${androidVersionCode}"`,
+      )
     }
   }
 
@@ -202,8 +236,17 @@ function bumpVersion(nextRaw) {
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8')
   }
 
+  const iosPbxPath = join(REPO_ROOT, IOS_PBXPROJ_PATH)
+  if (existsSync(iosPbxPath)) {
+    const nextMarketing = computeIosMarketingVersion(nextVer)
+    const pbx = readFileSync(iosPbxPath, 'utf8')
+      .replace(/MARKETING_VERSION\s*=\s*[^;]+;/g, `MARKETING_VERSION = ${nextMarketing};`)
+      .replace(/CURRENT_PROJECT_VERSION\s*=\s*[^;]+;/g, `CURRENT_PROJECT_VERSION = ${nextAndroidCode};`)
+    writeFileSync(iosPbxPath, pbx, 'utf8')
+  }
+
   console.log(
-    `[bump-version] Updated all ${PACKAGE_PATHS.length} package manifests + package-lock.json to v${nextVer} (android versionCode=${nextAndroidCode})`,
+    `[bump-version] Updated all ${PACKAGE_PATHS.length} package manifests, iOS project, and package-lock.json to v${nextVer} (mobile build=${nextAndroidCode})`,
   )
 }
 

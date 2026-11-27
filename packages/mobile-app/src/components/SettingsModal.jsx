@@ -41,6 +41,7 @@ export function SettingsModal({
   onToggleLogin2fa = null,
   onGithubLinked = null,
   onUnlinkGithub = null,
+  onDeleteAccount = null,
   turnQuota = null,
   dataSaver = true,
   onToggleDataSaver = null,
@@ -124,6 +125,8 @@ export function SettingsModal({
             onToggleLogin2fa={onToggleLogin2fa}
             onGithubLinked={onGithubLinked}
             onUnlinkGithub={onUnlinkGithub}
+            onDeleteAccount={onDeleteAccount}
+            onClose={onClose}
           />
 
           <AppearanceDesktopSection

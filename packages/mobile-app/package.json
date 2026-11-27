@@ -9,12 +9,14 @@
     "build": "vite build",
     "preview": "vite preview --host",
     "cap:sync": "node scripts/prepare-android.mjs",
-    "prepare:android": "node scripts/prepare-android.mjs"
+    "prepare:android": "node scripts/prepare-android.mjs",
+    "prepare:ios": "node scripts/prepare-ios.mjs"
   },
   "dependencies": {
     "@allinone/shared": "*",
     "@capacitor/android": "^7.6.10",
-    "@capacitor/core": "^7.2.0",
+    "@capacitor/core": "^7.6.11",
+    "@capacitor/ios": "^7.6.11",
     "highlight.js": "^11.12.0",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.511.0",
@@ -24,7 +26,7 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "@capacitor/cli": "^7.2.0",
+    "@capacitor/cli": "^7.6.11",
     "@tailwindcss/vite": "^4.1.7",
     "@vitejs/plugin-react": "^4.5.0",
     "tailwindcss": "^4.1.7",

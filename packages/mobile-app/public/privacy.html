@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>隐私政策 / Privacy Policy — All in One AI</title>
+    <link rel="icon" type="image/png" href="./icon-192.png" />
+    <style>
+      :root {
+        --bg: #f8fafc;
+        --card: #ffffff;
+        --border: #e2e8f0;
+        --text: #0f172a;
+        --muted: #475569;
+        --accent: #4d6bfe;
+        --badge-bg: rgba(77, 107, 254, 0.12);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0b0e14;
+          --card: #151923;
+          --border: #252b3b;
+          --text: #f1f5f9;
+          --muted: #94a3b8;
+          --accent: #6c87ff;
+          --badge-bg: rgba(108, 135, 255, 0.16);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.7;
+      }
+      main {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 36px 20px 64px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 24px;
+      }
+      header img {
+        width: 44px;
+        height: 44px;
+        border-radius: 11px;
+        background: #0b0e14;
+      }
+      h1 {
+        margin: 0;
+        font-size: 22px;
+        line-height: 1.3;
+      }
+      .subtitle {
+        margin: 4px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .lang-nav {
+        display: inline-flex;
+        gap: 10px;
+        margin-bottom: 20px;
+      }
+      .lang-nav a {
+        display: inline-block;
+        padding: 5px 12px;
+        border-radius: 999px;
+        background: var(--badge-bg);
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      section.card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 24px 24px 20px;
+        margin-bottom: 20px;
+      }
+      h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+      h3 {
+        margin: 18px 0 6px;
+        font-size: 15px;
+      }
+      p,
+      li {
+        font-size: 14px;
+        color: var(--muted);
+      }
+      ul {
+        padding-left: 20px;
+        margin: 6px 0 12px;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12.5px;
+        padding: 1px 6px;
+        border-radius: 6px;
+        background: var(--badge-bg);
+        color: var(--text);
+      }
+      a {
+        color: var(--accent);
+      }
+      footer {
+        text-align: center;
+        font-size: 12.5px;
+        color: var(--muted);
+        margin-top: 28px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="./icon-192.png" alt="All in One AI" />
+        <div>
+          <h1>All in One AI 隐私政策 / Privacy Policy</h1>
+          <p class="subtitle">生效日期 / Effective Date: 2026-11-27 · 开发者 / Developer: Hao Sun</p>
+        </div>
+      </header>
+
+      <nav class="lang-nav" aria-label="Language">
+        <a href="#zh">简体中文</a>
+        <a href="#en">English</a>
+        <a href="./support.html">技术支持 / Support</a>
+      </nav>
+
+      <section class="card" id="zh">
+        <h2>简体中文</h2>
+        <p>
+          <strong>All in One AI</strong>（Bundle ID: <code>com.allinone.dshmobile</code>）是一款面向个人开发者的跨设备 AI
+          远程控制客户端，用于通过端到端加密（E2EE）P2P 通道连接你本人电脑上的本地 AI 工具。我们严格遵守数据最小化原则，不投放广告、不追踪用户、不出售或向第三方共享你的个人数据。
+        </p>
+
+        <h3>1. 端到端加密与零知识架构</h3>
+        <ul>
+          <li>你的所有对话内容、代码片段、终端输出、图片与文件均在你的手机与个人电脑之间通过 <strong>AES-256-GCM / WebRTC DTLS</strong> 端到端加密传输。</li>
+          <li>配对密钥仅保存在你自己的设备本地（通过扫描你电脑上的二维码完成配对），中继服务器无法解密你的任何对话内容或本地文件。</li>
+          <li>本项目支持连接用户自行部署的私有中继服务器。</li>
+        </ul>
+
+        <h3>2. 我们收集的最小化信息</h3>
+        <ul>
+          <li><strong>账号标识信息</strong>：用户名、加盐哈希后的密码（scrypt）、可选绑定的电子邮箱（仅用于登录二次验证或找回密码）以及可选绑定的 GitHub 账号 ID。</li>
+          <li><strong>设备连接元数据</strong>：已绑定电脑的名称与系统平台、登录会话记录（设备类型与最近登录 IP，用于安全审计和强制下线异常设备）以及中继带宽月度计量统计。</li>
+          <li><strong>我们不收集</strong>：通讯录、精准定位、健康数据、财务信息、跨应用广告标识符（IDFA）或任何第三方数据分析 SDK 遥测。</li>
+        </ul>
+
+        <h3>3. 系统权限说明（iOS / Android）</h3>
+        <ul>
+          <li><strong>相机权限</strong>：仅在你主动点击扫码配对时调用，用于扫描电脑端生成的端到端加密二维码；不会录像或上传相机画面。</li>
+          <li><strong>照片图库权限</strong>：仅在你主动选择图片发送给电脑端 AI 助手，或主动点击保存对话中的图片到系统相册时使用。</li>
+          <li><strong>本地网络权限</strong>：用于发现并与同一局域网内的个人电脑建立低延迟 WebRTC P2P 直连，减少中继流量消耗。</li>
+        </ul>
+
+        <h3>4. 数据保留与账号注销</h3>
+        <p>
+          你可以随时在应用内永久注销账号：打开 <strong>All in One AI → 设置 → 账号与安全 → 注销账号（永久删除）</strong>，通过身份验证后，你的中继账号、绑定邮箱、GitHub 关联、已绑定电脑凭证与全部活跃会话将被立即永久删除且不可恢复。你本地电脑上的项目文件与对话历史由你本人设备保留，不受影响。
+        </p>
+
+        <h3>5. 联系我们</h3>
+        <p>
+          如对本隐私政策或数据权利有任何疑问，请访问
+          <a href="./support.html">技术支持页面</a> 或在
+          <a href="https://github.com/RainbowLion0320/AllinOne/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a>
+          提交反馈。
+        </p>
+      </section>
+
+      <section class="card" id="en">
+        <h2>English</h2>
+        <p>
+          <strong>All in One AI</strong> (Bundle ID: <code>com.allinone.dshmobile</code>) is a cross-device remote control client that connects your mobile device to AI coding tools running on your own personal computer over an end-to-end encrypted (E2EE) peer-to-peer channel. We follow strict data minimization: no ads, no third-party tracking SDKs, and no selling or sharing of personal data.
+        </p>
+
+        <h3>1. End-to-End Encryption &amp; Zero-Knowledge Design</h3>
+        <ul>
+          <li>All conversations, source code, tool outputs, images, and deliverables are encrypted end-to-end between your mobile device and your own computer using <strong>AES-256-GCM over WebRTC DTLS</strong>.</li>
+          <li>Encryption keys remain strictly on your devices (exchanged locally via QR code pairing). The relay server only handles WebRTC signaling and encrypted ciphertext and cannot decrypt your content.</li>
+          <li>You may also point the app to your own self-hosted relay server at any time.</li>
+        </ul>
+
+        <h3>2. Minimal Account Data We Process</h3>
+        <ul>
+          <li><strong>Account credentials</strong>: username, salted scrypt password hash, optional email address (used solely for password recovery and optional 2FA), and optional GitHub OAuth identifier.</li>
+          <li><strong>Connection metadata</strong>: names and OS labels of your paired computers, active device session logs (device type and recent login IP for security review and remote sign-out), and monthly relay bandwidth counters.</li>
+          <li><strong>Not collected</strong>: contacts, precise location, health/financial data, advertising identifiers (IDFA), or third-party behavioral analytics.</li>
+        </ul>
+
+        <h3>3. Device Permissions</h3>
+        <ul>
+          <li><strong>Camera</strong>: used exclusively when you tap Scan QR to pair E2EE keys with your computer. Camera frames are processed on-device and never uploaded.</li>
+          <li><strong>Photo Library</strong>: used only when you explicitly pick an image to send to your computer or save a generated image to Photos.</li>
+          <li><strong>Local Network</strong>: used to establish direct low-latency WebRTC peer-to-peer connections with your own computer on the same LAN.</li>
+        </ul>
+
+        <h3>4. Data Retention &amp; In-App Account Deletion</h3>
+        <p>
+          You can permanently delete your account directly inside the app at any time via
+          <strong>Settings → Account &amp; Security → Delete Account</strong>. Upon confirmation, your relay account, linked email/GitHub association, computer bindings, and all active sessions are immediately and permanently erased. Local files on your own computers are untouched.
+        </p>
+
+        <h3>5. Contact</h3>
+        <p>
+          For privacy questions or data requests, visit our <a href="./support.html">Support Page</a> or open an issue on
+          <a href="https://github.com/RainbowLion0320/AllinOne/issues" target="_blank" rel="noopener noreferrer">GitHub</a>.
+        </p>
+      </section>
+
+      <footer>
+        &copy; 2026 All in One AI · <a href="./support.html">技术支持 / Support</a> ·
+        <a href="https://github.com/RainbowLion0320/AllinOne" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </footer>
+    </main>
+  </body>
+</html>

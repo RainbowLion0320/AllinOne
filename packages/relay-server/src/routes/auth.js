@@ -1504,6 +1504,95 @@ export function createAuthRoutes({
       return true
     }
 
+    // Self-service permanent account deletion (App Store Guideline 5.1.1(v) compliance)
+    if (pathname === '/api/account/delete' && req.method === 'POST') {
+      const bearerToken = extractBearer(req)
+      const payload = auth.verifySessionToken(bearerToken)
+      if (!payload || !String(payload.room || '').startsWith('usr_')) {
+        sendJson(res, 401, { ok: false, error: '未授权或非账号登录模式' })
+        return true
+      }
+      if (!checkUserActionRateLimit('write', payload.room, 20)) {
+        sendJson(res, 429, { ok: false, error: '操作过于频繁，请稍后再试' })
+        return true
+      }
+      const ip = getClientIp(req)
+      if (!auth.checkRateLimit(ip) || !auth.checkAccountRateLimit(payload.room, ip)) {
+        sendJson(res, 429, { ok: false, error: '尝试次数过多，请稍后再试' })
+        return true
+      }
+      try {
+        const body = await readJsonObjectBody(req)
+        const targetUser = accounts.getUserById(payload.room)
+        if (!targetUser) {
+          sendJson(res, 401, { ok: false, error: '账号不存在' })
+          return true
+        }
+        if (targetUser.hasPassword !== false) {
+          const currentPassword = String(body.currentPassword ?? '')
+          if (!currentPassword) {
+            sendJson(res, 403, { ok: false, error: '注销账号需要验证当前密码' })
+            return true
+          }
+          const pwValid = await accounts.verifyUserPasswordAsync(payload.room, currentPassword)
+          if (!pwValid) {
+            auth.recordFailure(ip)
+            auth.recordAccountFailure(payload.room, ip)
+            sendJson(res, 403, { ok: false, error: '当前密码不正确' })
+            return true
+          }
+          if (!auth.verifySessionToken(bearerToken)) {
+            sendJson(res, 401, { ok: false, error: '会话已失效，请重新登录' })
+            return true
+          }
+          auth.clearAccountFailure(payload.room, ip)
+        } else {
+          const confirmUsername = String(body.confirmUsername || '').trim().toLowerCase()
+          if (!confirmUsername || confirmUsername !== String(targetUser.username || '').toLowerCase()) {
+            sendJson(res, 400, { ok: false, error: '请输入当前用户名以确认永久注销账号' })
+            return true
+          }
+        }
+
+        const deleted = accounts.deleteUser(payload.room)
+        if (!deleted?.ok) {
+          sendJson(res, deleted?.statusCode || 400, { ok: false, error: deleted?.error || '注销账号失败' })
+          return true
+        }
+
+        hub.disconnectRoomClients(payload.room, 4401, 'Account deleted')
+        hub.disconnectRoomBridges(payload.room, 4401, 'Account deleted')
+        hub.recordActivity({
+          type: 'user.delete',
+          roomId: payload.room,
+          label: `@${deleted.user.username}`,
+          detail: 'self-deleted',
+          ip,
+        })
+        if (mailer.isConfigured() && deleted.user.email && deleted.user.emailVerified && shouldSendSecurityEmail(payload.room, 'account_deleted', ip)) {
+          mailer
+            .sendSecurityNotice({
+              to: deleted.user.email,
+              username: deleted.user.username,
+              title: '账号已永久注销',
+              summary: '你的 All in One 账号以及关联的电脑设备绑定和登录会话已按你的操作永久删除。',
+              ip,
+              at: Date.now(),
+            })
+            .catch((err) => {
+              log.warn(`[relay] Failed to send account-deleted notice for @${deleted.user.username}: ${String(err?.message || err)}`)
+            })
+        }
+        sendJson(res, 200, {
+          ok: true,
+          deletedUsername: deleted.user.username,
+        })
+      } catch (err) {
+        sendRouteError(res, err, log, pathname)
+      }
+      return true
+    }
+
     // Verify existing session token & return profile + ICE servers
     if (pathname === '/api/auth/me' && req.method === 'GET') {
       const payload = auth.verifySessionToken(extractBearer(req))

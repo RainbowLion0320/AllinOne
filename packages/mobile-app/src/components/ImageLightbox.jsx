@@ -603,19 +603,21 @@ export function ImageLightbox({ state, imageContext: propImageContext = null, on
     naturalSize.width / imgRef.current.offsetWidth > 1.15
 
   const isModified = displayScalePct !== 100 || rotation !== 0
-  const handleNativeAndroidImageSave = async (e) => {
+  const handleNativeMobileImageSave = async (e) => {
     if (!isBlobOrDataDownload || !downloadHref) return
-    const isAndroidCap = Boolean(
-      typeof window !== 'undefined' &&
-      window.Capacitor?.isNativePlatform?.() &&
-      String(window.Capacitor?.getPlatform?.() || '').toLowerCase() === 'android' &&
+    const capPlatform =
+      typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()
+        ? String(window.Capacitor?.getPlatform?.() || '').toLowerCase()
+        : ''
+    const isNativeMobileCap = Boolean(
+      (capPlatform === 'android' || capPlatform === 'ios') &&
       typeof window.Capacitor?.Plugins?.AllinOneFiles?.saveAndShare === 'function',
     )
     const maybeSvg =
       /\.svg(?:$|[?#])/i.test(String(current.label || current.rawPath || '').trim()) ||
       /svg/i.test(String(current.item?.mimeType || '')) ||
       /^data:image\/svg\+xml/i.test(downloadHref)
-    if (!isAndroidCap && !maybeSvg && !downloadHref.startsWith('blob:')) return
+    if (!isNativeMobileCap && !maybeSvg && !downloadHref.startsWith('blob:')) return
     e.preventDefault()
     try {
       const res = await fetch(downloadHref)
@@ -623,7 +625,7 @@ export function ImageLightbox({ state, imageContext: propImageContext = null, on
       const isSvgBlob = maybeSvg || String(rawBlob.type || '').toLowerCase().includes('svg')
       const safeMime = isSvgBlob ? 'application/octet-stream' : (rawBlob.type || 'image/png')
       const safeBlob = isSvgBlob ? new Blob([rawBlob], { type: 'application/octet-stream' }) : rawBlob
-      if (isAndroidCap) {
+      if (isNativeMobileCap) {
         await saveOrShareBlobNatively(safeBlob, {
           filename: current.label || 'image.png',
           mimeType: safeMime,
@@ -687,7 +689,7 @@ export function ImageLightbox({ state, imageContext: propImageContext = null, on
             <a
               href={downloadHref}
               download={current.label || 'image.png'}
-              onClick={handleNativeAndroidImageSave}
+              onClick={handleNativeMobileImageSave}
               {...(isBlobOrDataDownload ? {} : { target: '_blank', rel: 'noreferrer' })}
               title={bi('保存原图', 'Save image')}
               className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 transition hover:bg-white/20 active:scale-95"

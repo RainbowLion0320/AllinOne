@@ -22,9 +22,12 @@ export function useOtaUpdater({ desktopApi, activeDevice, showToast }) {
 
   const isNativeMobile =
     typeof window !== 'undefined' && !desktopApi && Boolean(window.Capacitor?.isNativePlatform?.())
-  const nativeOtaPlugin = isNativeMobile ? window.Capacitor?.Plugins?.AllinOneUpdater || null : null
+  const nativePlatform = isNativeMobile ? String(window.Capacitor?.getPlatform?.() || '').toLowerCase() : ''
+  // App Store Guideline 2.5.2: strictly disable native JS OTA updates on iOS builds
+  const nativeOtaPlugin =
+    isNativeMobile && nativePlatform !== 'ios' ? window.Capacitor?.Plugins?.AllinOneUpdater || null : null
   const isWebHotUpdatable =
-    typeof window !== 'undefined' && !desktopApi && isHotReloadableWebOrigin(window.location)
+    typeof window !== 'undefined' && !desktopApi && !isNativeMobile && isHotReloadableWebOrigin(window.location)
   const canCheckMobileUpdate = !desktopApi && (isNativeMobile || isWebHotUpdatable)
 
   // Electron Desktop auto-updater subscription
@@ -284,6 +287,7 @@ export function useOtaUpdater({ desktopApi, activeDevice, showToast }) {
         nativeVersion,
         stagedVersion,
         hasNativeOta: Boolean(nativeOtaPlugin),
+        platform: nativePlatform,
         baseUrl: activeDevice?.baseUrl || '',
         token: activeDevice?.token || '',
       })
@@ -296,7 +300,7 @@ export function useOtaUpdater({ desktopApi, activeDevice, showToast }) {
       setUpdateState(next)
       return next
     },
-    [canCheckMobileUpdate, nativeOtaPlugin, activeDevice?.baseUrl, activeDevice?.token, handleDownloadMobileUpdate],
+    [canCheckMobileUpdate, nativeOtaPlugin, nativePlatform, activeDevice?.baseUrl, activeDevice?.token, handleDownloadMobileUpdate],
   )
 
   // Periodic background check for mobile (5s after launch + every 4h)

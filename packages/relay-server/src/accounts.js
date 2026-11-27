@@ -386,6 +386,7 @@ export function createAccountStore({ filePath }) {
   const stmtUpdateRevokeTokens = db.prepare(
     'UPDATE users SET token_version = ?, sessions_json = ? WHERE user_id = ?',
   )
+  const stmtDeleteUser = db.prepare('DELETE FROM users WHERE user_id = ?')
 
   const stmtUpsertDaily = db.prepare(`
     INSERT INTO daily_registrations (day_key, count) VALUES (?, ?)
@@ -2122,6 +2123,56 @@ export function createAccountStore({ filePath }) {
     return result
   }
 
+  function deleteUser(userId) {
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, statusCode: 404, error: '账号不存在' }
+        return
+      }
+      if (record.role === 'admin' && usersById.size > 1) {
+        let otherAdminCount = 0
+        for (const u of usersById.values()) {
+          if (u.userId !== userId && u.role === 'admin') {
+            otherAdminCount += 1
+          }
+        }
+        if (otherAdminCount === 0) {
+          result = {
+            ok: false,
+            statusCode: 400,
+            error: '当前为唯一管理员且服务器存在其他用户，请先将其他用户设为管理员后再注销',
+          }
+          return
+        }
+      }
+      stmtDeleteUser.run(userId)
+      usersById.delete(userId)
+      if (record.usernameLower && userIdByLower.get(record.usernameLower) === userId) {
+        userIdByLower.delete(record.usernameLower)
+      }
+      if (record.emailLower && userIdByEmailLower.get(record.emailLower) === userId) {
+        userIdByEmailLower.delete(record.emailLower)
+      }
+      if (record.githubId && userIdByGithubId.get(record.githubId) === userId) {
+        userIdByGithubId.delete(record.githubId)
+      }
+      dirtyTelemetryUsers.delete(userId)
+      pendingTurnDelta.delete(userId)
+      pendingLastLogin.delete(userId)
+      pendingDeviceLastSeen.delete(userId)
+      pendingSessionTouches.delete(userId)
+      changingPasswordUsers.delete(userId)
+      result = {
+        ok: true,
+        user: sanitizeUser(record),
+        bridgeIds: Array.isArray(record.devices) ? record.devices.map((d) => d.bridgeId).filter(Boolean) : [],
+      }
+    })
+    return result
+  }
+
   function listUsers() {
     syncExternalChangesIfNeeded()
     return [...usersById.values()]
@@ -2222,6 +2273,7 @@ export function createAccountStore({ filePath }) {
     isSessionRevoked,
     revokeUserSession,
     revokeUserTokens,
+    deleteUser,
     listUsers,
     listUsersForAdmin,
   }

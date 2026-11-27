@@ -3,6 +3,7 @@ import { compareSemver } from '@allinone/shared/semver'
 export { compareSemver }
 
 export const REPO_URL = 'https://github.com/RainbowLion0320/AllinOne'
+export const IOS_APP_STORE_URL = 'https://apps.apple.com/app/id6840015939'
 
 const DEFAULT_RELEASES_URL = 'https://github.com/RainbowLion0320/AllinOne/releases/latest'
 const DEFAULT_RELEASES_API_URL = 'https://api.github.com/repos/RainbowLion0320/AllinOne/releases/latest'
@@ -235,6 +236,7 @@ export async function checkNativeMobileUpdate({
   nativeVersion = '',
   stagedVersion = '',
   hasNativeOta = false,
+  platform = '',
   baseUrl = '',
   token = '',
   timeoutMs = 7000,
@@ -244,8 +246,19 @@ export async function checkNativeMobileUpdate({
   navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
   releasesApiUrl = DEFAULT_RELEASES_API_URL,
 } = {}) {
+  const detectedPlatform = String(
+    platform ||
+      (typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()
+        ? window.Capacitor?.getPlatform?.() || ''
+        : ''),
+  )
+    .trim()
+    .toLowerCase()
+  const isIosNative = detectedPlatform === 'ios'
+
   // 1. Remote HTTPS web origin (Mobile PWA or remote-hosted Android WebView APK): always hot-reload in-place!
-  if (isHotReloadableWebOrigin(locationLike)) {
+  //    Never used on native iOS builds (App Store Guideline 2.5.2).
+  if (!isIosNative && isHotReloadableWebOrigin(locationLike)) {
     return checkWebHotUpdate({
       currentVersion,
       baseUrl,
@@ -257,11 +270,14 @@ export async function checkNativeMobileUpdate({
     })
   }
 
+  // Strictly disable dynamic JS OTA bundles on iOS (App Store Guideline 2.5.2)
+  const allowNativeOta = Boolean(hasNativeOta) && !isIosNative
+
   const curVer = String(currentVersion || '').trim().replace(/^v/i, '')
   const curNativeVer = String(nativeVersion || curVer).trim().replace(/^v/i, '')
   const curStagedVer = String(stagedVersion || '').trim().replace(/^v/i, '')
   let bestVersion = ''
-  let releaseUrl = resolveApkUrl(baseUrl) || RELEASES_URL
+  let releaseUrl = isIosNative ? IOS_APP_STORE_URL : (resolveApkUrl(baseUrl) || RELEASES_URL)
   let apkAssetSize = 0
   let checkedAny = false
 
@@ -303,7 +319,7 @@ export async function checkNativeMobileUpdate({
   }
 
   const checkRelayOtaMirror = async () => {
-    if (!hasNativeOta || !cleanBase || !/^https:\/\//i.test(cleanBase)) return
+    if (!allowNativeOta || !cleanBase || !/^https:\/\//i.test(cleanBase)) return
     try {
       const res = await fetchWithTimeout(`${cleanBase}/downloads/ota/All-in-One-WebBundle.json?_t=${Date.now()}`, {
         cache: 'no-store',
@@ -367,6 +383,12 @@ export async function checkNativeMobileUpdate({
         bestVersion = ghVer
       }
 
+      if (isIosNative) {
+        // On iOS App Store builds, never link to external installers or download OTA bundles
+        releaseUrl = IOS_APP_STORE_URL
+        return
+      }
+
       const assets = Array.isArray(data?.assets) ? data.assets : []
       const apkAsset = assets.find(
         (a) => /\.apk$/i.test(String(a?.name || '')) && /^https:\/\//i.test(String(a?.browser_download_url || '')),
@@ -394,7 +416,7 @@ export async function checkNativeMobileUpdate({
       let ghSigAlg = ''
       let ghManifestSha = ''
       let ghManifestMinNative = ''
-      if (hasNativeOta && manifestAsset) {
+      if (allowNativeOta && manifestAsset) {
         try {
           const nativePlugin =
             typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()
@@ -452,7 +474,7 @@ export async function checkNativeMobileUpdate({
 
   // Pick the highest available OTA candidate (prefer signed relay mirror as primary when versions match, with GitHub fallback)
   let bestOta = null
-  if (hasNativeOta) {
+  if (allowNativeOta) {
     if (relayOta && githubOta) {
       const cmp = compareSemver(relayOta.version, githubOta.version)
       if (cmp > 0) {
@@ -479,10 +501,24 @@ export async function checkNativeMobileUpdate({
   if (!curVer || compareSemver(effectiveLatest, curVer) <= 0) {
     return {
       status: 'up-to-date',
-      hotUpdate: Boolean(hasNativeOta),
+      hotUpdate: allowNativeOta,
+      ...(isIosNative ? { mode: 'app-store' } : {}),
       currentVersion: curVer,
       latestVersion: effectiveLatest,
       releaseUrl,
+    }
+  }
+
+  if (isIosNative) {
+    return {
+      status: 'available',
+      hotUpdate: false,
+      mode: 'app-store',
+      nativeUpgradeRequired: true,
+      currentVersion: curVer,
+      latestVersion: effectiveLatest,
+      releaseUrl: IOS_APP_STORE_URL,
+      assetSize: 0,
     }
   }
 
@@ -492,7 +528,7 @@ export async function checkNativeMobileUpdate({
     requiredMinNative && curNativeVer && compareSemver(requiredMinNative, curNativeVer) > 0,
   )
 
-  if (hasNativeOta && bestOta && !needsNativeShellUpgrade && compareSemver(bestOta.version, curVer) > 0) {
+  if (allowNativeOta && bestOta && !needsNativeShellUpgrade && compareSemver(bestOta.version, curVer) > 0) {
     if (curStagedVer && compareSemver(curStagedVer, bestOta.version) === 0) {
       return {
         status: 'downloaded',

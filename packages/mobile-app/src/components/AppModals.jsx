@@ -98,6 +98,7 @@ export function AppModals({
   onToggleLoginEmail2fa,
   onGithubLinked,
   onUnlinkGithub,
+  onDeleteAccount,
   turnQuota,
   dataSaver,
   onToggleDataSaver,
@@ -280,6 +281,7 @@ export function AppModals({
             onToggleLogin2fa={onToggleLoginEmail2fa}
             onGithubLinked={onGithubLinked}
             onUnlinkGithub={onUnlinkGithub}
+            onDeleteAccount={onDeleteAccount}
             turnQuota={turnQuota}
             dataSaver={dataSaver}
             onToggleDataSaver={onToggleDataSaver}

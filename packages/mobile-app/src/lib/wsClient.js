@@ -455,6 +455,26 @@ export async function unlinkGithubAccount(baseUrl, token) {
   return data.user
 }
 
+export async function deleteUserAccount(baseUrl, token, { currentPassword = '', confirmUsername = '' } = {}) {
+  const base = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${base}/api/account/delete`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      ...(currentPassword ? { currentPassword } : {}),
+      ...(confirmUsername ? { confirmUsername } : {}),
+    }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || L(`注销账号失败 (HTTP ${res.status})`, `Failed to delete account (HTTP ${res.status})`))
+  }
+  return data
+}
+
 export async function listAccountDevices(baseUrl, token) {
   const base = normalizeBaseUrl(baseUrl)
   const res = await fetch(`${base}/api/account/devices`, {

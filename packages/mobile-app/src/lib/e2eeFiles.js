@@ -164,9 +164,9 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
   }
 }
 
-function getNativeAndroidFilesPlugin() {
+function getNativeMobileFilesPlugin() {
   try {
-    if (!isCapacitorAndroid()) return null
+    if (!isCapacitorMobile()) return null
     const plugin = window.Capacitor?.Plugins?.AllinOneFiles
     return typeof plugin?.saveAndShare === 'function' ? plugin : null
   } catch {
@@ -196,7 +196,7 @@ function uint8ToBase64(u8) {
   return btoa(binary)
 }
 
-function supportsStreamingAndroidExport(plugin) {
+function supportsStreamingMobileExport(plugin) {
   return Boolean(
     plugin &&
     typeof plugin.openExport === 'function' &&
@@ -206,14 +206,14 @@ function supportsStreamingAndroidExport(plugin) {
 }
 
 export async function saveOrShareBlobNatively(blob, { filename = 'document', mimeType = 'application/octet-stream', mode = 'save' } = {}) {
-  const plugin = getNativeAndroidFilesPlugin()
+  const plugin = getNativeMobileFilesPlugin()
   if (!plugin || !blob) return false
   const cleanFilename = String(filename || 'document')
   const cleanMime = String(mimeType || blob.type || 'application/octet-stream')
   const cleanMode = mode === 'share' ? 'share' : 'save'
 
-  // Stream via chunked export bridge when available (prevents >250MB Base64 OOM crashes on Android!)
-  if (supportsStreamingAndroidExport(plugin) && blob.size > NATIVE_EXPORT_CHUNK_BYTES) {
+  // Stream via chunked export bridge when available (prevents Base64 OOM crashes on Android & iOS)
+  if (supportsStreamingMobileExport(plugin) && blob.size > NATIVE_EXPORT_CHUNK_BYTES) {
     const { exportId } = await plugin.openExport({
       filename: cleanFilename,
       mimeType: cleanMime,
@@ -246,12 +246,12 @@ export async function saveOrShareBlobNatively(blob, { filename = 'document', mim
 }
 
 /**
- * Direct zero-OOM P2P -> Android MediaStore streaming export for huge deliverables (>12MB).
- * Decrypts AIO2 chunks on-the-fly and writes 512 KB slices directly to native storage without buffering the full Blob.
+ * Direct zero-OOM P2P -> native storage streaming export for huge deliverables (>12MB).
+ * Decrypts AIO2 chunks on-the-fly and writes 512 KB slices directly to Android/iOS native storage.
  */
 export async function streamExportDeliverableDirect(rawPath, context = {}, { mode = 'save', onProgress = null } = {}) {
-  const plugin = getNativeAndroidFilesPlugin()
-  if (!supportsStreamingAndroidExport(plugin)) return false
+  const plugin = getNativeMobileFilesPlugin()
+  if (!supportsStreamingMobileExport(plugin)) return false
   const client = context?.client
   if (!client) throw new Error(L('未连接到电脑端，请先确认电脑在线', 'Not connected to computer'))
 
@@ -301,7 +301,7 @@ export async function streamExportDeliverableDirect(rawPath, context = {}, { mod
 }
 
 export function canNativeShareFiles() {
-  if (getNativeAndroidFilesPlugin()) return true
+  if (getNativeMobileFilesPlugin()) return true
   try {
     if (typeof navigator === 'undefined' || typeof navigator.share !== 'function' || typeof File === 'undefined') {
       return false
@@ -316,7 +316,7 @@ export function canNativeShareFiles() {
 
 export async function shareDeliverableFile(entry) {
   if (!entry?.blob) return false
-  if (getNativeAndroidFilesPlugin()) {
+  if (getNativeMobileFilesPlugin()) {
     return await saveOrShareBlobNatively(entry.blob, {
       filename: entry.filename || 'document',
       mimeType: entry.mimeType || entry.blob.type || 'application/octet-stream',
@@ -350,13 +350,11 @@ export async function shareDeliverableFile(entry) {
   }
 }
 
-function isCapacitorAndroid() {
+function isCapacitorMobile() {
   try {
-    return Boolean(
-      typeof window !== 'undefined' &&
-      window.Capacitor?.isNativePlatform?.() &&
-      String(window.Capacitor?.getPlatform?.() || '').toLowerCase() === 'android',
-    )
+    if (typeof window === 'undefined' || !window.Capacitor?.isNativePlatform?.()) return false
+    const p = String(window.Capacitor?.getPlatform?.() || '').toLowerCase()
+    return p === 'android' || p === 'ios'
   } catch {
     return false
   }
@@ -364,13 +362,13 @@ function isCapacitorAndroid() {
 
 /**
  * Trigger a browser download or native mobile save/share for a decrypted deliverable Blob.
- * In Android Capacitor WebView, `<a download="blob:...">` is ignored by default, so we use
- * our native `AllinOneFiles` Capacitor plugin (MediaStore Downloads / FileProvider share) first.
+ * In Android/iOS Capacitor WebViews, `<a download="blob:...">` is ignored by default, so we use
+ * our native `AllinOneFiles` Capacitor plugin (Android MediaStore / iOS Photos & Share Sheet) first.
  */
 export async function triggerDeliverableDownload(entry) {
   if (!entry?.blob || !entry?.url) return false
 
-  if (getNativeAndroidFilesPlugin()) {
+  if (getNativeMobileFilesPlugin()) {
     const saved = await saveOrShareBlobNatively(entry.blob, {
       filename: entry.filename || 'document',
       mimeType: entry.mimeType || entry.blob.type || 'application/octet-stream',
@@ -382,7 +380,7 @@ export async function triggerDeliverableDownload(entry) {
     }
   }
 
-  if (isCapacitorAndroid() && canNativeShareFiles()) {
+  if (isCapacitorMobile() && canNativeShareFiles()) {
     const shared = await shareDeliverableFile(entry)
     if (shared) {
       scheduleEphemeralDeliverableRevoke(entry, 5_000)

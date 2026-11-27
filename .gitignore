@@ -5,11 +5,15 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
-packages/mobile-app/ios/
 *.apk
+*.ipa
 *.jks
 *.keystore
 *.p12
+*.p8
+*.mobileprovision
+*.cer
+*.certSigningRequest
 packages/relay-server/data/
 packages/dsh-mobile-hub/*.status.json
 packages/dsh-mobile-hub/cordis.patch.yml

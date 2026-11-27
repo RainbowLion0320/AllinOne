@@ -1582,6 +1582,21 @@ export class RelayHub {
     return disconnected
   }
 
+  disconnectRoomBridges(roomId, code = 4401, reason = 'Account deleted') {
+    const rid = String(roomId || '').trim()
+    if (!rid) return 0
+    const bridgeIds = this.getBridgeList(rid)
+      .map((b) => String(b?.bridgeId || '').trim())
+      .filter(Boolean)
+    let disconnected = 0
+    for (const bid of bridgeIds) {
+      if (this.disconnectBridge(rid, bid, code, reason)) {
+        disconnected += 1
+      }
+    }
+    return disconnected
+  }
+
   pushIceUpdate(roomId, { quotaExceeded = false, host = '' } = {}) {
     const rid = String(roomId || '').trim()
     if (!rid) return

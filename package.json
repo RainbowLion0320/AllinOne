@@ -27,6 +27,7 @@
     "pack:mac": "npm --workspace=@allinone/desktop-app run pack:mac",
     "pack:win": "npm --workspace=@allinone/desktop-app run pack:win",
     "prepare:android": "npm --workspace=@allinone/mobile-app run prepare:android",
+    "prepare:ios": "npm --workspace=@allinone/mobile-app run prepare:ios",
     "admin": "node packages/relay-server/src/admin-cli.js",
     "lint": "eslint .",
     "version:check": "node scripts/bump-version.mjs --check",

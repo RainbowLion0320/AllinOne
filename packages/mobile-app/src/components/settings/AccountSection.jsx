@@ -9,6 +9,7 @@ import {
   Mail,
   RefreshCw,
   Smartphone,
+  Trash2,
   User,
 } from 'lucide-react'
 import { useI18n } from '../../lib/i18n.jsx'
@@ -52,6 +53,8 @@ export function AccountSection({
   onToggleLogin2fa,
   onGithubLinked,
   onUnlinkGithub,
+  onDeleteAccount,
+  onClose,
 }) {
   const { lang, bi, t } = useI18n()
 
@@ -79,6 +82,13 @@ export function AccountSection({
   const [githubBind, setGithubBind] = useState({ starting: false, pending: false, authorizeUrl: '', error: '' })
   const [confirmUnlinkGithub, setConfirmUnlinkGithub] = useState(false)
   const [unlinkingGithub, setUnlinkingGithub] = useState(false)
+
+  const [showDeleteForm, setShowDeleteForm] = useState(false)
+  const [deletePassword, setDeletePassword] = useState('')
+  const [deleteConfirmUser, setDeleteConfirmUser] = useState('')
+  const [deletingAccount, setDeletingAccount] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
+
   const githubPollStopRef = useRef(null)
   const mountedRef = useRef(true)
 
@@ -111,6 +121,11 @@ export function AccountSection({
       setGithubBind({ starting: false, pending: false, authorizeUrl: '', error: '' })
       setConfirmUnlinkGithub(false)
       setUnlinkingGithub(false)
+      setShowDeleteForm(false)
+      setDeletePassword('')
+      setDeleteConfirmUser('')
+      setDeletingAccount(false)
+      setDeleteError('')
     }
   }, [open])
 
@@ -276,6 +291,43 @@ export function AccountSection({
       setDisable2faError(String(err?.message || err))
     } finally {
       setDisable2faBusy(false)
+    }
+  }
+
+  const handleConfirmDeleteAccount = async (e) => {
+    e.preventDefault()
+    if (!onDeleteAccount || deletingAccount) return
+    if (hasPassword) {
+      if (!deletePassword) {
+        setDeleteError(bi('请输入当前账号密码以确认注销', 'Please enter your current password to confirm'))
+        return
+      }
+    } else {
+      const expected = String(activeDevice?.username || '').trim().toLowerCase()
+      if (!deleteConfirmUser.trim() || deleteConfirmUser.trim().toLowerCase() !== expected) {
+        setDeleteError(bi(`请输入用户名 ${activeDevice?.username || ''} 以确认`, `Type ${activeDevice?.username || ''} to confirm`))
+        return
+      }
+    }
+    setDeletingAccount(true)
+    setDeleteError('')
+    try {
+      await onDeleteAccount({
+        currentPassword: hasPassword ? deletePassword : '',
+        confirmUsername: hasPassword ? '' : deleteConfirmUser.trim(),
+      })
+      if (mountedRef.current) {
+        setShowDeleteForm(false)
+        setDeletePassword('')
+        setDeleteConfirmUser('')
+      }
+      onClose?.()
+    } catch (err) {
+      if (mountedRef.current) {
+        setDeleteError(String(err?.message || err))
+      }
+    } finally {
+      if (mountedRef.current) setDeletingAccount(false)
     }
   }
 
@@ -806,6 +858,96 @@ export function AccountSection({
               <div className="mt-2 rounded-lg bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">
                 {githubBind.error}
               </div>
+            )}
+          </div>
+        )}
+
+        {/* Permanent Account Deletion (App Store Guideline 5.1.1(v)) */}
+        {activeDevice?.username && onDeleteAccount && (
+          <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+                <Trash2 className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+                <span className="truncate">{bi('注销账号', 'Delete Account')}</span>
+              </div>
+              <button
+                type="button"
+                disabled={deletingAccount}
+                onClick={() => {
+                  setShowDeleteForm((v) => {
+                    if (v) {
+                      setDeletePassword('')
+                      setDeleteConfirmUser('')
+                    }
+                    return !v
+                  })
+                  setDeleteError('')
+                }}
+                className="shrink-0 rounded-lg px-2 py-0.5 text-[11.5px] font-medium text-rose-500 hover:bg-rose-50 disabled:opacity-50 dark:hover:bg-rose-950/40"
+              >
+                {showDeleteForm ? bi('收起', 'Hide') : bi('永久删除', 'Delete')}
+              </button>
+            </div>
+
+            {showDeleteForm && (
+              <form
+                onSubmit={handleConfirmDeleteAccount}
+                className="mt-2 space-y-2 rounded-xl border border-rose-200/80 bg-rose-50/75 p-2.5 dark:border-rose-900/55 dark:bg-rose-950/35"
+              >
+                <p className="text-[11px] leading-relaxed text-rose-700 dark:text-rose-200">
+                  {bi(
+                    '此操作将永久删除你的中继账号、已绑定电脑凭证和所有设备会话，且不可恢复（本地电脑上的项目文件与对话不会受到影响）。',
+                    'This permanently deletes your relay account, linked computer credentials, and all active sessions. This cannot be undone (files on your computers are unaffected).',
+                  )}
+                </p>
+                {hasPassword ? (
+                  <input
+                    type="password"
+                    value={deletePassword}
+                    onChange={(e) => setDeletePassword(e.target.value)}
+                    placeholder={bi('输入当前账号密码以确认注销', 'Enter current password to confirm')}
+                    autoComplete="current-password"
+                    className="w-full rounded-xl border border-rose-200 bg-white px-3 py-1.5 text-xs text-slate-900 outline-none focus:border-rose-500 dark:border-rose-900/70 dark:bg-[#1E212B] dark:text-white"
+                  />
+                ) : (
+                  <input
+                    type="text"
+                    value={deleteConfirmUser}
+                    onChange={(e) => setDeleteConfirmUser(e.target.value)}
+                    placeholder={bi(`输入用户名 ${activeDevice.username} 确认`, `Type ${activeDevice.username} to confirm`)}
+                    autoComplete="off"
+                    className="w-full rounded-xl border border-rose-200 bg-white px-3 py-1.5 text-xs text-slate-900 outline-none focus:border-rose-500 dark:border-rose-900/70 dark:bg-[#1E212B] dark:text-white"
+                  />
+                )}
+                {deleteError && (
+                  <div className="rounded-lg bg-rose-100/80 px-2.5 py-1.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+                    {deleteError}
+                  </div>
+                )}
+                <div className="flex justify-end gap-1.5">
+                  <button
+                    type="button"
+                    disabled={deletingAccount}
+                    onClick={() => {
+                      setShowDeleteForm(false)
+                      setDeletePassword('')
+                      setDeleteConfirmUser('')
+                      setDeleteError('')
+                    }}
+                    className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800"
+                  >
+                    {t('common.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={deletingAccount}
+                    className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-rose-500 disabled:opacity-60"
+                  >
+                    {deletingAccount && <Loader2 className="h-3 w-3 animate-spin" />}
+                    <span>{bi('确认永久注销', 'Delete Forever')}</span>
+                  </button>
+                </div>
+              </form>
             )}
           </div>
         )}

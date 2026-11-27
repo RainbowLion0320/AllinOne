@@ -29,7 +29,7 @@ import {
   subscribeStreamActive,
 } from '../packages/mobile-app/src/state/streamingStore.js'
 import { mergeUnflushedOptimisticTail } from '../packages/mobile-app/src/lib/sessionCache.js'
-import { checkNativeMobileUpdate } from '../packages/mobile-app/src/lib/clientHelpers.js'
+import { IOS_APP_STORE_URL, checkNativeMobileUpdate } from '../packages/mobile-app/src/lib/clientHelpers.js'
 import {
   acquireBlobUrl,
   clearE2eeMediaCache,
@@ -349,8 +349,17 @@ test('p2pClient P2PPeerSession enforces post-consumption window grants and 24 MB
         receivedPlain.push(chunk)
       },
     })
-    await new Promise((r) => setTimeout(r, 10))
-    await ctrlDecodeChain
+    dlPromise.catch(() => {})
+    const waitUntil = async (pred, timeoutMs = 2000) => {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        await ctrlDecodeChain
+        if (pred()) return
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await ctrlDecodeChain
+    }
+    await waitUntil(() => sentBulkCtrls.some((c) => c.action === 'pull' && c.streamId === 42))
     assert.ok(sentBulkCtrls.some((c) => c.action === 'pull' && c.streamId === 42))
 
     // Feed all encrypted AIOB frames BEFORE sending download.header (nothing is consuming queue yet)
@@ -391,14 +400,13 @@ test('p2pClient P2PPeerSession enforces post-consumption window grants and 24 MB
       mimeType: 'application/octet-stream',
       size: 30 * 1024 * 1024,
     })
-    await new Promise((r) => setTimeout(r, 10))
+    await waitUntil(() => sentBulkCtrls.some((c) => c.action === 'pull' && c.streamId === 99))
     const oneMb = new Uint8Array(1024 * 1024)
     for (let i = 0; i < 25; i += 1) {
       session._handleBulkBytes(encodeBulkFrame(99, i, oneMb, 0))
     }
     await assert.rejects(overflowPromise, /安全上限|safety limit/i)
-    await new Promise((r) => setTimeout(r, 20))
-    await ctrlDecodeChain
+    await waitUntil(() => sentBulkCtrls.some((c) => c.action === 'cancel' && c.streamId === 99 && c.direction === 'download'))
     assert.equal(session._activeDownloads.has(99), false)
     assert.ok(
       sentBulkCtrls.some((c) => c.action === 'cancel' && c.streamId === 99 && c.direction === 'download'),
@@ -407,4 +415,67 @@ test('p2pClient P2PPeerSession enforces post-consumption window grants and 24 MB
   } finally {
     await session.close(false)
   }
+})
+
+test('clientHelpers checkNativeMobileUpdate enforces App Store Guideline 2.5.2 on iOS (never OTA, always App Store URL)', async () => {
+  const fetchCalls = []
+  let manifestCalled = false
+
+  const fetchImpl = async (url) => {
+    fetchCalls.push(url)
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => '' },
+      json: async () => ({
+        tag_name: 'v1.0.40',
+        html_url: 'https://github.com/RainbowLion0320/AllinOne/releases/tag/v1.0.40',
+        assets: [
+          {
+            name: 'All-in-One-Android.apk',
+            size: 12345678,
+            browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.40/All-in-One-Android.apk',
+          },
+          {
+            name: 'All-in-One-WebBundle.zip',
+            size: 987654,
+            digest: `sha256:${'cd'.repeat(32)}`,
+            browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.40/All-in-One-WebBundle.zip',
+          },
+          {
+            name: 'All-in-One-WebBundle.json',
+            size: 400,
+            browser_download_url: 'https://github.com/RainbowLion0320/AllinOne/releases/download/v1.0.40/All-in-One-WebBundle.json',
+          },
+        ],
+      }),
+    }
+  }
+
+  const res = await checkNativeMobileUpdate({
+    currentVersion: '1.0.37',
+    nativeVersion: '1.0.37',
+    hasNativeOta: true,
+    platform: 'ios',
+    baseUrl: 'https://relay.example.com',
+    locationLike: { protocol: 'capacitor:', hostname: 'localhost' },
+    fetchImpl,
+    fetchManifestImpl: async () => {
+      manifestCalled = true
+      return null
+    },
+  })
+
+  assert.equal(manifestCalled, false, 'iOS update check must never fetch OTA WebBundle manifests')
+  assert.equal(
+    fetchCalls.some((u) => u.includes('All-in-One-WebBundle')),
+    false,
+    'iOS update check must never touch relay or GitHub OTA WebBundle URLs',
+  )
+  assert.equal(res.status, 'available')
+  assert.equal(res.hotUpdate, false)
+  assert.equal(res.mode, 'app-store')
+  assert.equal(res.latestVersion, '1.0.40')
+  assert.equal(res.releaseUrl, IOS_APP_STORE_URL)
+  assert.equal(res.downloadUrl, undefined)
 })

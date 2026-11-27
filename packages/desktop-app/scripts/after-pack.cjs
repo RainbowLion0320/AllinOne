@@ -71,12 +71,13 @@ exports.default = async function afterPack(context) {
     )
   }
 
-  // 2. Ad-hoc deep re-sign macOS bundle when no Developer ID signing cert is configured (or identity: null)
+  // 2. Ad-hoc deep re-sign macOS bundle when no Developer ID signing cert is configured
   if (platform !== 'darwin') return
   if (
     context?.packager?.platformSpecificBuildOptions?.identity !== null &&
     (process.env.CSC_LINK || process.env.CSC_NAME)
   ) {
+    console.log('[afterPack] Developer ID signing configured; deferring signing to electron-builder & afterSign notarization')
     return
   }
 

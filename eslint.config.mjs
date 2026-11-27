@@ -11,6 +11,7 @@ export default [
       'packages/desktop-app/renderer/**',
       'packages/desktop-app/bridge-runtime/**',
       'packages/mobile-app/android/**',
+      'packages/mobile-app/ios/**',
       'packages/mobile-app/public/downloads/**',
     ],
   },
