@@ -25,7 +25,7 @@ export default defineConfig({
             manifest: {
               name: 'All in One',
               short_name: 'All in One',
-              description: 'All in One — 跨设备 AI 编程助手远程总控（Codex / Claude Code / Antigravity / DeepSeek Harness）',
+              description: 'All in One — 跨设备 AI 编程助手远程总控（ChatGPT / Claude Code / Antigravity / DeepSeek Harness / WorkBuddy / ZCode）',
               theme_color: '#03080E',
               background_color: '#03080E',
               display: 'standalone',

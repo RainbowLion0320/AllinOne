@@ -56,7 +56,7 @@ function getOtherVendorHint(card, bi) {
     return bi('正在后台同步 Gemini 5h / 周额度...', 'Syncing Gemini 5h & weekly quota...')
   }
   if (card.app === 'codex') {
-    return bi('正在同步 Codex 5h / 周额度...', 'Syncing Codex 5h & weekly quota...')
+    return bi('正在同步 ChatGPT 5h / 周额度...', 'Syncing ChatGPT 5h & weekly quota...')
   }
   if (card.app === 'zcode') {
     if (!card.writable) return bi('已同步桌面端会话 · 浏览器授权一次即可远程发送', 'Desktop mirror · Sign in once via browser to send')
@@ -655,8 +655,8 @@ export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
           </div>
           <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
             {bi(
-              '支持 Codex · Antigravity · Claude Code · WorkBuddy · DeepSeek Harness',
-              'Supports Codex · Antigravity · Claude Code · WorkBuddy · DeepSeek Harness',
+              '支持 ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · DeepSeek Harness',
+              'Supports ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · DeepSeek Harness',
             )}
           </p>
         </div>

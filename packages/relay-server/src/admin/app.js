@@ -15,7 +15,7 @@
 
   const APP_COLORS = {
     dsh: { name: 'DeepSeek', badge: 'DSH', color: '#4D6BFE', bg: 'rgba(77,107,254,0.16)' },
-    codex: { name: 'Codex', badge: 'CDX', color: '#10A37F', bg: 'rgba(16,163,127,0.16)' },
+    codex: { name: 'ChatGPT', badge: 'GPT', color: '#10A37F', bg: 'rgba(16,163,127,0.16)' },
     claude: { name: 'Claude', badge: 'CLD', color: '#D97757', bg: 'rgba(217,119,87,0.16)' },
     antigravity: { name: 'Antigravity', badge: 'AGY', color: '#7C5CFF', bg: 'rgba(124,92,255,0.16)' },
     workbuddy: { name: 'WorkBuddy', badge: 'WKB', color: '#06C798', bg: 'rgba(6,199,152,0.16)' },

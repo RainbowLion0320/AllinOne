@@ -26,7 +26,7 @@ function getFilterTabs(lang) {
   return [
     { id: 'all', label: translate(lang, 'common.all'), color: '#4D6BFE' },
     { id: 'dsh', label: 'DeepSeek', color: '#4D6BFE' },
-    { id: 'codex', label: 'Codex', color: '#6366F1' },
+    { id: 'codex', label: 'ChatGPT', color: '#10A37F' },
     { id: 'claude', label: 'Claude', color: '#D97757' },
     { id: 'antigravity', label: 'Antigravity', color: '#3186FF' },
     { id: 'workbuddy', label: 'WorkBuddy', color: '#06C798' },

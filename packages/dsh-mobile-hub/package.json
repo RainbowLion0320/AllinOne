@@ -1,10 +1,10 @@
 {
   "name": "dsh-mobile-hub",
-  "version": "1.0.35",
+  "version": "1.0.36",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "DeepSeek Harness Cordis plugin & local multi-agent bridge for AllinOne Mobile App (DSH / Codex / Claude / Antigravity).",
+  "description": "DeepSeek Harness Cordis plugin & local multi-agent bridge for AllinOne Mobile App (DSH / ChatGPT / Claude / Antigravity / WorkBuddy / ZCode).",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

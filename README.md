@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> <strong>Codex</strong> &nbsp;·&nbsp;
+  <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="ChatGPT" /> <strong>ChatGPT</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
@@ -72,7 +72,7 @@
 
 | 工具 | 支持范围 |
 | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | 远程读写 · 额度监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="ChatGPT" /> **OpenAI ChatGPT** | 远程读写 · 额度监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | 远程读写 · 额度监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | 远程读写 · 额度监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 远程读写 · 余额监控 |
@@ -142,7 +142,7 @@ flowchart LR
 
   subgraph PC["所有互联电脑（Windows / macOS / Linux · 出站连接零开端口）"]
     B["All in One 桥接器（多机并存 · 随时切换）"]
-    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy ..."]
+    A["ChatGPT · Claude · Antigravity · DeepSeek · WorkBuddy · ZCode ..."]
     B <-->|"官方本地接口"| A
   end
 
@@ -268,4 +268,4 @@ packages/
 ---
 
 - **安全与贡献**：部署前建议阅读 [SECURITY.md](./SECURITY.md)；欢迎通过 Issue / PR 参与贡献（[CONTRIBUTING.md](./CONTRIBUTING.md)）。
-- **声明与协议**：独立开源项目，与 OpenAI、Anthropic、Google、DeepSeek、Tencent 无官方关联 · 采用 [MIT License](./LICENSE)。
+- **声明与协议**：独立开源项目，与 OpenAI、Anthropic、Google、DeepSeek、Tencent、Zhipu 无官方关联 · 采用 [MIT License](./LICENSE)。

@@ -13,13 +13,17 @@ import {
   ZCodeAdapter,
   ensureZCodeManagedAuthStore,
   extractZCodeTaskState,
+  formatZCodeCliError,
   hasZCodeStandaloneAuth,
   isSafeZCodeAuthUrl,
   normalizeZCodeBillingQuota,
   normalizeZCodeDbMessages,
+  normalizeZCodeModelId,
+  normalizeZCodeReasoningLevel,
   parseZCodeStreamEvent,
   readZCodeQuotaFromLogs,
   resolveEffectiveZCodeMode,
+  resolveZCodeModelEfforts,
 } from '../packages/dsh-mobile-hub/src/adapters/zcode.js'
 import { extractVendorQuotaDetails } from '../packages/mobile-app/src/lib/quotaDashboard.js'
 
@@ -384,11 +388,59 @@ test('ZCode stream event parser & DB normalizer', () => {
   assert.equal(toolEnd.status, 'completed')
 
   const msgNorm = normalizeZCodeDbMessages(
-    [{ id: 'm1', time_created: 1000, data: JSON.stringify({ role: 'user' }) }],
-    [{ id: 'p1', message_id: 'm1', data: JSON.stringify({ type: 'text', text: 'hello' }) }],
+    [
+      {
+        id: 'm1',
+        time_created: 1000,
+        data: JSON.stringify({
+          role: 'user',
+          model: { providerID: 'account:bigmodel-start-plan', modelID: 'glm-5.4', variant: 'max' },
+        }),
+      },
+      {
+        id: 'm_sys_env',
+        time_created: 1001,
+        data: JSON.stringify({ role: 'user', synthetic: true, visibility: 'model-only' }),
+      },
+      {
+        id: 'm_sys_date',
+        time_created: 1002,
+        data: JSON.stringify({ role: 'user', visibility: 'model-only' }),
+      },
+      {
+        id: 'm2',
+        time_created: 2000,
+        data: JSON.stringify({ role: 'assistant', modelId: 'glm-5.4', providerId: 'account:bigmodel-start-plan' }),
+      },
+    ],
+    [
+      { id: 'p1', message_id: 'm1', data: JSON.stringify({ type: 'text', text: 'hello' }) },
+      { id: 'p1_syn', message_id: 'm1', data: JSON.stringify({ type: 'text', synthetic: true, text: '# Environment\nsecret context' }) },
+      { id: 'p_env', message_id: 'm_sys_env', data: JSON.stringify({ type: 'text', synthetic: true, text: 'Available skills...' }) },
+      { id: 'p_date', message_id: 'm_sys_date', data: JSON.stringify({ type: 'text', text: "Today's date is 2026-11-27." }) },
+      { id: 'p2', message_id: 'm2', data: JSON.stringify({ type: 'text', text: 'Hi there!' }) },
+    ],
   )
-  assert.equal(msgNorm.messages.length, 1)
+  assert.equal(msgNorm.messages.length, 2)
+  assert.equal(msgNorm.messages[0].role, 'user')
   assert.equal(msgNorm.messages[0].text, 'hello')
+  assert.equal(msgNorm.messages[1].role, 'assistant')
+  assert.equal(msgNorm.messages[1].text, 'Hi there!')
+  assert.equal(msgNorm.model, 'GLM-5.4')
+
+  // Model ID normalization, effort clamping & human-readable CLI error diagnostics
+  assert.equal(normalizeZCodeModelId('glm-5.4'), 'GLM-5.4')
+  assert.deepEqual(resolveZCodeModelEfforts('GLM-5.4').efforts, ['low', 'high', 'max'])
+  assert.equal(normalizeZCodeReasoningLevel('medium', 'GLM-5.4'), 'high')
+  assert.equal(normalizeZCodeReasoningLevel('off', 'GLM-5.2'), 'disabled')
+  assert.equal(normalizeZCodeReasoningLevel('high', 'GLM-5-Turbo'), 'enabled')
+
+  assert.match(formatZCodeCliError('Error: Select a model before sending a message (traceId: abc)', { resumed: true }), /新建 ZCode 对话/)
+  assert.match(
+    formatZCodeCliError("ProviderBusinessError: [1113][余额不足或无可用资源包,请充值。]\n  at detectProviderBusinessError (zcode.cjs:1)\nError: Turn execution failed"),
+    /Coding Plan.*1113.*Start Plan/,
+  )
+  assert.match(formatZCodeCliError('ProviderBusinessError: This client is not supported (3012)'), /Start Plan.*3012/)
 
   const ts = extractZCodeTaskState([{ content: 'Step 1', status: 'in_progress' }], { objective: 'Ship it', status: 'active' }, 'plan')
   assert.equal(ts.mode, 'plan')

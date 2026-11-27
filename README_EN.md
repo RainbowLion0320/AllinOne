@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> <strong>Codex</strong> &nbsp;·&nbsp;
+  <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="ChatGPT" /> <strong>ChatGPT</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> <strong>Claude</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
@@ -72,7 +72,7 @@
 
 | Tool | Support |
 | :--- | :--- |
-| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="Codex" /> **OpenAI Codex** | Remote Chat · Quota Tracking |
+| <img src="./packages/mobile-app/src/assets/vendors/codex.svg" width="20" height="20" align="absmiddle" alt="ChatGPT" /> **OpenAI ChatGPT** | Remote Chat · Quota Tracking |
 | <img src="./packages/mobile-app/src/assets/vendors/claude.svg" width="20" height="20" align="absmiddle" alt="Claude" /> **Claude Code / Desktop** | Remote Chat · Quota Tracking |
 | <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> **Google Antigravity** | Remote Chat · Quota Tracking |
 | <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | Remote Chat · Balance Tracking |
@@ -142,7 +142,7 @@ flowchart LR
 
   subgraph PC["All Connected Computers (Windows / macOS / Linux · Outbound Only)"]
     B["All in One Bridge (Multi-Host · Instant Switch)"]
-    A["Codex · Claude · Antigravity · DeepSeek · WorkBuddy ..."]
+    A["ChatGPT · Claude · Antigravity · DeepSeek · WorkBuddy · ZCode ..."]
     B <-->|"Official Local Interface"| A
   end
 
@@ -268,4 +268,4 @@ packages/
 ---
 
 - **Security & Contributing**: Read [SECURITY.md](./SECURITY.md) before deploying · Issues & PRs welcome ([CONTRIBUTING.md](./CONTRIBUTING.md)).
-- **Notice & License**: Independent open-source project; not affiliated with OpenAI, Anthropic, Google, DeepSeek, or Tencent · Licensed under [MIT](./LICENSE).
+- **Notice & License**: Independent open-source project; not affiliated with OpenAI, Anthropic, Google, DeepSeek, Tencent, or Zhipu · Licensed under [MIT](./LICENSE).

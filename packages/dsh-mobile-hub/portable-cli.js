@@ -5,7 +5,7 @@
  * Run on any PC to bind it to your All in One account:
  *  1. Authenticates with your account and saves a per-device credential in ~/.allinone-bridge/config.json
  *  2. Maintains an outbound Control-Plane WSS link + direct E2EE WebRTC P2P data channels (no public IP or port forwarding)
- *  3. Auto-detects locally installed AI coding agents (Codex / Claude Code / Antigravity / DeepSeek Harness)
+ *  3. Auto-detects locally installed AI coding agents (ChatGPT / Claude Code / Antigravity / DeepSeek Harness / WorkBuddy / ZCode)
  *  4. Generates a 100% offline SVG QR code to sync your 256-bit E2EE room key to phones & browsers
  */
 

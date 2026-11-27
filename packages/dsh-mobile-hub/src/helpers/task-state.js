@@ -433,7 +433,7 @@ export function createTaskStateTracker(initial = null) {
     if (!item || typeof item !== 'object') return false
     const text = String(item.text || '').trim()
     if (!text) return false
-    return setPlanDoc({ title: 'Codex Plan', content: text }, ts)
+    return setPlanDoc({ title: 'ChatGPT Plan', content: text }, ts)
   }
 
   /** Claude Code `TodoWrite`, `TaskCreate`, `TaskUpdate`, `EnterPlanMode`, `ExitPlanMode`, plan file writes. */

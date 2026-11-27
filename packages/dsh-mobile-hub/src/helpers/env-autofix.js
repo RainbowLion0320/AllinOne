@@ -242,16 +242,19 @@ export function detectHalfInstalledClis({
     }
   }
 
-  // 3. Codex: ~/.codex sessions/auth/config or Codex.app exists, but `codex` binary is missing
+  // 3. ChatGPT (formerly Codex): ~/.codex sessions/auth/config or ChatGPT/Codex desktop app exists, but `codex` binary is missing
   const codexEvidence = [
     join(homeDir, '.codex', 'sessions'),
     join(homeDir, '.codex', 'auth.json'),
     join(homeDir, '.codex', 'config.toml'),
+    join(homeDir, 'Applications', 'ChatGPT.app'),
     join(homeDir, 'Applications', 'Codex.app'),
   ]
   if (checkSystemApps) {
-    if (platform === 'darwin') codexEvidence.push('/Applications/Codex.app')
-    else if (platform === 'win32') codexEvidence.push(join(localApp, 'Programs', 'Codex'))
+    if (platform === 'darwin') codexEvidence.push('/Applications/ChatGPT.app', '/Applications/Codex.app')
+    else if (platform === 'win32') {
+      codexEvidence.push(join(localApp, 'Programs', 'ChatGPT'), join(localApp, 'Programs', 'Codex'))
+    }
   }
   if (hasAnyPath(codexEvidence)) {
     const codexNames = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex']
@@ -279,8 +282,8 @@ export function detectHalfInstalledClis({
       if (steps.length > 0) {
         missing.push({
           app: 'codex',
-          displayName: 'Codex CLI (codex)',
-          reason: '检测到本机已有 Codex 会话/配置，但缺少 codex 命令行工具',
+          displayName: 'ChatGPT CLI (codex)',
+          reason: '检测到本机已有 ChatGPT (Codex) 会话/配置，但缺少 codex 命令行工具',
           steps,
           verify: () => {
             ensureRichPath(true)

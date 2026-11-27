@@ -32,11 +32,11 @@ export const APP_META = Object.freeze({
   },
   codex: {
     id: 'codex',
-    name: 'Codex',
-    shortName: 'Codex',
-    color: '#6366F1',
-    badge: 'CDX',
-    description: 'OpenAI Codex（官方 app-server 读写分离，每轮自动释放写入锁）',
+    name: 'ChatGPT',
+    shortName: 'ChatGPT',
+    color: '#10A37F',
+    badge: 'GPT',
+    description: 'OpenAI ChatGPT（原 Codex，官方 app-server 读写分离，每轮自动释放写入锁）',
   },
   claude: {
     id: 'claude',

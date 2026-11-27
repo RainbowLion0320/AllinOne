@@ -258,9 +258,9 @@ export function normalizeCodexAsyncQuestionCard(threadId, item, { externalRunnin
     kind: 'question',
     asyncQuestion: true,
     callId,
-    title: 'Codex 需要你做选择',
+    title: 'ChatGPT 需要你做选择',
     detail: externalRunning
-      ? '电脑端 Codex 正在运行此轮：可直接去电脑端点击，或等待本轮暂停后在此提交。'
+      ? '电脑端 ChatGPT 正在运行此轮：可直接去电脑端点击，或等待本轮暂停后在此提交。'
       : '',
     ...(externalRunning ? { readOnlyHint: 'desktop-running' } : {}),
     questions,
@@ -984,8 +984,8 @@ export function normalizeCodexQuota(raw, now = Date.now()) {
           pools: [
             {
               id: 'codex',
-              label: 'Codex',
-              labelZh: 'Codex 主额度',
+              label: 'ChatGPT',
+              labelZh: 'ChatGPT 主额度',
               windows: [
                 ...(shorter ? [{ id: 'short', kind: 'short', ...shorter }] : []),
                 {
@@ -1225,7 +1225,7 @@ export class CodexAdapter extends BaseAdapter {
         app: APPS.CODEX,
         sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
         kind: isCommand ? 'command' : 'file_change',
-        title: isCommand ? 'Codex 请求执行命令' : 'Codex 请求修改文件',
+        title: isCommand ? 'ChatGPT 请求执行命令' : 'ChatGPT 请求修改文件',
         detail: summary,
         cwd: params.cwd || '',
         createdAt: Date.now(),
@@ -1280,7 +1280,7 @@ export class CodexAdapter extends BaseAdapter {
         app: APPS.CODEX,
         sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
         kind: 'question',
-        title: 'Codex 需要你做选择',
+        title: 'ChatGPT 需要你做选择',
         detail: '',
         questions,
         createdAt: Date.now(),
@@ -1303,7 +1303,7 @@ export class CodexAdapter extends BaseAdapter {
         app: APPS.CODEX,
         sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
         kind: 'permissions',
-        title: 'Codex 请求附加权限',
+        title: 'ChatGPT 请求附加权限',
         detail: formatPermissionProfileDetail(params.permissions, params.reason),
         cwd: params.cwd || '',
         createdAt: Date.now(),
@@ -1337,7 +1337,7 @@ export class CodexAdapter extends BaseAdapter {
         app: APPS.CODEX,
         sessionId: threadId ? makeCompositeId(APPS.CODEX, threadId) : '',
         kind: isUrlMode ? 'url_elicitation' : 'question',
-        title: params.serverName ? `Codex · ${params.serverName}` : 'Codex 请求补充信息',
+        title: params.serverName ? `ChatGPT · ${params.serverName}` : 'ChatGPT 请求补充信息',
         detail: String(params.message || '').trim(),
         ...(isUrlMode && params.url ? { url: String(params.url) } : {}),
         ...(isUrlMode
@@ -1490,7 +1490,7 @@ export class CodexAdapter extends BaseAdapter {
         const cur = probeCodexRolloutStatus(watched.path, { maxIdleMs: this.externalMaxIdleMs })
         if (cur.running) {
           this.pendingServerRequests.set(approvalId, entry)
-          throw new Error('电脑端 Codex 正在运行此轮，请直接在电脑端点击选项，或等本轮暂停后再在手机端提交。')
+          throw new Error('电脑端 ChatGPT 正在运行此轮，请直接在电脑端点击选项，或等本轮暂停后再在手机端提交。')
         }
       }
 
@@ -1521,7 +1521,7 @@ export class CodexAdapter extends BaseAdapter {
           sessionId,
           decision: 'cancel',
         })
-        const transportErr = new Error(String(err?.message || 'Codex 进程已退出，审批请求已失效'))
+        const transportErr = new Error(String(err?.message || 'ChatGPT 进程已退出，审批请求已失效'))
         transportErr.code = 'APPROVAL_TRANSPORT_CLOSED'
         throw transportErr
       }
@@ -1775,7 +1775,7 @@ export class CodexAdapter extends BaseAdapter {
         available: true,
         writable: true,
         mode: 'app-server-rpc',
-        detail: `已连接官方 codex app-server（${basename(this.codexBin)}，每轮自动释放写入锁，可与电脑端无缝切换）`,
+        detail: `已连接 ChatGPT 官方 codex app-server（${basename(this.codexBin)}，每轮自动释放写入锁，可与电脑端无缝切换）`,
         activeCount: this.activeTurns.size,
         ...(quota ? { quota } : {}),
       }
@@ -1785,7 +1785,7 @@ export class CodexAdapter extends BaseAdapter {
         available: false,
         writable: false,
         mode: 'unavailable',
-        detail: `未找到 codex CLI（请安装 Codex Desktop 或运行 npm i -g @openai/codex 后点击刷新）：${String(err?.message || err)}`,
+        detail: `未找到 ChatGPT / codex CLI（请安装 ChatGPT 桌面端或运行 npm i -g @openai/codex 后点击刷新）：${String(err?.message || err)}`,
         activeCount: 0,
       }
     }
@@ -2356,7 +2356,7 @@ export class CodexAdapter extends BaseAdapter {
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
     let effectiveTaskMode = normalizeTaskMode(taskMode)
     if (this.activeTurns.has(threadId)) {
-      const err = new Error('该 Codex 对话正在运行中，请等待完成或先中断当前任务。')
+      const err = new Error('该 ChatGPT 对话正在运行中，请等待完成或先中断当前任务。')
       err.code = 'SESSION_BUSY'
       throw err
     }
@@ -2457,7 +2457,7 @@ export class CodexAdapter extends BaseAdapter {
           const msg = String(resumeErr?.message || resumeErr)
           if (/already has an active writer|thread-store conflict/i.test(msg)) {
             throw new Error(
-              '该对话当前正被电脑端 Codex 桌面窗口占用（Codex 同一时间只允许一端写入）。请在电脑端 Codex 里切到其他对话后再试，或在手机端新建对话继续。',
+              '该对话当前正被电脑端 ChatGPT 桌面窗口占用（同一时间只允许一端写入）。请在电脑端 ChatGPT 里切到其他对话后再试，或在手机端新建对话继续。',
             )
           }
           if (!/no rollout found/i.test(msg)) {
@@ -2577,7 +2577,7 @@ export class CodexAdapter extends BaseAdapter {
             }
           }
           turnState.settled = true
-          turnState.reject?.(new Error('Codex 回合响应超时（长时间无输出），已自动释放锁'))
+          turnState.reject?.(new Error('ChatGPT 回合响应超时（长时间无输出），已自动释放锁'))
         }, CODEX_TURN_INACTIVITY_TIMEOUT_MS)
       }
       turnState.touchActivity = resetTurnTimeout

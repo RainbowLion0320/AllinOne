@@ -3,7 +3,7 @@ import { APP_LIST } from './protocol.js'
 /**
  * Registers Master Orchestrator tools directly into DeepSeek Harness's Cordis `tools` layer.
  * Any DSH conversation (mobile OR desktop) can then inspect and dispatch work to:
- *   - Codex (via official `codex app-server`)
+ *   - ChatGPT (formerly Codex, via official `codex app-server`)
  *   - Claude Code / Desktop Code (via official `claude` CLI)
  *   - Antigravity (official agy acp)
  *   - Other DeepSeek Harness sessions
@@ -29,7 +29,7 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
   safeRegister({
     name: 'allinone_apps_status',
     description:
-      '查看本机已接入的 AI 应用（DeepSeek Harness、Codex、Claude Code、Antigravity、WorkBuddy、ZCode 等）的在线可用状态、读写权限以及活跃任务数量。' +
+      '查看本机已接入的 AI 应用（DeepSeek Harness、ChatGPT、Claude Code、Antigravity、WorkBuddy、ZCode 等）的在线可用状态、读写权限以及活跃任务数量。' +
       '在跨应用派单前可先调用本工具确认哪些应用可用。',
     parameters: {
       type: 'object',
@@ -61,8 +61,8 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
   safeRegister({
     name: 'allinone_list_sessions',
     description:
-      '列出本机 DeepSeek Harness / Codex / Claude / Antigravity / WorkBuddy / ZCode 的所有对话列表（包含复合 ID、标题、工作目录、最近摘要和运行状态）。' +
-      '当用户说“看看 Codex 最近在干嘛”“找到 ZCode 里关于 XX 项目的对话”时使用。',
+      '列出本机 DeepSeek Harness / ChatGPT / Claude / Antigravity / WorkBuddy / ZCode 的所有对话列表（包含复合 ID、标题、工作目录、最近摘要和运行状态）。' +
+      '当用户说“看看 ChatGPT 最近在干嘛”“找到 ZCode 里关于 XX 项目的对话”时使用。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -70,7 +70,7 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
         app: {
           type: 'string',
           enum: ['all', ...APP_LIST],
-          description: '要筛选的应用：all（全部）、dsh、codex、claude、antigravity、workbuddy、zcode。默认 all。',
+          description: '要筛选的应用：all（全部）、dsh、codex（ChatGPT）、claude、antigravity、workbuddy、zcode。默认 all。',
         },
         search: {
           type: 'string',
@@ -161,11 +161,11 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
     },
   })
 
-  // 4. Dispatch a task to Codex / Claude / Antigravity / WorkBuddy / ZCode / another DSH session
+  // 4. Dispatch a task to ChatGPT / Claude / Antigravity / WorkBuddy / ZCode / another DSH session
   safeRegister({
     name: 'allinone_dispatch_task',
     description:
-      '向指定应用（codex / claude / antigravity / workbuddy / zcode / dsh）派发一个任务：可指定已有会话继续聊，或不传 sessionId 自动新建会话。' +
+      '向指定应用（codex[ChatGPT] / claude / antigravity / workbuddy / zcode / dsh）派发一个任务：可指定已有会话继续聊，或不传 sessionId 自动新建会话。' +
       '设置 wait=true 会等待对方执行完成并直接拿回结果；设置 wait=false 会立即异步派单并返回 taskId（适合并行给多个应用同时派活，再用 allinone_task_status 查进度）。',
     parameters: {
       type: 'object',
@@ -175,7 +175,7 @@ export function registerDshDispatchTools(ctx, orchestrator, log = console) {
         app: {
           type: 'string',
           enum: APP_LIST,
-          description: '目标应用：codex、claude、antigravity、workbuddy、zcode 或 dsh。',
+          description: '目标应用：codex（ChatGPT）、claude、antigravity、workbuddy、zcode 或 dsh。',
         },
         prompt: {
           type: 'string',

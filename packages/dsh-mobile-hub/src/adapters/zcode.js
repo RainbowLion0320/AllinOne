@@ -66,16 +66,132 @@ const ZCODE_MODE_RANK = Object.freeze({
   yolo: 5,
 })
 
-const ZCODE_DEFAULT_EFFORTS = Object.freeze(['low', 'medium', 'high'])
+const ZCODE_DEFAULT_EFFORTS = Object.freeze(['low', 'high', 'max'])
 
 const ZCODE_FALLBACK_MODELS = Object.freeze([
-  { id: 'GLM-5.3', name: 'GLM-5.3', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'high' },
-  { id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'medium' },
-  { id: 'GLM-5.2', name: 'GLM-5.2', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'high' },
-  { id: 'GLM-5.1', name: 'GLM-5.1', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'high' },
-  { id: 'GLM-5-Turbo', name: 'GLM-5-Turbo', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'medium' },
-  { id: 'GLM-4.7', name: 'GLM-4.7', efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'high' },
+  { id: 'GLM-5.4', name: 'GLM-5.4', efforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+  { id: 'GLM-5.3', name: 'GLM-5.3', efforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+  { id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash', efforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+  { id: 'GLM-5.2', name: 'GLM-5.2', efforts: ['disabled', 'high', 'max'], defaultEffort: 'high' },
+  { id: 'GLM-5.1', name: 'GLM-5.1', efforts: ['disabled', 'enabled'], defaultEffort: 'enabled' },
+  { id: 'GLM-5-Turbo', name: 'GLM-5-Turbo', efforts: ['disabled', 'enabled'], defaultEffort: 'enabled' },
+  { id: 'GLM-4.7', name: 'GLM-4.7', efforts: ['disabled', 'enabled'], defaultEffort: 'enabled' },
 ])
+
+const CANONICAL_GLM_MODELS = new Map(
+  [
+    'GLM-5.4',
+    'GLM-5.3',
+    'GLM-5.3-Flash',
+    'GLM-5.2',
+    'GLM-5.1',
+    'GLM-5-Turbo',
+    'GLM-4.7',
+    'GLM-4.6',
+    'GLM-4.5',
+    'GLM-4.5-Air',
+  ].map((m) => [m.toLowerCase(), m]),
+)
+
+export function normalizeZCodeModelId(rawModelId) {
+  const s = String(rawModelId || '').trim()
+  if (!s) return ''
+  return CANONICAL_GLM_MODELS.get(s.toLowerCase()) || s
+}
+
+/**
+ * Resolve valid reasoning levels for a ZCode model from builtin `modelRules` (with curated GLM defaults).
+ */
+export function resolveZCodeModelEfforts(modelId, builtin = null) {
+  const cleanId = normalizeZCodeModelId(modelId)
+  const rules = builtin?.config?.modelConfigRules?.modelRules
+  if (cleanId && Array.isArray(rules)) {
+    let matchedValues = null
+    for (const r of rules) {
+      const pat = typeof r?.modelMatch === 'string' ? r.modelMatch.trim() : ''
+      const vals = r?.config?.optionSpecs?.reasoningLevel?.values
+      if (!pat || !Array.isArray(vals) || vals.length === 0) continue
+      try {
+        if (new RegExp(`^(?:${pat})$`, 'i').test(cleanId)) {
+          matchedValues = vals.map((v) => String(v).trim()).filter(Boolean)
+        }
+      } catch {}
+    }
+    if (matchedValues && matchedValues.length > 0) {
+      const def = matchedValues.includes('high')
+        ? 'high'
+        : matchedValues.includes('enabled')
+          ? 'enabled'
+          : matchedValues[matchedValues.length - 1]
+      return { efforts: matchedValues, defaultEffort: def }
+    }
+  }
+  const fb = ZCODE_FALLBACK_MODELS.find((m) => m.id.toLowerCase() === cleanId.toLowerCase())
+  if (fb) return { efforts: [...fb.efforts], defaultEffort: fb.defaultEffort }
+  if (/glm-5\.2/i.test(cleanId)) return { efforts: ['disabled', 'high', 'max'], defaultEffort: 'high' }
+  if (/glm-5-(?:turbo)|glm-5\.1|glm-4/i.test(cleanId)) return { efforts: ['disabled', 'enabled'], defaultEffort: 'enabled' }
+  return { efforts: [...ZCODE_DEFAULT_EFFORTS], defaultEffort: 'high' }
+}
+
+/**
+ * Clamp a requested reasoning effort value so ZCode's strict model option validator never rejects it.
+ */
+export function normalizeZCodeReasoningLevel(effort, modelId, builtin = null) {
+  const raw = String(effort || '').trim().toLowerCase()
+  if (!raw) return ''
+  const { efforts, defaultEffort } = resolveZCodeModelEfforts(modelId, builtin)
+  if (efforts.includes(raw)) return raw
+  if ((raw === 'off' || raw === 'none') && efforts.includes('disabled')) return 'disabled'
+  if (raw === 'disabled' && efforts.includes('low')) return 'low'
+  if (raw === 'medium') {
+    if (efforts.includes('high')) return 'high'
+    if (efforts.includes('enabled')) return 'enabled'
+  }
+  if ((raw === 'low' || raw === 'high' || raw === 'max' || raw === 'xhigh') && efforts.includes('enabled')) {
+    return 'enabled'
+  }
+  if (raw === 'xhigh' && efforts.includes('max')) return 'max'
+  return defaultEffort || efforts[0] || ''
+}
+
+/**
+ * Translate verbose / cryptic ZCode CLI stderr & provider errors into concise, actionable messages.
+ */
+export function formatZCodeCliError(rawErr, { resumed = false } = {}) {
+  const text = String(rawErr || '').trim()
+  if (!text) return 'ZCode 执行失败'
+
+  if (/Select a model before sending a message/i.test(text)) {
+    return resumed
+      ? 'ZCode 官方 CLI（--resume）当前版本暂不支持直接续聊已有桌面端会话，请在 All in One 中新建 ZCode 对话，或在电脑端 ZCode 窗口中继续此会话。'
+      : 'ZCode 未选中可用模型，请先重新授权登录或在模型选择器中选择一个 GLM 模型后重试。'
+  }
+
+  const bizMatch = text.match(/providerMessage:\s*['"]([^'"]+)['"]/) || text.match(/ProviderBusinessError:\s*([^\r\n]+)/)
+  const bizMsg = bizMatch ? bizMatch[1].trim() : ''
+
+  if (/\[1113\]|余额不足|无可用资源包/i.test(text)) {
+    return '智谱 Coding Plan 无可用余额或资源包（错误码 1113）：ZCode 免费 Start Plan 仅限官方 ZCode 桌面端使用，远程发送需开通 BigModel / Z.AI Coding Plan 或配置自定义 API Key。'
+  }
+  if (/3012|This client is not supported/i.test(text)) {
+    return 'ZCode 免费 Start Plan 仅限官方 ZCode 桌面端使用（错误码 3012），远程发送需开通 Coding Plan 或配置自定义 API Key。'
+  }
+  if (bizMsg) {
+    return `智谱接口返回错误：${bizMsg}`
+  }
+
+  // Strip Node.js stack traces / verbose object dumps to keep UI error banners crisp
+  const firstMeaningful = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('at ') && !l.startsWith('{') && !l.startsWith('}'))
+  const lastErrLine = [...firstMeaningful].reverse().find((l) => /^Error:/i.test(l))
+  const chosen = (firstMeaningful[0] && !/^Error:\s*Turn execution failed/i.test(firstMeaningful[0])
+    ? firstMeaningful[0]
+    : lastErrLine || firstMeaningful[0] || text
+  ).replace(/^Error:\s*/i, '')
+  return chosen.slice(0, 320)
+}
 
 const TRUSTED_ZCODE_AUTH_SUFFIXES = Object.freeze([
   'bigmodel.cn',
@@ -447,10 +563,20 @@ export function normalizeZCodeDbMessages(msgRows = [], partRows = []) {
     const role = info.role === 'user' ? 'user' : info.role === 'assistant' ? 'assistant' : ''
     if (!role) continue
 
+    const rawModel =
+      info.modelID ||
+      info.modelId ||
+      info.model?.modelID ||
+      info.model?.modelId ||
+      info.modelSelection?.modelId ||
+      ''
+    if (rawModel) lastModel = normalizeZCodeModelId(rawModel)
+
+    // Skip internal system-injected context rows (environment, skills catalog, date reminders)
+    if (info.synthetic === true || info.visibility === 'model-only' || info.hidden === true) continue
+
     const msgId = String(mRow.id || `zcd-m-${messages.length}`)
     const ts = toEpochMs(info?.time?.created || mRow.time_created || mRow.time_updated || Date.now())
-    if (info.modelID) lastModel = String(info.modelID)
-    else if (info.model?.modelId) lastModel = String(info.model.modelId)
 
     const pRows = partsByMsgId.get(msgId) || []
     const textChunks = []
@@ -461,10 +587,9 @@ export function normalizeZCodeDbMessages(msgRows = [], partRows = []) {
     for (const pRow of pRows) {
       const p = safeJsonParse(pRow?.data, null)
       if (!p || typeof p !== 'object') continue
-      if (p.ignored === true) continue
+      if (p.ignored === true || p.synthetic === true) continue
 
       if (p.type === 'text' && typeof p.text === 'string') {
-        if (p.synthetic === true && !p.text.trim()) continue
         const trimmed = p.text.trim()
         if (trimmed) textChunks.push(p.text)
       } else if (p.type === 'reasoning' && typeof p.text === 'string') {
@@ -672,7 +797,7 @@ function readZCodeSqliteSync(dbPath, mode = 'list', sessionId = '') {
           .prepare(`SELECT session_id, status, last_seen_at FROM session_runtime_presence`)
           .all()
       } catch {}
-      // Latest message preview per session (bounded)
+      // Latest visible (non-synthetic) message preview per session (bounded)
       let previews = []
       try {
         previews = db
@@ -684,11 +809,29 @@ function readZCodeSqliteSync(dbPath, mode = 'list', sessionId = '') {
                SELECT id FROM (
                  SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY COALESCE(sequence, 0) DESC, time_created DESC) AS rn
                  FROM message
+                 WHERE COALESCE(json_extract(data, '$.synthetic'), 0) != 1
+                   AND COALESCE(json_extract(data, '$.visibility'), '') != 'model-only'
                ) WHERE rn = 1
              )`,
           )
           .all()
-      } catch {}
+      } catch {
+        try {
+          previews = db
+            .prepare(
+              `SELECT m.session_id, m.data AS msg_data, p.data AS part_data
+               FROM message m
+               LEFT JOIN part p ON p.message_id = m.id
+               WHERE m.id IN (
+                 SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY COALESCE(sequence, 0) DESC, time_created DESC) AS rn
+                   FROM message
+                 ) WHERE rn = 1
+               )`,
+            )
+            .all()
+        } catch {}
+      }
       return { sessions, presences, previews }
     }
     if (mode === 'read') {
@@ -871,8 +1014,10 @@ function extractPreviewFromRows(previewRows = []) {
   for (const row of previewRows || []) {
     const sid = String(row?.session_id || '')
     if (!sid) continue
+    const m = safeJsonParse(row?.msg_data, null)
+    if (m?.synthetic === true || m?.visibility === 'model-only' || m?.hidden === true) continue
     const p = safeJsonParse(row?.part_data, null)
-    if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim() && !p.ignored) {
+    if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim() && !p.ignored && !p.synthetic) {
       const clean = p.text.replace(/\s+/g, ' ').trim().slice(0, 120)
       if (clean) bySession.set(sid, clean)
     }
@@ -1079,8 +1224,10 @@ export class ZCodeAdapter extends BaseAdapter {
     const firstBuiltinModel = Array.isArray(matchedRule?.config?.builtinModelIds)
       ? String(matchedRule.config.builtinModelIds[0] || '').trim()
       : ''
-    const defaultModel = String(configuredDef?.modelId || firstBuiltinModel || 'GLM-5.3')
-    const defaultEffort = String(configuredDef?.options?.reasoningLevel || 'high')
+    const defaultModel = normalizeZCodeModelId(configuredDef?.modelId || firstBuiltinModel || 'GLM-5.4')
+    const defaultEffort =
+      normalizeZCodeReasoningLevel(configuredDef?.options?.reasoningLevel || '', defaultModel, builtin) ||
+      resolveZCodeModelEfforts(defaultModel, builtin).defaultEffort
 
     return {
       setting,
@@ -1110,6 +1257,10 @@ export class ZCodeAdapter extends BaseAdapter {
       targetProvider = targetModel.slice(0, idx)
       targetModel = targetModel.slice(idx + 1)
     }
+    targetModel = normalizeZCodeModelId(targetModel)
+    const normalizedEffort = cleanEffort
+      ? normalizeZCodeReasoningLevel(cleanEffort, targetModel, ctx.builtin)
+      : ''
 
     // If matching existing defaultModelSelection, skip overlay creation
     const cur = ctx.personal?.config?.defaultModelSelection
@@ -1117,7 +1268,7 @@ export class ZCodeAdapter extends BaseAdapter {
       cur &&
       cur.providerId === targetProvider &&
       cur.modelId === targetModel &&
-      (!cleanEffort || cur.options?.reasoningLevel === cleanEffort)
+      (!normalizedEffort || cur.options?.reasoningLevel === normalizedEffort)
     ) {
       return null
     }
@@ -1139,7 +1290,7 @@ export class ZCodeAdapter extends BaseAdapter {
     baseCfg.config.defaultModelSelection = {
       providerId: targetProvider,
       modelId: targetModel,
-      ...(cleanEffort ? { options: { reasoningLevel: cleanEffort } } : {}),
+      ...(normalizedEffort ? { options: { reasoningLevel: normalizedEffort } } : {}),
     }
     writeFileSync(filePath, JSON.stringify(baseCfg, null, 2), 'utf8')
     return {
@@ -1200,18 +1351,20 @@ export class ZCodeAdapter extends BaseAdapter {
     const models = []
     const seen = new Set()
 
-    const addModel = (id, name, providerId = ctx.defaultProvider, efforts = ZCODE_DEFAULT_EFFORTS) => {
-      const cleanId = String(id || '').trim()
+    const addModel = (id, name, providerId = ctx.defaultProvider, effortsOverride = null) => {
+      const cleanId = normalizeZCodeModelId(id)
       if (!cleanId) return
       const key = cleanId.toLowerCase()
       if (seen.has(key)) return
       seen.add(key)
+      const resolved = resolveZCodeModelEfforts(cleanId, ctx.builtin)
+      const efforts = Array.isArray(effortsOverride) && effortsOverride.length > 0 ? [...effortsOverride] : resolved.efforts
       models.push({
         id: cleanId,
         name: String(name || cleanId).trim(),
         provider: providerId,
-        efforts: [...efforts],
-        defaultEffort: cleanId.toLowerCase().includes('flash') ? 'medium' : 'high',
+        efforts,
+        defaultEffort: resolved.defaultEffort,
       })
     }
 
@@ -1643,6 +1796,7 @@ export class ZCodeAdapter extends BaseAdapter {
         cliArgs,
         spawnEnv,
         effectiveMode,
+        isResumed: isPersistedSession,
         reservation,
         cleanupOverlay: overlay?.cleanup || null,
       })
@@ -1663,6 +1817,7 @@ export class ZCodeAdapter extends BaseAdapter {
     cliArgs,
     spawnEnv,
     effectiveMode,
+    isResumed = false,
     reservation,
     cleanupOverlay,
   }) {
@@ -1882,19 +2037,22 @@ export class ZCodeAdapter extends BaseAdapter {
         if (this.activeProcs.get(sessionId) === state) this.activeProcs.delete(sessionId)
 
         if (turnError && !state.aborted) {
-          const err = new Error(turnError)
+          const cleanTurnErr = formatZCodeCliError(turnError, { resumed: isResumed })
+          const err = new Error(cleanTurnErr)
           err._streamErrorEmitted = true
           this.emitEvent(EVENTS.STREAM_ERROR, {
             sessionId: compositeId,
             app: APPS.ZCODE,
-            message: turnError,
+            message: cleanTurnErr,
           })
           rejectPromise(err)
           return
         }
 
         if (code !== 0 && !state.aborted && !seenResult) {
-          const cleanErr = stderrBuf.trim().replace(/^Error:\s*/i, '') || `ZCode 进程退出（code=${code}）`
+          const cleanErr = stderrBuf.trim()
+            ? formatZCodeCliError(stderrBuf, { resumed: isResumed })
+            : `ZCode 进程退出（code=${code}）`
           const err = new Error(cleanErr)
           err._streamErrorEmitted = true
           this.emitEvent(EVENTS.STREAM_ERROR, {

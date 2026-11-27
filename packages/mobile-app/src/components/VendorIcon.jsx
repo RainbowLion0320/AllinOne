@@ -27,7 +27,7 @@ export function formatEffortLabel(effort, lang = getCurrentLang()) {
 
 export function getEffortMeta(effort) {
   const key = String(effort || '').trim().toLowerCase()
-  if (key === 'off' || key === 'none') {
+  if (key === 'off' || key === 'none' || key === 'disabled') {
     return {
       level: 0,
       color: '#64748B',
@@ -41,7 +41,7 @@ export function getEffortMeta(effort) {
       pillClass: 'bg-sky-500/12 text-sky-700 dark:bg-sky-400/20 dark:text-sky-300',
     }
   }
-  if (key === 'medium') {
+  if (key === 'medium' || key === 'enabled') {
     return {
       level: 2,
       color: '#4D6BFE',
@@ -82,8 +82,8 @@ export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {
 }
 
 /**
- * Official brand vector icons for DeepSeek (DSH), OpenAI Codex, Anthropic Claude,
- * Google Antigravity, and Tencent WorkBuddy.
+ * Official brand vector icons for DeepSeek (DSH), OpenAI ChatGPT, Anthropic Claude,
+ * Google Antigravity, Tencent WorkBuddy, and Zhipu ZCode.
  */
 export function VendorIcon({ app, size = 18, className = '', mono = false, active = false }) {
   const color = mono ? 'currentColor' : APP_META[app]?.color || '#4D6BFE'
@@ -123,7 +123,7 @@ export function VendorIcon({ app, size = 18, className = '', mono = false, activ
           ...(active ? { '--vendor-glow': APP_META[app]?.color || '#4D6BFE' } : {}),
         }}
         className={`inline-block shrink-0 select-none object-contain ${
-          app === 'workbuddy' || app === 'zcode' ? 'rounded-[22%]' : ''
+          app === 'codex' || app === 'workbuddy' || app === 'zcode' ? 'rounded-[22%]' : ''
         } ${active ? 'vendor-icon-live' : ''} ${className}`}
       />
     )
@@ -146,7 +146,7 @@ const BADGE_SIZES = {
 
 const VENDOR_TINTS = {
   dsh: 'bg-[#4D6BFE]/12 ring-[#4D6BFE]/25 dark:bg-[#4D6BFE]/20 dark:ring-[#4D6BFE]/35',
-  codex: 'bg-[#6366F1]/12 ring-[#6366F1]/25 dark:bg-[#6366F1]/20 dark:ring-[#6366F1]/35',
+  codex: 'bg-[#10A37F]/12 ring-[#10A37F]/25 dark:bg-[#10A37F]/18 dark:ring-[#10A37F]/32',
   claude: 'bg-[#D97757]/12 ring-[#D97757]/25 dark:bg-[#D97757]/20 dark:ring-[#D97757]/35',
   antigravity: 'bg-[#3186FF]/12 ring-[#3186FF]/25 dark:bg-[#3186FF]/18 dark:ring-[#3186FF]/35',
   workbuddy: 'bg-[#06C798]/12 ring-[#06C798]/25 dark:bg-[#06C798]/20 dark:ring-[#06C798]/35',
@@ -154,7 +154,7 @@ const VENDOR_TINTS = {
 }
 
 /**
- * Sleek tinted icon tile replacing old text badges ("DSH", "CDX", "CLD", "AGY").
+ * Sleek tinted icon tile replacing old text badges ("DSH", "GPT", "CLD", "AGY", "WKB", "ZCD").
  * Pass `active={true}` for in-progress conversations to render a soft brand-colored breathing aura.
  */
 export function VendorBadge({ app, size = 'sm', active = false, className = '' }) {
