@@ -1,6 +1,8 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -106,6 +108,44 @@ function getZCodeHome(configuredHome = '', env = process.env) {
   return join(homedir(), '.zcode')
 }
 
+export function getZCodeManagedAuthDir(configuredAuthDir = '', env = process.env) {
+  const custom = String(configuredAuthDir || env?.ALLINONE_ZCODE_AUTH_DIR || '').trim()
+  if (custom) return custom
+  return join(homedir(), '.allinone-bridge', 'zcode-auth')
+}
+
+/**
+ * Ensure an isolated 0600 secret file exists for ZCode standalone CLI (`ZCODE_CREDENTIAL_SECRET_FILE`)
+ * so `zcode.cjs` never depends on native `@napi-rs/keyring` and never touches ZCode Desktop's OS-keyring store.
+ */
+export function ensureZCodeManagedAuthStore(authDir) {
+  const dir = String(authDir || '').trim()
+  if (!dir) throw new Error('Missing ZCode managed auth directory')
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try { chmodSync(dir, 0o700) } catch {}
+
+  const secretFile = join(dir, 'credential-secret')
+  const credentialsFile = join(dir, 'credentials.json')
+  const providerConfigFile = join(dir, 'provider_config.json')
+
+  let needSecret = true
+  if (existsSync(secretFile)) {
+    try {
+      const st = statSync(secretFile)
+      if (st.isFile() && st.size >= 32 && st.size <= 4096) {
+        needSecret = false
+      }
+    } catch {}
+  }
+  if (needSecret) {
+    const secret = randomBytes(32).toString('hex')
+    writeFileSync(secretFile, secret, { encoding: 'utf8', mode: 0o600 })
+  }
+  try { chmodSync(secretFile, 0o600) } catch {}
+
+  return { dir, secretFile, credentialsFile, providerConfigFile }
+}
+
 function safeReadJson(filePath) {
   if (!filePath || !existsSync(filePath)) return null
   try {
@@ -163,21 +203,9 @@ export function resolveEffectiveZCodeMode(requestedMode, hostConfiguredMode, eff
   return rawReq
 }
 
-/**
- * Detect whether standalone ZCode CLI (`zcode.cjs -p ...`) has usable model/account credentials.
- * Inspects only non-secret config structure and key names in `credentials.json` (never decrypts secrets).
- */
-export function hasZCodeStandaloneAuth({ zcodeHome = '', env = process.env } = {}) {
-  if (
-    String(env?.ZHIPU_API_KEY || env?.BIGMODEL_API_KEY || env?.ZAI_API_KEY || env?.ZCODE_API_KEY || '').trim()
-  ) {
-    return true
-  }
-  const home = zcodeHome || getZCodeHome('', env)
-  if (!home || !existsSync(home)) return false
-
-  // 1. Standalone login writes `config.defaultModelSelection` into `~/.zcode/v2/provider_config.json`
-  const providerCfg = safeReadJson(join(home, 'v2', 'provider_config.json'))
+function hasAuthFilesInDir(dir) {
+  if (!dir || !existsSync(dir)) return false
+  const providerCfg = safeReadJson(join(dir, 'provider_config.json'))
   if (providerCfg?.config?.defaultModelSelection?.providerId && providerCfg?.config?.defaultModelSelection?.modelId) {
     return true
   }
@@ -186,8 +214,7 @@ export function hasZCodeStandaloneAuth({ zcodeHome = '', env = process.env } = {
     return true
   }
 
-  // 2. Standalone login writes `account-provider:<providerId>:identity` key into `~/.zcode/v2/credentials.json`
-  const credsObj = safeReadJson(join(home, 'v2', 'credentials.json'))
+  const credsObj = safeReadJson(join(dir, 'credentials.json'))
   if (credsObj && typeof credsObj === 'object') {
     for (const key of Object.keys(credsObj)) {
       if (/^account-provider:.+:identity$/i.test(key) && credsObj[key]) {
@@ -195,8 +222,29 @@ export function hasZCodeStandaloneAuth({ zcodeHome = '', env = process.env } = {
       }
     }
   }
-
   return false
+}
+
+/**
+ * Detect whether standalone ZCode CLI (`zcode.cjs -p ...`) has usable model/account credentials,
+ * checking env keys, All in One's isolated managed auth store, and `~/.zcode/v2/`.
+ * Inspects only non-secret config structure and key names in `credentials.json` (never decrypts secrets).
+ */
+export function hasZCodeStandaloneAuth({ zcodeHome = '', authDir = '', env = process.env } = {}) {
+  if (
+    String(env?.ZHIPU_API_KEY || env?.BIGMODEL_API_KEY || env?.ZAI_API_KEY || env?.ZCODE_API_KEY || '').trim()
+  ) {
+    return true
+  }
+
+  const managedDir = authDir || getZCodeManagedAuthDir('', env)
+  if (managedDir && existsSync(join(managedDir, 'credential-secret')) && hasAuthFilesInDir(managedDir)) {
+    return true
+  }
+
+  const home = zcodeHome || getZCodeHome('', env)
+  if (!home || !existsSync(home)) return false
+  return hasAuthFilesInDir(join(home, 'v2'))
 }
 
 /**
@@ -864,6 +912,7 @@ export class ZCodeAdapter extends BaseAdapter {
 
     this.env = config.env || process.env
     this.zcodeHome = getZCodeHome(config.zcodeHome || '', this.env)
+    this.managedAuthDir = getZCodeManagedAuthDir(config.zcodeAuthDir || '', this.env)
     this.defaultCwd = config.cwd || process.cwd()
     this.configuredBin = String(config.zcodeBin || '').trim()
     this.permissionMode = ALLOWED_ZCODE_MODES.includes(config.zcodeMode) ? config.zcodeMode : 'build'
@@ -917,7 +966,18 @@ export class ZCodeAdapter extends BaseAdapter {
   }
 
   get personalProviderConfigPath() {
+    if (this._useManagedAuthStore()) {
+      return join(this.managedAuthDir, 'provider_config.json')
+    }
     return join(this.zcodeHome, 'v2', 'provider_config.json')
+  }
+
+  _useManagedAuthStore() {
+    return Boolean(
+      this.managedAuthDir &&
+        existsSync(join(this.managedAuthDir, 'credential-secret')) &&
+        hasAuthFilesInDir(this.managedAuthDir),
+    )
   }
 
   _resolveLauncher() {
@@ -947,7 +1007,11 @@ export class ZCodeAdapter extends BaseAdapter {
     if (typeof this.config.checkZCodeAuth === 'function') {
       return Boolean(this.config.checkZCodeAuth())
     }
-    return hasZCodeStandaloneAuth({ zcodeHome: this.zcodeHome, env: this.env })
+    return hasZCodeStandaloneAuth({
+      zcodeHome: this.zcodeHome,
+      authDir: this.managedAuthDir,
+      env: this.env,
+    })
   }
 
   hasLocalData() {
@@ -959,7 +1023,7 @@ export class ZCodeAdapter extends BaseAdapter {
     )
   }
 
-  _buildCliEnv({ personalConfigOverridePath = '' } = {}) {
+  _buildCliEnv({ personalConfigOverridePath = '', ensureManagedAuth = false } = {}) {
     const env = sanitizeChildEnv({ ...process.env, ...this.env })
     const builtinPath =
       this.launcher?.builtinConfigPath ||
@@ -967,8 +1031,20 @@ export class ZCodeAdapter extends BaseAdapter {
     if (builtinPath) {
       env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtinPath
     }
-    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE =
-      personalConfigOverridePath || this.personalProviderConfigPath
+
+    const useManaged = ensureManagedAuth || this._useManagedAuthStore()
+    if (useManaged) {
+      const store = ensureZCodeManagedAuthStore(this.managedAuthDir)
+      // Never set both ZCODE_CREDENTIAL_SECRET and ZCODE_CREDENTIAL_SECRET_FILE
+      delete env.ZCODE_CREDENTIAL_SECRET
+      env.ZCODE_CREDENTIAL_SECRET_FILE = store.secretFile
+      env.ZCODE_CREDENTIALS_FILE = store.credentialsFile
+      env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = personalConfigOverridePath || store.providerConfigFile
+    } else {
+      env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE =
+        personalConfigOverridePath || this.personalProviderConfigPath
+    }
+
     if (this.zcodeHome !== join(homedir(), '.zcode')) {
       const parentDir = join(this.zcodeHome, '..')
       if (basename(this.zcodeHome).toLowerCase() === '.zcode') {
@@ -1925,7 +2001,7 @@ export class ZCodeAdapter extends BaseAdapter {
       '--no-browser',
       '--json',
     ]
-    const spawnEnv = this._buildCliEnv()
+    const spawnEnv = this._buildCliEnv({ ensureManagedAuth: true })
 
     return await new Promise((resolveSetup) => {
       let settled = false

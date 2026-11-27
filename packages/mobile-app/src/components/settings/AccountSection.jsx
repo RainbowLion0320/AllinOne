@@ -8,7 +8,6 @@ import {
   LogOut,
   Mail,
   RefreshCw,
-  ShieldCheck,
   Smartphone,
   User,
 } from 'lucide-react'
@@ -507,28 +506,64 @@ export function AccountSection({
           </div>
         )}
 
-        {/* Email */}
+        {/* Email & Login 2FA */}
         {activeDevice && (
           <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
             <div className="flex items-center justify-between gap-2">
-              <div className="flex min-w-0 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+              <div className="flex min-w-0 flex-1 items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                 <Mail className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                <span className="truncate">{boundEmail || bi('未绑定邮箱', 'No email linked')}</span>
+                <span className="truncate" title={boundEmail || undefined}>
+                  {boundEmail || bi('未绑定邮箱', 'No email linked')}
+                </span>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowEmailForm((v) => {
-                    if (v) setEmailPasswordDraft('')
-                    return !v
-                  })
-                  setEmailError('')
-                  setEmailInfo('')
-                }}
-                className="shrink-0 rounded-lg px-2 py-0.5 text-[11.5px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
-              >
-                {showEmailForm ? bi('收起', 'Hide') : boundEmail ? bi('换绑', 'Change') : bi('绑定', 'Link')}
-              </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowEmailForm((v) => {
+                      if (v) setEmailPasswordDraft('')
+                      return !v
+                    })
+                    setEmailError('')
+                    setEmailInfo('')
+                  }}
+                  className="shrink-0 rounded-lg px-1.5 py-0.5 text-[11.5px] font-medium text-[#4D6BFE] hover:bg-[#4D6BFE]/10"
+                >
+                  {showEmailForm ? bi('收起', 'Hide') : boundEmail ? bi('换绑', 'Change') : bi('绑定', 'Link')}
+                </button>
+                {emailEnabled && boundEmail && onToggleLogin2fa && (
+                  <>
+                    <span aria-hidden="true" className="h-3.5 w-px bg-slate-200 dark:bg-slate-700/80" />
+                    <div className="flex items-center gap-1">
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                        {bi('二次验证', '2FA')}
+                      </span>
+                      <HelpButton
+                        active={openHelpKey === '2fa'}
+                        onClick={() => toggleHelp('2fa')}
+                        label={bi('查看邮箱二次验证说明', 'About email login 2FA')}
+                      />
+                      <ToggleSwitch
+                        checked={Boolean(activeDevice?.loginEmail2fa)}
+                        disabled={disable2faBusy}
+                        onChange={() => {
+                          if (!activeDevice?.loginEmail2fa) {
+                            setShowDisable2faForm(false)
+                            setDisable2faPassword('')
+                            setDisable2faError('')
+                            void onToggleLogin2fa(true)
+                          } else {
+                            setShowDisable2faForm((v) => !v)
+                            setDisable2faPassword('')
+                            setDisable2faError('')
+                          }
+                        }}
+                        label={bi('切换登录邮箱二次验证', 'Toggle email login 2FA')}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
 
             {showEmailForm && (
@@ -608,6 +643,61 @@ export function AccountSection({
                   </div>
                 )}
               </div>
+            )}
+
+            {showDisable2faForm && activeDevice?.loginEmail2fa && (
+              <form
+                onSubmit={handleConfirmDisable2fa}
+                className="mt-2 space-y-2 rounded-xl border border-rose-200/80 bg-rose-50/70 p-2.5 dark:border-rose-900/50 dark:bg-rose-950/30"
+              >
+                <div className="text-[11px] font-medium text-rose-700 dark:text-rose-200">
+                  {bi('输入当前密码以关闭二次验证', 'Enter current password to disable 2FA')}
+                </div>
+                <input
+                  type="password"
+                  value={disable2faPassword}
+                  onChange={(e) => setDisable2faPassword(e.target.value)}
+                  placeholder={bi('当前账号密码', 'Current password')}
+                  autoComplete="current-password"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1E212B] dark:text-white"
+                />
+                {disable2faError && (
+                  <div className="rounded-lg bg-rose-100/80 px-2.5 py-1.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+                    {disable2faError}
+                  </div>
+                )}
+                <div className="flex justify-end gap-1.5">
+                  <button
+                    type="button"
+                    disabled={disable2faBusy}
+                    onClick={() => {
+                      setShowDisable2faForm(false)
+                      setDisable2faPassword('')
+                      setDisable2faError('')
+                    }}
+                    className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800"
+                  >
+                    {t('common.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={disable2faBusy}
+                    className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
+                  >
+                    {disable2faBusy && <Loader2 className="h-3 w-3 animate-spin" />}
+                    <span>{bi('确认关闭', 'Confirm')}</span>
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {emailEnabled && boundEmail && onToggleLogin2fa && (
+              <HelpCallout show={openHelpKey === '2fa'}>
+                {bi(
+                  '开启后，使用密码登录账号时需要额外输入发送到绑定邮箱的 6 位一次性验证码，防止密码泄露后被他人登录。',
+                  'When enabled, signing in with your password also requires a 6-digit one-time code sent to your linked email.',
+                )}
+              </HelpCallout>
             )}
           </div>
         )}
@@ -717,91 +807,6 @@ export function AccountSection({
                 {githubBind.error}
               </div>
             )}
-          </div>
-        )}
-
-        {/* Email Login 2FA */}
-        {activeDevice && emailEnabled && boundEmail && onToggleLogin2fa && (
-          <div className="border-t border-slate-100 px-3.5 py-2.5 dark:border-slate-800">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex min-w-0 items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
-                <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                <span className="truncate">{bi('登录邮箱二次验证', 'Email Login 2FA')}</span>
-                <HelpButton
-                  active={openHelpKey === '2fa'}
-                  onClick={() => toggleHelp('2fa')}
-                  label={bi('查看邮箱二次验证说明', 'About email login 2FA')}
-                />
-              </div>
-              <ToggleSwitch
-                checked={Boolean(activeDevice?.loginEmail2fa)}
-                disabled={disable2faBusy}
-                onChange={() => {
-                  if (!activeDevice?.loginEmail2fa) {
-                    setShowDisable2faForm(false)
-                    setDisable2faPassword('')
-                    setDisable2faError('')
-                    void onToggleLogin2fa(true)
-                  } else {
-                    setShowDisable2faForm((v) => !v)
-                    setDisable2faPassword('')
-                    setDisable2faError('')
-                  }
-                }}
-                label={bi('切换登录邮箱二次验证', 'Toggle email login 2FA')}
-              />
-            </div>
-            {showDisable2faForm && activeDevice?.loginEmail2fa && (
-              <form
-                onSubmit={handleConfirmDisable2fa}
-                className="mt-2 space-y-2 rounded-xl border border-rose-200/80 bg-rose-50/70 p-2.5 dark:border-rose-900/50 dark:bg-rose-950/30"
-              >
-                <div className="text-[11px] font-medium text-rose-700 dark:text-rose-200">
-                  {bi('输入当前密码以关闭二次验证', 'Enter current password to disable 2FA')}
-                </div>
-                <input
-                  type="password"
-                  value={disable2faPassword}
-                  onChange={(e) => setDisable2faPassword(e.target.value)}
-                  placeholder={bi('当前账号密码', 'Current password')}
-                  autoComplete="current-password"
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-900 outline-none focus:border-[#4D6BFE] dark:border-slate-700 dark:bg-[#1E212B] dark:text-white"
-                />
-                {disable2faError && (
-                  <div className="rounded-lg bg-rose-100/80 px-2.5 py-1.5 text-[11px] text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
-                    {disable2faError}
-                  </div>
-                )}
-                <div className="flex justify-end gap-1.5">
-                  <button
-                    type="button"
-                    disabled={disable2faBusy}
-                    onClick={() => {
-                      setShowDisable2faForm(false)
-                      setDisable2faPassword('')
-                      setDisable2faError('')
-                    }}
-                    className="rounded-lg px-2.5 py-1 text-[11px] text-slate-500 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800"
-                  >
-                    {t('common.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={disable2faBusy}
-                    className="inline-flex items-center gap-1 rounded-lg bg-rose-500 px-3 py-1 text-[11px] font-semibold text-white disabled:opacity-60"
-                  >
-                    {disable2faBusy && <Loader2 className="h-3 w-3 animate-spin" />}
-                    <span>{bi('确认关闭', 'Confirm')}</span>
-                  </button>
-                </div>
-              </form>
-            )}
-            <HelpCallout show={openHelpKey === '2fa'}>
-              {bi(
-                '开启后，使用密码登录账号时需要额外输入发送到绑定邮箱的 6 位一次性验证码，防止密码泄露后被他人登录。',
-                'When enabled, signing in with your password also requires a 6-digit one-time code sent to your linked email.',
-              )}
-            </HelpCallout>
           </div>
         )}
       </div>

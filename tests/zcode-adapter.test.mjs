@@ -11,6 +11,7 @@ import { resolveSafeDeliverableCwd, resolveSafeDesktopDeliverable } from '../pac
 import { MultiAppOrchestrator } from '../packages/dsh-mobile-hub/src/orchestrator.js'
 import {
   ZCodeAdapter,
+  ensureZCodeManagedAuthStore,
   extractZCodeTaskState,
   hasZCodeStandaloneAuth,
   isSafeZCodeAuthUrl,
@@ -242,6 +243,7 @@ test('ZCode auth URL allowlist, mode clamping, and standalone auth detection', (
   assert.throws(() => resolveEffectiveZCodeMode('invalid-mode', 'build', null))
 
   const dir = makeTempDir('allinone-zcode-auth-')
+  const managedDir = join(dir, 'managed-auth')
   try {
     mkdirSync(join(dir, 'v2'), { recursive: true })
     // Desktop-only OAuth credentials without standalone account-provider identity -> not standalone ready
@@ -250,12 +252,22 @@ test('ZCode auth URL allowlist, mode clamping, and standalone auth detection', (
       JSON.stringify({ 'oauth:zai_cn:access_token': 'enc:v2:os:xxx', zcodejwttoken: 'enc:v2:os:yyy' }),
       'utf8',
     )
-    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, env: {} }), false)
+    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, authDir: managedDir, env: {} }), false)
 
     // Env API key unlocks standalone auth
-    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, env: { BIGMODEL_API_KEY: 'test-key' } }), true)
+    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, authDir: managedDir, env: { BIGMODEL_API_KEY: 'test-key' } }), true)
 
-    // `provider_config.json` defaultModelSelection written by `zcode login` unlocks standalone auth
+    // Isolated managed auth store (`ZCODE_CREDENTIAL_SECRET_FILE` + `ZCODE_CREDENTIALS_FILE`) unlocks standalone auth
+    const store = ensureZCodeManagedAuthStore(managedDir)
+    writeFileSync(
+      store.credentialsFile,
+      JSON.stringify({ 'account-provider:account:bigmodel-individual-coding-plan:identity': 'enc:v2:env:abc' }),
+      'utf8',
+    )
+    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, authDir: managedDir, env: {} }), true)
+
+    // `provider_config.json` defaultModelSelection written by `zcode login` in `~/.zcode/v2/` also unlocks standalone auth
+    const emptyManaged = join(dir, 'empty-managed')
     writeFileSync(
       join(dir, 'v2', 'provider_config.json'),
       JSON.stringify({
@@ -266,7 +278,7 @@ test('ZCode auth URL allowlist, mode clamping, and standalone auth detection', (
       }),
       'utf8',
     )
-    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, env: {} }), true)
+    assert.equal(hasZCodeStandaloneAuth({ zcodeHome: dir, authDir: emptyManaged, env: {} }), true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -433,6 +445,7 @@ test('ZCodeAdapter end-to-end: RO SQLite sync, 1-click setup, RW streaming & orc
   const adapter = new ZCodeAdapter({
     config: {
       zcodeHome,
+      zcodeAuthDir: join(tmp, 'managed-auth'),
       cwd: wsDir,
       zcodeLauncher: { bin: 'node', baseArgs: ['/fake/zcode.cjs'], kind: 'desktop-bundled' },
       checkZCodeAuth: () => authed,
@@ -470,11 +483,14 @@ test('ZCodeAdapter end-to-end: RO SQLite sync, 1-click setup, RW streaming & orc
 
     await assert.rejects(() => adapter.createSession({ cwd: wsDir }), (err) => err.code === 'SESSION_READONLY')
 
-    // 2. 1-click OAuth setup captures validated authorize_url & unlocks RW
+    // 2. 1-click OAuth setup captures validated authorize_url, configures isolated secret file & unlocks RW
     const setupRes = await adapter.runSetup({ action: 'setup', methodId: 'internal' })
     assert.equal(setupRes.ok, true)
     assert.equal(setupRes.status, 'awaiting_login')
     assert.equal(setupRes.authUrl, 'https://open.bigmodel.cn/oauth/zcode?state=test123')
+    assert.ok(spawnedCalls[0].opts.env.ZCODE_CREDENTIAL_SECRET_FILE)
+    assert.ok(spawnedCalls[0].opts.env.ZCODE_CREDENTIALS_FILE)
+    assert.equal(spawnedCalls[0].opts.env.ZCODE_CREDENTIAL_SECRET, undefined)
     await new Promise((r) => setTimeout(r, 100))
     assert.ok(events.some((e) => e.ev === EVENTS.SESSION_UPDATED && e.payload?.authReady && e.payload?.app === 'zcode'))
 
