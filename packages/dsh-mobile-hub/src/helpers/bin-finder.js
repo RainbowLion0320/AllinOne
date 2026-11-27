@@ -796,3 +796,105 @@ export function findZCodeLauncher({
 
   return null
 }
+
+/**
+ * Candidate data roots for Moonshot Kimi Desktop (`daimon-share/daimon`) and standalone Daimon (`~/.kimi/daimon`).
+ */
+export function getKimiDataDirCandidates(
+  home = homedir(),
+  platform = process.platform,
+  env = process.env,
+  configuredDir = '',
+) {
+  const list = [
+    configuredDir,
+    env?.KIMI_DAIMON_DIR,
+    env?.KIMI_DATA_DIR,
+  ]
+  if (platform === 'win32') {
+    const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+    const localApp = env?.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    list.push(
+      join(appData, 'kimi-desktop', 'daimon-share', 'daimon'),
+      join(localApp, 'kimi-desktop', 'daimon-share', 'daimon'),
+    )
+  } else if (platform === 'darwin') {
+    list.push(
+      join(home, 'Library', 'Application Support', 'kimi-desktop', 'daimon-share', 'daimon'),
+      join(home, 'Library', 'Application Support', 'Kimi', 'daimon-share', 'daimon'),
+    )
+  } else {
+    const xdgConfig = env?.XDG_CONFIG_HOME || join(home, '.config')
+    const xdgData = env?.XDG_DATA_HOME || join(home, '.local', 'share')
+    list.push(
+      join(xdgConfig, 'kimi-desktop', 'daimon-share', 'daimon'),
+      join(xdgData, 'kimi-desktop', 'daimon-share', 'daimon'),
+    )
+  }
+  list.push(join(home, '.kimi', 'daimon'))
+  return list.filter(Boolean)
+}
+
+/**
+ * Locate the active Moonshot Kimi Desktop data directory (`daimon-share/daimon`).
+ * Prefers a candidate containing a live `agents/main/runner.state.json`, then `config.json` or SQLite history.
+ */
+export function findKimiDataDir({
+  home = homedir(),
+  platform = process.platform,
+  env = process.env,
+  configuredDir = '',
+} = {}) {
+  const explicit = String(configuredDir || '').trim()
+  if (explicit) {
+    return existsSync(explicit) ? explicit : ''
+  }
+  const candidates = getKimiDataDirCandidates(home, platform, env, '')
+  for (const dir of candidates) {
+    if (existsSync(join(dir, 'agents', 'main', 'runner.state.json'))) return dir
+  }
+  for (const dir of candidates) {
+    if (
+      existsSync(join(dir, 'agents', 'main', 'sessions', 'hosted-logical', 'conversations.sqlite')) ||
+      existsSync(join(dir, 'config.json'))
+    ) {
+      return dir
+    }
+  }
+  return ''
+}
+
+/**
+ * Locate Kimi Desktop's log directory (`logs/main.log`) used for passive subscription quota parsing.
+ */
+export function findKimiDesktopLogDir({
+  home = homedir(),
+  platform = process.platform,
+  env = process.env,
+  kimiDataDir = '',
+  strict = false,
+} = {}) {
+  const candidates = []
+  if (kimiDataDir) {
+    // `<kimi-desktop>/daimon-share/daimon` -> `<kimi-desktop>/logs`
+    candidates.push(join(dirname(dirname(kimiDataDir)), 'logs'))
+  }
+  if (!strict) {
+    if (platform === 'win32') {
+      const appData = env?.APPDATA || join(home, 'AppData', 'Roaming')
+      candidates.push(join(appData, 'kimi-desktop', 'logs'))
+    } else if (platform === 'darwin') {
+      candidates.push(
+        join(home, 'Library', 'Logs', 'kimi-desktop'),
+        join(home, 'Library', 'Application Support', 'kimi-desktop', 'logs'),
+      )
+    } else {
+      const xdgConfig = env?.XDG_CONFIG_HOME || join(home, '.config')
+      candidates.push(join(xdgConfig, 'kimi-desktop', 'logs'))
+    }
+  }
+  for (const dir of candidates) {
+    if (dir && existsSync(join(dir, 'main.log'))) return dir
+  }
+  return ''
+}

@@ -524,6 +524,15 @@ export function NewChatModal({
               </div>
             )}
 
+            {app === 'kimi' && !selectedAppStatus?.writable && (
+              <div className="rounded-2xl border border-[#0A84FF]/30 bg-[#EEF6FF] p-3 text-xs text-slate-700 dark:border-[#0A84FF]/30 dark:bg-[#142032] dark:text-slate-200">
+                {bi(
+                  'Kimi 桌面端当前未运行（历史只读）。请先在电脑上打开 Kimi 桌面端，All in One 会自动通过官方本地控制协议直连并解锁实时对话。',
+                  'Kimi Desktop is currently closed (read-only history). Open Kimi Desktop on your computer to automatically unlock live chat.',
+                )}
+              </div>
+            )}
+
             {createError && (
               <div className="rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-950/50 dark:text-rose-300">
                 {createError}
@@ -532,7 +541,7 @@ export function NewChatModal({
 
             <button
               type="submit"
-              disabled={creating || ((app === 'workbuddy' || app === 'zcode') && !selectedAppStatus?.writable)}
+              disabled={creating || ((app === 'workbuddy' || app === 'zcode' || app === 'kimi') && !selectedAppStatus?.writable)}
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#4D6BFE] py-2.5 text-sm font-semibold text-white shadow-md shadow-[#4D6BFE]/25 active:scale-[0.98] disabled:opacity-60"
             >
               {creating && <Loader2 className="h-4 w-4 animate-spin" />}

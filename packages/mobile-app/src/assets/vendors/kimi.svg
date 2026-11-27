@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
+  <title>Kimi</title>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="#0E0F12" />
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5" />
+  <!-- Signature Kimi geometric K with curved lower stroke -->
+  <path
+    fill="#FFFFFF"
+    d="M17.5 19.5H23.8V32.4L36.7 19.5H44.6L31.4 32.5L41.8 40.2C43.2 41.2 44.3 41.6 45.2 41.7V46.8C42.4 46.8 40.1 45.9 37.8 44.1L27.1 35.9L23.8 39.2V46.5H17.5V19.5Z"
+  />
+  <!-- Signature Moonshot blue droplet / comet dot -->
+  <path
+    fill="#0A84FF"
+    d="M46.5 19.5V15.5C46.5 13.0147 48.5147 11 51 11C53.4853 11 55.5 13.0147 55.5 15.5C55.5 17.9853 53.4853 20 51 20H47C46.7239 20 46.5 19.7761 46.5 19.5Z"
+  />
+</svg>

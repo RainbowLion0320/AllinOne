@@ -112,14 +112,17 @@ const SessionRow = React.memo(function SessionRow({
         </span>
         {(session.source === 'claude-desktop-cowork' ||
           (session.source === 'workbuddy-desktop' && session.writable === false) ||
-          (session.source === 'zcode-desktop' && session.writable === false)) && (
+          (session.source === 'zcode-desktop' && session.writable === false) ||
+          (session.source === 'kimi-desktop' && session.writable === false)) && (
           <span
             title={
               session.source === 'workbuddy-desktop'
                 ? bi('WorkBuddy 桌面端实时同步视图', 'WorkBuddy Desktop live mirror')
                 : session.source === 'zcode-desktop'
                   ? bi('ZCode 桌面端实时同步视图', 'ZCode Desktop live mirror')
-                  : bi('Claude Desktop (Cowork) 实时同步视图', 'Claude Desktop (Cowork) live mirror')
+                  : session.source === 'kimi-desktop'
+                    ? bi('Kimi 桌面端历史只读视图（打开桌面端解锁实时收发）', 'Kimi Desktop read-only mirror (open Kimi Desktop to send)')
+                    : bi('Claude Desktop (Cowork) 实时同步视图', 'Claude Desktop (Cowork) live mirror')
             }
             className="shrink-0 rounded border border-slate-200/80 bg-white/70 px-1 py-0.5 text-[9.5px] font-medium text-slate-500 dark:border-slate-700/80 dark:bg-slate-800/70 dark:text-slate-400"
           >

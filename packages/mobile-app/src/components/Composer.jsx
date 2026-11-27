@@ -73,6 +73,12 @@ const NATIVE_SLASH_COMMANDS = {
     { cmd: '/init', icon: FileCode, zh: '初始化项目 AGENTS.md 指引', en: 'Initialize workspace AGENTS.md guide' },
     { cmd: '/skill', needsArgs: true, icon: Sparkles, zh: '调用本地技能处理任务', en: 'Invoke a local ZCode skill' },
   ],
+  kimi: [
+    { cmd: '/plan', needsArgs: true, icon: ListTodo, zh: '计划模式 · 先规划步骤再执行', en: 'Plan mode before executing' },
+    { cmd: '/goal', needsArgs: true, icon: Timer, zh: '目标模式 · 持续推进直到完成', en: 'Run in continuous goal mode' },
+    { cmd: '/compact', icon: FoldVertical, zh: '压缩当前对话上下文', en: 'Compact conversation context' },
+    { cmd: '/skill', needsArgs: true, icon: Sparkles, zh: '调用 Kimi 本地技能处理任务', en: 'Invoke a local Kimi skill' },
+  ],
 }
 
 function revokeAttachmentPreview(att) {

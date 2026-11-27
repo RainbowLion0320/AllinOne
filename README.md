@@ -15,7 +15,8 @@
   <img src="./packages/mobile-app/src/assets/vendors/antigravity.svg" width="20" height="20" align="absmiddle" alt="Antigravity" /> <strong>Antigravity</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> <strong>DeepSeek</strong> &nbsp;·&nbsp;
   <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> <strong>WorkBuddy</strong> &nbsp;·&nbsp;
-  <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> <strong>ZCode</strong> &nbsp;·&nbsp; <em>and more</em>
+  <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> <strong>ZCode</strong> &nbsp;·&nbsp;
+  <img src="./packages/mobile-app/src/assets/vendors/kimi.svg" width="20" height="20" align="absmiddle" alt="Kimi" /> <strong>Kimi</strong> &nbsp;·&nbsp; <em>and more</em>
   <br/>
   <sub>目前已接入以上主流 AI 工具，更多工具持续扩展中</sub>
 </p>
@@ -78,6 +79,7 @@
 | <img src="./packages/mobile-app/src/assets/vendors/deepseek.svg" width="20" height="20" align="absmiddle" alt="DeepSeek" /> **DeepSeek Harness** | 远程读写 · 余额监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/workbuddy.svg" width="20" height="20" align="absmiddle" alt="WorkBuddy" /> **腾讯 WorkBuddy** | 远程读写 · 积分监控 |
 | <img src="./packages/mobile-app/src/assets/vendors/zcode.svg" width="20" height="20" align="absmiddle" alt="ZCode" /> **智谱 ZCode** | 远程读写 · 额度监控 |
+| <img src="./packages/mobile-app/src/assets/vendors/kimi.svg" width="20" height="20" align="absmiddle" alt="Kimi" /> **月之暗面 Kimi** | 远程读写 · 额度监控 |
 
 > 自动复用各工具本机已有登录态，开箱即用。更多主流 AI 工具持续接入中，欢迎在 [Issues](https://github.com/RainbowLion0320/AllinOne/issues) 提出需求。
 
@@ -142,7 +144,7 @@ flowchart LR
 
   subgraph PC["所有互联电脑（Windows / macOS / Linux · 出站连接零开端口）"]
     B["All in One 桥接器（多机并存 · 随时切换）"]
-    A["ChatGPT · Claude · Antigravity · DeepSeek · WorkBuddy · ZCode ..."]
+    A["ChatGPT · Claude · Antigravity · DeepSeek · WorkBuddy · ZCode · Kimi ..."]
     B <-->|"官方本地接口"| A
   end
 
@@ -268,4 +270,4 @@ packages/
 ---
 
 - **安全与贡献**：部署前建议阅读 [SECURITY.md](./SECURITY.md)；欢迎通过 Issue / PR 参与贡献（[CONTRIBUTING.md](./CONTRIBUTING.md)）。
-- **声明与协议**：独立开源项目，与 OpenAI、Anthropic、Google、DeepSeek、Tencent、Zhipu 无官方关联 · 采用 [MIT License](./LICENSE)。
+- **声明与协议**：独立开源项目，与 OpenAI、Anthropic、Google、DeepSeek、Tencent、Zhipu、Moonshot AI 无官方关联 · 采用 [MIT License](./LICENSE)。

@@ -31,6 +31,7 @@ function getFilterTabs(lang) {
     { id: 'antigravity', label: 'Antigravity', color: '#3186FF' },
     { id: 'workbuddy', label: 'WorkBuddy', color: '#06C798' },
     { id: 'zcode', label: 'ZCode', color: '#64748B' },
+    { id: 'kimi', label: 'Kimi', color: '#0A84FF' },
   ]
 }
 

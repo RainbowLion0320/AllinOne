@@ -62,6 +62,10 @@ function getOtherVendorHint(card, bi) {
     if (!card.writable) return bi('已同步桌面端会话 · 浏览器授权一次即可远程发送', 'Desktop mirror · Sign in once via browser to send')
     return bi('智谱 ZCode 读写就绪 · 自动同步套餐额度', 'ZCode ready · Auto-syncing plan quota')
   }
+  if (card.app === 'kimi') {
+    if (!card.writable) return bi('已同步 Kimi 历史（只读）· 打开桌面端后自动解锁发送', 'Kimi history mirror · Open Kimi Desktop to send')
+    return bi('Kimi 桌面端实时直连 · 自动同步订阅额度', 'Kimi Desktop live · Auto-syncing quota')
+  }
   return card.writable ? bi('读写就绪', 'Ready') : bi('只读模式', 'Read-only')
 }
 
@@ -655,8 +659,8 @@ export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
           </div>
           <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
             {bi(
-              '支持 ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · DeepSeek Harness',
-              'Supports ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · DeepSeek Harness',
+              '支持 ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · Kimi · DeepSeek Harness',
+              'Supports ChatGPT · Antigravity · Claude Code · WorkBuddy · ZCode · Kimi · DeepSeek Harness',
             )}
           </p>
         </div>

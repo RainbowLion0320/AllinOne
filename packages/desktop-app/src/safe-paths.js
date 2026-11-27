@@ -38,6 +38,9 @@ export const SENSITIVE_HOME_SUBDIRS = Object.freeze([
   '.codebuddy',
   '.gemini',
   '.zcode',
+  '.kimi',
+  '.kimi-webbridge',
+  '.kimi-work',
 ])
 
 export function isSafeWindowsLocalPath(candidate) {

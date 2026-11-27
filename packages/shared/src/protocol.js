@@ -10,6 +10,7 @@ export const APPS = Object.freeze({
   ANTIGRAVITY: 'antigravity',
   WORKBUDDY: 'workbuddy',
   ZCODE: 'zcode',
+  KIMI: 'kimi',
 })
 
 export const APP_LIST = Object.freeze([
@@ -19,6 +20,7 @@ export const APP_LIST = Object.freeze([
   APPS.ANTIGRAVITY,
   APPS.WORKBUDDY,
   APPS.ZCODE,
+  APPS.KIMI,
 ])
 
 export const APP_META = Object.freeze({
@@ -69,6 +71,14 @@ export const APP_META = Object.freeze({
     color: '#64748B',
     badge: 'ZCD',
     description: '智谱 ZCode 桌面端会话与额度实时同步（复用官方原生 CLI 流式协议，与桌面端共享本地会话）',
+  },
+  kimi: {
+    id: 'kimi',
+    name: 'Kimi',
+    shortName: 'Kimi',
+    color: '#0A84FF',
+    badge: 'KMI',
+    description: '月之暗面 Kimi 桌面端实时双向直连（官方本地控制协议，与桌面端同步会话、思考流与额度）',
   },
 })
 

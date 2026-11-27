@@ -7,6 +7,7 @@ import claudeSvg from '../assets/vendors/claude.svg'
 import antigravitySvg from '../assets/vendors/antigravity.svg'
 import workbuddySvg from '../assets/vendors/workbuddy.svg'
 import zcodeSvg from '../assets/vendors/zcode.svg'
+import kimiSvg from '../assets/vendors/kimi.svg'
 
 const OFFICIAL_VENDOR_SVG = {
   dsh: deepseekSvg,
@@ -15,6 +16,7 @@ const OFFICIAL_VENDOR_SVG = {
   antigravity: antigravitySvg,
   workbuddy: workbuddySvg,
   zcode: zcodeSvg,
+  kimi: kimiSvg,
 }
 
 export function formatEffortLabel(effort, lang = getCurrentLang()) {
@@ -83,7 +85,7 @@ export function formatModelShort(modelId, modelName, lang = getCurrentLang()) {
 
 /**
  * Official brand vector icons for DeepSeek (DSH), OpenAI ChatGPT, Anthropic Claude,
- * Google Antigravity, Tencent WorkBuddy, and Zhipu ZCode.
+ * Google Antigravity, Tencent WorkBuddy, Zhipu ZCode, and Moonshot Kimi.
  */
 export function VendorIcon({ app, size = 18, className = '', mono = false, active = false }) {
   const color = mono ? 'currentColor' : APP_META[app]?.color || '#4D6BFE'
@@ -123,7 +125,7 @@ export function VendorIcon({ app, size = 18, className = '', mono = false, activ
           ...(active ? { '--vendor-glow': APP_META[app]?.color || '#4D6BFE' } : {}),
         }}
         className={`inline-block shrink-0 select-none object-contain ${
-          app === 'codex' || app === 'workbuddy' || app === 'zcode' ? 'rounded-[22%]' : ''
+          app === 'codex' || app === 'workbuddy' || app === 'zcode' || app === 'kimi' ? 'rounded-[22%]' : ''
         } ${active ? 'vendor-icon-live' : ''} ${className}`}
       />
     )
@@ -151,10 +153,11 @@ const VENDOR_TINTS = {
   antigravity: 'bg-[#3186FF]/12 ring-[#3186FF]/25 dark:bg-[#3186FF]/18 dark:ring-[#3186FF]/35',
   workbuddy: 'bg-[#06C798]/12 ring-[#06C798]/25 dark:bg-[#06C798]/20 dark:ring-[#06C798]/35',
   zcode: 'bg-slate-900/10 ring-slate-900/20 dark:bg-white/10 dark:ring-white/20',
+  kimi: 'bg-[#0A84FF]/12 ring-[#0A84FF]/25 dark:bg-[#0A84FF]/20 dark:ring-[#0A84FF]/35',
 }
 
 /**
- * Sleek tinted icon tile replacing old text badges ("DSH", "GPT", "CLD", "AGY", "WKB", "ZCD").
+ * Sleek tinted icon tile replacing old text badges ("DSH", "GPT", "CLD", "AGY", "WKB", "ZCD", "KMI").
  * Pass `active={true}` for in-progress conversations to render a soft brand-colored breathing aura.
  */
 export function VendorBadge({ app, size = 'sm', active = false, className = '' }) {

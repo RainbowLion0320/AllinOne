@@ -408,7 +408,7 @@ export function useSessionManager({
   )
 
   const defaultApp = useMemo(() => {
-    const order = ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy', 'zcode']
+    const order = ['dsh', 'codex', 'claude', 'antigravity', 'workbuddy', 'zcode', 'kimi']
     for (const id of order) {
       if (appsStatus.find((a) => a.app === id && a.writable)) return id
     }

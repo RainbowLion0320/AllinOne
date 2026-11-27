@@ -608,6 +608,11 @@ export function App() {
   const isZcodeWorking = zcodeSetup.status === 'working'
   const isZcodeAwaiting = zcodeSetup.status === 'awaiting_login'
 
+  const kimiStatus = appsStatus.find((a) => a.app === 'kimi')
+  const isKimiReadonly =
+    (activeSession?.app === 'kimi' && activeSession?.writable === false) ||
+    (!activeSession && activeApp === 'kimi' && kimiStatus && !kimiStatus.writable)
+
   return (
     <ImageActionsProvider value={imageActions}>
       <ImageLiveStateProvider value={imageLiveState}>
@@ -1208,6 +1213,28 @@ export function App() {
                           </>
                         )}
                       </div>
+                    </div>
+                  </div>
+                ) : isKimiReadonly ? (
+                  <div className="pb-safe shrink-0 bg-white/90 px-3 pt-2 backdrop-blur-md dark:bg-[#16171A]/90">
+                    <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-2.5 rounded-2xl border border-[#0A84FF]/30 bg-[#EEF6FF] px-3.5 py-2.5 lg:max-w-3xl dark:border-[#0A84FF]/30 dark:bg-[#142032]">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="h-2 w-2 shrink-0 rounded-full bg-amber-400" />
+                        <span className="truncate text-xs font-medium text-slate-700 dark:text-slate-200">
+                          {bi(
+                            'Kimi 桌面端未运行（只读同步历史）· 打开 Kimi 桌面端后自动解锁实时收发',
+                            'Kimi Desktop is closed (read-only history) · Open Kimi Desktop to unlock live chat',
+                          )}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleRefreshWorkspace}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#0A84FF] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#0071E3] active:scale-95"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                        <span>{bi('刷新检测', 'Retry')}</span>
+                      </button>
                     </div>
                   </div>
                 ) : activeSession?.writable === false ? (
