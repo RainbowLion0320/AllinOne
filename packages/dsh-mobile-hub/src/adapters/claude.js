@@ -1,13 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
-  readSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -16,15 +13,19 @@ import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeCliToken, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { parseDshConfiguredModels } from '../helpers/dsh-models.js'
-import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
+import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getClaudeCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 import { BaseAdapter } from './base-adapter.js'
-import { atomicWriteJsonSync, isPidAlive } from '../primitives/io-utils.js'
+import {
+  isPidAlive,
+  readHeadAndBodyLinesForParse,
+  readHeadAndTailLines,
+  readTailLinesWithMeta,
+} from '../primitives/io-utils.js'
+import { QuotaCacheManager } from '../primitives/quota-cache.js'
 import { SessionExternalWatcher } from '../primitives/session-watcher.js'
 import { StreamJsonCliRunner } from '../primitives/stream-json-runner.js'
-
-const claudeParseCache = createFileParseCache(24)
 
 const CLAUDE_EXTERNAL_MAX_IDLE_MS = 15 * 60_000
 const CLAUDE_WATCH_POLL_MS = 2_000
@@ -152,24 +153,6 @@ export function getClaudeDesktopRoots({
   return out
 }
 
-function readTailLinesZeroOom(filePath, maxBytes = CLAUDE_TAIL_PROBE_BYTES) {
-  const st = statSync(filePath)
-  const size = st.size
-  if (size === 0) return { lines: [], size: 0, mtimeMs: st.mtimeMs }
-  const readLen = Math.min(size, maxBytes)
-  const offset = Math.max(0, size - readLen)
-  const fd = openSync(filePath, 'r')
-  try {
-    const buf = Buffer.alloc(readLen)
-    const bytesRead = readSync(fd, buf, 0, readLen, offset)
-    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-    if (offset > 0 && lines.length > 0) lines.shift()
-    return { lines: lines.filter(Boolean), size, mtimeMs: st.mtimeMs }
-  } finally {
-    closeSync(fd)
-  }
-}
-
 /**
  * Zero-OOM tail probe for Claude Desktop `audit.jsonl` or Claude Code CLI `.jsonl`.
  * Detects externally active turns, active tool name, and pending desktop permission prompts.
@@ -187,12 +170,8 @@ export function probeClaudeTranscriptTail(filePath, { now = Date.now(), maxIdleM
   }
   if (!filePath) return empty
 
-  let tail
-  try {
-    tail = readTailLinesZeroOom(filePath, CLAUDE_TAIL_PROBE_BYTES)
-  } catch {
-    return empty
-  }
+  let tail = readTailLinesWithMeta(filePath, CLAUDE_TAIL_PROBE_BYTES)
+  if (!tail.exists) return empty
 
   const parseTail = (lines) => {
     let signal = 'unknown' // 'active' | 'idle' | 'unknown'
@@ -318,11 +297,11 @@ export function probeClaudeTranscriptTail(filePath, { now = Date.now(), maxIdleM
 
   let parsed = parseTail(tail.lines)
   if (!parsed.seenSignal && tail.size > CLAUDE_TAIL_PROBE_BYTES) {
-    try {
-      const bigger = readTailLinesZeroOom(filePath, CLAUDE_TAIL_PROBE_MAX_BYTES)
+    const bigger = readTailLinesWithMeta(filePath, CLAUDE_TAIL_PROBE_MAX_BYTES)
+    if (bigger.exists) {
       tail = bigger
       parsed = parseTail(bigger.lines)
-    } catch {}
+    }
   }
 
   const fresh = now - tail.mtimeMs <= maxIdleMs
@@ -689,30 +668,6 @@ function spawnClaude(bin, args, options = {}) {
   return spawnCrossPlatform(bin, args, options)
 }
 
-/** Read head + tail bytes of a potentially large jsonl file quickly for listing. */
-function readHeadAndTailLines(filePath, headBytes = 32_768, tailBytes = 32_768) {
-  const st = statSync(filePath)
-  const size = st.size
-  if (size <= headBytes + tailBytes) {
-    return readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean)
-  }
-  const fd = openSync(filePath, 'r')
-  try {
-    const headBuf = Buffer.alloc(headBytes)
-    const hRead = readSync(fd, headBuf, 0, headBytes, 0)
-    const tailBuf = Buffer.alloc(tailBytes)
-    const tRead = readSync(fd, tailBuf, 0, tailBytes, Math.max(0, size - tailBytes))
-    const headLines = headBuf.subarray(0, hRead).toString('utf8').split(/\r?\n/)
-    const tailLines = tailBuf.subarray(0, tRead).toString('utf8').split(/\r?\n/)
-    // Drop potentially truncated boundary lines
-    if (headLines.length > 1) headLines.pop()
-    if (tailLines.length > 1) tailLines.shift()
-    return [...headLines, ...tailLines].filter(Boolean)
-  } finally {
-    closeSync(fd)
-  }
-}
-
 function extractTextFromContent(content) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
@@ -736,12 +691,8 @@ function scanClaudeSessionSummary(filePath, fallbackProjectName) {
   const sessionId = basename(filePath, '.jsonl')
   if (sessionId.startsWith('agent-')) return null // skip internal subagent sidecar logs
 
-  let lines = []
-  try {
-    lines = readHeadAndTailLines(filePath)
-  } catch {
-    return null
-  }
+  const ht = readHeadAndTailLines(filePath)
+  const lines = ht.headLines === ht.tailLines ? ht.headLines : [...ht.headLines, ...ht.tailLines]
 
   let cwd = ''
   let aiTitle = ''
@@ -804,34 +755,12 @@ function scanClaudeSessionSummary(filePath, fallbackProjectName) {
 const CLAUDE_MAX_FULL_PARSE_BYTES = 32 * 1024 * 1024
 const CLAUDE_TAIL_FALLBACK_BYTES = 4 * 1024 * 1024
 
-function readClaudeFileForParse(filePath) {
-  const st = statSync(filePath)
-  if (st.size <= CLAUDE_MAX_FULL_PARSE_BYTES) {
-    return { headLines: [], bodyLines: readFileSync(filePath, 'utf8').split(/\r?\n/) }
-  }
-  const fd = openSync(filePath, 'r')
-  try {
-    const headLen = Math.min(st.size, 32 * 1024)
-    const headBuf = Buffer.alloc(headLen)
-    const headRead = readSync(fd, headBuf, 0, headLen, 0)
-    const headLines = headBuf.subarray(0, headRead).toString('utf8').split(/\r?\n/)
-    if (headLines.length > 1) headLines.pop()
-
-    const tailLen = Math.min(st.size, CLAUDE_TAIL_FALLBACK_BYTES)
-    const tailOffset = Math.max(0, st.size - tailLen)
-    const tailBuf = Buffer.alloc(tailLen)
-    const tailRead = readSync(fd, tailBuf, 0, tailLen, tailOffset)
-    const bodyLines = tailBuf.subarray(0, tailRead).toString('utf8').split(/\r?\n/)
-    if (tailOffset > 0 && bodyLines.length > 0) bodyLines.shift()
-    return { headLines, bodyLines }
-  } finally {
-    closeSync(fd)
-  }
-}
-
-function parseClaudeJsonlMessages(filePath) {
-  return claudeParseCache.getOrParse(filePath, () => {
-    const { headLines, bodyLines } = readClaudeFileForParse(filePath)
+function parseClaudeJsonlMessages(filePath, parseCache = null) {
+  const doParse = () => {
+    const { headLines, bodyLines } = readHeadAndBodyLinesForParse(filePath, {
+      maxFullBytes: CLAUDE_MAX_FULL_PARSE_BYTES,
+      tailBytes: CLAUDE_TAIL_FALLBACK_BYTES,
+    })
     const messages = []
     const toolIndex = new Map()
     const exitPlanToolIds = new Set()
@@ -982,7 +911,8 @@ function parseClaudeJsonlMessages(filePath) {
       model,
       taskState: taskTracker.snapshot(),
     }
-  })
+  }
+  return parseCache ? parseCache.getOrParse(filePath, doParse) : doParse()
 }
 
 /**
@@ -1014,30 +944,23 @@ function getClaudeQuotaCachePath() {
   return join(base, 'claude-quota-cache.json')
 }
 
-function readDiskClaudeQuota(cachePath, now = Date.now()) {
-  try {
-    if (!cachePath || !existsSync(cachePath)) return { weekly: null, short: null }
-    const raw = JSON.parse(readFileSync(cachePath, 'utf8'))
-    const ok = (q) =>
-      q &&
-      typeof q === 'object' &&
-      typeof q.remainingPercent === 'number' &&
-      Number.isFinite(q.remainingPercent) &&
-      (!q.resetsAt || now <= q.resetsAt + 60_000)
-    return {
-      weekly: ok(raw?.weekly) ? raw.weekly : null,
-      short: ok(raw?.short) ? raw.short : null,
-    }
-  } catch {
-    return { weekly: null, short: null }
-  }
+function isValidClaudeQuotaWindow(q, now = Date.now()) {
+  return Boolean(
+    q &&
+    typeof q === 'object' &&
+    typeof q.remainingPercent === 'number' &&
+    Number.isFinite(q.remainingPercent) &&
+    (!q.resetsAt || now <= q.resetsAt + 60_000),
+  )
 }
 
-function writeDiskClaudeQuota(cachePath, weekly, shortWin) {
-  if (!cachePath || (!weekly && !shortWin)) return
-  try {
-    atomicWriteJsonSync(cachePath, { weekly: weekly || null, short: shortWin || null }, { mode: 0o600 })
-  } catch {}
+function parseClaudeDiskQuotaBundle(raw, now = Date.now()) {
+  const src = raw?.quota && typeof raw.quota === 'object' ? raw.quota : raw
+  if (!src || typeof src !== 'object') return null
+  const weekly = isValidClaudeQuotaWindow(src.weekly, now) ? src.weekly : null
+  const short = isValidClaudeQuotaWindow(src.short, now) ? src.short : null
+  if (!weekly && !short) return null
+  return { weekly, short }
 }
 
 function sweepStaleClaudeSettingsFiles(dir, maxAgeMs = 10 * 60_000) {
@@ -1105,9 +1028,17 @@ export class ClaudeAdapter extends BaseAdapter {
     this.pendingControlRequests = this.runner.pendingControlRequests
 
     this.quotaCachePath = config.claudeQuotaCachePath || getClaudeQuotaCachePath()
-    const cachedClaudeQuota = readDiskClaudeQuota(this.quotaCachePath)
-    this.weeklyQuota = cachedClaudeQuota.weekly
-    this.shortQuota = cachedClaudeQuota.short
+    this.quotaManager = new QuotaCacheManager({
+      app: APPS.CLAUDE,
+      diskCachePath: this.quotaCachePath,
+      diskTtlMs: 7 * 24 * 60 * 60_000,
+      emitEvent: this.emitEvent,
+      parseDisk: (raw, now) => parseClaudeDiskQuotaBundle(raw, now),
+      isValid: (bundle, now) =>
+        Boolean(bundle && (isValidClaudeQuotaWindow(bundle.weekly, now) || isValidClaudeQuotaWindow(bundle.short, now))),
+    })
+    this.weeklyQuota = this.quotaManager.quota?.weekly || null
+    this.shortQuota = this.quotaManager.quota?.short || null
     this.desktopEntriesById = new Map() // nativeId -> desktop entry descriptor
 
     this.watcher = new SessionExternalWatcher({
@@ -1328,7 +1259,7 @@ export class ClaudeAdapter extends BaseAdapter {
           const targetFile = entry.projJsonlPath || entry.filePath || entry.auditPath || ''
           if (targetFile && existsSync(targetFile)) {
             try {
-              entry.taskState = parseClaudeJsonlMessages(targetFile).taskState || null
+              entry.taskState = parseClaudeJsonlMessages(targetFile, this.parseCache).taskState || null
               this.sessionTaskStates.set(nativeId, entry.taskState)
             } catch {}
           }
@@ -1419,7 +1350,10 @@ export class ClaudeAdapter extends BaseAdapter {
     } else {
       this.shortQuota = parsed
     }
-    writeDiskClaudeQuota(this.quotaCachePath, this.weeklyQuota, this.shortQuota)
+    this.quotaManager.set(
+      { weekly: this.weeklyQuota || null, short: this.shortQuota || null },
+      { persist: true, emit: false },
+    )
     const combined = this.getCachedQuota()
     if (combined) {
       this.emitEvent(EVENTS.BRIDGE_STATUS, {
@@ -1461,15 +1395,14 @@ export class ClaudeAdapter extends BaseAdapter {
       const done = (val) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        this.clearTrackedTimer(timer)
         resolvePromise(val)
       }
       let proc = null
-      const timer = setTimeout(() => {
+      const timer = this.setTimeout(() => {
         if (proc) killProcessTree(proc, { force: true })
         done(false)
       }, 6_000)
-      timer.unref?.()
       try {
         proc = spawnClaude(this.claudeBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -1693,14 +1626,14 @@ export class ClaudeAdapter extends BaseAdapter {
       throw new Error(`找不到 Claude 会话：${sessionId}`)
     }
 
-    let parsed = parseClaudeJsonlMessages(transcriptFile)
+    let parsed = parseClaudeJsonlMessages(transcriptFile, this.parseCache)
     if (
       parsed.messages.length === 0 &&
       desktopEntry?.auditPath &&
       desktopEntry.auditPath !== transcriptFile &&
       existsSync(desktopEntry.auditPath)
     ) {
-      parsed = parseClaudeJsonlMessages(desktopEntry.auditPath)
+      parsed = parseClaudeJsonlMessages(desktopEntry.auditPath, this.parseCache)
     }
 
     const activeProc = this.activeProcs.get(sessionId)
@@ -1822,97 +1755,15 @@ export class ClaudeAdapter extends BaseAdapter {
   async sendMessage(sessionId, { text, cwd, attachments = [], permissionMode, taskMode, model, reasoningEffort } = {}) {
     sessionId = assertSafeSessionId(sessionId, 'Claude sessionId')
     let effectiveTaskMode = normalizeTaskMode(taskMode)
-    if (this.activeProcs.has(sessionId)) {
-      const err = new Error('该 Claude 会话正在运行中，请等待完成或先点击停止。')
-      err.code = 'SESSION_BUSY'
-      throw err
-    }
-
-    const desktopEntry = this.resolveDesktopEntry(sessionId)
-    if (desktopEntry && desktopEntry.writable === false) {
-      const err = new Error(
-        '该对话来自 Claude Desktop (Cowork)，为避免与桌面端冲突或破坏签名日志，手机端仅提供实时监控与只读同步。如需手机接管写代码，可在同目录新建一条 Claude Code 对话。',
-      )
-      err.code = 'SESSION_READONLY'
-      throw err
-    }
-
-    const existingFile = this.findCliSessionFile(sessionId)
-    if (existingFile) {
-      const extProbe = probeClaudeExternalStatus({
-        pidSessionsDir: join(this.claudeHome, 'sessions'),
-        targetCliSessionId: sessionId,
-        transcriptPath: existingFile,
-        maxIdleMs: this.externalMaxIdleMs,
-        checkPidAlive: this.checkPidAlive,
-      })
-      if (extProbe.running) {
-        const err = new Error('该 Claude 会话正在电脑端运行中（手机端实时同步中），请等待电脑端完成后再发消息。')
-        err.code = 'SESSION_BUSY'
-        throw err
-      }
-    }
-    let targetCwd = String(cwd || '').trim()
-    if (!targetCwd && existingFile) {
-      const sum = scanClaudeSessionSummary(existingFile, '')
-      targetCwd = sum?.cwd || ''
-    }
-    if (!targetCwd) {
-      targetCwd = this.pendingCreated.get(sessionId)?.cwd || this.defaultCwd
-    }
-    if (!existsSync(targetCwd)) targetCwd = this.defaultCwd
-
-    let prompt = String(text || '').trim()
-    if (!effectiveTaskMode && prompt) {
-      const planMatch = /^\/plan(?:\s+([\s\S]*))?$/i.exec(prompt)
-      if (planMatch) {
-        effectiveTaskMode = 'plan'
-        const rest = String(planMatch[1] || '').trim()
-        if (rest) prompt = rest
-      }
-    }
-    if (attachments.length > 0) {
-      const lines = attachments.map((a) => `- 附件文件：${a.localPath || a.filename}`)
-      prompt = `${prompt}\n\n[手机端上传的附件，可直接读取]\n${lines.join('\n')}`
-    }
-    if (!prompt) throw new Error('消息内容不能为空')
-
-    const pref = this.sessionPrefs.get(sessionId)
-    const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
-    const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
-    const effectivePermissionMode = resolveEffectiveClaudePermissionMode(
-      permissionMode,
-      this.permissionMode,
-      effectiveTaskMode,
+    const reservationToken = this.runner.reserveSession(
+      sessionId,
+      '该 Claude 会话正在运行中，请等待完成或先点击停止。',
     )
-    if (effectiveModel || effectiveEffort) {
-      this.sessionPrefs.set(sessionId, { model: effectiveModel || 'default', reasoningEffort: effectiveEffort || '' })
-    }
 
-    const args = [
-      '-p',
-      '--input-format',
-      'stream-json',
-      '--output-format',
-      'stream-json',
-      '--verbose',
-      '--permission-prompt-tool',
-      'stdio',
-      '--permission-mode',
-      effectivePermissionMode,
-    ]
-    if (effectiveModel && effectiveModel !== 'default') {
-      args.push('--model', effectiveModel)
-    }
-    if (effectiveEffort && effectiveEffort !== 'off') {
-      args.push('--effort', effectiveEffort)
-    }
-    // Preserve live Windows/OS ANTHROPIC_BASE_URL & credentials over any stale ~/.claude/settings.json proxy
-    // Security: write ephemeral 0o600 temp file inside private 0o700 stateDir instead of world-shared os.tmpdir()
-    const envOverride = {}
-    if (process.env.ANTHROPIC_BASE_URL) envOverride.ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL
-    if (process.env.ANTHROPIC_AUTH_TOKEN) envOverride.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
-    if (process.env.ANTHROPIC_API_KEY) envOverride.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
+    let targetCwd
+    let prompt
+    let effectivePermissionMode
+    let args
     let tempSettingsPath = ''
     const cleanupTempSettings = () => {
       if (!tempSettingsPath) return
@@ -1920,18 +1771,110 @@ export class ClaudeAdapter extends BaseAdapter {
       tempSettingsPath = ''
       try { unlinkSync(p) } catch {}
     }
-    if (Object.keys(envOverride).length > 0) {
-      mkdirSync(this.tempSettingsDir, { recursive: true, mode: 0o700 })
-      try { chmodSync(this.tempSettingsDir, 0o700) } catch {}
-      tempSettingsPath = join(this.tempSettingsDir, `allinone-claude-settings-${process.pid}-${randomUUID()}.json`)
-      writeFileSync(tempSettingsPath, JSON.stringify({ env: envOverride }), { encoding: 'utf8', mode: 0o600 })
-      try { chmodSync(tempSettingsPath, 0o600) } catch {}
-      args.push('--settings', tempSettingsPath)
-    }
-    if (existingFile) {
-      args.push('--resume', sessionId)
-    } else {
-      args.push('--session-id', sessionId)
+
+    try {
+      const desktopEntry = this.resolveDesktopEntry(sessionId)
+      if (desktopEntry && desktopEntry.writable === false) {
+        const err = new Error(
+          '该对话来自 Claude Desktop (Cowork)，为避免与桌面端冲突或破坏签名日志，手机端仅提供实时监控与只读同步。如需手机接管写代码，可在同目录新建一条 Claude Code 对话。',
+        )
+        err.code = 'SESSION_READONLY'
+        throw err
+      }
+
+      const existingFile = this.findCliSessionFile(sessionId)
+      if (existingFile) {
+        const extProbe = probeClaudeExternalStatus({
+          pidSessionsDir: join(this.claudeHome, 'sessions'),
+          targetCliSessionId: sessionId,
+          transcriptPath: existingFile,
+          maxIdleMs: this.externalMaxIdleMs,
+          checkPidAlive: this.checkPidAlive,
+        })
+        if (extProbe.running) {
+          const err = new Error('该 Claude 会话正在电脑端运行中（手机端实时同步中），请等待电脑端完成后再发消息。')
+          err.code = 'SESSION_BUSY'
+          throw err
+        }
+      }
+      targetCwd = String(cwd || '').trim()
+      if (!targetCwd && existingFile) {
+        const sum = scanClaudeSessionSummary(existingFile, '')
+        targetCwd = sum?.cwd || ''
+      }
+      if (!targetCwd) {
+        targetCwd = this.pendingCreated.get(sessionId)?.cwd || this.defaultCwd
+      }
+      if (!existsSync(targetCwd)) targetCwd = this.defaultCwd
+
+      prompt = String(text || '').trim()
+      if (!effectiveTaskMode && prompt) {
+        const planMatch = /^\/plan(?:\s+([\s\S]*))?$/i.exec(prompt)
+        if (planMatch) {
+          effectiveTaskMode = 'plan'
+          const rest = String(planMatch[1] || '').trim()
+          if (rest) prompt = rest
+        }
+      }
+      if (attachments.length > 0) {
+        const lines = attachments.map((a) => `- 附件文件：${a.localPath || a.filename}`)
+        prompt = `${prompt}\n\n[手机端上传的附件，可直接读取]\n${lines.join('\n')}`
+      }
+      if (!prompt) throw new Error('消息内容不能为空')
+
+      const pref = this.sessionPrefs.get(sessionId)
+      const effectiveModel = assertSafeCliToken(model || pref?.model || '', 'model')
+      const effectiveEffort = assertSafeCliToken(reasoningEffort || pref?.reasoningEffort || '', 'reasoningEffort')
+      effectivePermissionMode = resolveEffectiveClaudePermissionMode(
+        permissionMode,
+        this.permissionMode,
+        effectiveTaskMode,
+      )
+      if (effectiveModel || effectiveEffort) {
+        this.sessionPrefs.set(sessionId, { model: effectiveModel || 'default', reasoningEffort: effectiveEffort || '' })
+      }
+
+      args = [
+        '-p',
+        '--input-format',
+        'stream-json',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--permission-prompt-tool',
+        'stdio',
+        '--permission-mode',
+        effectivePermissionMode,
+      ]
+      if (effectiveModel && effectiveModel !== 'default') {
+        args.push('--model', effectiveModel)
+      }
+      if (effectiveEffort && effectiveEffort !== 'off') {
+        args.push('--effort', effectiveEffort)
+      }
+      // Preserve live Windows/OS ANTHROPIC_BASE_URL & credentials over any stale ~/.claude/settings.json proxy
+      // Security: write ephemeral 0o600 temp file inside private 0o700 stateDir instead of world-shared os.tmpdir()
+      const envOverride = {}
+      if (process.env.ANTHROPIC_BASE_URL) envOverride.ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL
+      if (process.env.ANTHROPIC_AUTH_TOKEN) envOverride.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
+      if (process.env.ANTHROPIC_API_KEY) envOverride.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
+      if (Object.keys(envOverride).length > 0) {
+        mkdirSync(this.tempSettingsDir, { recursive: true, mode: 0o700 })
+        try { chmodSync(this.tempSettingsDir, 0o700) } catch {}
+        tempSettingsPath = join(this.tempSettingsDir, `allinone-claude-settings-${process.pid}-${randomUUID()}.json`)
+        writeFileSync(tempSettingsPath, JSON.stringify({ env: envOverride }), { encoding: 'utf8', mode: 0o600 })
+        try { chmodSync(tempSettingsPath, 0o600) } catch {}
+        args.push('--settings', tempSettingsPath)
+      }
+      if (existingFile) {
+        args.push('--resume', sessionId)
+      } else {
+        args.push('--session-id', sessionId)
+      }
+    } catch (preErr) {
+      cleanupTempSettings()
+      this.runner.releaseReservation(sessionId, reservationToken)
+      throw preErr
     }
 
     const compositeId = makeCompositeId(APPS.CLAUDE, sessionId)
@@ -1943,6 +1886,7 @@ export class ClaudeAdapter extends BaseAdapter {
       cwd: targetCwd,
       prompt,
       effectivePermissionMode,
+      reservationToken,
       onRateLimit: (info) => this.recordRateLimitInfo(info),
       onCleanup: cleanupTempSettings,
       onSessionPersisted: (sid, completed) => {
@@ -1967,6 +1911,7 @@ export class ClaudeAdapter extends BaseAdapter {
   }
 
   async dispose() {
+    this.quotaManager.dispose()
     this.watcher.dispose()
     this.runner.dispose()
     this.disposeBase()

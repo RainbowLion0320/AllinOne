@@ -270,13 +270,13 @@ export function extractDeliverableRefsFromMessage(msg, { maxItems = 12 } = {}) {
   }
 
   // 4. Plain Windows absolute paths in prose (must not be preceded by a letter/digit, e.g. `https://`)
-  const plainWinRe = /(?<![A-Za-z0-9_])([A-Za-z]:[\\/](?!\/)[^\s`"'<>|*?\[\]\r\n]+?\.(?:html?|pdf|docx?|xlsx?|csv|pptx?|md|markdown|txt|rtf|epub|zip))/gi
+  const plainWinRe = /(?<![A-Za-z0-9_])([A-Za-z]:[\\/](?!\/)[^\s`"'<>|*?[\]\r\n]+?\.(?:html?|pdf|docx?|xlsx?|csv|pptx?|md|markdown|txt|rtf|epub|zip))/gi
   while ((m = plainWinRe.exec(masked)) !== null) {
     pushRef(m[1])
   }
 
   // 5. Plain Unix absolute paths in common user/output roots or ~/...
-  const plainUnixRe = /((?:~\/|\/(?:Users|home|tmp|var|opt|mnt|Volumes|private\/tmp)\/)[^\s`"'<>()\[\]，。；：！？\r\n]+?\.(?:html?|pdf|docx?|xlsx?|csv|pptx?|md|markdown|txt|rtf|epub|zip))/gi
+  const plainUnixRe = /((?:~\/|\/(?:Users|home|tmp|var|opt|mnt|Volumes|private\/tmp)\/)[^\s`"'<>()[\]，。；：！？\r\n]+?\.(?:html?|pdf|docx?|xlsx?|csv|pptx?|md|markdown|txt|rtf|epub|zip))/gi
   while ((m = plainUnixRe.exec(masked)) !== null) {
     pushRef(m[1])
   }

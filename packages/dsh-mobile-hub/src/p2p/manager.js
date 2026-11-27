@@ -18,6 +18,7 @@ import {
   parseBinaryE2eeHeader,
 } from '@allinone/shared/e2ee'
 import {
+  BULK_DEFAULT_WINDOW_BYTES,
   BULK_FLAG_EOF,
   BULK_SLICE_BYTES,
   createBulkWindowController,
@@ -53,8 +54,32 @@ const MAX_INBOUND_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB plaintext safety
 const MAX_INBOUND_CIPHER_OVERHEAD_BYTES = 4 * 1024 * 1024 // headroom for AIO2 framing & GCM tags
 const MAX_NON_CHUNKED_UPLOAD_BYTES = E2EE_CHUNKED_THRESHOLD + 64 * 1024 // prevent non-chunked in-memory OOM
 const MAX_UPLOAD_QUEUE_BYTES = 32 * 1024 * 1024 // cap RAM buffered ahead of disk/AES-GCM
+const UPLOAD_IDLE_TIMEOUT_MS = 45_000 // reap abandoned uploads after 45s of bulk frame inactivity
+const UPLOAD_WINDOW_REPLENISH_BYTES = 256 * 1024 // send receiver credit window grant every >= 256 KB written
 const STREAM_COALESCE_WINDOW_MS = 60
 const STREAM_COALESCE_MAX_CHARS = 16 * 1024
+
+function deepFreezeSnapshot(obj, seen = new WeakSet()) {
+  if (!obj || typeof obj !== 'object' || seen.has(obj) || ArrayBuffer.isView(obj)) return obj
+  seen.add(obj)
+  for (const key of Object.keys(obj)) {
+    deepFreezeSnapshot(obj[key], seen)
+  }
+  return Object.freeze(obj)
+}
+
+function snapshotEventPayload(payload) {
+  if (payload === null || payload === undefined || typeof payload !== 'object') return payload
+  try {
+    return deepFreezeSnapshot(structuredClone(payload))
+  } catch {
+    try {
+      return deepFreezeSnapshot(JSON.parse(JSON.stringify(payload)))
+    } catch {
+      return payload
+    }
+  }
+}
 
 const STATE_REPLAYABLE_EVENTS = new Set([
   EVENTS.STREAM_START,
@@ -76,6 +101,7 @@ const STATE_REPLAYABLE_EVENTS = new Set([
 function createAsyncByteQueue(maxQueuedBytes = MAX_UPLOAD_QUEUE_BYTES) {
   const chunks = []
   let queuedBytes = 0
+  let consumedBytes = 0
   let waiter = null
   let ended = false
   let error = null
@@ -86,6 +112,7 @@ function createAsyncByteQueue(maxQueuedBytes = MAX_UPLOAD_QUEUE_BYTES) {
       if (waiter) {
         const w = waiter
         waiter = null
+        consumedBytes += u8.byteLength
         w.resolve({ value: u8, done: false })
       } else {
         if (queuedBytes + u8.byteLength > maxQueuedBytes) {
@@ -126,6 +153,7 @@ function createAsyncByteQueue(maxQueuedBytes = MAX_UPLOAD_QUEUE_BYTES) {
           if (chunks.length > 0) {
             const nextChunk = chunks.shift()
             queuedBytes = Math.max(0, queuedBytes - nextChunk.byteLength)
+            consumedBytes += nextChunk.byteLength
             return Promise.resolve({ value: nextChunk, done: false })
           }
           if (error) return Promise.reject(error)
@@ -138,7 +166,13 @@ function createAsyncByteQueue(maxQueuedBytes = MAX_UPLOAD_QUEUE_BYTES) {
     },
   }
 
-  return { push, end, fail, iterable }
+  return {
+    push,
+    end,
+    fail,
+    iterable,
+    getConsumedBytes: () => consumedBytes,
+  }
 }
 
 /**
@@ -198,6 +232,7 @@ export class P2PBridgeManager {
     this._signalChains = new Map()
     this._eventSeq = 0
     this._streamSeq = 1
+    this.bridgeBootId = randomUUID()
     this._eventQueue = Promise.resolve()
     this._pendingBroadcasts = 0
     /** @type {Array<{ seq: number, event: string, payload: any, ts: number }>} */
@@ -319,7 +354,10 @@ export class P2PBridgeManager {
     if (expectedSess && sess !== expectedSess) return
     this.sessions.delete(clientId)
     sess.closed = true
+    sess.replayingEvents = false
+    if (Array.isArray(sess.pendingLiveEvents)) sess.pendingLiveEvents.length = 0
     sess.ctrlWriter?.close?.()
+    sess.bulkWriter?.close?.()
     sess.ctrlCodec?.clear?.()
     for (const dl of sess.activeDownloads.values()) {
       try { dl.ac?.abort() } catch {}
@@ -328,28 +366,66 @@ export class P2PBridgeManager {
     sess.activeDownloads.clear()
     sess.pendingDownloads.clear()
     for (const up of sess.activeUploads.values()) {
-      try { up.queue.fail(new Error('P2P session closed')) } catch {}
+      try {
+        if (typeof up.abort === 'function') up.abort(new Error('P2P session closed'))
+        else up.queue?.fail?.(new Error('P2P session closed'))
+      } catch {}
     }
     sess.activeUploads.clear()
     try { await sess.peer?.close?.() } catch {}
   }
 
+  _enqueueCtrlFrames(sess, obj) {
+    if (!sess || sess.closed || !sess.peer?.isCtrlOpen?.()) {
+      return Promise.reject(new Error('Control DataChannel is not open'))
+    }
+    let frames
+    try {
+      frames = sess.ctrlCodec.encode(obj)
+    } catch (err) {
+      return Promise.reject(err)
+    }
+    if (!sess.ctrlWriter) {
+      return Promise.reject(new Error('Control DataChannel writer unavailable'))
+    }
+    // Enqueue every fragment synchronously in sequence so fragmented frames never interleave
+    const writes = frames.map((frame) => sess.ctrlWriter.send(frame))
+    return Promise.all(writes).then(() => true)
+  }
+
+  async sendCtrlJsonAsync(sess, obj) {
+    try {
+      return await this._enqueueCtrlFrames(sess, obj)
+    } catch (err) {
+      if (sess && !sess.closed) {
+        this.log.warn?.(
+          `mobile-hub: [p2p] ctrl write failed (${sess.clientId}), closing peer: ${String(err?.message || err)}`,
+        )
+        void this.destroySession(sess.clientId, sess)
+      }
+      throw err
+    }
+  }
+
   sendCtrlJson(sess, obj) {
     if (!sess || sess.closed || !sess.peer?.isCtrlOpen?.()) return false
-    const frames = sess.ctrlCodec.encode(obj)
-    if (sess.ctrlWriter) {
-      void sess.ctrlWriter.enqueue(() => {
-        if (sess.closed || !sess.peer?.isCtrlOpen?.()) return false
-        for (const f of frames) {
-          if (!sess.peer.sendCtrl(f)) return false
-        }
-        return true
-      }).catch(() => {})
-      return true
+    let frames
+    try {
+      frames = sess.ctrlCodec.encode(obj)
+    } catch (err) {
+      this.log.warn?.(`mobile-hub: [p2p] ctrl encode failed (${sess.clientId}): ${String(err?.message || err)}`)
+      return false
     }
-    for (const f of frames) {
-      if (!sess.peer.sendCtrl(f)) return false
-    }
+    if (!sess.ctrlWriter) return false
+    const writes = frames.map((frame) => sess.ctrlWriter.send(frame))
+    Promise.all(writes).catch((err) => {
+      if (!sess.closed) {
+        this.log.warn?.(
+          `mobile-hub: [p2p] ctrl write failed (${sess.clientId}), closing peer: ${String(err?.message || err)}`,
+        )
+        void this.destroySession(sess.clientId, sess)
+      }
+    })
     return true
   }
 
@@ -477,12 +553,17 @@ export class P2PBridgeManager {
         transport: '',
         pendingIce: [],
         ctrlCodec: createCtrlCodec(),
-        ctrlWriter: createSerializedChannelWriter(),
+        ctrlWriter: null,
+        bulkWriter: null,
         peer: null,
         inFlightRpcs: 0,
+        replayingEvents: false,
+        pendingLiveEvents: [],
+        lastDeliveredSeq: 0,
+        replayChain: Promise.resolve(),
         pendingDownloads: new Map(), // streamId -> { realPath, size, maxBytes, mimeType, filename, createdAt }
         activeDownloads: new Map(),  // streamId -> { ac, windowCtrl }
-        activeUploads: new Map(),    // streamId -> { transferId, queue, ... }
+        activeUploads: new Map(),    // streamId -> { transferId, queue, abort, touchIdleTimer, ... }
       }
       this.sessions.set(cid, sess)
 
@@ -499,6 +580,18 @@ export class P2PBridgeManager {
         },
         onTransportChange: (tr) => {
           if (!sess.closed) sess.transport = String(tr || '')
+        },
+        onCtrlOpen: () => {
+          if (sess.closed) return
+          if (sess.peer?.getCtrlChannel && sess.ctrlWriter) {
+            const dc = sess.peer.getCtrlChannel()
+            if (dc) sess.ctrlWriter.setChannel(dc)
+          }
+          this.sendCtrlJson(sess, {
+            type: 'p2p.hello',
+            bridgeBootId: this.bridgeBootId,
+            eventSeq: this._eventSeq,
+          })
         },
         onCtrlMessage: (rawText) => {
           if (sess.closed) return
@@ -522,6 +615,12 @@ export class P2PBridgeManager {
         sess.peer = this.electronClient
           ? this.electronClient.createPeer(peerOpts)
           : createWeriftPeer(peerOpts)
+        sess.ctrlWriter =
+          sess.peer.ctrlWriter ||
+          createSerializedChannelWriter(() => sess.peer?.getCtrlChannel?.() || null)
+        sess.bulkWriter =
+          sess.peer.bulkWriter ||
+          createSerializedChannelWriter(() => sess.peer?.getBulkChannel?.() || null)
 
         const answer = await sess.peer.handleOffer(inner.sdp)
         if (sess.closed || this.sessions.get(cid) !== sess || isRevokedOrDisposed()) {
@@ -533,6 +632,7 @@ export class P2PBridgeManager {
           kind: 'answer',
           sdp: answer.sdp,
           engine: sess.peer.engine,
+          bridgeBootId: this.bridgeBootId,
         })
         while (sess.pendingIce.length > 0 && !sess.closed && this.sessions.get(cid) === sess && !isRevokedOrDisposed()) {
           const cand = sess.pendingIce.shift()
@@ -545,21 +645,70 @@ export class P2PBridgeManager {
     }
   }
 
-  async _replayEventsSince(sess, sinceSeq) {
+  _replayEventsSince(sess, sinceSeq, clientBootId = '') {
+    if (!sess || sess.closed) return Promise.resolve()
+    const cleanBootId = String(clientBootId || '').trim()
     const cleanSeq = Number(sinceSeq)
-    if (!Number.isFinite(cleanSeq) || cleanSeq < 0 || sess.closed) return
-    const missed = this._eventRing.filter((item) => item.seq > cleanSeq)
-    for (const item of missed) {
-      if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
-      try {
-        const enc = await encryptBinaryJson(
-          this.e2eeKey,
-          { event: item.event, payload: item.payload, seq: item.seq, ts: item.ts, replay: true },
-          { kind: 'event', roomId: this.roomId },
-        )
-        this.sendCtrlJson(sess, { type: 'event', seq: item.seq, bin: enc.bytes })
-      } catch {}
-    }
+
+    const task = (sess.replayChain || Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
+        if (cleanBootId && cleanBootId !== this.bridgeBootId) {
+          await this.sendCtrlJsonAsync(sess, {
+            type: 'sync.reset',
+            bridgeBootId: this.bridgeBootId,
+            eventSeq: this._eventSeq,
+          }).catch(() => {})
+          return
+        }
+        if (!Number.isFinite(cleanSeq) || cleanSeq < 0) return
+
+        // Pause live event delivery into `sess.pendingLiveEvents` BEFORE awaiting crypto/writes
+        sess.replayingEvents = true
+        const missed = this._eventRing.filter((item) => item.seq > cleanSeq)
+        try {
+          for (const item of missed) {
+            if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
+            if (item.seq <= sess.lastDeliveredSeq) continue
+            const enc = await encryptBinaryJson(
+              this.e2eeKey,
+              {
+                event: item.event,
+                payload: item.payload,
+                seq: item.seq,
+                ts: item.ts,
+                replay: true,
+                bridgeBootId: this.bridgeBootId,
+              },
+              { kind: 'event', roomId: this.roomId },
+            )
+            if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
+            await this.sendCtrlJsonAsync(sess, { type: 'event', seq: item.seq, bin: enc.bytes })
+            sess.lastDeliveredSeq = Math.max(sess.lastDeliveredSeq, item.seq)
+          }
+
+          // Drain any live events buffered during replay in strict monotonic seq order (deduped)
+          while (sess.pendingLiveEvents.length > 0) {
+            if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
+            const batch = sess.pendingLiveEvents.splice(0, sess.pendingLiveEvents.length)
+            batch.sort((a, b) => a.seq - b.seq)
+            for (const live of batch) {
+              if (sess.closed || !sess.peer?.isCtrlOpen?.()) return
+              if (live.seq <= sess.lastDeliveredSeq) continue
+              await this.sendCtrlJsonAsync(sess, live.frameObj)
+              sess.lastDeliveredSeq = Math.max(sess.lastDeliveredSeq, live.seq)
+            }
+          }
+        } catch {
+          // Broken ctrl channel is logged & closed by sendCtrlJsonAsync
+        } finally {
+          sess.replayingEvents = false
+          if (sess.closed) sess.pendingLiveEvents.length = 0
+        }
+      })
+    sess.replayChain = task
+    return task
   }
 
   async handleCtrlMessage(sess, msg) {
@@ -570,8 +719,8 @@ export class P2PBridgeManager {
       return
     }
 
-    if (msg.type === 'sync.sinceSeq') {
-      void this._replayEventsSince(sess, msg.sinceSeq)
+    if (msg.type === 'sync.sinceSeq' || msg.type === 'sync' || msg.t === 'sync') {
+      void this._replayEventsSince(sess, msg.sinceSeq, msg.bridgeBootId || '')
       return
     }
 
@@ -587,49 +736,62 @@ export class P2PBridgeManager {
       } catch {
         return
       }
-      if (!inner || typeof inner !== 'object') return
+      this._handleBulkCtrlAction(sess, inner)
+      return
+    }
 
-      if (inner.action === 'pull') {
-        const streamId = Number(inner.streamId)
-        const initialWindowBytes = Number(inner.windowBytes || 0)
-        void this.startBulkDownload(sess, streamId, { initialWindowBytes })
-        return
+    if (msg.t === 'bulk' && typeof msg.action === 'string') {
+      this._handleBulkCtrlAction(sess, msg)
+    }
+  }
+
+  _handleBulkCtrlAction(sess, inner) {
+    if (!inner || typeof inner !== 'object') return
+
+    if (inner.action === 'pull') {
+      const streamId = Number(inner.streamId)
+      const initialWindowBytes = Number(inner.windowBytes || 0)
+      void this.startBulkDownload(sess, streamId, { initialWindowBytes })
+      return
+    }
+    if (inner.action === 'window') {
+      const streamId = Number(inner.streamId)
+      const credits = Number(inner.bytes || 0)
+      const dl = sess.activeDownloads.get(streamId)
+      if (dl?.windowCtrl && credits > 0) {
+        dl.windowCtrl.grant(credits)
       }
-      if (inner.action === 'window') {
-        const streamId = Number(inner.streamId)
-        const credits = Number(inner.bytes || 0)
+      return
+    }
+    if (inner.action === 'cancel') {
+      const streamId = Number(inner.streamId)
+      const dir = String(inner.direction || '').trim().toLowerCase()
+      if (dir !== 'upload') {
         const dl = sess.activeDownloads.get(streamId)
-        if (dl?.windowCtrl && credits > 0) {
-          dl.windowCtrl.grant(credits)
+        if (dl) {
+          try { dl.ac?.abort() } catch {}
+          try { dl.windowCtrl?.abort(new Error('Download cancelled')) } catch {}
+          sess.activeDownloads.delete(streamId)
         }
-        return
+        sess.pendingDownloads.delete(streamId)
       }
-      if (inner.action === 'cancel') {
-        const streamId = Number(inner.streamId)
-        const dir = String(inner.direction || '').trim().toLowerCase()
-        if (dir !== 'upload') {
-          const dl = sess.activeDownloads.get(streamId)
-          if (dl) {
-            try { dl.ac?.abort() } catch {}
-            try { dl.windowCtrl?.abort(new Error('Download cancelled')) } catch {}
-            sess.activeDownloads.delete(streamId)
-          }
-          sess.pendingDownloads.delete(streamId)
-        }
-        if (dir !== 'download') {
-          const up = sess.activeUploads.get(streamId)
-          if (up) {
+      if (dir !== 'download') {
+        const up = sess.activeUploads.get(streamId)
+        if (up) {
+          if (typeof up.abort === 'function') {
+            up.abort(new Error('Upload cancelled by client'), { byClient: true })
+          } else {
             try { up.queue.fail(new Error('Upload cancelled by client')) } catch {}
             if (sess.activeUploads.get(streamId) === up) {
               sess.activeUploads.delete(streamId)
             }
           }
         }
-        return
       }
-      if (inner.action === 'upload.start') {
-        void this.startBulkUploadReceiver(sess, inner)
-      }
+      return
+    }
+    if (inner.action === 'upload.start') {
+      void this.startBulkUploadReceiver(sess, inner)
     }
   }
 
@@ -791,9 +953,9 @@ export class P2PBridgeManager {
   }
 
   async sendBulkCtrl(sess, innerPayload) {
-    if (sess.closed) return
+    if (!sess || sess.closed) throw new Error('P2P session closed')
     const enc = await encryptBinaryJson(this.e2eeKey, innerPayload, { kind: 'p2p.bulk', roomId: this.roomId })
-    this.sendCtrlJson(sess, { type: 'bulk.ctrl', bin: enc.bytes })
+    await this.sendCtrlJsonAsync(sess, { type: 'bulk.ctrl', bin: enc.bytes })
   }
 
   /**
@@ -987,22 +1149,85 @@ export class P2PBridgeManager {
       }).catch(() => {})
       return
     }
-    const baseDiskBytes = quotaCheck.usedBytes
 
     const prevUpload = sess.activeUploads.get(streamId)
     if (prevUpload) {
-      try { prevUpload.queue.fail(new Error('Upload superseded by new stream')) } catch {}
+      if (typeof prevUpload.abort === 'function') {
+        prevUpload.abort(new Error('Upload superseded by new stream'))
+      } else {
+        try { prevUpload.queue.fail(new Error('Upload superseded by new stream')) } catch {}
+      }
     }
     const queue = createAsyncByteQueue()
-    const entry = { transferId, queue, receivedBytes: 0, writtenPlainBytes: 0, maxCipherBytes, isChunked }
-    sess.activeUploads.set(streamId, entry)
 
     let localPath = ''
     let ws = null
     let wsClosed = false
     let wsClosePromise = null
+    let wsErr = null
+    let idleTimer = null
+    let aborted = false
+    let cancelledByClient = false
+    let settledPlainBytes = 0
+
+    const clearIdleTimer = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = null
+      }
+    }
+
+    const abortUpload = (reason, { byClient = false } = {}) => {
+      if (aborted) return
+      aborted = true
+      if (byClient) cancelledByClient = true
+      clearIdleTimer()
+      const err = reason instanceof Error ? reason : new Error(String(reason || 'Upload aborted'))
+      if (byClient) err.name = 'AbortError'
+      try { queue.fail(err) } catch {}
+      if (ws && !wsClosed) {
+        try { ws.destroy(err) } catch {}
+      }
+      if (sess.activeUploads.get(streamId) === entry) {
+        sess.activeUploads.delete(streamId)
+      }
+    }
+
+    const touchIdleTimer = () => {
+      clearIdleTimer()
+      if (aborted || sess.closed) return
+      idleTimer = setTimeout(() => {
+        idleTimer = null
+        abortUpload(new Error('文件上传超时（45 秒内未收到数据分片），已自动中止并释放空间'))
+      }, UPLOAD_IDLE_TIMEOUT_MS)
+      idleTimer.unref?.()
+    }
+
+    const entry = {
+      transferId,
+      queue,
+      receivedBytes: 0,
+      writtenPlainBytes: 0,
+      maxCipherBytes,
+      isChunked,
+      reservationKey,
+      touchIdleTimer,
+      markEof: clearIdleTimer,
+      abort: abortUpload,
+    }
+    sess.activeUploads.set(streamId, entry)
+    touchIdleTimer()
+
     try {
-      await this.sendBulkCtrl(sess, { action: 'upload.ready', transferId, streamId })
+      await this.sendBulkCtrl(sess, {
+        action: 'upload.ready',
+        transferId,
+        streamId,
+        windowBytes: BULK_DEFAULT_WINDOW_BYTES,
+      })
+      if (aborted || sess.closed) {
+        throw Object.assign(new Error('Upload cancelled'), { name: 'AbortError' })
+      }
 
       const allocated = this.inboundStore.allocateFilePath(meta.filename || 'upload.bin')
       localPath = allocated.localPath
@@ -1010,7 +1235,6 @@ export class P2PBridgeManager {
       this.inboundStore.attachLocalPath(reservationKey, localPath)
 
       ws = createWriteStream(localPath, { mode: 0o600 })
-      let wsErr = null
       wsClosePromise = new Promise((resolveClose) => {
         ws.once('close', () => {
           wsClosed = true
@@ -1020,16 +1244,26 @@ export class P2PBridgeManager {
       ws.on('error', (e) => { wsErr = e })
       const writePlain = (chunk) =>
         new Promise((resolveW, rejectW) => {
+          if (aborted || wsClosed) return rejectW(wsErr || new Error('Upload stream closed'))
           if (wsErr) return rejectW(wsErr)
           const ok = ws.write(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
           if (ok) return resolveW()
-          const onDrain = () => { ws.off('error', onErr); resolveW() }
-          const onErr = (e) => { ws.off('drain', onDrain); rejectW(e) }
+          const cleanupW = () => {
+            ws.off('drain', onDrain)
+            ws.off('error', onErr)
+            ws.off('close', onClose)
+          }
+          const onDrain = () => { cleanupW(); resolveW() }
+          const onErr = (e) => { cleanupW(); rejectW(e) }
+          const onClose = () => { cleanupW(); rejectW(wsErr || new Error('Upload stream closed')) }
           ws.once('drain', onDrain)
           ws.once('error', onErr)
+          ws.once('close', onClose)
         })
 
       let writtenPlainBytes = 0
+      let writtenSinceGrant = 0
+      let grantedCipherBytes = 0
       const dec = await decryptAutoStream(this.e2eeKey, queue.iterable, {
         iv: meta.e2ee.iv,
         kid: meta.e2ee.kid || '',
@@ -1038,24 +1272,51 @@ export class P2PBridgeManager {
         chunked: isChunked,
         compressed: Boolean(meta.e2ee.compressed),
         onPlainChunk: async (plainChunk) => {
+          if (aborted || sess.closed) {
+            throw Object.assign(new Error('Upload cancelled'), { name: 'AbortError' })
+          }
           writtenPlainBytes += plainChunk.byteLength
           entry.writtenPlainBytes = writtenPlainBytes
           if (writtenPlainBytes > MAX_INBOUND_UPLOAD_BYTES) {
             throw new Error('文件超过本机安全上限 (2GB)')
           }
-          if (!this.inboundStore.updateWrittenAndCheckQuota(reservationKey, writtenPlainBytes, baseDiskBytes)) {
+          if (!this.inboundStore.updateWrittenAndCheckQuota(reservationKey, writtenPlainBytes)) {
             throw new Error('本机上传缓存目录空间已达配额上限，请清理后再试')
           }
           await writePlain(plainChunk)
+          writtenSinceGrant += plainChunk.byteLength
+          const consumedNow = queue.getConsumedBytes()
+          const cipherDelta = Math.max(0, consumedNow - grantedCipherBytes)
+          if (writtenSinceGrant >= UPLOAD_WINDOW_REPLENISH_BYTES || cipherDelta >= UPLOAD_WINDOW_REPLENISH_BYTES) {
+            const grantBytes = cipherDelta > 0 ? cipherDelta : writtenSinceGrant
+            grantedCipherBytes = consumedNow
+            writtenSinceGrant = 0
+            if (grantBytes > 0 && !aborted && !sess.closed) {
+              void this.sendBulkCtrl(sess, {
+                action: 'window',
+                streamId,
+                direction: 'upload',
+                bytes: grantBytes,
+              }).catch(() => {})
+            }
+          }
         },
       })
 
+      clearIdleTimer()
       await new Promise((resolveEnd, rejectEnd) => {
+        if (aborted || wsClosed) return rejectEnd(wsErr || new Error('Upload stream closed'))
         if (wsErr) return rejectEnd(wsErr)
-        const onErr = (e) => rejectEnd(e)
-        ws.once('error', onErr)
-        ws.end(() => {
+        const cleanupEnd = () => {
           ws.off('error', onErr)
+          ws.off('close', onClose)
+        }
+        const onErr = (e) => { cleanupEnd(); rejectEnd(e) }
+        const onClose = () => { cleanupEnd(); rejectEnd(wsErr || new Error('Upload stream closed')) }
+        ws.once('error', onErr)
+        ws.once('close', onClose)
+        ws.end(() => {
+          cleanupEnd()
           resolveEnd()
         })
       })
@@ -1063,6 +1324,7 @@ export class P2PBridgeManager {
         await Promise.race([wsClosePromise, new Promise((r) => setTimeout(r, 2000))])
       }
       try { chmodSync(localPath, 0o600) } catch {}
+      settledPlainBytes = dec.totalPlainBytes
 
       const uploadMeta = {
         clientId: sess.clientId,
@@ -1087,6 +1349,7 @@ export class P2PBridgeManager {
         size: dec.totalPlainBytes,
       })
     } catch (err) {
+      clearIdleTimer()
       if (ws && !wsClosed) {
         try { ws.destroy() } catch {}
         if (wsClosePromise) {
@@ -1094,7 +1357,7 @@ export class P2PBridgeManager {
         }
       }
       if (localPath) await unlinkAsync(localPath).catch(() => {})
-      if (!sess.closed) {
+      if (!sess.closed && !cancelledByClient) {
         await this.sendBulkCtrl(sess, {
           action: 'upload.error',
           transferId,
@@ -1103,7 +1366,8 @@ export class P2PBridgeManager {
         }).catch(() => {})
       }
     } finally {
-      this.inboundStore.releaseUploadSpace(reservationKey)
+      clearIdleTimer()
+      this.inboundStore.releaseUploadSpace(reservationKey, { settledSize: settledPlainBytes })
       if (sess.activeUploads.get(streamId) === entry) {
         sess.activeUploads.delete(streamId)
       }
@@ -1115,33 +1379,40 @@ export class P2PBridgeManager {
     if (!frame) return
     const up = sess.activeUploads.get(frame.streamId)
     if (!up) return
+    up.touchIdleTimer?.()
     if (frame.payload.byteLength > 0) {
       up.receivedBytes += frame.payload.byteLength
       const limit = up.maxCipherBytes || (MAX_INBOUND_UPLOAD_BYTES + MAX_INBOUND_CIPHER_OVERHEAD_BYTES)
       if (up.receivedBytes > limit) {
-        up.queue.fail(
+        up.abort(
           new Error(up.isChunked ? '文件超过本机安全上限 (2GB)' : '非分块加密上传超过 32MB 上限'),
         )
-        if (sess.activeUploads.get(frame.streamId) === up) {
-          sess.activeUploads.delete(frame.streamId)
-        }
+        return
+      }
+      if (up.reservationKey && !this.inboundStore.recordReceivedBytes(up.reservationKey, up.receivedBytes)) {
+        up.abort(new Error('本机上传缓存目录空间已达配额上限，请清理后再试'))
         return
       }
       if (!up.queue.push(frame.payload)) {
-        if (sess.activeUploads.get(frame.streamId) === up) {
-          sess.activeUploads.delete(frame.streamId)
-        }
+        up.abort(new Error('上传写入速度过慢，缓冲区超出内存上限'))
         return
       }
     }
     if (frame.eof) {
+      up.markEof?.()
       up.queue.end()
     }
   }
 
   _recordReplayableEvent(seq, event, payload, ts) {
     if (!STATE_REPLAYABLE_EVENTS.has(event)) return
-    this._eventRing.push({ seq, event, payload, ts })
+    const frozenSnapshot = Object.freeze({
+      seq,
+      event,
+      payload: snapshotEventPayload(payload),
+      ts,
+    })
+    this._eventRing.push(frozenSnapshot)
     if (this._eventRing.length > MAX_REPLAY_EVENTS) {
       this._eventRing.splice(0, this._eventRing.length - MAX_REPLAY_EVENTS)
     }
@@ -1156,7 +1427,13 @@ export class P2PBridgeManager {
     }
     const seq = ++this._eventSeq
     const ts = Date.now()
-    this._recordReplayableEvent(seq, event, payload, ts)
+    const payloadSnapshot = STATE_REPLAYABLE_EVENTS.has(event) ? snapshotEventPayload(payload) : payload
+    if (STATE_REPLAYABLE_EVENTS.has(event)) {
+      this._eventRing.push(Object.freeze({ seq, event, payload: payloadSnapshot, ts }))
+      if (this._eventRing.length > MAX_REPLAY_EVENTS) {
+        this._eventRing.splice(0, this._eventRing.length - MAX_REPLAY_EVENTS)
+      }
+    }
     if (this.sessions.size === 0) return
 
     this._pendingBroadcasts += 1
@@ -1170,12 +1447,20 @@ export class P2PBridgeManager {
         if (targets.length === 0) return
         const enc = await encryptBinaryJson(
           this.e2eeKey,
-          { event, payload, seq, ts },
+          { event, payload: payloadSnapshot, seq, ts, bridgeBootId: this.bridgeBootId },
           { kind: 'event', roomId: this.roomId },
         )
         const frameObj = { type: 'event', seq, bin: enc.bytes }
         for (const sess of targets) {
-          this.sendCtrlJson(sess, frameObj)
+          if (sess.closed || !sess.peer?.isCtrlOpen?.()) continue
+          if (sess.replayingEvents) {
+            if (sess.pendingLiveEvents.length < MAX_PENDING_BROADCASTS) {
+              sess.pendingLiveEvents.push({ seq, frameObj })
+            }
+          } else if (seq > sess.lastDeliveredSeq) {
+            sess.lastDeliveredSeq = seq
+            this.sendCtrlJson(sess, frameObj)
+          }
         }
       })
       .catch(() => {})

@@ -37,6 +37,41 @@ const EXTRA_SCAN_FILES = [
   'packages/mobile-app/vite.config.js',
 ]
 
+/**
+ * Compute a strictly monotonic, collision-free Android `versionCode` for SemVer
+ * (including pre-release versions: alpha < beta < rc < stable).
+ * Mirrors `packages/mobile-app/android/app/build.gradle`.
+ */
+export function computeAndroidVersionCode(rawVersion) {
+  const parsed = parseSemver(rawVersion)
+  if (!parsed) {
+    throw new Error(`Invalid SemVer for Android versionCode: "${rawVersion}"`)
+  }
+  const { major, minor, patch, pre } = parsed
+  if (major < 0 || major > 209 || minor < 0 || minor > 99 || patch < 0 || patch > 999) {
+    throw new Error(
+      `Version ${rawVersion} exceeds Android versionCode bounds (major<=209, minor<=99, patch<=999)`,
+    )
+  }
+  let preOffset = 99
+  if (pre.length > 0) {
+    const tag = String(pre[0] || '').toLowerCase()
+    const numToken = pre.slice(1).find((p) => /^\d+$/.test(p))
+    const num = numToken !== undefined ? Number(numToken) : 0
+    if (tag === 'rc') {
+      preOffset = 60 + Math.min(38, Math.max(0, num))
+    } else if (tag === 'beta') {
+      preOffset = 30 + Math.min(29, Math.max(0, num))
+    } else if (tag === 'alpha') {
+      preOffset = 10 + Math.min(19, Math.max(0, num))
+    } else {
+      const fallbackNum = /^\d+$/.test(tag) ? Number(tag) : num
+      preOffset = Math.min(9, Math.max(1, fallbackNum > 0 ? fallbackNum : 1))
+    }
+  }
+  return major * 10_000_000 + minor * 100_000 + patch * 100 + preOffset
+}
+
 function walkJsFiles(dir, out = []) {
   if (!existsSync(dir)) return out
   for (const dirent of readdirSync(dir, { withFileTypes: true })) {
@@ -71,6 +106,14 @@ function checkVersions() {
   }
 
   const rootVer = versions.get('package.json') || ''
+  let androidVersionCode = 0
+  if (rootVer) {
+    try {
+      androidVersionCode = computeAndroidVersionCode(rootVer)
+    } catch (err) {
+      errors.push(err?.message || String(err))
+    }
+  }
   for (const [rel, ver] of versions.entries()) {
     if (ver !== rootVer) {
       errors.push(`Version drift: ${rel} has "${ver}" but root package.json has "${rootVer}"`)
@@ -122,7 +165,9 @@ function checkVersions() {
     process.exit(1)
   }
 
-  console.log(`[version:check] OK — all ${versions.size} workspace manifests aligned at v${rootVer} (0 hardcoded version literals)`)
+  console.log(
+    `[version:check] OK — all ${versions.size} workspace manifests aligned at v${rootVer} (android versionCode=${androidVersionCode}, 0 hardcoded version literals)`,
+  )
 }
 
 function bumpVersion(nextRaw) {
@@ -131,6 +176,7 @@ function bumpVersion(nextRaw) {
     console.error(`Invalid SemVer target version: "${nextRaw}"`)
     process.exit(1)
   }
+  const nextAndroidCode = computeAndroidVersionCode(nextVer)
 
   for (const rel of PACKAGE_PATHS) {
     const full = join(REPO_ROOT, rel)
@@ -156,17 +202,22 @@ function bumpVersion(nextRaw) {
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8')
   }
 
-  console.log(`[bump-version] Updated all ${PACKAGE_PATHS.length} package manifests + package-lock.json to v${nextVer}`)
+  console.log(
+    `[bump-version] Updated all ${PACKAGE_PATHS.length} package manifests + package-lock.json to v${nextVer} (android versionCode=${nextAndroidCode})`,
+  )
 }
 
-const arg = process.argv[2]
-if (!arg || arg === '--help' || arg === '-h') {
-  console.log('Usage:\n  node scripts/bump-version.mjs --check\n  node scripts/bump-version.mjs <x.y.z>')
-  process.exit(arg ? 0 : 1)
-}
-if (arg === '--check') {
-  checkVersions()
-} else {
-  bumpVersion(arg)
-  checkVersions()
+const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+if (isMain) {
+  const arg = process.argv[2]
+  if (!arg || arg === '--help' || arg === '-h') {
+    console.log('Usage:\n  node scripts/bump-version.mjs --check\n  node scripts/bump-version.mjs <x.y.z>')
+    process.exit(arg ? 0 : 1)
+  }
+  if (arg === '--check') {
+    checkVersions()
+  } else {
+    bumpVersion(arg)
+    checkVersions()
+  }
 }

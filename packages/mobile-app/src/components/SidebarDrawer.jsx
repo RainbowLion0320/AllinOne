@@ -1,16 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { APP_META } from '@allinone/shared'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Check,
-  ChevronDown,
-  ChevronRight,
   ChevronsUpDown,
   Clock,
   Folder,
-  FolderOpen,
   Monitor,
-  MoreHorizontal,
-  Plus,
   QrCode,
   RefreshCw,
   ScanLine,
@@ -19,14 +12,16 @@ import {
   User,
   X,
 } from 'lucide-react'
-import { VendorBadge, VendorIcon } from './VendorIcon.jsx'
+import { VendorQuotaRings } from './VendorQuotaRings.jsx'
 import {
-  computeSidebarVendorLayout,
-  formatQuotaBadgeText,
-  formatQuotaTooltip,
-} from '../lib/sidebarVendors.js'
+  SidebarSessionList,
+  groupByProject,
+  groupByTime,
+  normalizeProjectKey,
+} from './SidebarSessionList.jsx'
+import { computeSidebarVendorLayout } from '../lib/sidebarVendors.js'
 import { useI18n } from '../lib/i18n.jsx'
-import { bi as biLang, translate } from '../lib/i18n.js'
+import { translate } from '../lib/i18n.js'
 
 function getFilterTabs(lang) {
   return [
@@ -39,152 +34,26 @@ function getFilterTabs(lang) {
   ]
 }
 
-const UNGROUPED_KEY = '__ungrouped__'
-
-function normalizeProjectKey(s) {
-  const rawWs = String(s.workspace || '').trim()
-  if (rawWs && rawWs !== 'Desktop' && rawWs !== 'SDK') return rawWs
-  const cwd = String(s.cwd || '').trim().replace(/[\\/]+$/, '')
-  if (cwd) {
-    const parts = cwd.split(/[\\/]/).filter(Boolean)
-    if (parts.length > 0) return parts[parts.length - 1]
-  }
-  return rawWs || UNGROUPED_KEY
-}
-
-function groupByProject(sessions, lang) {
-  const ungroupedLabel = biLang(lang, '未分组', 'Ungrouped')
-  const map = new Map()
-  for (const s of sessions) {
-    const rawName = normalizeProjectKey(s)
-    const isUngrouped = rawName === UNGROUPED_KEY
-    const name = isUngrouped ? ungroupedLabel : rawName
-    const key = rawName.toLowerCase()
-    let group = map.get(key)
-    if (!group) {
-      group = {
-        key,
-        label: name,
-        isUngrouped,
-        cwd: s.cwd || '',
-        latestAt: 0,
-        hasRunning: false,
-        items: [],
-      }
-      map.set(key, group)
-    }
-    if (!group.cwd && s.cwd) group.cwd = s.cwd
-    const ts = s.updatedAt || s.createdAt || 0
-    if (ts > group.latestAt) group.latestAt = ts
-    if (s.status === 'running') group.hasRunning = true
-    group.items.push(s)
-  }
-
-  const groups = [...map.values()]
-  for (const g of groups) {
-    g.items.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))
-  }
-  groups.sort((a, b) => {
-    // Keep Ungrouped at the bottom unless it's the only group
-    if (a.isUngrouped && !b.isUngrouped) return 1
-    if (b.isUngrouped && !a.isUngrouped) return -1
-    return b.latestAt - a.latestAt
+function useIsDesktopViewport() {
+  const [isDesktop, setIsDesktop] = useState(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return true
+    return window.matchMedia('(min-width: 1024px)').matches
   })
-  return groups
-}
 
-function groupByTime(sessions, lang) {
-  const now = new Date()
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-  const startOfYesterday = startOfToday - 86_400_000
-  const startOf7Days = startOfToday - 7 * 86_400_000
-
-  const groups = [
-    { key: 'today', label: translate(lang, 'time.today'), items: [] },
-    { key: 'yesterday', label: translate(lang, 'time.yesterday'), items: [] },
-    { key: 'week', label: translate(lang, 'time.week'), items: [] },
-    { key: 'older', label: translate(lang, 'time.older'), items: [] },
-  ]
-
-  for (const s of sessions) {
-    const t = s.updatedAt || s.createdAt || 0
-    if (t >= startOfToday) groups[0].items.push(s)
-    else if (t >= startOfYesterday) groups[1].items.push(s)
-    else if (t >= startOf7Days) groups[2].items.push(s)
-    else groups[3].items.push(s)
-  }
-
-  return groups.filter((g) => g.items.length > 0)
-}
-
-function SessionRow({ session, isActive, hasPendingPrompt = false, showProjectSubtitle, onSelect }) {
-  const { bi } = useI18n()
-  const meta = APP_META[session.app] || APP_META.dsh
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`group flex w-full flex-col rounded-xl px-2.5 py-2 text-left transition-all duration-150 active:scale-[0.985] ${
-        isActive
-          ? 'bg-[#E9EEFF] text-[#2842C9] dark:bg-[#273154] dark:text-white'
-          : 'hover:bg-slate-200/50 dark:hover:bg-slate-800/60'
-      }`}
-    >
-      <div className="flex items-center gap-2">
-        <VendorBadge app={session.app} size="xs" active={session.status === 'running' || hasPendingPrompt} />
-        <span className="flex-1 truncate text-[13px] font-medium text-slate-800 dark:text-slate-100">
-          {session.title}
-        </span>
-        {(session.source === 'claude-desktop-cowork' || (session.source === 'workbuddy-desktop' && session.writable === false)) && (
-          <span
-            title={
-              session.source === 'workbuddy-desktop'
-                ? bi('WorkBuddy 桌面端实时同步视图', 'WorkBuddy Desktop live mirror')
-                : bi('Claude Desktop (Cowork) 实时同步视图', 'Claude Desktop (Cowork) live mirror')
-            }
-            className="shrink-0 rounded border border-slate-200/80 bg-white/70 px-1 py-0.5 text-[9.5px] font-medium text-slate-500 dark:border-slate-700/80 dark:bg-slate-800/70 dark:text-slate-400"
-          >
-            Desktop
-          </span>
-        )}
-        {hasPendingPrompt ? (
-          <span
-            title={bi('等待你的选择', 'Waiting for your input')}
-            className="h-2 w-2 shrink-0 rounded-full bg-amber-500 animate-pulse"
-          />
-        ) : session.status === 'running' ? (
-          <span
-            title={bi('运行中', 'Running')}
-            className="h-2 w-2 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
-          />
-        ) : null}
-      </div>
-      {showProjectSubtitle && (
-        <div className="mt-0.5 pl-8 text-[11px] text-slate-400 truncate">
-          {session.workspace || meta.name}
-        </div>
-      )}
-    </button>
-  )
-}
-
-function getQuotaTone(remainingPercent) {
-  if (remainingPercent >= 40) {
-    return {
-      text: 'text-emerald-600 dark:text-emerald-400',
-      ring: '#10B981',
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined
+    const mq = window.matchMedia('(min-width: 1024px)')
+    const onChange = (ev) => setIsDesktop(ev.matches)
+    setIsDesktop(mq.matches)
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', onChange)
+      return () => mq.removeEventListener('change', onChange)
     }
-  }
-  if (remainingPercent >= 15) {
-    return {
-      text: 'text-amber-600 dark:text-amber-400',
-      ring: '#F59E0B',
-    }
-  }
-  return {
-    text: 'text-rose-600 dark:text-rose-400',
-    ring: '#F43F5E',
-  }
+    mq.addListener?.(onChange)
+    return () => mq.removeListener?.(onChange)
+  }, [])
+
+  return isDesktop
 }
 
 export const SidebarDrawer = React.memo(function SidebarDrawer({
@@ -217,20 +86,34 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
   onOpenDeviceSwitcher,
 }) {
   const { lang, bi, t } = useI18n()
+  const isDesktopViewport = useIsDesktopViewport()
+  const [keepMountedAfterClose, setKeepMountedAfterClose] = useState(false)
   const [uncontrolledFilterApp, setUncontrolledFilterApp] = useState('all')
   const filterApp = controlledFilterApp ?? uncontrolledFilterApp
-  const setFilterApp = (next) => {
-    if (typeof onFilterAppChange === 'function') onFilterAppChange(next)
-    else setUncontrolledFilterApp(next)
-  }
+  const setFilterApp = useCallback(
+    (next) => {
+      if (typeof onFilterAppChange === 'function') onFilterAppChange(next)
+      else setUncontrolledFilterApp(next)
+    },
+    [onFilterAppChange],
+  )
   const [groupMode, setGroupMode] = useState(() => localStorage.getItem('allinone_group_mode') || 'project')
   const [searchOpen, setSearchOpen] = useState(false)
   const [search, setSearch] = useState('')
   const searchInputRef = useRef(null)
-  const [moreVendorsOpen, setMoreVendorsOpen] = useState(false)
-  const moreVendorsRef = useRef(null)
-  // Map of projectKey -> boolean (explicitly expanded or collapsed by user)
   const [expandedMap, setExpandedMap] = useState({})
+
+  // Unmount heavy hidden mobile drawer body after slide-out animation completes so mobile background ticks cost 0ms
+  useEffect(() => {
+    if (isDesktopViewport || open) {
+      setKeepMountedAfterClose(open)
+      return undefined
+    }
+    const timer = setTimeout(() => setKeepMountedAfterClose(false), 260)
+    return () => clearTimeout(timer)
+  }, [open, isDesktopViewport])
+
+  const shouldRenderContent = isDesktopViewport || open || keepMountedAfterClose
 
   useEffect(() => {
     try { localStorage.setItem('allinone_group_mode', groupMode) } catch {}
@@ -242,39 +125,13 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
     }
   }, [searchOpen])
 
-  useEffect(() => {
-    if (!open) setMoreVendorsOpen(false)
-  }, [open])
-
-  useEffect(() => {
-    if (!moreVendorsOpen) return undefined
-    const handlePointerDown = (e) => {
-      if (moreVendorsRef.current && !moreVendorsRef.current.contains(e.target)) {
-        setMoreVendorsOpen(false)
-      }
-    }
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation()
-        setMoreVendorsOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handlePointerDown)
-    document.addEventListener('touchstart', handlePointerDown, { passive: true })
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('mousedown', handlePointerDown)
-      document.removeEventListener('touchstart', handlePointerDown)
-      document.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [moreVendorsOpen])
-
-  const closeSearch = () => {
+  const closeSearch = useCallback(() => {
     setSearch('')
     setSearchOpen(false)
-  }
+  }, [])
 
   const filtered = useMemo(() => {
+    if (!shouldRenderContent) return []
     const q = search.trim().toLowerCase()
     return sessions.filter((s) => {
       if (filterApp !== 'all' && s.app !== filterApp) return false
@@ -286,10 +143,19 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
         (s.preview || '').toLowerCase().includes(q)
       )
     })
-  }, [sessions, filterApp, search])
+  }, [shouldRenderContent, sessions, filterApp, search])
 
   const { showFilterBar, allTab, visibleVendors, overflowVendors, soleQuotaTab } = useMemo(() => {
     const allTabs = getFilterTabs(lang)
+    if (!shouldRenderContent) {
+      return {
+        showFilterBar: false,
+        allTab: allTabs[0],
+        visibleVendors: [],
+        overflowVendors: [],
+        soleQuotaTab: null,
+      }
+    }
     const layout = computeSidebarVendorLayout({
       vendorTabs: allTabs.slice(1),
       sessions,
@@ -302,41 +168,36 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
       overflowVendors: layout.overflowVendors,
       soleQuotaTab: layout.soleQuotaTab,
     }
-  }, [lang, sessions, appsStatus])
+  }, [shouldRenderContent, lang, sessions, appsStatus])
 
-  useEffect(() => {
-    if (overflowVendors.length === 0 && moreVendorsOpen) {
-      setMoreVendorsOpen(false)
-    }
-  }, [overflowVendors.length, moreVendorsOpen])
-
-  const activeOverflowVendor = useMemo(
-    () => overflowVendors.find((v) => v.id === filterApp) || null,
-    [overflowVendors, filterApp],
+  const projectGroups = useMemo(
+    () => (shouldRenderContent ? groupByProject(filtered, lang) : []),
+    [shouldRenderContent, filtered, lang],
   )
-  const hasRunningOverflow = useMemo(
-    () => overflowVendors.some((v) => v.hasRunning),
-    [overflowVendors],
+  const timeGroups = useMemo(
+    () => (shouldRenderContent ? groupByTime(filtered, lang) : []),
+    [shouldRenderContent, filtered, lang],
   )
-  const projectGroups = useMemo(() => groupByProject(filtered, lang), [filtered, lang])
-  const timeGroups = useMemo(() => groupByTime(filtered, lang), [filtered, lang])
 
   const activeProjectKey = useMemo(() => {
+    if (!shouldRenderContent) return ''
     const active = sessions.find((s) => s.id === activeSessionId)
     return active ? normalizeProjectKey(active).toLowerCase() : ''
-  }, [sessions, activeSessionId])
+  }, [shouldRenderContent, sessions, activeSessionId])
 
-  const isProjectExpanded = (group, index) => {
-    if (search.trim().length > 0) return true
-    if (group.key in expandedMap) return expandedMap[group.key]
-    if (group.key === activeProjectKey) return true
-    // By default expand the top 3 most recently active projects, collapse the rest
-    return index < 3
-  }
+  const isProjectExpanded = useCallback(
+    (group, index) => {
+      if (search.trim().length > 0) return true
+      if (group.key in expandedMap) return expandedMap[group.key]
+      if (group.key === activeProjectKey) return true
+      return index < 3
+    },
+    [search, expandedMap, activeProjectKey],
+  )
 
-  const toggleProject = (key, current) => {
+  const toggleProject = useCallback((key, current) => {
     setExpandedMap((prev) => ({ ...prev, [key]: !current }))
-  }
+  }, [])
 
   const allExpanded = projectGroups.length > 0 && projectGroups.every((g, idx) => isProjectExpanded(g, idx))
 
@@ -359,660 +220,309 @@ export const SidebarDrawer = React.memo(function SidebarDrawer({
 
       {/* Drawer Panel (slide-over on mobile, permanently docked sidebar on desktop lg:) */}
       <aside
+        aria-hidden={!shouldRenderContent}
         className={`fixed inset-y-0 left-0 z-50 flex w-[84%] max-w-[330px] flex-col bg-[#F8F9FC] shadow-2xl transition-[transform,visibility] duration-250 ease-out dark:bg-[#1B1D23] lg:static lg:inset-auto lg:z-auto lg:visible lg:pointer-events-auto lg:w-[292px] lg:max-w-none lg:shrink-0 lg:translate-x-0 lg:border-r lg:border-slate-200/80 lg:shadow-none lg:transition-none lg:dark:border-slate-800/80 ${
           open ? 'visible pointer-events-auto translate-x-0' : 'invisible pointer-events-none -translate-x-full'
         }`}
       >
-        {/* Top header (includes macOS traffic-light clearance & drag bar when running in Electron) */}
-        <div
-          className={`app-drag flex items-center justify-between px-4 pb-2 ${
-            isMacDesktop ? 'pt-9' : 'pt-safe'
-          }`}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              onGoHome?.()
-              onClose()
-            }}
-            title={bi('回到主界面', 'Back to home')}
-            className="app-no-drag flex min-w-0 items-center gap-2.5 rounded-xl py-0.5 pr-2 text-left transition hover:opacity-85 active:scale-[0.98]"
-          >
-            <img src="./icon-192.png" alt="All in One" className="h-7.5 w-7.5 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
-            <div className="min-w-0">
-              <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
-                All in One
-              </div>
-            </div>
-          </button>
-
-          <div className="app-no-drag flex items-center gap-0.5">
-            <button
-              type="button"
-              onClick={() => {
-                if (searchOpen) closeSearch()
-                else setSearchOpen(true)
-              }}
-              title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-              aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
-              aria-expanded={searchOpen}
-              className={`rounded-xl p-2 transition ${
-                searchOpen || search.trim().length > 0
-                  ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
-                  : 'text-slate-500 hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'
+        {shouldRenderContent && (
+          <>
+            {/* Top header (includes macOS traffic-light clearance & drag bar when running in Electron) */}
+            <div
+              className={`app-drag flex items-center justify-between px-4 pb-2 ${
+                isMacDesktop ? 'pt-9' : 'pt-safe'
               }`}
             >
-              <Search className="h-4 w-4" />
-            </button>
-            <button
-              type="button"
-              onClick={onRefresh}
-              title={bi('刷新会话列表', 'Refresh conversations')}
-              aria-label={bi('刷新会话列表', 'Refresh conversations')}
-              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
-            >
-              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label={bi('关闭侧边栏', 'Close sidebar')}
-              className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Active Computer Switcher Card */}
-        <div className="px-4 pb-2">
-          <button
-            type="button"
-            onClick={() => {
-              onClose()
-              onOpenDeviceSwitcher?.()
-            }}
-            className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-1.5 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
-          >
-            <div className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
-              <Monitor className="h-3.5 w-3.5" />
-              <span
-                className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-[#232631] ${
-                  connState === 'unauthorized'
-                    ? 'bg-rose-500'
-                    : connState === 'connected' && bridgeOnline
-                      ? 'bg-emerald-500'
-                      : connState === 'connecting'
-                        ? 'bg-amber-400'
-                        : 'bg-slate-400'
-                }`}
-              />
-            </div>
-
-            <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-slate-800 dark:text-white">
-              {activeDeviceName || bi('我的电脑', 'My Computer')}
-            </span>
-
-            {connState === 'unauthorized' ? (
-              <span className="shrink-0 rounded-md bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-500 dark:bg-rose-950/50 dark:text-rose-300">
-                {t('common.expired')}
-              </span>
-            ) : connState === 'connecting' ? (
-              <span className="shrink-0 text-[10.5px] text-amber-500">{t('common.connecting')}</span>
-            ) : !(connState === 'connected' && bridgeOnline) ? (
-              <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                {t('common.offline')}
-              </span>
-            ) : null}
-
-            <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-          </button>
-        </div>
-
-        {/* Collapsible Search Input (toggled from top bar search icon) */}
-        {searchOpen && (
-          <div className="animate-reveal-down px-4 pb-2">
-            <div className="relative">
-              <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              <input
-                ref={searchInputRef}
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') {
-                    e.stopPropagation()
-                    closeSearch()
-                  }
-                }}
-                placeholder={bi('搜索对话...', 'Search chats...')}
-                className="w-full rounded-xl border border-[#4D6BFE]/50 bg-white py-1.5 pr-8 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-[#4D6BFE]/50 dark:bg-[#14161B] dark:text-slate-100"
-              />
               <button
                 type="button"
-                onClick={closeSearch}
-                aria-label={bi('清空并关闭搜索', 'Clear and close search')}
-                className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                onClick={() => {
+                  onGoHome?.()
+                  onClose()
+                }}
+                title={bi('回到主界面', 'Back to home')}
+                className="app-no-drag flex min-w-0 items-center gap-2.5 rounded-xl py-0.5 pr-2 text-left transition hover:opacity-85 active:scale-[0.98]"
               >
-                <X className="h-3.5 w-3.5" />
+                <img src="./icon-192.png" alt="All in One" className="h-7.5 w-7.5 rounded-xl bg-[#0B0E14] ring-1 ring-white/10" />
+                <div className="min-w-0">
+                  <div className="text-[15px] font-bold leading-tight text-slate-900 dark:text-white">
+                    All in One
+                  </div>
+                </div>
               </button>
-            </div>
-          </div>
-        )}
 
-        {/* Dynamic Vendor Filter & Subscription Quota Bar (smart-sorted top 3 + "..." overflow switcher) */}
-        {showFilterBar ? (() => {
-          const inlineTabs = [allTab, ...visibleVendors]
-          const totalCols = inlineTabs.length + (overflowVendors.length > 0 ? 1 : 0)
-          const overflowNames = overflowVendors.map((v) => v.label).join(lang === 'zh' ? '、' : ', ')
-          const activeOverflowQuota = activeOverflowVendor?.quota || null
-          const activeOverflowPct = activeOverflowQuota
-            ? Math.max(0, Math.min(100, Math.round(activeOverflowQuota.remainingPercent)))
-            : null
-          const activeOverflowTone = activeOverflowPct !== null ? getQuotaTone(activeOverflowPct) : null
-          const moreTooltip = activeOverflowVendor
-            ? `${formatQuotaTooltip(activeOverflowVendor.label, activeOverflowQuota, lang)} · ${bi('点击切换更多厂商', 'Click to switch more tools')}`
-            : bi(`更多厂商（${overflowNames}）`, `More tools (${overflowNames})`)
-
-          return (
-            <div ref={moreVendorsRef} className="relative px-4 pb-2">
-              <div
-                className="grid gap-1.5"
-                style={{ gridTemplateColumns: `repeat(${totalCols}, minmax(0, 1fr))` }}
-              >
-                {inlineTabs.map((tab) => {
-                  const active = filterApp === tab.id
-                  const quota = tab.id !== 'all' ? tab.quota || null : null
-                  const pct = quota ? Math.max(0, Math.min(100, Math.round(quota.remainingPercent ?? 100))) : null
-                  const tone = pct !== null ? getQuotaTone(pct) : null
-                  const badgeText = quota ? formatQuotaBadgeText(quota, { compact: true, lang }) : ''
-                  const tooltip = formatQuotaTooltip(tab.label, quota, lang)
-
-                  // Tiles WITH subscription quota or credits balance: rounded-square border is the progress ring!
-                  if (pct !== null && tone && badgeText) {
-                    return (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        title={tooltip}
-                        aria-label={tooltip}
-                        onClick={() => {
-                          setMoreVendorsOpen(false)
-                          setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
-                        }}
-                        className={`group relative h-11 rounded-xl p-[2px] transition-all duration-150 hover:-translate-y-0.5 active:scale-95 ${
-                          active ? 'shadow-xs' : ''
-                        }`}
-                        style={{
-                          background: `conic-gradient(from 0deg, ${tone.ring} 0% ${pct}%, var(--quota-track) ${pct}% 100%)`,
-                        }}
-                      >
-                        <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
-                          {active && (
-                            <span
-                              aria-hidden="true"
-                              className="pointer-events-none absolute inset-0"
-                              style={{ backgroundColor: `${tab.color}24` }}
-                            />
-                          )}
-                          <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                            <VendorIcon app={tab.id} size={16} active={Boolean(tab.hasRunning)} />
-                            <span className={`text-[10px] leading-none font-semibold tabular-nums ${tone.text}`}>
-                              {badgeText}
-                            </span>
-                          </span>
-                        </span>
-                      </button>
-                    )
-                  }
-
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      title={tooltip}
-                      aria-label={tooltip}
-                      onClick={() => {
-                        setMoreVendorsOpen(false)
-                        setFilterApp(active && tab.id !== 'all' ? 'all' : tab.id)
-                      }}
-                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition-all duration-150 hover:-translate-y-0.5 active:scale-95 ${
-                        active
-                          ? 'border-transparent shadow-xs'
-                          : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
-                      }`}
-                      style={
-                        active
-                          ? {
-                              backgroundColor: `${tab.color}1F`,
-                              borderColor: `${tab.color}66`,
-                              color: tab.color,
-                            }
-                          : undefined
-                      }
-                    >
-                      <VendorIcon
-                        app={tab.id}
-                        size={tab.id === 'all' ? 17 : 19}
-                        mono={tab.id === 'all'}
-                        active={tab.id !== 'all' && Boolean(tab.hasRunning)}
-                      />
-                    </button>
-                  )
-                })}
-
-                {overflowVendors.length > 0 && (
-                  activeOverflowVendor && activeOverflowPct !== null && activeOverflowTone ? (
-                    <button
-                      type="button"
-                      title={moreTooltip}
-                      aria-label={moreTooltip}
-                      aria-haspopup="menu"
-                      aria-expanded={moreVendorsOpen}
-                      onClick={() => setMoreVendorsOpen((v) => !v)}
-                      className="group relative h-11 rounded-xl p-[2px] shadow-xs transition active:scale-95"
-                      style={{
-                        background: `conic-gradient(from 0deg, ${activeOverflowTone.ring} 0% ${activeOverflowPct}%, var(--quota-track) ${activeOverflowPct}% 100%)`,
-                      }}
-                    >
-                      <span className="relative flex h-full w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-[10px] bg-white transition group-hover:bg-slate-50 dark:bg-[#242731] dark:group-hover:bg-[#2B2F3B]">
-                        <span
-                          aria-hidden="true"
-                          className="pointer-events-none absolute inset-0"
-                          style={{ backgroundColor: `${activeOverflowVendor.color}24` }}
-                        />
-                        <span className="relative z-10 flex flex-col items-center justify-center gap-0.5">
-                          <VendorIcon app={activeOverflowVendor.id} size={16} active={Boolean(activeOverflowVendor.hasRunning)} />
-                          <span className={`text-[10px] leading-none font-semibold tabular-nums ${activeOverflowTone.text}`}>
-                            {formatQuotaBadgeText(activeOverflowQuota, { compact: true, lang })}
-                          </span>
-                        </span>
-                        <span
-                          aria-hidden="true"
-                          className="pointer-events-none absolute top-0.5 right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-slate-900/12 text-slate-600 dark:bg-white/15 dark:text-slate-200"
-                        >
-                          <MoreHorizontal className="h-2.5 w-2.5" />
-                        </span>
-                      </span>
-                    </button>
-                  ) : activeOverflowVendor ? (
-                    <button
-                      type="button"
-                      title={moreTooltip}
-                      aria-label={moreTooltip}
-                      aria-haspopup="menu"
-                      aria-expanded={moreVendorsOpen}
-                      onClick={() => setMoreVendorsOpen((v) => !v)}
-                      className="relative flex h-11 flex-col items-center justify-center rounded-xl border shadow-xs transition active:scale-95"
-                      style={{
-                        backgroundColor: `${activeOverflowVendor.color}1F`,
-                        borderColor: `${activeOverflowVendor.color}66`,
-                        color: activeOverflowVendor.color,
-                      }}
-                    >
-                      <VendorIcon app={activeOverflowVendor.id} size={19} active={Boolean(activeOverflowVendor.hasRunning)} />
-                      <span
-                        aria-hidden="true"
-                        className="pointer-events-none absolute top-0.5 right-0.5 flex h-3 w-3 items-center justify-center rounded-full bg-slate-900/12 text-slate-600 dark:bg-white/15 dark:text-slate-200"
-                      >
-                        <MoreHorizontal className="h-2.5 w-2.5" />
-                      </span>
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      title={moreTooltip}
-                      aria-label={moreTooltip}
-                      aria-haspopup="menu"
-                      aria-expanded={moreVendorsOpen}
-                      onClick={() => setMoreVendorsOpen((v) => !v)}
-                      className={`relative flex h-11 flex-col items-center justify-center rounded-xl border transition active:scale-95 ${
-                        moreVendorsOpen
-                          ? 'border-[#4D6BFE]/50 bg-[#4D6BFE]/12 text-[#4D6BFE] shadow-xs dark:border-[#4D6BFE]/60 dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
-                          : 'border-slate-200/70 bg-white text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:border-slate-700/70 dark:bg-[#242731] dark:text-slate-300 dark:hover:bg-[#2B2F3B]'
-                      }`}
-                    >
-                      <MoreHorizontal className="h-4.5 w-4.5" />
-                      {hasRunningOverflow && (
-                        <span
-                          aria-hidden="true"
-                          className="pointer-events-none absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse-dot"
-                        />
-                      )}
-                    </button>
-                  )
-                )}
-              </div>
-
-              {moreVendorsOpen && overflowVendors.length > 0 && (
-                <div
-                  role="menu"
-                  aria-label={bi('更多厂商', 'More tools')}
-                  className="animate-pop-in absolute top-full right-4 z-30 mt-1 w-56 rounded-2xl border border-slate-200/90 bg-white/98 p-1.5 shadow-xl backdrop-blur-md dark:border-slate-700/80 dark:bg-[#232631]/98"
+              <div className="app-no-drag flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (searchOpen) closeSearch()
+                    else setSearchOpen(true)
+                  }}
+                  title={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+                  aria-label={searchOpen ? bi('收起搜索', 'Close search') : bi('搜索对话', 'Search chats')}
+                  aria-expanded={searchOpen}
+                  className={`rounded-xl p-2 transition ${
+                    searchOpen || search.trim().length > 0
+                      ? 'bg-[#4D6BFE]/12 text-[#4D6BFE] dark:bg-[#4D6BFE]/20 dark:text-[#9AB0FF]'
+                      : 'text-slate-500 hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'
+                  }`}
                 >
-                  <div className="px-2.5 pt-1 pb-1 text-[10.5px] font-medium text-slate-400 dark:text-slate-500">
-                    {bi('更多厂商', 'More tools')}
-                  </div>
-                  <div className="space-y-0.5">
-                    {overflowVendors.map((tab) => {
-                      const active = filterApp === tab.id
-                      const pct = tab.quota
-                        ? Math.max(0, Math.min(100, Math.round(tab.quota.remainingPercent)))
-                        : null
-                      const tone = pct !== null ? getQuotaTone(pct) : null
-                      const tooltip = formatQuotaTooltip(tab.label, tab.quota, lang)
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          role="menuitemradio"
-                          aria-checked={active}
-                          title={tooltip}
-                          onClick={() => {
-                            setFilterApp(active ? 'all' : tab.id)
-                            setMoreVendorsOpen(false)
-                          }}
-                          className={`flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs transition ${
-                            active
-                              ? 'font-semibold text-slate-900 dark:text-white'
-                              : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800/80'
-                          }`}
-                          style={active ? { backgroundColor: `${tab.color}1A` } : undefined}
-                        >
-                          <VendorIcon app={tab.id} size={17} active={Boolean(tab.hasRunning)} />
-                          <span className="min-w-0 flex-1 truncate">{tab.label}</span>
-                          {tab.hasRunning && (
-                            <span
-                              title={bi('运行中', 'Running')}
-                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot"
-                            />
-                          )}
-                          {pct !== null && tone && (
-                            <span className={`shrink-0 text-[10.5px] font-semibold tabular-nums ${tone.text}`}>
-                              {formatQuotaBadgeText(tab.quota, { compact: false, lang })}
-                            </span>
-                          )}
-                          {tab.sessionCount > 0 && (
-                            <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                              {tab.sessionCount}
-                            </span>
-                          )}
-                          {active && (
-                            <Check className="h-3.5 w-3.5 shrink-0" style={{ color: tab.color }} />
-                          )}
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-              )}
+                  <Search className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={onRefresh}
+                  title={bi('刷新会话列表', 'Refresh conversations')}
+                  aria-label={bi('刷新会话列表', 'Refresh conversations')}
+                  className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-800"
+                >
+                  <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+                </button>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  aria-label={bi('关闭侧边栏', 'Close sidebar')}
+                  className="rounded-xl p-2 text-slate-500 hover:bg-slate-200/70 lg:hidden dark:text-slate-400 dark:hover:bg-slate-800"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
-          )
-        })() : soleQuotaTab ? (() => {
-          const pct = Math.max(0, Math.min(100, Math.round(soleQuotaTab.quota.remainingPercent)))
-          const tone = getQuotaTone(pct)
-          const tooltip = formatQuotaTooltip(soleQuotaTab.tab.label, soleQuotaTab.quota, lang)
-          return (
+
+            {/* Active Computer Switcher Card */}
             <div className="px-4 pb-2">
-              <div
-                title={tooltip}
-                className="flex items-center justify-between gap-2 rounded-xl border border-slate-200/70 bg-white px-2.5 py-2 dark:border-slate-700/70 dark:bg-[#242731]"
+              <button
+                type="button"
+                onClick={() => {
+                  onClose()
+                  onOpenDeviceSwitcher?.()
+                }}
+                className="flex w-full items-center gap-2.5 rounded-2xl border border-slate-200/80 bg-white px-3 py-1.5 text-left shadow-2xs transition hover:border-[#4D6BFE]/50 active:scale-[0.99] dark:border-slate-700/80 dark:bg-[#232631] dark:hover:border-[#4D6BFE]/50"
               >
-                <div className="flex min-w-0 items-center gap-2">
-                  <VendorIcon app={soleQuotaTab.tab.id} size={16} />
-                  <span className="truncate text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    {soleQuotaTab.tab.label}
-                  </span>
+                <div className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/12 text-[#4D6BFE]">
+                  <Monitor className="h-3.5 w-3.5" />
+                  <span
+                    className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-[#232631] ${
+                      connState === 'unauthorized'
+                        ? 'bg-rose-500'
+                        : connState === 'connected' && bridgeOnline
+                          ? 'bg-emerald-500'
+                          : connState === 'connecting'
+                            ? 'bg-amber-400'
+                            : 'bg-slate-400'
+                    }`}
+                  />
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <div className="h-1.5 w-14 overflow-hidden rounded-full bg-slate-200/80 dark:bg-slate-700/80">
-                    <div
-                      className="h-full rounded-full transition-all"
-                      style={{ width: `${pct}%`, backgroundColor: tone.ring }}
-                    />
-                  </div>
-                  <span className={`text-[11px] font-semibold tabular-nums ${tone.text}`}>
-                    {formatQuotaBadgeText(soleQuotaTab.quota, { compact: false, lang, showTotal: true })}
-                  </span>
-                </div>
-              </div>
-            </div>
-          )
-        })() : null}
 
-        {/* Grouping Mode Switcher: By Project (default) vs By Time */}
-        <div className="flex items-center justify-between px-4 pb-2 text-[11px]">
-          <div className="inline-flex rounded-lg bg-slate-200/70 p-0.5 dark:bg-[#242731]">
-            <button
-              type="button"
-              onClick={() => setGroupMode('project')}
-              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
-                groupMode === 'project'
-                  ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
-                  : 'text-slate-500 dark:text-slate-400'
-              }`}
-            >
-              <Folder className="h-3 w-3" />
-              <span>{bi('按项目', 'Projects')}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setGroupMode('time')}
-              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
-                groupMode === 'time'
-                  ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
-                  : 'text-slate-500 dark:text-slate-400'
-              }`}
-            >
-              <Clock className="h-3 w-3" />
-              <span>{bi('按时间', 'Recent')}</span>
-            </button>
-          </div>
-
-          {groupMode === 'project' && projectGroups.length > 0 && search.trim().length === 0 && (
-            <button
-              type="button"
-              onClick={toggleAllProjects}
-              className="text-slate-400 hover:text-[#4D6BFE]"
-            >
-              {allExpanded ? bi('折叠', 'Collapse') : bi('展开', 'Expand')}
-            </button>
-          )}
-        </div>
-
-        {/* Grouped conversation list */}
-        <div className="flex-1 overflow-y-auto px-3 pb-4">
-          {filtered.length === 0 ? (
-            <div className="py-12 text-center text-xs text-slate-400">
-              {e2eeLocked
-                ? bi('请先同步端到端密钥以查看对话', 'Sync E2EE key to view conversations')
-                : bridgeOnline
-                  ? bi('暂无匹配的对话', 'No matching conversations')
-                  : bi('等待电脑端上线...', 'Waiting for computer to come online...')}
-            </div>
-          ) : groupMode === 'project' ? (
-            <div className="space-y-1.5">
-              {projectGroups.map((group, idx) => {
-                const expanded = isProjectExpanded(group, idx)
-                return (
-                  <div
-                    key={group.key}
-                    className="overflow-hidden rounded-2xl border border-slate-200/60 bg-white/70 dark:border-slate-800/80 dark:bg-[#20232B]/70"
-                  >
-                    <div className="flex items-center gap-1 pr-1.5">
-                      <button
-                        type="button"
-                        onClick={() => toggleProject(group.key, expanded)}
-                        className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left transition-colors hover:bg-slate-100/60 dark:hover:bg-slate-800/40"
-                      >
-                        <ChevronRight
-                          className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform duration-200 ${
-                            expanded ? 'rotate-90' : ''
-                          }`}
-                        />
-                        {expanded ? (
-                          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[#4D6BFE]" />
-                        ) : (
-                          <Folder className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                        )}
-                        <span className="flex-1 truncate text-[12.5px] font-semibold text-slate-700 dark:text-slate-200">
-                          {group.label}
-                        </span>
-                        {group.hasRunning && (
-                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500 animate-pulse-dot" />
-                        )}
-                        <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-                          {group.items.length}
-                        </span>
-                      </button>
-
-                      {group.cwd && (
-                        <button
-                          type="button"
-                          title={bi(`在 ${group.label} 新建对话`, `New chat in ${group.label}`)}
-                          onClick={() => {
-                            onClose()
-                            onNewChat(group.cwd, filterApp !== 'all' ? filterApp : '')
-                          }}
-                          className="rounded-lg p-1 text-slate-400 hover:bg-slate-200/70 hover:text-[#4D6BFE] dark:hover:bg-slate-700/70"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                    </div>
-
-                    {expanded && (
-                      <div className="animate-reveal-down space-y-0.5 border-t border-slate-100 px-1.5 py-1.5 dark:border-slate-800/80">
-                        {group.items.map((s) => (
-                          <SessionRow
-                            key={s.id}
-                            session={s}
-                            isActive={s.id === activeSessionId}
-                            hasPendingPrompt={Boolean(pendingApprovalSessionIds?.has?.(s.id))}
-                            showProjectSubtitle={false}
-                            onSelect={() => {
-                              onSelectSession(s)
-                              onClose()
-                            }}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            timeGroups.map((group) => (
-              <div key={group.key} className="mb-3">
-                <div className="px-2 py-1.5 text-[11px] font-semibold tracking-wide text-slate-400">
-                  {group.label}
-                </div>
-                <div className="space-y-1">
-                  {group.items.map((s) => (
-                    <SessionRow
-                      key={s.id}
-                      session={s}
-                      isActive={s.id === activeSessionId}
-                      hasPendingPrompt={Boolean(pendingApprovalSessionIds?.has?.(s.id))}
-                      showProjectSubtitle={true}
-                      onSelect={() => {
-                        onSelectSession(s)
-                        onClose()
-                      }}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* Minimal single-row footer: User profile, Quick Scan & Settings */}
-        <div className="pb-safe border-t border-slate-200/80 px-3 pt-2 pb-2 dark:border-slate-800">
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onOpenSettings?.()
-              }}
-              aria-label={bi('打开设置', 'Open Settings')}
-              className="flex min-w-0 flex-1 items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
-            >
-              <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
-                {username ? username.slice(0, 1).toUpperCase() : <User className="h-3.5 w-3.5" />}
-                {hasUpdate && (
-                  <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
-                )}
-              </div>
-              <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
-                  {username ? `@${username}` : activeDeviceName || t('common.settings')}
+                <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-slate-800 dark:text-white">
+                  {activeDeviceName || bi('我的电脑', 'My Computer')}
                 </span>
-                {hasUpdate ? (
-                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
-                    {bi('有更新', 'Update')}
+
+                {connState === 'unauthorized' ? (
+                  <span className="shrink-0 rounded-md bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-500 dark:bg-rose-950/50 dark:text-rose-300">
+                    {t('common.expired')}
                   </span>
-                ) : isAdmin ? (
-                  <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE]">
-                    {t('common.admin')}
+                ) : connState === 'connecting' ? (
+                  <span className="shrink-0 text-[10.5px] text-amber-500">{t('common.connecting')}</span>
+                ) : !(connState === 'connected' && bridgeOnline) ? (
+                  <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                    {t('common.offline')}
                   </span>
                 ) : null}
+
+                <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+              </button>
+            </div>
+
+            {/* Collapsible Search Input */}
+            {searchOpen && (
+              <div className="animate-reveal-down px-4 pb-2">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                  <input
+                    ref={searchInputRef}
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        e.stopPropagation()
+                        closeSearch()
+                      }
+                    }}
+                    placeholder={bi('搜索对话...', 'Search chats...')}
+                    className="w-full rounded-xl border border-[#4D6BFE]/50 bg-white py-1.5 pr-8 pl-8.5 text-xs text-slate-800 outline-none focus:border-[#4D6BFE] dark:border-[#4D6BFE]/50 dark:bg-[#14161B] dark:text-slate-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={closeSearch}
+                    aria-label={bi('清空并关闭搜索', 'Clear and close search')}
+                    className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
-            </button>
+            )}
 
-            {isDesktopApp && canShowMyQr && onShowMyQr ? (
-              <button
-                type="button"
-                onClick={() => {
-                  onClose()
-                  onShowMyQr()
-                }}
-                title={bi('显示本机二维码，供手机扫码同步', 'Show QR code for phone sync')}
-                aria-label={bi('连手机', 'Connect Phone')}
-                className="scan-btn-sweep scan-btn-sweep-subtle inline-flex h-9 shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE]/12 px-2.5 text-[11.5px] font-semibold text-[#3B59ED] ring-1 ring-[#4D6BFE]/22 transition-all duration-150 hover:bg-[#4D6BFE]/20 active:scale-95 dark:bg-[#4D6BFE]/20 dark:text-[#9BB0FF] dark:ring-[#4D6BFE]/35 dark:hover:bg-[#4D6BFE]/28"
-              >
-                <QrCode className="h-3.5 w-3.5 shrink-0" />
-                <span>{bi('连手机', 'Phone')}</span>
-              </button>
-            ) : onQuickScan ? (
-              <button
-                type="button"
-                onClick={() => {
-                  onClose()
-                  onQuickScan()
-                }}
-                title={bi('扫一扫（同步密钥 / 授权新设备）', 'Scan QR (Sync Key / Authorize Device)')}
-                aria-label={bi('扫一扫', 'Scan QR')}
-                className={`scan-btn-sweep scan-btn-sweep-subtle relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ring-1 transition-all duration-150 hover:scale-105 active:scale-95 ${
-                  e2eeLocked
-                    ? 'bg-amber-500/15 text-amber-600 ring-amber-500/35 hover:bg-amber-500/25 dark:text-amber-400'
-                    : 'bg-[#4D6BFE]/10 text-[#4D6BFE] ring-[#4D6BFE]/22 hover:bg-[#4D6BFE]/18 dark:bg-[#4D6BFE]/18 dark:text-[#8CA3FF] dark:ring-[#4D6BFE]/32 dark:hover:bg-[#4D6BFE]/26'
-                }`}
-              >
-                <ScanLine className="relative z-10 h-4.5 w-4.5" />
-                <span aria-hidden="true" className="scan-btn-beam z-20" />
-                {e2eeLocked && (
-                  <span className="absolute top-1 right-1 z-30 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] animate-pulse-dot dark:ring-[#1B1D23]" />
-                )}
-              </button>
-            ) : null}
+            {/* Dynamic Vendor Filter & Subscription Quota Bar */}
+            <VendorQuotaRings
+              drawerOpen={open}
+              showFilterBar={showFilterBar}
+              allTab={allTab}
+              visibleVendors={visibleVendors}
+              overflowVendors={overflowVendors}
+              soleQuotaTab={soleQuotaTab}
+              filterApp={filterApp}
+              onSelectFilterApp={setFilterApp}
+            />
 
-            <button
-              type="button"
-              onClick={() => {
-                onClose()
-                onOpenSettings?.()
-              }}
-              title={bi('设置', 'Settings')}
-              aria-label={bi('打开设置', 'Open Settings')}
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-700 active:scale-95 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-            >
-              <Settings className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
+            {/* Grouping Mode Switcher: By Project (default) vs By Time */}
+            <div className="flex items-center justify-between px-4 pb-2 text-[11px]">
+              <div className="inline-flex rounded-lg bg-slate-200/70 p-0.5 dark:bg-[#242731]">
+                <button
+                  type="button"
+                  onClick={() => setGroupMode('project')}
+                  className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
+                    groupMode === 'project'
+                      ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
+                      : 'text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  <Folder className="h-3 w-3" />
+                  <span>{bi('按项目', 'Projects')}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGroupMode('time')}
+                  className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition ${
+                    groupMode === 'time'
+                      ? 'bg-white text-slate-900 shadow-2xs dark:bg-[#323644] dark:text-white'
+                      : 'text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  <Clock className="h-3 w-3" />
+                  <span>{bi('按时间', 'Recent')}</span>
+                </button>
+              </div>
+
+              {groupMode === 'project' && projectGroups.length > 0 && search.trim().length === 0 && (
+                <button
+                  type="button"
+                  onClick={toggleAllProjects}
+                  className="text-slate-400 hover:text-[#4D6BFE]"
+                >
+                  {allExpanded ? bi('折叠', 'Collapse') : bi('展开', 'Expand')}
+                </button>
+              )}
+            </div>
+
+            {/* Grouped conversation list */}
+            <div className="flex-1 overflow-y-auto px-3 pb-4">
+              <SidebarSessionList
+                filteredCount={filtered.length}
+                groupMode={groupMode}
+                projectGroups={projectGroups}
+                timeGroups={timeGroups}
+                activeSessionId={activeSessionId}
+                pendingApprovalSessionIds={pendingApprovalSessionIds}
+                e2eeLocked={e2eeLocked}
+                bridgeOnline={bridgeOnline}
+                filterApp={filterApp}
+                isProjectExpanded={isProjectExpanded}
+                onToggleProject={toggleProject}
+                onSelectSession={onSelectSession}
+                onNewChat={onNewChat}
+                onClose={onClose}
+              />
+            </div>
+
+            {/* Minimal single-row footer: User profile, Quick Scan & Settings */}
+            <div className="pb-safe border-t border-slate-200/80 px-3 pt-2 pb-2 dark:border-slate-800">
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose()
+                    onOpenSettings?.()
+                  }}
+                  aria-label={bi('打开设置', 'Open Settings')}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 rounded-2xl px-2.5 py-2 text-left transition hover:bg-slate-200/60 active:scale-[0.99] dark:hover:bg-slate-800/70"
+                >
+                  <div className="relative flex h-7.5 w-7.5 shrink-0 items-center justify-center rounded-xl bg-[#4D6BFE]/14 text-xs font-bold text-[#4D6BFE]">
+                    {username ? username.slice(0, 1).toUpperCase() : <User className="h-3.5 w-3.5" />}
+                    {hasUpdate && (
+                      <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-[#F8F9FC] dark:ring-[#1B1D23]" />
+                    )}
+                  </div>
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                    <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
+                      {username ? `@${username}` : activeDeviceName || t('common.settings')}
+                    </span>
+                    {hasUpdate ? (
+                      <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-600 dark:text-emerald-300">
+                        {bi('有更新', 'Update')}
+                      </span>
+                    ) : isAdmin ? (
+                      <span className="shrink-0 rounded bg-[#4D6BFE]/12 px-1 py-0.5 text-[9.5px] font-semibold text-[#4D6BFE]">
+                        {t('common.admin')}
+                      </span>
+                    ) : null}
+                  </div>
+                </button>
+
+                {isDesktopApp && canShowMyQr && onShowMyQr ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose()
+                      onShowMyQr()
+                    }}
+                    title={bi('显示本机二维码，供手机扫码同步', 'Show QR code for phone sync')}
+                    aria-label={bi('连手机', 'Connect Phone')}
+                    className="scan-btn-sweep scan-btn-sweep-subtle inline-flex h-9 shrink-0 items-center gap-1 rounded-xl bg-[#4D6BFE]/12 px-2.5 text-[11.5px] font-semibold text-[#3B59ED] ring-1 ring-[#4D6BFE]/22 transition-all duration-150 hover:bg-[#4D6BFE]/20 active:scale-95 dark:bg-[#4D6BFE]/20 dark:text-[#9BB0FF] dark:ring-[#4D6BFE]/35 dark:hover:bg-[#4D6BFE]/28"
+                  >
+                    <QrCode className="h-3.5 w-3.5 shrink-0" />
+                    <span>{bi('连手机', 'Phone')}</span>
+                  </button>
+                ) : onQuickScan ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose()
+                      onQuickScan()
+                    }}
+                    title={bi('扫一扫（同步密钥 / 授权新设备）', 'Scan QR (Sync Key / Authorize Device)')}
+                    aria-label={bi('扫一扫', 'Scan QR')}
+                    className={`scan-btn-sweep scan-btn-sweep-subtle relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ring-1 transition-all duration-150 hover:scale-105 active:scale-95 ${
+                      e2eeLocked
+                        ? 'bg-amber-500/15 text-amber-600 ring-amber-500/35 hover:bg-amber-500/25 dark:text-amber-400'
+                        : 'bg-[#4D6BFE]/10 text-[#4D6BFE] ring-[#4D6BFE]/22 hover:bg-[#4D6BFE]/18 dark:bg-[#4D6BFE]/18 dark:text-[#8CA3FF] dark:ring-[#4D6BFE]/32 dark:hover:bg-[#4D6BFE]/26'
+                    }`}
+                  >
+                    <ScanLine className="relative z-10 h-4.5 w-4.5" />
+                    <span aria-hidden="true" className="scan-btn-beam z-20" />
+                    {e2eeLocked && (
+                      <span className="absolute top-1 right-1 z-30 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-[#F8F9FC] animate-pulse-dot dark:ring-[#1B1D23]" />
+                    )}
+                  </button>
+                ) : null}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose()
+                    onOpenSettings?.()
+                  }}
+                  title={bi('设置', 'Settings')}
+                  aria-label={bi('打开设置', 'Open Settings')}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-700 active:scale-95 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                >
+                  <Settings className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </>
+        )}
       </aside>
     </>
   )

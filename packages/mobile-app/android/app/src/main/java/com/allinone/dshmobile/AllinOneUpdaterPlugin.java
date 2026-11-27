@@ -19,14 +19,18 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
+import org.json.JSONObject;
+
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -38,12 +42,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,11 +61,12 @@ import java.util.zip.ZipInputStream;
  * Cryptographically verified, zero-dependency OTA hot-update plugin for All in One Android.
  *
  * Security model (preserves zero-knowledge E2EE):
- *  - Official GitHub Releases downloads require HTTPS on strict GitHub hosts + SHA-256 verification
- *    (plus cryptographic signature verification whenever a signature is provided).
- *  - Any non-GitHub mirror (e.g. a fast self-hosted/China relay mirror) REQUIRES a valid asymmetric
- *    signature verified directly against this APK's own signing certificate public key — a compromised
- *    relay server can NEVER forge or inject unsigned JavaScript into the app.
+ *  - Every OTA bundle MUST pass APK-cert asymmetric signature verification BEFORE downloading
+ *    (with mandatory positive expectedSize) and again against actual downloaded SHA-256 + byte size.
+ *  - Native `fetchManifest` bypasses Android WebView CORS restrictions for GitHub Releases while
+ *    strictly enforcing HTTPS-only, non-private/non-loopback IP checks, host allowlisting,
+ *    manual redirect validation (max 5 hops), and a 256 KB body size cap.
+ *  - All state transitions and bundle directory swaps are synchronized via `stateLock`.
  *  - Atomic extraction with Zip-Slip & Zip-Bomb limits + automatic boot-failure rollback guard.
  */
 @CapacitorPlugin(name = "AllinOneUpdater")
@@ -83,10 +90,12 @@ public class AllinOneUpdaterPlugin extends Plugin {
 
     private static final long MAX_ZIP_BYTES = 50L * 1024L * 1024L;
     private static final long MAX_UNZIPPED_BYTES = 120L * 1024L * 1024L;
+    private static final int MAX_MANIFEST_BYTES = 256 * 1024;
     private static final int MAX_ZIP_ENTRIES = 2500;
-    private static final int MAX_REDIRECTS = 6;
+    private static final int MAX_REDIRECTS = 5;
     private static final int CONNECT_TIMEOUT_MS = 15_000;
     private static final int READ_TIMEOUT_MS = 30_000;
+    private static final int DEFAULT_MANIFEST_TIMEOUT_MS = 15_000;
     private static final int MAX_PENDING_BOOT_ATTEMPTS = 2;
 
     private static final Pattern SAFE_SEMVER_RE =
@@ -109,14 +118,26 @@ public class AllinOneUpdaterPlugin extends Plugin {
             "api.github.com",
             "objects.githubusercontent.com",
             "release-assets.githubusercontent.com",
-            "github-releases.githubusercontent.com"
+            "github-releases.githubusercontent.com",
+            "raw.githubusercontent.com"
         ))
     );
 
+    private static final Set<String> ALLOWED_MANIFEST_REQ_HEADERS = Collections.unmodifiableSet(
+        new HashSet<>(Arrays.asList(
+            "accept",
+            "if-none-match",
+            "cache-control"
+        ))
+    );
+
+    private final Object stateLock = new Object();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService manifestExecutor = Executors.newFixedThreadPool(2);
+    private final AtomicBoolean isDestroyed = new AtomicBoolean(false);
     private final AtomicInteger downloadSeq = new AtomicInteger(0);
-    private final AtomicBoolean downloading = new AtomicBoolean(false);
     private final AtomicReference<HttpURLConnection> activeConnection = new AtomicReference<>(null);
+    private int activeDownloadSeq = 0; // Guarded by stateLock
 
     /**
      * Called from MainActivity.onCreate() BEFORE super.onCreate() so any boot-looping OTA
@@ -199,8 +220,12 @@ public class AllinOneUpdaterPlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
-        cancelActiveDownloadInternal();
+        isDestroyed.set(true);
+        synchronized (stateLock) {
+            cancelActiveDownloadLocked();
+        }
         executor.shutdownNow();
+        manifestExecutor.shutdownNow();
         super.handleOnDestroy();
     }
 
@@ -301,6 +326,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
         try {
             URI uri = URI.create(rawUrl.trim());
             if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
+            if (uri.getUserInfo() != null) return false;
             String host = uri.getHost();
             if (!isTrustedGithubHost(host)) return false;
             if ("github.com".equalsIgnoreCase(host)) {
@@ -318,10 +344,121 @@ public class AllinOneUpdaterPlugin extends Plugin {
         try {
             URI uri = URI.create(rawUrl.trim());
             if (!"https".equalsIgnoreCase(uri.getScheme())) return null;
+            if (uri.getUserInfo() != null) return null;
             String host = uri.getHost();
             return (host != null && !host.isEmpty()) ? host.toLowerCase(Locale.ROOT) : null;
         } catch (Exception ignored) {
             return null;
+        }
+    }
+
+    private static String normalizeAllowedHost(String rawAllowedHost) {
+        if (rawAllowedHost == null) return null;
+        String trimmed = rawAllowedHost.trim();
+        if (trimmed.isEmpty()) return null;
+        try {
+            URI uri;
+            if (trimmed.contains("://")) {
+                uri = URI.create(trimmed);
+                if (!"https".equalsIgnoreCase(uri.getScheme())) return null;
+            } else {
+                uri = URI.create("https://" + trimmed);
+            }
+            if (uri.getUserInfo() != null) return null;
+            String host = uri.getHost();
+            return (host != null && !host.isEmpty()) ? host.toLowerCase(Locale.ROOT) : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isPrivateIpv4Bytes(byte[] b, int offset) {
+        int b0 = b[offset] & 0xFF;
+        int b1 = b[offset + 1] & 0xFF;
+        int b2 = b[offset + 2] & 0xFF;
+        if (b0 == 0 || b0 == 10 || b0 == 127) return true;
+        if (b0 == 100 && (b1 & 0xC0) == 64) return true; // 100.64.0.0/10 CGNAT
+        if (b0 == 169 && b1 == 254) return true; // 169.254.0.0/16 link-local
+        if (b0 == 172 && (b1 & 0xF0) == 16) return true; // 172.16.0.0/12
+        if (b0 == 192 && b1 == 0 && b2 == 0) return true; // 192.0.0.0/24
+        if (b0 == 192 && b1 == 168) return true; // 192.168.0.0/16
+        if (b0 == 198 && (b1 == 18 || b1 == 19)) return true; // 198.18.0.0/15
+        if (b0 >= 224) return true; // multicast & reserved
+        return false;
+    }
+
+    private static boolean isPrivateOrLoopbackAddress(InetAddress addr) {
+        if (addr == null) return true;
+        if (addr.isAnyLocalAddress()
+            || addr.isLoopbackAddress()
+            || addr.isLinkLocalAddress()
+            || addr.isSiteLocalAddress()
+            || addr.isMulticastAddress()) {
+            return true;
+        }
+        byte[] b = addr.getAddress();
+        if (b == null) return true;
+        if (b.length == 4) {
+            return isPrivateIpv4Bytes(b, 0);
+        }
+        if (b.length == 16) {
+            int b0 = b[0] & 0xFF;
+            int b1 = b[1] & 0xFF;
+            // fc00::/7 Unique Local Addresses
+            if ((b0 & 0xFE) == 0xFC) return true;
+            // fe80::/10 link-local & fec0::/10 deprecated site-local
+            if (b0 == 0xFE && ((b1 & 0xC0) == 0x80 || (b1 & 0xC0) == 0xC0)) return true;
+            // ::ffff:0:0/96 IPv4-mapped IPv6
+            boolean ipv4Mapped = true;
+            for (int i = 0; i < 10; i++) {
+                if (b[i] != 0) {
+                    ipv4Mapped = false;
+                    break;
+                }
+            }
+            if (ipv4Mapped && (b[10] & 0xFF) == 0xFF && (b[11] & 0xFF) == 0xFF) {
+                return isPrivateIpv4Bytes(b, 12);
+            }
+            // 64:ff9b::/96 NAT64 well-known prefix
+            boolean nat64 = b[0] == 0 && (b[1] & 0xFF) == 0x64 && (b[2] & 0xFF) == 0xFF && (b[3] & 0xFF) == 0x9B;
+            for (int i = 4; nat64 && i < 12; i++) {
+                if (b[i] != 0) nat64 = false;
+            }
+            if (nat64) {
+                return isPrivateIpv4Bytes(b, 12);
+            }
+        }
+        return false;
+    }
+
+    private static void validateNonPrivateHost(String host) throws SecurityException {
+        if (host == null || host.isEmpty()) {
+            throw new SecurityException("Empty host");
+        }
+        String norm = host.toLowerCase(Locale.ROOT);
+        if (norm.startsWith("[") && norm.endsWith("]")) {
+            norm = norm.substring(1, norm.length() - 1);
+        }
+        if ("localhost".equals(norm)
+            || norm.endsWith(".localhost")
+            || norm.endsWith(".local")
+            || norm.endsWith(".internal")
+            || norm.endsWith(".home.arpa")) {
+            throw new SecurityException("Blocked local/private host: " + host);
+        }
+        InetAddress[] addrs;
+        try {
+            addrs = InetAddress.getAllByName(norm);
+        } catch (Exception err) {
+            throw new SecurityException("Failed to resolve host: " + host);
+        }
+        if (addrs == null || addrs.length == 0) {
+            throw new SecurityException("Failed to resolve host: " + host);
+        }
+        for (InetAddress addr : addrs) {
+            if (isPrivateOrLoopbackAddress(addr)) {
+                throw new SecurityException("Blocked loopback or private network host: " + host);
+            }
         }
     }
 
@@ -380,6 +517,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
         String rawSigAlg
     ) {
         if (signatureBase64 == null || signatureBase64.trim().isEmpty()) return false;
+        if (sizeBytes <= 0L) return false;
         String sigAlg = rawSigAlg == null ? "" : rawSigAlg.trim();
         if (!ALLOWED_SIG_ALGS.contains(sigAlg)) return false;
 
@@ -415,6 +553,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
     }
 
     private void emitProgress(String status, String version, long downloadedBytes, long totalBytes, int percent) {
+        if (isDestroyed.get()) return;
         JSObject data = new JSObject();
         data.put("status", status);
         data.put("version", version);
@@ -424,8 +563,9 @@ public class AllinOneUpdaterPlugin extends Plugin {
         notifyListeners("otaProgress", data);
     }
 
-    private void cancelActiveDownloadInternal() {
+    private void cancelActiveDownloadLocked() {
         downloadSeq.incrementAndGet();
+        activeDownloadSeq = 0;
         HttpURLConnection conn = activeConnection.getAndSet(null);
         if (conn != null) {
             try {
@@ -456,7 +596,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
         HttpURLConnection conn = null;
 
         for (int hops = 0; hops <= MAX_REDIRECTS; hops++) {
-            if (downloadSeq.get() != mySeq) {
+            if (isDestroyed.get() || downloadSeq.get() != mySeq) {
                 throw new InterruptedException("Download cancelled");
             }
             String host = extractHttpsHost(currentUrl);
@@ -485,6 +625,9 @@ public class AllinOneUpdaterPlugin extends Plugin {
                 String location = c.getHeaderField("Location");
                 c.disconnect();
                 activeConnection.compareAndSet(c, null);
+                if (hops >= MAX_REDIRECTS) {
+                    throw new IOException("Too many HTTP redirects");
+                }
                 if (location == null || location.trim().isEmpty()) {
                     throw new IOException("Redirect without Location header");
                 }
@@ -522,7 +665,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
                 byte[] buf = new byte[16384];
                 int n;
                 while ((n = in.read(buf)) != -1) {
-                    if (downloadSeq.get() != mySeq) {
+                    if (isDestroyed.get() || downloadSeq.get() != mySeq) {
                         throw new InterruptedException("Download cancelled");
                     }
                     downloaded += n;
@@ -624,14 +767,187 @@ public class AllinOneUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void fetchManifest(PluginCall call) {
+        final String rawUrl = optTrimString(call, "url");
+        final String rawAllowedHost = optTrimString(call, "allowedHost");
+        final int rawTimeout = call.getInt("timeoutMs", DEFAULT_MANIFEST_TIMEOUT_MS);
+        final int timeoutMs = Math.max(3_000, Math.min(30_000, rawTimeout));
+        final JSObject rawHeaders = call.getObject("headers");
+
+        final String initialHost = extractHttpsHost(rawUrl);
+        if (initialHost == null) {
+            call.reject("Only valid HTTPS manifest URLs are allowed");
+            return;
+        }
+        final String normalizedAllowedHost = normalizeAllowedHost(rawAllowedHost);
+        final boolean initialIsGithub = isTrustedGithubHost(initialHost);
+        final boolean initialMatchesAllowed = normalizedAllowedHost != null && initialHost.equals(normalizedAllowedHost);
+        if (!initialIsGithub && !initialMatchesAllowed) {
+            call.reject("Blocked manifest host: " + initialHost);
+            return;
+        }
+
+        if (isDestroyed.get() || manifestExecutor.isShutdown()) {
+            call.reject("Updater plugin is shutting down");
+            return;
+        }
+
+        final Context ctx = getContext();
+        final String userAgent = "AllInOne-Android/" + readApkVersionName(ctx);
+
+        try {
+            manifestExecutor.execute(() -> {
+                if (isDestroyed.get()) {
+                    call.reject("Updater plugin is shutting down");
+                    return;
+                }
+                String currentUrl = rawUrl;
+                HttpURLConnection conn = null;
+                try {
+                    for (int hops = 0; hops <= MAX_REDIRECTS; hops++) {
+                        if (isDestroyed.get()) {
+                            throw new InterruptedException("Manifest fetch cancelled");
+                        }
+                        String host = extractHttpsHost(currentUrl);
+                        if (host == null) {
+                            throw new SecurityException("Blocked non-HTTPS manifest redirect");
+                        }
+                        boolean hopIsGithub = isTrustedGithubHost(host);
+                        boolean hopMatchesAllowed = normalizedAllowedHost != null && host.equals(normalizedAllowedHost);
+                        if (initialIsGithub) {
+                            if (!hopIsGithub) {
+                                throw new SecurityException("Blocked manifest redirect to untrusted host: " + host);
+                            }
+                        } else if (!hopMatchesAllowed && !hopIsGithub) {
+                            throw new SecurityException("Blocked manifest redirect to untrusted host: " + host);
+                        }
+                        validateNonPrivateHost(host);
+
+                        URL urlObj = new URL(currentUrl);
+                        HttpURLConnection c = (HttpURLConnection) urlObj.openConnection();
+                        c.setInstanceFollowRedirects(false);
+                        c.setConnectTimeout(timeoutMs);
+                        c.setReadTimeout(timeoutMs);
+                        c.setRequestMethod("GET");
+                        c.setRequestProperty("User-Agent", userAgent);
+                        c.setRequestProperty("Accept", "application/json, application/vnd.github+json, */*");
+                        if (hops == 0 && rawHeaders != null) {
+                            Iterator<String> keys = rawHeaders.keys();
+                            while (keys.hasNext()) {
+                                String k = keys.next();
+                                if (k == null) continue;
+                                String lower = k.trim().toLowerCase(Locale.ROOT);
+                                if (!ALLOWED_MANIFEST_REQ_HEADERS.contains(lower)) continue;
+                                String v = rawHeaders.optString(k, "");
+                                if (v != null && !v.contains("\r") && !v.contains("\n")) {
+                                    c.setRequestProperty(k.trim(), v.trim());
+                                }
+                            }
+                        }
+
+                        int code = c.getResponseCode();
+                        if (code == HttpURLConnection.HTTP_MOVED_PERM
+                            || code == HttpURLConnection.HTTP_MOVED_TEMP
+                            || code == HttpURLConnection.HTTP_SEE_OTHER
+                            || code == 307
+                            || code == 308) {
+                            String location = c.getHeaderField("Location");
+                            c.disconnect();
+                            if (hops >= MAX_REDIRECTS) {
+                                throw new IOException("Too many HTTP redirects");
+                            }
+                            if (location == null || location.trim().isEmpty()) {
+                                throw new IOException("Redirect without Location header");
+                            }
+                            currentUrl = URI.create(currentUrl).resolve(location.trim()).toString();
+                            continue;
+                        }
+                        conn = c;
+                        break;
+                    }
+
+                    if (conn == null) {
+                        throw new IOException("Too many HTTP redirects");
+                    }
+
+                    int status = conn.getResponseCode();
+                    String etag = conn.getHeaderField("ETag");
+                    long contentLength = conn.getContentLengthLong();
+                    if (contentLength > MAX_MANIFEST_BYTES) {
+                        throw new IOException("Manifest response exceeds 256 KB limit");
+                    }
+
+                    String body = "";
+                    if (status != HttpURLConnection.HTTP_NOT_MODIFIED) {
+                        InputStream rawStream = (status >= 200 && status < 400)
+                            ? conn.getInputStream()
+                            : conn.getErrorStream();
+                        if (rawStream != null) {
+                            try (InputStream in = new BufferedInputStream(rawStream, 8192)) {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                byte[] buf = new byte[8192];
+                                int n;
+                                int total = 0;
+                                while ((n = in.read(buf)) != -1) {
+                                    if (isDestroyed.get()) {
+                                        throw new InterruptedException("Manifest fetch cancelled");
+                                    }
+                                    total += n;
+                                    if (total > MAX_MANIFEST_BYTES) {
+                                        throw new IOException("Manifest response exceeds 256 KB limit");
+                                    }
+                                    baos.write(buf, 0, n);
+                                }
+                                body = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+                            }
+                        }
+                    }
+
+                    JSObject ret = new JSObject();
+                    ret.put("status", status);
+                    ret.put("body", body);
+                    if (etag != null && !etag.isEmpty()) {
+                        ret.put("etag", etag);
+                    }
+                    String trimmedBody = body.trim();
+                    if (trimmedBody.startsWith("{")) {
+                        try {
+                            ret.put("json", new JSObject(trimmedBody));
+                        } catch (Exception ignored) {
+                            ret.put("json", JSONObject.NULL);
+                        }
+                    } else {
+                        ret.put("json", JSONObject.NULL);
+                    }
+                    call.resolve(ret);
+                } catch (Exception err) {
+                    call.reject(err.getMessage() != null ? err.getMessage() : "Manifest fetch failed");
+                } finally {
+                    if (conn != null) {
+                        try {
+                            conn.disconnect();
+                        } catch (Exception ignored) {}
+                    }
+                }
+            });
+        } catch (RejectedExecutionException err) {
+            call.reject("Updater plugin is shutting down");
+        }
+    }
+
+    @PluginMethod
     public void getAppInfo(PluginCall call) {
         Context ctx = getContext();
-        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-        String stagedVer = otaPrefs.getString(KEY_STAGED_VERSION, "");
-        String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
-        if (stagedPath == null || stagedPath.isEmpty() || !isValidBundleDir(new File(stagedPath))) {
-            stagedVer = "";
-            stagedPath = "";
+        String stagedVer;
+        String activeBundleVersion;
+        synchronized (stateLock) {
+            SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+            stagedVer = otaPrefs.getString(KEY_STAGED_VERSION, "");
+            String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+            if (stagedPath == null || stagedPath.isEmpty() || !isValidBundleDir(new File(stagedPath))) {
+                stagedVer = "";
+            }
+            activeBundleVersion = otaPrefs.getString(KEY_ACTIVE_VERSION, "");
         }
 
         String activeServerPath = bridge != null ? bridge.getServerBasePath() : "";
@@ -645,7 +961,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
         ret.put("supportsOta", true);
         ret.put("nativeVersion", readApkVersionName(ctx));
         ret.put("nativeVersionCode", readApkVersionCode(ctx));
-        ret.put("activeBundleVersion", otaPrefs.getString(KEY_ACTIVE_VERSION, ""));
+        ret.put("activeBundleVersion", activeBundleVersion);
         ret.put("activeServerPath", activeServerPath);
         ret.put("isOtaActive", isOtaActive);
         ret.put("stagedVersion", stagedVer);
@@ -664,7 +980,7 @@ public class AllinOneUpdaterPlugin extends Plugin {
         final String primaryUrl = optTrimString(call, "url");
         final String fallbackUrl = optTrimString(call, "fallbackUrl");
         final String expectedSha256 = optTrimString(call, "expectedSha256").toLowerCase(Locale.ROOT);
-        final long expectedSize = Math.max(0L, call.getData() != null ? call.getData().optLong("expectedSize", 0L) : 0L);
+        final long expectedSize = call.getData() != null ? call.getData().optLong("expectedSize", 0L) : 0L;
         final String signature = optTrimString(call, "signature");
         final String sigAlg = optTrimString(call, "sigAlg");
 
@@ -686,17 +1002,6 @@ public class AllinOneUpdaterPlugin extends Plugin {
             call.reject("Update requires native APK >= " + minNativeVersion + " (installed: " + apkVersionName + ")");
             return;
         }
-        SharedPreferences curPrefs = checkCtx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-        String activeVer = curPrefs.getString(KEY_ACTIVE_VERSION, "");
-        String baselineVer = apkVersionName;
-        if (activeVer != null && SAFE_SEMVER_RE.matcher(activeVer).matches()
-            && (!SAFE_SEMVER_RE.matcher(baselineVer).matches() || compareSemver(activeVer, baselineVer) > 0)) {
-            baselineVer = activeVer;
-        }
-        if (SAFE_SEMVER_RE.matcher(baselineVer).matches() && compareSemver(version, baselineVer) <= 0) {
-            call.reject("Blocked OTA downgrade or replay (" + version + " <= " + baselineVer + ")");
-            return;
-        }
 
         final String primaryHost = extractHttpsHost(primaryUrl);
         if (primaryHost == null) {
@@ -710,157 +1015,206 @@ public class AllinOneUpdaterPlugin extends Plugin {
         }
         final boolean hasSignature = !signature.isEmpty() && !sigAlg.isEmpty();
 
-        // Unconditionally require APK-cert asymmetric signature verification for ALL OTA sources
+        // Unconditionally require positive expectedSize & APK-cert asymmetric signature verification BEFORE downloading
         if (!hasSignature) {
             call.reject("OTA update bundle requires a cryptographic APK-cert signature");
             return;
         }
-        if (expectedSize > 0L) {
-            if (!verifyBundleSignature(version, minNativeVersion, expectedSha256, expectedSize, signature, sigAlg)) {
-                call.reject("Release signature verification failed against APK signing certificate");
-                return;
-            }
+        if (expectedSize <= 0L || expectedSize > MAX_ZIP_BYTES) {
+            call.reject("Missing or invalid expectedSize for signed OTA bundle");
+            return;
         }
-
-        if (!downloading.compareAndSet(false, true)) {
-            call.reject("Another update download is already in progress");
+        if (!verifyBundleSignature(version, minNativeVersion, expectedSha256, expectedSize, signature, sigAlg)) {
+            call.reject("Release signature verification failed against APK signing certificate");
             return;
         }
 
-        final int mySeq = downloadSeq.incrementAndGet();
+        final int mySeq;
+        synchronized (stateLock) {
+            if (isDestroyed.get() || executor.isShutdown()) {
+                call.reject("Updater plugin is shutting down");
+                return;
+            }
+            SharedPreferences curPrefs = checkCtx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+            String activeVer = curPrefs.getString(KEY_ACTIVE_VERSION, "");
+            String baselineVer = apkVersionName;
+            if (activeVer != null && SAFE_SEMVER_RE.matcher(activeVer).matches()
+                && (!SAFE_SEMVER_RE.matcher(baselineVer).matches() || compareSemver(activeVer, baselineVer) > 0)) {
+                baselineVer = activeVer;
+            }
+            if (SAFE_SEMVER_RE.matcher(baselineVer).matches() && compareSemver(version, baselineVer) <= 0) {
+                call.reject("Blocked OTA downgrade or replay (" + version + " <= " + baselineVer + ")");
+                return;
+            }
+            if (activeDownloadSeq != 0) {
+                call.reject("Another update download is already in progress");
+                return;
+            }
+            mySeq = downloadSeq.incrementAndGet();
+            activeDownloadSeq = mySeq;
+        }
+
         final Context ctx = getContext();
 
-        executor.execute(() -> {
-            File tmpDir = new File(ctx.getFilesDir(), TMP_DIR_NAME);
-            File bundlesDir = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
-            File partFile = new File(tmpDir, "bundle-" + mySeq + "-" + UUID.randomUUID() + ".part");
-            File stageDir = new File(bundlesDir, ".stage-" + version + "-" + UUID.randomUUID());
+        try {
+            executor.execute(() -> {
+                File tmpDir = new File(ctx.getFilesDir(), TMP_DIR_NAME);
+                File bundlesDir = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
+                File partFile = new File(tmpDir, "bundle-" + mySeq + "-" + UUID.randomUUID() + ".part");
+                File stageDir = new File(bundlesDir, ".stage-" + version + "-" + UUID.randomUUID());
 
-            try {
-                if (!tmpDir.exists() && !tmpDir.mkdirs()) {
-                    throw new IOException("Failed to create temp directory");
-                }
-                if (!bundlesDir.exists() && !bundlesDir.mkdirs()) {
-                    throw new IOException("Failed to create bundles directory");
-                }
-
-                // Reuse already-staged bundle for the exact same version if intact
-                File finalDir = new File(bundlesDir, version);
-                SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-                String existingStagedVer = otaPrefs.getString(KEY_STAGED_VERSION, "");
-                String existingStagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
-                if (version.equals(existingStagedVer)
-                    && finalDir.getAbsolutePath().equals(existingStagedPath)
-                    && isValidBundleDir(finalDir)) {
-                    JSObject cached = new JSObject();
-                    cached.put("status", "downloaded");
-                    cached.put("version", version);
-                    cached.put("path", finalDir.getAbsolutePath());
-                    call.resolve(cached);
-                    return;
-                }
-
-                emitProgress("downloading", version, 0L, Math.max(0L, expectedSize), 0);
-
-                DownloadResult res;
                 try {
-                    res = streamDownloadToFile(
-                        primaryUrl,
-                        primaryIsGithub,
-                        partFile,
-                        version,
-                        expectedSize,
-                        mySeq
-                    );
-                } catch (InterruptedException cancelErr) {
-                    throw cancelErr;
-                } catch (Exception primaryErr) {
-                    String fbHost = extractHttpsHost(fallbackUrl);
-                    if (fbHost == null || downloadSeq.get() != mySeq) {
-                        throw primaryErr;
+                    if (isDestroyed.get() || downloadSeq.get() != mySeq) {
+                        throw new InterruptedException("Download cancelled");
                     }
-                    boolean fbIsGithub = isTrustedGithubHost(fbHost);
-                    if (fbIsGithub && !isAllowedGithubUrl(fallbackUrl)) {
-                        throw primaryErr;
+                    if (!tmpDir.exists() && !tmpDir.mkdirs()) {
+                        throw new IOException("Failed to create temp directory");
                     }
-                    // Clean partial file before fallback attempt
+                    if (!bundlesDir.exists() && !bundlesDir.mkdirs()) {
+                        throw new IOException("Failed to create bundles directory");
+                    }
+
+                    // Reuse already-staged bundle for the exact same version if intact
+                    File finalDir = new File(bundlesDir, version);
+                    synchronized (stateLock) {
+                        if (isDestroyed.get() || downloadSeq.get() != mySeq || activeDownloadSeq != mySeq) {
+                            throw new InterruptedException("Download cancelled");
+                        }
+                        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+                        String existingStagedVer = otaPrefs.getString(KEY_STAGED_VERSION, "");
+                        String existingStagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+                        if (version.equals(existingStagedVer)
+                            && finalDir.getAbsolutePath().equals(existingStagedPath)
+                            && isValidBundleDir(finalDir)) {
+                            JSObject cached = new JSObject();
+                            cached.put("status", "downloaded");
+                            cached.put("version", version);
+                            cached.put("path", finalDir.getAbsolutePath());
+                            call.resolve(cached);
+                            return;
+                        }
+                    }
+
+                    emitProgress("downloading", version, 0L, expectedSize, 0);
+
+                    DownloadResult res;
+                    try {
+                        res = streamDownloadToFile(
+                            primaryUrl,
+                            primaryIsGithub,
+                            partFile,
+                            version,
+                            expectedSize,
+                            mySeq
+                        );
+                    } catch (InterruptedException cancelErr) {
+                        throw cancelErr;
+                    } catch (Exception primaryErr) {
+                        String fbHost = extractHttpsHost(fallbackUrl);
+                        if (fbHost == null || isDestroyed.get() || downloadSeq.get() != mySeq) {
+                            throw primaryErr;
+                        }
+                        boolean fbIsGithub = isTrustedGithubHost(fbHost);
+                        if (fbIsGithub && !isAllowedGithubUrl(fallbackUrl)) {
+                            throw primaryErr;
+                        }
+                        // Clean partial file before fallback attempt
+                        deleteRecursively(partFile);
+                        res = streamDownloadToFile(
+                            fallbackUrl,
+                            fbIsGithub,
+                            partFile,
+                            version,
+                            expectedSize,
+                            mySeq
+                        );
+                    }
+
+                    if (isDestroyed.get() || downloadSeq.get() != mySeq) {
+                        throw new InterruptedException("Download cancelled");
+                    }
+
+                    if (!res.sha256.equalsIgnoreCase(expectedSha256)) {
+                        throw new SecurityException("SHA-256 verification failed");
+                    }
+
+                    // Re-verify signature against actual downloaded digest and byte count
+                    if (!verifyBundleSignature(version, minNativeVersion, res.sha256, res.bytes, signature, sigAlg)) {
+                        throw new SecurityException("Release signature verification failed");
+                    }
+
+                    extractZipSafely(partFile, stageDir);
+
+                    final File targetDir;
+                    synchronized (stateLock) {
+                        if (isDestroyed.get() || downloadSeq.get() != mySeq || activeDownloadSeq != mySeq) {
+                            throw new InterruptedException("Download cancelled");
+                        }
+                        // Never overwrite the currently mounted directory in-place; if same version, stage under unique suffix
+                        String currentServerPath = bridge != null ? bridge.getServerBasePath() : "";
+                        File chosenDir = finalDir;
+                        if (finalDir.getAbsolutePath().equals(currentServerPath)) {
+                            chosenDir = new File(bundlesDir, version + "-" + System.currentTimeMillis());
+                        } else if (finalDir.exists()) {
+                            deleteRecursively(finalDir);
+                        }
+                        if (!bundlesDir.exists() && !bundlesDir.mkdirs()) {
+                            throw new IOException("Failed to create bundles directory");
+                        }
+                        if (!stageDir.renameTo(chosenDir)) {
+                            throw new IOException("Failed to finalize update bundle directory");
+                        }
+                        targetDir = chosenDir;
+
+                        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+                        otaPrefs.edit()
+                            .putString(KEY_STAGED_VERSION, version)
+                            .putString(KEY_STAGED_PATH, targetDir.getAbsolutePath())
+                            .commit();
+                    }
+
+                    emitProgress("downloaded", version, res.bytes, res.bytes, 100);
+
+                    JSObject ret = new JSObject();
+                    ret.put("status", "downloaded");
+                    ret.put("version", version);
+                    ret.put("path", targetDir.getAbsolutePath());
+                    ret.put("size", res.bytes);
+                    call.resolve(ret);
+                } catch (InterruptedException cancelled) {
+                    JSObject ret = new JSObject();
+                    ret.put("status", "cancelled");
+                    ret.put("version", version);
+                    call.resolve(ret);
+                } catch (Exception err) {
+                    call.reject(err.getMessage() != null ? err.getMessage() : "Update download failed");
+                } finally {
                     deleteRecursively(partFile);
-                    res = streamDownloadToFile(
-                        fallbackUrl,
-                        fbIsGithub,
-                        partFile,
-                        version,
-                        expectedSize,
-                        mySeq
-                    );
+                    if (stageDir.exists()) {
+                        deleteRecursively(stageDir);
+                    }
+                    synchronized (stateLock) {
+                        if (activeDownloadSeq == mySeq) {
+                            activeDownloadSeq = 0;
+                        }
+                    }
                 }
-
-                if (downloadSeq.get() != mySeq) {
-                    throw new InterruptedException("Download cancelled");
+            });
+        } catch (RejectedExecutionException err) {
+            synchronized (stateLock) {
+                if (activeDownloadSeq == mySeq) {
+                    activeDownloadSeq = 0;
                 }
-
-                if (!res.sha256.equalsIgnoreCase(expectedSha256)) {
-                    throw new SecurityException("SHA-256 verification failed");
-                }
-
-                // Unconditional cryptographic signature verification against the APK's own signing cert
-                long sigSize = expectedSize > 0L ? expectedSize : res.bytes;
-                if (!verifyBundleSignature(version, minNativeVersion, res.sha256, sigSize, signature, sigAlg)) {
-                    throw new SecurityException("Release signature verification failed");
-                }
-
-                extractZipSafely(partFile, stageDir);
-
-                if (downloadSeq.get() != mySeq) {
-                    throw new InterruptedException("Download cancelled");
-                }
-
-                // Never overwrite the currently mounted directory in-place; if same version, stage under unique suffix
-                String currentServerPath = bridge != null ? bridge.getServerBasePath() : "";
-                File targetDir = finalDir;
-                if (finalDir.getAbsolutePath().equals(currentServerPath)) {
-                    targetDir = new File(bundlesDir, version + "-" + System.currentTimeMillis());
-                } else if (finalDir.exists()) {
-                    deleteRecursively(finalDir);
-                }
-
-                if (!stageDir.renameTo(targetDir)) {
-                    throw new IOException("Failed to finalize update bundle directory");
-                }
-
-                otaPrefs.edit()
-                    .putString(KEY_STAGED_VERSION, version)
-                    .putString(KEY_STAGED_PATH, targetDir.getAbsolutePath())
-                    .commit();
-
-                emitProgress("downloaded", version, res.bytes, res.bytes, 100);
-
-                JSObject ret = new JSObject();
-                ret.put("status", "downloaded");
-                ret.put("version", version);
-                ret.put("path", targetDir.getAbsolutePath());
-                ret.put("size", res.bytes);
-                call.resolve(ret);
-            } catch (InterruptedException cancelled) {
-                JSObject ret = new JSObject();
-                ret.put("status", "cancelled");
-                ret.put("version", version);
-                call.resolve(ret);
-            } catch (Exception err) {
-                call.reject(err.getMessage() != null ? err.getMessage() : "Update download failed");
-            } finally {
-                deleteRecursively(partFile);
-                if (stageDir.exists()) {
-                    deleteRecursively(stageDir);
-                }
-                downloading.set(false);
             }
-        });
+            call.reject("Updater plugin is shutting down");
+        }
     }
 
     @PluginMethod
     public void cancelDownload(PluginCall call) {
-        cancelActiveDownloadInternal();
+        synchronized (stateLock) {
+            cancelActiveDownloadLocked();
+        }
         JSObject ret = new JSObject();
         ret.put("ok", true);
         call.resolve(ret);
@@ -869,62 +1223,68 @@ public class AllinOneUpdaterPlugin extends Plugin {
     @PluginMethod
     public void applyUpdate(PluginCall call) {
         Context ctx = getContext();
-        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-        SharedPreferences capPrefs = ctx.getSharedPreferences(
-            com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
-            Activity.MODE_PRIVATE
-        );
-
         String requestedVersion = optTrimString(call, "version").replaceFirst("^[vV]", "");
-        String stagedVersion = otaPrefs.getString(KEY_STAGED_VERSION, "");
-        String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+        final String stagedVersion;
+        final String nextBasePath;
 
-        if (stagedPath == null || stagedPath.isEmpty()) {
-            call.reject("No downloaded update bundle is ready");
-            return;
+        synchronized (stateLock) {
+            SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+            SharedPreferences capPrefs = ctx.getSharedPreferences(
+                com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
+                Activity.MODE_PRIVATE
+            );
+
+            stagedVersion = otaPrefs.getString(KEY_STAGED_VERSION, "");
+            String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+
+            if (stagedPath == null || stagedPath.isEmpty()) {
+                call.reject("No downloaded update bundle is ready");
+                return;
+            }
+            if (!requestedVersion.isEmpty() && !requestedVersion.equals(stagedVersion)) {
+                call.reject("Requested update version is not staged");
+                return;
+            }
+
+            File targetDir = new File(stagedPath);
+            File bundlesRoot = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
+            if (!isDirectChildOf(targetDir, bundlesRoot) || !isValidBundleDir(targetDir)) {
+                call.reject("Staged update bundle is missing or corrupted");
+                return;
+            }
+
+            String prevPath = capPrefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, "");
+            String prevVersion = otaPrefs.getString(KEY_ACTIVE_VERSION, "");
+            if (prevPath == null) prevPath = "";
+            if (prevPath.equals(targetDir.getAbsolutePath())) {
+                prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
+                prevVersion = otaPrefs.getString(KEY_PREVIOUS_VERSION, "");
+            }
+
+            otaPrefs.edit()
+                .putLong(KEY_APK_VERSION_CODE, readApkVersionCode(ctx))
+                .putString(KEY_PREVIOUS_PATH, prevPath != null ? prevPath : "")
+                .putString(KEY_PREVIOUS_VERSION, prevVersion != null ? prevVersion : "")
+                .putString(KEY_ACTIVE_VERSION, stagedVersion)
+                .putString(KEY_ACTIVE_PATH, targetDir.getAbsolutePath())
+                .putString(KEY_PENDING_VERSION, stagedVersion)
+                .putString(KEY_PENDING_PATH, targetDir.getAbsolutePath())
+                .putInt(KEY_PENDING_ATTEMPTS, 1)
+                .commit();
+
+            capPrefs.edit()
+                .putString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, targetDir.getAbsolutePath())
+                .commit();
+
+            nextBasePath = targetDir.getAbsolutePath();
         }
-        if (!requestedVersion.isEmpty() && !requestedVersion.equals(stagedVersion)) {
-            call.reject("Requested update version is not staged");
-            return;
-        }
-
-        File targetDir = new File(stagedPath);
-        File bundlesRoot = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
-        if (!isDirectChildOf(targetDir, bundlesRoot) || !isValidBundleDir(targetDir)) {
-            call.reject("Staged update bundle is missing or corrupted");
-            return;
-        }
-
-        String prevPath = capPrefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, "");
-        String prevVersion = otaPrefs.getString(KEY_ACTIVE_VERSION, "");
-        if (prevPath == null) prevPath = "";
-        if (prevPath.equals(targetDir.getAbsolutePath())) {
-            prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
-            prevVersion = otaPrefs.getString(KEY_PREVIOUS_VERSION, "");
-        }
-
-        otaPrefs.edit()
-            .putLong(KEY_APK_VERSION_CODE, readApkVersionCode(ctx))
-            .putString(KEY_PREVIOUS_PATH, prevPath != null ? prevPath : "")
-            .putString(KEY_PREVIOUS_VERSION, prevVersion != null ? prevVersion : "")
-            .putString(KEY_ACTIVE_VERSION, stagedVersion)
-            .putString(KEY_ACTIVE_PATH, targetDir.getAbsolutePath())
-            .putString(KEY_PENDING_VERSION, stagedVersion)
-            .putString(KEY_PENDING_PATH, targetDir.getAbsolutePath())
-            .putInt(KEY_PENDING_ATTEMPTS, 1)
-            .commit();
-
-        capPrefs.edit()
-            .putString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, targetDir.getAbsolutePath())
-            .commit();
 
         JSObject ret = new JSObject();
         ret.put("ok", true);
         ret.put("version", stagedVersion);
-        ret.put("path", targetDir.getAbsolutePath());
+        ret.put("path", nextBasePath);
         call.resolve(ret);
 
-        final String nextBasePath = targetDir.getAbsolutePath();
         Activity activity = getActivity();
         if (activity != null && bridge != null) {
             activity.runOnUiThread(() -> {
@@ -942,58 +1302,94 @@ public class AllinOneUpdaterPlugin extends Plugin {
     @PluginMethod
     public void confirmBoot(PluginCall call) {
         Context ctx = getContext();
-        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-        SharedPreferences capPrefs = ctx.getSharedPreferences(
-            com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
-            Activity.MODE_PRIVATE
-        );
+        String requestedVersion = optTrimString(call, "version").replaceFirst("^[vV]", "");
 
-        String activePath = capPrefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, "");
-        String prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
-        String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+        synchronized (stateLock) {
+            SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+            SharedPreferences capPrefs = ctx.getSharedPreferences(
+                com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
+                Activity.MODE_PRIVATE
+            );
 
-        SharedPreferences.Editor ed = otaPrefs.edit();
-        ed.remove(KEY_PENDING_VERSION);
-        ed.remove(KEY_PENDING_PATH);
-        ed.remove(KEY_PENDING_ATTEMPTS);
-        if (activePath != null && !activePath.isEmpty() && activePath.equals(stagedPath)) {
-            ed.remove(KEY_STAGED_VERSION);
-            ed.remove(KEY_STAGED_PATH);
-        }
-        ed.apply();
+            String activePath = capPrefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, "");
+            String prevPath = otaPrefs.getString(KEY_PREVIOUS_PATH, "");
+            String stagedPath = otaPrefs.getString(KEY_STAGED_PATH, "");
+            String pendingVersion = otaPrefs.getString(KEY_PENDING_VERSION, "");
+            String activeOtaVersion = otaPrefs.getString(KEY_ACTIVE_VERSION, "");
+            String nativeVersion = readApkVersionName(ctx).replaceFirst("^[vV]", "");
 
-        // Prune stale bundle directories while keeping active + immediate previous + currently staged
-        File bundlesRoot = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
-        File[] children = bundlesRoot.listFiles();
-        if (children != null) {
-            for (File child : children) {
-                String p = child.getAbsolutePath();
-                if (p.equals(activePath) || p.equals(prevPath) || p.equals(stagedPath)) {
-                    continue;
-                }
-                if (child.getName().startsWith(".stage-")) {
-                    continue;
-                }
-                deleteRecursively(child);
+            String activeServerPath = bridge != null ? bridge.getServerBasePath() : activePath;
+            File bundlesRoot = new File(ctx.getFilesDir(), BUNDLES_DIR_NAME);
+            boolean isOtaActive = activeServerPath != null && !activeServerPath.isEmpty()
+                && isDirectChildOf(new File(activeServerPath), bundlesRoot);
+
+            String bootedVersion;
+            if (pendingVersion != null && !pendingVersion.isEmpty()) {
+                bootedVersion = pendingVersion;
+            } else if (isOtaActive && activeOtaVersion != null && !activeOtaVersion.isEmpty()) {
+                bootedVersion = activeOtaVersion;
+            } else {
+                bootedVersion = nativeVersion;
             }
-        }
 
-        JSObject ret = new JSObject();
-        ret.put("ok", true);
-        call.resolve(ret);
+            if (!requestedVersion.isEmpty() && !bootedVersion.isEmpty() && !requestedVersion.equals(bootedVersion)) {
+                JSObject mismatch = new JSObject();
+                mismatch.put("ok", true);
+                mismatch.put("confirmed", false);
+                mismatch.put("reason", "version_mismatch");
+                mismatch.put("activeVersion", bootedVersion);
+                call.resolve(mismatch);
+                return;
+            }
+
+            SharedPreferences.Editor ed = otaPrefs.edit();
+            ed.remove(KEY_PENDING_VERSION);
+            ed.remove(KEY_PENDING_PATH);
+            ed.remove(KEY_PENDING_ATTEMPTS);
+            if (activePath != null && !activePath.isEmpty() && activePath.equals(stagedPath)) {
+                ed.remove(KEY_STAGED_VERSION);
+                ed.remove(KEY_STAGED_PATH);
+            }
+            ed.commit();
+
+            // Prune stale bundle directories while keeping active + immediate previous + currently staged
+            File[] children = bundlesRoot.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    String p = child.getAbsolutePath();
+                    if (p.equals(activePath) || p.equals(prevPath) || p.equals(stagedPath)) {
+                        continue;
+                    }
+                    if (child.getName().startsWith(".stage-")) {
+                        continue;
+                    }
+                    deleteRecursively(child);
+                }
+            }
+
+            JSObject ret = new JSObject();
+            ret.put("ok", true);
+            ret.put("confirmed", true);
+            ret.put("activeVersion", bootedVersion);
+            call.resolve(ret);
+        }
     }
 
     @PluginMethod
     public void resetToBundled(PluginCall call) {
         Context ctx = getContext();
-        SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
-        SharedPreferences capPrefs = ctx.getSharedPreferences(
-            com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
-            Activity.MODE_PRIVATE
-        );
-        otaPrefs.edit().clear().putLong(KEY_APK_VERSION_CODE, readApkVersionCode(ctx)).commit();
-        capPrefs.edit().remove(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH).commit();
-        deleteRecursively(new File(ctx.getFilesDir(), BUNDLES_DIR_NAME));
+        synchronized (stateLock) {
+            cancelActiveDownloadLocked();
+            SharedPreferences otaPrefs = ctx.getSharedPreferences(OTA_PREFS, Activity.MODE_PRIVATE);
+            SharedPreferences capPrefs = ctx.getSharedPreferences(
+                com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME,
+                Activity.MODE_PRIVATE
+            );
+            otaPrefs.edit().clear().putLong(KEY_APK_VERSION_CODE, readApkVersionCode(ctx)).commit();
+            capPrefs.edit().remove(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH).commit();
+            deleteRecursively(new File(ctx.getFilesDir(), BUNDLES_DIR_NAME));
+            deleteRecursively(new File(ctx.getFilesDir(), TMP_DIR_NAME));
+        }
 
         JSObject ret = new JSObject();
         ret.put("ok", true);

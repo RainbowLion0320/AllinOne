@@ -27,7 +27,7 @@ function makeCacheKey(rawPath, context = {}) {
 function storeCachedDeliverable(cacheKey, entry) {
   const entrySize = Number(entry?.size || entry?.blob?.size || 0)
   if (entrySize > MAX_SINGLE_CACHED_FILE_BYTES) {
-    return
+    return false
   }
   const prev = deliverableCache.get(cacheKey)
   if (prev) {
@@ -51,6 +51,16 @@ function storeCachedDeliverable(cacheKey, entry) {
       }
     }
   }
+  return true
+}
+
+export function scheduleEphemeralDeliverableRevoke(entry, delayMs = 60_000) {
+  if (!entry?.ephemeralUrl || !entry?.url || entry._revokeScheduled) return
+  entry._revokeScheduled = true
+  const targetUrl = entry.url
+  setTimeout(() => {
+    try { URL.revokeObjectURL(targetUrl) } catch {}
+  }, delayMs)
 }
 
 export function clearE2eeDeliverableCache() {
@@ -135,8 +145,12 @@ export async function fetchE2eeDeliverableFile(rawPath, context = {}, { forceRef
       size: Number(size || 0),
       path: String(result.path || target),
       ts: Date.now(),
+      ephemeralUrl: false,
     }
-    storeCachedDeliverable(cacheKey, entry)
+    const cached = storeCachedDeliverable(cacheKey, entry)
+    if (!cached) {
+      entry.ephemeralUrl = true
+    }
     return entry
   })()
 
@@ -362,12 +376,18 @@ export async function triggerDeliverableDownload(entry) {
       mimeType: entry.mimeType || entry.blob.type || 'application/octet-stream',
       mode: 'save',
     })
-    if (saved) return true
+    if (saved) {
+      scheduleEphemeralDeliverableRevoke(entry, 5_000)
+      return true
+    }
   }
 
   if (isCapacitorAndroid() && canNativeShareFiles()) {
     const shared = await shareDeliverableFile(entry)
-    if (shared) return true
+    if (shared) {
+      scheduleEphemeralDeliverableRevoke(entry, 5_000)
+      return true
+    }
   }
 
   const a = document.createElement('a')
@@ -382,6 +402,8 @@ export async function triggerDeliverableDownload(entry) {
     setTimeout(() => {
       try { a.remove() } catch {}
     }, 100)
+    // Revoke uncached (>12 MB) temporary download Blob URLs after browser download starts
+    scheduleEphemeralDeliverableRevoke(entry, 60_000)
   }
   return true
 }

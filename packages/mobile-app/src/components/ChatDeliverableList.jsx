@@ -25,6 +25,7 @@ import {
   triggerDeliverableDownload,
 } from '../lib/e2eeFiles.js'
 import { formatBytesCompact } from '../lib/sessionCache.js'
+import { useImageActions } from '../state/ImageContext.jsx'
 
 const TONE_STYLES = {
   amber: {
@@ -80,8 +81,9 @@ function DeliverableIcon({ kind }) {
   }
 }
 
-function DeliverableCard({ file, imageContext }) {
+function DeliverableCard({ file }) {
   const { bi } = useI18n()
+  const imageContext = useImageActions()
   const cached = getCachedDeliverableFile(file.path, imageContext)
   const [busyAction, setBusyAction] = useState('') // '' | 'download' | 'preview' | 'share' | 'open'
   const [doneAction, setDoneAction] = useState('')
@@ -297,12 +299,12 @@ function DeliverableCard({ file, imageContext }) {
  * Renders lightweight on-demand E2EE deliverable file cards below assistant messages.
  * Zero automatic file transfer on render — bytes are only fetched when the user taps Download/Preview.
  */
-export const ChatDeliverableList = React.memo(function ChatDeliverableList({ files = [], imageContext }) {
+export const ChatDeliverableList = React.memo(function ChatDeliverableList({ files = [] }) {
   if (!Array.isArray(files) || files.length === 0) return null
   return (
     <div className="mt-2.5 space-y-2">
       {files.map((file) => (
-        <DeliverableCard key={file.key} file={file} imageContext={imageContext} />
+        <DeliverableCard key={file.key} file={file} />
       ))}
     </div>
   )

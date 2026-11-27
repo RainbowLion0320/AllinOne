@@ -1,4 +1,16 @@
-import { openSync, readSync, closeSync, statSync, watch, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
+import {
+  openSync,
+  readSync,
+  closeSync,
+  fstatSync,
+  statSync,
+  watch,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  mkdirSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { DEFAULT_TURN_QUOTA_MB } from '@allinone/shared'
@@ -121,6 +133,7 @@ export function createTurnLogMeter({
   let stopped = false
   let lastError = ''
   let lastCursorSavedAt = 0
+  let cursorWriteSeq = 0
 
   function loadPersistedCursor() {
     if (!cleanCursorPath) return null
@@ -138,16 +151,18 @@ export function createTurnLogMeter({
     const now = Date.now()
     if (!force && now - lastCursorSavedAt < 5_000) return
     lastCursorSavedAt = now
+    const tmp = `${cleanCursorPath}.tmp.${process.pid}.${++cursorWriteSeq}`
     try {
       mkdirSync(dirname(cleanCursorPath), { recursive: true })
-      const tmp = `${cleanCursorPath}.tmp.${process.pid}`
       writeFileSync(
         tmp,
         JSON.stringify({ logPath: cleanPath, ino: currentIno.toString(), offset, updatedAt: now }),
         { mode: 0o600 },
       )
       renameSync(tmp, cleanCursorPath)
-    } catch {}
+    } catch {
+      try { unlinkSync(tmp) } catch {}
+    }
   }
 
   function clearCatchupTimer() {
@@ -168,7 +183,11 @@ export function createTurnLogMeter({
     closeWatcher()
     if (!started || stopped || !cleanPath) return
     try {
-      watcher = watch(cleanPath, () => {
+      watcher = watch(cleanPath, (eventType) => {
+        if (eventType === 'rename') {
+          // On logrotate rename/create, release the old inode watcher so pollOnce re-stats and re-attaches cleanly
+          closeWatcher()
+        }
         pollOnce()
       })
       watcher.on('error', () => {
@@ -228,15 +247,17 @@ export function createTurnLogMeter({
     let fd = null
     let hasMoreBacklog = false
     let progressed = false
+    let rotatedOrReset = false
     try {
       const st = statSync(cleanPath, { bigint: true })
-      const size = Number(st.size)
+      let size = Number(st.size)
       if (currentIno === null) {
         currentIno = st.ino
         offset = !hadInitialStat || startFromBeginning ? 0 : size
         remainder = ''
         utf8Decoder = new StringDecoder('utf8')
         hadInitialStat = true
+        rotatedOrReset = true
         if (started && !watcher) attachWatcher()
       } else if (st.ino !== currentIno) {
         // Flush any buffered UTF-8 remainder before resetting for rotated inode
@@ -246,35 +267,57 @@ export function createTurnLogMeter({
         offset = 0
         remainder = ''
         utf8Decoder = new StringDecoder('utf8')
+        rotatedOrReset = true
         if (started) attachWatcher()
       } else if (size < offset) {
         // Log truncated in place (`copytruncate`) — reset cleanly to start of file
         offset = 0
         remainder = ''
         utf8Decoder = new StringDecoder('utf8')
+        rotatedOrReset = true
         if (started && !watcher) attachWatcher()
       } else if (started && !watcher) {
         attachWatcher()
       }
       lastError = ''
-      if (size <= offset) return
-
-      fd = openSync(cleanPath, 'r')
-      const MAX_BATCH = 256 * 1024
-      let tickBytes = 0
-      while (offset < size && tickBytes < MAX_BYTES_PER_TICK) {
-        const toRead = Math.min(MAX_BATCH, size - offset, MAX_BYTES_PER_TICK - tickBytes)
-        const buf = Buffer.allocUnsafe(toRead)
-        const bytesRead = readSync(fd, buf, 0, toRead, offset)
-        if (bytesRead <= 0) break
-        offset += bytesRead
-        tickBytes += bytesRead
-        progressed = true
-        processChunkText(utf8Decoder.write(buf.subarray(0, bytesRead)))
+      if (size > offset) {
+        fd = openSync(cleanPath, 'r')
+        // Re-stat the opened descriptor to catch any logrotate inode swap between statSync and openSync
+        const fdSt = fstatSync(fd, { bigint: true })
+        size = Number(fdSt.size)
+        if (fdSt.ino !== currentIno) {
+          const tail = utf8Decoder.end()
+          if (tail) processChunkText(`${tail}\n`)
+          currentIno = fdSt.ino
+          offset = 0
+          remainder = ''
+          utf8Decoder = new StringDecoder('utf8')
+          rotatedOrReset = true
+          if (started) attachWatcher()
+        } else if (size < offset) {
+          offset = 0
+          remainder = ''
+          utf8Decoder = new StringDecoder('utf8')
+          rotatedOrReset = true
+        }
+        const MAX_BATCH = 256 * 1024
+        let tickBytes = 0
+        while (offset < size && tickBytes < MAX_BYTES_PER_TICK) {
+          const toRead = Math.min(MAX_BATCH, size - offset, MAX_BYTES_PER_TICK - tickBytes)
+          const buf = Buffer.allocUnsafe(toRead)
+          const bytesRead = readSync(fd, buf, 0, toRead, offset)
+          if (bytesRead <= 0) break
+          offset += bytesRead
+          tickBytes += bytesRead
+          progressed = true
+          processChunkText(utf8Decoder.write(buf.subarray(0, bytesRead)))
+        }
+        hasMoreBacklog = offset < size
       }
-      hasMoreBacklog = offset < size
     } catch (err) {
-      if (err?.code && err.code !== 'ENOENT') {
+      if (err?.code === 'ENOENT') {
+        closeWatcher()
+      } else if (err?.code) {
         const msg = String(err.message || err.code)
         if (msg !== lastError) {
           lastError = msg
@@ -287,7 +330,8 @@ export function createTurnLogMeter({
       }
       reading = false
     }
-    if (progressed) persistCursor(false)
+    if (rotatedOrReset) persistCursor(true)
+    else if (progressed) persistCursor(false)
     if (hasMoreBacklog && started && !stopped && !catchupTimer) {
       catchupTimer = setTimeout(() => {
         catchupTimer = null

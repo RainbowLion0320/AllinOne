@@ -18,7 +18,6 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -26,6 +25,7 @@ import os from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { deflateRawSync } from 'node:zlib'
+import { compareCodePoint } from '../packages/shared/src/semver.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..')
@@ -70,7 +70,7 @@ export function crc32(buf) {
  * Each entry: `{ name: 'path/to/file', data: Buffer }`.
  */
 export function buildZipBuffer(entries) {
-  const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name))
+  const sorted = [...entries].sort((a, b) => compareCodePoint(a.name, b.name))
   const localParts = []
   const centralParts = []
   let offset = 0
@@ -224,10 +224,15 @@ class SignOtaPayload {
 }
 `
 
-function signOtaPayloadWithKeystore(payload) {
+function signOtaPayloadWithKeystore(payload, { requireSignature = false } = {}) {
   const ksPath = String(process.env.ANDROID_KEYSTORE_PATH || '').trim()
   const ksPass = String(process.env.ANDROID_KEYSTORE_PASSWORD || '')
   if (!ksPath || !existsSync(ksPath) || !ksPass) {
+    if (requireSignature) {
+      throw new Error(
+        'Missing Android signing keystore or password (ANDROID_KEYSTORE_PATH / ANDROID_KEYSTORE_PASSWORD) while OTA signature is required',
+      )
+    }
     return { sigAlg: '', signature: '' }
   }
   const tmpJava = join(os.tmpdir(), `SignOtaPayload-${process.pid}-${randomBytes(4).toString('hex')}.java`)
@@ -256,6 +261,7 @@ export function packageAndroidOtaBundle({
   version = '',
   minNativeVersion = process.env.ANDROID_MIN_NATIVE_VERSION || DEFAULT_MIN_NATIVE_VERSION,
   signWithKeystore = true,
+  requireSignature = false,
 } = {}) {
   if (!existsSync(distDir)) {
     throw new Error(`dist directory not found: ${distDir}`)
@@ -286,7 +292,12 @@ export function packageAndroidOtaBundle({
     sha256,
     size,
   })
-  const { sigAlg, signature } = signWithKeystore ? signOtaPayloadWithKeystore(payload) : { sigAlg: '', signature: '' }
+  const { sigAlg, signature } = signWithKeystore
+    ? signOtaPayloadWithKeystore(payload, { requireSignature })
+    : { sigAlg: '', signature: '' }
+  if (requireSignature && (!sigAlg || !signature)) {
+    throw new Error('Android OTA bundle signing is required but produced no signature')
+  }
 
   const manifest = {
     schema: 1,
@@ -304,9 +315,17 @@ export function packageAndroidOtaBundle({
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
 if (isMain) {
-  const result = packageAndroidOtaBundle()
-  const kb = (result.manifest.size / 1024).toFixed(1)
-  console.log(
-    `[package-android-ota] Built ${result.zipPath} (v${result.manifest.version}, ${result.fileCount} files, ${kb} KB, sha256=${result.manifest.sha256.slice(0, 12)}..., signed=${result.manifest.signature ? result.manifest.sigAlg : 'no'})`,
-  )
+  const args = process.argv.slice(2)
+  const allowUnsigned = args.includes('--allow-unsigned')
+  const requireSignature = args.includes('--require-signature') || (process.env.CI === 'true' && !allowUnsigned)
+  try {
+    const result = packageAndroidOtaBundle({ requireSignature })
+    const kb = (result.manifest.size / 1024).toFixed(1)
+    console.log(
+      `[package-android-ota] Built ${result.zipPath} (v${result.manifest.version}, ${result.fileCount} files, ${kb} KB, sha256=${result.manifest.sha256.slice(0, 12)}..., signed=${result.manifest.signature ? result.manifest.sigAlg : 'no'})`,
+    )
+  } catch (err) {
+    console.error(`[package-android-ota] ERROR: ${err?.message || err}`)
+    process.exit(1)
+  }
 }

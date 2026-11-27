@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-smoke:
-    name: Build & Smoke Test (Node 22)
+    name: Build, Lint & Smoke Test (Node 22)
     runs-on: ubuntu-latest
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
@@ -28,8 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Lint codebase
+        run: npm run lint
+
       - name: Verify version sync across workspace
-        run: node scripts/bump-version.mjs --check
+        run: npm run version:check
 
       - name: Build portable bridge & frontend
         run: npm run build
@@ -49,7 +52,40 @@ jobs:
         run: npm test
 
       - name: Audit production dependencies (high/critical)
-        run: npm audit --omit=dev --audit-level=high || true
+        run: npm audit --omit=dev --audit-level=high
+
+  android-check:
+    name: Verify Android Java Compile & Unit Tests
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare Android Capacitor project
+        run: npm run prepare:android
+
+      - name: Compile Android release Java & run debug unit tests
+        run: |
+          chmod +x packages/mobile-app/android/gradlew
+          (cd packages/mobile-app/android && ./gradlew testDebugUnitTest compileReleaseJavaWithJavac --no-daemon)
 
   docker-check:
     name: Verify Relay Dockerfile

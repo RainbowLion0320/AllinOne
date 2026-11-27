@@ -16,6 +16,7 @@ import { dirname, join, resolve } from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { MultiAppOrchestrator } from './src/orchestrator.js'
+import { ensureDefaultWorkspaceCwd, getDefaultWorkspaceCwd } from './src/protocol.js'
 import { RelayBridgeLink } from './src/ws-client.js'
 import { renderQrSvg } from '@allinone/shared/qr-svg'
 import { autoCompleteHalfInstalledClis } from './src/helpers/env-autofix.js'
@@ -118,9 +119,11 @@ function assertSecureServerUrl(serverUrl, { allowInsecureHttp = false } = {}) {
 }
 
 function parseArgs(argv) {
+  const envCwd = String(process.env.ALLINONE_CWD || '').trim()
   const opts = {
     server: process.env.ALLINONE_SERVER || DEFAULT_SERVER_URL,
-    cwd: process.env.ALLINONE_CWD || os.homedir(),
+    cwd: envCwd || getDefaultWorkspaceCwd(),
+    cwdIsDefault: !envCwd,
     label: process.env.ALLINONE_PC_NAME || os.hostname() || 'My-PC',
     stateDir: process.env.ALLINONE_HOME || join(os.homedir(), '.allinone-bridge'),
     username: process.env.ALLINONE_USERNAME || '',
@@ -138,8 +141,19 @@ function parseArgs(argv) {
     const a = argv[i]
     if (a === '--server' || a === '-s') opts.server = argv[++i] || opts.server
     else if (a.startsWith('--server=')) opts.server = a.slice('--server='.length)
-    else if (a === '--cwd' || a === '-c') opts.cwd = argv[++i] || opts.cwd
-    else if (a.startsWith('--cwd=')) opts.cwd = a.slice('--cwd='.length)
+    else if (a === '--cwd' || a === '-c') {
+      const next = argv[++i]
+      if (next) {
+        opts.cwd = next
+        opts.cwdIsDefault = false
+      }
+    } else if (a.startsWith('--cwd=')) {
+      const next = a.slice('--cwd='.length)
+      if (next) {
+        opts.cwd = next
+        opts.cwdIsDefault = false
+      }
+    }
     else if (a === '--name' || a === '-n') opts.label = argv[++i] || opts.label
     else if (a.startsWith('--name=')) opts.label = a.slice('--name='.length)
     else if (a === '--username' || a === '-u') opts.username = argv[++i] || opts.username
@@ -512,48 +526,128 @@ function openFileInBrowser(filePath) {
   } catch {}
 }
 
-function readStdinBootstrapFrame(timeoutMs = 5_000) {
-  return new Promise((resolveFrame) => {
-    let settled = false
-    let buf = ''
-    const done = (val) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      process.stdin.off('data', onData)
-      process.stdin.off('end', onEnd)
-      resolveFrame(val)
+let isMachineIpcMode = process.argv.includes('--machine-ipc')
+
+function emitMachineEvent(event, data = {}) {
+  if (!isMachineIpcMode) return
+  try {
+    process.stdout.write(`${JSON.stringify({ type: 'bridge.ipc', event, ...data })}\n`)
+  } catch {}
+}
+
+/**
+ * Unified `--machine-ipc` / embedded desktop stdin line reader + EOF detector attached
+ * IMMEDIATELY at startup (before async auth/adapter probing) so early `quit`/`probe` commands
+ * and parent EOF are never lost and never orphan the bridge process.
+ */
+function attachMachineIpcStdin({ bootstrapTimeoutMs = 5_000, onCommand, onEof } = {}) {
+  let ctrlBuf = ''
+  let bootstrapResolved = false
+  let bootstrapResolver = null
+  let bootstrapTimer = null
+  const pendingCommands = []
+  let commandHandler = onCommand || null
+  let eofHandler = onEof || null
+  let eofSeen = false
+  let quitRequested = false
+
+  const resolveBootstrap = (val) => {
+    if (bootstrapResolved) return
+    bootstrapResolved = true
+    if (bootstrapTimer) {
+      clearTimeout(bootstrapTimer)
+      bootstrapTimer = null
     }
-    const timer = setTimeout(() => done(null), timeoutMs)
-    timer.unref?.()
-    const onEnd = () => done(null)
-    const onData = (chunk) => {
-      buf += String(chunk || '')
-      if (buf.length > 64 * 1024) {
-        done(null)
-        return
-      }
-      const nl = buf.indexOf('\n')
-      if (nl === -1) return
-      const line = buf.slice(0, nl).trim()
+    const r = bootstrapResolver
+    bootstrapResolver = null
+    r?.(val)
+  }
+
+  const bootstrapPromise = new Promise((resolveFrame) => {
+    bootstrapResolver = resolveFrame
+    bootstrapTimer = setTimeout(() => resolveBootstrap(null), bootstrapTimeoutMs)
+    bootstrapTimer.unref?.()
+  })
+
+  const dispatchCommand = (cmd) => {
+    if (!cmd) return
+    if (cmd === 'quit' || cmd === 'stop') {
+      quitRequested = true
+      resolveBootstrap(null)
+    }
+    if (commandHandler) {
+      try { commandHandler(cmd) } catch {}
+    } else if (!pendingCommands.includes(cmd) && pendingCommands.length < 16) {
+      pendingCommands.push(cmd)
+    }
+  }
+
+  const handleRawLine = (rawLine) => {
+    if (!rawLine) return
+    if (rawLine.startsWith('{')) {
       try {
-        const parsed = JSON.parse(line)
-        if (parsed && parsed.type === 'bootstrap') {
-          done(parsed)
+        const parsed = JSON.parse(rawLine)
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.type === 'bootstrap') {
+            resolveBootstrap(parsed)
+            return
+          }
+          const cmd = String(parsed.type || parsed.cmd || '').trim().toLowerCase()
+          if (cmd) dispatchCommand(cmd)
           return
         }
       } catch {}
-      done(null)
     }
-    process.stdin.setEncoding('utf8')
-    process.stdin.on('data', onData)
-    process.stdin.once('end', onEnd)
-    process.stdin.resume()
+    const cmd = rawLine.trim().toLowerCase()
+    if (cmd) dispatchCommand(cmd)
+  }
+
+  const handleEof = () => {
+    if (eofSeen) return
+    eofSeen = true
+    quitRequested = true
+    resolveBootstrap(null)
+    if (eofHandler) {
+      try { eofHandler() } catch {}
+    }
+  }
+
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => {
+    ctrlBuf += String(chunk || '')
+    if (ctrlBuf.length > 64 * 1024) ctrlBuf = ctrlBuf.slice(-4096)
+    let nl
+    while ((nl = ctrlBuf.indexOf('\n')) !== -1) {
+      const rawLine = ctrlBuf.slice(0, nl).trim()
+      ctrlBuf = ctrlBuf.slice(nl + 1)
+      handleRawLine(rawLine)
+    }
   })
+  process.stdin.on('end', handleEof)
+  process.stdin.on('close', handleEof)
+  process.stdin.resume()
+
+  return {
+    bootstrapPromise,
+    isQuitRequested: () => quitRequested || eofSeen,
+    setHandlers({ onCommand: nextOnCommand, onEof: nextOnEof } = {}) {
+      commandHandler = nextOnCommand || null
+      eofHandler = nextOnEof || null
+      if (eofSeen) {
+        try { eofHandler?.() } catch {}
+        return
+      }
+      while (pendingCommands.length > 0) {
+        const cmd = pendingCommands.shift()
+        try { commandHandler?.(cmd) } catch {}
+      }
+    },
+  }
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
+  isMachineIpcMode = Boolean(opts.machineIpc)
   if (opts.help) {
     console.log(`All in One Portable PC Bridge v${BRIDGE_VERSION}
 
@@ -563,7 +657,7 @@ async function main() {
 选项:
   --server <url>      中转服务器地址 (默认: ${DEFAULT_SERVER_URL})
   --name <label>      本机显示名称 (默认: 本机主机名)
-  --cwd <dir>         默认工作目录 (默认: 用户主目录)
+  --cwd <dir>         默认工作目录 (默认: ${getDefaultWorkspaceCwd()})
   -u, --username <u>  账号用户名（用于无交互自动绑定本机）
   -p, --password <p>  账号密码（仅用于首次换取单机密钥，绝不落盘）
   --e2ee-key <key>      指定 256-bit 端到端加密密钥（留空自动生成）
@@ -577,15 +671,57 @@ async function main() {
     process.exit(0)
   }
 
-  const emitMachineEvent = (event, data = {}) => {
-    if (!opts.machineIpc) return
-    try {
-      process.stdout.write(`${JSON.stringify({ type: 'bridge.ipc', event, ...data })}\n`)
-    } catch {}
+  let orchestrator = null
+  let link = null
+  let rl = null
+  let dshIpcWatchTimer = null
+  let exiting = false
+  let e2eeHtmlCleanupTimer = null
+  let removeTempE2eeKeyPage = () => {}
+
+  async function shutdown(exitCode = 0) {
+    if (exiting) return
+    exiting = true
+    try { removeTempE2eeKeyPage() } catch {}
+    const forceTimer = setTimeout(() => process.exit(exitCode), 5_000)
+    forceTimer.unref?.()
+    if (dshIpcWatchTimer) {
+      clearInterval(dshIpcWatchTimer)
+      dshIpcWatchTimer = null
+    }
+    console.log('\n[allinone] 正在断开桥接并安全退出...')
+    try { rl?.close() } catch {}
+    try { await link?.close?.() } catch {}
+    try { await orchestrator?.dispose?.() } catch {}
+    clearTimeout(forceTimer)
+    process.exit(exitCode)
   }
 
-  if (opts.machineIpc && !process.stdin.isTTY) {
-    const boot = await readStdinBootstrapFrame(5_000)
+  process.on('SIGINT', () => void shutdown(0))
+  process.on('SIGTERM', () => void shutdown(0))
+
+  // Attach --machine-ipc stdin line reader + EOF handler IMMEDIATELY at startup (before async I/O)
+  let machineStdin = null
+  if (!process.stdin.isTTY && (opts.machineIpc || BOOTSTRAP_ENV.hadDesktopSecrets)) {
+    machineStdin = attachMachineIpcStdin({
+      bootstrapTimeoutMs: 5_000,
+      onCommand: (cmd) => {
+        if (cmd === 'quit' || cmd === 'stop') {
+          void shutdown(0)
+        }
+      },
+      onEof: () => {
+        void shutdown(0)
+      },
+    })
+  }
+
+  if (opts.machineIpc && machineStdin) {
+    const boot = await machineStdin.bootstrapPromise
+    if (machineStdin.isQuitRequested()) {
+      await shutdown(0)
+      return
+    }
     if (boot) {
       if (boot.bridgeSecret) BOOTSTRAP_ENV.bridgeSecret = String(boot.bridgeSecret).trim()
       if (boot.e2eeKey) {
@@ -596,6 +732,10 @@ async function main() {
       if (boot.webrtcProxyToken) BOOTSTRAP_ENV.webrtcProxyToken = String(boot.webrtcProxyToken).trim()
       BOOTSTRAP_ENV.hadDesktopSecrets = true
     }
+  }
+
+  if (opts.cwdIsDefault) {
+    opts.cwd = ensureDefaultWorkspaceCwd()
   }
 
   void warmLoginShellPathAsync().catch(() => {})
@@ -765,8 +905,7 @@ async function main() {
   const e2eeKeyId = await computeE2eeKeyId(activeE2eeKey)
   const e2eeFingerprint = formatE2eeFingerprint(e2eeKeyId)
 
-  let e2eeHtmlCleanupTimer = null
-  const removeTempE2eeKeyPage = () => {
+  removeTempE2eeKeyPage = () => {
     if (e2eeHtmlCleanupTimer) {
       clearTimeout(e2eeHtmlCleanupTimer)
       e2eeHtmlCleanupTimer = null
@@ -813,34 +952,16 @@ async function main() {
     ensureDshLocalIpcPlugin({ log: dshLog })
   } catch {}
 
+  if (machineStdin?.isQuitRequested()) {
+    await shutdown(0)
+    return
+  }
+
   let detectedApps = []
 
   let connectedOnce = false
   const wsBridgeUrl = toBridgeWsUrl(opts.server)
-  let link = null
-  let rl = null
-  let dshIpcWatchTimer = null
-  let exiting = false
   let bridge = null
-
-  async function shutdown(exitCode = 0) {
-    if (exiting) return
-    exiting = true
-    removeTempE2eeKeyPage()
-    const forceTimer = setTimeout(() => process.exit(exitCode), 5_000)
-    forceTimer.unref?.()
-    if (dshIpcWatchTimer) {
-      clearInterval(dshIpcWatchTimer)
-      dshIpcWatchTimer = null
-    }
-    console.log('\n[allinone] 正在断开桥接并安全退出...')
-    try { rl?.close() } catch {}
-    try {
-      await bridge?.stop()
-    } catch {}
-    clearTimeout(forceTimer)
-    process.exit(exitCode)
-  }
 
   const quietLog = {
     info: () => {},
@@ -848,7 +969,7 @@ async function main() {
     warn: (msg) => console.warn(`[allinone] ${msg}`),
     error: (msg) => console.error(`[allinone] ${msg}`),
   }
-  const orchestrator = new MultiAppOrchestrator({
+  orchestrator = new MultiAppOrchestrator({
     ctx: null,
     config: {
       cwd: opts.cwd,
@@ -916,7 +1037,26 @@ async function main() {
       await orchestrator.dispose()
     },
   }
+  if (machineStdin?.isQuitRequested() || exiting) {
+    await shutdown(0)
+    return
+  }
   link.start()
+  if (machineStdin) {
+    // Wire live command handler and flush any buffered early `probe` / `quit` commands immediately
+    machineStdin.setHandlers({
+      onCommand: (cmd) => {
+        if (cmd === 'resume' || cmd === 'probe' || cmd === 'reconnect') {
+          link?.probeOrReconnect('system-resume')
+        } else if (cmd === 'quit' || cmd === 'stop') {
+          void shutdown(0)
+        }
+      },
+      onEof: () => {
+        void shutdown(0)
+      },
+    })
+  }
 
   // Wait briefly for local AI tool detection so the status banner shows accurate tool availability
   detectedApps = await Promise.race([
@@ -1043,41 +1183,8 @@ async function main() {
         await shutdown(0)
       }
     })
-  } else if (BOOTSTRAP_ENV.hadDesktopSecrets || opts.machineIpc) {
-    // Embedded desktop-app control channel over piped stdin:
-    //  - JSON `{ type: 'probe' | 'quit' }` or plain text `"probe"`/`"quit"`
-    //  - stdin EOF means parent Electron process died/crashed -> shut down cleanly (no orphan bridge!)
-    let ctrlBuf = ''
-    process.stdin.setEncoding('utf8')
-    process.stdin.on('data', (chunk) => {
-      ctrlBuf += chunk
-      if (ctrlBuf.length > 64 * 1024) ctrlBuf = ctrlBuf.slice(-4096)
-      let nl
-      while ((nl = ctrlBuf.indexOf('\n')) !== -1) {
-        const rawLine = ctrlBuf.slice(0, nl).trim()
-        ctrlBuf = ctrlBuf.slice(nl + 1)
-        if (!rawLine) continue
-        let cmd = rawLine.toLowerCase()
-        if (rawLine.startsWith('{')) {
-          try {
-            const parsed = JSON.parse(rawLine)
-            cmd = String(parsed?.type || parsed?.cmd || '').trim().toLowerCase()
-          } catch {}
-        }
-        if (cmd === 'resume' || cmd === 'probe' || cmd === 'reconnect') {
-          link.probeOrReconnect('system-resume')
-        } else if (cmd === 'quit' || cmd === 'stop') {
-          void shutdown(0)
-        }
-      }
-    })
-    process.stdin.on('end', () => void shutdown(0))
-    process.stdin.on('close', () => void shutdown(0))
-    process.stdin.resume()
   }
 
-  process.on('SIGINT', () => void shutdown(0))
-  process.on('SIGTERM', () => void shutdown(0))
   process.on('uncaughtException', (err) => {
     console.error('[allinone] ✖ 捕获到未处理致命异常，正在安全退出:', err?.stack || String(err))
     emitMachineEvent('fatal', { message: String(err?.message || err) })
@@ -1089,6 +1196,8 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('\n[allinone] 启动失败：', String(err?.message || err))
+  const message = String(err?.message || err)
+  emitMachineEvent('fatal', { message })
+  console.error('\n[allinone] 启动失败：', message)
   process.exit(1)
 })

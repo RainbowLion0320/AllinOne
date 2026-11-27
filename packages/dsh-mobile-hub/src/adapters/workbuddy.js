@@ -1,11 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import {
-  closeSync,
   existsSync,
-  openSync,
   readdirSync,
   readFileSync,
-  readSync,
   statSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
@@ -19,7 +16,7 @@ import {
   makeCompositeId,
   toEpochMs,
 } from '../protocol.js'
-import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
+import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import {
   findExecutable,
   getCodebuddyCandidates,
@@ -29,13 +26,18 @@ import {
 import { installSingleAppCli } from '../helpers/env-autofix.js'
 import { createTaskStateTracker, normalizeTaskMode, parseMaybeJson } from '../helpers/task-state.js'
 import { BaseAdapter } from './base-adapter.js'
-import { getDatabaseSync, isPidAlive, runPythonSqliteJson } from '../primitives/io-utils.js'
+import {
+  getDatabaseSync,
+  isPidAlive,
+  readHeadAndBodyLinesForParse,
+  readHeadAndTailLines,
+  readTailLinesWithMeta,
+  runPythonSqliteJson,
+} from '../primitives/io-utils.js'
 import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
 import { QuotaCacheManager } from '../primitives/quota-cache.js'
 import { SessionExternalWatcher } from '../primitives/session-watcher.js'
 import { StreamJsonCliRunner } from '../primitives/stream-json-runner.js'
-
-const workbuddyParseCache = createFileParseCache(24)
 
 const WORKBUDDY_EXTERNAL_MAX_IDLE_MS = 15 * 60_000
 const WORKBUDDY_WATCH_POLL_MS = 2_000
@@ -477,71 +479,6 @@ function extractToolOutputText(output) {
   return String(output)
 }
 
-function readTailLinesZeroOom(filePath, maxBytes = WORKBUDDY_TAIL_PROBE_BYTES) {
-  const st = statSync(filePath)
-  const size = st.size
-  if (size === 0) return { lines: [], size: 0, mtimeMs: st.mtimeMs }
-  const readLen = Math.min(size, maxBytes)
-  const offset = Math.max(0, size - readLen)
-  const fd = openSync(filePath, 'r')
-  try {
-    const buf = Buffer.alloc(readLen)
-    const bytesRead = readSync(fd, buf, 0, readLen, offset)
-    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-    if (offset > 0 && lines.length > 0) lines.shift()
-    return { lines: lines.filter(Boolean), size, mtimeMs: st.mtimeMs }
-  } finally {
-    closeSync(fd)
-  }
-}
-
-function readHeadAndTailLines(filePath, headBytes = 32_768, tailBytes = 32_768) {
-  const st = statSync(filePath)
-  const size = st.size
-  if (size <= headBytes + tailBytes) {
-    return readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean)
-  }
-  const fd = openSync(filePath, 'r')
-  try {
-    const headBuf = Buffer.alloc(headBytes)
-    const hRead = readSync(fd, headBuf, 0, headBytes, 0)
-    const tailBuf = Buffer.alloc(tailBytes)
-    const tRead = readSync(fd, tailBuf, 0, tailBytes, Math.max(0, size - tailBytes))
-    const headLines = headBuf.subarray(0, hRead).toString('utf8').split(/\r?\n/)
-    const tailLines = tailBuf.subarray(0, tRead).toString('utf8').split(/\r?\n/)
-    if (headLines.length > 1) headLines.pop()
-    if (tailLines.length > 1) tailLines.shift()
-    return [...headLines, ...tailLines].filter(Boolean)
-  } finally {
-    closeSync(fd)
-  }
-}
-
-function readWorkbuddyFileForParse(filePath) {
-  const st = statSync(filePath)
-  if (st.size <= WORKBUDDY_MAX_FULL_PARSE_BYTES) {
-    return { headLines: [], bodyLines: readFileSync(filePath, 'utf8').split(/\r?\n/) }
-  }
-  const fd = openSync(filePath, 'r')
-  try {
-    const headLen = Math.min(st.size, 32 * 1024)
-    const headBuf = Buffer.alloc(headLen)
-    const headRead = readSync(fd, headBuf, 0, headLen, 0)
-    const headLines = headBuf.subarray(0, headRead).toString('utf8').split(/\r?\n/)
-    if (headLines.length > 1) headLines.pop()
-
-    const tailLen = Math.min(st.size, WORKBUDDY_TAIL_FALLBACK_BYTES)
-    const tailOffset = Math.max(0, st.size - tailLen)
-    const tailBuf = Buffer.alloc(tailLen)
-    const tailRead = readSync(fd, tailBuf, 0, tailLen, tailOffset)
-    const bodyLines = tailBuf.subarray(0, tailRead).toString('utf8').split(/\r?\n/)
-    if (tailOffset > 0 && bodyLines.length > 0) bodyLines.shift()
-    return { headLines, bodyLines }
-  } finally {
-    closeSync(fd)
-  }
-}
-
 /**
  * Read WorkBuddy Desktop SQLite metadata (`workbuddy.db`) strictly read-only.
  * Gracefully degrades to empty maps if `node:sqlite` or `workbuddy.db` is absent.
@@ -644,10 +581,12 @@ export function readWorkbuddyDbSnapshot(workbuddyHome) {
 }
 
 const WORKBUDDY_DB_PY_FALLBACK = [
-  'import sqlite3, json, sys',
+  'import json, sqlite3, sys',
+  'from pathlib import Path',
   'db_path = sys.argv[1]',
   'out = {"sessions": [], "workspaces": [], "spaces": [], "space_folders": []}',
-  'conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.5)',
+  'uri = Path(db_path).resolve().as_uri() + "?mode=ro"',
+  'conn = sqlite3.connect(uri, uri=True, timeout=1.5)',
   'conn.row_factory = sqlite3.Row',
   'try:',
   '  for key, sql in [',
@@ -742,12 +681,8 @@ export function probeWorkbuddyTranscriptTail(filePath, { now = Date.now(), maxId
   }
   if (!filePath || !existsSync(filePath)) return empty
 
-  let tail
-  try {
-    tail = readTailLinesZeroOom(filePath, WORKBUDDY_TAIL_PROBE_BYTES)
-  } catch {
-    return empty
-  }
+  let tail = readTailLinesWithMeta(filePath, WORKBUDDY_TAIL_PROBE_BYTES)
+  if (!tail.exists) return empty
 
   const parseTail = (lines) => {
     let signal = 'unknown'
@@ -847,11 +782,11 @@ export function probeWorkbuddyTranscriptTail(filePath, { now = Date.now(), maxId
 
   let parsed = parseTail(tail.lines)
   if (!parsed.seenSignal && tail.size > WORKBUDDY_TAIL_PROBE_BYTES) {
-    try {
-      const bigger = readTailLinesZeroOom(filePath, WORKBUDDY_TAIL_PROBE_MAX_BYTES)
+    const bigger = readTailLinesWithMeta(filePath, WORKBUDDY_TAIL_PROBE_MAX_BYTES)
+    if (bigger.exists) {
       tail = bigger
       parsed = parseTail(bigger.lines)
-    } catch {}
+    }
   }
 
   const fresh = now - tail.mtimeMs <= maxIdleMs
@@ -947,12 +882,8 @@ function scanWorkbuddySessionSummary(filePath, fallbackProjectName) {
     return null
   }
 
-  let lines = []
-  try {
-    lines = readHeadAndTailLines(filePath)
-  } catch {
-    return null
-  }
+  const ht = readHeadAndTailLines(filePath)
+  const lines = ht.headLines === ht.tailLines ? ht.headLines : [...ht.headLines, ...ht.tailLines]
 
   let cwd = ''
   let customTitle = ''
@@ -1030,9 +961,12 @@ function scanWorkbuddySessionSummary(filePath, fallbackProjectName) {
  * Parse a WorkBuddy / CodeBuddy JSONL transcript into All in One's unified message & taskState model.
  * Supports both WorkBuddy Desktop OpenAI-Responses-style lines and CodeBuddy/Claude CLI lines.
  */
-export function parseWorkbuddyJsonlMessages(filePath) {
-  return workbuddyParseCache.getOrParse(filePath, () => {
-    const { headLines, bodyLines } = readWorkbuddyFileForParse(filePath)
+export function parseWorkbuddyJsonlMessages(filePath, parseCache = null) {
+  const doParse = () => {
+    const { headLines, bodyLines } = readHeadAndBodyLinesForParse(filePath, {
+      maxFullBytes: WORKBUDDY_MAX_FULL_PARSE_BYTES,
+      tailBytes: WORKBUDDY_TAIL_FALLBACK_BYTES,
+    })
     const messages = []
     const toolIndex = new Map()
     const taskTracker = createTaskStateTracker()
@@ -1247,7 +1181,8 @@ export function parseWorkbuddyJsonlMessages(filePath) {
       messages: mergeAndCompactMessages(messages),
       taskState: taskTracker.snapshot(),
     }
-  })
+  }
+  return parseCache ? parseCache.getOrParse(filePath, doParse) : doParse()
 }
 
 /**
@@ -1345,6 +1280,14 @@ export class WorkBuddyAdapter extends BaseAdapter {
     this.quotaManager.quota = val
   }
 
+  get quotaCacheAt() {
+    return this.quotaManager.fetchedAt
+  }
+
+  set quotaCacheAt(val) {
+    this.quotaManager.fetchedAt = Number(val) || 0
+  }
+
   get lastClientListAt() {
     return this.watcher.lastClientListAt
   }
@@ -1400,15 +1343,14 @@ export class WorkBuddyAdapter extends BaseAdapter {
       const done = (val) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        this.clearTrackedTimer(timer)
         resolvePromise(val)
       }
       let proc = null
-      const timer = setTimeout(() => {
+      const timer = this.setTimeout(() => {
         if (proc) killProcessTree(proc, { force: true })
         done(false)
       }, 6_000)
-      timer.unref?.()
       try {
         proc = spawnCrossPlatform(this.codebuddyBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -1467,13 +1409,12 @@ export class WorkBuddyAdapter extends BaseAdapter {
             const fresh = await Promise.race([
               refreshPromise,
               new Promise((r) => {
-                t = setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
-                t.unref?.()
+                t = this.setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
               }),
             ])
             if (fresh) quota = fresh
           } finally {
-            if (t) clearTimeout(t)
+            if (t) this.clearTrackedTimer(t)
           }
         }
       }
@@ -1514,7 +1455,7 @@ export class WorkBuddyAdapter extends BaseAdapter {
     const cur = this.activeLoginSession
     if (!cur) return
     this.activeLoginSession = null
-    if (cur.timer) clearTimeout(cur.timer)
+    if (cur.timer) this.clearTrackedTimer(cur.timer)
     if (cur.client) cur.client.killImmediate('WorkBuddy login stopped')
   }
 
@@ -1597,7 +1538,7 @@ export class WorkBuddyAdapter extends BaseAdapter {
       const settle = (payload) => {
         if (settled) return
         settled = true
-        clearTimeout(waitUrlTimer)
+        this.clearTrackedTimer(waitUrlTimer)
         resolvePromise(payload)
       }
 
@@ -1637,7 +1578,7 @@ export class WorkBuddyAdapter extends BaseAdapter {
         },
         onExit: ({ code, error, stderrTail }) => {
           if (this.activeLoginSession === loginState) {
-            if (loginState.timer) clearTimeout(loginState.timer)
+            if (loginState.timer) this.clearTrackedTimer(loginState.timer)
             this.activeLoginSession = null
           }
           if (this.isCliAuthenticated()) {
@@ -1675,12 +1616,11 @@ export class WorkBuddyAdapter extends BaseAdapter {
         timer: null,
       }
       this.activeLoginSession = loginState
-      loginState.timer = setTimeout(() => {
+      loginState.timer = this.setTimeout(() => {
         if (this.activeLoginSession === loginState) this.stopActiveLoginSession()
       }, 180_000)
-      loginState.timer.unref?.()
 
-      const waitUrlTimer = setTimeout(() => {
+      const waitUrlTimer = this.setTimeout(() => {
         settle({
           ok: true,
           status: 'awaiting_login',
@@ -1693,7 +1633,6 @@ export class WorkBuddyAdapter extends BaseAdapter {
             : '已在电脑端拉起官方浏览器授权页，请完成扫码登录后自动解锁',
         })
       }, 8_000)
-      waitUrlTimer.unref?.()
 
       try {
         client.spawnProcess()
@@ -1884,7 +1823,7 @@ export class WorkBuddyAdapter extends BaseAdapter {
         if (dbRow?.title) entry.title = dbRow.title
         if (historyChanged && entry.filePath && existsSync(entry.filePath)) {
           try {
-            entry.taskState = parseWorkbuddyJsonlMessages(entry.filePath).taskState || null
+            entry.taskState = parseWorkbuddyJsonlMessages(entry.filePath, this.parseCache).taskState || null
             this.sessionTaskStates.set(nativeId, entry.taskState)
           } catch {}
         }
@@ -2141,7 +2080,7 @@ export class WorkBuddyAdapter extends BaseAdapter {
       throw new Error(`找不到 WorkBuddy 会话：${sessionId}`)
     }
 
-    const parsed = parseWorkbuddyJsonlMessages(found.filePath)
+    const parsed = parseWorkbuddyJsonlMessages(found.filePath, this.parseCache)
     const activeProc = this.activeProcs.get(sessionId)
     const isLocalActive = Boolean(activeProc)
     const taskState =

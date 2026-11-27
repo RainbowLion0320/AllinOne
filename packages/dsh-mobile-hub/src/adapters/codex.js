@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import { basename, dirname } from 'node:path'
 import { APPS, EVENTS, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
 import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getCodexCandidates, isExecutableFile } from '../helpers/bin-finder.js'
@@ -14,12 +14,16 @@ import {
 } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 import { BaseAdapter } from './base-adapter.js'
+import { readTailLinesWithMeta, readTailLinesZeroOom } from '../primitives/io-utils.js'
 import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
 import { BoundedLruMap } from '../primitives/lru.js'
+import { QuotaCacheManager } from '../primitives/quota-cache.js'
+import { SessionExternalWatcher } from '../primitives/session-watcher.js'
 
 const CODEX_CLIENT_VERSION =
   (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) || '0.0.0'
 const CODEX_TURN_INACTIVITY_TIMEOUT_MS = 20 * 60_000
+const MAX_PENDING_NEW_WRITERS = 4
 
 const UNTRUSTED_CODEX_DIR_PREFIXES = [
   '/tmp/',
@@ -28,6 +32,20 @@ const UNTRUSTED_CODEX_DIR_PREFIXES = [
   '/private/var/tmp/',
   '/dev/shm/',
 ]
+
+function isSafeCodexPathMode(statObj, currentUid) {
+  // Always reject world-writable files or directories
+  if ((statObj.mode & 0o002) !== 0) return false
+  // For group-writable entries, allow Linux User Private Groups (UPG: uid == currentUid & gid == currentGid)
+  // and macOS user-owned package dirs (e.g. Homebrew 0775 user:admin); reject shared/foreign group-writable paths.
+  if ((statObj.mode & 0o020) !== 0) {
+    const currentGid = typeof process.getgid === 'function' ? process.getgid() : -1
+    const isLinuxUpg = statObj.uid === currentUid && currentGid >= 0 && statObj.gid === currentGid
+    const isDarwinUserOwned = process.platform === 'darwin' && statObj.uid === currentUid
+    if (!isLinuxUpg && !isDarwinUserOwned) return false
+  }
+  return true
+}
 
 function isTrustedCodexExecutable(candidate, currentUid) {
   if (!candidate || !isExecutableFile(candidate)) return false
@@ -49,13 +67,13 @@ function isTrustedCodexExecutable(candidate, currentUid) {
     const st = statSync(realPath)
     if (!st.isFile()) return false
     if (st.uid !== currentUid && st.uid !== 0) return false
-    if ((st.mode & 0o022) !== 0) return false
+    if (!isSafeCodexPathMode(st, currentUid)) return false
 
     const parentDirs = new Set([dirname(realPath), dirname(candidate)])
     for (const dir of parentDirs) {
       const pSt = statSync(dir)
       if (pSt.uid !== currentUid && pSt.uid !== 0) return false
-      if ((pSt.mode & 0o022) !== 0) return false
+      if (!isSafeCodexPathMode(pSt, currentUid)) return false
     }
     return true
   } catch {
@@ -258,17 +276,9 @@ export function extractPendingCodexAsyncQuestionFromRollout(rawPath, { tailBytes
   if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
     return null
   }
-  let fd = null
   try {
-    fd = openSync(cleanPath, 'r')
-    const totalSize = fstatSync(fd).size
-    if (totalSize <= 0) return null
-    const readLen = Math.min(totalSize, tailBytes)
-    const startOffset = totalSize - readLen
-    const buf = Buffer.alloc(readLen)
-    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
-    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-    if (startOffset > 0 && lines.length > 0) lines.shift()
+    const lines = readTailLinesZeroOom(cleanPath, tailBytes)
+    if (!lines.length) return null
 
     const answeredCallIds = new Set()
     let latestItem = null
@@ -312,10 +322,6 @@ export function extractPendingCodexAsyncQuestionFromRollout(rawPath, { tailBytes
     return latestItem && !answeredCallIds.has(latestItem.id) ? latestItem : null
   } catch {
     return null
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch {}
-    }
   }
 }
 
@@ -323,22 +329,14 @@ export function extractPendingCodexAsyncQuestionFromRollout(rawPath, { tailBytes
  * Zero-OOM tail-seek extractor for Codex rollout `.jsonl` plan steps, collaboration mode (`plan`/`default`),
  * and goal triggers. Safe on multi-GB rollouts.
  */
-export function extractCodexTaskStateFromRollout(rawPath, { maxBytes = 512 * 1024 } = {}) {
+export function extractCodexTaskStateFromRollout(rawPath, { maxBytes = 512 * 1024, parseCache = null } = {}) {
   const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
   if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
     return null
   }
-  let fd = null
-  try {
-    fd = openSync(cleanPath, 'r')
-    const totalSize = fstatSync(fd).size
-    if (totalSize <= 0) return null
-    const readLen = Math.min(totalSize, maxBytes)
-    const startOffset = totalSize - readLen
-    const buf = Buffer.alloc(readLen)
-    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
-    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-    if (startOffset > 0 && lines.length > 0) lines.shift()
+  const parse = () => {
+    const lines = readTailLinesZeroOom(cleanPath, maxBytes)
+    if (!lines.length) return null
 
     const tracker = createTaskStateTracker()
     for (const line of lines) {
@@ -370,12 +368,14 @@ export function extractCodexTaskStateFromRollout(rawPath, { maxBytes = 512 * 102
       }
     }
     return tracker.snapshot()
+  }
+  try {
+    if (parseCache && typeof parseCache.getOrParse === 'function') {
+      return parseCache.getOrParse(cleanPath, parse, { keyPrefix: `cdx-task:${maxBytes}` })
+    }
+    return parse()
   } catch {
     return null
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch {}
-    }
   }
 }
 
@@ -567,20 +567,18 @@ export function probeCodexRolloutStatus(
     return { exists: true, running: false, size, mtimeMs, lastEvent: 'stale' }
   }
 
-  let fd = null
   try {
-    fd = openSync(cleanPath, 'r')
-    const actualSize = fstatSync(fd).size
     const maxWindowBytes = Math.max(tailBytes, 512 * 1024)
     let windowBytes = tailBytes
 
     while (true) {
-      const readLen = Math.min(actualSize, windowBytes)
-      const startOffset = actualSize - readLen
-      const buf = Buffer.alloc(readLen)
-      const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
-      const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
-      if (startOffset > 0 && lines.length > 0) lines.shift()
+      const meta = readTailLinesWithMeta(cleanPath, windowBytes)
+      if (!meta.exists) {
+        return { exists: true, running: false, size, mtimeMs, lastEvent: '' }
+      }
+      const actualSize = meta.size || size
+      const actualMtimeMs = meta.mtimeMs || mtimeMs
+      const lines = meta.lines
 
       let sawActiveLine = false
       let lastEvent = ''
@@ -598,7 +596,7 @@ export function probeCodexRolloutStatus(
 
         if (topType === 'event_msg') {
           if (CODEX_TERMINAL_EVENT_TYPES.has(pType)) {
-            return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent: pType }
+            return { exists: true, running: false, size: actualSize, mtimeMs: actualMtimeMs, lastEvent: pType }
           }
           if (CODEX_METADATA_EVENT_TYPES.has(pType)) {
             continue
@@ -620,26 +618,22 @@ export function probeCodexRolloutStatus(
       }
 
       if (sawActiveLine) {
-        return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent }
+        return { exists: true, running: true, size: actualSize, mtimeMs: actualMtimeMs, lastEvent }
       }
 
       // If we hit a truncated >tailBytes line with no parsed event yet, expand window up to 512KB before treating as giant_item
-      if (startOffset > 0) {
+      if (meta.truncated) {
         if (windowBytes < maxWindowBytes) {
           windowBytes = Math.min(maxWindowBytes, windowBytes * 2)
           continue
         }
-        return { exists: true, running: true, size: actualSize, mtimeMs, lastEvent: 'giant_item' }
+        return { exists: true, running: true, size: actualSize, mtimeMs: actualMtimeMs, lastEvent: 'giant_item' }
       }
 
-      return { exists: true, running: false, size: actualSize, mtimeMs, lastEvent }
+      return { exists: true, running: false, size: actualSize, mtimeMs: actualMtimeMs, lastEvent }
     }
   } catch {
     return { exists: true, running: false, size, mtimeMs, lastEvent: '' }
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch {}
-    }
   }
 }
 
@@ -648,24 +642,15 @@ export function probeCodexRolloutStatus(
  * when `codex app-server` fails to deserialize an older stored thread item across CLI upgrades.
  * Reads ONLY the tail `maxBytes` (default 2 MB) directly from disk in <5 ms.
  */
-export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limit = 14 } = {}) {
+export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limit = 14, parseCache = null } = {}) {
   const cleanPath = String(rawPath || '').replace(/^\\\\\?\\/, '').trim()
   if (!cleanPath || !cleanPath.toLowerCase().endsWith('.jsonl') || !existsSync(cleanPath)) {
     return []
   }
-  let fd = null
-  try {
-    fd = openSync(cleanPath, 'r')
-    const totalSize = fstatSync(fd).size
-    if (totalSize <= 0) return []
-    const readLen = Math.min(totalSize, maxBytes)
-    const startOffset = totalSize - readLen
-    const buf = Buffer.alloc(readLen)
-    const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
-    const rawText = buf.subarray(0, bytesRead).toString('utf8')
-    const lines = rawText.split(/\r?\n/)
-    // Drop first partial line if we started mid-file
-    if (startOffset > 0 && lines.length > 0) lines.shift()
+  const sliceLen = Math.max(6, Math.min(Number(limit) || 14, 30))
+  const parse = () => {
+    const lines = readTailLinesZeroOom(cleanPath, maxBytes)
+    if (!lines.length) return []
 
     const messages = []
     let milestoneEpoch = 0
@@ -749,14 +734,15 @@ export function readCodexRolloutTail(rawPath, { maxBytes = 2 * 1024 * 1024, limi
     }
 
     const compacted = mergeAndCompactMessages(messages)
-    const sliceLen = Math.max(6, Math.min(Number(limit) || 14, 30))
     return compacted.slice(-sliceLen)
+  }
+  try {
+    if (parseCache && typeof parseCache.getOrParse === 'function') {
+      return parseCache.getOrParse(cleanPath, parse, { keyPrefix: `cdx-tail:${maxBytes}:${sliceLen}` })
+    }
+    return parse()
   } catch {
     return []
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch {}
-    }
   }
 }
 
@@ -1050,37 +1036,69 @@ export class CodexAdapter extends BaseAdapter {
         if (method === 'account/rateLimits/updated' && params) {
           const parsed = normalizeCodexQuota(params)
           if (parsed) {
-            this.quotaCache = parsed
-            this.quotaCacheAt = Date.now()
-            this.emitEvent(EVENTS.BRIDGE_STATUS, {
-              type: 'quota.updated',
-              app: APPS.CODEX,
-              quota: parsed,
-            })
+            this.quotaManager.set(parsed, { persist: false, emit: true })
           }
         }
       },
     })
-    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled, inactivityTimer }
+    this.activeTurns = new Map() // threadId -> { writer, turnId, resolve, reject, textBuffer, aborted, settled, touchActivity }
     this.releasingWriters = new Map() // threadId -> Promise<void> (in-flight writer release before next thread/resume)
     this.releasingWriterClients = new Set() // live writer instances mid-release so dispose() can force-kill them
-    this.pendingNewWriters = new Map() // threadId -> { writer, summary, timer }
+    this.pendingNewWriters = new Map() // threadId -> { writer, summary, timer } (bounded to MAX_PENDING_NEW_WRITERS)
     this.pendingServerRequests = new Map() // approvalId -> { writer, rpcId, method, threadId }
     this.dismissedAsyncQuestions = new BoundedLruMap(256)
     this.answeredAsyncQuestions = new BoundedLruMap(256)
     this.sessionModes = new BoundedLruMap(256)
     this.modelsCache = null
     this.modelsCacheAt = 0
-    this.quotaCache = null
-    this.quotaCacheAt = 0
-    this.watchedSessions = new BoundedLruMap(8) // capped LRU live open-chat watch snapshots
-    this.trackedListSessions = new BoundedLruMap(40) // capped LRU recent sidebar thread snapshots
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || CODEX_WATCH_POLL_INTERVAL_MS)
     this.externalMaxIdleMs = Math.max(1000, Number(config.codexExternalMaxIdleMs) || CODEX_EXTERNAL_MAX_IDLE_MS)
-    this.watchTimer = null
-    this.watchPollInFlight = false
     this.lastListDiscoveryAt = 0
-    this.lastClientListAt = 0
+    this.quotaManager = new QuotaCacheManager({
+      app: APPS.CODEX,
+      ttlMs: CODEX_QUOTA_CACHE_TTL_MS,
+      errorBackoffMs: 15_000,
+      emitEvent: this.emitEvent,
+      fetcher: async () => {
+        const now = Date.now()
+        const res = await this.rpc('account/rateLimits/read', {}, 5_000)
+        return normalizeCodexQuota(res, now)
+      },
+    })
+    this.watcher = new SessionExternalWatcher({
+      pollMs: this.watchPollIntervalMs,
+      maxWatched: CODEX_MAX_WATCHED_SESSIONS,
+      maxTracked: CODEX_TRACKED_LIST_LIMIT,
+      watchTtlMs: CODEX_WATCH_TTL_MS,
+      listWatchTtlMs: CODEX_TRACKED_LIST_TTL_MS,
+      onPoll: (ctx) => this._pollExternalSessions(ctx),
+    })
+    this.watchedSessions = this.watcher.watched
+    this.trackedListSessions = this.watcher.tracked
+  }
+
+  get quotaCache() {
+    return this.quotaManager.quota
+  }
+
+  set quotaCache(val) {
+    this.quotaManager.quota = val
+  }
+
+  get quotaCacheAt() {
+    return this.quotaManager.fetchedAt
+  }
+
+  set quotaCacheAt(val) {
+    this.quotaManager.fetchedAt = Number(val) || 0
+  }
+
+  get lastClientListAt() {
+    return this.watcher.lastClientListAt
+  }
+
+  set lastClientListAt(val) {
+    this.watcher.lastClientListAt = Number(val) || 0
   }
 
   refreshBinary() {
@@ -1109,7 +1127,7 @@ export class CodexAdapter extends BaseAdapter {
         const targetWriter = exitedClient || writer
         // Fail any active turn bound to this writer if it crashed unexpectedly
         // (STREAM_ERROR is emitted once in sendMessage's catch block to avoid duplicate error events)
-        for (const [tid, active] of this.activeTurns.entries()) {
+        for (const [_tid, active] of this.activeTurns.entries()) {
           if (active.writer === targetWriter && !targetWriter.closing && !active.settled) {
             active.settled = true
             active.reject(err)
@@ -1178,6 +1196,9 @@ export class CodexAdapter extends BaseAdapter {
     const method = msg.method
     const params = msg.params || {}
     const threadId = params.threadId || params.conversationId || ''
+    if (threadId) {
+      this.activeTurns.get(threadId)?.touchActivity?.()
+    }
     const approvalId = `cdx-apr-${randomUUID().slice(0, 10)}`
 
     if (
@@ -1370,11 +1391,12 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   clearAsyncQuestionsForThread(threadId, { keepCallId = '', decision = 'desktop' } = {}) {
+    const sessionId = threadId ? makeCompositeId(APPS.CODEX, threadId) : ''
     for (const [aprId, entry] of [...this.pendingServerRequests.entries()]) {
       if (entry.method !== 'codex/asyncQuestion' || entry.threadId !== threadId) continue
       if (keepCallId && entry.callId === keepCallId) continue
       this.pendingServerRequests.delete(aprId)
-      this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision })
+      this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, sessionId, decision })
     }
   }
 
@@ -1417,6 +1439,10 @@ export class CodexAdapter extends BaseAdapter {
     if (!entry) return { resolved: false, reason: 'approval not found' }
     this.pendingServerRequests.delete(approvalId)
 
+    const sessionId = entry.threadId ? makeCompositeId(APPS.CODEX, entry.threadId) : ''
+    if (entry.threadId) {
+      this.activeTurns.get(entry.threadId)?.touchActivity?.()
+    }
     const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
 
     if (entry.method === 'codex/asyncQuestion') {
@@ -1442,6 +1468,7 @@ export class CodexAdapter extends BaseAdapter {
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.CODEX,
+          sessionId,
           decision: cancelled ? 'cancel' : 'submit',
         })
         return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit', steered: true }
@@ -1452,6 +1479,7 @@ export class CodexAdapter extends BaseAdapter {
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.CODEX,
+          sessionId,
           decision: 'cancel',
         })
         return { resolved: true, id: approvalId, decision: 'cancel' }
@@ -1470,6 +1498,7 @@ export class CodexAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.CODEX,
+        sessionId,
         decision: 'submit',
       })
       const replyText = buildCodexQuestionReplyText(entry.callId, entry.questions, answers, { cancelled: false })
@@ -1489,6 +1518,7 @@ export class CodexAdapter extends BaseAdapter {
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.CODEX,
+          sessionId,
           decision: 'cancel',
         })
         const transportErr = new Error(String(err?.message || 'Codex 进程已退出，审批请求已失效'))
@@ -1514,6 +1544,7 @@ export class CodexAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.CODEX,
+        sessionId,
         decision: cancelled ? 'cancel' : 'submit',
       })
       return { resolved: true, id: approvalId, decision: cancelled ? 'cancel' : 'submit' }
@@ -1533,6 +1564,7 @@ export class CodexAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.CODEX,
+        sessionId,
         decision: accepted ? decision : 'decline',
       })
       return { resolved: true, id: approvalId, decision: accepted ? decision : 'decline' }
@@ -1553,6 +1585,7 @@ export class CodexAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.CODEX,
+        sessionId,
         decision: action,
       })
       return { resolved: true, id: approvalId, decision: action }
@@ -1571,6 +1604,7 @@ export class CodexAdapter extends BaseAdapter {
     this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
       id: approvalId,
       app: APPS.CODEX,
+      sessionId,
       decision: validDecision,
     })
     return { resolved: true, id: approvalId, decision: validDecision }
@@ -1593,6 +1627,8 @@ export class CodexAdapter extends BaseAdapter {
     if (!threadId) return
     const compositeId = makeCompositeId(APPS.CODEX, threadId)
     const active = this.activeTurns.get(threadId)
+    // Reset sliding turn inactivity timeout on EVERY incoming stream/tool/notification/turn event
+    active?.touchActivity?.()
 
     if (method === 'turn/plan/updated') {
       const tracker = active?.taskTracker || createTaskStateTracker(this.sessionTaskStates.get(threadId) || null)
@@ -1705,6 +1741,7 @@ export class CodexAdapter extends BaseAdapter {
         return
       }
       this.quotaCacheAt = 0
+      this.quotaManager.failedAt = 0
       this.emitEvent(EVENTS.STREAM_DONE, {
         sessionId: compositeId,
         app: APPS.CODEX,
@@ -1720,21 +1757,7 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   async readQuota({ force = false } = {}) {
-    const now = Date.now()
-    if (!force && this.quotaCacheAt > 0 && now - this.quotaCacheAt < CODEX_QUOTA_CACHE_TTL_MS) {
-      if (!this.quotaCache?.resetsAt || now <= this.quotaCache.resetsAt + 60_000) {
-        return this.quotaCache
-      }
-    }
-    try {
-      const res = await this.rpc('account/rateLimits/read', {}, 5_000)
-      const parsed = normalizeCodexQuota(res, now)
-      this.quotaCache = parsed
-      this.quotaCacheAt = now
-      return parsed
-    } catch {
-      return this.quotaCache
-    }
+    return this.quotaManager.refreshInBackground({ force })
   }
 
   async getStatus(opts = {}) {
@@ -1773,8 +1796,7 @@ export class CodexAdapter extends BaseAdapter {
     if (!threadId || !cleanPath) return
     const existing = this.watchedSessions.get(threadId)
     const probe = snapshot.probe || probeCodexRolloutStatus(cleanPath, { maxIdleMs: this.externalMaxIdleMs })
-    this.watchedSessions.delete(threadId)
-    this.watchedSessions.set(threadId, {
+    this.watcher.rememberWatched(threadId, {
       threadId,
       path: cleanPath,
       lastSeenAt: Date.now(),
@@ -1788,12 +1810,6 @@ export class CodexAdapter extends BaseAdapter {
       model: snapshot.model ?? existing?.model ?? '',
       createdAt: snapshot.createdAt ?? existing?.createdAt ?? 0,
     })
-    while (this.watchedSessions.size > CODEX_MAX_WATCHED_SESSIONS) {
-      const oldest = this.watchedSessions.keys().next().value
-      if (!oldest) break
-      this.watchedSessions.delete(oldest)
-    }
-    this.ensureWatcherRunning()
   }
 
   rememberTrackedListSession(threadId, snapshot = {}, { fromDiscovery = false } = {}) {
@@ -1801,12 +1817,11 @@ export class CodexAdapter extends BaseAdapter {
     if (!threadId || !cleanPath) return
     const now = Date.now()
     if (!fromDiscovery) {
-      this.lastClientListAt = now
+      this.watcher.markListActive(now)
     }
     const existing = this.trackedListSessions.get(threadId)
     const probe = snapshot.probe || probeCodexRolloutStatus(cleanPath, { maxIdleMs: this.externalMaxIdleMs })
-    this.trackedListSessions.delete(threadId)
-    this.trackedListSessions.set(threadId, {
+    this.watcher.rememberTracked(threadId, {
       threadId,
       path: cleanPath,
       lastSeenAt: fromDiscovery ? (existing?.lastSeenAt || this.lastClientListAt || now) : now,
@@ -1820,20 +1835,10 @@ export class CodexAdapter extends BaseAdapter {
       model: snapshot.model ?? existing?.model ?? '',
       createdAt: snapshot.createdAt ?? existing?.createdAt ?? 0,
     })
-    while (this.trackedListSessions.size > CODEX_TRACKED_LIST_LIMIT) {
-      const oldest = this.trackedListSessions.keys().next().value
-      if (!oldest) break
-      this.trackedListSessions.delete(oldest)
-    }
-    this.ensureWatcherRunning()
   }
 
   ensureWatcherRunning() {
-    if (this.watchTimer || (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0)) return
-    this.watchTimer = setInterval(() => {
-      void this.pollExternalSessions().catch(() => {})
-    }, this.watchPollIntervalMs)
-    this.watchTimer.unref?.()
+    this.watcher.ensureRunning()
   }
 
   buildSessionUpdatedPayload(entry, probe, externalRunning) {
@@ -1858,155 +1863,141 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   async pollExternalSessions() {
-    if (this.watchPollInFlight) return
-    if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0) {
-      if (this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
+    return this.watcher.tick()
+  }
+
+  async _pollExternalSessions({ now }) {
+    if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0) return
+    const emittedIds = new Set()
+
+    // 1. Poll actively watched (opened) Codex sessions for live message/tool progress & status transitions
+    for (const [tid, w] of [...this.watchedSessions.entries()]) {
+      if (now - w.lastSeenAt > CODEX_WATCH_TTL_MS) {
+        this.watchedSessions.delete(tid)
+        continue
       }
-      return
-    }
-    this.watchPollInFlight = true
-    try {
-      const now = Date.now()
-      const emittedIds = new Set()
-
-      // 1. Poll actively watched (opened) Codex sessions for live message/tool progress & status transitions
-      for (const [tid, w] of [...this.watchedSessions.entries()]) {
-        if (now - w.lastSeenAt > CODEX_WATCH_TTL_MS) {
-          this.watchedSessions.delete(tid)
-          continue
-        }
-        if (this.activeTurns.has(tid)) {
-          const cur = probeCodexRolloutStatus(w.path, { now, maxIdleMs: this.externalMaxIdleMs })
-          w.size = cur.size
-          w.mtimeMs = cur.mtimeMs
-          w.externalRunning = false
-          continue
-        }
+      if (this.activeTurns.has(tid)) {
         const cur = probeCodexRolloutStatus(w.path, { now, maxIdleMs: this.externalMaxIdleMs })
-        const fileChanged = cur.exists && (cur.size !== w.size || cur.mtimeMs !== w.mtimeMs)
-        const statusChanged = cur.running !== w.externalRunning
-        if (!fileChanged && !statusChanged) continue
-
         w.size = cur.size
         w.mtimeMs = cur.mtimeMs
-        w.externalRunning = cur.running
-        const tracked = this.trackedListSessions.get(tid)
-        if (tracked) {
-          tracked.size = cur.size
-          tracked.mtimeMs = cur.mtimeMs
-          tracked.externalRunning = cur.running
-        }
-        emittedIds.add(tid)
-        if (fileChanged) {
-          const rolloutTask = extractCodexTaskStateFromRollout(w.path)
-          const goalRes = await this.rpc('thread/goal/get', { threadId: tid }, 2_000).catch(() => null)
-          const tracker = createTaskStateTracker(rolloutTask)
-          if (goalRes?.goal) tracker.setGoal(goalRes.goal, toEpochMs(goalRes.goal.updatedAt || Date.now()))
-          w.taskState = tracker.snapshot()
-          this.sessionTaskStates.set(tid, w.taskState)
-          this.sessionModes.set(tid, w.taskState?.mode === 'plan' ? 'plan' : 'default')
-        }
-        const pendingAsync = extractPendingCodexAsyncQuestionFromRollout(w.path)
-        if (pendingAsync) {
-          this.registerAsyncQuestionPrompt(tid, pendingAsync, {
-            externalRunning: cur.running,
-            cwd: w.cwd || '',
-          })
-        } else {
-          this.clearAsyncQuestionsForThread(tid, { decision: 'desktop' })
-        }
-        this.emitEvent(EVENTS.SESSION_UPDATED, {
-          historyChanged: fileChanged,
-          statusChanged,
-          externalUpdate: true,
-          session: this.buildSessionUpdatedPayload(w, cur, cur.running),
+        w.externalRunning = false
+        continue
+      }
+      const cur = probeCodexRolloutStatus(w.path, { now, maxIdleMs: this.externalMaxIdleMs })
+      const fileChanged = cur.exists && (cur.size !== w.size || cur.mtimeMs !== w.mtimeMs)
+      const statusChanged = cur.running !== w.externalRunning
+      if (!fileChanged && !statusChanged) continue
+
+      w.size = cur.size
+      w.mtimeMs = cur.mtimeMs
+      w.externalRunning = cur.running
+      const tracked = this.trackedListSessions.get(tid)
+      if (tracked) {
+        tracked.size = cur.size
+        tracked.mtimeMs = cur.mtimeMs
+        tracked.externalRunning = cur.running
+      }
+      emittedIds.add(tid)
+      if (fileChanged) {
+        const rolloutTask = extractCodexTaskStateFromRollout(w.path, { parseCache: this.parseCache })
+        const goalRes = await this.rpc('thread/goal/get', { threadId: tid }, 2_000).catch(() => null)
+        const tracker = createTaskStateTracker(rolloutTask)
+        if (goalRes?.goal) tracker.setGoal(goalRes.goal, toEpochMs(goalRes.goal.updatedAt || Date.now()))
+        w.taskState = tracker.snapshot()
+        this.sessionTaskStates.set(tid, w.taskState)
+        this.sessionModes.set(tid, w.taskState?.mode === 'plan' ? 'plan' : 'default')
+      }
+      const pendingAsync = extractPendingCodexAsyncQuestionFromRollout(w.path)
+      if (pendingAsync) {
+        this.registerAsyncQuestionPrompt(tid, pendingAsync, {
+          externalRunning: cur.running,
+          cwd: w.cwd || '',
         })
+      } else {
+        this.clearAsyncQuestionsForThread(tid, { decision: 'desktop' })
       }
+      this.emitEvent(EVENTS.SESSION_UPDATED, {
+        historyChanged: fileChanged,
+        statusChanged,
+        externalUpdate: true,
+        session: this.buildSessionUpdatedPayload(w, cur, cur.running),
+      })
+    }
 
-      // 2. Poll top recent sidebar Codex sessions so running dots flip live when Desktop starts/finishes any task
-      const listExpired = this.lastClientListAt > 0 && now - this.lastClientListAt > CODEX_TRACKED_LIST_TTL_MS
-      if (listExpired) {
-        this.trackedListSessions.clear()
+    // 2. Poll top recent sidebar Codex sessions so running dots flip live when Desktop starts/finishes any task
+    const listExpired = this.lastClientListAt > 0 && this.watcher.isListExpired(now)
+    if (listExpired) {
+      this.trackedListSessions.clear()
+    }
+    for (const [tid, entry] of [...this.trackedListSessions.entries()]) {
+      if (now - entry.lastSeenAt > CODEX_TRACKED_LIST_TTL_MS) {
+        this.trackedListSessions.delete(tid)
+        continue
       }
-      for (const [tid, entry] of [...this.trackedListSessions.entries()]) {
-        if (now - entry.lastSeenAt > CODEX_TRACKED_LIST_TTL_MS) {
-          this.trackedListSessions.delete(tid)
-          continue
-        }
-        if (emittedIds.has(tid) || this.watchedSessions.has(tid)) continue
-        if (this.activeTurns.has(tid)) {
-          entry.externalRunning = false
-          continue
-        }
-        const cur = probeCodexRolloutStatus(entry.path, { now, maxIdleMs: this.externalMaxIdleMs })
-        const statusChanged = cur.running !== entry.externalRunning
-        entry.size = cur.size
-        entry.mtimeMs = cur.mtimeMs
-        if (!statusChanged) continue
-
-        entry.externalRunning = cur.running
-        this.emitEvent(EVENTS.SESSION_UPDATED, {
-          historyChanged: false,
-          statusChanged: true,
-          externalUpdate: true,
-          session: this.buildSessionUpdatedPayload(entry, cur, cur.running),
-        })
+      if (emittedIds.has(tid) || this.watchedSessions.has(tid)) continue
+      if (this.activeTurns.has(tid)) {
+        entry.externalRunning = false
+        continue
       }
+      const cur = probeCodexRolloutStatus(entry.path, { now, maxIdleMs: this.externalMaxIdleMs })
+      const statusChanged = cur.running !== entry.externalRunning
+      entry.size = cur.size
+      entry.mtimeMs = cur.mtimeMs
+      if (!statusChanged) continue
 
-      // 3. Periodically discover newly started / resumed Desktop Codex threads via existing reader daemon
-      if (
-        !listExpired &&
-        this.trackedListSessions.size > 0 &&
-        this.reader.proc &&
-        !this.reader.proc.killed &&
-        now - this.lastListDiscoveryAt >= CODEX_LIST_DISCOVERY_INTERVAL_MS
-      ) {
-        this.lastListDiscoveryAt = now
-        try {
-          const res = await this.rpc(
-            'thread/list',
-            { limit: 10, useStateDbOnly: true, sortKey: 'updated_at', sortDirection: 'desc' },
-            5_000,
+      entry.externalRunning = cur.running
+      this.emitEvent(EVENTS.SESSION_UPDATED, {
+        historyChanged: false,
+        statusChanged: true,
+        externalUpdate: true,
+        session: this.buildSessionUpdatedPayload(entry, cur, cur.running),
+      })
+    }
+
+    // 3. Periodically discover newly started / resumed Desktop Codex threads via existing reader daemon
+    if (
+      !listExpired &&
+      this.trackedListSessions.size > 0 &&
+      this.reader.proc &&
+      !this.reader.proc.killed &&
+      now - this.lastListDiscoveryAt >= CODEX_LIST_DISCOVERY_INTERVAL_MS
+    ) {
+      this.lastListDiscoveryAt = now
+      try {
+        const res = await this.rpc(
+          'thread/list',
+          { limit: 10, useStateDbOnly: true, sortKey: 'updated_at', sortDirection: 'desc' },
+          5_000,
+        )
+        for (const raw of res?.data || []) {
+          if (!raw?.id || !raw?.path || this.activeTurns.has(raw.id)) continue
+          const probe = probeCodexRolloutStatus(raw.path, { now, maxIdleMs: this.externalMaxIdleMs })
+          const prev = this.trackedListSessions.get(raw.id)
+          const summary = normalizeThreadSummary(raw)
+          const prevRunning = Boolean(prev?.externalRunning)
+          this.rememberTrackedListSession(
+            raw.id,
+            {
+              ...summary,
+              path: raw.path,
+              probe,
+              externalRunning: probe.running,
+            },
+            { fromDiscovery: true },
           )
-          for (const raw of res?.data || []) {
-            if (!raw?.id || !raw?.path || this.activeTurns.has(raw.id)) continue
-            const probe = probeCodexRolloutStatus(raw.path, { now, maxIdleMs: this.externalMaxIdleMs })
-            const prev = this.trackedListSessions.get(raw.id)
-            const summary = normalizeThreadSummary(raw)
-            const prevRunning = Boolean(prev?.externalRunning)
-            this.rememberTrackedListSession(
-              raw.id,
-              {
-                ...summary,
-                path: raw.path,
-                probe,
-                externalRunning: probe.running,
-              },
-              { fromDiscovery: true },
-            )
-            if ((!prev && probe.running) || (prev && prevRunning !== probe.running)) {
-              const entry = this.trackedListSessions.get(raw.id)
-              if (entry && !emittedIds.has(raw.id)) {
-                this.emitEvent(EVENTS.SESSION_UPDATED, {
-                  historyChanged: false,
-                  statusChanged: true,
-                  externalUpdate: true,
-                  session: this.buildSessionUpdatedPayload(entry, probe, probe.running),
-                })
-              }
+          if ((!prev && probe.running) || (prev && prevRunning !== probe.running)) {
+            const entry = this.trackedListSessions.get(raw.id)
+            if (entry && !emittedIds.has(raw.id)) {
+              this.emitEvent(EVENTS.SESSION_UPDATED, {
+                historyChanged: false,
+                statusChanged: true,
+                externalUpdate: true,
+                session: this.buildSessionUpdatedPayload(entry, probe, probe.running),
+              })
             }
           }
-        } catch {}
-      }
-
-      if (this.watchedSessions.size === 0 && this.trackedListSessions.size === 0 && this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
-      }
-    } finally {
-      this.watchPollInFlight = false
+        }
+      } catch {}
     }
   }
 
@@ -2194,7 +2185,7 @@ export class CodexAdapter extends BaseAdapter {
     // Final safety net: zero-OOM tail-seek JSONL reader for giant/legacy rollout files
     // (also rescues fuller recent history when a corrupt schema item sits near the newest items)
     if (!cursor && !pendingNew && t.path && (messages.length === 0 || (hitDeserializationBoundary && messages.length < 4))) {
-      const tailMsgs = readCodexRolloutTail(t.path, { limit: targetBubbles })
+      const tailMsgs = readCodexRolloutTail(t.path, { limit: targetBubbles, parseCache: this.parseCache })
       if (tailMsgs.length > messages.length) {
         messages = tailMsgs
         hasMore = false
@@ -2214,7 +2205,7 @@ export class CodexAdapter extends BaseAdapter {
     if (isLocalActive && activeTurn?.taskTracker) {
       taskState = activeTurn.taskTracker.snapshot()
     } else if (!cursor) {
-      const rolloutTask = t.path ? extractCodexTaskStateFromRollout(t.path) : null
+      const rolloutTask = t.path ? extractCodexTaskStateFromRollout(t.path, { parseCache: this.parseCache }) : null
       const tracker = createTaskStateTracker(rolloutTask)
       if (Array.isArray(loadedTurns)) {
         for (const turn of loadedTurns) {
@@ -2290,6 +2281,24 @@ export class CodexAdapter extends BaseAdapter {
     }
   }
 
+  _evictPendingNewWritersIfNeeded(maxKeep = MAX_PENDING_NEW_WRITERS - 1) {
+    while (this.pendingNewWriters.size > maxKeep) {
+      const oldestTid = this.pendingNewWriters.keys().next().value
+      if (!oldestTid) break
+      const oldest = this.pendingNewWriters.get(oldestTid)
+      this.pendingNewWriters.delete(oldestTid)
+      if (oldest?.timer) this.clearTrackedTimer(oldest.timer)
+      if (oldest?.writer) {
+        const rel = this.releaseWriter(oldest.writer, oldestTid).finally(() => {
+          if (this.releasingWriters.get(oldestTid) === rel) {
+            this.releasingWriters.delete(oldestTid)
+          }
+        })
+        this.releasingWriters.set(oldestTid, rel)
+      }
+    }
+  }
+
   async createSession({ cwd, title, model, reasoningEffort, sandbox, approvalPolicy } = {}) {
     const targetCwd = String(cwd || '').trim() || this.defaultCwd
     const writer = this.createWriter('new')
@@ -2316,8 +2325,10 @@ export class CodexAdapter extends BaseAdapter {
       if (reasoningEffort) summary.reasoningEffort = reasoningEffort
 
       if (t.id) {
+        // Bound concurrent idle new-thread writers to MAX_PENDING_NEW_WRITERS (evicting oldest first)
+        this._evictPendingNewWritersIfNeeded(MAX_PENDING_NEW_WRITERS - 1)
         // Hold this temporary writer ONLY until Turn 1 completes (or 3 min idle) so empty threads can start Turn 1 cleanly
-        const timer = setTimeout(() => {
+        const timer = this.setTimeout(() => {
           const entry = this.pendingNewWriters.get(t.id)
           if (entry && entry.writer === writer) {
             this.pendingNewWriters.delete(t.id)
@@ -2329,7 +2340,6 @@ export class CodexAdapter extends BaseAdapter {
             this.releasingWriters.set(t.id, rel)
           }
         }, 3 * 60_000)
-        timer.unref?.()
         this.pendingNewWriters.set(t.id, { writer, summary, timer })
       } else {
         await this.releaseWriter(writer, '')
@@ -2422,7 +2432,7 @@ export class CodexAdapter extends BaseAdapter {
       // Reuse pending new-thread writer if Turn 1 and still alive; otherwise spawn a fresh per-turn writer
       const pendingNew = this.pendingNewWriters.get(threadId)
       if (pendingNew) {
-        clearTimeout(pendingNew.timer)
+        this.clearTrackedTimer(pendingNew.timer)
         this.pendingNewWriters.delete(threadId)
         if (pendingNew.writer?.proc && !pendingNew.writer.proc.killed) {
           writer = pendingNew.writer
@@ -2556,9 +2566,9 @@ export class CodexAdapter extends BaseAdapter {
       // Guard against hung writer turns with a sliding inactivity timeout (paused while awaiting approval)
       let turnTimer = null
       const resetTurnTimeout = () => {
-        if (turnTimer) clearTimeout(turnTimer)
+        if (turnTimer) this.clearTrackedTimer(turnTimer)
         if (turnState.settled) return
-        turnTimer = setTimeout(() => {
+        turnTimer = this.setTimeout(() => {
           if (turnState.settled) return
           for (const req of this.pendingServerRequests.values()) {
             if (req.writer === writer) {
@@ -2569,7 +2579,6 @@ export class CodexAdapter extends BaseAdapter {
           turnState.settled = true
           turnState.reject?.(new Error('Codex 回合响应超时（长时间无输出），已自动释放锁'))
         }, CODEX_TURN_INACTIVITY_TIMEOUT_MS)
-        turnTimer.unref?.()
       }
       turnState.touchActivity = resetTurnTimeout
       resetTurnTimeout()
@@ -2577,7 +2586,7 @@ export class CodexAdapter extends BaseAdapter {
       try {
         return await turnDone
       } finally {
-        if (turnTimer) clearTimeout(turnTimer)
+        if (turnTimer) this.clearTrackedTimer(turnTimer)
       }
     } catch (err) {
       if (!err?._streamErrorEmitted) {
@@ -2660,7 +2669,12 @@ export class CodexAdapter extends BaseAdapter {
             entry.writer?.sendRaw({ jsonrpc: '2.0', id: entry.rpcId, result: { decision: 'cancel' } })
           }
         } catch {}
-        this.emitEvent(EVENTS.APPROVAL_RESOLVED, { id: aprId, app: APPS.CODEX, decision: 'cancel' })
+        this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
+          id: aprId,
+          app: APPS.CODEX,
+          sessionId: makeCompositeId(APPS.CODEX, threadId),
+          decision: 'cancel',
+        })
       }
     }
     const active = this.activeTurns.get(threadId)
@@ -2674,17 +2688,13 @@ export class CodexAdapter extends BaseAdapter {
 
   async dispose() {
     this.disposed = true
-    if (this.watchTimer) {
-      clearInterval(this.watchTimer)
-      this.watchTimer = null
-    }
-    this.watchedSessions.clear()
-    this.trackedListSessions.clear()
+    this.watcher.dispose()
+    this.quotaManager.dispose()
     for (const [aprId] of this.pendingServerRequests.entries()) {
       this.pendingServerRequests.delete(aprId)
     }
     for (const [tid, entry] of this.pendingNewWriters.entries()) {
-      clearTimeout(entry.timer)
+      this.clearTrackedTimer(entry.timer)
       entry.writer.killImmediate()
       this.pendingNewWriters.delete(tid)
     }

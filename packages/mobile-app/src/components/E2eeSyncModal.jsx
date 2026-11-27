@@ -91,6 +91,7 @@ export function E2eeSyncModal({
   const grantPrivateKeyRef = useRef(null)
   const grantSecretRef = useRef('')
   const offerLockedReqIdRef = useRef('')
+  const bufferedOffersRef = useRef(new Map())
   const grantStateRef = useRef(null)
   grantStateRef.current = grantState
   const grantSessionGenRef = useRef(0)
@@ -113,9 +114,50 @@ export function E2eeSyncModal({
     grantPrivateKeyRef.current = null
     grantSecretRef.current = ''
     offerLockedReqIdRef.current = ''
+    bufferedOffersRef.current.clear()
     setGrantState(null)
     setGrantCountdownSec(0)
   }, [client])
+
+  const processGrantOffer = useCallback(
+    async (cur, payload) => {
+      if (!cur || !payload?.approverPubKey || payload.reqId !== cur.reqId) return
+      if (cur.phase !== 'waiting' || offerLockedReqIdRef.current === cur.reqId) return
+      const appNonce = String(payload.approverNonce || '').trim()
+      if (!appNonce || !cur.reqNonce) return
+      offerLockedReqIdRef.current = cur.reqId
+      try {
+        client?.sendGrantReveal?.({ reqId: cur.reqId, requesterNonce: cur.reqNonce })
+        const sas = await deriveGrantSas({
+          requesterPubKey: cur.pubKeyRaw,
+          approverPubKey: payload.approverPubKey,
+          reqId: cur.reqId,
+          roomId,
+          requesterNonce: cur.reqNonce,
+          approverNonce: appNonce,
+        })
+        setGrantState((prev) => {
+          if (!prev || prev.reqId !== cur.reqId || prev.phase !== 'waiting') return prev
+          const next = {
+            ...prev,
+            phase: 'sas',
+            sasCode: sas,
+            approverPubKey: payload.approverPubKey,
+            approverNonce: appNonce,
+            approverDeviceName: payload.approverDeviceName || bi('已授权设备', 'Authorized Device'),
+            approverIp: payload.approverIp || '',
+          }
+          grantStateRef.current = next
+          return next
+        })
+      } catch {
+        if (offerLockedReqIdRef.current === cur.reqId) {
+          offerLockedReqIdRef.current = ''
+        }
+      }
+    },
+    [client, roomId, bi],
+  )
 
   const startGrantSession = useCallback(async () => {
     if (!client || !roomId) return
@@ -144,23 +186,9 @@ export function E2eeSyncModal({
       })
       const qrDataUrl = renderQrDataUrl(uri, { pixelSize: 224, darkColor: '#0F172A', lightColor: '#FFFFFF' })
       if (grantSessionGenRef.current !== gen) return
-      const sent = client.sendGrantRequest({
-        reqId,
-        pubKey: pair.publicKeyRaw,
-        commit,
-        wantedKeyId: bridgeE2ee?.keyId || '',
-      })
-      if (!sent) {
-        if (grantSessionGenRef.current === gen) {
-          setError(bi('尚未连接到中转服务器，请稍候重试', 'Not connected to relay server yet.'))
-        }
-        return
-      }
-      grantPrivateKeyRef.current = pair.privateKey
-      grantSecretRef.current = grantSecret
-      offerLockedReqIdRef.current = ''
+
       const expiresAt = Date.now() + 120_000
-      setGrantState({
+      const nextGrantState = {
         reqId,
         reqNonce,
         commit,
@@ -174,14 +202,41 @@ export function E2eeSyncModal({
         approverIp: '',
         approverPubKey: '',
         approverNonce: '',
+      }
+      // Populate refs synchronously BEFORE sending so a fast `e2ee.grant.offer` is NEVER dropped
+      grantPrivateKeyRef.current = pair.privateKey
+      grantSecretRef.current = grantSecret
+      offerLockedReqIdRef.current = ''
+      grantStateRef.current = nextGrantState
+
+      const sent = client.sendGrantRequest({
+        reqId,
+        pubKey: pair.publicKeyRaw,
+        commit,
+        wantedKeyId: bridgeE2ee?.keyId || '',
       })
+      if (!sent) {
+        grantPrivateKeyRef.current = null
+        grantSecretRef.current = ''
+        grantStateRef.current = null
+        if (grantSessionGenRef.current === gen) {
+          setError(bi('尚未连接到中转服务器，请稍候重试', 'Not connected to relay server yet.'))
+        }
+        return
+      }
+      setGrantState(nextGrantState)
       setGrantCountdownSec(120)
+      const bufferedOffer = bufferedOffersRef.current.get(reqId)
+      if (bufferedOffer) {
+        bufferedOffersRef.current.delete(reqId)
+        void processGrantOffer(nextGrantState, bufferedOffer)
+      }
     } catch (err) {
       if (grantSessionGenRef.current === gen) {
         setError(String(err?.message || err))
       }
     }
-  }, [client, roomId, bridgeE2ee?.keyId, cancelActiveGrant, bi])
+  }, [client, roomId, bridgeE2ee?.keyId, cancelActiveGrant, processGrantOffer, bi])
 
   useEffect(() => {
     if (!open) {
@@ -237,48 +292,38 @@ export function E2eeSyncModal({
     return () => clearInterval(timer)
   }, [open, grantState])
 
+  // Drain any early buffered `e2ee.grant.offer` once grantState commits into 'waiting'
+  useEffect(() => {
+    if (!open || tab !== 'request' || !grantState || grantState.phase !== 'waiting') return
+    const buffered = bufferedOffersRef.current.get(grantState.reqId)
+    if (buffered) {
+      bufferedOffersRef.current.delete(grantState.reqId)
+      void processGrantOffer(grantState, buffered)
+    }
+  }, [open, tab, grantState, processGrantOffer])
+
   // Listen for approver `offer`, `deliver`, `reject` events on this client
   useEffect(() => {
     if (!open || !client || tab !== 'request') return
     const unsub = client.onEvent(async (event, payload) => {
+      if (!payload?.reqId) return
       const cur = grantStateRef.current
-      if (!cur || !payload || payload.reqId !== cur.reqId) return
 
       if (event === 'e2ee.grant.offer' && payload.approverPubKey) {
-        if (cur.phase !== 'waiting' || offerLockedReqIdRef.current === cur.reqId) return
-        const appNonce = String(payload.approverNonce || '').trim()
-        if (!appNonce || !cur.reqNonce) return
-        offerLockedReqIdRef.current = cur.reqId
-        try {
-          client.sendGrantReveal?.({ reqId: cur.reqId, requesterNonce: cur.reqNonce })
-          const sas = await deriveGrantSas({
-            requesterPubKey: cur.pubKeyRaw,
-            approverPubKey: payload.approverPubKey,
-            reqId: cur.reqId,
-            roomId,
-            requesterNonce: cur.reqNonce,
-            approverNonce: appNonce,
-          })
-          setGrantState((prev) =>
-            prev && prev.reqId === cur.reqId && prev.phase === 'waiting'
-              ? {
-                  ...prev,
-                  phase: 'sas',
-                  sasCode: sas,
-                  approverPubKey: payload.approverPubKey,
-                  approverNonce: appNonce,
-                  approverDeviceName: payload.approverDeviceName || bi('已授权设备', 'Authorized Device'),
-                  approverIp: payload.approverIp || '',
-                }
-              : prev,
-          )
-        } catch {
-          if (offerLockedReqIdRef.current === cur.reqId) {
-            offerLockedReqIdRef.current = ''
+        if (!cur || payload.reqId !== cur.reqId) {
+          // Buffer early offer in case it arrived during grant setup before state committed
+          bufferedOffersRef.current.set(payload.reqId, payload)
+          if (bufferedOffersRef.current.size > 8) {
+            const oldest = bufferedOffersRef.current.keys().next().value
+            if (oldest) bufferedOffersRef.current.delete(oldest)
           }
+          return
         }
+        await processGrantOffer(cur, payload)
         return
       }
+
+      if (!cur || payload.reqId !== cur.reqId) return
 
       if (event === 'e2ee.grant.cancel') {
         grantPrivateKeyRef.current = null
@@ -392,7 +437,7 @@ export function E2eeSyncModal({
       }
     })
     return () => unsub?.()
-  }, [open, client, tab, roomId, bridgeE2ee?.keyId, isDesktopApp, onImportKeyring, onImportKey, onClose, bi])
+  }, [open, client, tab, roomId, bridgeE2ee?.keyId, isDesktopApp, onImportKeyring, onImportKey, onClose, processGrantOffer, bi])
 
   const isBridgeLockedRef = useRef(isBridgeLocked)
   isBridgeLockedRef.current = isBridgeLocked

@@ -101,6 +101,13 @@ export class StreamJsonCliRunner {
     })
 
     return new Promise((resolvePromise, rejectPromise) => {
+      let cleanupRan = false
+      const runCleanupOnce = () => {
+        if (cleanupRan) return
+        cleanupRan = true
+        try { onCleanup?.() } catch {}
+      }
+
       let proc
       try {
         proc = this.spawnFn(bin, args, {
@@ -111,7 +118,7 @@ export class StreamJsonCliRunner {
         })
       } catch (err) {
         if (reservationToken) this.releaseReservation(sessionId, reservationToken)
-        try { onCleanup?.() } catch {}
+        runCleanupOnce()
         if (err && typeof err === 'object') err._streamErrorEmitted = true
         this.emitEvent(EVENTS.STREAM_ERROR, {
           sessionId: compositeId,
@@ -146,7 +153,7 @@ export class StreamJsonCliRunner {
         aborted: Boolean(reservationToken?.aborted),
         taskTracker,
         emitTaskState,
-        cleanup: onCleanup,
+        cleanup: runCleanupOnce,
         inactivityTimer: null,
       }
       this.activeProcs.set(sessionId, state)
@@ -377,12 +384,12 @@ export class StreamJsonCliRunner {
       })
 
       proc.on('exit', () => {
-        try { onCleanup?.() } catch {}
+        runCleanupOnce()
       })
 
       proc.on('error', (err) => {
         clearInactivityTimer()
-        try { onCleanup?.() } catch {}
+        runCleanupOnce()
         if (settled) return
         settled = true
         if (this.activeProcs.get(sessionId) === state) {
@@ -400,7 +407,7 @@ export class StreamJsonCliRunner {
 
       proc.on('close', (code) => {
         clearInactivityTimer()
-        try { onCleanup?.() } catch {}
+        runCleanupOnce()
         if (settled) return
         settled = true
         const tail = droppingOversizedLine ? '' : stdoutBuf.trim()
@@ -459,14 +466,17 @@ export class StreamJsonCliRunner {
         type: 'user',
         message: { role: 'user', content: prompt },
       })
+      let writeFailed = false
       try {
         proc.stdin.write(`${userFrame}\n`, 'utf8')
       } catch (err) {
+        writeFailed = true
         killProcessTree(proc, { force: true })
         clearInactivityTimer()
         if (!settled) {
           settled = true
           if (this.activeProcs.get(sessionId) === state) this.activeProcs.delete(sessionId)
+          this.clearPendingControlRequests(proc)
           if (err && typeof err === 'object') err._streamErrorEmitted = true
           this.emitEvent(EVENTS.STREAM_ERROR, {
             sessionId: compositeId,
@@ -474,6 +484,10 @@ export class StreamJsonCliRunner {
             message: String(err?.message || err),
           })
           rejectPromise(err)
+        }
+      } finally {
+        if (writeFailed) {
+          runCleanupOnce()
         }
       }
     })
@@ -732,15 +746,7 @@ export class StreamJsonCliRunner {
     if (!proc) return { interrupted: true, sessionId }
     this.clearPendingControlRequests(proc)
     try { proc.stdin?.end() } catch {}
-    killProcessTree(proc, { force: false })
-    if (proc.exitCode === null && proc.signalCode === null) {
-      const killTimer = setTimeout(() => {
-        if (proc.exitCode !== null || proc.signalCode !== null) return
-        killProcessTree(proc, { force: true })
-      }, 2_000)
-      killTimer.unref?.()
-      proc.once('close', () => clearTimeout(killTimer))
-    }
+    killProcessTree(proc, { force: false, graceMs: 2_000 })
     return { interrupted: true, sessionId }
   }
 

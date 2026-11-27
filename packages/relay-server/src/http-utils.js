@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 
-const SAFE_SCRIPT_URL_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
-const SAFE_PREFIX_RE = /^\/[A-Za-z0-9._\-\/]*$/
+const SAFE_SCRIPT_URL_RE = /^https?:\/\/[A-Za-z0-9._:[\]/-]+$/
+const SAFE_PREFIX_RE = /^\/[A-Za-z0-9._/-]*$/
 
 export const CAPACITOR_ORIGINS = new Set([
   'capacitor://localhost',
@@ -20,6 +20,13 @@ export class HttpError extends Error {
     this.name = 'HttpError'
     this.statusCode = statusCode
     this.code = code
+  }
+}
+
+export class PayloadTooLargeError extends HttpError {
+  constructor(message = '请求体过大') {
+    super(413, message, 'PAYLOAD_TOO_LARGE')
+    this.name = 'PayloadTooLargeError'
   }
 }
 
@@ -217,32 +224,65 @@ export function buildAllowedOriginsSet(publicRelayUrl, rawAllowedOrigins) {
   return allowed
 }
 
+const MAX_DRAIN_AFTER_LIMIT_BYTES = 128 * 1024
+
 /**
  * Parse a JSON HTTP request body and assert that it is a plain object.
- * Throws `HttpError(413)` on size overflow and `HttpError(400)` on invalid JSON or non-object payload.
+ * Throws `PayloadTooLargeError(413)` on size overflow without abruptly destroying the TCP socket
+ * (so route handlers can flush a clean `413` JSON response with `Connection: close`),
+ * and `HttpError(400)` on invalid JSON or non-object payload.
  */
 export function readJsonObjectBody(req, maxBytes = 256 * 1024) {
   return new Promise((resolvePromise, rejectPromise) => {
+    const declaredLen = Number(req.headers?.['content-length'])
+    if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+      if (declaredLen <= maxBytes + MAX_DRAIN_AFTER_LIMIT_BYTES) {
+        let drained = 0
+        req.on('data', (chunk) => {
+          drained += chunk.length
+          if (drained > maxBytes + MAX_DRAIN_AFTER_LIMIT_BYTES) {
+            try { req.pause() } catch {}
+          }
+        })
+        req.on('error', () => {})
+        try { req.resume() } catch {}
+      } else {
+        try { req.pause() } catch {}
+      }
+      rejectPromise(new PayloadTooLargeError())
+      return
+    }
+
     const chunks = []
     let total = 0
+    let drainedAfterLimit = 0
     let settled = false
+    let tooLarge = false
     const fail = (err) => {
       if (settled) return
       settled = true
       rejectPromise(err)
     }
     req.on('data', (chunk) => {
+      if (tooLarge) {
+        drainedAfterLimit += chunk.length
+        if (drainedAfterLimit > MAX_DRAIN_AFTER_LIMIT_BYTES) {
+          try { req.pause() } catch {}
+        }
+        return
+      }
       if (settled) return
       total += chunk.length
       if (total > maxBytes) {
-        fail(new HttpError(413, '请求体过大', 'PAYLOAD_TOO_LARGE'))
-        try { req.destroy() } catch {}
+        tooLarge = true
+        chunks.length = 0
+        fail(new PayloadTooLargeError())
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
-      if (settled) return
+      if (tooLarge || settled) return
       settled = true
       try {
         const text = Buffer.concat(chunks).toString('utf8').trim()
@@ -260,27 +300,37 @@ export function readJsonObjectBody(req, maxBytes = 256 * 1024) {
         rejectPromise(new HttpError(400, '请求格式错误', 'INVALID_JSON'))
       }
     })
-    req.on('error', (err) => fail(new HttpError(400, String(err?.message || '读取请求失败'), 'REQUEST_STREAM_ERROR')))
+    req.on('error', (err) => {
+      if (tooLarge) return
+      fail(new HttpError(400, String(err?.message || '读取请求失败'), 'REQUEST_STREAM_ERROR'))
+    })
   })
 }
 
-export function sendJson(res, status, data) {
+export function sendJson(res, status, data, extraHeaders = null) {
   const body = JSON.stringify(data)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
+    ...(extraHeaders || {}),
   })
   res.end(body)
 }
 
 export function sendRouteError(res, err, log = console, context = '') {
   if (err instanceof HttpError) {
-    sendJson(res, err.statusCode, {
-      ok: false,
-      ...(err.code ? { code: err.code } : {}),
-      error: err.message,
-    })
+    const extraHeaders = err.statusCode === 413 ? { Connection: 'close' } : null
+    sendJson(
+      res,
+      err.statusCode,
+      {
+        ok: false,
+        ...(err.code ? { code: err.code } : {}),
+        error: err.message,
+      },
+      extraHeaders,
+    )
     return
   }
   if (err?.statusCode === 503) {
@@ -459,5 +509,87 @@ export function createIpDailyRegistrationLimiter({ maxPerIpPerDay = 5, maxEntrie
     }
   }
 
-  return { check, record, limit }
+  function tryReserve(ip, now = Date.now()) {
+    if (limit <= 0) return { ok: true, release: () => {} }
+    const cleanIp = String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+    const today = utcDay(now)
+    if (counts.size >= maxEntries) {
+      for (const [k, v] of counts.entries()) {
+        if (v.day !== today) counts.delete(k)
+      }
+      while (counts.size >= maxEntries) {
+        const oldest = counts.keys().next().value
+        if (!oldest) break
+        counts.delete(oldest)
+      }
+    }
+    const entry = counts.get(cleanIp)
+    if (!entry || entry.day !== today) {
+      const nextEntry = { day: today, count: 1 }
+      counts.set(cleanIp, nextEntry)
+      let released = false
+      return {
+        ok: true,
+        release: () => {
+          if (released) return
+          released = true
+          const cur = counts.get(cleanIp)
+          if (cur === nextEntry) {
+            cur.count = Math.max(0, cur.count - 1)
+            if (cur.count === 0) counts.delete(cleanIp)
+          }
+        },
+      }
+    }
+    if (entry.count >= limit) {
+      return { ok: false, release: () => {} }
+    }
+    entry.count += 1
+    let released = false
+    return {
+      ok: true,
+      release: () => {
+        if (released) return
+        released = true
+        const cur = counts.get(cleanIp)
+        if (cur === entry) {
+          cur.count = Math.max(0, cur.count - 1)
+          if (cur.count === 0) counts.delete(cleanIp)
+        }
+      },
+    }
+  }
+
+  return { check, record, tryReserve, limit }
+}
+
+/**
+ * Bounded per-user / per-key 1-minute sliding window API action rate limiter.
+ */
+export function createUserActionRateLimiter({ maxBuckets = 5000, windowMs = 60_000 } = {}) {
+  const buckets = new Map()
+  return function checkUserActionRateLimit(bucketName, roomId, limitPerMin = 60) {
+    const rid = String(roomId || '').trim()
+    if (!rid) return true
+    const key = `${bucketName}:${rid}`
+    const now = Date.now()
+    if (buckets.size >= maxBuckets) {
+      for (const [k, v] of buckets.entries()) {
+        if (now - v.startAt >= windowMs) buckets.delete(k)
+      }
+      while (buckets.size >= maxBuckets) {
+        const oldest = buckets.keys().next().value
+        if (!oldest) break
+        buckets.delete(oldest)
+      }
+    }
+    const entry = buckets.get(key)
+    if (!entry || now - entry.startAt >= windowMs) {
+      buckets.set(key, { count: 1, startAt: now })
+      return true
+    }
+    if (entry.count >= limitPerMin) return false
+    entry.count += 1
+    return true
+  }
 }

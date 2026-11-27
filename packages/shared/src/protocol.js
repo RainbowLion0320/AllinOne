@@ -113,7 +113,8 @@ export const EVENTS = Object.freeze({
   CLIENT_REVOKED: 'client.revoked',
 })
 
-export const P2P_PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 1
+export const P2P_PROTOCOL_VERSION = PROTOCOL_VERSION
 
 /**
  * Canonical control-plane WebSocket message types between Relay, Bridge, and Client.
@@ -133,17 +134,15 @@ export const WS_MSG = Object.freeze({
   E2EE_GRANT_LIST_RES: 'e2ee.grant.list.res',
   E2EE_GRANT_OFFER: 'e2ee.grant.offer',
   E2EE_GRANT_REVEAL: 'e2ee.grant.reveal',
-  E2EE_GRANT_APPROVE: 'e2ee.grant.approve',
+  E2EE_GRANT_DELIVER: 'e2ee.grant.deliver',
   E2EE_GRANT_REJECT: 'e2ee.grant.reject',
   E2EE_GRANT_CANCEL: 'e2ee.grant.cancel',
   E2EE_QR_NUDGE: 'e2ee.qr.nudge',
 })
 
 /**
- * Protocol version & capability flags advertised during control-plane and P2P handshakes.
+ * Capability flags advertised during control-plane and P2P handshakes.
  */
-export const PROTOCOL_VERSION = 1
-
 export const PROTOCOL_CAPABILITIES = Object.freeze([
   'ctrl-bin-v1',
   'deflate-raw',
@@ -156,7 +155,7 @@ export const PROTOCOL_CAPABILITIES = Object.freeze([
 /**
  * Canonical account tiers & default monthly TURN quotas (MB; 0 = unlimited).
  */
-export const VALID_TIERS = Object.freeze(['free', 'pro', 'ultra'])
+export const VALID_TIERS = Object.freeze(['free', 'pro', 'ultra', 'admin'])
 export const DEFAULT_TURN_QUOTA_MB = Object.freeze({
   free: 1024,
   pro: 10240,

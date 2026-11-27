@@ -296,9 +296,8 @@ export class JsonRpcStdioClient {
       }
       proc.once('close', finish)
       const killTimer = setTimeout(() => {
-        killProcessTree(proc, { force: false })
+        killProcessTree(proc, { force: false, graceMs: forceAfterMs })
         forceTimer = setTimeout(() => {
-          killProcessTree(proc, { force: true })
           doneTimer = setTimeout(finish, 150)
           doneTimer.unref?.()
         }, forceAfterMs)

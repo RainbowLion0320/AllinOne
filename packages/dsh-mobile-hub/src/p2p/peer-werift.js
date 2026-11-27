@@ -1,5 +1,73 @@
 import { RTCPeerConnection, RTCIceCandidate } from 'werift'
-import { sendWithBackpressure } from '@allinone/shared/p2p-mux'
+import { createSerializedChannelWriter } from '@allinone/shared/p2p-mux'
+
+const CTRL_HIGH_WATER_BYTES = 1024 * 1024
+const CTRL_LOW_WATER_BYTES = 256 * 1024
+
+/**
+ * Wrap a `werift` RTCDataChannel with a browser-compatible EventTarget + Buffer-converting `send()`
+ * surface so `createSerializedChannelWriter` / `waitForChannelDrain` receive immediate `bufferedamountlow`
+ * and `close` notifications without racing or throwing on `Uint8Array` views.
+ */
+function wrapWeriftDataChannel(dc, isPeerClosed) {
+  const subsByType = {
+    bufferedamountlow: new Map(),
+    close: new Map(),
+  }
+
+  return {
+    get readyState() {
+      return isPeerClosed() ? 'closed' : dc.readyState
+    },
+    get bufferedAmount() {
+      return Number(dc.bufferedAmount || 0)
+    },
+    get bufferedAmountLowThreshold() {
+      return dc.bufferedAmountLowThreshold
+    },
+    set bufferedAmountLowThreshold(v) {
+      try {
+        dc.bufferedAmountLowThreshold = v
+      } catch {}
+    },
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return
+      if (type === 'bufferedamountlow' && dc.bufferedAmountLow && typeof dc.bufferedAmountLow.subscribe === 'function') {
+        if (subsByType.bufferedamountlow.has(fn)) return
+        const sub = dc.bufferedAmountLow.subscribe(() => fn())
+        subsByType.bufferedamountlow.set(fn, sub)
+      } else if (type === 'close' && dc.stateChanged && typeof dc.stateChanged.subscribe === 'function') {
+        if (subsByType.close.has(fn)) return
+        const sub = dc.stateChanged.subscribe((s) => {
+          if (s === 'closed' || s === 'closing') fn()
+        })
+        subsByType.close.set(fn, sub)
+      }
+    },
+    removeEventListener(type, fn) {
+      const bucket = subsByType[type]
+      if (!bucket) return
+      const sub = bucket.get(fn)
+      if (sub) {
+        bucket.delete(fn)
+        try { sub.unsubscribe?.() } catch {}
+      }
+    },
+    send(data) {
+      if (isPeerClosed() || dc.readyState !== 'open') {
+        throw new Error('DataChannel closed')
+      }
+      if (typeof data === 'string') {
+        dc.send(data)
+        return
+      }
+      const buf = Buffer.isBuffer(data)
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+      dc.send(buf)
+    },
+  }
+}
 
 /**
  * Pure-JS `werift` WebRTC Peer backend for standalone CLI / headless Node.js bridges.
@@ -28,6 +96,8 @@ export function createWeriftPeer({
   })
   let ctrlDc = null
   let bulkDc = null
+  let ctrlChannel = null
+  let bulkChannel = null
   let closed = false
   let pcClosed = false
   let teardownPromise = null
@@ -36,6 +106,13 @@ export function createWeriftPeer({
   const pendingIce = []
   const detectTimers = new Set()
 
+  const ctrlWriter = createSerializedChannelWriter(null, {
+    highWaterMark: CTRL_HIGH_WATER_BYTES,
+    lowWaterMark: CTRL_LOW_WATER_BYTES,
+    timeoutMs: 30_000,
+  })
+  const bulkWriter = createSerializedChannelWriter()
+
   const clearDetectTimers = () => {
     for (const t of detectTimers) clearTimeout(t)
     detectTimers.clear()
@@ -43,6 +120,8 @@ export function createWeriftPeer({
 
   const teardown = () => {
     clearDetectTimers()
+    ctrlWriter.close()
+    bulkWriter.close()
     if (pcClosed) return teardownPromise || Promise.resolve()
     pcClosed = true
     teardownPromise = (async () => {
@@ -155,6 +234,8 @@ export function createWeriftPeer({
     const label = String(dc.label || '')
     if (label === 'aio-ctrl') {
       ctrlDc = dc
+      ctrlChannel = wrapWeriftDataChannel(dc, () => closed)
+      ctrlWriter.setChannel(ctrlChannel)
       const notifyOpen = () => {
         if (!closed) {
           try { onCtrlOpen?.() } catch {}
@@ -180,6 +261,8 @@ export function createWeriftPeer({
     } else if (label === 'aio-bulk') {
       bulkDc = dc
       try { dc.bufferedAmountLowThreshold = 512 * 1024 } catch {}
+      bulkChannel = wrapWeriftDataChannel(dc, () => closed)
+      bulkWriter.setChannel(bulkChannel)
       const notifyOpen = () => {
         if (!closed) {
           try { onBulkOpen?.() } catch {}
@@ -206,6 +289,14 @@ export function createWeriftPeer({
 
   return {
     engine: 'werift',
+    ctrlWriter,
+    bulkWriter,
+    getCtrlChannel() {
+      return ctrlChannel
+    },
+    getBulkChannel() {
+      return bulkChannel
+    },
     async handleOffer(sdp) {
       if (closed) throw new Error('WebRTC peer closed')
       await pc.setRemoteDescription({ type: 'offer', sdp: String(sdp || '') })
@@ -257,10 +348,7 @@ export function createWeriftPeer({
       if (closed || !bulkDc || bulkDc.readyState !== 'open') {
         throw new Error('Bulk DataChannel is not open')
       }
-      const buf = Buffer.isBuffer(bytes)
-        ? bytes
-        : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-      await sendWithBackpressure(bulkDc, buf, opts)
+      await bulkWriter.send(bytes, opts)
     },
     async close() {
       const shouldNotify = !closed

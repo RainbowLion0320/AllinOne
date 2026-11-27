@@ -37,6 +37,7 @@ export function E2eeGrantApproveModal({
   preferredKeyId = '',
   client = null,
   onDone = null,
+  onNotify = null,
   onClose = null,
 }) {
   const { bi } = useI18n()
@@ -51,6 +52,10 @@ export function E2eeGrantApproveModal({
   const stepRef = useRef(step)
   stepRef.current = step
   const rejectedOrDoneRef = useRef(false)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  const onNotifyRef = useRef(onNotify)
+  onNotifyRef.current = onNotify
 
   const grantReqId = grant?.reqId || ''
   const qrVerified = Boolean(grant?.qrVerified)
@@ -84,7 +89,12 @@ export function E2eeGrantApproveModal({
     requesterNonceRef.current = ''
     return () => {
       clearCloseTimer()
-      if ((stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') && !rejectedOrDoneRef.current) {
+      // NEVER send e2ee.grant.reject if this grant was already claimed/cancelled externally
+      if (
+        (stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') &&
+        !rejectedOrDoneRef.current &&
+        !client?.isGrantCancelled?.(grantReqId)
+      ) {
         rejectedOrDoneRef.current = true
         try {
           client?.sendGrantReject?.({ reqId: grantReqId })
@@ -93,12 +103,27 @@ export function E2eeGrantApproveModal({
     }
   }, [open, grantReqId, client])
 
-  // Listen for Commit-then-Reveal `e2ee.grant.reveal` while modal is open (avoids race if reveal arrives fast)
+  // Listen for `e2ee.grant.cancel` (multi-approver claimed_by_other / already_claimed) & `e2ee.grant.reveal`
   useEffect(() => {
     if (!open || !client || !grantReqId) return
     let cancelled = false
     const unsub = client.onEvent(async (event, payload) => {
-      if (cancelled || event !== 'e2ee.grant.reveal' || !payload || payload.reqId !== grantReqId) return
+      if (cancelled || !payload || payload.reqId !== grantReqId) return
+
+      if (event === 'e2ee.grant.cancel') {
+        clearCloseTimer()
+        rejectedOrDoneRef.current = true
+        const reason = String(payload.reason || '').trim().toLowerCase()
+        if (reason === 'claimed_by_other' || reason === 'already_claimed' || reason === 'delivered') {
+          onNotifyRef.current?.(
+            bi('该授权请求已被其他设备处理', 'This authorization request was already handled by another device'),
+          )
+        }
+        onCloseRef.current?.()
+        return
+      }
+
+      if (event !== 'e2ee.grant.reveal') return
       if (stepRef.current !== 'waiting-reveal') return
       const reqNonce = String(payload.requesterNonce || '').trim()
       const pair = pairRef.current
@@ -180,7 +205,12 @@ export function E2eeGrantApproveModal({
 
   const handleDismiss = () => {
     clearCloseTimer()
-    if ((stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') && !rejectedOrDoneRef.current && grant?.reqId) {
+    if (
+      (stepRef.current === 'sas' || stepRef.current === 'waiting-reveal') &&
+      !rejectedOrDoneRef.current &&
+      grant?.reqId &&
+      !client?.isGrantCancelled?.(grant.reqId)
+    ) {
       rejectedOrDoneRef.current = true
       try {
         client?.sendGrantReject?.({ reqId: grant.reqId })

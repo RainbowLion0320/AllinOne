@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { readFile as readFileAsync, stat as statAsync } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { APPS, EVENTS, assertPathWithinDir, assertSafeSessionId, makeCompositeId, toEpochMs } from '../protocol.js'
-import { createFileParseCache, mergeAndCompactMessages } from '../helpers/history-normalize.js'
+import { mergeAndCompactMessages } from '../helpers/history-normalize.js'
 import { findExecutable, getAgyCandidates, killProcessTree, spawnCrossPlatform } from '../helpers/bin-finder.js'
 import {
   answersToElicitationContent,
@@ -12,24 +13,25 @@ import {
 } from '../helpers/interactive-schema.js'
 import { createTaskStateTracker, normalizeTaskMode } from '../helpers/task-state.js'
 import { BaseAdapter } from './base-adapter.js'
-import { atomicWriteJsonSync, queryReadOnlySqlite } from '../primitives/io-utils.js'
+import { queryReadOnlySqlite, readFileForParseSafe } from '../primitives/io-utils.js'
 import { JsonRpcStdioClient } from '../primitives/json-rpc-stdio.js'
 import { BoundedLruMap } from '../primitives/lru.js'
+import { QuotaCacheManager } from '../primitives/quota-cache.js'
+import { SessionExternalWatcher } from '../primitives/session-watcher.js'
 
 const AGY_APP_DATA_DIR = 'antigravity'
-const transcriptCache = createFileParseCache(16)
 const WARM_IDLE_CLOSE_MS = 45_000             // Release SQLite WAL promptly once truly idle (no bg tasks)
 const WARM_IDLE_EXCESS_CLOSE_MS = 25_000      // Tighter idle close when >3 warm sessions exist
 const WARM_BUSY_HARD_CAP_MS = 2 * 60 * 60_000 // Allow background tasks up to 2 hours
+const MAX_WARM_SESSIONS = 3
 const MAX_IDLE_WARM_SESSIONS = 3
+const MAX_AGY_INLINE_IMAGE_BYTES = 20 * 1024 * 1024 // 20 MB max for inline base64 images
 const WATCH_POLL_INTERVAL_MS = 2_000          // Lightweight active-session external sync poll
 const WATCH_TTL_MS = 15 * 60_000              // Stop watching inactive sessions after 15 min
 const MAX_WATCHED_SESSIONS = 3
 const DESKTOP_PROC_CACHE_TTL_MS = 10_000
 const AGY_QUOTA_CACHE_TTL_MS = 3 * 60_000
 const AGY_QUOTA_PROBE_TIMEOUT_MS = 12_000
-
-let desktopProcCache = { running: false, checkedAt: 0 }
 
 /**
  * Normalize an official Antigravity CLI `statusLine` JSON payload into a uniform E2EE quota object.
@@ -122,25 +124,6 @@ export function normalizeAntigravityQuota(payload, now = Date.now()) {
 function getAgyQuotaCachePath() {
   const base = String(process.env.ALLINONE_HOME || '').trim() || join(homedir(), '.allinone-bridge')
   return join(base, 'agy-quota-cache.json')
-}
-
-function readDiskAgyQuota(cachePath, now = Date.now()) {
-  try {
-    if (!cachePath || !existsSync(cachePath)) return null
-    const raw = JSON.parse(readFileSync(cachePath, 'utf8'))
-    if (!raw || typeof raw.remainingPercent !== 'number' || !Number.isFinite(raw.remainingPercent)) return null
-    if (raw.resetsAt > 0 && now > raw.resetsAt + 60_000) return null
-    return raw
-  } catch {
-    return null
-  }
-}
-
-function writeDiskAgyQuota(cachePath, quota) {
-  if (!cachePath || !quota) return
-  try {
-    atomicWriteJsonSync(cachePath, quota, { mode: 0o600 })
-  } catch {}
 }
 
 /**
@@ -236,7 +219,7 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
     }
 
     const hardTimer = setTimeout(() => {
-      killProcessTree(proc, { force: true })
+      if (proc) killProcessTree(proc, { force: false, graceMs: 1_500 })
       finish()
     }, timeoutMs + 3_000)
     hardTimer.unref?.()
@@ -248,6 +231,7 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
           'param([string]$AgyBin, [string]$SettingsPath, [string]$OutPath, [int]$TimeoutMs)',
           'Add-Type -TypeDefinition @"',
           'using System;',
+          'using System.Diagnostics;',
           'using System.Runtime.InteropServices;',
           'using System.Threading;',
           'using System.IO;',
@@ -272,6 +256,14 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
           '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);',
           '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);',
           '  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(IntPtr hFile, byte[] buf, int toRead, out int read, IntPtr ov);',
+          '  static void KillTree(int pid) {',
+          '    if (pid <= 0) return;',
+          '    try {',
+          '      var psi = new ProcessStartInfo("taskkill.exe", "/PID " + pid + " /T /F");',
+          '      psi.UseShellExecute = false; psi.CreateNoWindow = true;',
+          '      using (var kp = Process.Start(psi)) { if (kp != null) kp.WaitForExit(1500); }',
+          '    } catch {}',
+          '  }',
           '  public static void Run(string cmdLine, string watchFile, int timeoutMs) {',
           '    IntPtr inR, inW, outR, outW, hPC;',
           '    if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0)) return;',
@@ -293,6 +285,7 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
           '    if (CreateProcess(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, 0x00080000 | 0x08000000, IntPtr.Zero, null, ref si, out pi)) {',
           '      int waited = 0;',
           '      while (waited < timeoutMs && !File.Exists(watchFile)) { Thread.Sleep(150); waited += 150; }',
+          '      KillTree(pi.dwProcessId);',
           '      TerminateProcess(pi.hProcess, 0);',
           '      CloseHandle(pi.hProcess); CloseHandle(pi.hThread);',
           '    }',
@@ -301,7 +294,14 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
           '  }',
           '}',
           '"@',
-          '$cmd = "`"$AgyBin`" --settings `"$SettingsPath`""',
+          '$safeBin = $AgyBin.Replace(\'"\', \'\')',
+          '$safeSettings = $SettingsPath.Replace(\'"\', \'\')',
+          'if ($safeBin -match \'(?i)\\.(cmd|bat)$\') {',
+          '  $comspec = if ($env:ComSpec) { $env:ComSpec.Replace(\'"\', \'\') } else { \'cmd.exe\' }',
+          '  $cmd = \'"\' + $comspec + \'" /d /s /c ""\' + $safeBin + \'" --settings "\' + $safeSettings + \'""\'',
+          '} else {',
+          '  $cmd = \'"\' + $safeBin + \'" --settings "\' + $safeSettings + \'"\'',
+          '}',
           '[AllInOneAgyConPty]::Run($cmd, $OutPath, $TimeoutMs)',
         ].join('\r\n')
         writeFileSync(ps1Path, ps1Body, 'utf8')
@@ -316,13 +316,38 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
         writeFileSync(
           pyRunner,
           [
-            'import os, pty, select, signal, subprocess, sys, time',
-            'def _on_term(_sig, _frame): raise SystemExit(0)',
-            'signal.signal(signal.SIGTERM, _on_term)',
-            'signal.signal(signal.SIGINT, _on_term)',
+            'import atexit, fcntl, os, pty, select, signal, subprocess, sys, termios, time',
             'agy_bin, settings_path, out_path, timeout_ms = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])',
             'master_fd, slave_fd = pty.openpty()',
-            'proc = subprocess.Popen([agy_bin, "--settings", settings_path], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True, start_new_session=True)',
+            'proc = None',
+            '_cleaned = False',
+            'def _cleanup_child():',
+            '  global _cleaned',
+            '  if _cleaned: return',
+            '  _cleaned = True',
+            '  if proc is not None and proc.poll() is None:',
+            '    try: proc.terminate()',
+            '    except Exception: pass',
+            '    try: proc.wait(timeout=1.2)',
+            '    except Exception:',
+            '      try: proc.kill()',
+            '      except Exception: pass',
+            '      try: proc.wait(timeout=0.5)',
+            '      except Exception: pass',
+            '  try: os.close(master_fd)',
+            '  except Exception: pass',
+            'atexit.register(_cleanup_child)',
+            'def _on_term(_sig, _frame):',
+            '  _cleanup_child()',
+            '  raise SystemExit(0)',
+            'for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):',
+            '  try: signal.signal(_sig, _on_term)',
+            '  except Exception: pass',
+            '# Keep agy in the SAME process group (PGID) as this detached python helper so',
+            '# killProcessTree(-py_pid) reliably terminates both python and agy with zero orphans.',
+            'try: fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)',
+            'except Exception: pass',
+            'proc = subprocess.Popen([agy_bin, "--settings", settings_path], stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)',
             'os.close(slave_fd)',
             'deadline = time.monotonic() + (timeout_ms / 1000.0)',
             'try:',
@@ -332,18 +357,7 @@ function fetchAntigravityQuotaViaStatusLine(agyBin, { timeoutMs = AGY_QUOTA_PROB
             '      try: os.read(master_fd, 4096)',
             '      except OSError: break',
             'finally:',
-            '  try: os.killpg(proc.pid, signal.SIGTERM)',
-            '  except Exception:',
-            '    try: proc.terminate()',
-            '    except Exception: pass',
-            '  try: proc.wait(timeout=1.5)',
-            '  except Exception:',
-            '    try: os.killpg(proc.pid, signal.SIGKILL)',
-            '    except Exception:',
-            '      try: proc.kill()',
-            '      except Exception: pass',
-            '  try: os.close(master_fd)',
-            '  except Exception: pass',
+            '  _cleanup_child()',
             '',
           ].join('\n'),
           'utf8',
@@ -383,10 +397,10 @@ function getTranscriptFingerprint(agyHome, conversationId) {
   }
 }
 
-async function isAntigravityDesktopRunning(force = false) {
+async function isAntigravityDesktopRunning(cacheState, force = false) {
   const now = Date.now()
-  if (!force && now - desktopProcCache.checkedAt < DESKTOP_PROC_CACHE_TTL_MS) {
-    return desktopProcCache.running
+  if (!force && cacheState && now - cacheState.checkedAt < DESKTOP_PROC_CACHE_TTL_MS) {
+    return cacheState.running
   }
   const running = await new Promise((resolvePromise) => {
     let settled = false
@@ -431,7 +445,10 @@ async function isAntigravityDesktopRunning(force = false) {
       done(false)
     }
   })
-  desktopProcCache = { running, checkedAt: Date.now() }
+  if (cacheState) {
+    cacheState.running = running
+    cacheState.checkedAt = Date.now()
+  }
   return running
 }
 
@@ -441,23 +458,6 @@ function computeAgyExternalRunning({ selfActive, desktopRunning, status, notFull
   const recentlyModified = mtimeMs > 0 && now - mtimeMs < 90_000
   return Boolean(notFullyIdle && recentlyModified)
 }
-
-const AGY_SQLITE_PY_SCRIPT = [
-  'import base64, json, pathlib, sqlite3, sys',
-  'req = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))',
-  'con = sqlite3.connect(pathlib.Path(req["dbPath"]).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)',
-  'try:',
-  '    con.row_factory = sqlite3.Row',
-  '    cur = con.execute(req["sql"], req.get("params") or [])',
-  '    if req.get("single"):',
-  '        row = cur.fetchone()',
-  '        out = dict(row) if row else None',
-  '    else:',
-  '        out = [dict(r) for r in cur.fetchall()]',
-  '    print(json.dumps(out))',
-  'finally:',
-  '    con.close()',
-].join('\n')
 
 /**
  * Shared read-only SQLite query helper for Antigravity's `conversation_summaries.db`.
@@ -683,31 +683,19 @@ export function parseAgyTranscriptContent(raw) {
 const AGY_MAX_FULL_TRANSCRIPT_BYTES = 32 * 1024 * 1024
 const AGY_TAIL_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 
-function parseDesktopTranscript(conversationId, agyHome = getAgyHome()) {
+function parseDesktopTranscript(conversationId, agyHome = getAgyHome(), parseCache = null) {
   const transcriptPath = getTranscriptPathSafe(agyHome, conversationId)
   if (!existsSync(transcriptPath)) {
     return { messages: [], divergence: null, latestStepIndex: -1, branchEpoch: 0, taskState: null }
   }
-  return transcriptCache.getOrParse(transcriptPath, () => {
-    const st = statSync(transcriptPath)
-    if (st.size > AGY_MAX_FULL_TRANSCRIPT_BYTES) {
-      const fd = openSync(transcriptPath, 'r')
-      try {
-        const readLen = Math.min(st.size, AGY_TAIL_TRANSCRIPT_BYTES)
-        const startOffset = Math.max(0, st.size - readLen)
-        const buf = Buffer.alloc(readLen)
-        const bytesRead = readSync(fd, buf, 0, readLen, startOffset)
-        const rawTail = buf.subarray(0, bytesRead).toString('utf8')
-        const firstNl = startOffset > 0 ? rawTail.indexOf('\n') : -1
-        const safeTail = firstNl !== -1 ? rawTail.slice(firstNl + 1) : rawTail
-        return parseAgyTranscriptContent(safeTail)
-      } finally {
-        closeSync(fd)
-      }
-    }
-    const raw = readFileSync(transcriptPath, 'utf8')
+  const parse = () => {
+    const { raw } = readFileForParseSafe(transcriptPath, AGY_MAX_FULL_TRANSCRIPT_BYTES, AGY_TAIL_TRANSCRIPT_BYTES)
     return parseAgyTranscriptContent(raw)
-  })
+  }
+  if (parseCache && typeof parseCache.getOrParse === 'function') {
+    return parseCache.getOrParse(transcriptPath, parse, { keyPrefix: 'agy-transcript' })
+  }
+  return parse()
 }
 
 function extractAcpText(content) {
@@ -878,21 +866,69 @@ export class AntigravityAdapter extends BaseAdapter {
     this.startingWarmSessions = new Map() // conversationId -> Promise<entry> deduplicating concurrent acquireWarmSession
     this.startingClients = new Set() // in-flight AgyAcpClient instances before warmSessions registration
     this.bridgeWrittenSessions = new BoundedLruMap(128) // conversationId -> { writtenAt, stepCount }
-    this.watchedSessions = new BoundedLruMap(MAX_WATCHED_SESSIONS)
     this.watchPollIntervalMs = Math.max(200, Number(config.watchPollIntervalMs) || WATCH_POLL_INTERVAL_MS)
-    this.watchTimer = null
-    this.watchPollInFlight = false
     this.reapingInFlight = false
     this.cliVersionCache = null
     this.modelsCache = null
     this.modelsCacheAt = 0
+    this._desktopProcCache = { running: false, checkedAt: 0 }
     this.quotaCachePath = config.agyQuotaCachePath || getAgyQuotaCachePath()
-    this.quotaCache = readDiskAgyQuota(this.quotaCachePath)
-    this.quotaCacheAt = this.quotaCache?.updatedAt || 0
-    this.quotaRefreshInFlight = null
     this.activeQuotaProcs = new Set()
     this.disableQuotaProbe = Boolean(config.disableAgyQuotaProbe)
     this.reaperTimer = null
+    this.watcher = new SessionExternalWatcher({
+      pollMs: this.watchPollIntervalMs,
+      maxWatched: MAX_WATCHED_SESSIONS,
+      maxTracked: 1,
+      watchTtlMs: WATCH_TTL_MS,
+      onPoll: (ctx) => this._pollWatchedSessions(ctx),
+    })
+    this.watchedSessions = this.watcher.watched
+    this.quotaManager = new QuotaCacheManager({
+      app: APPS.ANTIGRAVITY,
+      ttlMs: AGY_QUOTA_CACHE_TTL_MS,
+      errorBackoffMs: 20_000,
+      diskCachePath: this.quotaCachePath,
+      diskTtlMs: 24 * 60 * 60_000,
+      emitEvent: this.emitEvent,
+      isValid: (q, now) =>
+        Boolean(
+          q &&
+          typeof q.remainingPercent === 'number' &&
+          Number.isFinite(q.remainingPercent) &&
+          (!q.resetsAt || now <= q.resetsAt + 60_000),
+        ),
+      parseDisk: (parsed) => parsed?.quota || parsed,
+      fetcher: () => this._fetchQuotaOnce(),
+    })
+  }
+
+  get quotaCache() {
+    return this.quotaManager.quota
+  }
+
+  set quotaCache(val) {
+    this.quotaManager.quota = val
+  }
+
+  get quotaCacheAt() {
+    return this.quotaManager.fetchedAt
+  }
+
+  set quotaCacheAt(val) {
+    this.quotaManager.fetchedAt = Number(val) || 0
+  }
+
+  get quotaRefreshInFlight() {
+    return this.quotaManager.inFlight
+  }
+
+  set quotaRefreshInFlight(val) {
+    this.quotaManager.inFlight = val
+  }
+
+  isDesktopRunning(force = false) {
+    return isAntigravityDesktopRunning(this._desktopProcCache, force)
   }
 
   refreshBinary() {
@@ -1002,15 +1038,14 @@ export class AntigravityAdapter extends BaseAdapter {
       const done = (val) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        this.clearTrackedTimer(timer)
         resolvePromise(val)
       }
       let proc = null
-      const timer = setTimeout(() => {
+      const timer = this.setTimeout(() => {
         if (proc) killProcessTree(proc, { force: true })
         done('')
       }, 15_000)
-      timer.unref?.()
       try {
         proc = spawnCrossPlatform(this.agyBin, ['models'], {
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -1085,15 +1120,14 @@ export class AntigravityAdapter extends BaseAdapter {
       const done = (val) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        this.clearTrackedTimer(timer)
         resolvePromise(val)
       }
       let proc = null
-      const timer = setTimeout(() => {
+      const timer = this.setTimeout(() => {
         if (proc) killProcessTree(proc, { force: true })
         done('')
       }, 6_000)
-      timer.unref?.()
       try {
         proc = spawnCrossPlatform(this.agyBin, ['--version'], {
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -1114,58 +1148,38 @@ export class AntigravityAdapter extends BaseAdapter {
   }
 
   getValidQuota(now = Date.now()) {
-    if (!this.quotaCache) return null
-    if (this.quotaCache.resetsAt > 0 && now > this.quotaCache.resetsAt + 60_000) {
-      this.quotaCache = null
-      return null
+    const valid = this.quotaManager.getValid(now)
+    if (!valid && this.quotaManager.quota) {
+      this.quotaManager.quota = null
     }
-    return this.quotaCache
+    return valid
+  }
+
+  async _fetchQuotaOnce() {
+    if (this.disposed || this.disableQuotaProbe) return null
+    const bin = this.agyBin || findAgyBinary(this.configuredBin)
+    if (!bin) return null
+    let spawnedProc = null
+    try {
+      return await fetchAntigravityQuotaViaStatusLine(bin, {
+        onSpawn: (proc) => {
+          spawnedProc = proc
+          if (this.disposed) {
+            killProcessTree(proc, { force: true })
+            return
+          }
+          this.activeQuotaProcs.add(proc)
+        },
+      })
+    } finally {
+      if (spawnedProc) this.activeQuotaProcs.delete(spawnedProc)
+    }
   }
 
   refreshQuotaInBackground({ force = false } = {}) {
     if (this.disposed || this.disableQuotaProbe) return Promise.resolve(this.getValidQuota())
-    const now = Date.now()
-    if (!force && this.quotaCache && Array.isArray(this.quotaCache.pools) && this.quotaCacheAt > 0 && now - this.quotaCacheAt < AGY_QUOTA_CACHE_TTL_MS) {
-      return Promise.resolve(this.getValidQuota(now))
-    }
-    if (this.quotaRefreshInFlight) return this.quotaRefreshInFlight
-    const bin = this.agyBin || findAgyBinary(this.configuredBin)
-    if (!bin) return Promise.resolve(this.getValidQuota(now))
-
-    let spawnedProc = null
-    const p = fetchAntigravityQuotaViaStatusLine(bin, {
-      onSpawn: (proc) => {
-        spawnedProc = proc
-        if (this.disposed) {
-          killProcessTree(proc, { force: true })
-          return
-        }
-        this.activeQuotaProcs.add(proc)
-      },
-    })
-      .then((fresh) => {
-        if (this.disposed) return null
-        this.quotaCacheAt = Date.now()
-        if (fresh) {
-          this.quotaCache = fresh
-          writeDiskAgyQuota(this.quotaCachePath, fresh)
-          this.emitEvent(EVENTS.BRIDGE_STATUS, {
-            type: 'quota.updated',
-            app: APPS.ANTIGRAVITY,
-            quota: fresh,
-          })
-        }
-        return this.getValidQuota()
-      })
-      .catch(() => this.getValidQuota())
-      .finally(() => {
-        if (spawnedProc) this.activeQuotaProcs.delete(spawnedProc)
-        if (this.quotaRefreshInFlight === p) {
-          this.quotaRefreshInFlight = null
-        }
-      })
-    this.quotaRefreshInFlight = p
-    return p
+    const needsPoolUpgrade = Boolean(this.quotaCache && !Array.isArray(this.quotaCache.pools))
+    return this.quotaManager.refreshInBackground({ force: Boolean(force || needsPoolUpgrade) })
   }
 
   async getStatus(opts = {}) {
@@ -1196,7 +1210,7 @@ export class AntigravityAdapter extends BaseAdapter {
     const [cliVer, rows, desktopRunning] = await Promise.all([
       this.checkCliVersion(),
       queryAgySummariesDb(dbPath, limit, search),
-      isAntigravityDesktopRunning(),
+      this.isDesktopRunning(),
     ])
     const cliReady = Boolean(cliVer)
     const seen = new Set()
@@ -1269,10 +1283,10 @@ export class AntigravityAdapter extends BaseAdapter {
     const dbPath = join(this.agyHome, 'conversation_summaries.db')
     const [meta, desktopRunning] = await Promise.all([
       queryAgySummaryById(dbPath, conversationId),
-      isAntigravityDesktopRunning(),
+      this.isDesktopRunning(),
     ])
     const pending = this.pendingCreated.get(conversationId)
-    const parsed = parseDesktopTranscript(conversationId, this.agyHome)
+    const parsed = parseDesktopTranscript(conversationId, this.agyHome, this.parseCache)
     const messages = parsed.messages
     const cwd = parseWorkspaceUri(meta?.workspace_uris) || pending?.cwd || ''
     const pref = this.sessionPrefs.get(conversationId)
@@ -1356,8 +1370,7 @@ export class AntigravityAdapter extends BaseAdapter {
     if (!conversationId) return
     const fp = snapshot.fp || getTranscriptFingerprint(this.agyHome, conversationId)
     const existing = this.watchedSessions.get(conversationId)
-    this.watchedSessions.delete(conversationId)
-    this.watchedSessions.set(conversationId, {
+    this.watcher.rememberWatched(conversationId, {
       conversationId,
       lastSeenAt: Date.now(),
       mtimeMs: fp.mtimeMs,
@@ -1370,12 +1383,6 @@ export class AntigravityAdapter extends BaseAdapter {
       cwd: snapshot.cwd || existing?.cwd || '',
       cliReady: snapshot.cliReady ?? existing?.cliReady ?? true,
     })
-    while (this.watchedSessions.size > MAX_WATCHED_SESSIONS) {
-      const oldest = this.watchedSessions.keys().next().value
-      if (!oldest) break
-      this.watchedSessions.delete(oldest)
-    }
-    this.ensureWatcherRunning()
   }
 
   updateWatchSnapshot(conversationId, { fp = null, dbState = null } = {}) {
@@ -1393,106 +1400,88 @@ export class AntigravityAdapter extends BaseAdapter {
   }
 
   ensureWatcherRunning() {
-    if (this.disposed || this.watchTimer || this.watchedSessions.size === 0) return
-    this.watchTimer = setInterval(() => {
-      void this.pollWatchedSessions().catch(() => {})
-    }, this.watchPollIntervalMs)
-    this.watchTimer.unref?.()
+    this.watcher.ensureRunning()
   }
 
   async pollWatchedSessions() {
-    if (this.watchPollInFlight) return
-    if (this.watchedSessions.size === 0) {
-      if (this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
+    return this.watcher.tick()
+  }
+
+  async _pollWatchedSessions({ now }) {
+    if (this.watchedSessions.size === 0) return
+    const dbPath = join(this.agyHome, 'conversation_summaries.db')
+    const desktopRunning = await this.isDesktopRunning()
+    for (const [sid, w] of [...this.watchedSessions.entries()]) {
+      if (now - w.lastSeenAt > WATCH_TTL_MS) {
+        this.watchedSessions.delete(sid)
+        continue
       }
-      return
-    }
-    this.watchPollInFlight = true
-    try {
-      const now = Date.now()
-      const dbPath = join(this.agyHome, 'conversation_summaries.db')
-      const desktopRunning = await isAntigravityDesktopRunning()
-      for (const [sid, w] of [...this.watchedSessions.entries()]) {
-        if (now - w.lastSeenAt > WATCH_TTL_MS) {
-          this.watchedSessions.delete(sid)
-          continue
-        }
-        if (this.activeTurns.has(sid) || this.warmSessions.get(sid)?.wakeup) {
-          // Bridge is actively streaming this session itself; keep snapshot aligned without echoing
-          const curFp = getTranscriptFingerprint(this.agyHome, sid)
-          w.mtimeMs = curFp.mtimeMs
-          w.size = curFp.size
-          w.externalRunning = false
-          continue
-        }
-
+      if (this.activeTurns.has(sid) || this.warmSessions.get(sid)?.wakeup) {
+        // Bridge is actively streaming this session itself; keep snapshot aligned without echoing
         const curFp = getTranscriptFingerprint(this.agyHome, sid)
-        const dbState = await queryAgyConversationState(dbPath, sid)
-        const nextStatus = String(dbState?.status || '')
-        const nextNotIdle = Boolean(dbState?.notFullyIdle)
-        const nextStepCount = Number(dbState?.stepCount || 0)
-        const nextTitle = dbState?.title || w.title
-        const nextCwd = dbState?.cwd || w.cwd
-        const externalRunning = computeAgyExternalRunning({
-          selfActive: false,
-          desktopRunning,
-          status: nextStatus,
-          notFullyIdle: nextNotIdle,
-          mtimeMs: curFp.mtimeMs,
-          now,
-        })
-
-        const fileChanged = curFp.size !== w.size || curFp.mtimeMs !== w.mtimeMs
-        const metaChanged = nextTitle !== w.title || nextCwd !== w.cwd
-        const statusChanged =
-          nextStatus !== w.status ||
-          nextNotIdle !== w.notFullyIdle ||
-          nextStepCount !== w.stepCount ||
-          externalRunning !== Boolean(w.externalRunning)
-
-        if (!fileChanged && !statusChanged && !metaChanged) continue
-
         w.mtimeMs = curFp.mtimeMs
         w.size = curFp.size
-        w.status = nextStatus
-        w.notFullyIdle = nextNotIdle
-        w.stepCount = nextStepCount
-        w.externalRunning = externalRunning
-        w.title = nextTitle
-        w.cwd = nextCwd
-
-        const pref = this.sessionPrefs.get(sid)
-        const latestTaskState = fileChanged ? parseDesktopTranscript(sid, this.agyHome).taskState : undefined
-        this.emitEvent(EVENTS.SESSION_UPDATED, {
-          historyChanged: fileChanged,
-          statusChanged,
-          externalUpdate: true,
-          session: {
-            id: makeCompositeId(APPS.ANTIGRAVITY, sid),
-            app: APPS.ANTIGRAVITY,
-            nativeId: sid,
-            title: w.title,
-            cwd: w.cwd,
-            workspace: w.cwd ? basename(w.cwd) : 'Antigravity',
-            model: pref?.model || '',
-            reasoningEffort: pref?.reasoningEffort || '',
-            status: externalRunning ? 'running' : 'idle',
-            ...(latestTaskState !== undefined ? { taskState: latestTaskState } : {}),
-            syncState: { externalRunning },
-            writable: w.cliReady,
-            updatedAt: curFp.mtimeMs || now,
-          },
-        })
+        w.externalRunning = false
+        continue
       }
 
-      if (this.watchedSessions.size === 0 && this.watchTimer) {
-        clearInterval(this.watchTimer)
-        this.watchTimer = null
-      }
-    } finally {
-      this.watchPollInFlight = false
+      const curFp = getTranscriptFingerprint(this.agyHome, sid)
+      const dbState = await queryAgyConversationState(dbPath, sid)
+      const nextStatus = String(dbState?.status || '')
+      const nextNotIdle = Boolean(dbState?.notFullyIdle)
+      const nextStepCount = Number(dbState?.stepCount || 0)
+      const nextTitle = dbState?.title || w.title
+      const nextCwd = dbState?.cwd || w.cwd
+      const externalRunning = computeAgyExternalRunning({
+        selfActive: false,
+        desktopRunning,
+        status: nextStatus,
+        notFullyIdle: nextNotIdle,
+        mtimeMs: curFp.mtimeMs,
+        now,
+      })
+
+      const fileChanged = curFp.size !== w.size || curFp.mtimeMs !== w.mtimeMs
+      const metaChanged = nextTitle !== w.title || nextCwd !== w.cwd
+      const statusChanged =
+        nextStatus !== w.status ||
+        nextNotIdle !== w.notFullyIdle ||
+        nextStepCount !== w.stepCount ||
+        externalRunning !== Boolean(w.externalRunning)
+
+      if (!fileChanged && !statusChanged && !metaChanged) continue
+
+      w.mtimeMs = curFp.mtimeMs
+      w.size = curFp.size
+      w.status = nextStatus
+      w.notFullyIdle = nextNotIdle
+      w.stepCount = nextStepCount
+      w.externalRunning = externalRunning
+      w.title = nextTitle
+      w.cwd = nextCwd
+
+      const pref = this.sessionPrefs.get(sid)
+      const latestTaskState = fileChanged ? parseDesktopTranscript(sid, this.agyHome, this.parseCache).taskState : undefined
+      this.emitEvent(EVENTS.SESSION_UPDATED, {
+        historyChanged: fileChanged,
+        statusChanged,
+        externalUpdate: true,
+        session: {
+          id: makeCompositeId(APPS.ANTIGRAVITY, sid),
+          app: APPS.ANTIGRAVITY,
+          nativeId: sid,
+          title: w.title,
+          cwd: w.cwd,
+          workspace: w.cwd ? basename(w.cwd) : 'Antigravity',
+          model: pref?.model || '',
+          reasoningEffort: pref?.reasoningEffort || '',
+          status: externalRunning ? 'running' : 'idle',
+          ...(latestTaskState !== undefined ? { taskState: latestTaskState } : {}),
+          syncState: { externalRunning },
+          writable: w.cliReady,
+          updatedAt: curFp.mtimeMs || now,
+        },
+      })
     }
   }
 
@@ -1549,6 +1538,7 @@ export class AntigravityAdapter extends BaseAdapter {
       entry.starting = false
       entry.lastActivityAt = Date.now()
       this.warmSessions.set(sessionId, entry)
+      this._enforceWarmSessionCap(sessionId)
       this.ensureReaperRunning()
     } catch (err) {
       entry.starting = false
@@ -1602,7 +1592,7 @@ export class AntigravityAdapter extends BaseAdapter {
     client.setServerRequestHandler((c, msg) => this.handleServerRequest(entry, c, msg))
     client.onExit = () => {
       this.clearPendingForClient(client)
-      if (entry.wakeup?.settleTimer) clearTimeout(entry.wakeup.settleTimer)
+      if (entry.wakeup?.settleTimer) this.clearTrackedTimer(entry.wakeup.settleTimer)
       if (entry.wakeup) {
         const compositeId = makeCompositeId(APPS.ANTIGRAVITY, entry.sessionId)
         this.emitEvent(EVENTS.STREAM_DONE, {
@@ -1618,16 +1608,35 @@ export class AntigravityAdapter extends BaseAdapter {
         this.warmSessions.delete(entry.sessionId)
       }
     }
-    if (addToMap && sessionId) this.warmSessions.set(sessionId, entry)
+    if (addToMap && sessionId) {
+      this.warmSessions.set(sessionId, entry)
+      this._enforceWarmSessionCap(sessionId)
+    }
     return entry
+  }
+
+  _enforceWarmSessionCap(excludeSessionId = '') {
+    if (this.warmSessions.size <= MAX_WARM_SESSIONS) return
+    const evictable = []
+    for (const [sid, entry] of this.warmSessions.entries()) {
+      if (sid === excludeSessionId) continue
+      if (!this.isWarmEntrySafeToClose(sid, entry)) continue
+      evictable.push({ sid, entry, lastActivityAt: entry.lastActivityAt || 0 })
+    }
+    evictable.sort((a, b) => a.lastActivityAt - b.lastActivityAt)
+    let excess = this.warmSessions.size - MAX_WARM_SESSIONS
+    for (const { sid, entry } of evictable) {
+      if (excess <= 0) break
+      excess -= 1
+      void this.closeWarmSession(sid, entry)
+    }
   }
 
   ensureReaperRunning() {
     if (this.disposed || this.reaperTimer) return
-    this.reaperTimer = setInterval(() => {
+    this.reaperTimer = this.setInterval(() => {
       void this.reapIdleSessions().catch(() => {})
     }, 30_000)
-    this.reaperTimer.unref?.()
   }
 
   hasPendingServerRequest(sessionId) {
@@ -1652,7 +1661,7 @@ export class AntigravityAdapter extends BaseAdapter {
     if (expectedEntry && entry !== expectedEntry) return
     this.warmSessions.delete(sessionId)
     if (entry.wakeup?.settleTimer) {
-      clearTimeout(entry.wakeup.settleTimer)
+      this.clearTrackedTimer(entry.wakeup.settleTimer)
       entry.wakeup.settleTimer = null
     }
     await entry.client.close(sessionId).catch(() => {})
@@ -1662,7 +1671,7 @@ export class AntigravityAdapter extends BaseAdapter {
     if (this.reapingInFlight) return
     if (this.warmSessions.size === 0) {
       if (this.reaperTimer) {
-        clearInterval(this.reaperTimer)
+        this.clearTrackedTimer(this.reaperTimer)
         this.reaperTimer = null
       }
       return
@@ -1683,7 +1692,7 @@ export class AntigravityAdapter extends BaseAdapter {
         if (entry.fgTurn || entry.wakeup || this.activeTurns.has(sid) || this.hasPendingServerRequest(sid)) continue
 
         const idleMs = now - entry.lastActivityAt
-        if (idleMs < 20_000) continue // Grace window for SQLite summary write flush
+        if (idleMs < 20_000 && this.warmSessions.size <= MAX_WARM_SESSIONS) continue // Grace window for SQLite summary write flush
 
         const dbState = await queryAgyConversationState(dbPath, sid)
         // Re-verify after async DB query before making any close decision
@@ -1702,8 +1711,11 @@ export class AntigravityAdapter extends BaseAdapter {
 
       idleCandidates.sort((a, b) => b.idleMs - a.idleMs)
       const ttlMs = idleCandidates.length > MAX_IDLE_WARM_SESSIONS ? WARM_IDLE_EXCESS_CLOSE_MS : WARM_IDLE_CLOSE_MS
+      let remainingIdle = idleCandidates.length
       for (const { sid, entry, idleMs } of idleCandidates) {
-        if (idleMs >= ttlMs && this.isWarmEntrySafeToClose(sid, entry)) {
+        const overCap = remainingIdle > MAX_IDLE_WARM_SESSIONS
+        if ((idleMs >= ttlMs || overCap) && this.isWarmEntrySafeToClose(sid, entry)) {
+          remainingIdle -= 1
           await this.closeWarmSession(sid, entry)
         }
       }
@@ -1716,7 +1728,7 @@ export class AntigravityAdapter extends BaseAdapter {
     if (!entry.wakeup) return
     const wk = entry.wakeup
     entry.wakeup = null
-    if (wk.settleTimer) clearTimeout(wk.settleTimer)
+    if (wk.settleTimer) this.clearTrackedTimer(wk.settleTimer)
     entry.lastActivityAt = Date.now()
     const fp = getTranscriptFingerprint(this.agyHome, entry.sessionId)
     entry.lastTranscriptMtimeMs = fp.mtimeMs
@@ -1737,8 +1749,8 @@ export class AntigravityAdapter extends BaseAdapter {
     if (this.disposed) return
     const wk = entry.wakeup
     if (!wk) return
-    if (wk.settleTimer) clearTimeout(wk.settleTimer)
-    wk.settleTimer = setTimeout(async () => {
+    if (wk.settleTimer) this.clearTrackedTimer(wk.settleTimer)
+    wk.settleTimer = this.setTimeout(async () => {
       try {
         if (this.disposed || entry.wakeup !== wk || entry.fgTurn) return
         if (this.hasPendingServerRequest(entry.sessionId)) {
@@ -1764,7 +1776,6 @@ export class AntigravityAdapter extends BaseAdapter {
         this.log.warn?.(`mobile-hub: agy wakeup settle error (${entry.sessionId}): ${String(err?.message || err)}`)
       }
     }, 2_500)
-    wk.settleTimer.unref?.()
   }
 
   handleWarmSessionUpdate(entry, params) {
@@ -1975,7 +1986,7 @@ export class AntigravityAdapter extends BaseAdapter {
       const resumeRes = await client.rpc('session/resume', { sessionId, cwd: targetCwd, mcpServers: [] }, 30_000)
       if (this.disposed) throw new Error('AntigravityAdapter 已销毁')
       entry.currentModeId = String(resumeRes?.modes?.currentModeId || 'default')
-      const diskTaskState = parseDesktopTranscript(sessionId, this.agyHome).taskState
+      const diskTaskState = parseDesktopTranscript(sessionId, this.agyHome, this.parseCache).taskState
       entry.taskTracker = createTaskStateTracker(diskTaskState)
       if (entry.currentModeId === 'plan') {
         entry.taskTracker.setMode('plan')
@@ -1992,6 +2003,7 @@ export class AntigravityAdapter extends BaseAdapter {
       entry.lastActivityAt = Date.now()
       entry.starting = false
       this.warmSessions.set(sessionId, entry)
+      this._enforceWarmSessionCap(sessionId)
       this.ensureReaperRunning()
       return entry
     } catch (err) {
@@ -2040,7 +2052,7 @@ export class AntigravityAdapter extends BaseAdapter {
       if (!existingWarm?.wakeup && !existingWarm?.sawBackgroundTask) {
         const [dbState, desktopRunning] = await Promise.all([
           queryAgyConversationState(dbPath, sessionId),
-          isAntigravityDesktopRunning(true),
+          this.isDesktopRunning(true),
         ])
         const fp = getTranscriptFingerprint(this.agyHome, sessionId)
         const bridgeWrite = this.bridgeWrittenSessions.get(sessionId)
@@ -2071,19 +2083,44 @@ export class AntigravityAdapter extends BaseAdapter {
       if (!targetCwd || !existsSync(targetCwd)) targetCwd = this.defaultCwd
 
       // Build native ACP multimodal prompt (ZERO injected wrapper text!)
+      // Strictly cap inline base64 images at 20 MB using async stat + async readFile to prevent OOM
       const promptBlocks = []
       const fileLines = []
       for (const att of attachments) {
-        if (att.localPath && existsSync(att.localPath) && String(att.mimeType || '').startsWith('image/')) {
+        if (att.localPath && String(att.mimeType || '').startsWith('image/')) {
+          let st = null
           try {
-            const b64 = readFileSync(att.localPath).toString('base64')
-            promptBlocks.push({
-              type: 'image',
-              data: b64,
-              mimeType: att.mimeType || 'image/png',
-            })
-            continue
-          } catch {}
+            st = await statAsync(att.localPath)
+          } catch {
+            st = null
+          }
+          if (st && st.isFile()) {
+            const limitMb = Math.round(MAX_AGY_INLINE_IMAGE_BYTES / (1024 * 1024))
+            const label = att.filename || basename(att.localPath)
+            if (st.size > MAX_AGY_INLINE_IMAGE_BYTES) {
+              const sizeMb = (st.size / (1024 * 1024)).toFixed(1)
+              const err = new Error(`图片附件「${label}」大小 (${sizeMb} MB) 超过 Antigravity 内联图片上限 (${limitMb} MB)，请压缩后再发送。`)
+              err.code = 'IMAGE_TOO_LARGE'
+              throw err
+            }
+            try {
+              const buf = await readFileAsync(att.localPath)
+              if (buf.byteLength > MAX_AGY_INLINE_IMAGE_BYTES) {
+                const sizeMb = (buf.byteLength / (1024 * 1024)).toFixed(1)
+                const err = new Error(`图片附件「${label}」大小 (${sizeMb} MB) 超过 Antigravity 内联图片上限 (${limitMb} MB)，请压缩后再发送。`)
+                err.code = 'IMAGE_TOO_LARGE'
+                throw err
+              }
+              promptBlocks.push({
+                type: 'image',
+                data: buf.toString('base64'),
+                mimeType: att.mimeType || 'image/png',
+              })
+              continue
+            } catch (imgErr) {
+              if (imgErr?.code === 'IMAGE_TOO_LARGE') throw imgErr
+            }
+          }
         }
         if (att.localPath || att.filename) {
           fileLines.push(`- 附件：${att.localPath || att.filename}`)
@@ -2147,7 +2184,7 @@ export class AntigravityAdapter extends BaseAdapter {
 
       // Sync interactive Plan / Goal mode cleanly via native ACP `session/set_mode` + `/goal` slash trigger
       if (!entry.taskTracker) {
-        entry.taskTracker = createTaskStateTracker(parseDesktopTranscript(sessionId, this.agyHome).taskState)
+        entry.taskTracker = createTaskStateTracker(parseDesktopTranscript(sessionId, this.agyHome, this.parseCache).taskState)
       }
       const setPromptTextBlock = (nextText) => {
         const textBlock = promptBlocks.find((b) => b?.type === 'text')
@@ -2277,13 +2314,12 @@ export class AntigravityAdapter extends BaseAdapter {
           await this.closeWarmSession(sessionId, entry)
         } else {
           // Re-snapshot shortly after turn end to capture trailing SQLite/transcript flush & refresh Gemini quota
-          const settleSnap = setTimeout(() => {
+          this.setTimeout(() => {
             if (!this.disposed) {
               void snapNow().catch(() => {})
               void this.refreshQuotaInBackground({ force: true })
             }
           }, 450)
-          settleSnap.unref?.()
 
           if (failedHard) {
             await this.closeWarmSession(sessionId, entry)
@@ -2422,6 +2458,7 @@ export class AntigravityAdapter extends BaseAdapter {
     if (!item) return { resolved: false, reason: 'approval not found' }
     this.pendingServerRequests.delete(approvalId)
 
+    const sessionId = item.sessionId ? makeCompositeId(APPS.ANTIGRAVITY, item.sessionId) : ''
     const { decision, answers } = normalizeResolvePayload(decisionOrPayload)
 
     const sendAcpReply = (payloadObj) => {
@@ -2431,6 +2468,7 @@ export class AntigravityAdapter extends BaseAdapter {
         this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
           id: approvalId,
           app: APPS.ANTIGRAVITY,
+          sessionId,
           decision: 'cancel',
         })
         const transportErr = new Error(String(err?.message || 'Antigravity ACP 进程已退出，审批请求已失效'))
@@ -2454,6 +2492,7 @@ export class AntigravityAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.ANTIGRAVITY,
+        sessionId,
         decision: action,
       })
       return { resolved: true, id: approvalId, decision: action }
@@ -2472,6 +2511,7 @@ export class AntigravityAdapter extends BaseAdapter {
       this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
         id: approvalId,
         app: APPS.ANTIGRAVITY,
+        sessionId,
         decision: decision || 'cancel',
       })
       return { resolved: true, id: approvalId, decision: decision || 'cancel' }
@@ -2517,14 +2557,11 @@ export class AntigravityAdapter extends BaseAdapter {
   async dispose() {
     this.disposed = true
     if (this.reaperTimer) {
-      clearInterval(this.reaperTimer)
+      this.clearTrackedTimer(this.reaperTimer)
       this.reaperTimer = null
     }
-    if (this.watchTimer) {
-      clearInterval(this.watchTimer)
-      this.watchTimer = null
-    }
-    this.watchedSessions.clear()
+    this.watcher.dispose()
+    this.quotaManager.dispose()
     this.startingWarmSessions.clear()
     for (const proc of this.activeQuotaProcs) {
       killProcessTree(proc, { force: true })
@@ -2539,7 +2576,7 @@ export class AntigravityAdapter extends BaseAdapter {
     }
     this.activeTurns.clear()
     for (const entry of this.warmSessions.values()) {
-      if (entry.wakeup?.settleTimer) clearTimeout(entry.wakeup.settleTimer)
+      if (entry.wakeup?.settleTimer) this.clearTrackedTimer(entry.wakeup.settleTimer)
       entry.wakeup = null
       entry.client?.killImmediate()
     }

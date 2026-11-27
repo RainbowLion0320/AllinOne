@@ -28,12 +28,15 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { compareSemver, parseSemver } from '@allinone/shared/semver'
+import { compareCodePoint, compareSemver, parseSemver } from '@allinone/shared/semver'
 
 export { compareSemver }
 
 const DEFAULT_GITHUB_REPO = 'RainbowLion0320/AllinOne'
 const DESKTOP_MANIFEST_NAME = 'All-in-One-Desktop-Release.json'
+const MAX_REDIRECT_HOPS = 5
+export const DEFAULT_DESKTOP_MANIFEST_PUBLIC_KEY =
+  'MCowBQYDK2VwAyEAEmluQz00cYh3j/CoAJdTns80esfio4wMpvhQS1lwq5U='
 const ALLOWED_DOWNLOAD_HOSTS = new Set([
   'github.com',
   'api.github.com',
@@ -51,7 +54,7 @@ export function computeDesktopManifestPayload(version, assets = []) {
       sha256: String(a.sha256).trim().toLowerCase(),
       size: Number(a.size) || 0,
     }))
-    .sort((a, b) => a.name.localeCompare(b.name))
+    .sort((a, b) => compareCodePoint(a.name, b.name))
     .map((a) => `${a.name}:${a.sha256}:${a.size}`)
   return `allinone-desktop-release-v1\n${cleanVer}\n${lines.join('\n')}`
 }
@@ -109,7 +112,11 @@ export function pickReleaseAsset(assets = [], platform = process.platform, arch 
 function isAllowedDownloadUrl(rawUrl, allowLocalhost = false) {
   try {
     const u = new URL(rawUrl)
-    if (allowLocalhost && (u.hostname === '127.0.0.1' || u.hostname === 'localhost') && u.protocol === 'http:') {
+    if (
+      allowLocalhost &&
+      (u.hostname === '127.0.0.1' || u.hostname === 'localhost') &&
+      (u.protocol === 'http:' || u.protocol === 'https:')
+    ) {
       return true
     }
     if (u.protocol !== 'https:') return false
@@ -259,8 +266,8 @@ export class DesktopUpdater extends EventEmitter {
     apiUrl = '',
     allowLocalhost = false,
     requireSha256 = true,
-    manifestPublicKey = '',
-    requireSignature = false,
+    manifestPublicKey = DEFAULT_DESKTOP_MANIFEST_PUBLIC_KEY,
+    requireSignature = true,
     getLang = () => 'zh',
   } = {}) {
     super()
@@ -273,7 +280,7 @@ export class DesktopUpdater extends EventEmitter {
     this.allowLocalhost = allowLocalhost
     this.requireSha256 = requireSha256 !== false
     this.manifestPublicKey = String(manifestPublicKey || '').trim()
-    this.requireSignature = Boolean(requireSignature || this.manifestPublicKey)
+    this.requireSignature = requireSignature !== false
     this.getLang = typeof getLang === 'function' ? getLang : () => 'zh'
     this.abortController = null
     this.isChecking = false
@@ -316,6 +323,48 @@ export class DesktopUpdater extends EventEmitter {
     return this.getState()
   }
 
+  async fetchWithValidatedRedirects(rawUrl, { headers = {}, signal, maxRedirects = MAX_REDIRECT_HOPS } = {}) {
+    let currentUrl = String(rawUrl || '').trim()
+    for (let hop = 0; hop <= maxRedirects; hop += 1) {
+      if (!isAllowedDownloadUrl(currentUrl, this.allowLocalhost)) {
+        throw new Error(
+          hop === 0
+            ? this.bi('拒绝从不受信任的下载地址拉取数据', 'Blocked request to untrusted host')
+            : this.bi('下载重定向到了不受信任的域名', 'Download redirected to an untrusted host'),
+        )
+      }
+      const reqHeaders =
+        hop === 0
+          ? headers
+          : { 'User-Agent': headers['User-Agent'] || `AllInOne-Desktop/${this.currentVersion}` }
+      const res = await fetch(currentUrl, {
+        headers: reqHeaders,
+        redirect: 'manual',
+        signal,
+      })
+      if (
+        res.status === 301 ||
+        res.status === 302 ||
+        res.status === 303 ||
+        res.status === 307 ||
+        res.status === 308
+      ) {
+        const location = res.headers?.get?.('location') || ''
+        try { await res.body?.cancel?.() } catch {}
+        if (!location.trim()) {
+          throw new Error(this.bi('重定向缺少目标地址', 'Redirect response missing Location header'))
+        }
+        if (hop >= maxRedirects) {
+          throw new Error(this.bi('重定向次数过多，已中止请求', 'Too many HTTP redirects'))
+        }
+        currentUrl = new URL(location.trim(), currentUrl).toString()
+        continue
+      }
+      return res
+    }
+    throw new Error(this.bi('重定向次数过多，已中止请求', 'Too many HTTP redirects'))
+  }
+
   async checkForUpdates({ silent = false } = {}) {
     const isBusy = () =>
       this.state.status === 'downloading' || this.state.status === 'installing' || this._installing
@@ -340,7 +389,7 @@ export class DesktopUpdater extends EventEmitter {
         if (this._releaseEtag && this._cachedRelease) {
           headers['If-None-Match'] = this._releaseEtag
         }
-        res = await fetch(this.apiUrl, {
+        res = await this.fetchWithValidatedRedirects(this.apiUrl, {
           headers,
           signal: controller.signal,
         })
@@ -406,17 +455,17 @@ export class DesktopUpdater extends EventEmitter {
       }
 
       let expectedSha256 = parseExpectedSha256(asset.digest)
+      let manifestOk = false
       if (this.manifestPublicKey) {
         const manifestAsset = (Array.isArray(release.assets) ? release.assets : []).find(
           (a) => a && a.name === DESKTOP_MANIFEST_NAME && isAllowedDownloadUrl(a.browser_download_url, this.allowLocalhost),
         )
-        let manifestOk = false
         if (manifestAsset) {
           try {
             const mCtrl = new AbortController()
             const mTimer = setTimeout(() => mCtrl.abort(), 10_000)
             try {
-              const mRes = await fetch(manifestAsset.browser_download_url, {
+              const mRes = await this.fetchWithValidatedRedirects(manifestAsset.browser_download_url, {
                 headers: { 'User-Agent': `AllInOne-Desktop/${this.currentVersion}` },
                 signal: mCtrl.signal,
               })
@@ -442,14 +491,14 @@ export class DesktopUpdater extends EventEmitter {
             }
           } catch {}
         }
-        if (this.requireSignature && !manifestOk) {
-          throw new Error(
-            this.bi(
-              '远端安装包缺少有效的 Ed25519 发布签名，已阻止自动更新',
-              'Remote release is missing a valid Ed25519 manifest signature; update blocked for security.',
-            ),
-          )
-        }
+      }
+      if (this.requireSignature && !manifestOk) {
+        throw new Error(
+          this.bi(
+            '远端安装包缺少有效的 Ed25519 发布签名，已阻止自动更新',
+            'Remote release is missing a valid Ed25519 manifest signature; update blocked for security.',
+          ),
+        )
       }
       const safeName = asset.name.replace(/[^a-zA-Z0-9._-]/g, '_')
       const cachedPath = join(this.downloadDir, safeName)
@@ -573,9 +622,8 @@ export class DesktopUpdater extends EventEmitter {
     })
 
     try {
-      const res = await fetch(downloadUrl, {
+      const res = await this.fetchWithValidatedRedirects(downloadUrl, {
         headers: { 'User-Agent': `AllInOne-Desktop/${this.currentVersion}` },
-        redirect: 'follow',
         signal: controller.signal,
       })
       if (!res.ok) {

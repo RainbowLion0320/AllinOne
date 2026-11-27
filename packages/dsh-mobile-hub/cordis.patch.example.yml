@@ -7,8 +7,8 @@
       config:
         # Optional default working directory for new chats
         cwd: ''
-        # Default permission preset for new DSH sessions
-        permissionPreset: 'danger-full-access'
+        # Default permission preset for new DSH sessions (safer workspace-write by default; opt-in to danger-full-access if needed)
+        permissionPreset: 'workspace-write'
         # Pure zero-invasion bridge mode: keep false to avoid injecting extra tools / token overhead
         enableDispatchTools: false
         # Optional local status file for diagnostics

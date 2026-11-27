@@ -161,6 +161,10 @@ export async function waitForChannelDrain(
       cleanups.push(() => sub?.unsubscribe?.())
     }
 
+    // Immediate re-check after attaching edge-triggered listeners to prevent missed-edge 250ms stalls
+    if (!isOpen()) return finish(new Error('DataChannel closed during transfer'))
+    if (getBuffered() <= lowWaterMark) return finish()
+
     // Only poll at 50 Hz if the DataChannel lacks native low-water events; otherwise use a gentle 250ms safety check.
     const pollMs = hasNativeDrainEvent ? 250 : 20
     const poll = setInterval(() => {
@@ -197,10 +201,27 @@ export async function sendWithBackpressure(dc, bytes, opts = {}) {
 /**
  * Serialize async writes onto a single DataChannel so concurrent streams or fragmented
  * control bursts cannot race on `bufferedAmountLowThreshold` or overshoot `highWaterMark`.
+ * Accepts either a DataChannel instance or a resolver function `() => dc`.
  */
-export function createSerializedChannelWriter(dc = null, defaultOpts = {}) {
+export function createSerializedChannelWriter(dcOrGetter = null, defaultOpts = {}) {
+  let boundDc = typeof dcOrGetter === 'function' ? null : dcOrGetter
+  let dcGetter = typeof dcOrGetter === 'function' ? dcOrGetter : null
   let chain = Promise.resolve()
   let closed = false
+
+  function resolveDc() {
+    return dcGetter ? dcGetter() : boundDc
+  }
+
+  function setChannel(nextDc) {
+    if (typeof nextDc === 'function') {
+      dcGetter = nextDc
+      boundDc = null
+    } else {
+      dcGetter = null
+      boundDc = nextDc || null
+    }
+  }
 
   function enqueue(fn) {
     if (closed) return Promise.reject(new Error('DataChannel writer closed'))
@@ -213,16 +234,21 @@ export function createSerializedChannelWriter(dc = null, defaultOpts = {}) {
   }
 
   function send(bytes, opts = {}) {
-    if (!dc) return Promise.reject(new Error('DataChannel not bound to writer'))
     const merged = { ...defaultOpts, ...opts }
-    return enqueue(() => sendWithBackpressure(dc, bytes, merged))
+    return enqueue(() => {
+      const target = resolveDc()
+      if (!target) throw new Error('DataChannel not bound to writer')
+      return sendWithBackpressure(target, bytes, merged)
+    })
   }
 
   function close() {
     closed = true
+    boundDc = null
+    dcGetter = null
   }
 
-  return { enqueue, send, close }
+  return { enqueue, send, setChannel, close }
 }
 
 /**
@@ -278,7 +304,13 @@ export function createBulkWindowController({
         clearTimeout(timer)
         if (signal && onAbort) signal.removeEventListener('abort', onAbort)
         const idx = waiters.indexOf(entry)
-        if (idx !== -1) waiters.splice(idx, 1)
+        if (idx !== -1) {
+          waiters.splice(idx, 1)
+          // Prevent head-of-line deadlock when an aborted/timed-out front waiter blocked smaller waiters behind it
+          if (idx === 0 && waiters.length > 0 && (closedErr || creditBytes >= waiters[0].needed)) {
+            wakeAll()
+          }
+        }
       }
       const entry = {
         needed,
@@ -378,7 +410,7 @@ export function createCtrlCodec({
     return true
   }
 
-  function pruneStale(now = Date.now(), reserve = 0) {
+  function pruneStale(now = Date.now(), reserve = 0, neededBytes = 0, excludeId = null) {
     for (const [id, entry] of [...assemblies.entries()]) {
       if (now - entry.createdAt > fragTimeoutMs) {
         removeAssembly(id)
@@ -386,9 +418,16 @@ export function createCtrlCodec({
     }
     const maxAllowed = Math.max(0, maxFragsInFlight - reserve)
     while (assemblies.size > maxAllowed) {
-      const oldest = assemblies.keys().next().value
+      const oldest = [...assemblies.keys()].find((k) => k !== excludeId)
       if (oldest === undefined) break
       removeAssembly(oldest)
+    }
+    if (neededBytes > 0) {
+      while (totalReassemblyBytes + neededBytes > totalReassemblyCap) {
+        const oldest = [...assemblies.keys()].find((k) => k !== excludeId)
+        if (oldest === undefined) break
+        removeAssembly(oldest)
+      }
     }
   }
 
@@ -501,7 +540,7 @@ export function createCtrlCodec({
       entry = undefined
     }
     if (!entry) {
-      pruneStale(now, 1)
+      pruneStale(now, 1, slice.byteLength)
       if (
         slice.byteLength > MAX_CTRL_REASSEMBLY_BYTES ||
         totalReassemblyBytes + slice.byteLength > totalReassemblyCap
@@ -519,7 +558,7 @@ export function createCtrlCodec({
         return null
       }
       if (totalReassemblyBytes + slice.byteLength > totalReassemblyCap) {
-        pruneStale(now, 0)
+        pruneStale(now, 0, slice.byteLength, fragId)
         if (totalReassemblyBytes + slice.byteLength > totalReassemblyCap) {
           if (entry.received === 0) removeAssembly(fragId)
           return null

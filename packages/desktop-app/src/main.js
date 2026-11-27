@@ -22,14 +22,15 @@ import {
   shell,
 } from 'electron'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
-import { homedir, hostname } from 'node:os'
-import { basename, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { hostname } from 'node:os'
+import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SANDBOX_PREVIEW_CSP } from '@allinone/shared'
 import { DesktopBridgeManager } from './bridge-manager.js'
-import { DesktopUpdater } from './updater.js'
+import { resolveSafeDesktopDeliverable } from './safe-paths.js'
+import { DEFAULT_DESKTOP_MANIFEST_PUBLIC_KEY, DesktopUpdater } from './updater.js'
 import { DesktopWebRtcProxy } from './webrtc-proxy.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -222,7 +223,7 @@ function disposeBridgeOnce() {
     })()
     let timeoutHandle = null
     const hardTimeout = new Promise((resolveTimeout) => {
-      timeoutHandle = setTimeout(resolveTimeout, 6_000)
+      timeoutHandle = setTimeout(resolveTimeout, 8_500)
       timeoutHandle.unref?.()
     })
     disposePromise = Promise.race([work, hardTimeout]).finally(() => {
@@ -240,6 +241,8 @@ const devUpdateApiUrl = !app.isPackaged
 const updater = new DesktopUpdater({
   currentVersion: app.getVersion(),
   downloadDir: join(app.getPath('userData'), 'updates'),
+  manifestPublicKey: DEFAULT_DESKTOP_MANIFEST_PUBLIC_KEY,
+  requireSignature: true,
   getLang: () => currentLang,
   ...(devUpdateApiUrl ? { apiUrl: devUpdateApiUrl, allowLocalhost: true } : {}),
 })
@@ -720,7 +723,7 @@ function registerStaticProtocol() {
       if (extname(target).toLowerCase() === '.html') {
         const isSandboxFrame = basename(target).toLowerCase() === 'sandbox-preview.html'
         headers['Content-Security-Policy'] = isSandboxFrame
-          ? `sandbox allow-scripts allow-forms; ${SANDBOX_PREVIEW_CSP}`
+          ? SANDBOX_PREVIEW_CSP
           : "default-src 'self' app:; script-src 'self' app:; style-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob: https:; font-src 'self' app: data:; connect-src 'self' app: https: http: ws: wss:; object-src 'none'; base-uri 'self'"
       }
       return new Response(buf, {
@@ -872,130 +875,12 @@ function registerIpc() {
     return shell.openPath(bridgeManager.stateDir)
   })
 
-  const SAFE_DELIVERABLE_EXTS = new Set([
-    '.pdf',
-    '.doc',
-    '.docx',
-    '.xls',
-    '.xlsx',
-    '.csv',
-    '.ppt',
-    '.pptx',
-    '.md',
-    '.markdown',
-    '.txt',
-    '.rtf',
-    '.epub',
-    '.zip',
-  ])
-  const SAFE_REVEAL_DELIVERABLE_EXTS = new Set([
-    ...SAFE_DELIVERABLE_EXTS,
-    '.html',
-    '.htm',
-  ])
-  const isSafeWindowsLocalPath = (candidate) =>
-    !/^\\\\/.test(candidate) && /^[A-Za-z]:\\[^:]+$/.test(candidate)
-
-  const resolveSafeDesktopDeliverable = (rawPath, cwd = '', { allowHtml = false } = {}) => {
-    const allowedExts = allowHtml ? SAFE_REVEAL_DELIVERABLE_EXTS : SAFE_DELIVERABLE_EXTS
-    let p = String(rawPath || '').trim()
-    if (!p || p.includes('\0')) return { ok: false, error: '缺少文件路径' }
-    if ((p.startsWith('<') && p.endsWith('>')) || (p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
-      p = p.slice(1, -1).trim()
-    }
-    if (/^file:\/\//i.test(p)) {
-      p = p.replace(/[?#].*$/, '').replace(/^file:\/\/(?:localhost)?/i, '')
-      try { p = decodeURIComponent(p) } catch {}
-      if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) p = p.slice(1)
-    }
-    if (p.startsWith('~/') || p.startsWith('~\\')) {
-      p = join(homedir(), p.slice(2))
-    }
-    if (process.platform === 'win32') {
-      // Block Windows UNC paths (\\host\share) and device namespaces (\\?\, \\.\) to prevent NTLMv2 leaks & remote opens
-      if (/^(?:\\\\|\/\/)/.test(p)) {
-        return { ok: false, error: '出于安全限制，禁止直接打开网络共享 (UNC) 或设备路径' }
-      }
-      p = p.replace(/\//g, '\\')
-      if (/^\\\\/.test(p)) {
-        return { ok: false, error: '出于安全限制，禁止直接打开网络共享 (UNC) 或设备路径' }
-      }
-    }
-    const baseDir = String(cwd || '').trim() || homedir()
-    const resolved = isAbsolute(p) ? resolve(p) : resolve(baseDir, p)
-    if (process.platform === 'win32' && !isSafeWindowsLocalPath(resolved)) {
-      return { ok: false, error: '出于安全限制，仅允许打开本地磁盘上的交付文件' }
-    }
-    const ext = extname(resolved).toLowerCase()
-    if (!allowedExts.has(ext)) {
-      return { ok: false, error: `不支持直接打开该格式（${ext || '未知格式'}）` }
-    }
-    if (!existsSync(resolved)) {
-      return { ok: false, error: `找不到本机文件：${resolved}` }
-    }
-    let realPath = ''
-    try {
-      realPath = realpathSync(resolved)
-    } catch (err) {
-      return { ok: false, error: `无法访问本机文件：${String(err?.message || err)}` }
-    }
-    if (process.platform === 'win32' && !isSafeWindowsLocalPath(realPath)) {
-      return { ok: false, error: '出于安全限制，符号链接目标仅允许指向本地磁盘文件' }
-    }
-    const realExt = extname(realPath).toLowerCase()
-    if (!allowedExts.has(realExt)) {
-      return { ok: false, error: `符号链接目标格式不受支持（${realExt || '未知格式'}）` }
-    }
-    let isFile = false
-    try {
-      isFile = statSync(realPath).isFile()
-    } catch (err) {
-      return { ok: false, error: `无法读取文件信息：${String(err?.message || err)}` }
-    }
-    if (!isFile) {
-      return { ok: false, error: '目标路径不是文件' }
-    }
-    // Constrain deliverable opens to cwd or user home/temp while blocking sensitive dot-directories & OS roots
-    const isUnderDir = (candidate, root) => {
-      if (!root) return false
-      try {
-        const rr = realpathSync(root)
-        const normC = process.platform === 'win32' ? candidate.toLowerCase() : candidate
-        const normR = process.platform === 'win32' ? rr.toLowerCase() : rr
-        return normC === normR || normC.startsWith(normR + sep)
-      } catch {
-        return false
-      }
-    }
-    const homeDir = homedir()
-    const sensitiveSubdirs = [
-      '.ssh',
-      '.gnupg',
-      '.aws',
-      '.kube',
-      '.allinone-bridge',
-      '.dsh',
-      '.codex',
-      '.claude',
-      '.workbuddy',
-      '.codebuddy',
-      '.gemini',
-    ]
-    for (const sub of sensitiveSubdirs) {
-      if (isUnderDir(realPath, join(homeDir, sub))) {
-        return { ok: false, error: '出于安全限制，禁止直接打开敏感配置目录中的文件' }
-      }
-    }
-    const allowedRoots = [cwd ? String(cwd).trim() : '', homeDir, app.getPath('temp')].filter(Boolean)
-    if (!allowedRoots.some((r) => isUnderDir(realPath, r))) {
-      return { ok: false, error: '出于安全限制，仅允许打开工作区或用户目录内的交付文件' }
-    }
-    return { ok: true, realPath, ext: realExt }
-  }
-
   ipcMain.handle('desktop:open-deliverable', async (event, rawPath, cwd = '') => {
     assertTrustedIpcEvent(event)
-    const check = resolveSafeDesktopDeliverable(rawPath, cwd, { allowHtml: false })
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd, {
+      allowHtml: false,
+      tempDir: app.getPath('temp'),
+    })
     if (!check.ok) return check
     // Reveal archives in Finder/Explorer instead of auto-extracting untrusted .zip payloads
     if (check.ext === '.zip') {
@@ -1008,7 +893,10 @@ function registerIpc() {
 
   ipcMain.handle('desktop:reveal-deliverable', (event, rawPath, cwd = '') => {
     assertTrustedIpcEvent(event)
-    const check = resolveSafeDesktopDeliverable(rawPath, cwd, { allowHtml: true })
+    const check = resolveSafeDesktopDeliverable(rawPath, cwd, {
+      allowHtml: true,
+      tempDir: app.getPath('temp'),
+    })
     if (!check.ok) return check
     shell.showItemInFolder(check.realPath)
     return { ok: true, path: check.realPath }

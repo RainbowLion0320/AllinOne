@@ -40,6 +40,24 @@ function parseSha256Digest(raw) {
   return m ? m[1].toLowerCase() : ''
 }
 
+function parseNativeManifestResult(res) {
+  if (!res) return null
+  if (typeof res === 'string') {
+    try { return JSON.parse(res) } catch { return null }
+  }
+  if (typeof res !== 'object') return null
+  if (typeof res.body === 'string') {
+    try { return JSON.parse(res.body) } catch { return null }
+  }
+  if (typeof res.text === 'string') {
+    try { return JSON.parse(res.text) } catch { return null }
+  }
+  if (res.data && typeof res.data === 'object') return res.data
+  if (res.manifest && typeof res.manifest === 'object') return res.manifest
+  if (res.sha256 || res.version || res.signature) return res
+  return null
+}
+
 function parseMinNativeVersionFromBody(body) {
   const m = String(body || '').match(MIN_NATIVE_MARKER_RE)
   return m ? m[1].trim() : ''
@@ -222,6 +240,7 @@ export async function checkNativeMobileUpdate({
   timeoutMs = 7000,
   locationLike = typeof window !== 'undefined' ? window.location : null,
   fetchImpl = typeof fetch === 'function' ? fetch : null,
+  fetchManifestImpl = null,
   navigatorLike = typeof navigator !== 'undefined' ? navigator : null,
   releasesApiUrl = DEFAULT_RELEASES_API_URL,
 } = {}) {
@@ -377,16 +396,35 @@ export async function checkNativeMobileUpdate({
       let ghManifestMinNative = ''
       if (hasNativeOta && manifestAsset) {
         try {
-          const mRes = await fetchWithTimeout(manifestAsset.browser_download_url, { cache: 'no-store' })
-          if (mRes.ok) {
-            const mData = await mRes.json().catch(() => null)
-            const mSha = parseSha256Digest(mData?.sha256)
-            if (mSha && (!bundleSha || mSha === bundleSha)) {
-              ghManifestSha = mSha
-              ghSignature = String(mData?.signature || '').trim()
-              ghSigAlg = String(mData?.sigAlg || '').trim()
-              ghManifestMinNative = String(mData?.minNativeVersion || '').trim().replace(/^v/i, '')
+          const nativePlugin =
+            typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()
+              ? window.Capacitor?.Plugins?.AllinOneUpdater || null
+              : null
+          const manifestFetcher =
+            typeof fetchManifestImpl === 'function'
+              ? fetchManifestImpl
+              : typeof nativePlugin?.fetchManifest === 'function'
+                ? (url) => nativePlugin.fetchManifest({ url })
+                : null
+
+          let mData = null
+          if (manifestFetcher) {
+            // Native Java HTTP client follows GitHub 302 -> objects.githubusercontent.com without WebView CORS failures
+            const rawNative = await manifestFetcher(manifestAsset.browser_download_url)
+            mData = parseNativeManifestResult(rawNative)
+          } else {
+            const mRes = await fetchWithTimeout(manifestAsset.browser_download_url, { cache: 'no-store' })
+            if (mRes.ok) {
+              mData = await mRes.json().catch(() => null)
             }
+          }
+
+          const mSha = parseSha256Digest(mData?.sha256)
+          if (mSha && (!bundleSha || mSha === bundleSha)) {
+            ghManifestSha = mSha
+            ghSignature = String(mData?.signature || '').trim()
+            ghSigAlg = String(mData?.sigAlg || '').trim()
+            ghManifestMinNative = String(mData?.minNativeVersion || '').trim().replace(/^v/i, '')
           }
         } catch {}
       }
@@ -496,7 +534,7 @@ export async function checkNativeMobileUpdate({
 
 const CONFIGURED_APK_URL = String(import.meta.env?.VITE_APK_URL || '').trim()
 
-const SAFE_SETUP_BASE_RE = /^https?:\/\/[A-Za-z0-9._:\-\[\]\/]+$/
+const SAFE_SETUP_BASE_RE = /^https?:\/\/[A-Za-z0-9._:[\]/-]+$/
 
 export function formatSafeSetupCmd(baseUrl, os = 'unix') {
   const cleanBase = String(baseUrl || '').trim().replace(/\/+$/, '')

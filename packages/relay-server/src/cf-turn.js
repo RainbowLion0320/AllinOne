@@ -8,7 +8,7 @@ const FETCH_TIMEOUT_MS = 6000
 const RETRY_BACKOFF_MS = [15_000, 30_000, 60_000, 120_000]
 const MAX_SCOPED_CREDS = 500
 const MAX_SCOPED_FETCH_PER_MIN = 30
-const VALID_TIERS = new Set([...SHARED_TIERS, 'admin'])
+const VALID_TIERS = new Set(SHARED_TIERS)
 
 function parseBoolOption(raw, fallback) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
@@ -293,6 +293,21 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
     return cached
   }
 
+  /**
+   * Pure read-only check of cached Cloudflare TURN readiness (zero outbound HTTP calls).
+   * Safe to call in `/api/admin/overview` and quota snapshots for offline users.
+   */
+  function isReady(scopeKey = '') {
+    if (!enabled) return false
+    const now = Date.now()
+    const cleanScope = String(scopeKey || '').trim()
+    if (cleanScope) {
+      const scoped = scopedCache.get(cleanScope)
+      if (scoped && now < scoped.expiresAt - 10_000) return true
+    }
+    return Boolean(cached && now < cached.expiresAt - 10_000)
+  }
+
   function getStats() {
     const now = Date.now()
     const ready = Boolean(enabled && cached && now < cached.expiresAt - 10_000)
@@ -315,6 +330,7 @@ export function createCloudflareTurnProvider(options = {}, env = process.env) {
     ttlSec,
     fallbackSelfHosted,
     appliesToTier,
+    isReady,
     refresh,
     start,
     stop,

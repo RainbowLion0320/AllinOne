@@ -26,25 +26,27 @@ import { InteractivePromptCard } from './InteractivePromptCard.jsx'
 import { TaskStateBar } from './TaskStateBar.jsx'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang } from '../lib/i18n.js'
-import { ImageContextProvider } from '../state/ImageContext.jsx'
-import { useSessionStream, useSessionStreamingActive } from '../state/streamingStore.js'
+import { clearStreamError, useSessionStream, useSessionStreamingActive } from '../state/streamingStore.js'
+import { SectionErrorBoundary } from './SectionErrorBoundary.jsx'
 
 const LazyMarkdownView = React.lazy(() =>
   import('../lib/markdown.jsx').then((m) => ({ default: m.MarkdownView })),
 )
 
-function SafeMarkdown({ text, streaming = false, imageContext = null }) {
+function SafeMarkdown({ text, streaming = false, resetKey = '' }) {
   if (!text) return null
   return (
-    <Suspense
-      fallback={
-        <div className="min-w-0 max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[15px] leading-[1.72] text-slate-800 dark:text-slate-100">
-          {text}
-        </div>
-      }
-    >
-      <LazyMarkdownView text={text} streaming={streaming} imageContext={imageContext} />
-    </Suspense>
+    <SectionErrorBoundary name="markdown" compact resetKey={resetKey}>
+      <Suspense
+        fallback={
+          <div className="min-w-0 max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[15px] leading-[1.72] text-slate-800 dark:text-slate-100">
+            {text}
+          </div>
+        }
+      >
+        <LazyMarkdownView text={text} streaming={streaming} />
+      </Suspense>
+    </SectionErrorBoundary>
   )
 }
 
@@ -242,44 +244,78 @@ function mergeUniqueTools(listA = [], listB = []) {
 
 /**
  * Merge consecutive assistant messages (e.g. multiple tool-only steps before final answer)
- * into a single visual assistant turn so tool calls collapse into ONE pill cleanly.
+ * into a single visual assistant turn while preserving referential equality for unchanged
+ * historical runs so `React.memo(MessageRow)` never re-renders prior messages on append.
  */
-function mergeAssistantRuns(messages) {
-  const merged = []
-  for (const msg of messages || []) {
-    const prev = merged[merged.length - 1]
-    if (msg.role === 'assistant' && prev && prev.role === 'assistant') {
-      const nextThinking = [prev.thinking, msg.thinking].filter(Boolean).join('\n\n')
-      const nextText = [prev.text, msg.text].filter(Boolean).join('\n\n')
-      const nextTools = mergeUniqueTools(prev.tools, msg.tools)
-      const nextImages = mergeUniqueImages(prev.images, msg.images)
-      const prevToolCount = Number(prev.toolCount) || (Array.isArray(prev.tools) ? prev.tools.length : 0)
+function mergeAssistantRunsStable(messages, prevCache) {
+  const raw = messages || []
+  const runs = []
+  for (const msg of raw) {
+    if (!msg) continue
+    const lastRun = runs[runs.length - 1]
+    if (msg.role === 'assistant' && lastRun && lastRun[0].role === 'assistant') {
+      lastRun.push(msg)
+    } else {
+      runs.push([msg])
+    }
+  }
+
+  const nextCache = new Map()
+  const merged = new Array(runs.length)
+
+  for (let i = 0; i < runs.length; i += 1) {
+    const run = runs[i]
+    if (run.length === 1) {
+      merged[i] = run[0]
+      continue
+    }
+    const key = run[0].id || `run-${i}`
+    const cached = prevCache?.get(key)
+    if (
+      cached &&
+      cached.sources.length === run.length &&
+      cached.sources.every((s, idx) => s === run[idx])
+    ) {
+      merged[i] = cached.merged
+      nextCache.set(key, cached)
+      continue
+    }
+
+    let acc = run[0]
+    for (let j = 1; j < run.length; j += 1) {
+      const msg = run[j]
+      const nextThinking = [acc.thinking, msg.thinking].filter(Boolean).join('\n\n')
+      const nextText = [acc.text, msg.text].filter(Boolean).join('\n\n')
+      const nextTools = mergeUniqueTools(acc.tools, msg.tools)
+      const nextImages = mergeUniqueImages(acc.images, msg.images)
+      const prevToolCount = Number(acc.toolCount) || (Array.isArray(acc.tools) ? acc.tools.length : 0)
       const msgToolCount = Number(msg.toolCount) || (Array.isArray(msg.tools) ? msg.tools.length : 0)
       const nextToolCount =
-        prev.toolCount != null || msg.toolCount != null
+        acc.toolCount != null || msg.toolCount != null
           ? Math.max(nextTools.length, prevToolCount + msgToolCount)
           : undefined
-      merged[merged.length - 1] = {
-        ...prev,
+      acc = {
+        ...acc,
         text: nextText,
         thinking: nextThinking || undefined,
         tools: nextTools.length > 0 ? nextTools : undefined,
         ...(nextToolCount !== undefined ? { toolCount: nextToolCount } : {}),
         images: nextImages.length > 0 ? nextImages : undefined,
-        ts: msg.ts || prev.ts,
+        ts: msg.ts || acc.ts,
       }
-    } else {
-      merged.push(msg)
     }
+    merged[i] = acc
+    nextCache.set(key, { sources: run, merged: acc })
   }
-  return merged
+
+  return { merged, nextCache }
 }
 
 /**
- * Memoized message row so prepending older pages or live streaming deltas never re-render
- * already-mounted Markdown trees or image cards.
+ * Memoized message row so prepending older pages, live streaming deltas, or transport
+ * status changes never re-render already-mounted Markdown trees or image cards.
  */
-const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, virtualize = false }) {
+const MessageRow = React.memo(function MessageRow({ msg, appId, virtualize = false }) {
   const allImages = useMemo(
     () => mergeUniqueImages(msg.images || [], extractImageRefsFromText(msg.text)),
     [msg.images, msg.text],
@@ -300,7 +336,7 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
         )}
         {allImages.length > 0 && (
           <div className="max-w-[85%]">
-            <ChatImageGallery images={allImages} imageContext={imageContext} compact={true} />
+            <ChatImageGallery images={allImages} compact={true} />
           </div>
         )}
       </div>
@@ -315,13 +351,9 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
         {Array.isArray(msg.tools) && msg.tools.length > 0 && (
           <ToolCallsGroup tools={msg.tools} totalToolCount={msg.toolCount} streaming={false} />
         )}
-        <SafeMarkdown text={msg.text} imageContext={imageContext} />
-        {allImages.length > 0 && (
-          <ChatImageGallery images={allImages} imageContext={imageContext} />
-        )}
-        {deliverables.length > 0 && (
-          <ChatDeliverableList files={deliverables} imageContext={imageContext} />
-        )}
+        <SafeMarkdown text={msg.text} resetKey={msg.id} />
+        {allImages.length > 0 && <ChatImageGallery images={allImages} />}
+        {deliverables.length > 0 && <ChatDeliverableList files={deliverables} />}
       </div>
     </div>
   )
@@ -334,7 +366,6 @@ const MessageRow = React.memo(function MessageRow({ msg, appId, imageContext, vi
 const StreamingAssistantTurn = React.memo(function StreamingAssistantTurn({
   sessionId,
   appId,
-  imageContext,
   scrollRef,
   isNearBottomRef,
   pinnedToBottomRef,
@@ -369,10 +400,8 @@ const StreamingAssistantTurn = React.memo(function StreamingAssistantTurn({
             {stream.tools?.length > 0 && <ToolCallsGroup tools={stream.tools} streaming={true} />}
             {stream.text ? (
               <>
-                <SafeMarkdown text={stream.text} streaming={true} imageContext={imageContext} />
-                {streamingImages.length > 0 && (
-                  <ChatImageGallery images={streamingImages} imageContext={imageContext} />
-                )}
+                <SafeMarkdown text={stream.text} streaming={true} resetKey={`${sessionId}:stream`} />
+                {streamingImages.length > 0 && <ChatImageGallery images={streamingImages} />}
               </>
             ) : (
               <div className="inline-flex items-center gap-2 py-1 text-sm text-slate-400">
@@ -387,6 +416,14 @@ const StreamingAssistantTurn = React.memo(function StreamingAssistantTurn({
         <div className="flex items-start gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{stream.error}</span>
+          <button
+            type="button"
+            onClick={() => clearStreamError(sessionId)}
+            aria-label={bi('关闭错误提示', 'Dismiss error')}
+            className="shrink-0 rounded-lg p-0.5 text-rose-500/80 transition hover:bg-rose-200/50 hover:text-rose-700 dark:text-rose-300/80 dark:hover:bg-rose-900/50"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
     </>
@@ -411,12 +448,10 @@ export const ChatView = React.memo(function ChatView({
   selectedWorkspace = '',
   onSelectWorkspace,
   onOpenNewChatModal,
-  activeDeviceName = '',
   bridgeOnline = false,
   refreshingQuotas = false,
   onRefreshQuotas,
   approvals,
-  imageContext,
   onResolveApproval,
 }) {
   const { bi, t } = useI18n()
@@ -452,7 +487,12 @@ export const ChatView = React.memo(function ChatView({
 
   useEffect(() => cancelPendingRafs, [])
 
-  const displayMessages = useMemo(() => mergeAssistantRuns(messages), [messages])
+  const mergedRunCacheRef = useRef(new Map())
+  const displayMessages = useMemo(() => {
+    const { merged, nextCache } = mergeAssistantRunsStable(messages, mergedRunCacheRef.current)
+    mergedRunCacheRef.current = nextCache
+    return merged
+  }, [messages])
 
   const captureVisibleAnchor = () => {
     const el = scrollRef.current
@@ -774,13 +814,11 @@ export const ChatView = React.memo(function ChatView({
   const hasContent = displayMessages.length > 0 || isStreamingActive
 
   return (
-    <ImageContextProvider value={imageContext}>
     <div className="relative flex min-h-0 flex-1 flex-col">
       <TaskStateBar
         sessionId={session?.id || ''}
         taskState={session?.taskState || null}
         running={Boolean(isStreamingActive || session?.syncState?.externalRunning)}
-        imageContext={imageContext}
       />
       <div
         ref={scrollRef}
@@ -900,7 +938,6 @@ export const ChatView = React.memo(function ChatView({
               selectedWorkspace={selectedWorkspace}
               onSelectWorkspace={onSelectWorkspace}
               onOpenNewChatModal={onOpenNewChatModal}
-              activeDeviceName={activeDeviceName}
               bridgeOnline={bridgeOnline}
               refreshingQuotas={refreshingQuotas}
               onRefreshQuotas={onRefreshQuotas}
@@ -916,7 +953,6 @@ export const ChatView = React.memo(function ChatView({
                 key={msg.id}
                 msg={msg}
                 appId={session?.app || 'dsh'}
-                imageContext={imageContext}
                 virtualize={idx >= 15 && idx < displayMessages.length - 8}
               />
             ))}
@@ -926,7 +962,6 @@ export const ChatView = React.memo(function ChatView({
               <StreamingAssistantTurn
                 sessionId={session.id}
                 appId={session.app || 'dsh'}
-                imageContext={imageContext}
                 scrollRef={scrollRef}
                 isNearBottomRef={isNearBottomRef}
                 pinnedToBottomRef={pinnedToBottomRef}
@@ -987,6 +1022,5 @@ export const ChatView = React.memo(function ChatView({
         </button>
       )}
     </div>
-    </ImageContextProvider>
   )
 })

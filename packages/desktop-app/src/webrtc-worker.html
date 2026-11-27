@@ -11,8 +11,88 @@
   const api = window.allinoneWebrtcWorker
   if (!api) return
 
-  /** @type {Map<string, { pc: RTCPeerConnection, ctrl: RTCDataChannel | null, bulk: RTCDataChannel | null, pendingIce: any[], localIceQueue: any[], answerSent: boolean, lastTransport: string, transportRetryTimer: any, blobQueue: Promise<void>, pendingBlobs: number }>} */
+  const RX_ACK_BATCH_BYTES = 128 * 1024
+  const DC_BUFFERED_PAUSE_THRESHOLD = 2 * 1024 * 1024
+  const MAX_PAUSED_RX_QUEUE_BYTES = 16 * 1024 * 1024
+
+  /** @type {Map<string, any>} */
   const peers = new Map()
+  let rxPaused = false
+  let pausedRxQueue = []
+  let pausedRxQueueBytes = 0
+  let pendingRxAckBytes = 0
+  let rxAckFlushTimer = null
+
+  const flushRxAckNow = () => {
+    if (rxAckFlushTimer) {
+      clearTimeout(rxAckFlushTimer)
+      rxAckFlushTimer = null
+    }
+    if (pendingRxAckBytes <= 0) return
+    const bytes = pendingRxAckBytes
+    pendingRxAckBytes = 0
+    try {
+      api.sendControl({ type: 'rx-ack', bytes })
+    } catch {}
+  }
+
+  const queueRxAck = (byteLen) => {
+    const n = Number(byteLen) || 0
+    if (n <= 0) return
+    pendingRxAckBytes += n
+    if (pendingRxAckBytes >= RX_ACK_BATCH_BYTES) {
+      flushRxAckNow()
+      return
+    }
+    if (!rxAckFlushTimer) {
+      rxAckFlushTimer = setTimeout(flushRxAckNow, 16)
+    }
+  }
+
+  const flushHeldEntryRxAck = (entry) => {
+    if (!entry || entry.heldRxAckBytes <= 0) return
+    const held = entry.heldRxAckBytes
+    entry.heldRxAckBytes = 0
+    queueRxAck(held)
+  }
+
+  const dispatchInboundToMain = (item) => {
+    if (!item || peers.get(item.peerId) !== item.entry) return
+    if (item.kind === 'text') {
+      api.sendControl({ type: 'dc.text', peerId: item.peerId, role: item.role, data: item.data })
+    } else if (item.kind === 'bin') {
+      api.sendBinary(item.peerId, item.role, item.bytes)
+    }
+  }
+
+  const enqueueOrDispatchInbound = (item) => {
+    if (!rxPaused && pausedRxQueue.length === 0) {
+      dispatchInboundToMain(item)
+      return
+    }
+    const size = item.kind === 'bin' ? (item.bytes?.byteLength || 0) : (item.data?.length || 0)
+    if (pausedRxQueueBytes + size > MAX_PAUSED_RX_QUEUE_BYTES) {
+      // Never silently drop ordered DataChannel frames — fail and close the peer cleanly instead
+      api.sendControl({
+        type: 'dc.error',
+        peerId: item.peerId,
+        role: item.role,
+        message: 'Inbound loopback queue exceeded safety cap',
+      })
+      closePeer(item.peerId)
+      return
+    }
+    pausedRxQueue.push({ item, size })
+    pausedRxQueueBytes += size
+  }
+
+  const flushPausedRxQueue = () => {
+    while (!rxPaused && pausedRxQueue.length > 0) {
+      const next = pausedRxQueue.shift()
+      pausedRxQueueBytes = Math.max(0, pausedRxQueueBytes - next.size)
+      dispatchInboundToMain(next.item)
+    }
+  }
 
   const detachChannelHandlers = (dc) => {
     if (!dc) return
@@ -23,10 +103,8 @@
     dc.onbufferedamountlow = null
   }
 
-  const closePeer = (peerId) => {
-    const entry = peers.get(peerId)
+  const disposeEntry = (entry) => {
     if (!entry) return
-    peers.delete(peerId)
     if (entry.transportRetryTimer) {
       clearTimeout(entry.transportRetryTimer)
       entry.transportRetryTimer = null
@@ -43,6 +121,7 @@
       clearInterval(entry.bulkBufferedTimer)
       entry.bulkBufferedTimer = null
     }
+    flushHeldEntryRxAck(entry)
     detachChannelHandlers(entry.ctrl)
     detachChannelHandlers(entry.bulk)
     if (entry.pc) {
@@ -54,6 +133,25 @@
     try { entry.ctrl?.close?.() } catch {}
     try { entry.bulk?.close?.() } catch {}
     try { entry.pc?.close?.() } catch {}
+  }
+
+  const closePeer = (peerId) => {
+    const entry = peers.get(peerId)
+    if (!entry) return
+    peers.delete(peerId)
+    if (pausedRxQueue.length > 0) {
+      const kept = []
+      let keptBytes = 0
+      for (const q of pausedRxQueue) {
+        if (q.item.entry !== entry) {
+          kept.push(q)
+          keptBytes += q.size
+        }
+      }
+      pausedRxQueue = kept
+      pausedRxQueueBytes = keptBytes
+    }
+    disposeEntry(entry)
   }
 
   const detectTransport = (peerId, entry, allowRetry = true) => {
@@ -124,6 +222,7 @@
     dc.onopen = notifyOpen
     dc.onclose = () => {
       if (peers.get(peerId) !== entry) return
+      flushHeldEntryRxAck(entry)
       api.sendControl({ type: 'dc.close', peerId, role })
       if (role === 'ctrl') {
         closePeer(peerId)
@@ -136,7 +235,7 @@
     dc.onmessage = (ev) => {
       if (peers.get(peerId) !== entry) return
       if (typeof ev.data === 'string') {
-        api.sendControl({ type: 'dc.text', peerId, role, data: ev.data })
+        enqueueOrDispatchInbound({ kind: 'text', peerId, entry, role, data: ev.data })
       } else if (ev.data instanceof ArrayBuffer) {
         const bytes = new Uint8Array(ev.data)
         if (entry.pendingBlobs > 0) {
@@ -144,7 +243,7 @@
           entry.blobQueue = entry.blobQueue
             .then(() => {
               if (peers.get(peerId) === entry) {
-                try { api.sendBinary(peerId, role, bytes) } catch {}
+                try { enqueueOrDispatchInbound({ kind: 'bin', peerId, entry, role, bytes }) } catch {}
               }
             })
             .catch(() => {})
@@ -152,7 +251,7 @@
               entry.pendingBlobs = Math.max(0, entry.pendingBlobs - 1)
             })
         } else {
-          api.sendBinary(peerId, role, bytes)
+          enqueueOrDispatchInbound({ kind: 'bin', peerId, entry, role, bytes })
         }
       } else if (ev.data instanceof Blob) {
         const blob = ev.data
@@ -161,7 +260,7 @@
           try {
             const ab = await blob.arrayBuffer()
             if (peers.get(peerId) === entry) {
-              api.sendBinary(peerId, role, new Uint8Array(ab))
+              enqueueOrDispatchInbound({ kind: 'bin', peerId, entry, role, bytes: new Uint8Array(ab) })
             }
           } catch {} finally {
             entry.pendingBlobs = Math.max(0, entry.pendingBlobs - 1)
@@ -174,9 +273,13 @@
     } catch {}
     dc.onbufferedamountlow = () => {
       if (peers.get(peerId) !== entry) return
+      const buffered = dc.bufferedAmount || 0
+      if (buffered < DC_BUFFERED_PAUSE_THRESHOLD) {
+        flushHeldEntryRxAck(entry)
+      }
       const ackedBytes = role === 'bulk' ? entry.bulkAckedSinceReport : 0
       if (role === 'bulk') entry.bulkAckedSinceReport = 0
-      api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: dc.bufferedAmount || 0, ackedBytes })
+      api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: buffered, ackedBytes })
     }
     // Per W3C WebRTC spec, remote-created DataChannels delivered via ondatachannel
     // often arrive already in 'open' state and never fire an 'open' event.
@@ -188,134 +291,168 @@
   api.onCommand(async (cmd) => {
     const { type, peerId, reqId } = cmd || {}
     try {
+      if (type === 'rx.pause') {
+        rxPaused = true
+        return
+      }
+      if (type === 'rx.resume') {
+        rxPaused = false
+        flushPausedRxQueue()
+        return
+      }
+
       if (type === 'peer.offer') {
         closePeer(peerId)
-        const iceServers = Array.isArray(cmd.iceServers) ? cmd.iceServers : []
-        const pc = new RTCPeerConnection({ iceServers })
-        const entry = {
-          pc,
-          ctrl: null,
-          bulk: null,
-          pendingIce: [],
-          localIceQueue: [],
-          answerSent: false,
-          lastTransport: '',
-          transportRetryTimer: null,
-          connectTimeoutTimer: null,
-          disconnectedTimer: null,
-          bulkBufferedTimer: null,
-          blobQueue: Promise.resolve(),
-          pendingBlobs: 0,
-          bulkAckedSinceReport: 0,
-        }
-        peers.set(peerId, entry)
-
-        // Reap stuck peers that never open a control DataChannel within 45s
-        entry.connectTimeoutTimer = setTimeout(() => {
-          entry.connectTimeoutTimer = null
-          if (peers.get(peerId) === entry && entry.ctrl?.readyState !== 'open') {
-            api.sendControl({ type: 'state', peerId, state: 'failed' })
-            closePeer(peerId)
+        let pc = null
+        let entry = null
+        try {
+          const iceServers = Array.isArray(cmd.iceServers) ? cmd.iceServers : []
+          pc = new RTCPeerConnection({ iceServers })
+          entry = {
+            pc,
+            ctrl: null,
+            bulk: null,
+            pendingIce: [],
+            localIceQueue: [],
+            answerSent: false,
+            lastTransport: '',
+            transportRetryTimer: null,
+            connectTimeoutTimer: null,
+            disconnectedTimer: null,
+            bulkBufferedTimer: null,
+            blobQueue: Promise.resolve(),
+            pendingBlobs: 0,
+            bulkAckedSinceReport: 0,
+            heldRxAckBytes: 0,
           }
-        }, 45_000)
+          peers.set(peerId, entry)
 
-        // Periodic 1s dc.buffered heartbeat while bulk data is draining so backpressure never wedges
-        entry.bulkBufferedTimer = setInterval(() => {
-          if (peers.get(peerId) !== entry) return
-          const bdc = entry.bulk
-          if (!bdc || bdc.readyState !== 'open') return
-          const buffered = bdc.bufferedAmount || 0
-          if (buffered > 0 || entry.bulkAckedSinceReport > 0) {
-            const ackedBytes = entry.bulkAckedSinceReport
-            entry.bulkAckedSinceReport = 0
-            api.sendControl({ type: 'dc.buffered', peerId, role: 'bulk', bufferedAmount: buffered, ackedBytes })
-          }
-        }, 1_000)
+          // Reap stuck peers that never open a control DataChannel within 45s
+          entry.connectTimeoutTimer = setTimeout(() => {
+            entry.connectTimeoutTimer = null
+            if (peers.get(peerId) === entry && entry.ctrl?.readyState !== 'open') {
+              api.sendControl({ type: 'state', peerId, state: 'failed' })
+              closePeer(peerId)
+            }
+          }, 45_000)
 
-        pc.onicecandidate = (ev) => {
-          if (peers.get(peerId) !== entry) return
-          if (ev.candidate) {
-            const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
-            if (!entry.answerSent) {
-              entry.localIceQueue.push(candidate)
+          // Periodic 1s dc.buffered heartbeat while bulk data is draining so backpressure never wedges
+          entry.bulkBufferedTimer = setInterval(() => {
+            if (peers.get(peerId) !== entry) return
+            const bdc = entry.bulk
+            if (!bdc || bdc.readyState !== 'open') {
+              flushHeldEntryRxAck(entry)
               return
             }
+            const buffered = bdc.bufferedAmount || 0
+            if (buffered < DC_BUFFERED_PAUSE_THRESHOLD) {
+              flushHeldEntryRxAck(entry)
+            }
+            if (buffered > 0 || entry.bulkAckedSinceReport > 0) {
+              const ackedBytes = entry.bulkAckedSinceReport
+              entry.bulkAckedSinceReport = 0
+              api.sendControl({ type: 'dc.buffered', peerId, role: 'bulk', bufferedAmount: buffered, ackedBytes })
+            }
+          }, 1_000)
+
+          pc.onicecandidate = (ev) => {
+            if (peers.get(peerId) !== entry) return
+            if (ev.candidate) {
+              const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
+              if (!entry.answerSent) {
+                entry.localIceQueue.push(candidate)
+                return
+              }
+              api.sendControl({ type: 'ice', peerId, candidate })
+            }
+          }
+          pc.onconnectionstatechange = () => {
+            if (peers.get(peerId) !== entry) return
+            const st = pc.connectionState || pc.iceConnectionState || 'new'
+            api.sendControl({ type: 'state', peerId, state: st })
+            if (st === 'failed' || st === 'closed') {
+              closePeer(peerId)
+              return
+            }
+            detectTransport(peerId, entry, true)
+          }
+          pc.oniceconnectionstatechange = () => {
+            if (peers.get(peerId) !== entry) return
+            const st = pc.iceConnectionState || 'new'
+            api.sendControl({ type: 'iceState', peerId, state: st })
+            if (st === 'failed' || st === 'closed') {
+              closePeer(peerId)
+              return
+            }
+            if (st === 'disconnected') {
+              if (!entry.disconnectedTimer) {
+                entry.disconnectedTimer = setTimeout(() => {
+                  entry.disconnectedTimer = null
+                  if (peers.get(peerId) === entry && pc.iceConnectionState === 'disconnected') {
+                    api.sendControl({ type: 'iceState', peerId, state: 'failed' })
+                    closePeer(peerId)
+                  }
+                }, 15_000)
+              }
+            } else if (entry.disconnectedTimer) {
+              clearTimeout(entry.disconnectedTimer)
+              entry.disconnectedTimer = null
+            }
+            detectTransport(peerId, entry, true)
+          }
+          pc.ondatachannel = (ev) => {
+            if (peers.get(peerId) !== entry) return
+            wireDataChannel(peerId, entry, ev.channel)
+          }
+
+          await pc.setRemoteDescription({ type: 'offer', sdp: String(cmd.sdp || '') })
+          if (peers.get(peerId) !== entry) {
+            disposeEntry(entry)
+            if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+            return
+          }
+          for (const c of entry.pendingIce) {
+            if (peers.get(peerId) !== entry) break
+            try { await pc.addIceCandidate(c) } catch {}
+          }
+          entry.pendingIce = []
+          if (peers.get(peerId) !== entry) {
+            disposeEntry(entry)
+            if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+            return
+          }
+
+          const answer = await pc.createAnswer()
+          if (peers.get(peerId) !== entry) {
+            disposeEntry(entry)
+            if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+            return
+          }
+          await pc.setLocalDescription(answer)
+          if (peers.get(peerId) !== entry) {
+            disposeEntry(entry)
+            if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
+            return
+          }
+          const finalSdp = pc.localDescription?.sdp || answer.sdp
+          api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: finalSdp } })
+          entry.answerSent = true
+          for (const candidate of entry.localIceQueue) {
+            if (peers.get(peerId) !== entry) break
             api.sendControl({ type: 'ice', peerId, candidate })
           }
-        }
-        pc.onconnectionstatechange = () => {
-          if (peers.get(peerId) !== entry) return
-          const st = pc.connectionState || pc.iceConnectionState || 'new'
-          api.sendControl({ type: 'state', peerId, state: st })
-          if (st === 'failed' || st === 'closed') {
+          entry.localIceQueue = []
+          return
+        } catch (offerErr) {
+          if (entry && peers.get(peerId) === entry) {
             closePeer(peerId)
-            return
+          } else if (entry) {
+            disposeEntry(entry)
+          } else if (pc) {
+            try { pc.close() } catch {}
           }
-          detectTransport(peerId, entry, true)
+          throw offerErr
         }
-        pc.oniceconnectionstatechange = () => {
-          if (peers.get(peerId) !== entry) return
-          const st = pc.iceConnectionState || 'new'
-          api.sendControl({ type: 'iceState', peerId, state: st })
-          if (st === 'failed' || st === 'closed') {
-            closePeer(peerId)
-            return
-          }
-          if (st === 'disconnected') {
-            if (!entry.disconnectedTimer) {
-              entry.disconnectedTimer = setTimeout(() => {
-                entry.disconnectedTimer = null
-                if (peers.get(peerId) === entry && pc.iceConnectionState === 'disconnected') {
-                  api.sendControl({ type: 'iceState', peerId, state: 'failed' })
-                  closePeer(peerId)
-                }
-              }, 15_000)
-            }
-          } else if (entry.disconnectedTimer) {
-            clearTimeout(entry.disconnectedTimer)
-            entry.disconnectedTimer = null
-          }
-          detectTransport(peerId, entry, true)
-        }
-        pc.ondatachannel = (ev) => {
-          if (peers.get(peerId) !== entry) return
-          wireDataChannel(peerId, entry, ev.channel)
-        }
-
-        await pc.setRemoteDescription({ type: 'offer', sdp: String(cmd.sdp || '') })
-        if (peers.get(peerId) !== entry) {
-          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
-          return
-        }
-        for (const c of entry.pendingIce) {
-          if (peers.get(peerId) !== entry) break
-          try { await pc.addIceCandidate(c) } catch {}
-        }
-        entry.pendingIce = []
-        if (peers.get(peerId) !== entry) {
-          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
-          return
-        }
-
-        const answer = await pc.createAnswer()
-        if (peers.get(peerId) !== entry) {
-          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
-          return
-        }
-        await pc.setLocalDescription(answer)
-        if (peers.get(peerId) !== entry) {
-          if (reqId) api.sendControl({ type: 'res', reqId, ok: false, error: 'Peer closed during offer' })
-          return
-        }
-        const finalSdp = pc.localDescription?.sdp || answer.sdp
-        api.sendControl({ type: 'res', reqId, ok: true, answer: { type: answer.type, sdp: finalSdp } })
-        entry.answerSent = true
-        for (const candidate of entry.localIceQueue) {
-          if (peers.get(peerId) !== entry) break
-          api.sendControl({ type: 'ice', peerId, candidate })
-        }
-        entry.localIceQueue = []
-        return
       }
 
       if (type === 'peer.ice') {
@@ -345,6 +482,9 @@
 
       if (type === 'peer.closeAll') {
         for (const id of [...peers.keys()]) closePeer(id)
+        pausedRxQueue = []
+        pausedRxQueueBytes = 0
+        flushRxAckNow()
         return
       }
     } catch (err) {
@@ -355,14 +495,24 @@
   })
 
   api.onBinary((peerId, role, bytes) => {
+    const byteLen = bytes?.byteLength || 0
     const entry = peers.get(peerId)
     const dc = role === 'bulk' ? entry?.bulk : entry?.ctrl
-    if (!dc || dc.readyState !== 'open') return
+    if (!dc || dc.readyState !== 'open') {
+      queueRxAck(byteLen)
+      return
+    }
     try {
       dc.send(bytes)
       const buffered = dc.bufferedAmount || 0
+      if (buffered < DC_BUFFERED_PAUSE_THRESHOLD) {
+        flushHeldEntryRxAck(entry)
+        queueRxAck(byteLen)
+      } else {
+        entry.heldRxAckBytes += byteLen
+      }
       if (role === 'bulk') {
-        entry.bulkAckedSinceReport += bytes?.byteLength || 0
+        entry.bulkAckedSinceReport += byteLen
         if (buffered >= 512 * 1024 || entry.bulkAckedSinceReport >= 256 * 1024) {
           const ackedBytes = entry.bulkAckedSinceReport
           entry.bulkAckedSinceReport = 0
@@ -372,6 +522,7 @@
         api.sendControl({ type: 'dc.buffered', peerId, role, bufferedAmount: buffered })
       }
     } catch (err) {
+      queueRxAck(byteLen)
       api.sendControl({ type: 'dc.error', peerId, role, message: String(err?.message || err) })
     }
   })

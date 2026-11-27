@@ -48,8 +48,12 @@ export function createAuthManager({
   const MAX_ACCT_FAILS = 10
   const ACCT_WINDOW_MS = 15 * 60 * 1000
 
-  // Separate per-account rate limit dedicated to password reset OTP verification
-  const resetAccountFailures = new Map()
+  // Per-(ip, normalizedEmail) rate limit dedicated to password reset OTP verification.
+  // Keyed by (ip, email) so remote attackers cannot lock out victims from another IP,
+  // and tracked uniformly regardless of whether the email exists (zero enumeration oracle).
+  const resetFailures = new Map()
+  const MAX_RESET_FAILS = 10
+  const RESET_WINDOW_MS = 15 * 60 * 1000
 
   // Per-(IP, roomId) + Per-IP-only rate limits for /ws/bridge & device-status auth failures.
   // Nonexistent/invalid rooms collapse into one sentinel bucket per IP (`__invalid__`) so
@@ -117,8 +121,12 @@ export function createAuthManager({
     }
   }
 
-  function clearFailure(ip) {
-    failures.delete(ip)
+  // Per-IP global failure counters expire naturally after WINDOW_MS and are NEVER
+  // cleared by a single successful login (prevents self-reset brute-force bypass).
+  function clearFailure(ip, identifier = '') {
+    if (identifier) {
+      clearAccountFailure(identifier, ip)
+    }
   }
 
   function normalizeExistingAccountId(identifier) {
@@ -165,35 +173,42 @@ export function createAuthManager({
     if (key) accountFailures.delete(key)
   }
 
-  function checkResetRateLimit(identifier) {
-    const key = normalizeExistingAccountId(identifier)
-    if (!key) return true
-    const now = Date.now()
-    const entry = resetAccountFailures.get(key)
-    if (!entry) return true
-    if (now - entry.firstAt > ACCT_WINDOW_MS) {
-      resetAccountFailures.delete(key)
-      return true
-    }
-    return entry.count < MAX_ACCT_FAILS
+  function normalizeResetKey(ip, email) {
+    const cleanIp = String(ip || 'unknown').trim().slice(0, 64) || 'unknown'
+    const cleanEmail = String(email || '').trim().toLowerCase().slice(0, 254)
+    if (!cleanEmail) return ''
+    return `${cleanIp}::${cleanEmail}`
   }
 
-  function recordResetFailure(identifier) {
-    const key = normalizeExistingAccountId(identifier)
+  function checkResetRateLimit(ip, email) {
+    const key = normalizeResetKey(ip, email)
+    if (!key) return true
+    const now = Date.now()
+    const entry = resetFailures.get(key)
+    if (!entry) return true
+    if (now - entry.firstAt > RESET_WINDOW_MS) {
+      resetFailures.delete(key)
+      return true
+    }
+    return entry.count < MAX_RESET_FAILS
+  }
+
+  function recordResetFailure(ip, email) {
+    const key = normalizeResetKey(ip, email)
     if (!key) return
     const now = Date.now()
-    pruneMap(resetAccountFailures, ACCT_WINDOW_MS, now, MAX_ACCT_FAILS)
-    const entry = resetAccountFailures.get(key)
-    if (!entry || now - entry.firstAt > ACCT_WINDOW_MS) {
-      resetAccountFailures.set(key, { count: 1, firstAt: now })
+    pruneMap(resetFailures, RESET_WINDOW_MS, now, MAX_RESET_FAILS)
+    const entry = resetFailures.get(key)
+    if (!entry || now - entry.firstAt > RESET_WINDOW_MS) {
+      resetFailures.set(key, { count: 1, firstAt: now })
     } else {
       entry.count += 1
     }
   }
 
-  function clearResetFailure(identifier) {
-    const key = normalizeExistingAccountId(identifier)
-    if (key) resetAccountFailures.delete(key)
+  function clearResetFailure(ip, email) {
+    const key = normalizeResetKey(ip, email)
+    if (key) resetFailures.delete(key)
   }
 
   function normalizeBridgeIp(ip) {
@@ -251,12 +266,11 @@ export function createAuthManager({
     }
   }
 
+  // Only clears the per-(ip, roomId) bucket; NEVER resets the IP-wide bridge failure counter.
   function clearBridgeFailure(ip, roomId = '') {
     const cleanRoom = String(roomId || '').trim()
     if (cleanRoom) {
       bridgeFailures.delete(normalizeBridgeKey(ip, cleanRoom))
-    } else {
-      bridgeIpFailures.delete(normalizeBridgeIp(ip))
     }
   }
 

@@ -1,7 +1,11 @@
+import { EVENTS, WS_MSG } from '@allinone/shared'
 import { bi, getCurrentLang } from './i18n.js'
 import { P2PPeerSession } from './p2pClient.js'
 
 const L = (zh, en) => bi(getCurrentLang(), zh, en)
+const P2P_MAX_AUTO_RETRIES = 4
+const P2P_RETRY_BASE_MS = 1_500
+const P2P_RETRY_MAX_MS = 12_000
 
 function normalizeE2eeKeysMap(keysMap) {
   const out = {}
@@ -601,6 +605,12 @@ export class MobileRelayClient {
 
     /** @type {Map<string, P2PPeerSession>} bridgeId -> P2PPeerSession */
     this.p2pPeers = new Map()
+    /** @type {Map<string, { lastSeq: number, bootId: string }>} bridgeId -> event sync cursor */
+    this._bridgeEventSync = new Map()
+    /** @type {Set<string>} */
+    this._cancelledGrantIds = new Set()
+    this._p2pRetryAttempt = 0
+    this._p2pRetryTimer = null
     this.p2pState = 'idle' // 'idle' | 'connecting' | 'connected' | 'failed'
     this.p2pError = ''
     this.p2pEngine = ''
@@ -609,6 +619,7 @@ export class MobileRelayClient {
 
     this._onWindowOnline = () => {
       if (this.closed) return
+      this._resetP2pRetryBackoff()
       if (this.connectionState === 'disconnected') {
         this.attempt = 0
         void this.openSocket()
@@ -625,11 +636,15 @@ export class MobileRelayClient {
     this._onResumeProbe = () => {
       if (this.closed) return
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      this._resetP2pRetryBackoff()
       this.probeConnection()
     }
     this._onAppState = (ev) => {
       if (this.closed) return
-      if (ev?.detail?.isActive) this.probeConnection()
+      if (ev?.detail?.isActive) {
+        this._resetP2pRetryBackoff()
+        this.probeConnection()
+      }
     }
     if (typeof window !== 'undefined') {
       window.addEventListener('online', this._onWindowOnline)
@@ -637,6 +652,59 @@ export class MobileRelayClient {
     }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', this._onResumeProbe)
+    }
+  }
+
+  _resetP2pRetryBackoff() {
+    this._p2pRetryAttempt = 0
+    if (this._p2pRetryTimer) {
+      clearTimeout(this._p2pRetryTimer)
+      this._p2pRetryTimer = null
+    }
+  }
+
+  _scheduleP2pAutoRetry(bridgeId) {
+    if (this.closed || this._p2pRetryTimer) return
+    if (this.connectionState !== 'connected') return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+    const targetId = this._resolveTargetBridgeId(bridgeId)
+    if (!targetId || targetId !== this._resolveTargetBridgeId()) return
+    if (this._quotaBlockedBridgeId === targetId && this.turnQuota?.exceeded) return
+    if (!this.bridges.some((b) => b.bridgeId === targetId && b.online)) return
+    if (!this.getBridgeE2eeContext(targetId).ready) return
+    if (this._p2pRetryAttempt >= P2P_MAX_AUTO_RETRIES) return
+
+    const baseDelay = Math.min(P2P_RETRY_MAX_MS, P2P_RETRY_BASE_MS * Math.pow(2, this._p2pRetryAttempt))
+    const jitter = 0.8 + Math.random() * 0.4
+    const delay = Math.round(baseDelay * jitter)
+    this._p2pRetryAttempt += 1
+    this._p2pRetryTimer = setTimeout(() => {
+      this._p2pRetryTimer = null
+      if (this.closed || this.connectionState !== 'connected') return
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      const curTarget = this._resolveTargetBridgeId()
+      if (curTarget !== targetId) return
+      if (this._quotaBlockedBridgeId === targetId && this.turnQuota?.exceeded) return
+      const curPeer = this.p2pPeers.get(targetId)
+      if (curPeer && !curPeer.closed && curPeer.state !== 'failed') return
+      void this.retryP2p(targetId, { preserveBackoff: true }).catch(() => {})
+    }, delay)
+  }
+
+  isGrantCancelled(reqId) {
+    const clean = String(reqId || '').trim().toLowerCase()
+    return Boolean(clean && this._cancelledGrantIds.has(clean))
+  }
+
+  _markGrantCancelled(reqId) {
+    const clean = String(reqId || '').trim().toLowerCase()
+    if (!clean) return
+    this._cancelledGrantIds.delete(clean)
+    this._cancelledGrantIds.add(clean)
+    while (this._cancelledGrantIds.size > 64) {
+      const oldest = this._cancelledGrantIds.values().next().value
+      if (!oldest) break
+      this._cancelledGrantIds.delete(oldest)
     }
   }
 
@@ -650,7 +718,7 @@ export class MobileRelayClient {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const wsRef = this.ws
       const prevPong = this.lastPongAt
-      try { wsRef.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+      try { wsRef.send(JSON.stringify({ type: WS_MSG.PING, ts: Date.now() })) } catch {}
       setTimeout(() => {
         if (this.closed || this.ws !== wsRef) return
         if (this.lastPongAt <= prevPong) {
@@ -662,6 +730,15 @@ export class MobileRelayClient {
     const activePeer = targetId ? this.p2pPeers.get(targetId) : null
     if (activePeer?.isOpen?.()) {
       activePeer.probeLiveness(4_000)
+    } else if (
+      this.connectionState === 'connected' &&
+      targetId &&
+      (!activePeer || activePeer.closed || activePeer.state === 'failed') &&
+      !(this._quotaBlockedBridgeId === targetId && this.turnQuota?.exceeded) &&
+      this.bridges.some((b) => b.bridgeId === targetId && b.online) &&
+      this.getBridgeE2eeContext(targetId).ready
+    ) {
+      void this.retryP2p(targetId).catch(() => {})
     }
   }
 
@@ -759,10 +836,23 @@ export class MobileRelayClient {
 
     const existing = this.p2pPeers.get(targetId)
     if (existing && !existing.closed && existing.state !== 'failed') return
-    // Do not spin-loop if the previous attempt just failed on a blocked network; wait for user Retry or network change
-    if (existing && existing.state === 'failed') return
+    if (existing && existing.state === 'failed') {
+      this._scheduleP2pAutoRetry(targetId)
+      return
+    }
 
     void this.ensureP2pConnected(targetId).catch(() => {})
+  }
+
+  _getBridgeSyncCursor(bridgeId) {
+    const clean = String(bridgeId || '').trim()
+    if (!clean) return { lastSeq: 0, bootId: '' }
+    let cur = this._bridgeEventSync.get(clean)
+    if (!cur) {
+      cur = { lastSeq: 0, bootId: '' }
+      this._bridgeEventSync.set(clean, cur)
+    }
+    return cur
   }
 
   _createP2pPeer(bridgeId) {
@@ -772,9 +862,30 @@ export class MobileRelayClient {
       this.p2pPeers.delete(bridgeId)
     }
 
+    const syncCursor = this._getBridgeSyncCursor(bridgeId)
+    const bridgeMeta = this.bridges.find((b) => b.bridgeId === bridgeId)
+    const metaBootId = String(bridgeMeta?.bootId || bridgeMeta?.bridgeBootId || '').trim()
+    if (metaBootId && syncCursor.bootId && syncCursor.bootId !== metaBootId) {
+      syncCursor.lastSeq = 0
+      syncCursor.bootId = metaBootId
+    } else if (metaBootId && !syncCursor.bootId) {
+      syncCursor.bootId = metaBootId
+    }
+
     const peer = new P2PPeerSession({
       bridgeId,
       roomId: this.roomId,
+      initialEventSeq: syncCursor.lastSeq,
+      bridgeBootId: syncCursor.bootId,
+      onEventSeq: (seq) => {
+        const cur = this._getBridgeSyncCursor(bridgeId)
+        if (seq > cur.lastSeq) cur.lastSeq = seq
+      },
+      onBridgeBootId: (nextBootId, resetSeq) => {
+        const cur = this._getBridgeSyncCursor(bridgeId)
+        cur.bootId = nextBootId
+        if (resetSeq) cur.lastSeq = 0
+      },
       getClientId: () => this.clientId,
       getE2eeContext: (bid) => this.getBridgeE2eeContext(bid),
       getIceServers: () => this.iceServers,
@@ -782,14 +893,14 @@ export class MobileRelayClient {
         if (this.ws?.readyState !== WebSocket.OPEN) return
         try {
           this.ws.send(JSON.stringify({
-            type: 'p2p.signal',
+            type: WS_MSG.P2P_SIGNAL,
             bridgeId: bid,
             sessionId,
             e2ee,
           }))
         } catch {}
       },
-      onStateChange: ({ bridgeId: bid, state, error, engine, transport }) => {
+      onStateChange: ({ bridgeId: bid, state, error, errorCode, engine, transport }) => {
         if (this.p2pPeers.get(bid) !== peer) return
         const activeTarget = this._resolveTargetBridgeId()
         if (bid === activeTarget) {
@@ -797,6 +908,16 @@ export class MobileRelayClient {
           this.p2pError = error || ''
           this.p2pEngine = engine || ''
           this.p2pTransport = transport || ''
+          if (state === 'connected') {
+            this._resetP2pRetryBackoff()
+          } else if (
+            state === 'failed' &&
+            errorCode !== 'P2P_UNSUPPORTED' &&
+            errorCode !== 'E2EE_KEY_REQUIRED' &&
+            errorCode !== 'BRIDGE_OFFLINE'
+          ) {
+            this._scheduleP2pAutoRetry(bid)
+          }
           this.emitStatus()
         }
       },
@@ -848,9 +969,10 @@ export class MobileRelayClient {
     return peer.connect()
   }
 
-  async retryP2p(bridgeOverride = '') {
+  async retryP2p(bridgeOverride = '', { preserveBackoff = false } = {}) {
     const targetId = this._resolveTargetBridgeId(bridgeOverride)
     if (!targetId) return null
+    if (!preserveBackoff) this._resetP2pRetryBackoff()
     if (this._quotaBlockedBridgeId === targetId) this._quotaBlockedBridgeId = ''
     const existing = this.p2pPeers.get(targetId)
     if (existing) {
@@ -864,7 +986,12 @@ export class MobileRelayClient {
   setTargetBridgeId(bridgeId) {
     const next = String(bridgeId || '').trim()
     if (next === this.targetBridgeId) return
+    const prevBridgeId = this.targetBridgeId
     this.targetBridgeId = next
+    this._resetP2pRetryBackoff()
+    // Reset per-bridge event sync sequence on bridge switch
+    if (prevBridgeId) this._bridgeEventSync.delete(prevBridgeId)
+    if (next) this._bridgeEventSync.delete(next)
     // Close non-target bridge peers so switching PCs doesn't keep stale WebRTC sockets alive
     for (const [bid, peer] of [...this.p2pPeers.entries()]) {
       if (next && bid !== next) {
@@ -878,6 +1005,7 @@ export class MobileRelayClient {
 
   setE2eeKeys(keysMap) {
     this.e2eeKeys = normalizeE2eeKeysMap(keysMap)
+    this._resetP2pRetryBackoff()
     // Clear prior failed peers so newly synced keys immediately trigger auto-connect
     for (const [bid, peer] of [...this.p2pPeers.entries()]) {
       if (peer.state === 'failed') {
@@ -974,6 +1102,8 @@ export class MobileRelayClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    this._resetP2pRetryBackoff()
+    this._bridgeEventSync.clear()
     this.stopPing()
     const notifyPromises = this._closeAllP2pPeers(true)
     this._settleGrantListResolvers()
@@ -1070,7 +1200,7 @@ export class MobileRelayClient {
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
 
-      if (msg.type === 'pong') {
+      if (msg.type === WS_MSG.PONG) {
         this.lastPongAt = Date.now()
         if (this.pongTimeoutTimer) {
           clearTimeout(this.pongTimeoutTimer)
@@ -1079,8 +1209,9 @@ export class MobileRelayClient {
         return
       }
 
-      if (msg.type === 'hello') {
+      if (msg.type === WS_MSG.HELLO) {
         this.lastPongAt = Date.now()
+        this._resetP2pRetryBackoff()
         if (msg.clientId) this.clientId = String(msg.clientId)
         if (msg.roomId && !this.roomId) this.roomId = String(msg.roomId)
         if (Array.isArray(msg.iceServers)) this.iceServers = msg.iceServers
@@ -1107,7 +1238,7 @@ export class MobileRelayClient {
           this.pendingGrants = msg.pendingGrants
           for (const g of msg.pendingGrants) {
             for (const fn of this.eventListeners) {
-              try { fn('e2ee.grant.request', g, msg) } catch {}
+              try { fn(EVENTS.E2EE_GRANT_REQUEST, g, msg) } catch {}
             }
           }
         }
@@ -1115,11 +1246,12 @@ export class MobileRelayClient {
         return
       }
 
-      if (msg.type === 'ice.update') {
+      if (msg.type === WS_MSG.ICE_UPDATE) {
         const wasExceeded = Boolean(this.turnQuota?.exceeded)
         if (Array.isArray(msg.iceServers)) this.iceServers = msg.iceServers
         if (msg.turnQuota !== undefined) this.turnQuota = msg.turnQuota || null
         if (msg.quotaExceeded) {
+          this._resetP2pRetryBackoff()
           let droppedActiveRelayed = false
           const activeTarget = this._resolveTargetBridgeId()
           for (const [bid, peer] of [...this.p2pPeers.entries()]) {
@@ -1150,7 +1282,7 @@ export class MobileRelayClient {
         return
       }
 
-      if (msg.type === 'p2p.signal') {
+      if (msg.type === WS_MSG.P2P_SIGNAL) {
         const bid = String(msg.bridgeId || '').trim()
         const peer = this.p2pPeers.get(bid)
         if (peer) {
@@ -1159,7 +1291,7 @@ export class MobileRelayClient {
         return
       }
 
-      if (msg.type === 'p2p.signal.error') {
+      if (msg.type === WS_MSG.P2P_SIGNAL_ERROR) {
         const bid = String(msg.bridgeId || '').trim()
         const peer = this.p2pPeers.get(bid)
         if (peer) {
@@ -1172,7 +1304,7 @@ export class MobileRelayClient {
         return
       }
 
-      if (msg.type === 'e2ee.grant.list.res') {
+      if (msg.type === WS_MSG.E2EE_GRANT_LIST_RES) {
         const resolver = this._grantListResolvers.get(String(msg.id || ''))
         if (resolver) {
           this._grantListResolvers.delete(String(msg.id || ''))
@@ -1185,7 +1317,7 @@ export class MobileRelayClient {
       }
 
       if (msg.type === 'event' && !msg.e2ee) {
-        if (msg.event === 'bridge.status') {
+        if (msg.event === EVENTS.BRIDGE_STATUS) {
           if (Array.isArray(msg.payload?.bridges)) this.bridges = msg.payload.bridges
           if (Array.isArray(msg.payload?.devices)) this.devices = msg.payload.devices
           this._pruneOfflinePeers()
@@ -1194,7 +1326,7 @@ export class MobileRelayClient {
           for (const fn of this.eventListeners) {
             try { fn(msg.event, msg.payload, msg) } catch {}
           }
-        } else if (msg.event === 'clients.status') {
+        } else if (msg.event === EVENTS.CLIENTS_STATUS) {
           if (Array.isArray(msg.payload?.clients)) {
             this.onlineClientCount = Number(msg.payload?.onlineCount) || msg.payload.clients.length
             this.emitStatus()
@@ -1203,20 +1335,21 @@ export class MobileRelayClient {
             try { fn(msg.event, msg.payload, msg) } catch {}
           }
         } else if (
-          msg.event === 'e2ee.grant.request' ||
-          msg.event === 'e2ee.grant.offer' ||
-          msg.event === 'e2ee.grant.reveal' ||
-          msg.event === 'e2ee.grant.deliver' ||
-          msg.event === 'e2ee.grant.reject' ||
-          msg.event === 'e2ee.grant.cancel' ||
-          msg.event === 'e2ee.qr.nudge'
+          msg.event === EVENTS.E2EE_GRANT_REQUEST ||
+          msg.event === EVENTS.E2EE_GRANT_OFFER ||
+          msg.event === EVENTS.E2EE_GRANT_REVEAL ||
+          msg.event === EVENTS.E2EE_GRANT_DELIVER ||
+          msg.event === EVENTS.E2EE_GRANT_REJECT ||
+          msg.event === EVENTS.E2EE_GRANT_CANCEL ||
+          msg.event === EVENTS.E2EE_QR_NUDGE
         ) {
-          if (msg.event === 'e2ee.grant.request' && msg.payload?.reqId) {
+          if (msg.event === EVENTS.E2EE_GRANT_REQUEST && msg.payload?.reqId) {
             this.pendingGrants = [
               msg.payload,
               ...this.pendingGrants.filter((g) => g.reqId !== msg.payload.reqId),
             ]
-          } else if (msg.event === 'e2ee.grant.cancel' && msg.payload?.reqId) {
+          } else if (msg.event === EVENTS.E2EE_GRANT_CANCEL && msg.payload?.reqId) {
+            this._markGrantCancelled(msg.payload.reqId)
             this.pendingGrants = this.pendingGrants.filter((g) => g.reqId !== msg.payload.reqId)
           }
           for (const fn of this.eventListeners) {
@@ -1285,7 +1418,7 @@ export class MobileRelayClient {
     this.pingTimer = setInterval(() => {
       const wsRef = this.ws
       if (wsRef?.readyState === WebSocket.OPEN) {
-        try { wsRef.send(JSON.stringify({ type: 'ping', ts: Date.now() })) } catch {}
+        try { wsRef.send(JSON.stringify({ type: WS_MSG.PING, ts: Date.now() })) } catch {}
         if (this.pongTimeoutTimer) clearTimeout(this.pongTimeoutTimer)
         this.pongTimeoutTimer = setTimeout(() => {
           this.pongTimeoutTimer = null
@@ -1341,7 +1474,7 @@ export class MobileRelayClient {
   sendGrantRequest({ reqId, pubKey, commit = '', wantedKeyId = '' }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     this.ws.send(JSON.stringify({
-      type: 'e2ee.grant.req',
+      type: WS_MSG.E2EE_GRANT_REQ,
       reqId,
       pubKey,
       ...(commit ? { commit } : {}),
@@ -1362,14 +1495,14 @@ export class MobileRelayClient {
         resolve(this.pendingGrants || [])
       }, timeoutMs)
       this._grantListResolvers.set(id, { resolve, timer })
-      this.ws.send(JSON.stringify({ type: 'e2ee.grant.list', id }))
+      this.ws.send(JSON.stringify({ type: WS_MSG.E2EE_GRANT_LIST, id }))
     })
   }
 
   sendGrantOffer({ reqId, approverPubKey, approverNonce = '' }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     this.ws.send(JSON.stringify({
-      type: 'e2ee.grant.offer',
+      type: WS_MSG.E2EE_GRANT_OFFER,
       reqId,
       approverPubKey,
       ...(approverNonce ? { approverNonce } : {}),
@@ -1379,32 +1512,32 @@ export class MobileRelayClient {
 
   sendGrantReveal({ reqId, requesterNonce }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
-    this.ws.send(JSON.stringify({ type: 'e2ee.grant.reveal', reqId, requesterNonce }))
+    this.ws.send(JSON.stringify({ type: WS_MSG.E2EE_GRANT_REVEAL, reqId, requesterNonce }))
     return true
   }
 
   sendGrantDeliver({ reqId, envelope }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
-    this.ws.send(JSON.stringify({ type: 'e2ee.grant.deliver', reqId, envelope }))
+    this.ws.send(JSON.stringify({ type: WS_MSG.E2EE_GRANT_DELIVER, reqId, envelope }))
     return true
   }
 
   sendGrantReject({ reqId }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
-    this.ws.send(JSON.stringify({ type: 'e2ee.grant.reject', reqId }))
+    this.ws.send(JSON.stringify({ type: WS_MSG.E2EE_GRANT_REJECT, reqId }))
     return true
   }
 
   sendGrantCancel({ reqId }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
-    this.ws.send(JSON.stringify({ type: 'e2ee.grant.cancel', reqId }))
+    this.ws.send(JSON.stringify({ type: WS_MSG.E2EE_GRANT_CANCEL, reqId }))
     return true
   }
 
   sendQrNudge({ wantedKeyId = '', action = 'scanning' } = {}) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     this.ws.send(JSON.stringify({
-      type: 'e2ee.qr.nudge',
+      type: WS_MSG.E2EE_QR_NUDGE,
       action: action === 'done' ? 'done' : 'scanning',
       ...(wantedKeyId ? { wantedKeyId } : {}),
     }))

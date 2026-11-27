@@ -33,9 +33,8 @@ import {
 import { fetchE2eeDeliverableFile, triggerDeliverableDownload } from './e2eeFiles.js'
 import { copyTextToClipboard } from './clientHelpers.js'
 import {
-  ImageContextProvider,
   StreamingFlagProvider,
-  useImageContext,
+  useImageActions,
   useStreamingFlag,
 } from '../state/ImageContext.jsx'
 
@@ -465,13 +464,13 @@ function RichBlockquote({ children }) {
 }
 
 function MarkdownCode({ className, children }) {
-  const imageContext = useImageContext()
+  const imageActions = useImageActions()
   const textVal = extractPlainText(children)
   if (className && /language-/i.test(className)) {
     return <code className={className}>{children}</code>
   }
-  if (imageContext && isImageTarget(textVal)) {
-    return <ImageChip target={textVal} label={getImageLabel(textVal)} imageContext={imageContext} />
+  if (imageActions && isImageTarget(textVal)) {
+    return <ImageChip target={textVal} label={getImageLabel(textVal)} imageContext={imageActions} />
   }
   return (
     <code className="rounded-md bg-slate-100/95 px-1.5 py-0.5 font-mono text-[0.86em] break-words [overflow-wrap:anywhere] text-[#3552E8] dark:bg-[#242836] dark:text-[#9AB0FF]">
@@ -481,14 +480,14 @@ function MarkdownCode({ className, children }) {
 }
 
 function MarkdownLink({ href, children }) {
-  const imageContext = useImageContext()
+  const imageActions = useImageActions()
   const dest = String(href || '').trim()
   const label = extractPlainText(children).trim()
-  if (imageContext && isImageTarget(dest)) {
-    return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageContext} />
+  if (imageActions && isImageTarget(dest)) {
+    return <ImageChip target={dest} label={label || getImageLabel(dest)} imageContext={imageActions} />
   }
-  if (imageContext && isDeliverableTarget(dest)) {
-    return <DeliverableChip target={dest} label={label || getDeliverableName(dest)} imageContext={imageContext} />
+  if (imageActions && isDeliverableTarget(dest)) {
+    return <DeliverableChip target={dest} label={label || getDeliverableName(dest)} imageContext={imageActions} />
   }
   if (/^(?:https?:\/\/|mailto:|tel:)/i.test(dest)) {
     return (
@@ -511,11 +510,11 @@ function MarkdownLink({ href, children }) {
 }
 
 function MarkdownImg({ src, alt }) {
-  const imageContext = useImageContext()
+  const imageActions = useImageActions()
   const target = String(src || '').trim()
   if (!target) return null
-  if (imageContext) {
-    return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageContext} />
+  if (imageActions) {
+    return <ImageChip target={target} label={alt || getImageLabel(target)} imageContext={imageActions} />
   }
   const safeSrc = resolveImageSrc(target)
   if (!safeSrc) return null
@@ -697,13 +696,12 @@ const STATIC_MARKDOWN_COMPONENTS = {
  * - Nested lists, GFM task checklists, GitHub Alert callouts, strikethrough, italic, bold+code
  * - E2EE local image lightbox chips & safe local file path pills
  */
-export const MarkdownView = React.memo(function MarkdownView({ text, streaming = false, imageContext = null }) {
-  const parentCtx = useImageContext()
+export const MarkdownView = React.memo(function MarkdownView({ text, streaming = false }) {
   const prepared = useMemo(() => preprocessMarkdown(text), [text])
 
   if (!text) return null
 
-  const body = (
+  return (
     <StreamingFlagProvider streaming={streaming}>
       <div className={`min-w-0 max-w-full break-words [overflow-wrap:anywhere] ${streaming ? 'stream-caret' : ''}`}>
         <ReactMarkdown
@@ -716,9 +714,4 @@ export const MarkdownView = React.memo(function MarkdownView({ text, streaming =
       </div>
     </StreamingFlagProvider>
   )
-
-  if (imageContext && imageContext !== parentCtx) {
-    return <ImageContextProvider value={imageContext}>{body}</ImageContextProvider>
-  }
-  return body
 })

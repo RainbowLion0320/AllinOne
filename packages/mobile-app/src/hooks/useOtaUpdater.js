@@ -45,27 +45,40 @@ export function useOtaUpdater({ desktopApi, activeDevice, showToast }) {
   // Native Android OTA: delayed healthy-boot confirmation (2.5s) + progress + app info
   useEffect(() => {
     if (!nativeOtaPlugin) return undefined
-    const currentVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : ''
+    const appVersion = String(typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : '')
+      .trim()
+      .replace(/^v/i, '')
     let cancelled = false
+    let latestActiveBundleVer = ''
 
     const refreshInfo = () => {
-      if (typeof nativeOtaPlugin.getAppInfo !== 'function') return
-      nativeOtaPlugin
+      if (typeof nativeOtaPlugin.getAppInfo !== 'function') return Promise.resolve(null)
+      return nativeOtaPlugin
         .getAppInfo()
         .then((info) => {
           if (!cancelled && info && typeof info === 'object') {
+            latestActiveBundleVer = String(info.activeBundleVersion || '').trim().replace(/^v/i, '')
             setOtaInfo(info)
+            return info
           }
+          return null
         })
-        .catch(() => {})
+        .catch(() => null)
     }
-    refreshInfo()
+    void refreshInfo()
 
     const confirmTimer = setTimeout(() => {
-      if (cancelled) return
-      try {
-        void nativeOtaPlugin.confirmBoot?.({ version: currentVersion })?.then?.(refreshInfo)?.catch?.(() => {})
-      } catch {}
+      if (cancelled || typeof nativeOtaPlugin.confirmBoot !== 'function') return
+      const activeVersion = appVersion || latestActiveBundleVer
+      Promise.resolve(nativeOtaPlugin.confirmBoot({ version: activeVersion }))
+        .then((res) => {
+          if (cancelled) return
+          if (res && typeof res === 'object' && res.confirmed === false) {
+            console.warn('[OTA] confirmBoot returned unconfirmed:', res)
+          }
+          return refreshInfo()
+        })
+        .catch(() => {})
     }, 2_500)
 
     let handlePromise = null

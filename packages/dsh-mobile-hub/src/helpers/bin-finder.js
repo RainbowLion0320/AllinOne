@@ -11,7 +11,9 @@ import { delimiter, dirname, join } from 'node:path'
 
 let pathEnriched = false
 let cachedLoginShellPath = null
+let cachedLoginShellPathAt = 0
 let loginShellPathPromise = null
+const LOGIN_SHELL_REFRESH_DEDUPE_MS = 5_000
 
 function listNewestVersionBins(baseDir, subPath = 'bin') {
   if (!existsSync(baseDir)) return []
@@ -49,7 +51,12 @@ function getUnixCandidateShells() {
 
 function readUnixLoginShellPath(force = false) {
   if (process.platform === 'win32') return ''
-  if (!force && cachedLoginShellPath !== null) return cachedLoginShellPath
+  const now = Date.now()
+  if (cachedLoginShellPath !== null) {
+    if (!force || now - cachedLoginShellPathAt < LOGIN_SHELL_REFRESH_DEDUPE_MS) {
+      return cachedLoginShellPath
+    }
+  }
   for (const sh of getUnixCandidateShells()) {
     try {
       const out = execFileSync(sh, ['-lc', 'printf "%s" "$PATH"'], {
@@ -59,11 +66,13 @@ function readUnixLoginShellPath(force = false) {
       }).trim()
       if (out && out.includes('/')) {
         cachedLoginShellPath = out
+        cachedLoginShellPathAt = Date.now()
         return out
       }
     } catch {}
   }
   cachedLoginShellPath = ''
+  cachedLoginShellPathAt = Date.now()
   return ''
 }
 
@@ -90,11 +99,16 @@ export function warmLoginShellPathAsync({ force = false } = {}) {
       })
       if (out) {
         cachedLoginShellPath = out
+        cachedLoginShellPathAt = Date.now()
         break
       }
     }
-    if (cachedLoginShellPath === null) cachedLoginShellPath = ''
-    return ensureRichPath(true)
+    if (cachedLoginShellPath === null) {
+      cachedLoginShellPath = ''
+      cachedLoginShellPathAt = Date.now()
+    }
+    // Login-shell PATH was just refreshed asynchronously above; skip redundant sync execFileSync
+    return ensureRichPath(true, { refreshLoginShell: false })
   })().finally(() => {
     loginShellPathPromise = null
   })
@@ -105,7 +119,7 @@ export function warmLoginShellPathAsync({ force = false } = {}) {
  * Enrich `process.env.PATH` with login-shell PATH + common macOS/Linux/Windows tool locations.
  * Pass `forceRefresh = true` after installing a new CLI so freshly created bin dirs are picked up immediately.
  */
-export function ensureRichPath(forceRefresh = false) {
+export function ensureRichPath(forceRefresh = false, { refreshLoginShell = forceRefresh } = {}) {
   if (pathEnriched && !forceRefresh) return process.env.PATH || ''
   pathEnriched = true
 
@@ -126,7 +140,7 @@ export function ensureRichPath(forceRefresh = false) {
       join(home, '.cargo', 'bin'),
     )
   } else {
-    const loginPath = readUnixLoginShellPath()
+    const loginPath = readUnixLoginShellPath(Boolean(refreshLoginShell))
     if (loginPath) {
       extras.push(...loginPath.split(delimiter).filter(Boolean))
     }
@@ -334,34 +348,109 @@ export function spawnCrossPlatform(bin, args = [], options = {}) {
 
 /**
  * Terminate a child process and its full process tree across platforms:
- *  - Windows: `taskkill /T /F` when forcing, plus `proc.kill`
- *  - POSIX: kills process group `-proc.pid` first (reaping spawned shells/subtools), falling back to `proc.kill`
+ *  - Windows (`win32`): NEVER call `proc.kill('SIGTERM')` before `taskkill /T` (Node's `SIGTERM`
+ *    on Windows calls `TerminateProcess` on the parent alone, severing the tree and orphaning children).
+ *    Instead, run `taskkill /PID <pid> /T /F` when `force: true` (falling back to `proc.kill('SIGKILL')`
+ *    only if `taskkill` errors/exits non-zero), or graceful `taskkill /PID <pid> /T` first when
+ *    `force: false`, escalating to `taskkill /PID <pid> /T /F` after `graceMs` if still alive.
+ *  - POSIX: sends `SIGTERM` to process group `-proc.pid` (falling back to `proc.pid`) and escalates
+ *    to `SIGKILL` after `graceMs` when `force: false`, or immediately sends `SIGKILL` when `force: true`.
  */
-export function killProcessTree(proc, { force = false } = {}) {
+export function killProcessTree(proc, { force = false, graceMs = 2_000 } = {}) {
   if (!proc) return
-  const sig = force ? 'SIGKILL' : 'SIGTERM'
-  if (process.platform === 'win32' && proc.pid) {
-    if (force) {
-      try {
-        const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        })
-        tk.on('error', () => {})
-      } catch {}
+  const isExited = () =>
+    (proc.exitCode !== null && proc.exitCode !== undefined) ||
+    (proc.signalCode !== null && proc.signalCode !== undefined)
+  const cleanGraceMs = Number.isFinite(Number(graceMs)) && Number(graceMs) > 0 ? Math.floor(Number(graceMs)) : 0
+
+  if (process.platform === 'win32') {
+    const pid = Number(proc.pid)
+    if (Number.isInteger(pid) && pid > 0) {
+      const runTaskkill = (withForce, onFail = null) => {
+        const args = withForce ? ['/PID', String(pid), '/T', '/F'] : ['/PID', String(pid), '/T']
+        try {
+          const tk = spawn('taskkill', args, {
+            stdio: 'ignore',
+            windowsHide: true,
+          })
+          let failed = false
+          const handleFail = () => {
+            if (failed) return
+            failed = true
+            onFail?.()
+          }
+          tk.on('error', handleFail)
+          tk.on('close', (code) => {
+            if (code !== 0) handleFail()
+          })
+          return tk
+        } catch {
+          onFail?.()
+          return null
+        }
+      }
+
+      const forceFallback = () => {
+        if (!isExited()) {
+          try { proc.kill('SIGKILL') } catch {}
+        }
+      }
+
+      if (force) {
+        runTaskkill(true, forceFallback)
+        return
+      }
+
+      runTaskkill(false)
+      if (cleanGraceMs > 0 && !isExited()) {
+        const timer = setTimeout(() => {
+          if (isExited()) return
+          runTaskkill(true, forceFallback)
+        }, cleanGraceMs)
+        timer.unref?.()
+        const cancelTimer = () => clearTimeout(timer)
+        proc.once?.('close', cancelTimer)
+        proc.once?.('exit', cancelTimer)
+      }
+      return
     }
-    try { proc.kill(sig) } catch {}
+    try { proc.kill(force ? 'SIGKILL' : 'SIGTERM') } catch {}
     return
   }
-  if (proc.pid && Number.isInteger(proc.pid) && proc.pid > 1) {
+
+  const sendPosixSignal = (sig) => {
+    const pid = Number(proc.pid)
+    if (Number.isInteger(pid) && pid > 1) {
+      try {
+        process.kill(-pid, sig)
+        return
+      } catch {}
+      try {
+        process.kill(pid, sig)
+        return
+      } catch {}
+    }
     try {
-      process.kill(-proc.pid, sig)
-      return
+      proc.kill(sig)
     } catch {}
   }
-  try {
-    proc.kill(sig)
-  } catch {}
+
+  if (force) {
+    sendPosixSignal('SIGKILL')
+    return
+  }
+
+  sendPosixSignal('SIGTERM')
+  if (cleanGraceMs > 0 && !isExited()) {
+    const timer = setTimeout(() => {
+      if (isExited()) return
+      sendPosixSignal('SIGKILL')
+    }, cleanGraceMs)
+    timer.unref?.()
+    const cancelTimer = () => clearTimeout(timer)
+    proc.once?.('close', cancelTimer)
+    proc.once?.('exit', cancelTimer)
+  }
 }
 
 /**

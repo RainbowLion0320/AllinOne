@@ -209,11 +209,29 @@ read_env_val() {
   line="$(grep -E "^${key}=" "$file" | tail -n 1 || true)"
   [ -z "$line" ] && return 0
   local val="${line#*=}"
-  val="${val%\"}"
-  val="${val#\"}"
-  val="${val%\'}"
-  val="${val#\'}"
+  if [[ "$val" == \'*\' ]]; then
+    val="${val#\'}"
+    val="${val%\'}"
+  elif [[ "$val" == \"*\" ]]; then
+    val="${val#\"}"
+    val="${val%\"}"
+    val="${val//\\\"/\"}"
+    val="${val//\\\\/\\}"
+  fi
   printf '%s' "$val"
+}
+
+quote_env_val() {
+  local val="$1"
+  val="${val//$'\r'/}"
+  val="${val//$'\n'/}"
+  if [[ "$val" != *"'"* ]]; then
+    printf "'%s'" "$val"
+  else
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    printf '"%s"' "$val"
+  fi
 }
 
 collect_custom_env_lines() {
@@ -292,7 +310,7 @@ wait_relay_healthy() {
   local tries=30
   local i
   for i in $(seq 1 "$tries"); do
-    if "${DOCKER_CMD[@]}" exec allinone-relay node -e "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+    if "${DOCKER_CMD[@]}" exec allinone-relay node -e "fetch('http://127.0.0.1:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -363,8 +381,8 @@ services:
       STUN_PORT: ${STUN_PORT:-3478}
     volumes:
       - relay_data:/app/packages/relay-server/data
-      # 若启用自建 coturn 按用户配额计量（TURN_LOG_FILE=/var/log/coturn/turn.log），取消下方只读挂载注释：
-      # - /var/log/coturn/turn.log:/var/log/coturn/turn.log:ro
+      # 若启用自建 coturn 按用户配额计量（TURN_LOG_PATH=/var/log/coturn/turn.log），取消下方只读目录挂载注释（挂载目录避免 logrotate 替换 inode 后断流）：
+      # - /var/log/coturn:/var/log/coturn:ro
     ports:
       - "127.0.0.1:8787:8787"
       # 内置无状态 STUN (RFC 5389)；若同机运行 coturn 占用 UDP 3478，请注释本行并在 .env 中设 STUN_PORT=off
@@ -407,6 +425,15 @@ services:
     image: \${ALLINONE_IMAGE:-ghcr.io/rainbowlion0320/allinone-relay:latest}
     container_name: allinone-relay
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 自动透传同目录 .env 中的全部配置（JWT_SECRET / PUBLIC_RELAY_URL / ALLOWED_ORIGINS /
     # MAX_DAILY_REGISTRATIONS / ADMIN_BOOTSTRAP_TOKEN / ICE_SERVERS / STUN_PORT / TURN_* / CF_TURN_* / SMTP_* / RESEND_*）
     env_file:
@@ -418,8 +445,8 @@ services:
       STUN_PORT: \${STUN_PORT:-3478}
     volumes:
       - relay_data:/app/packages/relay-server/data
-      # 若启用自建 coturn 按用户配额计量（TURN_LOG_FILE=/var/log/coturn/turn.log），取消下方只读挂载注释：
-      # - /var/log/coturn/turn.log:/var/log/coturn/turn.log:ro
+      # 若启用自建 coturn 按用户配额计量（TURN_LOG_PATH=/var/log/coturn/turn.log），取消下方只读目录挂载注释（挂载目录避免 logrotate 替换 inode 后断流）：
+      # - /var/log/coturn:/var/log/coturn:ro
     ports:
       - "127.0.0.1:${port}:8787"
       # 内置无状态 STUN (RFC 5389)；若同机运行 coturn 占用 UDP 3478，请注释本行并在 .env 中设 STUN_PORT=off
@@ -504,12 +531,30 @@ main() {
     local saved_image prev_image_id backup_dir
     saved_image="$(read_env_val "$env_file" "ALLINONE_IMAGE")"
     [ -n "$saved_image" ] && IMAGE="$saved_image"
-    prev_image_id="$(docker inspect --format='{{.Image}}' allinone-relay 2>/dev/null || true)"
+    prev_image_id="$("${DOCKER_CMD[@]}" inspect --format='{{.Image}}' allinone-relay 2>/dev/null || true)"
     backup_dir="${INSTALL_DIR}/backups/$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$backup_dir"
-    if docker ps -q --filter 'name=^/allinone-relay$' | grep -q .; then
-      info "升级前备份账号数据到 ${backup_dir} ..."
-      docker cp allinone-relay:/app/packages/relay-server/data/. "$backup_dir/" 2>/dev/null || true
+    if "${DOCKER_CMD[@]}" ps -q --filter 'name=^/allinone-relay$' | grep -q .; then
+      info "升级前执行 SQLite 在线一致性快照备份到 ${backup_dir} ..."
+      if "${DOCKER_CMD[@]}" exec allinone-relay node -e "
+        const fs = require('node:fs');
+        const { DatabaseSync } = require('node:sqlite');
+        const dbPath = '/app/packages/relay-server/data/accounts.db';
+        const outPath = '/tmp/accounts.backup.db';
+        try { fs.rmSync(outPath, { force: true }); } catch {}
+        if (!fs.existsSync(dbPath)) process.exit(2);
+        const db = new DatabaseSync(dbPath);
+        db.exec('PRAGMA busy_timeout = 5000');
+        db.exec(\"VACUUM INTO '\" + outPath + \"'\");
+        db.close();
+      " >/dev/null 2>&1; then
+        "${DOCKER_CMD[@]}" cp allinone-relay:/tmp/accounts.backup.db "$backup_dir/accounts.db" 2>/dev/null || true
+        "${DOCKER_CMD[@]}" exec allinone-relay rm -f /tmp/accounts.backup.db >/dev/null 2>&1 || true
+      else
+        warn "SQLite 在线快照不可用，先安全停止容器刷新 WAL 后执行冷备份..."
+        (cd "$INSTALL_DIR" && "${COMPOSE_CMD[@]}" --env-file "$env_file" stop allinone-relay) || true
+        "${DOCKER_CMD[@]}" cp allinone-relay:/app/packages/relay-server/data/. "$backup_dir/" 2>/dev/null || true
+      fi
       chmod -R go-rwx "$backup_dir" 2>/dev/null || true
     fi
     prepare_image
@@ -521,7 +566,7 @@ main() {
         (cd "$INSTALL_DIR" && ALLINONE_IMAGE="$prev_image_id" "${COMPOSE_CMD[@]}" --env-file "$env_file" up -d) || true
         wait_relay_healthy && err "已回滚到旧版本镜像，请检查日志排查新版本原因。"
       fi
-      die "服务启动超时，请运行：cd ${INSTALL_DIR} && docker compose logs --tail=50"
+      die "服务启动超时，请运行：cd ${INSTALL_DIR} && ${COMPOSE_CMD[*]} logs --tail=50"
     fi
     ok "All in One 已无损升级并重启成功！（升级前备份：${backup_dir}）"
     local saved_url
@@ -647,20 +692,20 @@ main() {
   custom_env_lines="$(collect_custom_env_lines "$env_file")"
   local tmp_env="${env_file}.tmp.$$"
   umask 077
-  cat > "$tmp_env" <<EOF
-# Generated by All in One install.sh
-ALLINONE_IMAGE=${IMAGE}
-JWT_SECRET=${jwt_secret}
-PUBLIC_RELAY_URL=${PUBLIC_URL}
-# Daily open registration limit (default: 20/day, 0 = unlimited)
-MAX_DAILY_REGISTRATIONS=${max_daily_reg}
-SMTP_HOST=${smtp_host}
-SMTP_PORT=${smtp_port:-465}
-SMTP_SECURE=${smtp_secure}
-SMTP_USER=${smtp_user}
-SMTP_PASS=${smtp_pass}
-SMTP_FROM=${smtp_from}
-EOF
+  {
+    printf '# Generated by All in One install.sh\n'
+    printf 'ALLINONE_IMAGE=%s\n' "$(quote_env_val "$IMAGE")"
+    printf 'JWT_SECRET=%s\n' "$(quote_env_val "$jwt_secret")"
+    printf 'PUBLIC_RELAY_URL=%s\n' "$(quote_env_val "$PUBLIC_URL")"
+    printf '# Daily open registration limit (default: 20/day, 0 = unlimited)\n'
+    printf 'MAX_DAILY_REGISTRATIONS=%s\n' "$(quote_env_val "$max_daily_reg")"
+    printf 'SMTP_HOST=%s\n' "$(quote_env_val "$smtp_host")"
+    printf 'SMTP_PORT=%s\n' "$(quote_env_val "${smtp_port:-465}")"
+    printf 'SMTP_SECURE=%s\n' "$(quote_env_val "$smtp_secure")"
+    printf 'SMTP_USER=%s\n' "$(quote_env_val "$smtp_user")"
+    printf 'SMTP_PASS=%s\n' "$(quote_env_val "$smtp_pass")"
+    printf 'SMTP_FROM=%s\n' "$(quote_env_val "$smtp_from")"
+  } > "$tmp_env"
   if [ -n "$custom_env_lines" ]; then
     {
       printf '\n# Preserved custom settings\n'

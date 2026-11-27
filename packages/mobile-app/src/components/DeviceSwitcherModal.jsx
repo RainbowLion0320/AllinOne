@@ -24,6 +24,31 @@ import { useI18n } from '../lib/i18n.jsx'
 import { translate } from '../lib/i18n.js'
 import { copyTextToClipboard, formatSafeSetupCmd } from '../lib/clientHelpers.js'
 
+function PlatformIcon({ platform = '', className = 'h-4.5 w-4.5' }) {
+  const p = String(platform || '').trim().toLowerCase()
+  if (p === 'darwin' || p.includes('mac')) {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+        <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.33c.64-.78 1.08-1.86.96-2.94-.93.04-2.06.62-2.72 1.4-.58.68-1.1 1.79-.96 2.84 1.04.08 2.09-.52 2.72-1.3z" />
+      </svg>
+    )
+  }
+  if (p === 'win32' || p.includes('win')) {
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+        <rect x="3" y="3" width="8.2" height="8.2" rx="1.2" />
+        <rect x="12.8" y="3" width="8.2" height="8.2" rx="1.2" />
+        <rect x="3" y="12.8" width="8.2" height="8.2" rx="1.2" />
+        <rect x="12.8" y="12.8" width="8.2" height="8.2" rx="1.2" />
+      </svg>
+    )
+  }
+  if (p === 'linux' || p.includes('linux')) {
+    return <Terminal aria-hidden="true" className={className} />
+  }
+  return <Monitor aria-hidden="true" className={className} />
+}
+
 function StatusPill({ status, onlineCount = 0 }) {
   const { bi, t } = useI18n()
   if (status === 'probing' || status === 'connecting') {
@@ -325,7 +350,7 @@ export function DeviceSwitcherModal({
                           : 'border-slate-200/80 bg-white hover:border-slate-300 dark:border-slate-800 dark:bg-[#171920] dark:hover:border-slate-700'
                       }`}
                     >
-                      <div className="flex items-start gap-2.5">
+                      <div className="flex items-center gap-2.5">
                         <button
                           type="button"
                           disabled={isEditing}
@@ -334,10 +359,12 @@ export function DeviceSwitcherModal({
                             onSelectDevice?.(activeEntry.id, pc.bridgeId)
                             onClose()
                           }}
-                          className="flex min-w-0 flex-1 items-start gap-2.5 text-left"
+                          className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                         >
                           <div
-                            className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+                            title={platformLabel || undefined}
+                            aria-label={platformLabel || undefined}
+                            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
                               isSelected
                                 ? 'bg-[#4D6BFE] text-white'
                                 : pc.online
@@ -345,7 +372,7 @@ export function DeviceSwitcherModal({
                                   : 'bg-slate-100 text-slate-400 dark:bg-slate-800'
                             }`}
                           >
-                            <Monitor className="h-4.5 w-4.5" />
+                            <PlatformIcon platform={pc.platform} className="h-4.5 w-4.5" />
                           </div>
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-1.5">
@@ -354,15 +381,9 @@ export function DeviceSwitcherModal({
                               </span>
                               <StatusPill status={pc.online ? 'online' : 'offline'} />
                             </div>
-                            {(platformLabel || (!pc.online && pc.lastSeenAt > 0)) && (
-                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-400">
-                                {platformLabel && <span>{platformLabel}</span>}
-                                {!pc.online && pc.lastSeenAt > 0 && (
-                                  <>
-                                    {platformLabel && <span>·</span>}
-                                    <span>{formatRelativeSeen(pc.lastSeenAt, lang)}</span>
-                                  </>
-                                )}
+                            {!pc.online && pc.lastSeenAt > 0 && (
+                              <div className="mt-0.5 text-[11px] text-slate-400">
+                                {formatRelativeSeen(pc.lastSeenAt, lang)}
                               </div>
                             )}
                           </div>

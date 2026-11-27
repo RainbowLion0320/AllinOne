@@ -90,20 +90,36 @@ function main() {
   // 2. Sync Capacitor Android project (updates Gradle bindings & copies dist/ -> assets/public)
   runCapSync(buildEnv)
 
-  // 2b. Strip PC-only downloads, shell installers & Service Workers from Android assets (~3.5 MB saved)
+  // 2b. Strip PC-only downloads, shell installers, OS metadata & Web PWA Service Workers from Android assets
   const androidPublicDir = join(ANDROID_ASSETS_DIR, 'public')
   if (existsSync(androidPublicDir)) {
-    for (const rel of ['downloads', 'setup.sh', 'setup.ps1', 'sw.js', 'registerSW.js']) {
+    for (const rel of [
+      'downloads',
+      'setup.sh',
+      'setup.ps1',
+      'sw.js',
+      'registerSW.js',
+      'manifest.webmanifest',
+      '.DS_Store',
+    ]) {
       const target = join(androidPublicDir, rel)
       if (existsSync(target)) {
         rmSync(target, { recursive: true, force: true })
       }
     }
-    for (const name of readdirSync(androidPublicDir)) {
-      if (/^workbox-.*\.js$/.test(name) || name.endsWith('.map')) {
-        rmSync(join(androidPublicDir, name), { force: true })
+    const pruneDir = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name)
+        if (entry.name === '.DS_Store' || /^workbox-.*\.js$/.test(entry.name) || entry.name.endsWith('.map')) {
+          rmSync(full, { recursive: true, force: true })
+          continue
+        }
+        if (entry.isDirectory()) {
+          pruneDir(full)
+        }
       }
     }
+    pruneDir(androidPublicDir)
   }
 
   // 3. Write clean runtime assets/capacitor.config.json (gitignored)

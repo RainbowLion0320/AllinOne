@@ -13,12 +13,25 @@
  *  - Respects `ALLINONE_NO_AUTOFIX=1` opt-out.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PLUGIN_NAME = 'allinone-dsh-ipc'
+const ALLOWED_DSH_PERMISSION_PRESETS = new Set(['read-only', 'workspace-write', 'danger-full-access'])
+
+function atomicWriteTextFileSync(filePath, content) {
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  writeFileSync(tmpPath, content, 'utf8')
+  try {
+    renameSync(tmpPath, filePath)
+  } catch (err) {
+    try { unlinkSync(tmpPath) } catch {}
+    throw err
+  }
+}
 
 function resolvePluginVersion() {
   if (typeof __ALLINONE_VERSION__ === 'string' && __ALLINONE_VERSION__.trim()) {
@@ -34,15 +47,23 @@ function resolvePluginVersion() {
 
 const PLUGIN_VERSION = resolvePluginVersion()
 
-const CORDIS_PATCH_YML = [
-  '# Managed automatically by All in One Desktop App (authenticated 127.0.0.1 IPC only)',
-  '- insert:',
-  `    - id: ${PLUGIN_NAME}`,
-  `      name: ${PLUGIN_NAME}`,
-  '      config:',
-  "        permissionPreset: 'danger-full-access'",
-  '',
-].join('\n')
+function buildCordisPatchYml(permissionPreset = '') {
+  const cleanPreset = ALLOWED_DSH_PERMISSION_PRESETS.has(permissionPreset) ? permissionPreset : ''
+  const lines = [
+    '# Managed automatically by All in One Desktop App (authenticated 127.0.0.1 IPC only)',
+    '- insert:',
+    `    - id: ${PLUGIN_NAME}`,
+    `      name: ${PLUGIN_NAME}`,
+    '      config:',
+  ]
+  if (cleanPreset) {
+    lines.push(`        permissionPreset: '${cleanPreset}'`)
+  } else {
+    lines.push("        permissionPreset: 'workspace-write'")
+  }
+  lines.push('')
+  return lines.join('\n')
+}
 
 function buildPluginPackageJson() {
   return JSON.stringify(
@@ -87,6 +108,7 @@ function resolvePluginCode() {
 export function ensureDshLocalIpcPlugin({
   dshHome = '',
   env = process.env,
+  permissionPreset = '',
   log = console,
 } = {}) {
   const noAutofix = String(env.ALLINONE_NO_AUTOFIX || '').trim()
@@ -130,9 +152,18 @@ export function ensureDshLocalIpcPlugin({
     } catch {}
   }
 
+  const effectivePreset = String(permissionPreset || env.ALLINONE_DSH_PERMISSION_PRESET || '').trim()
+  const cordisPatchYml = buildCordisPatchYml(effectivePreset)
+  const cordisPatchPath = join(pluginDir, 'cordis.patch.yml')
+  let existingPatchContent = ''
+  if (existsSync(cordisPatchPath)) {
+    try { existingPatchContent = readFileSync(cordisPatchPath, 'utf8') } catch {}
+  }
+
   const needsFileWrite =
     !existsSync(join(pluginDir, 'index.js')) ||
-    !existsSync(join(pluginDir, 'cordis.patch.yml')) ||
+    !existsSync(cordisPatchPath) ||
+    existingPatchContent !== cordisPatchYml ||
     currentInstalledVersion !== PLUGIN_VERSION
   const needsBundleEntry = !existingBundles.includes(PLUGIN_NAME)
 
@@ -143,9 +174,9 @@ export function ensureDshLocalIpcPlugin({
   try {
     mkdirSync(pluginDir, { recursive: true })
     // Write implementation files BEFORE package.json version marker so an interrupted write never leaves a stale "up-to-date" install
-    writeFileSync(join(pluginDir, 'cordis.patch.yml'), CORDIS_PATCH_YML, 'utf8')
-    writeFileSync(join(pluginDir, 'index.js'), pluginCode, 'utf8')
-    writeFileSync(pluginPkgPath, `${buildPluginPackageJson()}\n`, 'utf8')
+    atomicWriteTextFileSync(cordisPatchPath, cordisPatchYml)
+    atomicWriteTextFileSync(join(pluginDir, 'index.js'), pluginCode)
+    atomicWriteTextFileSync(pluginPkgPath, `${buildPluginPackageJson()}\n`)
 
     if (needsBundleEntry) {
       const backupPath = join(profileDir, 'package.json.bak-before-allinone')
@@ -156,7 +187,7 @@ export function ensureDshLocalIpcPlugin({
       if (!pkg.dsh.profile || typeof pkg.dsh.profile !== 'object') pkg.dsh.profile = {}
       if (!Array.isArray(pkg.dsh.profile.bundles)) pkg.dsh.profile.bundles = []
       pkg.dsh.profile.bundles.push(PLUGIN_NAME)
-      writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8')
+      atomicWriteTextFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`)
     }
 
     log.info?.(

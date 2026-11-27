@@ -181,16 +181,8 @@ export function createStaticHandler({
 
     try {
       const ext = extname(target).toLowerCase()
-      const isMutable =
-        ext === '.html' ||
-        ext === '.ps1' ||
-        ext === '.sh' ||
-        ext === '.mjs' ||
-        target.endsWith('sw.js') ||
-        target.endsWith('registerSW.js') ||
-        target.endsWith('manifest.webmanifest') ||
-        target.endsWith('All-in-One-WebBundle.json') ||
-        target.endsWith('All-in-One-WebBundle.zip')
+      const fileBase = basename(target)
+      const relPosix = target.slice(staticRoot.length).replace(/\\/g, '/')
 
       if (ext === '.ps1' || ext === '.sh') {
         const effectiveUrl = resolveSafePublicScriptUrl(req, publicRelayUrl, isTrustedProxy)
@@ -209,10 +201,29 @@ export function createStaticHandler({
         return true
       }
 
+      const isNoStore =
+        ext === '.html' ||
+        fileBase === 'sw.js' ||
+        fileBase === 'registerSW.js' ||
+        fileBase === 'manifest.webmanifest'
+
+      // Strictly opt-in `immutable` ONLY for content-hashed bundles under `/assets/*`.
+      // Unhashed downloads/binaries/icons/manifests (`.apk`, `.dmg`, `.exe`, `icon-*.png`,
+      // `All-in-One-WebBundle.json`, `allinone-bridge.mjs`, etc.) revalidate cleanly.
+      const isHashedAsset =
+        relPosix.startsWith('/assets/') &&
+        /-[A-Za-z0-9_-]{6,}\.[a-z0-9]+$/i.test(fileBase)
+
+      const cacheControl = isNoStore
+        ? 'no-cache, no-store, must-revalidate'
+        : isHashedAsset
+          ? 'public, max-age=31536000, immutable'
+          : 'public, max-age=300, must-revalidate'
+
       const staticHeaders = {
         'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
         'Content-Length': targetStat.size,
-        'Cache-Control': isMutable ? 'no-cache, no-store, must-revalidate' : 'public, max-age=31536000, immutable',
+        'Cache-Control': cacheControl,
       }
       if (ext === '.html') {
         const isSandboxPreview = basename(target).toLowerCase() === 'sandbox-preview.html'

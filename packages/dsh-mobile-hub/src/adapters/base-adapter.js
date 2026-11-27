@@ -64,6 +64,10 @@ export class BaseAdapter {
     return t
   }
 
+  setTimeout(fn, delayMs) {
+    return this.setTrackedTimeout(fn, delayMs)
+  }
+
   setTrackedInterval(fn, intervalMs) {
     const t = setInterval(fn, intervalMs)
     t.unref?.()
@@ -71,11 +75,23 @@ export class BaseAdapter {
     return t
   }
 
+  setInterval(fn, intervalMs) {
+    return this.setTrackedInterval(fn, intervalMs)
+  }
+
   clearTrackedTimer(t) {
     if (!t) return
     this._trackedTimers.delete(t)
     clearTimeout(t)
     clearInterval(t)
+  }
+
+  clearTimeout(t) {
+    this.clearTrackedTimer(t)
+  }
+
+  clearInterval(t) {
+    this.clearTrackedTimer(t)
   }
 
   isSessionBusy(sessionId) {

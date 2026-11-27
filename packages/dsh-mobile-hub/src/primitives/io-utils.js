@@ -50,30 +50,46 @@ export function isPidAlive(pid) {
 }
 
 /**
- * Zero-OOM tail reader for arbitrarily large JSONL transcripts.
+ * Zero-OOM tail reader returning lines plus file metadata (`size`, `mtimeMs`, `truncated`).
  * Reads at most the trailing `maxBytes` bytes and drops the first partial line when seeking mid-file.
  */
-export function readTailLinesZeroOom(filePath, maxBytes = 65_536) {
+export function readTailLinesWithMeta(filePath, maxBytes = 65_536) {
   let fd = null
   try {
     const st = statSync(filePath)
-    if (!st.isFile() || st.size === 0) return []
+    if (!st.isFile() || st.size === 0) {
+      return { lines: [], size: 0, mtimeMs: st.mtimeMs || 0, truncated: false, exists: true }
+    }
+    fd = openSync(filePath, 'r')
     const len = Math.min(st.size, maxBytes)
     const offset = Math.max(0, st.size - len)
     const buf = Buffer.allocUnsafe(len)
-    fd = openSync(filePath, 'r')
     const bytesRead = readSync(fd, buf, 0, len, offset)
     const raw = buf.subarray(0, bytesRead).toString('utf8')
     const lines = raw.split(/\r?\n/)
     if (offset > 0 && lines.length > 0) lines.shift()
-    return lines.filter((l) => l.trim().length > 0)
+    return {
+      lines: lines.filter((l) => l.trim().length > 0),
+      size: st.size,
+      mtimeMs: st.mtimeMs || 0,
+      truncated: offset > 0,
+      exists: true,
+    }
   } catch {
-    return []
+    return { lines: [], size: 0, mtimeMs: 0, truncated: false, exists: false }
   } finally {
     if (fd !== null) {
       try { closeSync(fd) } catch {}
     }
   }
+}
+
+/**
+ * Zero-OOM tail reader for arbitrarily large JSONL transcripts.
+ * Reads at most the trailing `maxBytes` bytes and drops the first partial line when seeking mid-file.
+ */
+export function readTailLinesZeroOom(filePath, maxBytes = 65_536) {
+  return readTailLinesWithMeta(filePath, maxBytes).lines
 }
 
 /**
@@ -85,24 +101,25 @@ export function readHeadAndTailLines(filePath, headBytes = 32_768, tailBytes = 3
   try {
     const st = statSync(filePath)
     if (!st.isFile() || st.size === 0) return { headLines: [], tailLines: [], size: 0, mtimeMs: st.mtimeMs || 0 }
+    if (st.size <= headBytes + tailBytes) {
+      const allLines = readFileSync(filePath, 'utf8').split(/\r?\n/).filter((l) => l.trim().length > 0)
+      return { headLines: allLines, tailLines: allLines, size: st.size, mtimeMs: st.mtimeMs || 0 }
+    }
     fd = openSync(filePath, 'r')
     const headLen = Math.min(st.size, headBytes)
     const headBuf = Buffer.allocUnsafe(headLen)
     const headRead = readSync(fd, headBuf, 0, headLen, 0)
-    const headRaw = headBuf.subarray(0, headRead).toString('utf8')
-    const headLines = headRaw.split(/\r?\n/).filter((l) => l.trim().length > 0)
-    if (st.size <= headBytes) {
-      return { headLines, tailLines: headLines, size: st.size, mtimeMs: st.mtimeMs || 0 }
-    }
+    const headLines = headBuf.subarray(0, headRead).toString('utf8').split(/\r?\n/)
+    if (headLen < st.size && headLines.length > 1) headLines.pop()
+
     const tailLen = Math.min(st.size, tailBytes)
     const tailOffset = Math.max(0, st.size - tailLen)
     const tailBuf = Buffer.allocUnsafe(tailLen)
     const tailRead = readSync(fd, tailBuf, 0, tailLen, tailOffset)
-    const tailRaw = tailBuf.subarray(0, tailRead).toString('utf8')
-    const tailLines = tailRaw.split(/\r?\n/)
+    const tailLines = tailBuf.subarray(0, tailRead).toString('utf8').split(/\r?\n/)
     if (tailOffset > 0 && tailLines.length > 0) tailLines.shift()
     return {
-      headLines,
+      headLines: headLines.filter((l) => l.trim().length > 0),
       tailLines: tailLines.filter((l) => l.trim().length > 0),
       size: st.size,
       mtimeMs: st.mtimeMs || 0,
@@ -117,9 +134,10 @@ export function readHeadAndTailLines(filePath, headBytes = 32_768, tailBytes = 3
 }
 
 /**
- * Safely read a UTF-8 transcript file up to `maxBytes` (tail-sliced when larger than cap).
+ * Safely read a UTF-8 transcript file for full parsing when <= `maxBytes`,
+ * or tail-sliced to `tailFallbackBytes` when larger than `maxBytes`.
  */
-export function readFileForParseSafe(filePath, maxBytes = 8 * 1024 * 1024) {
+export function readFileForParseSafe(filePath, maxBytes = 8 * 1024 * 1024, tailFallbackBytes = maxBytes) {
   let fd = null
   try {
     const st = statSync(filePath)
@@ -127,16 +145,71 @@ export function readFileForParseSafe(filePath, maxBytes = 8 * 1024 * 1024) {
     if (st.size <= maxBytes) {
       return { raw: readFileSync(filePath, 'utf8'), truncated: false, size: st.size, mtimeMs: st.mtimeMs || 0 }
     }
-    const buf = Buffer.allocUnsafe(maxBytes)
-    const offset = st.size - maxBytes
+    const tailCap = Math.min(st.size, Math.max(64 * 1024, Number(tailFallbackBytes) || maxBytes))
+    const buf = Buffer.allocUnsafe(tailCap)
+    const offset = Math.max(0, st.size - tailCap)
     fd = openSync(filePath, 'r')
-    const bytesRead = readSync(fd, buf, 0, maxBytes, offset)
+    const bytesRead = readSync(fd, buf, 0, tailCap, offset)
     let raw = buf.subarray(0, bytesRead).toString('utf8')
-    const firstNl = raw.indexOf('\n')
-    if (firstNl !== -1) raw = raw.slice(firstNl + 1)
+    if (offset > 0) {
+      const firstNl = raw.indexOf('\n')
+      if (firstNl !== -1) raw = raw.slice(firstNl + 1)
+    }
     return { raw, truncated: true, size: st.size, mtimeMs: st.mtimeMs || 0 }
   } catch {
     return { raw: '', truncated: false, size: 0, mtimeMs: 0 }
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+  }
+}
+
+/**
+ * Zero-OOM JSONL parser helper: reads the full file when `<= maxFullBytes`, or reads
+ * head metadata lines + tail body lines when larger than `maxFullBytes`.
+ */
+export function readHeadAndBodyLinesForParse(
+  filePath,
+  { maxFullBytes = 32 * 1024 * 1024, headBytes = 32 * 1024, tailBytes = 4 * 1024 * 1024 } = {},
+) {
+  let fd = null
+  try {
+    const st = statSync(filePath)
+    if (!st.isFile() || st.size === 0) {
+      return { headLines: [], bodyLines: [], truncated: false, size: 0, mtimeMs: st.mtimeMs || 0 }
+    }
+    if (st.size <= maxFullBytes) {
+      return {
+        headLines: [],
+        bodyLines: readFileSync(filePath, 'utf8').split(/\r?\n/),
+        truncated: false,
+        size: st.size,
+        mtimeMs: st.mtimeMs || 0,
+      }
+    }
+    fd = openSync(filePath, 'r')
+    const headLen = Math.min(st.size, headBytes)
+    const headBuf = Buffer.allocUnsafe(headLen)
+    const headRead = readSync(fd, headBuf, 0, headLen, 0)
+    const headLines = headBuf.subarray(0, headRead).toString('utf8').split(/\r?\n/)
+    if (headLines.length > 1) headLines.pop()
+
+    const tailLen = Math.min(st.size, tailBytes)
+    const tailOffset = Math.max(0, st.size - tailLen)
+    const tailBuf = Buffer.allocUnsafe(tailLen)
+    const tailRead = readSync(fd, tailBuf, 0, tailLen, tailOffset)
+    const bodyLines = tailBuf.subarray(0, tailRead).toString('utf8').split(/\r?\n/)
+    if (tailOffset > 0 && bodyLines.length > 0) bodyLines.shift()
+    return {
+      headLines,
+      bodyLines,
+      truncated: true,
+      size: st.size,
+      mtimeMs: st.mtimeMs || 0,
+    }
+  } catch {
+    return { headLines: [], bodyLines: [], truncated: false, size: 0, mtimeMs: 0 }
   } finally {
     if (fd !== null) {
       try { closeSync(fd) } catch {}
@@ -239,9 +312,11 @@ export async function queryReadOnlySqlite(
   }
 
   const pyCode = [
-    'import sqlite3, json, sys',
+    'import json, sqlite3, sys',
+    'from pathlib import Path',
     'db_path, sql, params_json, single_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]',
-    'conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.5)',
+    'uri = Path(db_path).resolve().as_uri() + "?mode=ro"',
+    'conn = sqlite3.connect(uri, uri=True, timeout=1.5)',
     'conn.row_factory = sqlite3.Row',
     'try:',
     '  cur = conn.execute(sql, json.loads(params_json))',

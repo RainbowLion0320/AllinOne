@@ -15,6 +15,7 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sig
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { compareCodePoint } from '../packages/shared/src/semver.js'
 
 export function computeDesktopManifestCanonicalPayload(version, assets = []) {
   const cleanVer = String(version || '').trim().replace(/^v/i, '')
@@ -25,7 +26,7 @@ export function computeDesktopManifestCanonicalPayload(version, assets = []) {
       sha256: String(a.sha256).trim().toLowerCase(),
       size: Number(a.size) || 0,
     }))
-    .sort((a, b) => a.name.localeCompare(b.name))
+    .sort((a, b) => compareCodePoint(a.name, b.name))
     .map((a) => `${a.name}:${a.sha256}:${a.size}`)
   return `allinone-desktop-release-v1\n${cleanVer}\n${lines.join('\n')}`
 }
@@ -60,7 +61,7 @@ export function signDesktopReleaseManifest({ version, files = [], privateKeyPem 
       size: st.size,
     }
   })
-  assets.sort((a, b) => a.name.localeCompare(b.name))
+  assets.sort((a, b) => compareCodePoint(a.name, b.name))
 
   const privKey = parsePrivateKeyInput(privateKeyPem)
   const pubKey = createPublicKey(privKey)
@@ -125,10 +126,15 @@ if (isMain) {
       files.push(args[i])
     }
   }
+  const allowUnsigned = args.includes('--allow-unsigned')
   const privKey = String(process.env.DESKTOP_UPDATE_ED25519_PRIVATE_KEY || '').trim()
   if (!privKey) {
-    console.error('[sign-desktop-release] DESKTOP_UPDATE_ED25519_PRIVATE_KEY is not set; skipping manifest signing.')
-    process.exit(0)
+    if (allowUnsigned) {
+      console.warn('[sign-desktop-release] DESKTOP_UPDATE_ED25519_PRIVATE_KEY is not set; skipping manifest signing (--allow-unsigned).')
+      process.exit(0)
+    }
+    console.error('[sign-desktop-release] ERROR: DESKTOP_UPDATE_ED25519_PRIVATE_KEY is not set (fail-closed). Pass --allow-unsigned only for local unsigned testing.')
+    process.exit(1)
   }
   const manifest = signDesktopReleaseManifest({ version, files, privateKeyPem: privKey })
   writeFileSync(resolve(outPath), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')

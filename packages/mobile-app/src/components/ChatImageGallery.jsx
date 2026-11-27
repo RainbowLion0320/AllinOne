@@ -16,27 +16,32 @@ import {
   resolveImageSrc,
 } from '../lib/imageUrls.js'
 import {
+  acquireBlobUrl,
   getCachedE2eeImageUrl,
   invalidateCachedE2eeImageUrl,
   loadE2eeImageUrl,
   loadPersistedE2eeImageUrl,
   needsE2eeMediaLoad,
+  releaseBlobUrl,
 } from '../lib/e2eeMedia.js'
 import { useI18n } from '../lib/i18n.jsx'
+import { useImageActions, useImageLiveState } from '../state/ImageContext.jsx'
 
 /**
  * Sleek inline image preview card rendered inside chat messages.
  * Always keeps <img> eagerly mounted (never display:none with loading="lazy") so mobile
  * browsers & Android WebView load images reliably every single time.
  * Supports Zero-Knowledge E2EE image decryption over direct WebRTC P2P (`RPC.FILE_READ` + `aio-bulk`).
+ * Subscribes to `ImageLiveStateContext` only at this leaf so transport/cache updates never re-render parent rows.
  */
 function ChatImageCard({
   item,
-  imageContext,
   onOpen,
   compact = false,
 }) {
   const { bi } = useI18n()
+  const imageActions = useImageActions()
+  const liveState = useImageLiveState()
   const [status, setStatus] = useState('loading') // 'loading' | 'loaded' | 'error'
   const [retryNonce, setRetryNonce] = useState(0)
   const [e2eeSrc, setE2eeSrc] = useState('')
@@ -44,8 +49,8 @@ function ChatImageCard({
   const [manualLoadAllowed, setManualLoadAllowed] = useState(false)
   const imgRef = useRef(null)
   const rehydrateAttemptedRef = useRef(false)
-  const imageContextRef = useRef(imageContext)
-  imageContextRef.current = imageContext
+  const imageActionsRef = useRef(imageActions)
+  imageActionsRef.current = imageActions
 
   useEffect(() => {
     rehydrateAttemptedRef.current = false
@@ -57,10 +62,10 @@ function ChatImageCard({
     item?.localPreviewUrl,
     item?.url,
     item?.path,
-    imageContext?.roomId,
-    imageContext?.bridgeId,
-    imageContext?.cwd,
-    imageContext?.e2eeKeyId,
+    imageActions?.roomId,
+    imageActions?.bridgeId,
+    imageActions?.cwd,
+    imageActions?.e2eeKeyId,
   ])
 
   const effectiveItem =
@@ -68,12 +73,12 @@ function ChatImageCard({
       ? { ...item, localPreviewUrl: '' }
       : item
 
-  const isOnline = imageContext?.connState === 'connected' && Boolean(imageContext?.bridgeOnline)
-  const p2pState = imageContext?.p2pState || 'idle'
-  const p2pTransport = imageContext?.p2pTransport || ''
+  const isOnline = liveState?.connState === 'connected' && Boolean(liveState?.bridgeOnline)
+  const p2pState = liveState?.p2pState || 'idle'
+  const p2pTransport = liveState?.p2pTransport || ''
 
   const needsE2ee = needsE2eeMediaLoad(effectiveItem)
-  const cachedE2eeSrc = needsE2ee ? getCachedE2eeImageUrl(effectiveItem, imageContext) : ''
+  const cachedE2eeSrc = needsE2ee ? getCachedE2eeImageUrl(effectiveItem, imageActions) : ''
   const resolvedE2eeSrc = e2eeSrc || cachedE2eeSrc
   const waitingForTransport = Boolean(
     needsE2ee &&
@@ -92,7 +97,7 @@ function ChatImageCard({
       !manualLoadAllowed &&
       isOnline &&
       p2pState === 'connected' &&
-      imageContext?.relayDataSaver &&
+      liveState?.dataSaver &&
       p2pTransport === 'relay',
   )
   const directSrc = needsE2ee
@@ -122,16 +127,23 @@ function ChatImageCard({
   const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
   const rawHint = item?.path || item?.raw || ''
 
+  // Retain ref-counted Blob URL while mounted so LRU cache eviction never breaks a visible image
+  useEffect(() => {
+    if (!src || !src.startsWith('blob:')) return undefined
+    acquireBlobUrl(src)
+    return () => releaseBlobUrl(src)
+  }, [src])
+
   // Hydrate previously viewed images from persistent IndexedDB first (0 network bytes, works offline & on Relay Saver)
   useEffect(() => {
     if (!needsE2ee || retryNonce > 0) return
-    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageActionsRef.current)
     if (latestCached) {
       setE2eeSrc(latestCached)
       return
     }
     let cancelled = false
-    loadPersistedE2eeImageUrl(effectiveItem, imageContextRef.current)
+    loadPersistedE2eeImageUrl(effectiveItem, imageActionsRef.current)
       .then((persistedUrl) => {
         if (!cancelled && persistedUrl) {
           setE2eeSrc(persistedUrl)
@@ -148,10 +160,11 @@ function ChatImageCard({
     effectiveItem?.path,
     effectiveItem?.url,
     effectiveItem?.raw,
-    imageContext?.roomId,
-    imageContext?.bridgeId,
-    imageContext?.cwd,
-    imageContext?.e2eeKeyId,
+    imageActions?.roomId,
+    imageActions?.bridgeId,
+    imageActions?.cwd,
+    imageActions?.e2eeKeyId,
+    liveState?.mediaCacheRev,
   ])
 
   useEffect(() => {
@@ -159,7 +172,7 @@ function ChatImageCard({
       setE2eeSrc('')
       return
     }
-    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+    const latestCached = getCachedE2eeImageUrl(effectiveItem, imageActionsRef.current)
     if (latestCached && retryNonce === 0) {
       setE2eeSrc(latestCached)
       return
@@ -175,7 +188,7 @@ function ChatImageCard({
     let cancelled = false
     const isForceRetry = retryNonce > 0
     setStatus('loading')
-    loadE2eeImageUrl(effectiveItem, imageContextRef.current, {
+    loadE2eeImageUrl(effectiveItem, imageActionsRef.current, {
       forceRefresh: isForceRetry,
       signal: controller?.signal || null,
     })
@@ -207,11 +220,11 @@ function ChatImageCard({
     effectiveItem?.path,
     effectiveItem?.url,
     effectiveItem?.raw,
-    imageContext?.roomId,
-    imageContext?.bridgeId,
-    imageContext?.cwd,
-    imageContext?.e2eeKeyId,
-    imageContext?.client,
+    imageActions?.roomId,
+    imageActions?.bridgeId,
+    imageActions?.cwd,
+    imageActions?.e2eeKeyId,
+    imageActions?.client,
     retryNonce,
   ])
 
@@ -235,9 +248,9 @@ function ChatImageCard({
 
   const handleRetryTransport = () => {
     setManualLoadAllowed(true)
-    if (isOnline && p2pState === 'failed' && imageContext?.client?.retryP2p) {
+    if (isOnline && p2pState === 'failed' && imageActions?.client?.retryP2p) {
       setStatus('loading')
-      void imageContext.client.retryP2p(imageContext.bridgeId || '').catch(() => {
+      void imageActions.client.retryP2p(imageActions.bridgeId || '').catch(() => {
         setStatus('error')
       })
       return
@@ -335,7 +348,7 @@ function ChatImageCard({
             </div>
             <div className="inline-flex items-center gap-1 rounded-full bg-slate-200/75 px-2.5 py-0.5 text-[10.5px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
               <span>
-                {imageContext?.connState === 'connected' && !imageContext?.bridgeOnline
+                {liveState?.connState === 'connected' && !liveState?.bridgeOnline
                   ? bi('电脑离线 · 暂无法加载', 'Computer offline · Paused')
                   : bi('连接已断开 · 暂无法加载', 'Disconnected · Paused')}
               </span>
@@ -392,7 +405,7 @@ function ChatImageCard({
                   }
                   if (needsE2ee && typeof src === 'string' && src.startsWith('blob:') && !rehydrateAttemptedRef.current) {
                     rehydrateAttemptedRef.current = true
-                    invalidateCachedE2eeImageUrl(effectiveItem, imageContextRef.current)
+                    invalidateCachedE2eeImageUrl(effectiveItem, imageActionsRef.current)
                     setE2eeSrc('')
                     setStatus('loading')
                     setRetryNonce((n) => n + 1)
@@ -423,48 +436,45 @@ function ChatImageCard({
 /**
  * Renders a responsive gallery of images attached to or referenced by a chat message.
  */
-export const ChatImageGallery = React.memo(function ChatImageGallery({ images = [], imageContext, compact = false }) {
+export const ChatImageGallery = React.memo(function ChatImageGallery({ images = [], compact = false }) {
+  const imageActions = useImageActions()
   if (!Array.isArray(images) || images.length === 0) return null
-
-  const resolvedList = images.map((item) => {
-    const needsE2ee = needsE2eeMediaLoad(item)
-    const rawDirect = needsE2ee
-      ? getCachedE2eeImageUrl(item, imageContext)
-      : (typeof item === 'object' && item?.localPreviewUrl) || resolveImageSrc(item)
-    const src =
-      !needsE2ee && isExternalHttpImageUrl(rawDirect) && isPrivateOrLoopbackUrl(rawDirect)
-        ? ''
-        : rawDirect
-    const label = item?.name || getImageLabel(item?.path || item?.url || item?.raw || '')
-    return {
-      item,
-      src,
-      label,
-      rawPath: item?.path || item?.raw || '',
-    }
-  })
 
   return (
     <div className={`mt-2.5 flex flex-wrap gap-2 ${compact ? 'justify-end' : ''}`}>
-      {resolvedList.map((entry, idx) => (
-        <ChatImageCard
-          key={`${entry.rawPath || entry.item?.id || entry.item?.url || idx}-${idx}`}
-          item={entry.item}
-          imageContext={imageContext}
-          compact={compact || images.length > 1}
-          onOpen={(opened) =>
-            imageContext?.onOpenImage?.({
-              images: resolvedList.map((e, i) => ({
-                item: e.item,
-                src: i === idx && opened?.src ? opened.src : e.src,
-                label: e.label,
-                rawPath: e.rawPath,
-              })),
-              index: idx,
-            })
-          }
-        />
-      ))}
+      {images.map((item, idx) => {
+        const rawPath = item?.path || item?.raw || ''
+        return (
+          <ChatImageCard
+            key={`${rawPath || item?.id || item?.url || idx}-${idx}`}
+            item={item}
+            compact={compact || images.length > 1}
+            onOpen={(opened) => {
+              const resolvedList = images.map((it, i) => {
+                const needsE2ee = needsE2eeMediaLoad(it)
+                const rawDirect = needsE2ee
+                  ? getCachedE2eeImageUrl(it, imageActions)
+                  : (typeof it === 'object' && it?.localPreviewUrl) || resolveImageSrc(it)
+                const safeSrc =
+                  !needsE2ee && isExternalHttpImageUrl(rawDirect) && isPrivateOrLoopbackUrl(rawDirect)
+                    ? ''
+                    : rawDirect
+                const label = it?.name || getImageLabel(it?.path || it?.url || it?.raw || '')
+                return {
+                  item: it,
+                  src: i === idx && opened?.src ? opened.src : safeSrc,
+                  label,
+                  rawPath: it?.path || it?.raw || '',
+                }
+              })
+              imageActions?.onOpenImage?.({
+                images: resolvedList,
+                index: idx,
+              })
+            }}
+          />
+        )
+      })}
     </div>
   )
 })

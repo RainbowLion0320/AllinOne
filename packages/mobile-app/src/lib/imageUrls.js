@@ -306,7 +306,7 @@ export function extractImageRefsFromText(text) {
   }
 
   // 4. Plain Windows absolute image paths in prose (no newlines/quotes/brackets)
-  const plainWinRe = /(?<![A-Za-z0-9_])([A-Za-z]:[\\/](?!\/)[^\s`"'<>|*?\[\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))/gi
+  const plainWinRe = /(?<![A-Za-z0-9_])([A-Za-z]:[\\/](?!\/)[^\s`"'<>|*?[\]\r\n]+?\.(?:png|jpe?g|webp|gif|bmp|svg|avif))/gi
   while ((m = plainWinRe.exec(masked)) !== null) {
     pushRef(m[1])
   }

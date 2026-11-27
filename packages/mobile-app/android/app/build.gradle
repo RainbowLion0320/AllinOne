@@ -4,10 +4,31 @@ apply plugin: 'com.android.application'
 
 def pkgJsonFile = file('../../package.json')
 def pkgVersion = pkgJsonFile.exists() ? (new JsonSlurper().parseText(pkgJsonFile.text).version ?: '1.0.0') : '1.0.0'
-def verParts = pkgVersion.toString().split('-')[0].split('\\.').collect { it.isInteger() ? it.toInteger() : 0 }
-def computedVersionCode = (verParts.size() > 0 ? verParts[0] : 1) * 1000000 +
-    (verParts.size() > 1 ? verParts[1] : 0) * 1000 +
-    (verParts.size() > 2 ? verParts[2] : 0)
+def versionStr = pkgVersion.toString().trim().replaceFirst(/^[vV]/, '')
+def buildSplit = versionStr.split('\\+', 2)[0]
+def preSplit = buildSplit.split('-', 2)
+def verParts = preSplit[0].split('\\.').collect { it.isInteger() ? it.toInteger() : 0 }
+def verMajor = verParts.size() > 0 ? verParts[0] : 1
+def verMinor = verParts.size() > 1 ? verParts[1] : 0
+def verPatch = verParts.size() > 2 ? verParts[2] : 0
+def preOffset = 99
+if (preSplit.length > 1 && !preSplit[1].trim().isEmpty()) {
+    def preTokens = preSplit[1].trim().split('\\.')
+    def preTag = preTokens[0].toLowerCase(Locale.ROOT)
+    def numToken = preTokens.length > 1 ? preTokens[1..-1].find { it ==~ /^\d+$/ } : null
+    def preNum = numToken != null ? numToken.toInteger() : 0
+    if (preTag == 'rc') {
+        preOffset = 60 + Math.min(38, Math.max(0, preNum))
+    } else if (preTag == 'beta') {
+        preOffset = 30 + Math.min(29, Math.max(0, preNum))
+    } else if (preTag == 'alpha') {
+        preOffset = 10 + Math.min(19, Math.max(0, preNum))
+    } else {
+        def fallbackNum = (preTag ==~ /^\d+$/) ? preTag.toInteger() : preNum
+        preOffset = Math.min(9, Math.max(1, fallbackNum > 0 ? fallbackNum : 1))
+    }
+}
+def computedVersionCode = verMajor * 10000000 + verMinor * 100000 + verPatch * 100 + preOffset
 
 def releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
 def hasReleaseKeystore = releaseKeystorePath != null && !releaseKeystorePath.trim().isEmpty() && file(releaseKeystorePath).exists()

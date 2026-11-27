@@ -13,10 +13,11 @@ import {
   RotateCw,
   X,
 } from 'lucide-react'
-import { loadE2eeImageUrl, needsE2eeMediaLoad } from '../lib/e2eeMedia.js'
+import { acquireBlobUrl, loadE2eeImageUrl, needsE2eeMediaLoad, releaseBlobUrl } from '../lib/e2eeMedia.js'
 import { saveOrShareBlobNatively } from '../lib/e2eeFiles.js'
 import { isExternalHttpImageUrl, isPrivateOrLoopbackUrl } from '../lib/imageUrls.js'
 import { useI18n } from '../lib/i18n.jsx'
+import { useImageActions } from '../state/ImageContext.jsx'
 
 const MIN_SCALE = 0.25
 const MAX_SCALE = 8
@@ -37,8 +38,10 @@ function clamp(val, min, max) {
  *  - Rotate 90°, Fit-to-screen, 1:1 native pixel size, swipe/arrow multi-image nav
  *  - Zero-Knowledge E2EE media decryption & original image download
  */
-export function ImageLightbox({ state, imageContext = null, onMediaCached = null, onClose }) {
+export function ImageLightbox({ state, imageContext: propImageContext = null, onMediaCached = null, onClose }) {
   const { bi } = useI18n()
+  const ctxImageActions = useImageActions()
+  const imageContext = propImageContext || ctxImageActions
   const [index, setIndex] = useState(() => state?.index || 0)
   const [resolvedMap, setResolvedMap] = useState({})
   const [errorMap, setErrorMap] = useState({})
@@ -314,14 +317,11 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
     bi,
   ])
 
-  // Keyboard shortcuts: Esc, Arrows, +/-, 0 (fit), 1 (1:1), R (rotate)
+  // Keyboard shortcuts: Arrows, +/-, 0 (fit), 1 (1:1), R (rotate); Escape & Android Back handled by unified back layer
   useEffect(() => {
     if (!state) return
     const onKey = (e) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation()
-        onClose()
-      } else if (e.key === 'ArrowLeft' && total > 1) {
+      if (e.key === 'ArrowLeft' && total > 1) {
         e.preventDefault()
         stepImage(-1)
       } else if (e.key === 'ArrowRight' && total > 1) {
@@ -344,11 +344,17 @@ export function ImageLightbox({ state, imageContext = null, onMediaCached = null
         rotateBy(90)
       }
     }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [state, total, onClose, stepImage, zoomAroundCenter, resetView, toggleActualPixels, rotateBy])
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [state, total, stepImage, zoomAroundCenter, resetView, toggleActualPixels, rotateBy])
 
   const isOpen = Boolean(state && Array.isArray(state.images) && state.images.length > 0 && current)
+  const pinnedBlobUrl = resolvedMap[index] || currentInitialSrc || ''
+  useEffect(() => {
+    if (!isOpen || !pinnedBlobUrl || !pinnedBlobUrl.startsWith('blob:')) return undefined
+    acquireBlobUrl(pinnedBlobUrl)
+    return () => releaseBlobUrl(pinnedBlobUrl)
+  }, [isOpen, pinnedBlobUrl])
 
   // Non-passive wheel listener for smooth cursor-anchored mouse wheel & trackpad pinch zoom
   useEffect(() => {

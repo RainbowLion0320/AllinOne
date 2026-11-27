@@ -25,6 +25,7 @@ export function createAdminRoutes({
   relayVersion,
   extractPublicHostname,
   buildUserTurnQuota,
+  buildUserTurnQuotaReadOnly = buildUserTurnQuota,
   log = console,
 }) {
   async function handleAdminRoute(req, res, pathname) {
@@ -71,7 +72,7 @@ export function createAdminRoutes({
         hub,
         serverHealth,
         dailyRegistration,
-        getTurnQuota: (uid) => buildUserTurnQuota(uid),
+        getTurnQuota: (uid, user) => buildUserTurnQuotaReadOnly(user || uid),
         currentAdminRoom: payload.room || '',
         currentAdminSid: payload.sid || '',
       })

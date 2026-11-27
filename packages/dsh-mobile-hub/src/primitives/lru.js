@@ -1,3 +1,5 @@
+import { statSync } from 'node:fs'
+
 /**
  * Bounded LRU Map (extends native Map so `instanceof Map` checks stay valid).
  * Automatically refreshes recency on `get`/`set` and evicts oldest entries past `maxSize`.
@@ -96,6 +98,21 @@ export class FileParseCache {
         this._totalBytes = Math.max(0, this._totalBytes - evicted.bytes)
       }
     }
+  }
+
+  getOrParse(filePath, parserFn, { keyPrefix = '', approxBytes = 0 } = {}) {
+    let st
+    try {
+      st = statSync(filePath)
+    } catch {
+      return parserFn()
+    }
+    const cacheKey = keyPrefix ? `${keyPrefix}:${filePath}` : filePath
+    const cached = this.get(cacheKey, st.mtimeMs, st.size)
+    if (cached !== undefined) return cached
+    const value = parserFn(st)
+    this.set(cacheKey, st.mtimeMs, st.size, value, approxBytes || Math.min(st.size, 2 * 1024 * 1024))
+    return value
   }
 
   delete(key) {

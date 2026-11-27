@@ -186,7 +186,7 @@ export function buildAdminOverview({
     const roomClients = clientsByRoom.get(u.userId) || []
     const rStats = hub.getRoomStats(u.userId)
     const tier = u.tier || (u.role === 'admin' ? 'admin' : 'free')
-    const turnQuota = typeof getTurnQuota === 'function' ? getTurnQuota(u.userId) : null
+    const turnQuota = typeof getTurnQuota === 'function' ? getTurnQuota(u.userId, u) : null
     totalTurnUsedBytes += Number(turnQuota?.usedBytes ?? u.turnUsage?.bytes ?? 0)
 
     const liveBridgeById = new Map(roomBridges.map((b) => [b.bridgeId, b]))

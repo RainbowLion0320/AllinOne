@@ -1,6 +1,6 @@
 {
   "name": "allinone-dsh-mobile",
-  "version": "1.0.30",
+  "version": "1.0.31",
   "private": true,
   "license": "MIT",
   "description": "All in One — Self-hosted cross-device control center (Mobile PWA / Electron Desktop / PC Bridge) for DeepSeek Harness, Codex, Claude Code, and Antigravity.",
@@ -28,13 +28,18 @@
     "pack:win": "npm --workspace=@allinone/desktop-app run pack:win",
     "prepare:android": "npm --workspace=@allinone/mobile-app run prepare:android",
     "admin": "node packages/relay-server/src/admin-cli.js",
+    "lint": "eslint .",
     "version:check": "node scripts/bump-version.mjs --check",
     "test:unit": "node --test tests/*.test.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "test": "npm run test:unit && npm run test:smoke"
   },
   "devDependencies": {
-    "esbuild": "^0.25.12"
+    "@eslint/js": "^10.0.1",
+    "esbuild": "^0.25.12",
+    "eslint": "^10.15.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0"
   },
   "engines": {
     "node": ">=22.13.0"

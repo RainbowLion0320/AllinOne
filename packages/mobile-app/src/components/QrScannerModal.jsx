@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { useI18n } from '../lib/i18n.jsx'
 import { bi as biLang, getCurrentLang } from '../lib/i18n.js'
+import { BACK_LAYER_PRIORITY, useRegisterBackLayer } from '../hooks/useModalBackLayer.js'
 
 let jsQrPromise = null
 function loadJsQr() {
@@ -311,18 +312,12 @@ export function QrScannerModal({ open, onClose, onDetected }) {
     }
   }, [open, retrySeq, emitDetected, stopCamera])
 
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation()
-        stopCamera()
-        onClose?.()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [open, stopCamera, onClose])
+  const handleCloseScanner = useCallback(() => {
+    stopCamera()
+    onClose?.()
+  }, [stopCamera, onClose])
+
+  useRegisterBackLayer(Boolean(open), handleCloseScanner, BACK_LAYER_PRIORITY.SCANNER)
 
   const handleToggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks?.()[0]

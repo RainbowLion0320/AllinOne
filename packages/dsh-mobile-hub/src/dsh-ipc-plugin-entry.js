@@ -26,7 +26,7 @@ export function apply(ctx, config = {}) {
   const dshAdapter = new DshAdapter({
     ctx,
     config: {
-      permissionPreset: config.permissionPreset || 'danger-full-access',
+      ...(config.permissionPreset ? { permissionPreset: config.permissionPreset } : {}),
       ...(config.dshHome ? { dshHome: config.dshHome } : {}),
     },
     log,

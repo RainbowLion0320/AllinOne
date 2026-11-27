@@ -14,8 +14,9 @@
  *    and an opt-out escape hatch (`ALLINONE_NO_AUTOFIX=1`).
  */
 
-import { execFileSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,9 +27,16 @@ import {
   getCodebuddyCandidates,
   getCodexCandidates,
   isExecutableFile,
+  killProcessTree,
   sanitizeChildEnv,
-  spawnCmdShim,
+  spawnCrossPlatform,
 } from './bin-finder.js'
+
+const TRUSTED_INSTALLER_HOSTS = new Set([
+  'antigravity.google',
+  'claude.ai',
+  'www.codebuddy.cn',
+])
 
 const FAILURE_COOLDOWN_MS = 6 * 60 * 60 * 1000 // 6 hours after failed attempt
 const INSTALL_TIMEOUT_MS = 180_000 // 3 minutes per official installer
@@ -158,21 +166,21 @@ export function detectHalfInstalledClis({
             ? [
                 {
                   label: 'official-ps1',
-                  cmd: 'powershell',
-                  args: [
-                    '-NoProfile',
-                    '-ExecutionPolicy',
-                    'Bypass',
-                    '-Command',
-                    'irm https://antigravity.google/cli/install.ps1 | iex',
-                  ],
+                  kind: 'remote-script',
+                  requiresConfirmation: true,
+                  scriptUrl: 'https://antigravity.google/cli/install.ps1',
+                  shell: 'powershell',
+                  manualCommand: 'irm https://antigravity.google/cli/install.ps1 | iex',
                 },
               ]
             : [
                 {
                   label: 'official-sh',
-                  cmd: '/bin/bash',
-                  args: ['-lc', 'curl -fsSL https://antigravity.google/cli/install.sh | bash'],
+                  kind: 'remote-script',
+                  requiresConfirmation: true,
+                  scriptUrl: 'https://antigravity.google/cli/install.sh',
+                  shell: 'bash',
+                  manualCommand: 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
                 },
               ],
         verify: () => {
@@ -193,28 +201,7 @@ export function detectHalfInstalledClis({
     const claudeNames = platform === 'win32' ? ['claude.exe', 'claude.cmd', 'claude'] : ['claude']
     const claudeBin = checkBin(claudeNames, getClaudeCandidates(homeDir, platform, env))
     if (!claudeBin) {
-      const steps =
-        platform === 'win32'
-          ? [
-              {
-                label: 'official-ps1',
-                cmd: 'powershell',
-                args: [
-                  '-NoProfile',
-                  '-ExecutionPolicy',
-                  'Bypass',
-                  '-Command',
-                  'irm https://claude.ai/install.ps1 | iex',
-                ],
-              },
-            ]
-          : [
-              {
-                label: 'official-sh',
-                cmd: '/bin/bash',
-                args: ['-lc', 'curl -fsSL https://claude.ai/install.sh | bash'],
-              },
-            ]
+      const steps = []
       const npmBin = checkBin(platform === 'win32' ? ['npm.cmd', 'npm'] : ['npm'], [])
       if (npmBin) {
         steps.push({
@@ -223,6 +210,25 @@ export function detectHalfInstalledClis({
           args: ['install', '-g', '@anthropic-ai/claude-code'],
         })
       }
+      steps.push(
+        platform === 'win32'
+          ? {
+              label: 'official-ps1',
+              kind: 'remote-script',
+              requiresConfirmation: true,
+              scriptUrl: 'https://claude.ai/install.ps1',
+              shell: 'powershell',
+              manualCommand: 'irm https://claude.ai/install.ps1 | iex',
+            }
+          : {
+              label: 'official-sh',
+              kind: 'remote-script',
+              requiresConfirmation: true,
+              scriptUrl: 'https://claude.ai/install.sh',
+              shell: 'bash',
+              manualCommand: 'curl -fsSL https://claude.ai/install.sh | bash',
+            },
+      )
       missing.push({
         app: 'claude',
         displayName: 'Claude Code CLI (claude)',
@@ -307,28 +313,7 @@ export function detectHalfInstalledClis({
       : ['codebuddy', 'cbc']
     const cbBin = checkBin(cbNames, getCodebuddyCandidates(homeDir, platform, env))
     if (!cbBin) {
-      const steps =
-        platform === 'win32'
-          ? [
-              {
-                label: 'official-ps1',
-                cmd: 'powershell',
-                args: [
-                  '-NoProfile',
-                  '-ExecutionPolicy',
-                  'Bypass',
-                  '-Command',
-                  'irm https://www.codebuddy.cn/cli/install.ps1 | iex',
-                ],
-              },
-            ]
-          : [
-              {
-                label: 'official-sh',
-                cmd: '/bin/bash',
-                args: ['-lc', 'curl -fsSL https://www.codebuddy.cn/cli/install.sh | bash'],
-              },
-            ]
+      const steps = []
       const npmBin = checkBin(platform === 'win32' ? ['npm.cmd', 'npm'] : ['npm'], [])
       if (npmBin) {
         steps.push({
@@ -337,6 +322,25 @@ export function detectHalfInstalledClis({
           args: ['install', '-g', '@tencent-ai/codebuddy-code'],
         })
       }
+      steps.push(
+        platform === 'win32'
+          ? {
+              label: 'official-ps1',
+              kind: 'remote-script',
+              requiresConfirmation: true,
+              scriptUrl: 'https://www.codebuddy.cn/cli/install.ps1',
+              shell: 'powershell',
+              manualCommand: 'irm https://www.codebuddy.cn/cli/install.ps1 | iex',
+            }
+          : {
+              label: 'official-sh',
+              kind: 'remote-script',
+              requiresConfirmation: true,
+              scriptUrl: 'https://www.codebuddy.cn/cli/install.sh',
+              shell: 'bash',
+              manualCommand: 'curl -fsSL https://www.codebuddy.cn/cli/install.sh | bash',
+            },
+      )
       missing.push({
         app: 'workbuddy',
         displayName: 'CodeBuddy CLI (codebuddy)',
@@ -354,9 +358,12 @@ export function detectHalfInstalledClis({
 }
 
 /**
- * On-demand single-app official CLI installer (used by 1-click UI setup buttons like WorkBuddy RW activation).
+ * On-demand single-app official CLI installer (explicitly user-triggered from 1-click UI setup buttons).
  */
-export async function installSingleAppCli(appName, { log = console, timeoutMs = INSTALL_TIMEOUT_MS } = {}) {
+export async function installSingleAppCli(
+  appName,
+  { log = console, timeoutMs = INSTALL_TIMEOUT_MS, allowRemoteScripts = true } = {},
+) {
   ensureRichPath(true)
   const item = detectHalfInstalledClis().find((m) => m.app === appName)
   if (!item) {
@@ -372,7 +379,11 @@ export async function installSingleAppCli(appName, { log = console, timeoutMs = 
   )
   let lastErr = ''
   for (const step of item.steps) {
-    log.info?.(`[autofix] 正在通过官方脚本 (${step.label}) 安装 ${item.displayName}...`)
+    if (step.requiresConfirmation && !allowRemoteScripts) {
+      lastErr = `需要用户确认后执行官方安装命令：${step.manualCommand || step.scriptUrl}`
+      continue
+    }
+    log.info?.(`[autofix] 正在通过官方方式 (${step.label}) 安装 ${item.displayName}...`)
     const res = await runInstallStep(step, env, timeoutMs)
     if ((res.ok && item.verify()) || item.verify()) {
       ensureRichPath(true)
@@ -383,7 +394,7 @@ export async function installSingleAppCli(appName, { log = console, timeoutMs = 
   return { ok: false, error: lastErr || `安装 ${item.displayName} 失败` }
 }
 
-function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
+function runSpawnStep(cmd, args, env, timeoutMs = INSTALL_TIMEOUT_MS) {
   return new Promise((resolveDone) => {
     let settled = false
     let proc = null
@@ -391,56 +402,32 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
     const appendOut = (chunk) => {
       outputTail = (outputTail + chunk.toString('utf8')).slice(-4000)
     }
-    let forceKillTimer = null
     const finish = (ok, code, error = '') => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer)
-        forceKillTimer = null
-      }
       resolveDone({ ok, code, error, output: outputTail.trim() })
     }
 
     const timer = setTimeout(() => {
-      if (process.platform === 'win32' && proc?.pid) {
-        try {
-          const tk = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
-            stdio: 'ignore',
-            windowsHide: true,
-            env: sanitizeChildEnv(env),
-          })
-          tk.on('error', () => {})
-        } catch {}
+      if (proc) {
+        killProcessTree(proc, { force: false, graceMs: 2_000 })
       }
-      try { proc?.kill('SIGTERM') } catch {}
-      forceKillTimer = setTimeout(() => {
-        forceKillTimer = null
-        try { proc?.kill('SIGKILL') } catch {}
-      }, 2000)
-      forceKillTimer.unref?.()
       finish(false, -1, `安装超时 (${Math.round(timeoutMs / 1000)}s)`)
     }, timeoutMs)
     timer.unref?.()
 
     try {
-      const isWinCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(step.cmd)
-      const spawnOpts = {
+      const execCmd =
+        process.platform !== 'win32' && cmd === '/bin/bash' && !isExecutableFile('/bin/bash')
+          ? 'bash'
+          : cmd
+      proc = spawnCrossPlatform(execCmd, args, {
         cwd: os.homedir(),
         env: sanitizeChildEnv(env),
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-      }
-      if (isWinCmd) {
-        proc = spawnCmdShim(step.cmd, step.args, spawnOpts)
-      } else {
-        const execCmd =
-          process.platform !== 'win32' && step.cmd === '/bin/bash' && !isExecutableFile('/bin/bash')
-            ? 'bash'
-            : step.cmd
-        proc = spawn(execCmd, step.args, spawnOpts)
-      }
+      })
       proc.stdout?.setEncoding('utf8')
       proc.stderr?.setEncoding('utf8')
       proc.stdout?.on('data', appendOut)
@@ -453,9 +440,73 @@ function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
   })
 }
 
+async function runRemoteInstallerScriptStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
+  let urlObj
+  try {
+    urlObj = new URL(String(step.scriptUrl || ''))
+  } catch {
+    return { ok: false, code: -1, error: '无效的官方安装脚本 URL', output: '' }
+  }
+  if (urlObj.protocol !== 'https:' || !TRUSTED_INSTALLER_HOSTS.has(urlObj.hostname.toLowerCase())) {
+    return { ok: false, code: -1, error: `拒绝下载未在白名单中的安装脚本来源 (${urlObj.hostname})`, output: '' }
+  }
+
+  // Download to a private local file first instead of piping `curl | bash` / `irm | iex`
+  const ac = new AbortController()
+  const fetchTimer = setTimeout(() => ac.abort(), Math.min(30_000, timeoutMs))
+  fetchTimer.unref?.()
+  let scriptBody = ''
+  try {
+    const res = await fetch(urlObj.toString(), { method: 'GET', signal: ac.signal })
+    if (!res.ok) {
+      return { ok: false, code: res.status, error: `下载官方安装脚本失败 (HTTP ${res.status})`, output: '' }
+    }
+    scriptBody = await res.text()
+  } catch (err) {
+    return { ok: false, code: -1, error: `下载官方安装脚本异常: ${String(err?.message || err)}`, output: '' }
+  } finally {
+    clearTimeout(fetchTimer)
+  }
+
+  const trimmed = scriptBody.trim()
+  if (!trimmed || trimmed.length > 2 * 1024 * 1024 || /^<!doctype\s+html|^<html\b/i.test(trimmed)) {
+    return { ok: false, code: -1, error: '官方安装脚本校验失败（内容为空、过大或返回了 HTML 页面）', output: '' }
+  }
+
+  const ext = step.shell === 'powershell' ? 'ps1' : 'sh'
+  const scriptDir = join(os.tmpdir(), 'allinone-installer')
+  mkdirSync(scriptDir, { recursive: true, mode: 0o700 })
+  try { chmodSync(scriptDir, 0o700) } catch {}
+  const scriptPath = join(scriptDir, `install-${process.pid}-${randomBytes(6).toString('hex')}.${ext}`)
+  try {
+    writeFileSync(scriptPath, scriptBody, { encoding: 'utf8', mode: 0o700 })
+    try { chmodSync(scriptPath, 0o700) } catch {}
+    if (step.shell === 'powershell') {
+      return await runSpawnStep(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+        env,
+        timeoutMs,
+      )
+    }
+    return await runSpawnStep('/bin/bash', [scriptPath], env, timeoutMs)
+  } finally {
+    try { unlinkSync(scriptPath) } catch {}
+  }
+}
+
+function runInstallStep(step, env, timeoutMs = INSTALL_TIMEOUT_MS) {
+  if (step.kind === 'remote-script') {
+    return runRemoteInstallerScriptStep(step, env, timeoutMs)
+  }
+  return runSpawnStep(step.cmd, step.args, env, timeoutMs)
+}
+
 /**
  * Automatically detect and silently complete all half-installed CLIs in the background.
  * Safe to call on every startup: zero-cost when everything is already installed.
+ * By default only runs package-manager steps (`npm`/`brew`); remote installer scripts require
+ * explicit opt-in (`allowRemoteScripts: true` or `ALLINONE_ALLOW_REMOTE_AUTOFIX=1`).
  */
 export async function autoCompleteHalfInstalledClis({
   stateDir = join(os.homedir(), '.allinone-bridge'),
@@ -463,6 +514,7 @@ export async function autoCompleteHalfInstalledClis({
   onProgress = () => {},
   onInstalled = async () => {},
   force = false,
+  allowRemoteScripts = String(process.env.ALLINONE_ALLOW_REMOTE_AUTOFIX || '').trim() === '1',
   cooldownMs = FAILURE_COOLDOWN_MS,
 } = {}) {
   const noAutofix = String(process.env.ALLINONE_NO_AUTOFIX || '').trim()
@@ -496,6 +548,15 @@ export async function autoCompleteHalfInstalledClis({
     const failed = []
 
     for (const item of missing) {
+      const eligibleSteps = item.steps.filter((s) => !s.requiresConfirmation || allowRemoteScripts)
+      if (eligibleSteps.length === 0) {
+        const hint = item.steps.find((s) => s.manualCommand)?.manualCommand || ''
+        log.info?.(
+          `[autofix] ${item.reason}；出于安全策略，已跳过自动执行远程安装脚本${hint ? `，请手动确认安装：${hint}` : ''}`,
+        )
+        continue
+      }
+
       const prev = state[item.app]
       if (!force && prev?.lastFailedAt && now - prev.lastFailedAt < cooldownMs) {
         log.info?.(
@@ -511,7 +572,7 @@ export async function autoCompleteHalfInstalledClis({
 
       let ok = false
       let lastErr = ''
-      for (const step of item.steps) {
+      for (const step of eligibleSteps) {
         const res = await runInstallStep(step, env)
         if (res.ok && item.verify()) {
           ok = true

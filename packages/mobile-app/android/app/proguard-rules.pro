@@ -1,5 +1,7 @@
 # ProGuard / R8 rules for All in One Android (Capacitor + custom native plugins)
 
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+
 -keep class com.allinone.dshmobile.** { *; }
 -keepclassmembers class com.allinone.dshmobile.** {
     @com.getcapacitor.PluginMethod <methods>;

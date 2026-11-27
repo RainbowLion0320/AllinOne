@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto'
 const DEFAULT_SMTP_TIMEOUT_MS = 15_000
 const MAX_SMTP_BUFFER_BYTES = 64 * 1024
 const MAX_CONCURRENT_MAILS = 8
+const MAX_MAIL_QUEUE = 50
 
 function sanitizeHeaderValue(val) {
   return String(val ?? '').replace(/[\r\n]+/g, ' ').trim()
@@ -59,7 +60,7 @@ function formatDisplayName(display) {
     return encodeRfc2047(clean)
   }
   // Quote RFC 5322 specials in ASCII display-name
-  if (/[()<>\[\]:;@\\,".]/.test(clean)) {
+  if (/[()<>[\]:;@\\,".]/.test(clean)) {
     return `"${clean.replace(/([\\"])/g, '\\$1')}"`
   }
   return clean
@@ -497,13 +498,23 @@ export function createMailer(options = {}) {
       inFlightMails += 1
       return
     }
+    if (mailWaiters.length >= MAX_MAIL_QUEUE) {
+      const err = new Error('邮件发送队列繁忙，请稍后重试')
+      err.statusCode = 503
+      err.code = 'MAIL_QUEUE_FULL'
+      throw err
+    }
+    // Slot ownership is handed off directly by releaseMailSlot() without decrementing
+    // inFlightMails so concurrent callers cannot steal a slot or oversubscribe the limit.
     await new Promise((resolve) => mailWaiters.push(resolve))
-    inFlightMails += 1
   }
   function releaseMailSlot() {
-    inFlightMails = Math.max(0, inFlightMails - 1)
     const next = mailWaiters.shift()
-    if (next) next()
+    if (next) {
+      next()
+      return
+    }
+    inFlightMails = Math.max(0, inFlightMails - 1)
   }
 
   async function sendMail({ to, subject, text, html }) {

@@ -22,7 +22,7 @@ const MAX_DAILY_REG_DAYS = 14
 const DEFAULT_MAX_DAILY_REGISTRATIONS = 20
 const SCHEMA_VERSION = 1
 
-export const VALID_TIERS = new Set([...SHARED_TIERS, 'admin'])
+export const VALID_TIERS = new Set(SHARED_TIERS)
 
 export function getLocalDayKey(ts = Date.now()) {
   const d = ts instanceof Date ? ts : new Date(ts)
@@ -165,7 +165,7 @@ function sanitizeBridgeSlug(raw) {
   return slug || 'my-pc'
 }
 
-function validateUsername(raw) {
+export function validateUsername(raw) {
   const u = String(raw || '').trim()
   if (!USERNAME_RE.test(u)) {
     return { ok: false, error: '用户名需为 3~32 位字母、数字、点、下划线或连字符' }
@@ -214,10 +214,11 @@ export function resolveAccountsDbPath(filePath) {
  * ACID SQLite (WAL) Account, Device Credential, Session & Monthly TURN Metering Store.
  *
  * Uses Node.js 22+ built-in `node:sqlite` (zero external dependencies):
- *  - Per-row transactional writes (`<0.1ms`, eliminates event-loop-blocking full-DB JSON rewrites)
- *  - Commit-before-memory-mutate semantics (zero memory/disk divergence on disk failure)
- *  - Automatic one-time migration from legacy `accounts.json` preserving `.bak` snapshot
- *  - Cross-process `PRAGMA data_version` detection so live `admin-cli.js` edits take effect safely
+ *  - Per-column targeted SQL transactions so live `admin-cli.js` edits are never clobbered
+ *  - `PRAGMA data_version` checked inside `BEGIN IMMEDIATE` before any write, merging
+ *    pending in-memory telemetry deltas instead of dropping them on external reloads
+ *  - WAL size cap (`journal_size_limit = 64 MB`), `0600` sidecar permissions (`-wal`/`-shm`),
+ *    and `PRAGMA wal_checkpoint(TRUNCATE)` on clean close
  *  - Upgradable PHC-format scrypt password hashes (`$scrypt$N=32768,r=8,p=1$...`)
  */
 export function createAccountStore({ filePath }) {
@@ -225,13 +226,34 @@ export function createAccountStore({ filePath }) {
   mkdirSync(dirname(dbPath), { recursive: true })
 
   const db = new DatabaseSync(dbPath)
-  try { chmodSync(dbPath, 0o600) } catch {}
+  let walSidecarsHardened = false
+
+  function hardenDbFilePermissions(force = false) {
+    if (!force && walSidecarsHardened) return
+    let walSeen = false
+    let shmSeen = false
+    for (const suffix of ['', '-wal', '-shm']) {
+      const target = `${dbPath}${suffix}`
+      try {
+        if (existsSync(target)) {
+          chmodSync(target, 0o600)
+          if (suffix === '-wal') walSeen = true
+          if (suffix === '-shm') shmSeen = true
+        }
+      } catch {}
+    }
+    if (walSeen && shmSeen) walSidecarsHardened = true
+  }
+
+  hardenDbFilePermissions(true)
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
+    PRAGMA journal_size_limit = 67108864;
     PRAGMA foreign_keys = ON;
   `)
+  hardenDbFilePermissions(true)
 
   const currentSchemaVer = Number(db.prepare('PRAGMA user_version').get()?.user_version || 0)
   if (currentSchemaVer < SCHEMA_VERSION) {
@@ -267,6 +289,7 @@ export function createAccountStore({ filePath }) {
         PRAGMA user_version = ${SCHEMA_VERSION};
       `)
       db.exec('COMMIT')
+      hardenDbFilePermissions(true)
     } catch (err) {
       try { db.exec('ROLLBACK') } catch {}
       throw err
@@ -305,15 +328,29 @@ export function createAccountStore({ filePath }) {
       sessions_json = excluded.sessions_json
   `)
 
-  // Telemetry-only update never clobbers tier/role/password/email modified by concurrent admin-cli.js
-  const stmtUpdateTelemetry = db.prepare(`
-    UPDATE users SET
-      last_login_at = ?,
-      turn_usage_json = ?,
-      devices_json = ?,
-      sessions_json = ?
-    WHERE user_id = ?
-  `)
+  // Targeted column updates prevent concurrent admin-cli.js edits (tier/role/etc.) from ever being reverted
+  const stmtUpdatePasswordOnly = db.prepare(
+    'UPDATE users SET password_salt = ?, password_hash = ? WHERE user_id = ?',
+  )
+  const stmtUpdatePasswordAndRevoke = db.prepare(
+    'UPDATE users SET password_salt = ?, password_hash = ?, token_version = ?, sessions_json = ? WHERE user_id = ?',
+  )
+  const stmtUpdateEmail = db.prepare(
+    'UPDATE users SET email = ?, email_lower = ?, email_verified = ?, email_verified_at = ? WHERE user_id = ?',
+  )
+  const stmtUpdateLogin2fa = db.prepare('UPDATE users SET login_email_2fa = ? WHERE user_id = ?')
+  const stmtUpdateTierRole = db.prepare('UPDATE users SET tier = ?, role = ? WHERE user_id = ?')
+  const stmtUpdateLastLogin = db.prepare('UPDATE users SET last_login_at = ? WHERE user_id = ?')
+  const stmtUpdateTurnUsage = db.prepare('UPDATE users SET turn_usage_json = ? WHERE user_id = ?')
+  const stmtUpdateDevices = db.prepare('UPDATE users SET devices_json = ? WHERE user_id = ?')
+  const stmtUpdateSessions = db.prepare('UPDATE users SET sessions_json = ? WHERE user_id = ?')
+  const stmtUpdateSessionsAndLoginIps = db.prepare(
+    'UPDATE users SET sessions_json = ?, known_login_ips_json = ? WHERE user_id = ?',
+  )
+  const stmtUpdateKnownLoginIps = db.prepare('UPDATE users SET known_login_ips_json = ? WHERE user_id = ?')
+  const stmtUpdateRevokeTokens = db.prepare(
+    'UPDATE users SET token_version = ?, sessions_json = ? WHERE user_id = ?',
+  )
 
   const stmtUpsertDaily = db.prepare(`
     INSERT INTO daily_registrations (day_key, count) VALUES (?, ?)
@@ -325,6 +362,7 @@ export function createAccountStore({ filePath }) {
   const stmtAllDaily = db.prepare('SELECT day_key, count FROM daily_registrations')
   const stmtDataVersion = db.prepare('PRAGMA data_version')
   const stmtUserCount = db.prepare('SELECT COUNT(*) AS cnt FROM users')
+  const stmtHealthCheck = db.prepare('SELECT 1 AS ok')
 
   /** @type {Map<string, any>} */
   const usersById = new Map()
@@ -336,13 +374,34 @@ export function createAccountStore({ filePath }) {
   let dailyRegistrations = {}
   /** @type {Set<string>} */
   const changingPasswordUsers = new Set()
+
+  // Deferred hot-path telemetry deltas (preserved across external `data_version` reloads)
   /** @type {Set<string>} */
   const dirtyTelemetryUsers = new Set()
+  /** @type {Map<string, { month: string, bytes: number, updatedAt: number }>} */
+  const pendingTurnDelta = new Map()
+  /** @type {Map<string, number>} */
+  const pendingLastLogin = new Map()
+  /** @type {Map<string, Map<string, number>>} */
+  const pendingDeviceLastSeen = new Map()
+  /** @type {Map<string, { patches: Map<string, any>, evictedSids: Set<string> }>} */
+  const pendingSessionTouches = new Map()
 
   let closed = false
   let lastDataVersion = 0
   let lastPersistError = ''
   let flushTimer = null
+
+  function pruneDirtyFlagIfClean(userId) {
+    if (
+      !pendingTurnDelta.has(userId) &&
+      !pendingLastLogin.has(userId) &&
+      !pendingDeviceLastSeen.has(userId) &&
+      !pendingSessionTouches.has(userId)
+    ) {
+      dirtyTelemetryUsers.delete(userId)
+    }
+  }
 
   function normalizeDailyRegistrations(raw, now = Date.now()) {
     const out = {}
@@ -365,6 +424,9 @@ export function createAccountStore({ filePath }) {
     const emailLower = rawEmail ? String(row.email_lower || rawEmail).trim().toLowerCase() : ''
     const tier = normalizeTier(row.tier || (row.role === 'admin' ? 'admin' : 'free'))
     const role = tier === 'admin' ? 'admin' : 'user'
+    const parsedIps = safeJsonParse(row.known_login_ips_json, [])
+    const parsedDevices = safeJsonParse(row.devices_json, [])
+    const parsedSessions = safeJsonParse(row.sessions_json, [])
     return {
       userId: String(row.user_id),
       username: String(row.username),
@@ -381,12 +443,10 @@ export function createAccountStore({ filePath }) {
       tokenVersion: Number.isFinite(Number(row.token_version)) ? Math.max(0, Math.floor(Number(row.token_version))) : 0,
       createdAt: Number(row.created_at) || 0,
       lastLoginAt: Number(row.last_login_at) || 0,
-      knownLoginIps: Array.isArray(safeJsonParse(row.known_login_ips_json, []))
-        ? safeJsonParse(row.known_login_ips_json, []).filter(Boolean).slice(0, 12)
-        : [],
+      knownLoginIps: Array.isArray(parsedIps) ? parsedIps.filter(Boolean).slice(0, 12) : [],
       turnUsage: normalizeTurnUsageRecord(safeJsonParse(row.turn_usage_json, null)),
-      devices: Array.isArray(safeJsonParse(row.devices_json, [])) ? safeJsonParse(row.devices_json, []) : [],
-      sessions: Array.isArray(safeJsonParse(row.sessions_json, [])) ? safeJsonParse(row.sessions_json, []) : [],
+      devices: Array.isArray(parsedDevices) ? parsedDevices : [],
+      sessions: Array.isArray(parsedSessions) ? parsedSessions : [],
     }
   }
 
@@ -414,14 +474,124 @@ export function createAccountStore({ filePath }) {
     )
   }
 
+  /**
+   * Merge buffered in-memory telemetry deltas onto freshly reloaded SQLite rows so
+   * an external `admin-cli.js` edit NEVER discards unflushed usage/session/login updates.
+   */
+  function mergePendingTelemetryIntoMemory() {
+    for (const uid of [...dirtyTelemetryUsers]) {
+      const rec = usersById.get(uid)
+      if (!rec) {
+        dirtyTelemetryUsers.delete(uid)
+        pendingTurnDelta.delete(uid)
+        pendingLastLogin.delete(uid)
+        pendingDeviceLastSeen.delete(uid)
+        pendingSessionTouches.delete(uid)
+        continue
+      }
+      const turnDelta = pendingTurnDelta.get(uid)
+      if (turnDelta && turnDelta.bytes > 0) {
+        const cur = normalizeTurnUsageRecord(rec.turnUsage)
+        if (cur.month === turnDelta.month) {
+          rec.turnUsage = {
+            month: cur.month,
+            bytes: cur.bytes + turnDelta.bytes,
+            updatedAt: Math.max(cur.updatedAt || 0, turnDelta.updatedAt || 0),
+          }
+        } else if (turnDelta.month > cur.month) {
+          rec.turnUsage = { ...turnDelta }
+        }
+      }
+      const loginTs = pendingLastLogin.get(uid)
+      if (loginTs) {
+        rec.lastLoginAt = Math.max(Number(rec.lastLoginAt) || 0, loginTs)
+      }
+      const devMap = pendingDeviceLastSeen.get(uid)
+      if (devMap && devMap.size > 0 && Array.isArray(rec.devices)) {
+        for (const dev of rec.devices) {
+          const ts = devMap.get(dev.deviceId)
+          if (ts) dev.lastSeenAt = Math.max(Number(dev.lastSeenAt) || 0, ts)
+        }
+      }
+      const sessPending = pendingSessionTouches.get(uid)
+      if (sessPending && Array.isArray(rec.sessions)) {
+        if (sessPending.evictedSids.size > 0) {
+          rec.sessions = rec.sessions.filter((s) => s?.sid && !sessPending.evictedSids.has(s.sid))
+        }
+        for (const s of rec.sessions) {
+          const patch = sessPending.patches.get(s.sid)
+          if (!patch) continue
+          if (patch.deviceName) s.deviceName = patch.deviceName
+          if (patch.clientKind) s.clientKind = patch.clientKind
+          if (patch.ip) s.ip = patch.ip
+          if (patch.clientUid) s.clientUid = patch.clientUid
+          if (patch.lastSeenAt) s.lastSeenAt = Math.max(Number(s.lastSeenAt) || 0, patch.lastSeenAt)
+        }
+      }
+    }
+  }
+
+  function loadAllFromDb() {
+    usersById.clear()
+    userIdByLower.clear()
+    userIdByEmailLower.clear()
+
+    const rows = stmtAllUsers.all()
+    const countedByDay = {}
+    for (const row of rows) {
+      const normalized = rowToUserRecord(row)
+      usersById.set(normalized.userId, normalized)
+      userIdByLower.set(normalized.usernameLower, normalized.userId)
+      if (normalized.emailLower) {
+        userIdByEmailLower.set(normalized.emailLower, normalized.userId)
+      }
+      if (normalized.createdAt) {
+        const dk = getLocalDayKey(normalized.createdAt)
+        countedByDay[dk] = (countedByDay[dk] || 0) + 1
+      }
+    }
+
+    const rawDaily = {}
+    for (const dRow of stmtAllDaily.all()) {
+      rawDaily[String(dRow.day_key)] = Number(dRow.count) || 0
+    }
+    for (const [dk, cnt] of Object.entries(countedByDay)) {
+      rawDaily[dk] = Math.max(rawDaily[dk] || 0, cnt)
+    }
+    dailyRegistrations = normalizeDailyRegistrations(rawDaily)
+    lastDataVersion = Number(stmtDataVersion.get()?.data_version || 0)
+    mergePendingTelemetryIntoMemory()
+  }
+
+  function syncExternalChangesIfNeeded() {
+    if (closed) return
+    try {
+      const dv = Number(stmtDataVersion.get()?.data_version || 0)
+      if (dv !== lastDataVersion) {
+        loadAllFromDb()
+      }
+    } catch {}
+  }
+
+  /**
+   * Execute an atomic SQLite write transaction.
+   * Checks `PRAGMA data_version` inside `BEGIN IMMEDIATE` BEFORE running `fn()`,
+   * syncing any external CLI commits (while preserving dirty telemetry deltas)
+   * so `lastDataVersion` is never bumped past an unseen external write.
+   */
   function runTx(fn) {
     if (closed) throw new Error('AccountStore is closed')
     db.exec('BEGIN IMMEDIATE')
     try {
+      const dvBefore = Number(stmtDataVersion.get()?.data_version || 0)
+      if (dvBefore !== lastDataVersion) {
+        loadAllFromDb()
+      }
       const res = fn()
       db.exec('COMMIT')
       lastPersistError = ''
       lastDataVersion = Number(stmtDataVersion.get()?.data_version || lastDataVersion)
+      hardenDbFilePermissions(false)
       return res
     } catch (err) {
       try { db.exec('ROLLBACK') } catch {}
@@ -490,47 +660,6 @@ export function createAccountStore({ filePath }) {
     } catch {}
   }
 
-  function loadAllFromDb() {
-    usersById.clear()
-    userIdByLower.clear()
-    userIdByEmailLower.clear()
-
-    const rows = stmtAllUsers.all()
-    const countedByDay = {}
-    for (const row of rows) {
-      const normalized = rowToUserRecord(row)
-      usersById.set(normalized.userId, normalized)
-      userIdByLower.set(normalized.usernameLower, normalized.userId)
-      if (normalized.emailLower) {
-        userIdByEmailLower.set(normalized.emailLower, normalized.userId)
-      }
-      if (normalized.createdAt) {
-        const dk = getLocalDayKey(normalized.createdAt)
-        countedByDay[dk] = (countedByDay[dk] || 0) + 1
-      }
-    }
-
-    const rawDaily = {}
-    for (const dRow of stmtAllDaily.all()) {
-      rawDaily[String(dRow.day_key)] = Number(dRow.count) || 0
-    }
-    for (const [dk, cnt] of Object.entries(countedByDay)) {
-      rawDaily[dk] = Math.max(rawDaily[dk] || 0, cnt)
-    }
-    dailyRegistrations = normalizeDailyRegistrations(rawDaily)
-    lastDataVersion = Number(stmtDataVersion.get()?.data_version || 0)
-  }
-
-  function syncExternalChangesIfNeeded() {
-    if (closed) return
-    try {
-      const dv = Number(stmtDataVersion.get()?.data_version || 0)
-      if (dv !== lastDataVersion) {
-        loadAllFromDb()
-      }
-    } catch {}
-  }
-
   function scheduleTelemetryFlush(userId, delayMs = 3000) {
     if (closed) return
     if (userId) dirtyTelemetryUsers.add(userId)
@@ -549,23 +678,35 @@ export function createAccountStore({ filePath }) {
     }
     if (closed || dirtyTelemetryUsers.size === 0) return
     const ids = [...dirtyTelemetryUsers]
-    dirtyTelemetryUsers.clear()
     try {
       runTx(() => {
+        // `runTx` already checked `PRAGMA data_version` inside `BEGIN IMMEDIATE`
+        // and merged pending deltas onto fresh DB rows if an external commit occurred.
         for (const uid of ids) {
           const rec = usersById.get(uid)
           if (!rec) continue
-          stmtUpdateTelemetry.run(
-            Number(rec.lastLoginAt) || 0,
-            JSON.stringify(rec.turnUsage || normalizeTurnUsageRecord(null)),
-            JSON.stringify(Array.isArray(rec.devices) ? rec.devices : []),
-            JSON.stringify(Array.isArray(rec.sessions) ? rec.sessions : []),
-            uid,
-          )
+          if (pendingLastLogin.has(uid)) {
+            stmtUpdateLastLogin.run(Number(rec.lastLoginAt) || 0, uid)
+          }
+          if (pendingTurnDelta.has(uid)) {
+            stmtUpdateTurnUsage.run(JSON.stringify(rec.turnUsage || normalizeTurnUsageRecord(null)), uid)
+          }
+          if (pendingDeviceLastSeen.has(uid)) {
+            stmtUpdateDevices.run(JSON.stringify(Array.isArray(rec.devices) ? rec.devices : []), uid)
+          }
+          if (pendingSessionTouches.has(uid)) {
+            stmtUpdateSessions.run(JSON.stringify(Array.isArray(rec.sessions) ? rec.sessions : []), uid)
+          }
         }
       })
+      for (const uid of ids) {
+        dirtyTelemetryUsers.delete(uid)
+        pendingLastLogin.delete(uid)
+        pendingTurnDelta.delete(uid)
+        pendingDeviceLastSeen.delete(uid)
+        pendingSessionTouches.delete(uid)
+      }
     } catch (err) {
-      for (const uid of ids) dirtyTelemetryUsers.add(uid)
       console.error(`[accounts] Deferred telemetry flush failed: ${err?.message || err}`)
     }
   }
@@ -575,8 +716,26 @@ export function createAccountStore({ filePath }) {
     flush()
     closed = true
     try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    } catch {}
+    try {
       db.close()
     } catch {}
+  }
+
+  function isHealthy() {
+    if (closed) return false
+    try {
+      const row = stmtHealthCheck.get()
+      if (row && Number(row.ok) === 1) {
+        if (lastPersistError) lastPersistError = ''
+        return true
+      }
+      return false
+    } catch (err) {
+      lastPersistError = String(err?.message || err)
+      return false
+    }
   }
 
   migrateLegacyJsonIfPresent()
@@ -632,6 +791,12 @@ export function createAccountStore({ filePath }) {
       remaining: cleanLimit > 0 ? Math.max(0, cleanLimit - used) : null,
       exceeded: cleanLimit > 0 && used >= cleanLimit,
     }
+  }
+
+  function isUsernameTaken(username) {
+    syncExternalChangesIfNeeded()
+    const lower = String(username || '').trim().toLowerCase()
+    return Boolean(lower && userIdByLower.has(lower))
   }
 
   function isEmailTaken(email, excludeUserId = '') {
@@ -702,67 +867,78 @@ export function createAccountStore({ filePath }) {
 
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
 
-    syncExternalChangesIfNeeded()
-    if (isBootstrap && usersById.size > 0) {
-      return { ok: false, statusCode: 400, error: '管理员账号已初始化，请重新提交注册' }
-    }
-    const finalIsBootstrap = isBootstrap && usersById.size === 0
-    if (!finalIsBootstrap && cleanLimit > 0 && getTodayRegistrationCount() >= cleanLimit) {
-      return {
-        ok: false,
-        statusCode: 429,
-        code: 'DAILY_REGISTRATION_LIMIT',
-        error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
-      }
-    }
-    if (userIdByLower.has(uCheck.usernameLower)) {
-      return { ok: false, statusCode: 400, error: '该用户名已被注册，请换一个用户名' }
-    }
-    if (cleanEmailLower && userIdByEmailLower.has(cleanEmailLower)) {
-      return { ok: false, statusCode: 400, error: '该邮箱已被其他账号绑定' }
-    }
-
-    const now = Date.now()
-    const todayKey = getLocalDayKey(now)
-    const nextTodayCount = getTodayRegistrationCount(now) + 1
-    const cutoffKey = getLocalDayKey(now - (MAX_DAILY_REG_DAYS - 1) * 24 * 60 * 60 * 1000)
-    const userId = `usr_${randomBytes(8).toString('hex')}`
-    const tier = finalIsBootstrap ? 'admin' : 'free'
-    const role = finalIsBootstrap ? 'admin' : 'user'
-
-    const record = {
-      userId,
-      username: uCheck.username,
-      usernameLower: uCheck.usernameLower,
-      email: cleanEmail,
-      emailLower: cleanEmailLower,
-      emailVerified: Boolean(cleanEmail && emailVerified),
-      emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
-      loginEmail2fa: false,
-      knownLoginIps: [],
-      tier,
-      role,
-      turnUsage: normalizeTurnUsageRecord(null, now),
-      passwordSalt: salt,
-      passwordHash: hash,
-      tokenVersion: 0,
-      createdAt: now,
-      lastLoginAt: now,
-      devices: [],
-      sessions: [],
-    }
-
-    // Commit to SQLite BEFORE updating in-memory maps so disk errors never diverge state
+    let txResult = null
     runTx(() => {
+      if (isBootstrap && usersById.size > 0) {
+        txResult = { ok: false, statusCode: 400, error: '管理员账号已初始化，请重新提交注册' }
+        return
+      }
+      const finalIsBootstrap = isBootstrap && usersById.size === 0
+      const now = Date.now()
+      const todayKey = getLocalDayKey(now)
+      const currentTodayCount = Math.max(0, Math.floor(Number(dailyRegistrations[todayKey]) || 0))
+      if (!finalIsBootstrap && cleanLimit > 0 && currentTodayCount >= cleanLimit) {
+        txResult = {
+          ok: false,
+          statusCode: 429,
+          code: 'DAILY_REGISTRATION_LIMIT',
+          error: `今日新用户注册名额已满（每日上限 ${cleanLimit} 人），请明天再试`,
+        }
+        return
+      }
+      if (userIdByLower.has(uCheck.usernameLower)) {
+        txResult = { ok: false, statusCode: 400, error: '该用户名已被注册，请换一个用户名' }
+        return
+      }
+      if (cleanEmailLower && userIdByEmailLower.has(cleanEmailLower)) {
+        txResult = { ok: false, statusCode: 400, error: '该邮箱已被其他账号绑定' }
+        return
+      }
+
+      const nextTodayCount = currentTodayCount + 1
+      const cutoffKey = getLocalDayKey(now - (MAX_DAILY_REG_DAYS - 1) * 24 * 60 * 60 * 1000)
+      const userId = `usr_${randomBytes(8).toString('hex')}`
+      const tier = finalIsBootstrap ? 'admin' : 'free'
+      const role = finalIsBootstrap ? 'admin' : 'user'
+
+      const record = {
+        userId,
+        username: uCheck.username,
+        usernameLower: uCheck.usernameLower,
+        email: cleanEmail,
+        emailLower: cleanEmailLower,
+        emailVerified: Boolean(cleanEmail && emailVerified),
+        emailVerifiedAt: cleanEmail && emailVerified ? now : 0,
+        loginEmail2fa: false,
+        knownLoginIps: [],
+        tier,
+        role,
+        turnUsage: normalizeTurnUsageRecord(null, now),
+        passwordSalt: salt,
+        passwordHash: hash,
+        tokenVersion: 0,
+        createdAt: now,
+        lastLoginAt: now,
+        devices: [],
+        sessions: [],
+      }
+
       persistUserRow(record)
       stmtUpsertDaily.run(todayKey, nextTodayCount)
       stmtPruneDaily.run(cutoffKey)
+
+      txResult = { ok: true, record, todayKey, nextTodayCount, now }
     })
 
-    usersById.set(userId, record)
-    userIdByLower.set(record.usernameLower, userId)
+    if (!txResult || !txResult.ok) {
+      return txResult || { ok: false, statusCode: 400, error: '注册失败，请重试' }
+    }
+
+    const { record, todayKey, nextTodayCount, now } = txResult
+    usersById.set(record.userId, record)
+    userIdByLower.set(record.usernameLower, record.userId)
     if (record.emailLower) {
-      userIdByEmailLower.set(record.emailLower, userId)
+      userIdByEmailLower.set(record.emailLower, record.userId)
     }
     dailyRegistrations[todayKey] = nextTodayCount
     dailyRegistrations = normalizeDailyRegistrations(dailyRegistrations, now)
@@ -789,7 +965,9 @@ export function createAccountStore({ filePath }) {
     syncExternalChangesIfNeeded()
     const record = usersById.get(userId)
     if (!record) return null
-    record.lastLoginAt = Date.now()
+    const now = Date.now()
+    record.lastLoginAt = now
+    pendingLastLogin.set(userId, Math.max(pendingLastLogin.get(userId) || 0, now))
     scheduleTelemetryFlush(userId)
     return sanitizeUser(record)
   }
@@ -820,57 +998,69 @@ export function createAccountStore({ filePath }) {
     const origHash = record.passwordHash
     const verifyRes = await verifyPasswordHashAsync(password, origSalt, origHash)
     if (!verifyRes.ok) return null
-    if (usersById.get(userId) !== record || record.passwordHash !== origHash) return null
+    syncExternalChangesIfNeeded()
+    let current = usersById.get(userId)
+    if (!current || current.passwordHash !== origHash || current.passwordSalt !== origSalt) return null
 
     // Transparently upgrade legacy N=16384 password hashes to N=32768 PHC format on login
+    // using a targeted column UPDATE inside `runTx` so concurrent admin-cli edits are never clobbered.
     if (verifyRes.needsUpgrade) {
       try {
         const upgraded = await hashPasswordAsync(password)
-        if (usersById.get(userId) === record && record.passwordHash === origHash) {
-          const next = { ...record, passwordSalt: upgraded.salt, passwordHash: upgraded.hash }
-          runTx(() => persistUserRow(next))
-          record.passwordSalt = upgraded.salt
-          record.passwordHash = upgraded.hash
-        }
+        runTx(() => {
+          const fresh = usersById.get(userId)
+          if (!fresh || fresh.passwordHash !== origHash || fresh.passwordSalt !== origSalt) return
+          stmtUpdatePasswordOnly.run(upgraded.salt, upgraded.hash, userId)
+          fresh.passwordSalt = upgraded.salt
+          fresh.passwordHash = upgraded.hash
+        })
+        current = usersById.get(userId)
+        if (!current) return null
       } catch {}
     }
 
     if (recordLogin) {
-      record.lastLoginAt = Date.now()
+      const now = Date.now()
+      current.lastLoginAt = now
+      pendingLastLogin.set(userId, Math.max(pendingLastLogin.get(userId) || 0, now))
       scheduleTelemetryFlush(userId)
     }
     return {
-      user: sanitizeUser(record),
-      devices: record.devices.map(sanitizeDeviceRecord),
+      user: sanitizeUser(current),
+      devices: current.devices.map(sanitizeDeviceRecord),
     }
   }
 
   function setUserEmail(userId, email, { verified = true } = {}) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return { ok: false, error: '用户不存在' }
     const eCheck = validateEmail(email)
     if (!eCheck.ok) return eCheck
-    const existingOwner = userIdByEmailLower.get(eCheck.emailLower)
-    if (existingOwner && existingOwner !== userId) {
-      return { ok: false, error: '该邮箱已被其他账号绑定' }
-    }
-    const prevEmailLower = record.emailLower
-    const next = {
-      ...record,
-      email: eCheck.email,
-      emailLower: eCheck.emailLower,
-      emailVerified: Boolean(verified),
-      emailVerifiedAt: verified ? Date.now() : 0,
-    }
-    runTx(() => persistUserRow(next))
-
-    if (prevEmailLower && prevEmailLower !== eCheck.emailLower && userIdByEmailLower.get(prevEmailLower) === userId) {
-      userIdByEmailLower.delete(prevEmailLower)
-    }
-    Object.assign(record, next)
-    userIdByEmailLower.set(record.emailLower, userId)
-    return { ok: true, user: sanitizeUser(record) }
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
+      }
+      const existingOwner = userIdByEmailLower.get(eCheck.emailLower)
+      if (existingOwner && existingOwner !== userId) {
+        result = { ok: false, error: '该邮箱已被其他账号绑定' }
+        return
+      }
+      const prevEmailLower = record.emailLower
+      const verifiedBool = Boolean(verified)
+      const verifiedAt = verifiedBool ? Date.now() : 0
+      stmtUpdateEmail.run(eCheck.email, eCheck.emailLower, verifiedBool ? 1 : 0, verifiedAt, userId)
+      if (prevEmailLower && prevEmailLower !== eCheck.emailLower && userIdByEmailLower.get(prevEmailLower) === userId) {
+        userIdByEmailLower.delete(prevEmailLower)
+      }
+      record.email = eCheck.email
+      record.emailLower = eCheck.emailLower
+      record.emailVerified = verifiedBool
+      record.emailVerifiedAt = verifiedAt
+      userIdByEmailLower.set(record.emailLower, userId)
+      result = { ok: true, user: sanitizeUser(record) }
+    })
+    return result
   }
 
   async function resetPasswordByEmailAsync(email, newPassword) {
@@ -891,26 +1081,26 @@ export function createAccountStore({ filePath }) {
       return { ok: false, error: '该邮箱尚未完成验证，无法用于重置密码' }
     }
     const { salt, hash } = await hashPasswordAsync(pCheck.password)
-    syncExternalChangesIfNeeded()
-    // Re-verify email ownership after async scrypt (prevents mid-reset email swap TOCTOU)
-    if (
-      usersById.get(userId) !== record ||
-      record.emailVerified !== true ||
-      record.emailLower !== eCheck.emailLower
-    ) {
-      return { ok: false, error: '账号状态已变更，请重试' }
-    }
-    const next = {
-      ...record,
-      passwordSalt: salt,
-      passwordHash: hash,
-      tokenVersion: Number(record.tokenVersion || 0) + 1,
-      sessions: [],
-    }
-    runTx(() => persistUserRow(next))
-    Object.assign(record, next)
-    dirtyTelemetryUsers.delete(userId)
-    return { ok: true, user: sanitizeUser(record) }
+
+    let result = null
+    runTx(() => {
+      const fresh = usersById.get(userId)
+      // Re-verify email ownership after async scrypt (prevents mid-reset email swap TOCTOU)
+      if (!fresh || fresh.emailVerified !== true || fresh.emailLower !== eCheck.emailLower) {
+        result = { ok: false, error: '账号状态已变更，请重试' }
+        return
+      }
+      const nextTv = Number(fresh.tokenVersion || 0) + 1
+      stmtUpdatePasswordAndRevoke.run(salt, hash, nextTv, '[]', userId)
+      fresh.passwordSalt = salt
+      fresh.passwordHash = hash
+      fresh.tokenVersion = nextTv
+      fresh.sessions = []
+      pendingSessionTouches.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = { ok: true, user: sanitizeUser(fresh) }
+    })
+    return result
   }
 
   async function changePasswordAsync(userId, currentPassword, newPassword, { validateSession } = {}) {
@@ -932,127 +1122,137 @@ export function createAccountStore({ filePath }) {
       const pCheck = validatePassword(newPassword)
       if (!pCheck.ok) return pCheck
       const { salt, hash } = await hashPasswordAsync(pCheck.password)
-      syncExternalChangesIfNeeded()
-      const sessionValid = typeof validateSession === 'function' ? Boolean(validateSession()) : true
-      if (
-        usersById.get(userId) !== record ||
-        record.passwordHash !== origHash ||
-        record.passwordSalt !== origSalt ||
-        Number(record.tokenVersion || 0) !== origTv ||
-        !sessionValid
-      ) {
-        return { ok: false, error: '会话已失效或密码已被更新，请重新登录', code: 'stale_session' }
-      }
-      const next = {
-        ...record,
-        passwordSalt: salt,
-        passwordHash: hash,
-        tokenVersion: origTv + 1,
-        sessions: [],
-      }
-      runTx(() => persistUserRow(next))
-      Object.assign(record, next)
-      dirtyTelemetryUsers.delete(userId)
-      return { ok: true, user: sanitizeUser(record) }
+
+      let result = null
+      runTx(() => {
+        const fresh = usersById.get(userId)
+        const sessionValid = typeof validateSession === 'function' ? Boolean(validateSession()) : true
+        if (
+          !fresh ||
+          fresh.passwordHash !== origHash ||
+          fresh.passwordSalt !== origSalt ||
+          Number(fresh.tokenVersion || 0) !== origTv ||
+          !sessionValid
+        ) {
+          result = { ok: false, error: '会话已失效或密码已被更新，请重新登录', code: 'stale_session' }
+          return
+        }
+        const nextTv = origTv + 1
+        stmtUpdatePasswordAndRevoke.run(salt, hash, nextTv, '[]', userId)
+        fresh.passwordSalt = salt
+        fresh.passwordHash = hash
+        fresh.tokenVersion = nextTv
+        fresh.sessions = []
+        pendingSessionTouches.delete(userId)
+        pruneDirtyFlagIfClean(userId)
+        result = { ok: true, user: sanitizeUser(fresh) }
+      })
+      return result
     } finally {
       changingPasswordUsers.delete(userId)
     }
   }
 
   function bindDevice({ userId, label = '', hostname = '', platform = 'unknown', bridgeId = '' } = {}) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return null
-    const devices = Array.isArray(record.devices) ? record.devices.map((d) => ({ ...d })) : []
-    const now = Date.now()
-    const cleanHost = String(hostname || label || 'My-PC').trim().slice(0, 64) || 'My-PC'
-    const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
-    const cleanPlatform = String(platform || 'unknown').trim().slice(0, 32) || 'unknown'
-    const explicitBridgeSlug = String(bridgeId || '').trim() ? sanitizeBridgeSlug(bridgeId) : ''
-    const GENERIC_HOSTS = new Set(['', 'my-pc', 'my pc', 'localhost', 'unknown'])
-    const hostKey = cleanHost.toLowerCase()
-    const platKey = cleanPlatform.toLowerCase()
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const devices = Array.isArray(record.devices) ? record.devices.map((d) => ({ ...d })) : []
+      const now = Date.now()
+      const cleanHost = String(hostname || label || 'My-PC').trim().slice(0, 64) || 'My-PC'
+      const cleanLabel = String(label || hostname || 'My PC').trim().slice(0, 64) || cleanHost
+      const cleanPlatform = String(platform || 'unknown').trim().slice(0, 32) || 'unknown'
+      const explicitBridgeSlug = String(bridgeId || '').trim() ? sanitizeBridgeSlug(bridgeId) : ''
+      const GENERIC_HOSTS = new Set(['', 'my-pc', 'my pc', 'localhost', 'unknown'])
+      const hostKey = cleanHost.toLowerCase()
+      const platKey = cleanPlatform.toLowerCase()
 
-    const existingDevice =
-      (explicitBridgeSlug ? devices.find((d) => d.bridgeId === explicitBridgeSlug) : null) ||
-      (!explicitBridgeSlug && !GENERIC_HOSTS.has(hostKey)
-        ? devices.find(
-            (d) =>
-              String(d.hostname || '').trim().toLowerCase() === hostKey &&
-              String(d.platform || '').trim().toLowerCase() === platKey,
-          )
-        : null)
+      const existingDevice =
+        (explicitBridgeSlug ? devices.find((d) => d.bridgeId === explicitBridgeSlug) : null) ||
+        (!explicitBridgeSlug && !GENERIC_HOSTS.has(hostKey)
+          ? devices.find(
+              (d) =>
+                String(d.hostname || '').trim().toLowerCase() === hostKey &&
+                String(d.platform || '').trim().toLowerCase() === platKey,
+            )
+          : null)
 
-    if (existingDevice) {
+      if (existingDevice) {
+        const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
+        const hadCustomLabel =
+          existingDevice.label &&
+          existingDevice.hostname &&
+          existingDevice.label.trim().toLowerCase() !== existingDevice.hostname.trim().toLowerCase()
+        const incomingIsDefaultLabel = !label || cleanLabel.toLowerCase() === hostKey
+        existingDevice.label = hadCustomLabel && incomingIsDefaultLabel ? existingDevice.label : cleanLabel
+        existingDevice.hostname = cleanHost
+        existingDevice.platform = cleanPlatform
+        existingDevice.secretHash = sha256Hex(`${userId}:${existingDevice.deviceId}:${deviceSecret}`)
+        existingDevice.lastSeenAt = now
+        stmtUpdateDevices.run(JSON.stringify(devices), userId)
+        record.devices = devices
+        pendingDeviceLastSeen.delete(userId)
+        pruneDirtyFlagIfClean(userId)
+        result = {
+          userId: record.userId,
+          username: record.username,
+          roomId: record.userId,
+          deviceId: existingDevice.deviceId,
+          bridgeId: existingDevice.bridgeId,
+          label: existingDevice.label,
+          hostname: existingDevice.hostname,
+          platform: existingDevice.platform,
+          deviceSecret,
+        }
+        return
+      }
+
+      if (devices.length >= MAX_DEVICES_PER_USER) {
+        const err = new Error(`每个账号最多绑定 ${MAX_DEVICES_PER_USER} 台电脑，请先解绑旧设备后再试`)
+        err.code = 'MAX_DEVICES_EXCEEDED'
+        throw err
+      }
+
+      const deviceId = `dev_${randomBytes(6).toString('hex')}`
       const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
-      const hadCustomLabel =
-        existingDevice.label &&
-        existingDevice.hostname &&
-        existingDevice.label.trim().toLowerCase() !== existingDevice.hostname.trim().toLowerCase()
-      const incomingIsDefaultLabel = !label || cleanLabel.toLowerCase() === hostKey
-      existingDevice.label = hadCustomLabel && incomingIsDefaultLabel ? existingDevice.label : cleanLabel
-      existingDevice.hostname = cleanHost
-      existingDevice.platform = cleanPlatform
-      existingDevice.secretHash = sha256Hex(`${userId}:${existingDevice.deviceId}:${deviceSecret}`)
-      existingDevice.lastSeenAt = now
-      const next = { ...record, devices }
-      runTx(() => persistUserRow(next))
+      const baseSlug = sanitizeBridgeSlug(bridgeId || cleanHost || cleanLabel)
+
+      const existingBridgeIds = new Set(devices.map((d) => d.bridgeId))
+      let finalBridgeId = baseSlug
+      if (existingBridgeIds.has(finalBridgeId)) {
+        finalBridgeId = `${baseSlug.slice(0, 24)}-${deviceId.slice(4, 10)}`
+      }
+
+      const devRecord = {
+        deviceId,
+        bridgeId: finalBridgeId,
+        label: cleanLabel,
+        hostname: cleanHost,
+        platform: cleanPlatform,
+        secretHash: sha256Hex(`${userId}:${deviceId}:${deviceSecret}`),
+        createdAt: now,
+        lastSeenAt: now,
+      }
+      devices.push(devRecord)
+      stmtUpdateDevices.run(JSON.stringify(devices), userId)
       record.devices = devices
-      return {
+      pendingDeviceLastSeen.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+
+      result = {
         userId: record.userId,
         username: record.username,
         roomId: record.userId,
-        deviceId: existingDevice.deviceId,
-        bridgeId: existingDevice.bridgeId,
-        label: existingDevice.label,
-        hostname: existingDevice.hostname,
-        platform: existingDevice.platform,
+        deviceId: devRecord.deviceId,
+        bridgeId: devRecord.bridgeId,
+        label: devRecord.label,
+        hostname: devRecord.hostname,
+        platform: devRecord.platform,
         deviceSecret,
       }
-    }
-
-    if (devices.length >= MAX_DEVICES_PER_USER) {
-      const err = new Error(`每个账号最多绑定 ${MAX_DEVICES_PER_USER} 台电脑，请先解绑旧设备后再试`)
-      err.code = 'MAX_DEVICES_EXCEEDED'
-      throw err
-    }
-
-    const deviceId = `dev_${randomBytes(6).toString('hex')}`
-    const deviceSecret = `dv_${randomBytes(24).toString('hex')}`
-    const baseSlug = sanitizeBridgeSlug(bridgeId || cleanHost || cleanLabel)
-
-    const existingBridgeIds = new Set(devices.map((d) => d.bridgeId))
-    let finalBridgeId = baseSlug
-    if (existingBridgeIds.has(finalBridgeId)) {
-      finalBridgeId = `${baseSlug.slice(0, 24)}-${deviceId.slice(4, 10)}`
-    }
-
-    const devRecord = {
-      deviceId,
-      bridgeId: finalBridgeId,
-      label: cleanLabel,
-      hostname: cleanHost,
-      platform: cleanPlatform,
-      secretHash: sha256Hex(`${userId}:${deviceId}:${deviceSecret}`),
-      createdAt: now,
-      lastSeenAt: now,
-    }
-    devices.push(devRecord)
-    const next = { ...record, devices }
-    runTx(() => persistUserRow(next))
-    record.devices = devices
-
-    return {
-      userId: record.userId,
-      username: record.username,
-      roomId: record.userId,
-      deviceId: devRecord.deviceId,
-      bridgeId: devRecord.bridgeId,
-      label: devRecord.label,
-      hostname: devRecord.hostname,
-      platform: devRecord.platform,
-      deviceSecret,
-    }
+    })
+    return result
   }
 
   function verifyDeviceBridge(userId, deviceSecret) {
@@ -1066,7 +1266,15 @@ export function createAccountStore({ filePath }) {
         const now = Date.now()
         const shouldPersist = now - (dev.lastSeenAt || 0) > 60_000
         dev.lastSeenAt = now
-        if (shouldPersist) scheduleTelemetryFlush(userId)
+        if (shouldPersist) {
+          let devMap = pendingDeviceLastSeen.get(userId)
+          if (!devMap) {
+            devMap = new Map()
+            pendingDeviceLastSeen.set(userId, devMap)
+          }
+          devMap.set(dev.deviceId, now)
+          scheduleTelemetryFlush(userId)
+        }
         return {
           roomId: record.userId,
           userId: record.userId,
@@ -1090,31 +1298,41 @@ export function createAccountStore({ filePath }) {
   }
 
   function renameUserDevice(userId, deviceId, newLabel) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return null
-    const devices = record.devices.map((d) => ({ ...d }))
-    const target = devices.find((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
-    if (!target) return null
     const clean = String(newLabel || '').trim().slice(0, 48)
     if (!clean) return null
-    target.label = clean
-    runTx(() => persistUserRow({ ...record, devices }))
-    record.devices = devices
-    return sanitizeDeviceRecord(target)
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const devices = record.devices.map((d) => ({ ...d }))
+      const target = devices.find((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+      if (!target) return
+      target.label = clean
+      stmtUpdateDevices.run(JSON.stringify(devices), userId)
+      record.devices = devices
+      pendingDeviceLastSeen.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = sanitizeDeviceRecord(target)
+    })
+    return result
   }
 
   function removeUserDevice(userId, deviceId) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return null
-    const devices = record.devices.slice()
-    const idx = devices.findIndex((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
-    if (idx === -1) return null
-    const [removed] = devices.splice(idx, 1)
-    runTx(() => persistUserRow({ ...record, devices }))
-    record.devices = devices
-    return sanitizeDeviceRecord(removed)
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const devices = record.devices.slice()
+      const idx = devices.findIndex((d) => d.deviceId === deviceId || d.bridgeId === deviceId)
+      if (idx === -1) return
+      const [removed] = devices.splice(idx, 1)
+      stmtUpdateDevices.run(JSON.stringify(devices), userId)
+      record.devices = devices
+      pendingDeviceLastSeen.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = sanitizeDeviceRecord(removed)
+    })
+    return result
   }
 
   function getUserById(userId) {
@@ -1140,9 +1358,6 @@ export function createAccountStore({ filePath }) {
   }
 
   function setUserTier(userId, targetTier, { actorUserId = '' } = {}) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return { ok: false, error: '用户不存在' }
     const raw = String(targetTier || '').trim().toLowerCase()
     if (!VALID_TIERS.has(raw)) {
       return { ok: false, error: '无效的用户等级，仅支持 free / pro / ultra / admin' }
@@ -1150,25 +1365,34 @@ export function createAccountStore({ filePath }) {
     if (actorUserId && actorUserId === userId && raw !== 'admin') {
       return { ok: false, error: '不能取消当前管理员自身的管理员身份' }
     }
-    if (record.role === 'admin' && raw !== 'admin') {
-      let adminCount = 0
-      for (const u of usersById.values()) {
-        if (u.role === 'admin') adminCount += 1
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
       }
-      if (adminCount <= 1) {
-        return { ok: false, error: '系统至少需要保留一名管理员' }
+      if (record.role === 'admin' && raw !== 'admin') {
+        let adminCount = 0
+        for (const u of usersById.values()) {
+          if (u.role === 'admin') adminCount += 1
+        }
+        if (adminCount <= 1) {
+          result = { ok: false, error: '系统至少需要保留一名管理员' }
+          return
+        }
       }
-    }
-    const prevTier = resolveUserTier(record)
-    const nextRole = raw === 'admin' ? 'admin' : 'user'
-    const nextTier = normalizeTier(raw)
-    if (prevTier !== nextTier) {
-      const next = { ...record, tier: nextTier, role: nextRole }
-      runTx(() => persistUserRow(next))
-      record.tier = nextTier
-      record.role = nextRole
-    }
-    return { ok: true, prevTier, tier: nextTier, user: sanitizeUser(record) }
+      const prevTier = resolveUserTier(record)
+      const nextRole = raw === 'admin' ? 'admin' : 'user'
+      const nextTier = normalizeTier(raw)
+      if (prevTier !== nextTier) {
+        stmtUpdateTierRole.run(nextTier, nextRole, userId)
+        record.tier = nextTier
+        record.role = nextRole
+      }
+      result = { ok: true, prevTier, tier: nextTier, user: sanitizeUser(record) }
+    })
+    return result
   }
 
   function getTurnUsage(userId, now = new Date()) {
@@ -1185,12 +1409,20 @@ export function createAccountStore({ filePath }) {
     if (!record || add <= 0) return null
     const cur = normalizeTurnUsageRecord(record.turnUsage, now)
     const prevBytes = cur.bytes
+    const ts = now instanceof Date ? now.getTime() : Number(now) || Date.now()
     const next = {
       month: cur.month,
       bytes: prevBytes + add,
-      updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
+      updatedAt: ts,
     }
     record.turnUsage = next
+    const existingDelta = pendingTurnDelta.get(userId)
+    if (existingDelta && existingDelta.month === cur.month) {
+      existingDelta.bytes += add
+      existingDelta.updatedAt = Math.max(existingDelta.updatedAt, ts)
+    } else {
+      pendingTurnDelta.set(userId, { month: cur.month, bytes: add, updatedAt: ts })
+    }
     scheduleTelemetryFlush(userId, 2000)
     return {
       userId: record.userId,
@@ -1203,18 +1435,26 @@ export function createAccountStore({ filePath }) {
   }
 
   function resetTurnUsage(userId, now = new Date()) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return { ok: false, error: '用户不存在' }
-    const curMonth = getCurrentTurnMonth(now)
-    const nextUsage = {
-      month: curMonth,
-      bytes: 0,
-      updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
-    }
-    runTx(() => persistUserRow({ ...record, turnUsage: nextUsage }))
-    record.turnUsage = nextUsage
-    return { ok: true, user: sanitizeUser(record), turnUsage: { ...nextUsage } }
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
+      }
+      const curMonth = getCurrentTurnMonth(now)
+      const nextUsage = {
+        month: curMonth,
+        bytes: 0,
+        updatedAt: now instanceof Date ? now.getTime() : Number(now) || Date.now(),
+      }
+      stmtUpdateTurnUsage.run(JSON.stringify(nextUsage), userId)
+      record.turnUsage = nextUsage
+      pendingTurnDelta.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = { ok: true, user: sanitizeUser(record), turnUsage: { ...nextUsage } }
+    })
+    return result
   }
 
   function getTokenVersion(userId) {
@@ -1312,47 +1552,59 @@ export function createAccountStore({ filePath }) {
     userId,
     { sid, deviceName = '', clientKind = 'web', ip = '', clientUid = '', onlineSids = null } = {},
   ) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
-    if (!record || !cleanSid) return null
-    const now = Date.now()
-    const pruned = pruneSessionsArray(record.sessions, now).map((s) => ({ ...s }))
-    const cleanName = String(deviceName || '').trim().slice(0, 64)
-    const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
-    const cleanIp = String(ip || '').trim().slice(0, 64)
-    const cleanUid = normalizeClientUid(clientUid)
-    const { kept, replacedSids } = evictDuplicateSessionsFromList(pruned, {
-      keepSid: cleanSid,
-      deviceName: cleanName,
-      clientKind: cleanKind,
-      ip: cleanIp,
-      clientUid: cleanUid,
-      onlineSids,
-    })
-    let entry = kept.find((s) => s.sid === cleanSid)
-    if (entry) {
-      if (cleanName) entry.deviceName = cleanName
-      entry.clientKind = cleanKind
-      if (cleanIp) entry.ip = cleanIp
-      if (cleanUid) entry.clientUid = cleanUid
-      entry.lastSeenAt = now
-    } else {
-      entry = {
-        sid: cleanSid,
-        deviceName: cleanName || 'Unknown Device',
+    if (!cleanSid) return null
+    // Capture any unpersisted knownLoginIps written via checkAndRememberLoginContext({ skipSave: true })
+    const preRecord = usersById.get(userId)
+    const stagedLoginIps = preRecord && Array.isArray(preRecord.knownLoginIps) ? preRecord.knownLoginIps.slice(0, 12) : null
+
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const now = Date.now()
+      const pruned = pruneSessionsArray(record.sessions, now).map((s) => ({ ...s }))
+      const cleanName = String(deviceName || '').trim().slice(0, 64)
+      const cleanKind = clientKind === 'desktop' || clientKind === 'mobile' ? clientKind : 'web'
+      const cleanIp = String(ip || '').trim().slice(0, 64)
+      const cleanUid = normalizeClientUid(clientUid)
+      const { kept, replacedSids } = evictDuplicateSessionsFromList(pruned, {
+        keepSid: cleanSid,
+        deviceName: cleanName,
         clientKind: cleanKind,
         ip: cleanIp,
-        ...(cleanUid ? { clientUid: cleanUid } : {}),
-        createdAt: now,
-        lastSeenAt: now,
+        clientUid: cleanUid,
+        onlineSids,
+      })
+      let entry = kept.find((s) => s.sid === cleanSid)
+      if (entry) {
+        if (cleanName) entry.deviceName = cleanName
+        entry.clientKind = cleanKind
+        if (cleanIp) entry.ip = cleanIp
+        if (cleanUid) entry.clientUid = cleanUid
+        entry.lastSeenAt = now
+      } else {
+        entry = {
+          sid: cleanSid,
+          deviceName: cleanName || 'Unknown Device',
+          clientKind: cleanKind,
+          ip: cleanIp,
+          ...(cleanUid ? { clientUid: cleanUid } : {}),
+          createdAt: now,
+          lastSeenAt: now,
+        }
+        kept.unshift(entry)
       }
-      kept.unshift(entry)
-    }
-    const finalSessions = pruneSessionsArray(kept, now)
-    runTx(() => persistUserRow({ ...record, sessions: finalSessions }))
-    record.sessions = finalSessions
-    return { ...entry, replacedSids }
+      const finalSessions = pruneSessionsArray(kept, now)
+      const mergedIps = stagedLoginIps || (Array.isArray(record.knownLoginIps) ? record.knownLoginIps.slice(0, 12) : [])
+      stmtUpdateSessionsAndLoginIps.run(JSON.stringify(finalSessions), JSON.stringify(mergedIps), userId)
+      record.sessions = finalSessions
+      record.knownLoginIps = mergedIps
+      pendingSessionTouches.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = { ...entry, replacedSids }
+    })
+    return result
   }
 
   function touchUserSession(
@@ -1374,22 +1626,28 @@ export function createAccountStore({ filePath }) {
     const cleanIp = String(ip || '').trim().slice(0, 64)
     const cleanUid = normalizeClientUid(clientUid)
     let changed = false
+    const patch = {}
     if (cleanName && entry.deviceName !== cleanName) {
       entry.deviceName = cleanName
+      patch.deviceName = cleanName
       changed = true
     }
     if (cleanKind && entry.clientKind !== cleanKind) {
       entry.clientKind = cleanKind
+      patch.clientKind = cleanKind
       changed = true
     }
     if (cleanIp && entry.ip !== cleanIp) {
       entry.ip = cleanIp
+      patch.ip = cleanIp
       changed = true
     }
     if (cleanUid && entry.clientUid !== cleanUid) {
       entry.clientUid = cleanUid
+      patch.clientUid = cleanUid
       changed = true
     }
+    let evicted = []
     if (cleanUid && onlineSids) {
       const { kept, replacedSids } = evictDuplicateSessionsFromList(record.sessions, {
         keepSid: cleanSid,
@@ -1401,12 +1659,24 @@ export function createAccountStore({ filePath }) {
       })
       if (replacedSids.length > 0) {
         record.sessions = kept
+        evicted = replacedSids
         changed = true
       }
     }
     const stale = now - (Number(entry.lastSeenAt) || 0) > 60_000
     entry.lastSeenAt = now
-    if (changed || stale) scheduleTelemetryFlush(userId)
+    patch.lastSeenAt = now
+    if (changed || stale) {
+      let pending = pendingSessionTouches.get(userId)
+      if (!pending) {
+        pending = { patches: new Map(), evictedSids: new Set() }
+        pendingSessionTouches.set(userId, pending)
+      }
+      const prevPatch = pending.patches.get(cleanSid) || {}
+      pending.patches.set(cleanSid, { ...prevPatch, ...patch })
+      for (const rs of evicted) pending.evictedSids.add(rs)
+      scheduleTelemetryFlush(userId)
+    }
     return true
   }
 
@@ -1433,32 +1703,45 @@ export function createAccountStore({ filePath }) {
   }
 
   function revokeUserSession(userId, sid) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
     const cleanSid = String(sid || '').trim()
-    if (!record || !cleanSid) return false
-    const existed = Array.isArray(record.sessions) && record.sessions.some((s) => s?.sid === cleanSid)
-    if (!existed) return false
-    const nextSessions = pruneSessionsArray(
-      record.sessions.filter((s) => s.sid !== cleanSid),
-      Date.now(),
-    )
-    runTx(() => persistUserRow({ ...record, sessions: nextSessions }))
-    record.sessions = nextSessions
-    return true
+    if (!cleanSid) return false
+    let revoked = false
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const existed = Array.isArray(record.sessions) && record.sessions.some((s) => s?.sid === cleanSid)
+      if (!existed) return
+      const nextSessions = pruneSessionsArray(
+        record.sessions.filter((s) => s.sid !== cleanSid),
+        Date.now(),
+      )
+      stmtUpdateSessions.run(JSON.stringify(nextSessions), userId)
+      record.sessions = nextSessions
+      pendingSessionTouches.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      revoked = true
+    })
+    return revoked
   }
 
   function setLoginEmail2fa(userId, enabled) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return { ok: false, error: '用户不存在' }
     const next = Boolean(enabled)
-    if (next && (!record.email || !record.emailVerified)) {
-      return { ok: false, error: '请先绑定并验证邮箱，再开启登录二次验证' }
-    }
-    runTx(() => persistUserRow({ ...record, loginEmail2fa: next }))
-    record.loginEmail2fa = next
-    return { ok: true, user: sanitizeUser(record) }
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) {
+        result = { ok: false, error: '用户不存在' }
+        return
+      }
+      if (next && (!record.email || !record.emailVerified)) {
+        result = { ok: false, error: '请先绑定并验证邮箱，再开启登录二次验证' }
+        return
+      }
+      stmtUpdateLogin2fa.run(next ? 1 : 0, userId)
+      record.loginEmail2fa = next
+      result = { ok: true, user: sanitizeUser(record) }
+    })
+    return result
   }
 
   function checkAndRememberLoginContext(userId, { deviceName = '', ip = '', clientUid = '', skipSave = false } = {}) {
@@ -1481,25 +1764,36 @@ export function createAccountStore({ filePath }) {
     )
     const isNewContext = Boolean(hadHistory && cleanIp && !knownByIp && !knownBySession)
     if (cleanIp) {
-      const nextIps = [cleanIp, ...existingIps.filter((x) => x !== cleanIp)].slice(0, 12)
-      if (!skipSave) {
-        runTx(() => persistUserRow({ ...record, knownLoginIps: nextIps }))
+      if (skipSave) {
+        record.knownLoginIps = [cleanIp, ...existingIps.filter((x) => x !== cleanIp)].slice(0, 12)
+      } else {
+        runTx(() => {
+          const fresh = usersById.get(userId)
+          if (!fresh) return
+          const freshIps = Array.isArray(fresh.knownLoginIps) ? fresh.knownLoginIps : []
+          const nextIps = [cleanIp, ...freshIps.filter((x) => x !== cleanIp)].slice(0, 12)
+          stmtUpdateKnownLoginIps.run(JSON.stringify(nextIps), userId)
+          fresh.knownLoginIps = nextIps
+        })
       }
-      record.knownLoginIps = nextIps
     }
     return { isNewContext }
   }
 
   function revokeUserTokens(userId) {
-    syncExternalChangesIfNeeded()
-    const record = usersById.get(userId)
-    if (!record) return null
-    const nextTv = Number(record.tokenVersion || 0) + 1
-    runTx(() => persistUserRow({ ...record, tokenVersion: nextTv, sessions: [] }))
-    record.tokenVersion = nextTv
-    record.sessions = []
-    dirtyTelemetryUsers.delete(userId)
-    return { roomId: record.userId, tokenVersion: nextTv }
+    let result = null
+    runTx(() => {
+      const record = usersById.get(userId)
+      if (!record) return
+      const nextTv = Number(record.tokenVersion || 0) + 1
+      stmtUpdateRevokeTokens.run(nextTv, '[]', userId)
+      record.tokenVersion = nextTv
+      record.sessions = []
+      pendingSessionTouches.delete(userId)
+      pruneDirtyFlagIfClean(userId)
+      result = { roomId: record.userId, tokenVersion: nextTv }
+    })
+    return result
   }
 
   function listUsers() {
@@ -1546,7 +1840,7 @@ export function createAccountStore({ filePath }) {
 
   return {
     dbPath,
-    isHealthy: () => !closed && !lastPersistError,
+    isHealthy,
     getLastError: () => lastPersistError,
     getScryptStats,
     userCount: () => {
@@ -1563,6 +1857,7 @@ export function createAccountStore({ filePath }) {
     },
     getTodayRegistrationCount,
     getDailyRegistrationStats,
+    isUsernameTaken,
     isEmailTaken,
     getUserByEmail,
     registerUserAsync,

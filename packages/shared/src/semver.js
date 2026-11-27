@@ -85,3 +85,17 @@ export function isSemverAtLeast(current, minimum) {
   if (!parseSemver(current) || !parseSemver(minimum)) return false
   return compareSemver(current, minimum) >= 0
 }
+
+/**
+ * Locale-independent lexicographical UTF-16 code-unit comparison.
+ * Use this instead of `localeCompare()` for deterministic manifest/archive signing.
+ * @param {string} a
+ * @param {string} b
+ */
+export function compareCodePoint(a, b) {
+  const sa = String(a ?? '')
+  const sb = String(b ?? '')
+  if (sa < sb) return -1
+  if (sa > sb) return 1
+  return 0
+}

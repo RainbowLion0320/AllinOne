@@ -23,6 +23,7 @@ services:
       PORT: 8787
       HOST: 0.0.0.0
       LOG_FORMAT: ${LOG_FORMAT:-text}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       # 内置无状态 STUN (RFC 5389) 端口：默认 3478；同机部署 coturn 时请设为 off 并注释下方 UDP 端口映射
       # 如需自定义 STUN 端口，请同时将 STUN_PORT 与 STUN_HOST_PORT 设为同一数字端口
       STUN_PORT: ${STUN_PORT:-3478}
@@ -32,6 +33,7 @@ services:
       TURN_PORT: ${TURN_PORT:-3478}
       TURN_SECRET: ${TURN_SECRET:-}
       TURN_TTL_SEC: ${TURN_TTL_SEC:-600}
+      TURN_LOG_PATH: ${TURN_LOG_PATH:-}
       TURN_LOG_FILE: ${TURN_LOG_FILE:-}
       TURN_QUOTA_FREE_MB: ${TURN_QUOTA_FREE_MB:-1024}
       TURN_QUOTA_PRO_MB: ${TURN_QUOTA_PRO_MB:-10240}
@@ -63,8 +65,8 @@ services:
       RESEND_FROM: ${RESEND_FROM:-}
     volumes:
       - relay_data:/app/packages/relay-server/data
-      # 若启用自建 coturn 按用户配额计量（TURN_LOG_FILE=/var/log/coturn/turn.log），取消下方只读挂载注释：
-      # - /var/log/coturn/turn.log:/var/log/coturn/turn.log:ro
+      # 若启用自建 coturn 按用户配额计量（TURN_LOG_PATH=/var/log/coturn/turn.log），取消下方只读目录挂载注释（挂载目录避免 logrotate 替换 inode 后断流）：
+      # - /var/log/coturn:/var/log/coturn:ro
     ports:
       - "127.0.0.1:8787:8787"
       # 内置无状态 STUN；若同机运行 coturn 占用 UDP 3478，请注释本行并在 .env 中设 STUN_PORT=off

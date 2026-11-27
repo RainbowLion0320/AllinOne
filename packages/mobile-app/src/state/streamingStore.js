@@ -229,6 +229,34 @@ export function clearStream(sid) {
   if (wasActive) emitActive(sid)
 }
 
+export function clearStreamError(sid) {
+  if (!sid) return
+  const cur = entries.get(sid)
+  if (!cur || !cur.error) return
+  if (!cur.active) {
+    entries.delete(sid)
+    dirtySessions.delete(sid)
+    emitSession(sid)
+  } else {
+    entries.set(sid, { ...cur, error: '' })
+    emitSession(sid)
+  }
+}
+
+export function clearAllStreamErrors() {
+  for (const [sid, cur] of [...entries.entries()]) {
+    if (!cur?.error) continue
+    if (!cur.active) {
+      entries.delete(sid)
+      dirtySessions.delete(sid)
+      emitSession(sid)
+    } else {
+      entries.set(sid, { ...cur, error: '' })
+      emitSession(sid)
+    }
+  }
+}
+
 export function clearAllStreams() {
   if (entries.size === 0 && dirtySessions.size === 0) return
   const sids = [...new Set([...entries.keys(), ...dirtySessions])]

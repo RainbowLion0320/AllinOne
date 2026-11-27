@@ -20,7 +20,8 @@ export default defineConfig({
       ? [
           VitePWA({
             registerType: 'prompt',
-            includeAssets: ['icon-192.png', 'icon-512.png', 'apple-touch-icon.png'],
+            includeAssets: [],
+            includeManifestIcons: false,
             manifest: {
               name: 'All in One',
               short_name: 'All in One',
@@ -50,7 +51,15 @@ export default defineConfig({
               clientsClaim: false,
               cleanupOutdatedCaches: true,
               globPatterns: ['**/*.{js,css,svg,png,woff2}'],
-              globIgnores: ['downloads/**'],
+              globIgnores: [
+                'downloads/**',
+                'assets/jsQR-*.js',
+                'assets/hljs-lang-*.js',
+                'assets/*Modal-*.js',
+                'assets/ModelPickerSheet-*.js',
+                'assets/ImageLightbox-*.js',
+                'assets/LoginScreen-*.js',
+              ],
               navigateFallback: null,
               runtimeCaching: [
                 {
@@ -65,6 +74,18 @@ export default defineConfig({
                     expiration: {
                       maxEntries: 32,
                       maxAgeSeconds: 86400,
+                    },
+                  },
+                },
+                {
+                  urlPattern: ({ request, url }) =>
+                    request.destination === 'script' && /\/assets\/[^/]+\.js$/i.test(url.pathname),
+                  handler: 'CacheFirst',
+                  options: {
+                    cacheName: 'lazy-js-chunks',
+                    expiration: {
+                      maxEntries: 80,
+                      maxAgeSeconds: 30 * 24 * 60 * 60,
                     },
                   },
                 },
@@ -90,8 +111,15 @@ export default defineConfig({
           ) {
             return 'markdown-vendor'
           }
-          if (/\/node_modules\/highlight\.js\/lib\/core\.js$/.test(norm)) {
+          if (/\/node_modules\/highlight\.js\/(?:lib|es)\/core\.js$/.test(norm)) {
             return 'hljs-core'
+          }
+          const hljsLang = norm.match(/\/node_modules\/highlight\.js\/(?:lib|es)\/languages\/([^/]+?)(?:\.js)?$/)
+          if (hljsLang) {
+            return `hljs-lang-${hljsLang[1]}`
+          }
+          if (/\/node_modules\/jsqr\//.test(norm)) {
+            return 'jsQR'
           }
           if (/\/node_modules\/lucide-react\//.test(norm)) {
             return 'lucide'

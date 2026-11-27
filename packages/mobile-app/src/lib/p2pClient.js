@@ -12,6 +12,7 @@ import {
   BULK_SLICE_BYTES,
   P2P_BULK_LABEL,
   P2P_CTRL_LABEL,
+  createBulkWindowController,
   createCtrlCodec,
   createSerializedChannelWriter,
   decodeBulkFrame,
@@ -27,26 +28,42 @@ const P2P_KEEPALIVE_MS = 20_000
 const P2P_KEEPALIVE_TIMEOUT_MS = 45_000
 const P2P_DISCONNECTED_RESTART_MS = 3_000
 const P2P_BULK_INITIAL_WINDOW_BYTES = 8 * 1024 * 1024 // 8 MB receiver credit window
-const P2P_BULK_WINDOW_REPLENISH_BYTES = 2 * 1024 * 1024 // Replenish every 2 MB consumed
+const P2P_BULK_WINDOW_REPLENISH_BYTES = 256 * 1024 // Replenish every >= 256 KB actually consumed
+const P2P_BULK_MAX_QUEUE_BYTES = 24 * 1024 * 1024 // 24 MB hard safety cap against misbehaving peer
 const MAX_P2P_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB local disk safety cap (0 bytes via server)
 
-function createAsyncByteQueue() {
+function createAsyncByteQueue(maxBytes = P2P_BULK_MAX_QUEUE_BYTES, { onConsume = null } = {}) {
+  const cap = Math.max(1024 * 1024, Number(maxBytes) || P2P_BULK_MAX_QUEUE_BYTES)
   const chunks = []
+  let queuedBytes = 0
   let waiter = null
   let ended = false
   let error = null
 
   const push = (u8) => {
-    if (ended || error) return
+    if (ended || error) return false
     if (u8 && u8.byteLength > 0) {
       if (waiter) {
         const w = waiter
         waiter = null
         w.resolve({ value: u8, done: false })
       } else {
+        if (queuedBytes + u8.byteLength > cap) {
+          fail(
+            new Error(
+              L(
+                'P2P 下载缓冲区超出安全上限，已中止传输',
+                'P2P download buffer exceeded safety limit; stream aborted',
+              ),
+            ),
+          )
+          return false
+        }
         chunks.push(u8)
+        queuedBytes += u8.byteLength
       }
     }
+    return true
   }
   const end = () => {
     if (ended || error) return
@@ -60,6 +77,8 @@ function createAsyncByteQueue() {
   const fail = (err) => {
     if (ended || error) return
     error = err || new Error(L('P2P 传输已中断', 'P2P transfer aborted'))
+    chunks.length = 0
+    queuedBytes = 0
     if (waiter) {
       const w = waiter
       waiter = null
@@ -69,22 +88,51 @@ function createAsyncByteQueue() {
 
   const iterable = {
     [Symbol.asyncIterator]() {
+      let lastDeliveredBytes = 0
+      const notifyConsumed = () => {
+        if (lastDeliveredBytes > 0) {
+          const consumed = lastDeliveredBytes
+          lastDeliveredBytes = 0
+          try { onConsume?.(consumed) } catch {}
+        }
+      }
       return {
         next() {
+          // Previous delivered chunk has now been fully processed by decryptAutoStream / onPlainChunk
+          notifyConsumed()
           if (chunks.length > 0) {
-            return Promise.resolve({ value: chunks.shift(), done: false })
+            const nextChunk = chunks.shift()
+            queuedBytes = Math.max(0, queuedBytes - nextChunk.byteLength)
+            lastDeliveredBytes = nextChunk.byteLength
+            return Promise.resolve({ value: nextChunk, done: false })
           }
           if (error) return Promise.reject(error)
           if (ended) return Promise.resolve({ value: undefined, done: true })
           return new Promise((resolve, reject) => {
-            waiter = { resolve, reject }
+            waiter = {
+              resolve: (item) => {
+                if (!item.done && item.value) {
+                  lastDeliveredBytes = item.value.byteLength
+                }
+                resolve(item)
+              },
+              reject,
+            }
           })
         },
       }
     },
   }
 
-  return { push, end, fail, iterable }
+  return {
+    push,
+    end,
+    fail,
+    iterable,
+    get queuedBytes() {
+      return queuedBytes
+    },
+  }
 }
 
 function makeUnreachableError(detail = '') {
@@ -121,6 +169,10 @@ export class P2PPeerSession {
     sendSignal,
     onStateChange,
     onEvent,
+    initialEventSeq = 0,
+    bridgeBootId = '',
+    onEventSeq = null,
+    onBridgeBootId = null,
   }) {
     this.bridgeId = String(bridgeId || '').trim()
     this.roomId = String(roomId || '').trim()
@@ -130,10 +182,13 @@ export class P2PPeerSession {
     this.sendSignal = sendSignal
     this.onStateChange = onStateChange || (() => {})
     this.onEvent = onEvent || (() => {})
+    this.onEventSeq = typeof onEventSeq === 'function' ? onEventSeq : null
+    this.onBridgeBootId = typeof onBridgeBootId === 'function' ? onBridgeBootId : null
 
     this.sessionId = `p2p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     this.state = 'idle' // 'idle' | 'connecting' | 'connected' | 'failed' | 'closed'
     this.error = ''
+    this.errorCode = ''
     this.remoteEngine = ''
     this.transportType = '' // 'direct' | 'relay' | ''
     this.closed = false
@@ -142,7 +197,7 @@ export class P2PPeerSession {
     this.ctrlDc = null
     this.bulkDc = null
     this.ctrlCodec = createCtrlCodec()
-    this.ctrlWriter = createSerializedChannelWriter()
+    this.ctrlWriter = createSerializedChannelWriter(() => this.ctrlDc)
     this.remoteIceQueue = []
     this.remoteDescSet = false
 
@@ -156,13 +211,15 @@ export class P2PPeerSession {
     this._disconnectTimer = null
     this._transportRecheckTimer = null
     this._lastPongAt = 0
-    this._lastEventSeq = 0
+    this._lastEventSeq = Math.max(0, Number(initialEventSeq) || 0)
+    this._bridgeBootId = String(bridgeBootId || '').trim()
+    this._syncSent = false
 
     this._reqSeq = 1
     this._uploadStreamSeq = 1
     this._pendingRpcs = new Map()
-    this._activeDownloads = new Map() // streamId -> { queue, headerResolve, headerReject, receivedBytes, unackedWindowBytes, totalSize, onProgress }
-    this._activeUploads = new Map() // transferId -> { streamId, readyResolve, readyReject, doneResolve, doneReject }
+    this._activeDownloads = new Map() // streamId -> { queue, headerResolve, headerReject, receivedBytes, consumedUnackedBytes, totalSize, onProgress, cancelDownload }
+    this._activeUploads = new Map() // transferId -> { streamId, readyResolve, readyReject, doneResolve, doneReject, windowCtrl, remoteError }
     this._inboundEventQueue = Promise.resolve()
     this._bulkCtrlQueue = Promise.resolve()
     this._ctrlDecodeQueue = Promise.resolve()
@@ -178,19 +235,47 @@ export class P2PPeerSession {
     )
   }
 
-  _setState(nextState, errorMsg = '', forceEmit = false) {
-    if (!forceEmit && this.state === nextState && this.error === errorMsg) return
+  _setState(nextState, errorMsg = '', forceEmit = false, errorCode = '') {
+    if (!forceEmit && this.state === nextState && this.error === errorMsg && this.errorCode === errorCode) return
     this.state = nextState
     this.error = errorMsg
+    this.errorCode = errorCode
     try {
       this.onStateChange({
         bridgeId: this.bridgeId,
         state: this.state,
         error: this.error,
+        errorCode: this.errorCode,
         engine: this.remoteEngine,
         transport: this.transportType,
       })
     } catch {}
+  }
+
+  _applyRemoteBootId(rawBootId) {
+    const nextBootId = String(rawBootId || '').trim()
+    if (!nextBootId) return
+    if (this._bridgeBootId && this._bridgeBootId !== nextBootId) {
+      this._bridgeBootId = nextBootId
+      this._lastEventSeq = 0
+      try { this.onBridgeBootId?.(nextBootId, true) } catch {}
+      return
+    }
+    if (!this._bridgeBootId) {
+      this._bridgeBootId = nextBootId
+      try { this.onBridgeBootId?.(nextBootId, false) } catch {}
+    }
+  }
+
+  _maybeSendEventSync() {
+    if (this._syncSent || this.closed || this.ctrlDc?.readyState !== 'open') return
+    if (this._lastEventSeq <= 0) return
+    this._syncSent = true
+    void this._sendCtrlJson({
+      type: 'sync.sinceSeq',
+      sinceSeq: this._lastEventSeq,
+      ...(this._bridgeBootId ? { bridgeBootId: this._bridgeBootId } : {}),
+    }).catch(() => {})
   }
 
   async _detectIceTransport() {
@@ -264,18 +349,17 @@ export class P2PPeerSession {
   }
 
   _sendCtrlJson(obj) {
-    if (this.closed || this.ctrlDc?.readyState !== 'open') return false
-    const frames = this.ctrlCodec.encode(obj)
-    void this.ctrlWriter
-      .enqueue(() => {
-        if (this.closed || this.ctrlDc?.readyState !== 'open') return false
-        for (const f of frames) {
-          this.ctrlDc.send(f)
-        }
-        return true
-      })
-      .catch(() => {})
-    return true
+    if (this.closed || this.ctrlDc?.readyState !== 'open') {
+      return Promise.reject(new Error(L('P2P 控制通道未就绪', 'P2P control channel is not open')))
+    }
+    let frames
+    try {
+      frames = this.ctrlCodec.encode(obj)
+    } catch (err) {
+      return Promise.reject(err)
+    }
+    const writes = frames.map((frame) => this.ctrlWriter.send(frame))
+    return Promise.all(writes).then(() => true)
   }
 
   async _sendBulkCtrl(inner) {
@@ -284,9 +368,7 @@ export class P2PPeerSession {
     }
     const ctx = this._getRequiredE2ee()
     const enc = await encryptBinaryJson(ctx.key, inner, { kind: 'p2p.bulk', roomId: this.roomId })
-    if (!this._sendCtrlJson({ type: 'bulk.ctrl', bin: enc.bytes })) {
-      throw new Error(L('P2P 发送控制指令失败', 'Failed to send P2P bulk control message'))
-    }
+    await this._sendCtrlJson({ type: 'bulk.ctrl', bin: enc.bytes })
   }
 
   _checkChannelsReady() {
@@ -348,7 +430,7 @@ export class P2PPeerSession {
         )
         return
       }
-      this._sendCtrlJson({ type: 'ping', ts: now })
+      void this._sendCtrlJson({ type: 'ping', ts: now }).catch(() => {})
     }, P2P_KEEPALIVE_MS)
   }
 
@@ -356,9 +438,15 @@ export class P2PPeerSession {
    * Immediately probe DataChannel liveness (e.g. after mobile app resume / OS wake) with a short one-shot deadline.
    */
   probeLiveness(graceMs = 6_000) {
+    if (this.closed) return
+    const iceState = this.pc?.iceConnectionState
+    if (iceState === 'failed' || iceState === 'closed') {
+      this._failAndTeardown(makeUnreachableError(`ICE ${iceState}`), 'failed')
+      return
+    }
     if (!this.isOpen() || this._wakeGraceTimer) return
     const prevPong = this._lastPongAt
-    this._sendCtrlJson({ type: 'ping', ts: Date.now() })
+    void this._sendCtrlJson({ type: 'ping', ts: Date.now() }).catch(() => {})
     this._wakeGraceTimer = setTimeout(() => {
       this._wakeGraceTimer = null
       if (this.closed || !this.isOpen()) return
@@ -400,6 +488,7 @@ export class P2PPeerSession {
     }
     this._stopKeepalive()
     this.ctrlCodec.clear()
+    try { this.ctrlWriter.close() } catch {}
 
     if (this._readyReject) {
       const rej = this._readyReject
@@ -421,6 +510,7 @@ export class P2PPeerSession {
     this._activeDownloads.clear()
 
     for (const up of this._activeUploads.values()) {
+      try { up.windowCtrl?.abort(reason) } catch {}
       try { up.readyReject?.(reason) } catch {}
       try { up.doneReject?.(reason) } catch {}
     }
@@ -433,7 +523,12 @@ export class P2PPeerSession {
     this.bulkDc = null
     this.pc = null
 
-    this._setState(finalState, finalState === 'failed' ? reason.message : '')
+    this._setState(
+      finalState,
+      finalState === 'failed' ? reason.message : '',
+      false,
+      finalState === 'failed' ? String(reason.code || '') : '',
+    )
   }
 
   connect() {
@@ -477,7 +572,10 @@ export class P2PPeerSession {
     this.ctrlDc = ctrlDc
     this.bulkDc = bulkDc
 
-    ctrlDc.onopen = () => this._checkChannelsReady()
+    ctrlDc.onopen = () => {
+      this._maybeSendEventSync()
+      this._checkChannelsReady()
+    }
     bulkDc.onopen = () => this._checkChannelsReady()
 
     const feedCtrlBytes = (u8) => {
@@ -581,18 +679,8 @@ export class P2PPeerSession {
             this._disconnectTimer = null
             if (this.closed || !this.pc) return
             if (this.pc.iceConnectionState === 'disconnected') {
-              try {
-                if (typeof this.pc.restartIce === 'function') {
-                  this.pc.restartIce()
-                }
-              } catch {}
-              // If still disconnected after another 4s, fail cleanly so UI/auto-retry rebuilds the peer
-              this._disconnectTimer = setTimeout(() => {
-                this._disconnectTimer = null
-                if (!this.closed && this.pc?.iceConnectionState === 'disconnected') {
-                  this._failAndTeardown(makeUnreachableError('ICE disconnected'), 'failed')
-                }
-              }, 4_000)
+              // Fail cleanly after brief jitter grace so MobileRelayClient rebuilds a fresh peer
+              this._failAndTeardown(makeUnreachableError('ICE disconnected'), 'failed')
             }
           }, P2P_DISCONNECTED_RESTART_MS)
         }
@@ -663,6 +751,9 @@ export class P2PPeerSession {
 
     if (inner.kind === 'answer' && inner.sdp) {
       this.remoteEngine = String(inner.engine || '')
+      if (inner.bridgeBootId || inner.bootId) {
+        this._applyRemoteBootId(inner.bridgeBootId || inner.bootId)
+      }
       try {
         await this.pc.setRemoteDescription({ type: 'answer', sdp: inner.sdp })
         this.remoteDescSet = true
@@ -699,7 +790,17 @@ export class P2PPeerSession {
 
     if (msg.type === 'pong') return
     if (msg.type === 'ping') {
-      this._sendCtrlJson({ type: 'pong', ts: Date.now() })
+      void this._sendCtrlJson({ type: 'pong', ts: Date.now() }).catch(() => {})
+      return
+    }
+    if (msg.type === 'p2p.hello') {
+      this._applyRemoteBootId(msg.bridgeBootId || msg.bootId)
+      this._maybeSendEventSync()
+      return
+    }
+    if (msg.type === 'sync.reset') {
+      this._lastEventSeq = 0
+      this._applyRemoteBootId(msg.bridgeBootId || msg.bootId)
       return
     }
 
@@ -761,8 +862,22 @@ export class P2PPeerSession {
           if (this.closed) return
           const inner = await decryptBinaryJson(key, binSnap, { kind: 'event', roomId: this.roomId })
           if (this.closed || !inner?.event) return
-          if (Number.isFinite(Number(inner.seq))) {
-            this._lastEventSeq = Math.max(this._lastEventSeq, Number(inner.seq))
+          if (inner.event === 'p2p.hello') {
+            this._applyRemoteBootId(inner.payload?.bridgeBootId || inner.payload?.bootId)
+            return
+          }
+          const seqNum =
+            typeof inner.seq === 'number'
+              ? inner.seq
+              : typeof msg.seq === 'number'
+                ? msg.seq
+                : null
+          if (seqNum !== null && Number.isFinite(seqNum)) {
+            if (seqNum <= this._lastEventSeq) {
+              return
+            }
+            this._lastEventSeq = seqNum
+            try { this.onEventSeq?.(seqNum) } catch {}
           }
           try {
             this.onEvent(inner.event, inner.payload, rawMsg)
@@ -816,7 +931,7 @@ export class P2PPeerSession {
       return
     }
 
-    if (inner.action === 'upload.ready') {
+    if (inner.action === 'upload.ready' || inner.action === 'upload_ready') {
       const up = this._activeUploads.get(String(inner.transferId || ''))
       if (up && up.readyResolve) {
         const res = up.readyResolve
@@ -827,11 +942,26 @@ export class P2PPeerSession {
       return
     }
 
+    if (inner.action === 'window') {
+      const streamId = Number(inner.streamId)
+      const credits = Number(inner.bytes || 0)
+      if (credits > 0 && (!inner.direction || inner.direction === 'upload')) {
+        for (const up of this._activeUploads.values()) {
+          if (up.streamId === streamId && up.windowCtrl) {
+            up.windowCtrl.grant(credits)
+            break
+          }
+        }
+      }
+      return
+    }
+
     if (inner.action === 'upload.done') {
       const transferId = String(inner.transferId || '')
       const up = this._activeUploads.get(transferId)
       if (up) {
         this._activeUploads.delete(transferId)
+        up.windowCtrl?.abort(new Error('Upload complete'))
         up.doneResolve?.(inner)
       }
       return
@@ -844,6 +974,7 @@ export class P2PPeerSession {
         this._activeUploads.delete(transferId)
         const err = new Error(inner.message || L('P2P 上传失败', 'P2P upload failed'))
         up.remoteError = err
+        up.windowCtrl?.abort(err)
         up.readyReject?.(err)
         up.doneReject?.(err)
       }
@@ -858,12 +989,21 @@ export class P2PPeerSession {
     if (!dl) return
     if (frame.payload.byteLength > 0) {
       dl.receivedBytes += frame.payload.byteLength
-      dl.unackedWindowBytes = (dl.unackedWindowBytes || 0) + frame.payload.byteLength
-      dl.queue.push(frame.payload)
-      if (dl.unackedWindowBytes >= P2P_BULK_WINDOW_REPLENISH_BYTES) {
-        const grantBytes = dl.unackedWindowBytes
-        dl.unackedWindowBytes = 0
-        void this._sendBulkCtrl({ action: 'window', streamId: frame.streamId, bytes: grantBytes }).catch(() => {})
+      const accepted = dl.queue.push(frame.payload)
+      if (!accepted) {
+        this._activeDownloads.delete(frame.streamId)
+        dl.headerReject?.(
+          new Error(
+            L(
+              'P2P 下载缓冲区超出安全上限，已中止传输',
+              'P2P download buffer exceeded safety limit; stream aborted',
+            ),
+          ),
+        )
+        dl.headerResolve = null
+        dl.headerReject = null
+        dl.cancelDownload?.()
+        return
       }
       if (typeof dl.onProgress === 'function') {
         try {
@@ -909,11 +1049,17 @@ export class P2PPeerSession {
         e2eeKey: ctx.key,
       })
 
-      if (!this._sendCtrlJson({ type: 'rpc.req', id, bin: enc.bytes })) {
-        clearTimeout(timer)
+      this._sendCtrlJson({ type: 'rpc.req', id, bin: enc.bytes }).catch((sendErr) => {
+        const pending = this._pendingRpcs.get(id)
+        if (!pending) return
+        clearTimeout(pending.timer)
         this._pendingRpcs.delete(id)
-        reject(new Error(L('P2P 通道发送失败', 'Failed to send request over P2P channel')))
-      }
+        pending.reject(
+          sendErr instanceof Error
+            ? sendErr
+            : new Error(L('P2P 通道发送失败', 'Failed to send request over P2P channel')),
+        )
+      })
     })
   }
 
@@ -931,7 +1077,30 @@ export class P2PPeerSession {
     await this.connect()
     const ctx = this._getRequiredE2ee()
 
-    const queue = createAsyncByteQueue()
+    let cancelSent = false
+    const sendDownloadCancel = () => {
+      if (cancelSent) return
+      cancelSent = true
+      void this._sendBulkCtrl({ action: 'cancel', streamId: cleanId, direction: 'download' }).catch(() => {})
+    }
+
+    let consumedUnackedBytes = 0
+    const onQueueConsumed = (consumedBytes) => {
+      if (this.closed || !this._activeDownloads.has(cleanId)) return
+      consumedUnackedBytes += consumedBytes
+      if (consumedUnackedBytes >= P2P_BULK_WINDOW_REPLENISH_BYTES) {
+        const grantBytes = consumedUnackedBytes
+        consumedUnackedBytes = 0
+        void this._sendBulkCtrl({
+          action: 'window',
+          streamId: cleanId,
+          direction: 'download',
+          bytes: grantBytes,
+        }).catch(() => {})
+      }
+    }
+
+    const queue = createAsyncByteQueue(P2P_BULK_MAX_QUEUE_BYTES, { onConsume: onQueueConsumed })
     let headerResolve = null
     let headerReject = null
     const headerPromise = new Promise((res, rej) => {
@@ -945,18 +1114,12 @@ export class P2PPeerSession {
       headerResolve,
       headerReject,
       receivedBytes: 0,
-      unackedWindowBytes: 0,
       totalSize: Number(size || 0),
       onProgress,
+      cancelDownload: sendDownloadCancel,
     }
     this._activeDownloads.set(cleanId, dl)
 
-    let cancelSent = false
-    const sendDownloadCancel = () => {
-      if (cancelSent) return
-      cancelSent = true
-      void this._sendBulkCtrl({ action: 'cancel', streamId: cleanId, direction: 'download' }).catch(() => {})
-    }
     const onAbort = () => {
       const err = new Error(L('已取消文件传输', 'File transfer cancelled'))
       err.name = 'AbortError'
@@ -1056,17 +1219,28 @@ export class P2PPeerSession {
       readyReject,
       doneResolve,
       doneReject,
+      windowCtrl: null,
       remoteError: null,
     }
     this._activeUploads.set(transferId, uploadEntry)
 
+    let cancelSent = false
+    let uploadStarted = false
+    let completed = false
+    const sendUploadCancel = () => {
+      if (cancelSent) return
+      cancelSent = true
+      void this._sendBulkCtrl({ action: 'cancel', streamId, direction: 'upload' }).catch(() => {})
+    }
+
     const onAbort = () => {
       const err = new Error(L('已取消文件上传', 'File upload cancelled'))
       err.name = 'AbortError'
+      uploadEntry.windowCtrl?.abort(err)
       readyReject?.(err)
       doneReject?.(err)
       this._activeUploads.delete(transferId)
-      void this._sendBulkCtrl({ action: 'cancel', streamId, direction: 'upload' }).catch(() => {})
+      sendUploadCancel()
     }
     if (signal) {
       if (signal.aborted) {
@@ -1079,7 +1253,7 @@ export class P2PPeerSession {
     const waitReadyWithTimeout = async () => {
       let timer = null
       try {
-        await Promise.race([
+        return await Promise.race([
           readyPromise,
           new Promise((_, rej) => {
             timer = setTimeout(
@@ -1102,6 +1276,7 @@ export class P2PPeerSession {
         roomId: this.roomId,
         compress: isCompressibleFile(realMime, filename),
         onHeader: async (e2eeMeta) => {
+          uploadStarted = true
           await this._sendBulkCtrl({
             action: 'upload.start',
             transferId,
@@ -1111,7 +1286,14 @@ export class P2PPeerSession {
             size: totalSize,
             e2ee: e2eeMeta,
           })
-          await waitReadyWithTimeout()
+          const readyInfo = await waitReadyWithTimeout()
+          const initialWin = Number(readyInfo?.windowBytes || 0)
+          if (Number.isFinite(initialWin) && initialWin > 0) {
+            uploadEntry.windowCtrl = createBulkWindowController({
+              initialWindowBytes: initialWin,
+              timeoutMs: 45_000,
+            })
+          }
         },
         onChunk: async (cipherChunk) => {
           for (let off = 0; off < cipherChunk.byteLength; off += BULK_SLICE_BYTES) {
@@ -1122,6 +1304,10 @@ export class P2PPeerSession {
               throw err
             }
             const slice = cipherChunk.subarray(off, Math.min(cipherChunk.byteLength, off + BULK_SLICE_BYTES))
+            if (uploadEntry.windowCtrl) {
+              await uploadEntry.windowCtrl.consume(slice.byteLength, signal)
+            }
+            if (uploadEntry.remoteError) throw uploadEntry.remoteError
             const frame = encodeBulkFrame(streamId, seq++, slice, 0)
             await sendWithBackpressure(this.bulkDc, frame, { signal })
             sentBytes += slice.byteLength
@@ -1155,6 +1341,8 @@ export class P2PPeerSession {
         if (doneTimer) clearTimeout(doneTimer)
       }
 
+      completed = true
+
       const localPreviewUrl =
         realMime.startsWith('image/') &&
         totalSize <= 50 * 1024 * 1024 &&
@@ -1172,7 +1360,11 @@ export class P2PPeerSession {
       }
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort)
+      uploadEntry.windowCtrl?.abort(new Error('Upload closed'))
       this._activeUploads.delete(transferId)
+      if (!completed && uploadStarted) {
+        sendUploadCancel()
+      }
     }
   }
 

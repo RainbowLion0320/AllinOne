@@ -16,13 +16,17 @@ import {
 } from 'lucide-react'
 import { useI18n } from '../lib/i18n.jsx'
 import { fetchE2eeDeliverableFile } from '../lib/e2eeFiles.js'
+import { useImageActions } from '../state/ImageContext.jsx'
+import { BACK_LAYER_PRIORITY, useRegisterBackLayer } from '../hooks/useModalBackLayer.js'
+import { SectionErrorBoundary } from './SectionErrorBoundary.jsx'
 
 const LazyMarkdownView = lazy(() =>
   import('../lib/markdown.jsx').then((mod) => ({ default: mod.MarkdownView })),
 )
 
-function PlanDocModal({ planDoc, imageContext, onClose }) {
+function PlanDocModal({ planDoc, onClose }) {
   const { bi } = useI18n()
+  const imageContext = useImageActions()
   const [content, setContent] = useState(() => (typeof planDoc?.content === 'string' ? planDoc.content : ''))
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
@@ -33,16 +37,7 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
     Boolean(window.allinoneDesktop?.isDesktop) &&
     window.allinoneDesktop?.platform === 'darwin'
 
-  useEffect(() => {
-    const onKeyDown = (e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose?.()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+  useRegisterBackLayer(true, () => onClose?.(), BACK_LAYER_PRIORITY.PLAN_DOC)
 
   useEffect(() => {
     if (typeof planDoc?.content === 'string' && planDoc.content.trim()) {
@@ -133,15 +128,17 @@ function PlanDocModal({ planDoc, imageContext, onClose }) {
               <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{errorMsg}</span>
             </div>
           ) : (
-            <Suspense
-              fallback={
-                <div className="flex items-center justify-center gap-2 py-12 text-xs text-slate-400">
-                  <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
-                </div>
-              }
-            >
-              <LazyMarkdownView text={content} imageContext={imageContext} />
-            </Suspense>
+            <SectionErrorBoundary name="plan-doc" compact resetKey={planDoc?.path || planDoc?.title}>
+              <Suspense
+                fallback={
+                  <div className="flex items-center justify-center gap-2 py-12 text-xs text-slate-400">
+                    <Loader2 className="h-4 w-4 animate-spin text-[#4D6BFE]" />
+                  </div>
+                }
+              >
+                <LazyMarkdownView text={content} />
+              </Suspense>
+            </SectionErrorBoundary>
           )}
         </div>
       </div>
@@ -205,7 +202,7 @@ function formatGoalStatusBadge(status, bi) {
  * Minimal, collapsible sticky Plan / Goal / Steps status bar pinned cleanly above the chat stream.
  * Renders ONLY while a plan/goal/checklist is active or actionable, and auto-hides cleanly once finished.
  */
-export function TaskStateBar({ sessionId = '', taskState = null, running = false, imageContext }) {
+export const TaskStateBar = React.memo(function TaskStateBar({ sessionId = '', taskState = null, running = false }) {
   const { bi } = useI18n()
   const [expanded, setExpanded] = useState(false)
   const [planOpen, setPlanOpen] = useState(false)
@@ -468,10 +465,9 @@ export function TaskStateBar({ sessionId = '', taskState = null, running = false
       {planOpen && planDoc && (
         <PlanDocModal
           planDoc={planDoc}
-          imageContext={imageContext}
           onClose={() => setPlanOpen(false)}
         />
       )}
     </div>
   )
-}
+})

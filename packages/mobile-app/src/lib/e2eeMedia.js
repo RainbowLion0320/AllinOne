@@ -12,9 +12,12 @@ const MAX_PERSISTED_MEDIA_ENTRIES = 60
 const MAX_PERSISTED_MEDIA_BYTES = 40 * 1024 * 1024 // 40 MB persistent LRU cap
 const MAX_PERSISTED_ITEM_BYTES = 12 * 1024 * 1024 // Skip persisting >12 MB single images
 const MAX_PERSISTED_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
+const IDB_OPEN_TIMEOUT_MS = 5_000
 
-/** @type {Map<string, { url: string, ts: number }>} */
+/** @type {Map<string, { url: string, ts: number, refs: number, evicted: boolean }>} */
 const blobUrlCache = new Map()
+/** @type {Map<string, { url: string, ts: number, refs: number, evicted: boolean }>} */
+const urlToEntry = new Map()
 /** @type {Map<string, { promise: Promise<string>, controller: AbortController | null, waiters: number }>} */
 const inflightLoads = new Map()
 let cacheEpoch = 0
@@ -25,31 +28,54 @@ function openMediaDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null)
   if (mediaDbPromise) return mediaDbPromise
   mediaDbPromise = new Promise((resolve) => {
+    let settled = false
+    let timer = null
+    const finish = (db) => {
+      if (settled) {
+        if (db) {
+          try { db.close() } catch {}
+        }
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      if (!db) mediaDbPromise = null
+      resolve(db)
+    }
+    timer = setTimeout(() => finish(null), IDB_OPEN_TIMEOUT_MS)
     try {
       const req = indexedDB.open(MEDIA_DB_NAME, 1)
       req.onupgradeneeded = () => {
         const db = req.result
+        if (req.transaction) {
+          req.transaction.onabort = () => finish(null)
+        }
         if (!db.objectStoreNames.contains(MEDIA_STORE_NAME)) {
           const store = db.createObjectStore(MEDIA_STORE_NAME, { keyPath: 'key' })
           store.createIndex('cachedAt', 'cachedAt', { unique: false })
         }
       }
+      req.onblocked = () => finish(null)
       req.onsuccess = () => {
         const db = req.result
+        if (settled) {
+          try { db.close() } catch {}
+          return
+        }
         db.onclose = () => { mediaDbPromise = null }
+        db.onabort = () => { mediaDbPromise = null }
         db.onversionchange = () => {
           try { db.close() } catch {}
           mediaDbPromise = null
         }
-        resolve(db)
+        finish(db)
       }
-      req.onerror = () => {
-        mediaDbPromise = null
-        resolve(null)
-      }
+      req.onerror = () => finish(null)
     } catch {
-      mediaDbPromise = null
-      resolve(null)
+      finish(null)
     }
   })
   return mediaDbPromise
@@ -95,6 +121,7 @@ async function deletePersistedMedia(cacheKey) {
       tx.objectStore(MEDIA_STORE_NAME).delete(cacheKey)
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -156,6 +183,7 @@ async function persistMediaBlob(cacheKey, blob, { roomId = '', bridgeId = '', mi
       })
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -229,6 +257,7 @@ async function clearPersistedMediaStore({ roomId = '', bridgeId = '' } = {}) {
       }
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -287,20 +316,61 @@ function attachSignal(entry, signal) {
   })
 }
 
+function retireBlobEntry(entry) {
+  if (!entry) return
+  entry.evicted = true
+  if (entry.refs <= 0) {
+    urlToEntry.delete(entry.url)
+    if (entry.url) {
+      try { URL.revokeObjectURL(entry.url) } catch {}
+    }
+  }
+}
+
+/**
+ * Increment active mount reference count for a cached Blob URL so LRU eviction
+ * never revokes a URL currently rendered in ChatImageGallery or ImageLightbox.
+ */
+export function acquireBlobUrl(url) {
+  if (!url || typeof url !== 'string') return
+  const entry = urlToEntry.get(url)
+  if (!entry) return
+  entry.refs += 1
+}
+
+/**
+ * Decrement active mount reference count; if the URL was evicted/invalidated while mounted,
+ * revoke it immediately once the last consumer unmounts.
+ */
+export function releaseBlobUrl(url) {
+  if (!url || typeof url !== 'string') return
+  const entry = urlToEntry.get(url)
+  if (!entry) return
+  entry.refs = Math.max(0, entry.refs - 1)
+  if (entry.refs === 0 && entry.evicted) {
+    urlToEntry.delete(url)
+    try { URL.revokeObjectURL(url) } catch {}
+  }
+}
+
 function cacheBlobUrl(cacheKey, url) {
   const existing = blobUrlCache.get(cacheKey)
   if (existing && existing.url !== url) {
-    try { URL.revokeObjectURL(existing.url) } catch {}
+    retireBlobEntry(existing)
   }
   blobUrlCache.delete(cacheKey)
-  blobUrlCache.set(cacheKey, { url, ts: Date.now() })
-  while (blobUrlCache.size > MAX_BLOB_CACHE) {
-    const oldestKey = blobUrlCache.keys().next().value
-    if (!oldestKey) break
-    const oldest = blobUrlCache.get(oldestKey)
-    blobUrlCache.delete(oldestKey)
-    if (oldest?.url) {
-      try { URL.revokeObjectURL(oldest.url) } catch {}
+  const nextEntry = { url, ts: Date.now(), refs: 0, evicted: false }
+  blobUrlCache.set(cacheKey, nextEntry)
+  urlToEntry.set(url, nextEntry)
+
+  if (blobUrlCache.size > MAX_BLOB_CACHE) {
+    // Evict only unreferenced (refs === 0) oldest entries so mounted images are never broken
+    for (const [k, entry] of [...blobUrlCache.entries()]) {
+      if (blobUrlCache.size <= MAX_BLOB_CACHE) break
+      if (k === cacheKey) continue
+      if (entry.refs > 0) continue
+      blobUrlCache.delete(k)
+      retireBlobEntry(entry)
     }
   }
 }
@@ -308,9 +378,7 @@ function cacheBlobUrl(cacheKey, url) {
 export function clearE2eeMediaCache({ persistent = false, roomId = '', bridgeId = '' } = {}) {
   cacheEpoch += 1
   for (const entry of blobUrlCache.values()) {
-    if (entry?.url) {
-      try { URL.revokeObjectURL(entry.url) } catch {}
-    }
+    retireBlobEntry(entry)
   }
   blobUrlCache.clear()
   for (const entry of inflightLoads.values()) {
@@ -363,10 +431,10 @@ export function invalidateCachedE2eeImageUrl(item, imageContext = {}) {
   const { cacheKey } = resolveTargetAndKey(item, imageContext)
   if (!cacheKey) return
   const hit = blobUrlCache.get(cacheKey)
-  if (hit?.url) {
-    try { URL.revokeObjectURL(hit.url) } catch {}
-  }
   blobUrlCache.delete(cacheKey)
+  if (hit) {
+    retireBlobEntry(hit)
+  }
 }
 
 /**

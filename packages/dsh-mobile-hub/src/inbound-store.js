@@ -44,9 +44,25 @@ export class InboundAttachmentStore {
 
     /** @type {Map<string, { clientId: string, localPath: string, filename: string, mimeType: string, size: number, createdAt: number }>} */
     this.tokens = new Map()
-    /** @type {Map<string, { localPath: string, reservedBytes: number, writtenBytes: number }>} */
+    /** @type {Map<string, { localPath: string, reservedBytes: number, receivedBytes: number, writtenBytes: number, effectiveBytes: number }>} */
     this.inFlight = new Map()
+    this._inFlightUploadBytes = 0
+    this._settledDiskBytes = 0
+    this._settledDiskBytesCachedAt = 0
     this._lastPruneAt = 0
+  }
+
+  get inFlightUploadBytes() {
+    return this._inFlightUploadBytes
+  }
+
+  _syncEntryEffectiveBytes(entry) {
+    if (!entry) return
+    const next = Math.max(entry.reservedBytes, entry.receivedBytes, entry.writtenBytes)
+    if (next !== entry.effectiveBytes) {
+      this._inFlightUploadBytes = Math.max(0, this._inFlightUploadBytes + (next - entry.effectiveBytes))
+      entry.effectiveBytes = next
+    }
   }
 
   ensureDir() {
@@ -102,10 +118,28 @@ export class InboundAttachmentStore {
 
     let inFlightBytes = 0
     for (const entry of this.inFlight.values()) {
-      inFlightBytes += Math.max(entry.reservedBytes, entry.writtenBytes)
+      inFlightBytes += Math.max(entry.reservedBytes, entry.receivedBytes || 0, entry.writtenBytes)
     }
 
     return { settledDiskBytes, inFlightBytes, files }
+  }
+
+  /**
+   * Return current settled on-disk usage + live atomic in-flight upload reservation bytes.
+   */
+  getDiskUsage({ refresh = false, now = Date.now() } = {}) {
+    if (refresh || this._settledDiskBytesCachedAt === 0 || now - this._settledDiskBytesCachedAt > 2_000) {
+      const stats = this._collectDiskStats()
+      this._settledDiskBytes = stats.settledDiskBytes
+      this._settledDiskBytesCachedAt = now
+    }
+    const inFlightBytes = this._inFlightUploadBytes
+    return {
+      settledBytes: this._settledDiskBytes,
+      inFlightBytes,
+      totalBytes: this._settledDiskBytes + inFlightBytes,
+      maxDiskBytes: this.maxDiskBytes,
+    }
   }
 
   /**
@@ -116,9 +150,16 @@ export class InboundAttachmentStore {
       ? Math.floor(Number(declaredBytes))
       : UNKNOWN_SIZE_RESERVE_FLOOR_BYTES
 
+    const existing = this.inFlight.get(reservationKey)
+    if (existing) {
+      this._inFlightUploadBytes = Math.max(0, this._inFlightUploadBytes - (existing.effectiveBytes || 0))
+      this.inFlight.delete(reservationKey)
+    }
+
     const stats = this._collectDiskStats()
     let { settledDiskBytes } = stats
-    const { inFlightBytes, files } = stats
+    const { files } = stats
+    const inFlightBytes = this._inFlightUploadBytes
 
     if (settledDiskBytes + inFlightBytes + cleanDeclared > this.maxDiskBytes && files.length > 0) {
       const expired = files
@@ -133,6 +174,9 @@ export class InboundAttachmentStore {
       }
     }
 
+    this._settledDiskBytes = settledDiskBytes
+    this._settledDiskBytesCachedAt = now
+
     if (settledDiskBytes + inFlightBytes + cleanDeclared > this.maxDiskBytes) {
       return {
         ok: false,
@@ -142,16 +186,20 @@ export class InboundAttachmentStore {
       }
     }
 
-    this.inFlight.set(reservationKey, {
+    const entry = {
       localPath: '',
       reservedBytes: cleanDeclared,
+      receivedBytes: 0,
       writtenBytes: 0,
-    })
+      effectiveBytes: cleanDeclared,
+    }
+    this.inFlight.set(reservationKey, entry)
+    this._inFlightUploadBytes += cleanDeclared
 
     return {
       ok: true,
       usedBytes: settledDiskBytes,
-      inFlightBytes: inFlightBytes + cleanDeclared,
+      inFlightBytes: this._inFlightUploadBytes,
       quotaBytes: this.maxDiskBytes,
     }
   }
@@ -162,23 +210,50 @@ export class InboundAttachmentStore {
   }
 
   /**
-   * Live quota check during streaming writes (blocks `declaredSize = 0` or under-reported quota bypasses).
+   * Atomically account for incoming wire bytes as bulk frames arrive so concurrent `size=0`
+   * uploads can never overshoot `maxDiskBytes` even before chunk decryption flushes to disk.
+   */
+  recordReceivedBytes(reservationKey, receivedBytes) {
+    const entry = this.inFlight.get(reservationKey)
+    if (entry) {
+      const next = Math.max(0, Math.floor(Number(receivedBytes) || 0))
+      if (next > entry.receivedBytes) {
+        entry.receivedBytes = next
+        this._syncEntryEffectiveBytes(entry)
+      }
+    }
+    return this.getDiskUsage().totalBytes <= this.maxDiskBytes
+  }
+
+  /**
+   * Live quota check during streaming writes (blocks `declaredSize = 0` or under-reported quota bypasses,
+   * and always incorporates live settled disk usage across concurrent completed uploads).
    */
   updateWrittenAndCheckQuota(reservationKey, writtenBytes, baseSettledBytes = null) {
     const entry = this.inFlight.get(reservationKey)
     if (entry) {
       entry.writtenBytes = Math.max(0, Math.floor(Number(writtenBytes) || 0))
+      this._syncEntryEffectiveBytes(entry)
     }
-    let totalInFlight = 0
-    for (const item of this.inFlight.values()) {
-      totalInFlight += Math.max(item.reservedBytes, item.writtenBytes)
-    }
-    const settled = baseSettledBytes != null ? baseSettledBytes : this._collectDiskStats().settledDiskBytes
-    return settled + totalInFlight <= this.maxDiskBytes
+    const usage = this.getDiskUsage()
+    const settled = baseSettledBytes != null
+      ? Math.max(Math.floor(Number(baseSettledBytes) || 0), usage.settledBytes)
+      : usage.settledBytes
+    return settled + this._inFlightUploadBytes <= this.maxDiskBytes
   }
 
-  releaseUploadSpace(reservationKey) {
-    this.inFlight.delete(reservationKey)
+  releaseUploadSpace(reservationKey, { settledSize = 0 } = {}) {
+    const entry = this.inFlight.get(reservationKey)
+    if (entry) {
+      this._inFlightUploadBytes = Math.max(0, this._inFlightUploadBytes - (entry.effectiveBytes || 0))
+      this.inFlight.delete(reservationKey)
+    }
+    const cleanSettled = Math.max(0, Math.floor(Number(settledSize) || 0))
+    if (cleanSettled > 0) {
+      this._settledDiskBytes += cleanSettled
+    }
+    // Force fresh disk tally on next quota check so completed/unlinked files are reflected immediately
+    this._settledDiskBytesCachedAt = 0
   }
 
   allocateFilePath(rawFilename = 'upload.bin') {
@@ -236,6 +311,7 @@ export class InboundAttachmentStore {
           const st = statSync(fp)
           if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
             unlinkSync(fp)
+            this._settledDiskBytesCachedAt = 0
           }
         } catch {}
       }

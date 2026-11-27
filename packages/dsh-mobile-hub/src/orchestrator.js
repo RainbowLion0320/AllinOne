@@ -4,11 +4,11 @@ import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   APPS,
-  APP_LIST,
   EVENTS,
   RPC,
   assertSafeSessionId,
   assertSafeWorkspaceCwd,
+  ensureDefaultWorkspaceCwd,
   getWindowsSystemRootNorm,
   makeCompositeId,
   parseCompositeId,
@@ -114,6 +114,8 @@ export class MultiAppOrchestrator {
     this._sessionRootsSyncedAt = 0
     this._inFlightAppsStatus = null
     this._inFlightModels = null
+    /** @type {Set<string>} Composite sessionIds locked during pre-send materialization & dispatch */
+    this._sendingLocks = new Set()
 
     const emitEvent = (event, payload) => {
       if (event === EVENTS.APPROVAL_RESOLVED && payload?.id) {
@@ -372,8 +374,20 @@ export class MultiAppOrchestrator {
     return run
   }
 
+  _resolveDefaultWorkspaceCwd() {
+    const raw = String(this.config?.cwd || '').trim()
+    if (raw) {
+      try {
+        const safe = assertSafeWorkspaceCwd(raw, { allowEmpty: false })
+        if (safe) return safe
+      } catch {}
+    }
+    return ensureDefaultWorkspaceCwd()
+  }
+
   async createSession({ app = APPS.DSH, cwd, title, model, provider, reasoningEffort, sandbox, approvalPolicy } = {}) {
-    const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true }) || undefined
+    const rawCwd = String(cwd ?? '').trim()
+    const safeCwd = rawCwd ? assertSafeWorkspaceCwd(rawCwd, { allowEmpty: false }) : this._resolveDefaultWorkspaceCwd()
     // Enforce host ceiling on Codex sandbox & approvalPolicy so remote callers cannot escalate privileges
     const effectiveSandbox =
       app === APPS.CODEX ? clampCodexSandbox(sandbox, this.config.codexSandbox) : undefined
@@ -518,20 +532,31 @@ export class MultiAppOrchestrator {
     if (!String(prompt || '').trim()) {
       throw new Error('派单任务内容 prompt 不能为空')
     }
-    const safeCwd = assertSafeWorkspaceCwd(cwd, { allowEmpty: true })
+    const rawCwd = String(cwd ?? '').trim()
+    let safeExplicitCwd = ''
+    if (rawCwd) {
+      try {
+        safeExplicitCwd = assertSafeWorkspaceCwd(rawCwd, { allowEmpty: false })
+      } catch (err) {
+        throw new Error(`派单工作目录无效（${rawCwd}）：${String(err?.message || err)}`)
+      }
+    }
 
     let targetNativeId = sessionId
     if (targetNativeId && targetNativeId.includes(':')) {
       targetNativeId = parseCompositeId(targetNativeId).sessionId
     }
 
+    let resolvedCwd = safeExplicitCwd
     if (!targetNativeId) {
+      resolvedCwd = safeExplicitCwd || this._resolveDefaultWorkspaceCwd()
       const created = await this.createSession({
         app,
-        cwd: safeCwd || this.config.cwd,
+        cwd: resolvedCwd,
         title: title || `总控派单 · ${String(prompt).trim().slice(0, 24)}`,
       })
       targetNativeId = created.nativeId
+      if (created?.cwd) resolvedCwd = created.cwd
     }
 
     const taskId = `task-${randomUUID().slice(0, 10)}`
@@ -541,7 +566,7 @@ export class MultiAppOrchestrator {
       app,
       sessionId: compositeId,
       nativeId: targetNativeId,
-      cwd: safeCwd || this.config.cwd || '',
+      cwd: resolvedCwd || this._resolveDefaultWorkspaceCwd(),
       prompt: String(prompt),
       issuedBy,
       status: 'running',
@@ -558,7 +583,7 @@ export class MultiAppOrchestrator {
       app,
       sessionId: targetNativeId,
       text: prompt,
-      cwd: safeCwd,
+      cwd: safeExplicitCwd || (!sessionId ? resolvedCwd : undefined),
     })
       .then((res) => {
         task.status = res.aborted ? 'aborted' : 'completed'
@@ -958,6 +983,7 @@ export class MultiAppOrchestrator {
         const targetId = params?.id || makeCompositeId(params?.app || APPS.DSH, params?.sessionId)
         const parsed = parseCompositeId(targetId)
         assertSafeSessionId(parsed.sessionId, 'sessionId')
+        const canonicalTargetId = makeCompositeId(parsed.app, parsed.sessionId)
         const publicParams = {
           app: parsed.app,
           sessionId: parsed.sessionId,
@@ -972,37 +998,53 @@ export class MultiAppOrchestrator {
           timeoutMs: params?.timeoutMs,
         }
         const callerClientId = String(ctx?.clientId || '').trim()
-        if (publicParams.wait === true) {
-          return await this.sendMessage(publicParams, { clientId: callerClientId })
-        }
         assertSafeWorkspaceCwd(publicParams.cwd, { allowEmpty: true })
         const adapter = this.getAdapter(parsed.app)
-        if (this._isAdapterSessionBusy(adapter, parsed.sessionId)) {
+        if (this._sendingLocks.has(canonicalTargetId) || this._isAdapterSessionBusy(adapter, parsed.sessionId)) {
           const err = new Error('该对话正在运行中，请等待完成或先点击停止。')
           err.code = 'SESSION_BUSY'
           throw err
         }
+        // Synchronously lock session BEFORE awaiting attachment materialization (kills async TOCTOU race)
+        this._sendingLocks.add(canonicalTargetId)
+        if (publicParams.wait === true) {
+          try {
+            return await this.sendMessage(publicParams, { clientId: callerClientId })
+          } finally {
+            this._sendingLocks.delete(canonicalTargetId)
+          }
+        }
         const burnedTokens = []
-        const preMaterialized = await this.materializeAttachments(publicParams.attachments || [], {
-          clientId: callerClientId,
-          strict: true,
-          _burnedOut: burnedTokens,
-        })
+        let preMaterialized
+        try {
+          preMaterialized = await this.materializeAttachments(publicParams.attachments || [], {
+            clientId: callerClientId,
+            strict: true,
+            _burnedOut: burnedTokens,
+          })
+        } catch (matErr) {
+          this._sendingLocks.delete(canonicalTargetId)
+          throw matErr
+        }
         void this.sendMessage(publicParams, {
           clientId: callerClientId,
           preMaterialized,
           burnedTokens,
-        }).catch((err) => {
-          const msg = String(err?.message || err)
-          this.log.warn?.(`mobile-hub: async sendMessage(${targetId}) error: ${msg}`)
-          if (err?._streamErrorEmitted) return
-          this.onEvent(EVENTS.STREAM_ERROR, {
-            sessionId: targetId,
-            app: parsed.app,
-            message: msg,
-          })
         })
-        return { accepted: true, sessionId: targetId }
+          .catch((err) => {
+            const msg = String(err?.message || err)
+            this.log.warn?.(`mobile-hub: async sendMessage(${canonicalTargetId}) error: ${msg}`)
+            if (err?.code === 'SESSION_BUSY' || err?._streamErrorEmitted) return
+            this.onEvent(EVENTS.STREAM_ERROR, {
+              sessionId: canonicalTargetId,
+              app: parsed.app,
+              message: msg,
+            })
+          })
+          .finally(() => {
+            this._sendingLocks.delete(canonicalTargetId)
+          })
+        return { accepted: true, sessionId: canonicalTargetId }
       }
       case RPC.SESSION_INTERRUPT:
         return await this.interruptSession(params)

@@ -464,27 +464,18 @@ function QuotaVendorCard({ card, selected, onSelect, bi, index, spanFullOnDeskto
       <div className="mb-2.5 flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2.5">
           <VendorBadge app={card.app} size="md" active={card.runningCount > 0} className="shrink-0 shadow-2xs" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="truncate text-[14px] font-bold text-slate-900 dark:text-white">
-                {meta.shortName}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-[14px] font-bold text-slate-900 dark:text-white">
+              {meta.shortName}
+            </span>
+            {tierTags.map((tag) => (
+              <span
+                key={tag}
+                className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] leading-none font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-300"
+              >
+                {tag}
               </span>
-              {tierTags.map((tag) => (
-                <span
-                  key={tag}
-                  className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] leading-none font-semibold text-slate-500 dark:bg-slate-800 dark:text-slate-300"
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
-            {card.sessionCount > 0 && (
-              <div className="mt-0.5 text-[10.5px] text-slate-400 dark:text-slate-500">
-                {card.runningCount > 0
-                  ? bi(`${card.runningCount} 个进行中 · 共 ${card.sessionCount} 个对话`, `${card.runningCount} running · ${card.sessionCount} chats`)
-                  : bi(`${card.sessionCount} 个对话`, `${card.sessionCount} chats`)}
-              </div>
-            )}
+            ))}
           </div>
         </div>
 
@@ -538,11 +529,6 @@ function OtherVendorCard({ card, selected, onSelect, bi }) {
           <span className="truncate text-[13px] font-semibold text-slate-800 dark:text-slate-100">
             {meta.shortName}
           </span>
-          {card.sessionCount > 0 && (
-            <span className="shrink-0 text-[10px] text-slate-400 tabular-nums dark:text-slate-500">
-              · {card.sessionCount}
-            </span>
-          )}
         </div>
         <div className="truncate text-[11px] text-slate-400 dark:text-slate-500">{hint}</div>
       </div>
@@ -571,7 +557,6 @@ export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
   selectedWorkspace = '',
   onSelectWorkspace,
   onOpenNewChatModal,
-  activeDeviceName = '',
   bridgeOnline = false,
   refreshingQuotas = false,
   onRefreshQuotas,
@@ -617,35 +602,18 @@ export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
   const isLoadingInitial = appsStatus.length === 0 && bridgeOnline
 
   return (
-    <div className="mx-auto w-full max-w-2xl pt-3 pb-6 sm:pt-5 lg:max-w-3xl">
-      {/* Compact Dashboard Header */}
-      <div className="animate-home-rise mb-4 flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="h-10 w-10 shrink-0 overflow-hidden rounded-[13px] bg-[#03080E] shadow-md shadow-blue-950/25 ring-1 ring-white/10">
-            <img src="./icon-192.png" alt="All in One" className="h-full w-full object-cover" />
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h2 className="truncate text-[16px] font-bold tracking-tight text-slate-900 dark:text-white">
-                {bi('额度总览', 'Quota Overview')}
-              </h2>
-              {activeDeviceName && (
-                <span className="inline-flex max-w-[140px] items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10.5px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                  <span
-                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                      bridgeOnline ? 'bg-emerald-500' : 'bg-slate-400'
-                    }`}
-                  />
-                  <span className="truncate">{activeDeviceName}</span>
-                </span>
-              )}
-            </div>
-            <p className="mt-0.5 truncate text-[11.5px] text-slate-400 dark:text-slate-500">
-              {updatedLabel
-                ? updatedLabel
-                : bi('点击卡片切换当前对话厂商，直接发送即可开聊', 'Tap a vendor card to select target & start chatting')}
-            </p>
-          </div>
+    <div className="mx-auto w-full max-w-2xl pt-2 pb-6 sm:pt-4 lg:max-w-3xl">
+      {/* Compact single-line Dashboard Header (active computer & status already live in top header) */}
+      <div className="animate-home-rise mb-3 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h2 className="shrink-0 text-[15px] font-bold tracking-tight text-slate-900 dark:text-white">
+            {bi('额度总览', 'Quota Overview')}
+          </h2>
+          {updatedLabel && (
+            <span className="truncate text-[11px] text-slate-400 dark:text-slate-500">
+              {updatedLabel}
+            </span>
+          )}
         </div>
 
         {onRefreshQuotas && (
@@ -655,7 +623,7 @@ export const HomeQuotaDashboard = React.memo(function HomeQuotaDashboard({
             onClick={() => onRefreshQuotas()}
             title={bi('刷新各厂商实时额度', 'Refresh live vendor quotas')}
             aria-label={bi('刷新额度', 'Refresh quotas')}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-200/85 bg-white px-2.5 py-1.5 text-[11.5px] font-semibold text-slate-600 shadow-2xs transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 disabled:opacity-45 dark:border-slate-700/80 dark:bg-[#1E212B] dark:text-slate-300 dark:hover:border-[#4D6BFE]/60 dark:hover:text-[#9BB0FF]"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-200/85 bg-white px-2.5 py-1 text-[11.5px] font-semibold text-slate-600 shadow-2xs transition hover:border-[#4D6BFE]/50 hover:text-[#4D6BFE] active:scale-95 disabled:opacity-45 dark:border-slate-700/80 dark:bg-[#1E212B] dark:text-slate-300 dark:hover:border-[#4D6BFE]/60 dark:hover:text-[#9BB0FF]"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${refreshingQuotas ? 'animate-spin text-[#4D6BFE]' : ''}`} />
             <span>{refreshingQuotas ? bi('刷新中', 'Syncing') : bi('刷新额度', 'Refresh')}</span>

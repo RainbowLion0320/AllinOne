@@ -14,6 +14,7 @@ const MAX_CACHED_SESSIONS = 40
 const MAX_MESSAGES_PER_SESSION = 120
 const MAX_TOTAL_CACHE_BYTES = 12 * 1024 * 1024 // 12 MB
 const MAX_CACHE_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days
+const IDB_OPEN_TIMEOUT_MS = 5_000
 
 const memoryFallback = new Map()
 let dbPromise = null
@@ -35,31 +36,54 @@ function openDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null)
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve) => {
+    let settled = false
+    let timer = null
+    const finish = (db) => {
+      if (settled) {
+        if (db) {
+          try { db.close() } catch {}
+        }
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      if (!db) dbPromise = null
+      resolve(db)
+    }
+    timer = setTimeout(() => finish(null), IDB_OPEN_TIMEOUT_MS)
     try {
       const req = indexedDB.open(DB_NAME, 1)
       req.onupgradeneeded = () => {
         const db = req.result
+        if (req.transaction) {
+          req.transaction.onabort = () => finish(null)
+        }
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           const store = db.createObjectStore(STORE_NAME, { keyPath: 'sessionId' })
           store.createIndex('cachedAt', 'cachedAt', { unique: false })
         }
       }
+      req.onblocked = () => finish(null)
       req.onsuccess = () => {
         const db = req.result
+        if (settled) {
+          try { db.close() } catch {}
+          return
+        }
         db.onclose = () => { dbPromise = null }
+        db.onabort = () => { dbPromise = null }
         db.onversionchange = () => {
           try { db.close() } catch {}
           dbPromise = null
         }
-        resolve(db)
+        finish(db)
       }
-      req.onerror = () => {
-        dbPromise = null
-        resolve(null)
-      }
+      req.onerror = () => finish(null)
     } catch {
-      dbPromise = null
-      resolve(null)
+      finish(null)
     }
   })
   return dbPromise
@@ -134,6 +158,7 @@ export async function loadCachedSession(sessionId, scope = '') {
         const req = tx.objectStore(STORE_NAME).get(cacheKey)
         req.onsuccess = () => resolve(req.result || memoryFallback.get(cacheKey) || null)
         req.onerror = () => resolve(memoryFallback.get(cacheKey) || null)
+        tx.onabort = () => resolve(memoryFallback.get(cacheKey) || null)
       } catch {
         resolve(memoryFallback.get(cacheKey) || null)
       }
@@ -166,6 +191,7 @@ async function deleteCachedSession(sessionId, scope = '') {
       tx.objectStore(STORE_NAME).delete(cacheKey)
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -250,6 +276,7 @@ export async function saveCachedSession(sessionId, payload, scope = '') {
       tx.objectStore(STORE_NAME).put(record)
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -408,6 +435,7 @@ export async function clearSessionCache(scopeOrPrefix = '', { prefix = false } =
       }
       tx.oncomplete = () => resolve()
       tx.onerror = () => resolve()
+      tx.onabort = () => resolve()
     } catch {
       resolve()
     }
@@ -530,5 +558,63 @@ export function reconcileCachedWithFreshPage(cached, fresh) {
     hasMore: Boolean(fresh?.hasMore),
     nextCursor: fresh?.nextCursor ?? null,
     totalCount: fresh?.totalCount ?? null,
+  }
+}
+
+/**
+ * Preserve trailing freshly-committed optimistic messages (`msg-u-*` / `msg-a-*`) when a quiet
+ * remote history read returns before the PC CLI/adapter has finished flushing the latest turn to disk.
+ * Returns `{ messages, preservedOptimistic }` so callers can optionally schedule a follow-up sync.
+ */
+export function mergeUnflushedOptimisticTail(
+  reconciledMessages = [],
+  currentMessages = [],
+  { maxAgeMs = 90_000, now = Date.now() } = {},
+) {
+  const base = Array.isArray(reconciledMessages) ? reconciledMessages : []
+  const cur = Array.isArray(currentMessages) ? currentMessages : []
+  if (cur.length === 0) return { messages: base, preservedOptimistic: false }
+
+  // Inspect only the contiguous trailing run of optimistic messages (msg-u-* / msg-a-*)
+  const trailingOptimistic = []
+  for (let i = cur.length - 1; i >= 0; i -= 1) {
+    const m = cur[i]
+    if (!m || !/^msg-[ua]-/.test(String(m.id || ''))) break
+    const ts = Number(m.ts || 0)
+    if (ts > 0 && now - ts > maxAgeMs) break
+    trailingOptimistic.unshift(m)
+  }
+  if (trailingOptimistic.length === 0) {
+    return { messages: base, preservedOptimistic: false }
+  }
+
+  const recentTail = base.slice(-Math.max(6, trailingOptimistic.length * 2))
+  const missing = []
+  for (const opt of trailingOptimistic) {
+    const optText = String(opt.text || '').trim()
+    const optTs = Number(opt.ts || 0)
+    const matchedOnDisk = recentTail.some((fm) => {
+      if (!fm || fm.role !== opt.role) return false
+      const fmText = String(fm.text || '').trim()
+      if (optText && fmText === optText) return true
+      if (optText && fmText && (fmText.includes(optText.slice(0, 64)) || optText.includes(fmText.slice(0, 64)))) {
+        return true
+      }
+      if (!optText && opt.role === 'assistant' && fm.tools?.length && opt.tools?.length) {
+        return !optTs || !fm.ts || Number(fm.ts) >= optTs - 10_000
+      }
+      return false
+    })
+    if (!matchedOnDisk) {
+      missing.push(opt)
+    }
+  }
+
+  if (missing.length === 0) {
+    return { messages: base, preservedOptimistic: false }
+  }
+  return {
+    messages: [...base, ...missing],
+    preservedOptimistic: true,
   }
 }

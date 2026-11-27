@@ -1,7 +1,7 @@
 import os from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
-import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from '@allinone/shared'
+import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION, WS_MSG } from '@allinone/shared'
 import { EVENTS } from './protocol.js'
 import {
   E2EE_VERSION,
@@ -84,7 +84,7 @@ export class RelayBridgeLink {
       getE2eeKeyId: async () => this.e2eeKeyId || (await this.e2eeReady),
       getIceServers: () => this.iceServers,
       sendSignal: ({ clientId, sessionId, e2ee }) => {
-        this.send({ type: EVENTS.P2P_SIGNAL, clientId, sessionId, e2ee })
+        this.send({ type: WS_MSG.P2P_SIGNAL, clientId, sessionId, e2ee })
       },
       onRpc: (method, params, ctx) => this.onRpc(method, params, ctx),
       onRegisterP2pUpload,
@@ -104,10 +104,11 @@ export class RelayBridgeLink {
       ...(this.bridgeVersion ? { bridgeVersion: this.bridgeVersion } : {}),
       protocolVersion: PROTOCOL_VERSION,
       capabilities: PROTOCOL_CAPABILITIES,
+      bridgeBootId: this.p2p.bridgeBootId,
       p2pEngine: this.p2p.getEngineName(),
       e2ee: { enabled: true, v: E2EE_VERSION, keyId: this.e2eeKeyId },
     }
-    this.send({ type: 'bridge.meta', meta })
+    this.send({ type: WS_MSG.BRIDGE_META, meta })
   }
 
   setAppsMeta(apps) {
@@ -156,6 +157,10 @@ export class RelayBridgeLink {
     return disposePromise
   }
 
+  close() {
+    return this.stop()
+  }
+
   /**
    * Called after OS wake/resume: immediately probe the control WS and tear it down if no pong arrives in 4s.
    */
@@ -172,7 +177,7 @@ export class RelayBridgeLink {
     }
     const wsRef = this.ws
     const prevPongAt = this.lastPongAt
-    this.send({ type: 'ping', ts: Date.now() })
+    this.send({ type: WS_MSG.PING, ts: Date.now() })
     const probeTimer = setTimeout(() => {
       if (this.stopped || this.ws !== wsRef) return
       if (this.lastPongAt <= prevPongAt) {
@@ -301,12 +306,12 @@ export class RelayBridgeLink {
         return
       }
 
-      if (msg.type === 'pong') {
+      if (msg.type === WS_MSG.PONG) {
         this.lastPongAt = Date.now()
         return
       }
 
-      if (msg.type === 'bridge.welcome') {
+      if (msg.type === WS_MSG.BRIDGE_WELCOME) {
         if (msg.protocolVersion && Number(msg.protocolVersion) !== PROTOCOL_VERSION) {
           this.log.warn?.(
             `mobile-hub: relay protocolVersion=${msg.protocolVersion} differs from local PROTOCOL_VERSION=${PROTOCOL_VERSION}`,
@@ -318,7 +323,7 @@ export class RelayBridgeLink {
         return
       }
 
-      if (msg.type === 'ice.update') {
+      if (msg.type === WS_MSG.ICE_UPDATE) {
         if (Array.isArray(msg.iceServers)) {
           this.iceServers = msg.iceServers
         }
@@ -337,7 +342,7 @@ export class RelayBridgeLink {
         return
       }
 
-      if (msg.type === EVENTS.P2P_SIGNAL) {
+      if (msg.type === WS_MSG.P2P_SIGNAL) {
         try {
           await this.p2p.handleEncryptedSignal({
             clientId: msg.clientId,
@@ -403,7 +408,7 @@ export class RelayBridgeLink {
         try { this.ws.terminate() } catch {}
         return
       }
-      this.send({ type: 'ping', ts: Date.now() })
+      this.send({ type: WS_MSG.PING, ts: Date.now() })
     }, 20_000)
     this.heartbeatTimer.unref?.()
   }

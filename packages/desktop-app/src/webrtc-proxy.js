@@ -5,7 +5,10 @@
  * built-in native Chromium C++ `libwebrtc` via an on-demand hidden `BrowserWindow`:
  *  - Zero extra npm dependencies (`node:net` binary length-prefixed frames)
  *  - Zero idle RAM (worker window created lazily on first P2P peer, destroyed after 2 min idle)
- *  - Native C++ WebRTC throughput (80-100+ MB/s on LAN) & 100% iOS Safari / Chrome interop
+ *  - True bidirectional backpressure: never silently drops ordered DataChannel frames, pauses
+ *    upstream reads when loopback socket drains (hard cap 32 MB -> clean disconnect), and tracks
+ *    real unacknowledged IPC bytes to renderer via `rx-ack` credits.
+ *  - Hardened pre-auth DoS limits: max 8 concurrent connections, 64 KB pre-auth buffer cap, 5s timeout.
  *
  * Wire framing over loopback TCP:
  *   [4B uint32 BE totalLen][1B kind][payload]
@@ -21,6 +24,13 @@ const FRAME_JSON = 1
 const FRAME_BIN = 2
 const IDLE_DESTROY_MS = 120_000
 const AUTH_TIMEOUT_MS = 5_000
+const DEFAULT_MAX_CONNECTIONS = 8
+const MAX_PRE_AUTH_BYTES = 64 * 1024
+const MAX_AUTHED_FRAME_BYTES = 16 * 1024 * 1024
+const SOCKET_WRITE_HIGH_WATER = 4 * 1024 * 1024
+const MAX_SOCKET_WRITE_HARD_CAP = 32 * 1024 * 1024
+const MAX_INFLIGHT_TO_WORKER_BYTES = 4 * 1024 * 1024
+const RESUME_INFLIGHT_TO_WORKER_BYTES = 1 * 1024 * 1024
 
 function encodeJsonFrame(obj) {
   const payload = Buffer.from(JSON.stringify(obj), 'utf8')
@@ -48,27 +58,13 @@ function encodeBinFrame(peerId, role, bytes) {
   return out
 }
 
-const MAX_SOCKET_WRITE_BACKLOG = 8 * 1024 * 1024
-
-function writeSocketSafe(sock, frameBuf) {
-  if (!sock || sock.destroyed || !sock.writable) return false
-  if (sock.writableLength > MAX_SOCKET_WRITE_BACKLOG) {
-    return false
-  }
-  try {
-    sock.write(frameBuf)
-    return true
-  } catch {
-    return false
-  }
-}
-
 export class DesktopWebRtcProxy {
-  constructor({ BrowserWindow, ipcMain, srcDir, log = console }) {
+  constructor({ BrowserWindow, ipcMain, srcDir, log = console, maxConnections = DEFAULT_MAX_CONNECTIONS }) {
     this.BrowserWindow = BrowserWindow
     this.ipcMain = ipcMain
     this.srcDir = srcDir
     this.log = log
+    this.maxConnections = Math.max(1, Number(maxConnections) || DEFAULT_MAX_CONNECTIONS)
     this.token = randomBytes(32).toString('hex')
     this.tokenBuf = Buffer.from(this.token, 'utf8')
     this.server = null
@@ -76,9 +72,13 @@ export class DesktopWebRtcProxy {
     this.workerWin = null
     this.workerReadyPromise = null
     this.activeSocket = null
+    this.activeSocketFlow = null
+    this.workerRxPaused = false
+    this.waitingSocketDrain = false
     this.sockets = new Set()
     this.activePeerIds = new Set()
     this.pendingReqIds = new Set()
+    this.pendingOfferPeerIds = new Map()
     this.idleTimer = null
     this.disposed = false
 
@@ -93,6 +93,7 @@ export class DesktopWebRtcProxy {
 
     await new Promise((resolveStart, rejectStart) => {
       const srv = net.createServer((socket) => this.handleClientSocket(socket))
+      srv.maxConnections = this.maxConnections
       srv.once('error', rejectStart)
       srv.listen(0, '127.0.0.1', () => {
         srv.off('error', rejectStart)
@@ -115,6 +116,50 @@ export class DesktopWebRtcProxy {
     }
   }
 
+  setWorkerRxPaused(paused) {
+    const next = Boolean(paused)
+    if (this.workerRxPaused === next) return
+    this.workerRxPaused = next
+    if (this.workerWin && !this.workerWin.isDestroyed()) {
+      try {
+        this.workerWin.webContents.send('webrtc-worker:cmd', { type: next ? 'rx.pause' : 'rx.resume' })
+      } catch {}
+    }
+  }
+
+  writeSocketBackpressured(sock, frameBuf) {
+    if (!sock || sock.destroyed || !sock.writable) return false
+    if (sock.writableLength + frameBuf.length > MAX_SOCKET_WRITE_HARD_CAP) {
+      this.log.warn?.(
+        `[webrtc-proxy] loopback socket write backlog exceeded ${MAX_SOCKET_WRITE_HARD_CAP}B hard cap; closing socket cleanly`,
+      )
+      try {
+        sock.destroy(new Error('WebRTC loopback write backlog exceeded'))
+      } catch {}
+      return false
+    }
+    try {
+      const ok = sock.write(frameBuf)
+      if (!ok || sock.writableLength >= SOCKET_WRITE_HIGH_WATER) {
+        this.setWorkerRxPaused(true)
+        if (!this.waitingSocketDrain) {
+          this.waitingSocketDrain = true
+          sock.once('drain', () => {
+            this.waitingSocketDrain = false
+            if (this.activeSocket === sock && !sock.destroyed) {
+              this.setWorkerRxPaused(false)
+            }
+          })
+        }
+      }
+      return true
+    } catch (err) {
+      this.log.warn?.(`[webrtc-proxy] loopback socket write failed: ${String(err?.message || err)}`)
+      try { sock.destroy() } catch {}
+      return false
+    }
+  }
+
   scheduleIdleDestroy() {
     this.clearIdleTimer()
     if (this.activePeerIds.size > 0 || !this.workerWin) return
@@ -124,6 +169,9 @@ export class DesktopWebRtcProxy {
         try { this.workerWin.destroy() } catch {}
         this.workerWin = null
         this.workerReadyPromise = null
+        this.workerRxPaused = false
+        this.waitingSocketDrain = false
+        this.activeSocketFlow?.resetInflight?.()
       }
     }, IDLE_DESTROY_MS)
   }
@@ -150,6 +198,7 @@ export class DesktopWebRtcProxy {
       },
     })
     this.workerWin = win
+    this.workerRxPaused = false
     win.webContents?.setWindowOpenHandler?.(() => ({ action: 'deny' }))
     win.webContents?.on?.('will-navigate', (ev) => {
       try { ev.preventDefault() } catch {}
@@ -164,6 +213,8 @@ export class DesktopWebRtcProxy {
         if (this.workerReadyPromise === readyPromise) {
           this.workerReadyPromise = null
         }
+        this.workerRxPaused = false
+        this.waitingSocketDrain = false
         if (!win.isDestroyed()) {
           try { win.destroy() } catch {}
         }
@@ -204,7 +255,9 @@ export class DesktopWebRtcProxy {
           this.log.warn?.(`[webrtc-proxy] worker render process ${reason}; resetting worker`)
           cleanupWorker()
           this.activePeerIds.clear()
+          this.pendingOfferPeerIds.clear()
           this.clearIdleTimer()
+          this.activeSocketFlow?.resetInflight?.()
           const sock = this.activeSocket
           const errMsg = `WebRTC worker crashed (${reason})`
           if (sock && !sock.destroyed) {
@@ -217,6 +270,7 @@ export class DesktopWebRtcProxy {
           this.pendingReqIds.clear()
           if (sock) {
             this.activeSocket = null
+            this.activeSocketFlow = null
             try { sock.end() } catch {}
             const destroyTimer = setTimeout(() => {
               if (!sock.destroyed) {
@@ -235,11 +289,16 @@ export class DesktopWebRtcProxy {
           settled = true
           if (this.workerWin === win) this.workerWin = null
           if (this.workerReadyPromise === readyPromise) this.workerReadyPromise = null
+          this.workerRxPaused = false
+          this.waitingSocketDrain = false
           rejectReady(new Error('WebRTC worker closed before ready'))
           return
         }
         if (this.workerWin === win) {
           this.workerWin = null
+          this.workerRxPaused = false
+          this.waitingSocketDrain = false
+          this.activeSocketFlow?.resetInflight?.()
           if (this.workerReadyPromise === readyPromise) {
             this.workerReadyPromise = null
           }
@@ -259,8 +318,23 @@ export class DesktopWebRtcProxy {
     if (ev?.sender && (!this.workerWin || this.workerWin.isDestroyed() || ev.sender !== this.workerWin.webContents)) {
       return
     }
+    if (msg.type === 'rx-ack') {
+      const ackBytes = Number(msg.bytes) || 0
+      if (ackBytes > 0) {
+        this.activeSocketFlow?.ackInflight?.(ackBytes)
+      }
+      return
+    }
     if (msg.type === 'res' && msg.reqId) {
       this.pendingReqIds.delete(msg.reqId)
+      const offerPeerId = this.pendingOfferPeerIds.get(msg.reqId)
+      if (offerPeerId) {
+        this.pendingOfferPeerIds.delete(msg.reqId)
+        if (!msg.ok) {
+          this.activePeerIds.delete(offerPeerId)
+          if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
+        }
+      }
     }
     const isPeerClosed =
       ((msg.type === 'state' || msg.type === 'iceState') && (msg.state === 'closed' || msg.state === 'failed')) ||
@@ -270,7 +344,7 @@ export class DesktopWebRtcProxy {
       if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
     }
     if (this.activeSocket && !this.activeSocket.destroyed) {
-      writeSocketSafe(this.activeSocket, encodeJsonFrame(msg))
+      this.writeSocketBackpressured(this.activeSocket, encodeJsonFrame(msg))
     }
   }
 
@@ -280,11 +354,15 @@ export class DesktopWebRtcProxy {
       return
     }
     try {
-      writeSocketSafe(this.activeSocket, encodeBinFrame(payload.peerId, payload.role, payload.bytes))
+      this.writeSocketBackpressured(this.activeSocket, encodeBinFrame(payload.peerId, payload.role, payload.bytes))
     } catch {}
   }
 
   handleClientSocket(socket) {
+    if (this.disposed || this.sockets.size >= this.maxConnections) {
+      try { socket.destroy() } catch {}
+      return
+    }
     this.sockets.add(socket)
     socket.setNoDelay(true)
     let authed = false
@@ -292,9 +370,40 @@ export class DesktopWebRtcProxy {
     let bufferedLen = 0
     let frameQueue = Promise.resolve()
     let queuedFrameBytes = 0
+    let inflightToWorkerBytes = 0
     let socketPaused = false
-    const MAX_QUEUED_FRAME_BYTES = 4 * 1024 * 1024
-    const RESUME_QUEUED_FRAME_BYTES = 1 * 1024 * 1024
+
+    const totalPendingToWorker = () => queuedFrameBytes + inflightToWorkerBytes
+    const maybePauseSocket = () => {
+      if (!socketPaused && totalPendingToWorker() >= MAX_INFLIGHT_TO_WORKER_BYTES && !socket.destroyed) {
+        socketPaused = true
+        try { socket.pause() } catch {}
+      }
+    }
+    const maybeResumeSocket = () => {
+      if (socketPaused && totalPendingToWorker() <= RESUME_INFLIGHT_TO_WORKER_BYTES && !socket.destroyed) {
+        socketPaused = false
+        try { socket.resume() } catch {}
+      }
+    }
+    const socketFlow = {
+      addInflight(n) {
+        if (n > 0) {
+          inflightToWorkerBytes += n
+          maybePauseSocket()
+        }
+      },
+      ackInflight(n) {
+        if (n > 0) {
+          inflightToWorkerBytes = Math.max(0, inflightToWorkerBytes - n)
+          maybeResumeSocket()
+        }
+      },
+      resetInflight() {
+        inflightToWorkerBytes = 0
+        maybeResumeSocket()
+      },
+    }
 
     const peekHeaderLen = () => {
       if (bufferedLen < 4) return -1
@@ -367,6 +476,9 @@ export class DesktopWebRtcProxy {
           const prevSocket = this.activeSocket
           this.activePeerIds.clear()
           this.pendingReqIds.clear()
+          this.pendingOfferPeerIds.clear()
+          this.waitingSocketDrain = false
+          this.setWorkerRxPaused(false)
           if (this.workerWin && !this.workerWin.isDestroyed()) {
             try { this.workerWin.webContents.send('webrtc-worker:cmd', { type: 'peer.closeAll' }) } catch {}
           }
@@ -374,7 +486,10 @@ export class DesktopWebRtcProxy {
           try { prevSocket.destroy() } catch {}
         }
         this.activeSocket = socket
-        socket.write(encodeJsonFrame({ type: 'auth.ok' }))
+        this.activeSocketFlow = socketFlow
+        this.waitingSocketDrain = false
+        this.setWorkerRxPaused(false)
+        this.writeSocketBackpressured(socket, encodeJsonFrame({ type: 'auth.ok' }))
         return
       }
 
@@ -395,7 +510,7 @@ export class DesktopWebRtcProxy {
         if (!isCreatingCmd) {
           if (!this.workerWin || this.workerWin.isDestroyed()) {
             if (cmd.reqId && !socket.destroyed) {
-              socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
+              this.writeSocketBackpressured(socket, encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
             }
             return
           }
@@ -409,14 +524,17 @@ export class DesktopWebRtcProxy {
             } else if (cmd.reqId) {
               this.pendingReqIds.delete(cmd.reqId)
               if (!socket.destroyed) {
-                socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
+                this.writeSocketBackpressured(socket, encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: true }))
               }
             }
           } catch (err) {
             if (cmd.reqId) {
               this.pendingReqIds.delete(cmd.reqId)
               if (!socket.destroyed) {
-                socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }))
+                this.writeSocketBackpressured(
+                  socket,
+                  encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }),
+                )
               }
             }
           }
@@ -428,6 +546,9 @@ export class DesktopWebRtcProxy {
 
         if (cmd.reqId) {
           this.pendingReqIds.add(cmd.reqId)
+          if (cmd.peerId) {
+            this.pendingOfferPeerIds.set(cmd.reqId, cmd.peerId)
+          }
         }
         try {
           const win = await this.ensureWorker()
@@ -438,13 +559,17 @@ export class DesktopWebRtcProxy {
         } catch (err) {
           if (cmd.reqId) {
             this.pendingReqIds.delete(cmd.reqId)
+            this.pendingOfferPeerIds.delete(cmd.reqId)
           }
           if (cmd.type === 'peer.offer' && cmd.peerId) {
             this.activePeerIds.delete(cmd.peerId)
             if (this.activePeerIds.size === 0) this.scheduleIdleDestroy()
           }
           if (cmd.reqId && !socket.destroyed) {
-            socket.write(encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }))
+            this.writeSocketBackpressured(
+              socket,
+              encodeJsonFrame({ type: 'res', reqId: cmd.reqId, ok: false, error: String(err?.message || err) }),
+            )
           }
         }
         return
@@ -458,6 +583,8 @@ export class DesktopWebRtcProxy {
         const role = payload[1 + pidLen] === 1 ? 'bulk' : 'ctrl'
         const bytes = Buffer.from(payload.subarray(2 + pidLen))
         if (this.workerWin && !this.workerWin.isDestroyed()) {
+          // Track real unacknowledged bytes in flight until webrtc-worker.html returns `rx-ack`
+          socketFlow.addInflight(bytes.length)
           this.workerWin.webContents.send('webrtc-worker:send-binary', { peerId, role, bytes })
         }
       }
@@ -465,11 +592,18 @@ export class DesktopWebRtcProxy {
 
     socket.on('data', (chunk) => {
       if (!chunk || chunk.length === 0) return
+      if (!authed && bufferedLen + chunk.length > MAX_PRE_AUTH_BYTES) {
+        clearAuthTimer()
+        socket.destroy()
+        return
+      }
       chunks.push(chunk)
       bufferedLen += chunk.length
       while (bufferedLen >= 4) {
         const len = peekHeaderLen()
-        if (len <= 0 || len > 16 * 1024 * 1024) {
+        const maxFrameLen = authed ? MAX_AUTHED_FRAME_BYTES : MAX_PRE_AUTH_BYTES
+        if (len <= 0 || len > maxFrameLen) {
+          clearAuthTimer()
           socket.destroy()
           return
         }
@@ -479,10 +613,7 @@ export class DesktopWebRtcProxy {
         const payload = frame.subarray(5)
         const frameBytes = payload.length
         queuedFrameBytes += frameBytes
-        if (!socketPaused && queuedFrameBytes >= MAX_QUEUED_FRAME_BYTES) {
-          socketPaused = true
-          try { socket.pause() } catch {}
-        }
+        maybePauseSocket()
         frameQueue = frameQueue
           .then(() => processFrame(kind, payload))
           .catch((err) => {
@@ -490,10 +621,7 @@ export class DesktopWebRtcProxy {
           })
           .finally(() => {
             queuedFrameBytes = Math.max(0, queuedFrameBytes - frameBytes)
-            if (socketPaused && queuedFrameBytes <= RESUME_QUEUED_FRAME_BYTES && !socket.destroyed) {
-              socketPaused = false
-              try { socket.resume() } catch {}
-            }
+            maybeResumeSocket()
           })
       }
     })
@@ -503,8 +631,12 @@ export class DesktopWebRtcProxy {
       clearAuthTimer()
       if (this.activeSocket === socket) {
         this.activeSocket = null
+        this.activeSocketFlow = null
+        this.waitingSocketDrain = false
         this.activePeerIds.clear()
         this.pendingReqIds.clear()
+        this.pendingOfferPeerIds.clear()
+        this.setWorkerRxPaused(false)
         if (this.workerWin && !this.workerWin.isDestroyed()) {
           try { this.workerWin.webContents.send('webrtc-worker:cmd', { type: 'peer.closeAll' }) } catch {}
         }
@@ -523,6 +655,9 @@ export class DesktopWebRtcProxy {
     this.clearIdleTimer()
     this.activePeerIds.clear()
     this.pendingReqIds.clear()
+    this.pendingOfferPeerIds.clear()
+    this.workerRxPaused = false
+    this.waitingSocketDrain = false
     this.ipcMain.removeListener('webrtc-worker:control', this._onWorkerControl)
     this.ipcMain.removeListener('webrtc-worker:binary', this._onWorkerBinary)
     for (const sock of [...this.sockets]) {
@@ -530,6 +665,7 @@ export class DesktopWebRtcProxy {
     }
     this.sockets.clear()
     this.activeSocket = null
+    this.activeSocketFlow = null
     if (this.workerWin && !this.workerWin.isDestroyed()) {
       try { this.workerWin.destroy() } catch {}
       this.workerWin = null

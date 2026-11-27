@@ -339,6 +339,7 @@ export class RelayHub {
     if (!roomMap || roomMap.size === 0) return []
     const out = []
     for (const g of roomMap.values()) {
+      if (g.status !== 'pending') continue
       if (excludeClientId && g.requesterClientId === excludeClientId) continue
       if (g.expiresAt <= now) continue
       out.push(this.sanitizeGrantPublic(g))
@@ -436,11 +437,19 @@ export class RelayHub {
     return out
   }
 
-  pushRoomGrantEvent(roomId, event, payload, excludeClientId = '') {
+  pushRoomGrantEvent(roomId, event, payload, excludeClientIds = '') {
     const rid = String(roomId || '').trim()
     if (!rid) return
     const entries = this._getRoomClientEntries(rid)
     if (entries.length === 0) return
+    const excluded =
+      excludeClientIds instanceof Set
+        ? excludeClientIds
+        : Array.isArray(excludeClientIds)
+          ? new Set(excludeClientIds.filter(Boolean))
+          : excludeClientIds
+            ? new Set([excludeClientIds])
+            : null
     const frame = JSON.stringify({
       type: 'event',
       ts: Date.now(),
@@ -450,7 +459,7 @@ export class RelayHub {
     })
     for (const [cid, c] of entries) {
       if (c.ws.readyState !== 1) continue
-      if (excludeClientId && cid === excludeClientId) continue
+      if (excluded && excluded.has(cid)) continue
       this._safeSend(c.ws, frame)
     }
   }
@@ -791,7 +800,7 @@ export class RelayHub {
       if (!rl.ok) {
         if (rl.terminate) {
           this.log.warn?.(`[control] Closing flooding bridge WS: room=${roomId} id=${bridgeId}`)
-          try { ws.close(4029, 'Message rate limit exceeded') } catch {}
+          this._closeWsWithFallback(ws, 1008, 'Message rate limit exceeded')
         }
         return
       }
@@ -887,7 +896,7 @@ export class RelayHub {
     })
     const roomId = String(user?.room || '').trim()
     if (!roomId.startsWith('usr_')) {
-      try { ws.close(4401, 'Invalid account room') } catch {}
+      this._closeWsWithFallback(ws, 4401, 'Invalid account room')
       return
     }
     const roomClientEntries = this._getRoomClientEntries(roomId)
@@ -964,7 +973,7 @@ export class RelayHub {
       if (!rl.ok) {
         if (rl.terminate) {
           this.log.warn?.(`[control] Closing flooding client WS: room=${roomId} client=${clientId}`)
-          try { ws.close(4029, 'Message rate limit exceeded') } catch {}
+          this._closeWsWithFallback(ws, 1008, 'Message rate limit exceeded')
         }
         return
       }
@@ -1036,6 +1045,9 @@ export class RelayHub {
         safePatch.bridgeVersion = incoming.bridgeVersion.trim().slice(0, 32)
       } else if (typeof incoming.version === 'string' && incoming.version.trim()) {
         safePatch.bridgeVersion = incoming.version.trim().slice(0, 32)
+      }
+      if (typeof incoming.bridgeBootId === 'string' && incoming.bridgeBootId.trim()) {
+        safePatch.bridgeBootId = incoming.bridgeBootId.trim().slice(0, 64)
       }
       if (Array.isArray(incoming.capabilities)) {
         safePatch.capabilities = sanitizeCapabilities(incoming.capabilities)
@@ -1173,6 +1185,8 @@ export class RelayHub {
         pubKey,
         wantedKeyId,
         commit,
+        status: 'pending',
+        revealed: false,
         createdAt: now,
         expiresAt: now + E2EE_GRANT_TTL_MS,
         offeredByClientId: '',
@@ -1203,9 +1217,31 @@ export class RelayHub {
       const now = Date.now()
       this.pruneExpiredGrantsForRoom(roomId, now)
       const grant = this.e2eeGrants.get(roomId)?.get(reqId)
-      if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      if (!grant || grant.roomId !== roomId || grant.expiresAt <= now) {
+        this.sendToClient(clientId, {
+          type: 'event',
+          ts: now,
+          bridgeId: '',
+          event: EVENTS.E2EE_GRANT_CANCEL,
+          payload: { reqId, reason: 'already_claimed' },
+        })
+        return
+      }
+      if (grant.requesterClientId === clientId) return
       // One-shot offer lock: never allow a second offer on the same commitment
-      if (grant.offeredByClientId) return
+      if (grant.status !== 'pending' || grant.offeredByClientId) {
+        if (grant.offeredByClientId !== clientId) {
+          this.sendToClient(clientId, {
+            type: 'event',
+            ts: now,
+            bridgeId: '',
+            event: EVENTS.E2EE_GRANT_CANCEL,
+            payload: { reqId, reason: 'already_claimed' },
+          })
+        }
+        return
+      }
+      grant.status = 'offered'
       grant.offeredByClientId = clientId
       grant.approverPubKey = approverPubKey
       grant.approverNonce = approverNonce
@@ -1224,6 +1260,13 @@ export class RelayHub {
           approverNonce,
         },
       })
+      // Dismiss grant modals on all other non-requester approver clients cleanly
+      this.pushRoomGrantEvent(
+        roomId,
+        EVENTS.E2EE_GRANT_CANCEL,
+        { reqId, reason: 'claimed_by_other' },
+        [grant.requesterClientId, clientId],
+      )
       return
     }
 
@@ -1235,7 +1278,10 @@ export class RelayHub {
       this.pruneExpiredGrantsForRoom(roomId, now)
       const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId || grant.expiresAt <= now) return
-      if (!grant.offeredByClientId || !this.clients.has(grant.offeredByClientId)) return
+      if (grant.status !== 'offered' || !grant.offeredByClientId || !this.clients.has(grant.offeredByClientId)) return
+      // Strictly one-shot reveal latch per commitment
+      if (grant.revealed) return
+      grant.revealed = true
       this.sendToClient(grant.offeredByClientId, {
         type: 'event',
         ts: now,
@@ -1249,7 +1295,7 @@ export class RelayHub {
       return
     }
 
-    if (msg.type === 'e2ee.grant.deliver') {
+    if (msg.type === WS_MSG.E2EE_GRANT_DELIVER) {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const env = msg.envelope
       if (!/^[0-9a-f]{16,32}$/.test(reqId) || !env || typeof env !== 'object') return
@@ -1298,12 +1344,14 @@ export class RelayHub {
       return
     }
 
-    if (msg.type === 'e2ee.grant.reject') {
+    if (msg.type === WS_MSG.E2EE_GRANT_REJECT) {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const now = Date.now()
       this.pruneExpiredGrantsForRoom(roomId, now)
       const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId === clientId || grant.expiresAt <= now) return
+      // Never allow another approver dismissing its modal to abort the active claiming approver's grant
+      if (grant.offeredByClientId && grant.offeredByClientId !== clientId) return
       this._deleteGrant(roomId, reqId)
       this.sendToClient(grant.requesterClientId, {
         type: 'event',
@@ -1319,7 +1367,7 @@ export class RelayHub {
       return
     }
 
-    if (msg.type === 'e2ee.grant.cancel') {
+    if (msg.type === WS_MSG.E2EE_GRANT_CANCEL) {
       const reqId = String(msg.reqId || '').trim().toLowerCase()
       const grant = this.e2eeGrants.get(roomId)?.get(reqId)
       if (!grant || grant.roomId !== roomId || grant.requesterClientId !== clientId) return
@@ -1328,7 +1376,7 @@ export class RelayHub {
       return
     }
 
-    if (msg.type === 'e2ee.qr.nudge') {
+    if (msg.type === WS_MSG.E2EE_QR_NUDGE) {
       const action = msg.action === 'done' ? 'done' : 'scanning'
       const wantedKeyId = String(msg.wantedKeyId || '').trim().toLowerCase()
       if (wantedKeyId && !/^[0-9a-f]{16}$/.test(wantedKeyId)) return
@@ -1534,13 +1582,13 @@ export class RelayHub {
     return disconnected
   }
 
-  pushIceUpdate(roomId, { quotaExceeded = false } = {}) {
+  pushIceUpdate(roomId, { quotaExceeded = false, host = '' } = {}) {
     const rid = String(roomId || '').trim()
     if (!rid) return
-    const iceServers = this.getIceServers(null, rid)
+    const iceServers = this.getIceServers(null, rid, host)
     const turnQuota = this.getTurnQuota(rid)
     const msg = {
-      type: 'ice.update',
+      type: WS_MSG.ICE_UPDATE,
       iceServers,
       ...(turnQuota ? { turnQuota } : {}),
       quotaExceeded: Boolean(quotaExceeded || turnQuota?.exceeded),
@@ -1573,10 +1621,10 @@ export class RelayHub {
       this._iceRefreshTimer = null
     }
     for (const b of this.bridges.values()) {
-      try { b.ws.close(1001, 'Server shutting down') } catch {}
+      this._closeWsWithFallback(b.ws, 1001, 'Server shutting down')
     }
     for (const c of this.clients.values()) {
-      try { c.ws.close(1001, 'Server shutting down') } catch {}
+      this._closeWsWithFallback(c.ws, 1001, 'Server shutting down')
     }
   }
 }

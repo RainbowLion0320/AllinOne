@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 
@@ -60,6 +60,27 @@ const SENSITIVE_SUBPATH_PREFIXES = [
   '/appdata/roaming/mozilla',
   '/appdata/roaming/codebuddyextension',
 ]
+
+const DEFAULT_WORKSPACE_DIR_NAME = 'AllinOne-Workspace'
+
+/**
+ * Return the dedicated safe default workspace directory (`~/AllinOne-Workspace`).
+ * Never returns `os.homedir()` itself so `assertSafeWorkspaceCwd` always accepts it.
+ */
+export function getDefaultWorkspaceCwd() {
+  return join(homedir(), DEFAULT_WORKSPACE_DIR_NAME)
+}
+
+/**
+ * Ensure the dedicated safe default workspace directory exists on disk and return its path.
+ */
+export function ensureDefaultWorkspaceCwd() {
+  const dir = getDefaultWorkspaceCwd()
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {}
+  return dir
+}
 
 function getNormalizedHomePath() {
   try {
@@ -129,18 +150,28 @@ export function assertSafeWorkspaceCwd(rawCwd, { allowEmpty = true } = {}) {
   } else if (expanded.startsWith('~/') || expanded.startsWith('~\\')) {
     expanded = join(homedir(), expanded.slice(2))
   }
-  if (isSensitiveOrSystemCwdPath(expanded)) {
+  const homeNorm = getNormalizedHomePath()
+  const rejectSensitive = (candidatePath) => {
+    const candNorm = String(candidatePath || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    if (homeNorm && candNorm === homeNorm) {
+      throw new Error(
+        `出于安全限制，不允许将用户主目录直接设为工作目录，请指定具体项目子目录（或使用默认目录 ${getDefaultWorkspaceCwd()}）`,
+      )
+    }
     throw new Error('出于安全限制，不允许将系统敏感目录或凭据目录设为工作目录')
+  }
+  if (isSensitiveOrSystemCwdPath(expanded)) {
+    rejectSensitive(expanded)
   }
   const resolved = resolve(expanded)
   if (isSensitiveOrSystemCwdPath(resolved)) {
-    throw new Error('出于安全限制，不允许将系统敏感目录或凭据目录设为工作目录')
+    rejectSensitive(resolved)
   }
   if (existsSync(resolved)) {
     try {
       const real = realpathSync(resolved)
       if (isSensitiveOrSystemCwdPath(real)) {
-        throw new Error('出于安全限制，不允许将系统敏感目录或凭据目录设为工作目录')
+        rejectSensitive(real)
       }
     } catch (err) {
       if (String(err?.message || '').includes('出于安全限制')) throw err

@@ -8,7 +8,7 @@
  *    (zero Node.js installation required on the user's computer!)
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
@@ -31,6 +31,8 @@ const MAX_LOG_BYTES = 1024 * 1024 // 1 MB rolling cap
 const MAX_STDIO_LINE_BUF = 64 * 1024
 const RESTART_CIRCUIT_WINDOW_MS = 2 * 60 * 1000
 const RESTART_CIRCUIT_MAX = 5
+const RESTART_STABILITY_WINDOW_MS = 15_000
+const GRACEFUL_QUIT_TIMEOUT_MS = 3_500
 
 function normalizeBaseUrl(raw) {
   return String(raw || '').trim().replace(/\/+$/, '')
@@ -206,12 +208,14 @@ export class DesktopBridgeManager extends EventEmitter {
     this.secretStore = secretStore
     this.getWebRtcProxyInfo = typeof getWebRtcProxyInfo === 'function' ? getWebRtcProxyInfo : null
     this.stateDir = join(os.homedir(), '.allinone-bridge')
+    this.workspaceDir = join(os.homedir(), 'AllinOne-Workspace')
     this.configPath = join(this.stateDir, 'config.json')
     this.logPath = join(this.stateDir, 'desktop-bridge.log')
 
     this.proc = null
     this.killPromise = null
     this.restartTimer = null
+    this.stabilityTimer = null
     this.restartAttempts = 0
     this.restartTimestamps = []
     this._logQueue = []
@@ -233,6 +237,21 @@ export class DesktopBridgeManager extends EventEmitter {
   ensureStateDir() {
     mkdirSync(this.stateDir, { recursive: true })
     try { chmodSync(this.stateDir, 0o700) } catch {}
+  }
+
+  ensureWorkspaceDir() {
+    const dir = this.workspaceDir || join(os.homedir(), 'AllinOne-Workspace')
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch {}
+    return existsSync(dir) ? dir : os.homedir()
+  }
+
+  clearStabilityTimer() {
+    if (this.stabilityTimer) {
+      clearTimeout(this.stabilityTimer)
+      this.stabilityTimer = null
+    }
   }
 
   appendLog(line) {
@@ -384,6 +403,10 @@ export class DesktopBridgeManager extends EventEmitter {
 
     const mySeq = ++this.syncSeq
     this.authRevoked = false
+    this.restartAttempts = 0
+    this.restartTimestamps = []
+    clearTimeout(this.restartTimer)
+    this.restartTimer = null
     this.state = 'binding'
     this.error = ''
     this.emitStatus()
@@ -539,13 +562,15 @@ export class DesktopBridgeManager extends EventEmitter {
       return this.getStatus()
     }
     const childAlive = Boolean(this.proc && !this.proc.killed && this.proc.exitCode === null)
-    if (childAlive && this.state === 'connected') {
-      // Prompt running embedded bridge to immediately probe/reconnect its control WS after OS wake
-      try {
-        if (this.proc.stdin && !this.proc.stdin.destroyed && this.proc.stdin.writable) {
-          this.proc.stdin.write(`${JSON.stringify({ type: 'probe' })}\n`)
-        }
-      } catch {}
+    if (childAlive && (this.state === 'connected' || this.state === 'starting')) {
+      if (this.state === 'connected') {
+        // Prompt running embedded bridge to immediately probe/reconnect its control WS after OS wake
+        try {
+          if (this.proc.stdin && !this.proc.stdin.destroyed && this.proc.stdin.writable) {
+            this.proc.stdin.write(`${JSON.stringify({ type: 'probe' })}\n`)
+          }
+        } catch {}
+      }
       return this.getStatus()
     }
 
@@ -611,6 +636,7 @@ export class DesktopBridgeManager extends EventEmitter {
     this.appendLog(`Starting embedded bridge: script=${scriptPath} server=${serverUrl} bridgeId=${cfg.bridgeId || label}`)
 
     const webrtcProxyInfo = this.getWebRtcProxyInfo?.() || null
+    const workspaceDir = this.ensureWorkspaceDir()
     const child = spawn(
       process.execPath,
       [
@@ -622,7 +648,7 @@ export class DesktopBridgeManager extends EventEmitter {
         '--machine-ipc',
       ],
       {
-        cwd: os.homedir(),
+        cwd: workspaceDir,
         env: {
           ...process.env,
           ELECTRON_RUN_AS_NODE: '1',
@@ -655,20 +681,35 @@ export class DesktopBridgeManager extends EventEmitter {
       if (!ev || ev.type !== 'bridge.ipc') return false
       if (ev.event === 'state') {
         if (ev.state === 'connected') {
-          this.restartAttempts = 0
-          this.restartTimestamps = []
           this.state = 'connected'
           this.error = ''
           this.emitStatus()
+          if (!this.stabilityTimer) {
+            this.stabilityTimer = setTimeout(() => {
+              this.stabilityTimer = null
+              if (this.proc === child && this.state === 'connected') {
+                this.restartAttempts = 0
+                this.restartTimestamps = []
+              }
+            }, RESTART_STABILITY_WINDOW_MS)
+            this.stabilityTimer.unref?.()
+          }
         } else if (ev.state === 'disconnected') {
+          this.clearStabilityTimer()
           if (!childAuthRevoked && this.state !== 'error') {
             this.state = 'starting'
             this.emitStatus()
           }
-        } else if (ev.state === 'unauthorized' || ev.state === 'fatal') {
+        } else if (ev.state === 'unauthorized') {
+          this.clearStabilityTimer()
           childAuthRevoked = true
           this.authRevoked = true
           this.error = '本机绑定凭证已失效，请重新登录'
+          this.state = 'error'
+          this.emitStatus()
+        } else if (ev.state === 'fatal') {
+          this.clearStabilityTimer()
+          this.error = String(ev.message || '桥接发生异常')
           this.state = 'error'
           this.emitStatus()
         }
@@ -687,6 +728,7 @@ export class DesktopBridgeManager extends EventEmitter {
         return true
       }
       if (ev.event === 'fatal') {
+        this.clearStabilityTimer()
         this.error = String(ev.message || '桥接发生异常')
         this.state = 'error'
         this.emitStatus()
@@ -750,6 +792,7 @@ export class DesktopBridgeManager extends EventEmitter {
 
     child.on('error', (err) => {
       if (this.proc !== child) return
+      this.clearStabilityTimer()
       this.proc = null
       this.state = 'error'
       this.error = String(err?.message || err)
@@ -767,6 +810,7 @@ export class DesktopBridgeManager extends EventEmitter {
         errBuf = ''
       }
       if (this.proc !== child) return
+      this.clearStabilityTimer()
       this.proc = null
       this.autofixText = ''
       this.appendLog(`Bridge exited (code=${code}, signal=${signal})`)
@@ -834,6 +878,7 @@ export class DesktopBridgeManager extends EventEmitter {
   async killChild() {
     clearTimeout(this.restartTimer)
     this.restartTimer = null
+    this.clearStabilityTimer()
     while (this.killPromise || this.proc) {
       if (this.killPromise) {
         await this.killPromise
@@ -845,10 +890,11 @@ export class DesktopBridgeManager extends EventEmitter {
       const p = new Promise((resolveDone) => {
         let settled = false
         let forceTimer = null
+        let killTimer = null
         const done = () => {
           if (settled) return
           settled = true
-          clearTimeout(killTimer)
+          if (killTimer) clearTimeout(killTimer)
           if (forceTimer) clearTimeout(forceTimer)
           resolveDone()
         }
@@ -857,14 +903,39 @@ export class DesktopBridgeManager extends EventEmitter {
           return
         }
         child.once('exit', done)
-        const killTimer = setTimeout(() => {
-          try { child.kill('SIGKILL') } catch {}
-          forceTimer = setTimeout(done, 150)
-        }, 6_000)
+
+        const escalateForceKill = () => {
+          if (settled) return
+          if (process.platform === 'win32' && child.pid) {
+            try {
+              execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {})
+            } catch {}
+          }
+          try {
+            child.kill('SIGKILL')
+          } catch {}
+          forceTimer = setTimeout(done, 500)
+          forceTimer.unref?.()
+        }
+
+        killTimer = setTimeout(escalateForceKill, GRACEFUL_QUIT_TIMEOUT_MS)
+        killTimer.unref?.()
+
+        // Request graceful cross-platform shutdown over stdin IPC first (works cleanly on Windows & POSIX)
+        let sentGracefulQuit = false
         try {
-          child.kill('SIGTERM')
-        } catch {
-          done()
+          if (child.stdin && !child.stdin.destroyed && child.stdin.writable) {
+            child.stdin.write(`${JSON.stringify({ type: 'quit' })}\n`)
+            sentGracefulQuit = true
+          }
+        } catch {}
+
+        if (!sentGracefulQuit && process.platform !== 'win32') {
+          try {
+            child.kill('SIGTERM')
+          } catch {
+            done()
+          }
         }
       }).finally(() => {
         if (this.killPromise === p) {

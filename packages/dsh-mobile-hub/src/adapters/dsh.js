@@ -493,7 +493,9 @@ export class DshAdapter extends BaseAdapter {
         ctx?.get?.('workingDirectory')?.defaultDirectory ||
         process.cwd(),
     )
-    this.permissionPreset = String(config.permissionPreset ?? 'danger-full-access').trim()
+    this.permissionPreset = String(
+      config.permissionPreset ?? process.env.ALLINONE_DSH_PERMISSION_PRESET ?? '',
+    ).trim()
     this.agentPreset = String(config.agentPreset ?? '').trim() || undefined
     this.activeTurns = new Map() // sessionId -> { agent, aborted, pollTimer, startedAt }
     this.ownedHandles = new Map()
@@ -658,7 +660,7 @@ export class DshAdapter extends BaseAdapter {
 
       const cleanup = (resolvedDecision = '') => {
         if (flushTimer) {
-          clearTimeout(flushTimer)
+          this.clearTrackedTimer(flushTimer)
           flushTimer = null
         }
         this.pendingApprovals.delete(aprId)
@@ -670,6 +672,7 @@ export class DshAdapter extends BaseAdapter {
           this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
             id: aprId,
             app: APPS.DSH,
+            sessionId: compositeId,
             decision: resolvedDecision,
           })
         }
@@ -688,18 +691,16 @@ export class DshAdapter extends BaseAdapter {
           // `userQuestions` projection patch. For `wait.timed === true`, resolve immediately so
           // `TimedQuestionWait` never fires `ASK_TIMED_OUT` when desktop releases its claim.
           if (request?.wait?.callId && !request?.wait?.timed) {
-            flushTimer = setTimeout(() => {
+            flushTimer = this.setTimeout(() => {
               flushTimer = null
               desktopRace.restore()
               resolvePromise(result)
             }, 50)
-            flushTimer.unref?.()
             return
           }
           // Defer signal restoration to next macrotask so any queued gateway microtask still
           // observes the aborted `desktopSignal`.
-          const restoreTimer = setTimeout(() => desktopRace.restore(), 0)
-          restoreTimer.unref?.()
+          this.setTimeout(() => desktopRace.restore(), 0)
           resolvePromise(result)
           return
         }
@@ -830,6 +831,7 @@ export class DshAdapter extends BaseAdapter {
           this.emitEvent(EVENTS.APPROVAL_RESOLVED, {
             id: aprId,
             app: APPS.DSH,
+            sessionId: compositeId,
             decision: resolvedDecision,
           })
         }
@@ -842,8 +844,7 @@ export class DshAdapter extends BaseAdapter {
         const shouldCancelDesktop = cancelDesktop && desktopForwarded && !desktopSettled
         if (shouldCancelDesktop) {
           desktopRace.abortDesktop()
-          const restoreTimer = setTimeout(() => desktopRace.restore(), 0)
-          restoreTimer.unref?.()
+          this.setTimeout(() => desktopRace.restore(), 0)
         } else {
           desktopRace.restore()
         }
@@ -1038,6 +1039,11 @@ export class DshAdapter extends BaseAdapter {
     return this.quotaManager.refreshInBackground({ force })
   }
 
+  _readJsonCached(filePath) {
+    if (!filePath || !existsSync(filePath)) return null
+    return this.parseCache.getOrParse(filePath, () => readJsonSafe(filePath))
+  }
+
   async resolveQuota({ forceQuota = false } = {}) {
     let quota = this.quotaCache
     const now = Date.now()
@@ -1050,13 +1056,12 @@ export class DshAdapter extends BaseAdapter {
           const fresh = await Promise.race([
             p,
             new Promise((r) => {
-              t = setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
-              t.unref?.()
+              t = this.setTimeout(() => r(null), forceQuota ? 2_200 : 1_800)
             }),
           ])
           if (fresh) quota = fresh
         } finally {
-          if (t) clearTimeout(t)
+          if (t) this.clearTrackedTimer(t)
         }
       }
     }
@@ -1105,7 +1110,7 @@ export class DshAdapter extends BaseAdapter {
 
   async listWorkspaces() {
     const wsPath = join(this.dshHome, 'storages', 'workspace.json')
-    const data = readJsonSafe(wsPath)
+    const data = this._readJsonCached(wsPath)
     const tables = data?.tables?.workspaces || {}
     const list = Object.entries(tables).map(([id, row]) => ({
       id,
@@ -1128,7 +1133,7 @@ export class DshAdapter extends BaseAdapter {
       }
     }
     const wsPath = join(this.dshHome, 'storages', 'workspace.json')
-    const wsData = readJsonSafe(wsPath)
+    const wsData = this._readJsonCached(wsPath)
     const archivedSet = new Set(wsData?.global?.archivedSessionIds || [])
     const pinnedSet = new Set(wsData?.global?.pinnedSessionIds || [])
 
@@ -1150,7 +1155,7 @@ export class DshAdapter extends BaseAdapter {
         const archived = archivedSet.has(sessionId)
         if (!includeArchived && archived) continue
         const fp = join(cacheDir, file)
-        const rec = readJsonSafe(fp)
+        const rec = this._readJsonCached(fp)
         if (!rec?.record) continue
 
         let mtimeMs = 0
@@ -1253,7 +1258,7 @@ export class DshAdapter extends BaseAdapter {
 
   resolveWorkspaceInfo(sessionId = '', cwd = '') {
     const wsPath = join(this.dshHome, 'storages', 'workspace.json')
-    const wsData = readJsonSafe(wsPath)
+    const wsData = this._readJsonCached(wsPath)
     const rows = Object.values(wsData?.tables?.workspaces || {})
     if (sessionId) {
       for (const row of rows) {
@@ -1324,7 +1329,7 @@ export class DshAdapter extends BaseAdapter {
     // 2) Enrich or fallback from projcache JSON
     const cacheDir = join(this.dshHome, 'storages', 'session_projcache', 'sessions')
     const cacheFile = assertPathWithinDir(join(cacheDir, `${sessionId}.json`), cacheDir, 'DSH session cache')
-    const cacheRec = readJsonSafe(cacheFile)
+    const cacheRec = this._readJsonCached(cacheFile)
     let provider = ''
     let reasoningEffort = ''
     if (cacheRec?.record) {
@@ -1670,8 +1675,7 @@ export class DshAdapter extends BaseAdapter {
         }
       }
 
-      pollTimer = setInterval(flushNewEvents, 250)
-      pollTimer.unref?.()
+      pollTimer = this.setInterval(flushNewEvents, 250)
       turnState.pollTimer = pollTimer
       agent.followup(buildDshUserMessage(prompt))
       await agent.whenIdle()
@@ -1722,7 +1726,7 @@ export class DshAdapter extends BaseAdapter {
       }
       throw errObj
     } finally {
-      if (pollTimer) clearInterval(pollTimer)
+      if (pollTimer) this.clearTrackedTimer(pollTimer)
       if (this.activeTurns.get(lockedId) === turnState) {
         this.activeTurns.delete(lockedId)
       }
@@ -1756,7 +1760,7 @@ export class DshAdapter extends BaseAdapter {
     for (const active of this.activeTurns.values()) {
       active.aborted = true
       if (active.pollTimer) {
-        clearInterval(active.pollTimer)
+        this.clearTrackedTimer(active.pollTimer)
         active.pollTimer = null
       }
       try {

@@ -170,6 +170,7 @@ jobs:
             (cd packages/mobile-app/android && ./gradlew assembleRelease --no-daemon)
             APK_SRC="packages/mobile-app/android/app/build/outputs/apk/release/app-release.apk"
             APK_OUT="packages/mobile-app/release/All-in-One-Android.apk"
+            OTA_SIGN_FLAG="--require-signature"
           else
             if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
               echo "::error::ANDROID_KEYSTORE_BASE64 secret is required for tagged releases (refusing to publish debug-signed APK)"
@@ -179,13 +180,14 @@ jobs:
             (cd packages/mobile-app/android && ./gradlew assembleDebug --no-daemon)
             APK_SRC="packages/mobile-app/android/app/build/outputs/apk/debug/app-debug.apk"
             APK_OUT="packages/mobile-app/release/All-in-One-Android-debug.apk"
+            OTA_SIGN_FLAG="--allow-unsigned"
           fi
           cp "$APK_SRC" "$APK_OUT"
           APKSIGNER="$(ls -1 ${ANDROID_HOME}/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -n "$APKSIGNER" ]; then
             "$APKSIGNER" verify --print-certs "$APK_OUT"
           fi
-          node scripts/package-android-ota.mjs
+          node scripts/package-android-ota.mjs "$OTA_SIGN_FLAG"
           ls -lh packages/mobile-app/release/
 
       - name: Upload Android APK & OTA WebBundle artifacts
@@ -234,6 +236,31 @@ jobs:
               "${DESKTOP_FILES[@]}"
           fi
 
+      - name: Read Android OTA minNativeVersion metadata
+        id: ota_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIN_NATIVE="$(node -e '
+            const fs = require("fs");
+            let v = "";
+            if (fs.existsSync("release-artifacts/All-in-One-WebBundle.json")) {
+              const m = JSON.parse(fs.readFileSync("release-artifacts/All-in-One-WebBundle.json", "utf8"));
+              v = String(m.minNativeVersion || "").trim().replace(/^v/i, "");
+            }
+            if (!v && fs.existsSync("release-meta.json")) {
+              const meta = JSON.parse(fs.readFileSync("release-meta.json", "utf8"));
+              v = String(meta.androidMinNativeVersion || "").trim().replace(/^v/i, "");
+            }
+            if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v)) {
+              console.error("Invalid or missing androidOtaMinNative:", v);
+              process.exit(1);
+            }
+            process.stdout.write(v);
+          ')"
+          echo "min_native=${MIN_NATIVE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved android-ota-min-native: ${MIN_NATIVE}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -244,7 +271,7 @@ jobs:
             - **Windows (x64)**: `All.in.One.Setup.*.exe`
             - **Android**: `All-in-One-Android.apk` (release-signed, camera QR scan enabled, cryptographically verified in-app OTA hot-updates via `All-in-One-WebBundle.zip`) or install via Mobile Browser PWA (**Add to Home Screen**).
 
-            <!-- android-ota-min-native: 1.0.26 -->
+            <!-- android-ota-min-native: ${{ steps.ota_meta.outputs.min_native }} -->
 
             > **macOS first launch**: Open-source builds are ad-hoc signed without an Apple Developer notarization certificate. If Gatekeeper blocks the first launch, allow it in **System Settings → Privacy & Security → Open Anyway**, or run `xattr -cr "/Applications/All in One.app"` once in Terminal.
           files: release-artifacts/*
